@@ -1,5 +1,6 @@
 use crate::middleware::{
     ContextConfig, ContextMiddleware, LimitsConfig, LimitsMiddleware, MiddlewareDriver,
+    OutputLimitRecoveryMiddleware,
 };
 use crate::model_info::ModelInfoSource;
 use std::sync::Arc;
@@ -10,6 +11,9 @@ impl MiddlewarePresets {
     /// Sensible defaults with dynamic model info lookup
     pub fn defaults() -> Vec<Arc<dyn MiddlewareDriver>> {
         vec![
+            // Registered first so it sees a model-token-limit stop before any
+            // other driver can publish it.
+            Arc::new(OutputLimitRecoveryMiddleware::default()),
             Arc::new(LimitsMiddleware::new(LimitsConfig {
                 max_steps: Some(100),
                 max_turns: Some(20),
@@ -90,9 +94,18 @@ mod tests {
     // ── Preset factory functions return correct numbers of middleware ────────
 
     #[test]
-    fn defaults_returns_two_drivers() {
+    fn defaults_returns_three_drivers() {
         let drivers = MiddlewarePresets::defaults();
-        assert_eq!(drivers.len(), 2, "defaults() should produce 2 drivers");
+        assert_eq!(drivers.len(), 3, "defaults() should produce 3 drivers");
+    }
+
+    #[test]
+    fn defaults_register_output_limit_recovery_first() {
+        let drivers = MiddlewarePresets::defaults();
+        assert_eq!(
+            drivers.first().map(|d| d.name()),
+            Some("OutputLimitRecoveryMiddleware")
+        );
     }
 
     #[test]
@@ -128,16 +141,15 @@ mod tests {
 
     #[test]
     fn defaults_and_cost_conscious_differ() {
-        // Both return 2 drivers but with different configurations.
-        // We can't directly compare config, but we can verify names are consistent.
+        // Same limits/context drivers with different configurations; defaults()
+        // additionally carries the output-limit recovery driver.
         let d1 = MiddlewarePresets::defaults();
         let d2 = MiddlewarePresets::cost_conscious();
-        // Both should contain LimitsMiddleware and ContextMiddleware
-        let names1: Vec<&str> = d1.iter().map(|d| d.name()).collect();
+        let names1: Vec<&str> = d1.iter().skip(1).map(|d| d.name()).collect();
         let names2: Vec<&str> = d2.iter().map(|d| d.name()).collect();
         assert_eq!(
             names1, names2,
-            "both presets should use the same middleware types"
+            "both presets should use the same limits/context middleware types"
         );
     }
 

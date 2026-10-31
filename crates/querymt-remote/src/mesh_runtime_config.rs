@@ -10,7 +10,11 @@ pub struct MeshRuntimeConfig {
     pub iroh_enabled: bool,
     /// Enable GSO on the shared iroh actor endpoint. Use true to preserve the default.
     pub iroh_gso: bool,
+    /// None preserves iroh's default DNS policy.
+    pub iroh_dns: Option<crate::IrohDnsConfig>,
     pub iroh_scopes: Vec<IrohMeshConfig>,
+    /// Custom identities use `<identity_file>.invites.json` and
+    /// `<identity_file>.mesh_state.json` rather than the default QueryMT stores.
     pub identity_file: Option<PathBuf>,
     pub request_timeout: Duration,
     pub stream_reconnect_grace: Duration,
@@ -50,6 +54,10 @@ impl MeshRuntimeConfig {
     pub fn validate(&self) -> Result<()> {
         if !self.enabled {
             return Ok(());
+        }
+
+        if let Some(dns) = &self.iroh_dns {
+            dns.validate()?;
         }
 
         let has_lan = self.lan.is_some();
@@ -118,6 +126,7 @@ mod tests {
             lan: None,
             iroh_enabled: false,
             iroh_gso: true,
+            iroh_dns: None,
             iroh_scopes: Vec::new(),
             identity_file: None,
             request_timeout: Duration::from_secs(300),

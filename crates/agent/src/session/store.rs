@@ -9,11 +9,20 @@ use crate::session::domain::{
     ProgressKind, Task, TaskKind, TaskStatus,
 };
 use crate::session::error::{SessionError, SessionResult};
+use crate::session::lifecycle::{SessionLifecycle, SessionLifecyclePatch};
 use async_trait::async_trait;
 use querymt::LLMParams;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use time::OffsetDateTime;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPin {
+    pub session_id: String,
+    pub pinned: bool,
+    pub pinned_at: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRuntimeBinding {
@@ -69,6 +78,19 @@ impl RemoteSessionBookmark {
             title: update.title.or(self.title),
         }
     }
+}
+
+/// Durable startup barrier for a copied conversation awaiting isolation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingForkIsolation {
+    pub source_session_id: String,
+    pub source_cwd: std::path::PathBuf,
+    pub options: crate::worktree::WorkspaceCreationOptions,
+    /// Set when the barrier belongs to an ownership handoff: the successor
+    /// must adopt this existing workspace (completing the transfer from
+    /// `source_session_id`) instead of allocating a fresh one on recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_workspace_id: Option<String>,
 }
 
 /// Represents the metadata for a session.
@@ -291,6 +313,83 @@ pub trait SessionStore: Send + Sync {
     /// Retrieves session metadata by its unique ID.
     async fn get_session(&self, session_id: &str) -> SessionResult<Option<Session>>;
 
+    /// Resolve durable local/remote ownership for a set of session IDs.
+    /// Custom stores retain point-lookup semantics unless they provide a batch implementation.
+    async fn resolve_session_locations(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, crate::session::location::SessionLocation>> {
+        let mut locations = HashMap::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            let bookmark = self.get_remote_session_bookmark(session_id).await?;
+            let local_exists = self.get_session(session_id).await?.is_some();
+            locations.insert(
+                session_id.clone(),
+                crate::session::location::classify_session_location(local_exists, bookmark),
+            );
+        }
+        Ok(locations)
+    }
+
+    /// Whether this store provides authoritative persisted session lifecycle state.
+    fn supports_session_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// Read lifecycle state for one existing session.
+    async fn get_session_lifecycle(&self, _session_id: &str) -> SessionResult<SessionLifecycle> {
+        Err(SessionError::InvalidOperation(
+            "Session lifecycle is unsupported by this store".into(),
+        ))
+    }
+
+    /// Atomically patch lifecycle state for one existing session.
+    async fn patch_session_lifecycle(
+        &self,
+        _session_id: &str,
+        _patch: &SessionLifecyclePatch,
+    ) -> SessionResult<SessionLifecycle> {
+        Err(SessionError::InvalidOperation(
+            "Session lifecycle is unsupported by this store".into(),
+        ))
+    }
+
+    /// Read lifecycle state for a batch of existing sessions.
+    async fn get_session_lifecycles(
+        &self,
+        _session_ids: &[String],
+    ) -> SessionResult<HashMap<String, SessionLifecycle>> {
+        Err(SessionError::InvalidOperation(
+            "Session lifecycle is unsupported by this store".into(),
+        ))
+    }
+
+    /// Whether this store provides authoritative persisted session pin state.
+    fn supports_session_pins(&self) -> bool {
+        false
+    }
+
+    /// Atomically pin or unpin a locally stored session, returning whether its state changed.
+    async fn set_session_pinned(
+        &self,
+        _session_id: &str,
+        _pinned: bool,
+    ) -> SessionResult<(SessionPin, bool)> {
+        Err(SessionError::InvalidOperation(
+            "Session pins are unsupported by this store".into(),
+        ))
+    }
+
+    /// Batch-read pin state for existing local sessions.
+    async fn get_session_pins(
+        &self,
+        _session_ids: &[String],
+    ) -> SessionResult<HashMap<String, SessionPin>> {
+        Err(SessionError::InvalidOperation(
+            "Session pins are unsupported by this store".into(),
+        ))
+    }
+
     /// Persist a session title and return the stored RFC 3339 last-activity
     /// timestamp. `None` explicitly clears the title. Default stores reject
     /// the operation; callers emit metadata updates only after it succeeds.
@@ -302,6 +401,21 @@ pub trait SessionStore: Send + Sync {
         let _ = (session_id, name);
         Err(crate::session::error::SessionError::InvalidOperation(
             "set_session_name is not supported by this store".to_string(),
+        ))
+    }
+
+    /// Overwrite a session's durable working directory. Used when a session's
+    /// execution workspace changes durably — e.g. an isolated fork binding its
+    /// own checkout so the session row, workspace association, listing, load,
+    /// and resume all agree. Default stores reject the operation.
+    async fn set_session_cwd(
+        &self,
+        session_id: &str,
+        cwd: Option<std::path::PathBuf>,
+    ) -> SessionResult<()> {
+        let _ = (session_id, cwd);
+        Err(crate::session::error::SessionError::InvalidOperation(
+            "set_session_cwd is not supported by this store".to_string(),
         ))
     }
 
@@ -375,6 +489,59 @@ pub trait SessionStore: Send + Sync {
         target_message_id: &str,
         fork_origin: ForkOrigin,
     ) -> SessionResult<String>;
+
+    /// Copy history and persist isolation intent in the same transaction.
+    /// Stores without this capability must reject isolated forks before copying.
+    async fn fork_session_with_isolation_intent(
+        &self,
+        source_session_id: &str,
+        target_message_id: &str,
+        fork_origin: ForkOrigin,
+        intent: Option<PendingForkIsolation>,
+    ) -> SessionResult<String> {
+        if intent.is_some() {
+            return Err(SessionError::InvalidOperation(
+                "atomic fork isolation intent is unsupported by this store".into(),
+            ));
+        }
+        self.fork_session(source_session_id, target_message_id, fork_origin)
+            .await
+    }
+
+    /// Create a session and persist its non-runnable isolation barrier in the
+    /// same transaction. Stores without this capability must reject isolated
+    /// creation before the session row exists.
+    async fn create_session_with_isolation_intent(
+        &self,
+        name: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+        parent_session_id: Option<String>,
+        fork_origin: Option<ForkOrigin>,
+        intent: Option<PendingForkIsolation>,
+    ) -> SessionResult<Session> {
+        if intent.is_some() {
+            return Err(SessionError::InvalidOperation(
+                "atomic session isolation intent is unsupported by this store".into(),
+            ));
+        }
+        self.create_session(name, cwd, parent_session_id, fork_origin)
+            .await
+    }
+
+    /// Return the pending isolation intent; absent for legacy local sessions.
+    async fn get_pending_fork_isolation(
+        &self,
+        _session_id: &str,
+    ) -> SessionResult<Option<PendingForkIsolation>> {
+        Ok(None)
+    }
+
+    /// Release the startup barrier only after workspace ownership and cwd persist.
+    async fn complete_fork_isolation(&self, _session_id: &str) -> SessionResult<()> {
+        Err(SessionError::InvalidOperation(
+            "fork isolation completion is unsupported by this store".into(),
+        ))
+    }
 
     /// Create or retrieve an LLM configuration
     async fn create_or_get_llm_config(&self, input: &LLMParams) -> SessionResult<LLMConfig>;
@@ -484,6 +651,13 @@ pub trait SessionStore: Send + Sync {
 
     /// Get fork information for a session
     async fn get_session_fork_info(&self, session_id: &str) -> SessionResult<Option<ForkInfo>>;
+
+    /// Resolve a session's public id and workspace cwd by internal row id
+    /// (fork records reference the parent session by internal id).
+    async fn get_session_ref_by_internal_id(
+        &self,
+        session_internal_id: i64,
+    ) -> SessionResult<Option<(String, Option<std::path::PathBuf>)>>;
 
     /// List child sessions (forks) of a parent session
     async fn list_child_sessions(&self, parent_id: &str) -> SessionResult<Vec<String>>;

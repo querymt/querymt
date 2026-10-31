@@ -11,12 +11,11 @@ use async_trait::async_trait;
 use kameo::actor::Spawn;
 use libp2p::PeerId;
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool};
+use querymt::chat::{ChatCall, ChatCapabilities, ChatOutput, ChatProvider, ChatStream};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
@@ -196,7 +195,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         &self,
         session_id: &str,
         request_id: &str,
-        consumer_tx: mpsc::Sender<StreamRelayMessage>,
+        consumer_tx: mpsc::UnboundedSender<StreamRelayMessage>,
     ) -> Result<(Self::RouterRef, Self::RemoteRouterRef), LLMError> {
         let router = self.get_or_create_stream_router(session_id).await;
         router
@@ -364,6 +363,11 @@ impl MeshChatProvider {
         Self::new(mesh, &target_node_id.to_string(), provider_name, model)
     }
 
+    /// Resolve the remote provider's capabilities and generation defaults before use.
+    pub async fn negotiate_contract(&self) -> Result<crate::ProviderContractInfo, LLMError> {
+        self.inner.core().negotiate_contract().await
+    }
+
     pub fn with_params(mut self, params: Option<serde_json::Value>) -> Self {
         let config = self.inner.core().config().clone().with_params(params);
         self.rebuild_with_config(config);
@@ -409,27 +413,16 @@ impl MeshChatProvider {
 
 #[async_trait]
 impl ChatProvider for MeshChatProvider {
-    fn supports_streaming(&self) -> bool {
-        self.inner.supports_streaming()
+    fn capabilities(&self) -> ChatCapabilities {
+        self.inner.capabilities()
     }
 
-    async fn chat_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<ChatOutput, LLMError> {
-        self.inner.chat_with_tools(messages, tools).await
+    async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+        self.inner.chat(call).await
     }
 
-    async fn chat_stream_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<
-        Pin<Box<dyn futures_util::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
-        LLMError,
-    > {
-        self.inner.chat_stream_with_tools(messages, tools).await
+    async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
+        self.inner.chat_stream(call).await
     }
 }
 

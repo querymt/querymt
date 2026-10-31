@@ -97,7 +97,260 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0021_normalize_session_cwd_slashes",
         apply: migration_0021_normalize_session_cwd_slashes,
     },
+    Migration {
+        version: "0022_session_lifecycle",
+        apply: migration_0022_session_lifecycle,
+    },
+    Migration {
+        version: "0023_session_pins",
+        apply: migration_0023_session_pins,
+    },
+    Migration {
+        version: "0024_event_journal_session_seq",
+        apply: migration_0024_event_journal_session_seq,
+    },
+    Migration {
+        version: "0022_worktree_workspaces",
+        apply: migration_0022_worktree_workspaces,
+    },
+    Migration {
+        version: "0023_revert_workspace_provenance",
+        apply: migration_0023_revert_workspace_provenance,
+    },
+    Migration {
+        version: "0024_delegation_isolation",
+        apply: migration_0024_delegation_isolation,
+    },
+    Migration {
+        version: "0025_workspace_archival",
+        apply: migration_0025_workspace_archival,
+    },
+    Migration {
+        version: "0026_pending_fork_isolation",
+        apply: migration_0026_pending_fork_isolation,
+    },
+    Migration {
+        version: "0027_workspace_provisioning_intent",
+        apply: migration_0027_workspace_provisioning_intent,
+    },
+    Migration {
+        version: "0028_workspace_result_captured_head",
+        apply: migration_0028_workspace_result_captured_head,
+    },
+    Migration {
+        version: "0029_workspace_source_cwd",
+        apply: migration_0029_workspace_source_cwd,
+    },
+    Migration {
+        version: "0030_workspace_handoff",
+        apply: migration_0030_workspace_handoff,
+    },
+    Migration {
+        version: "0031_workspace_handoff_keeps_marker",
+        apply: migration_0031_workspace_handoff_keeps_marker,
+    },
+    Migration {
+        version: "0032_event_journal_run_lifecycle_index",
+        apply: migration_0032_event_journal_run_lifecycle_index,
+    },
 ];
+
+/// Partial index over run lifecycle rows so finding a session's unfinished
+/// run reads only those rows instead of every event of the session.
+///
+/// The predicate must stay textually identical to the one in
+/// `EventJournal::last_unfinished_run` for SQLite to use the index.
+fn migration_0032_event_journal_run_lifecycle_index(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_event_journal_run_lifecycle \
+         ON event_journal(session_id, stream_seq) \
+         WHERE kind IN ('run_started', 'run_completed');",
+    )
+}
+
+/// Drop the `to_session_id` cascade so deleting a successor keeps the
+/// read-only marker of its previous owners.
+fn migration_0031_workspace_handoff_keeps_marker(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    schema::ensure_workspace_handoff_survives_successor_delete(conn)
+}
+
+/// Add `workspaces.handed_off_to` and the `workspace_handoffs` marker table.
+fn migration_0030_workspace_handoff(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    schema::ensure_workspace_handoff(conn)
+}
+
+/// Add and backfill `workspaces.source_cwd` (project grouping key).
+fn migration_0029_workspace_source_cwd(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    schema::ensure_workspace_source_cwd(conn)
+}
+
+fn migration_0026_pending_fork_isolation(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE session_fork_isolation_intents (\n            session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,\n            intent_json TEXT NOT NULL\n        );",
+    )
+}
+
+/// Replayable provisioning-intent columns for existing workspaces.
+///
+/// Adds `requested_base_ref`, `operation_id`, and `provisioning_phase` to the
+/// `workspaces` table so interrupted allocation can be recovered from the
+/// recorded source/policy alone instead of requiring a pre-populated
+/// baseline. Existing rows keep NULLs: an absent phase is reconciled from
+/// the presence of a bound baseline, and an absent requested ref only
+/// matters for rows still in `provisioning`. Guarded column adds keep the
+/// migration idempotent for fresh installs where `init_schema` already
+/// created the columns.
+fn migration_0027_workspace_provisioning_intent(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    schema::ensure_workspace_provisioning_columns(conn)
+}
+
+/// Record the checkout HEAD at result-capture time on retained results.
+///
+/// Keeps captured HEAD distinct from live HEAD so baseline-relative review
+/// stays accurate after later commits/branch movement. Existing result rows
+/// keep NULL; review falls back to the workspace baseline commit. Guarded so
+/// the migration is idempotent for fresh installs.
+fn migration_0028_workspace_result_captured_head(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    schema::ensure_workspace_result_columns(conn)
+}
+
+fn migration_0025_workspace_archival(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let definition: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE name = 'workspaces'",
+        [],
+        |row| row.get(0),
+    )?;
+    if definition.contains("'archived'") {
+        return Ok(());
+    }
+    // SQLite cannot alter a CHECK constraint. Rebuild atomically with FK
+    // enforcement temporarily disabled, preserving self-links and results.
+    let foreign_keys: bool = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    let violations_before: i64 =
+        conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = (|| {
+        let tx = conn.transaction()?;
+        let ddl = schema::workspaces_create_table_statement().replace(
+            "CREATE TABLE IF NOT EXISTS workspaces",
+            "CREATE TABLE workspaces_new",
+        );
+        tx.execute_batch(&ddl)?;
+
+        // Copy by explicit column name, never `SELECT *`: positional copies
+        // silently misalign data if the old and new column orders differ.
+        // Columns the old table has but the new statement lacks (additive
+        // columns added by later `ALTER TABLE` helpers) are recreated on the
+        // new table first so their data survives the rebuild.
+        let table_columns = |tx: &rusqlite::Transaction<'_>,
+                             table: &str|
+         -> Result<Vec<(String, String)>, rusqlite::Error> {
+            let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+            stmt.query_map([], |row| Ok((row.get(1)?, row.get(2)?)))?
+                .collect()
+        };
+        let old_columns = table_columns(&tx, "workspaces")?;
+        let new_columns = table_columns(&tx, "workspaces_new")?;
+        for (name, declared_type) in &old_columns {
+            if !new_columns.iter().any(|(existing, _)| existing == name) {
+                tx.execute_batch(&format!(
+                    "ALTER TABLE workspaces_new ADD COLUMN \"{name}\" {declared_type}"
+                ))?;
+            }
+        }
+        let copied = old_columns
+            .iter()
+            .map(|(name, _)| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tx.execute_batch(&format!(
+            "INSERT INTO workspaces_new ({copied}) SELECT {copied} FROM workspaces; \
+             DROP TABLE workspaces; \
+             ALTER TABLE workspaces_new RENAME TO workspaces;"
+        ))?;
+        tx.execute_batch(schema::WORKSPACE_TABLES_DDL)?;
+        let violations: i64 =
+            tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        // Existing unrelated legacy FK violations must not block this
+        // additive migration; the rebuild must not introduce any new ones.
+        if violations != violations_before {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        tx.commit()
+    })();
+    conn.pragma_update(None, "foreign_keys", foreign_keys)?;
+    result
+}
+
+/// Managed worktree workspaces and retained result provenance.
+///
+/// Additive migration: creates the `workspaces` and `workspace_results`
+/// tables from the shared workspace DDL. Existing sessions and any other
+/// rows are untouched — local sessions keep their cwd execution and gain no
+/// workspace association (`owner_session_id` stays NULL until isolation is
+/// requested).
+fn migration_0022_worktree_workspaces(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(schema::WORKSPACE_TABLES_DDL)
+}
+
+/// Workspace provenance for undo/redo revert frames.
+///
+/// Records which workspace checkout a revert frame was captured against so
+/// redo validates all entries before restoring (cross-workspace entries are
+/// rejected without any partial restoration). Additive and nullable: frames
+/// recorded before this column keep existing behavior (`workspace_root IS
+/// NULL` is treated as same-workspace). The `ALTER TABLE` is guarded by a
+/// column-existence check so it stays idempotent for fresh installs where
+/// `init_schema` already created the column.
+fn migration_0023_revert_workspace_provenance(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    let existing: HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(revert_states)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?
+    };
+    if !existing.contains("workspace_root") {
+        conn.execute(
+            "ALTER TABLE revert_states ADD COLUMN workspace_root TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Requested/resolved execution isolation for delegates.
+///
+/// Records the delegation isolation policy (`inherit` | `shared` |
+/// `isolated`) so the resolved policy survives restarts. Additive and
+/// nullable: delegation rows recorded before this column inherit the
+/// parent's execution mode (`isolation IS NULL` reads as `inherit`), which
+/// preserves legacy shared execution for local parents. The `ALTER TABLE`
+/// is guarded by a column-existence check so it stays idempotent for fresh
+/// installs where `init_schema` already created the column.
+fn migration_0024_delegation_isolation(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let existing: HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(delegations)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?
+    };
+    if !existing.contains("isolation") {
+        conn.execute("ALTER TABLE delegations ADD COLUMN isolation TEXT", [])?;
+    }
+    Ok(())
+}
 
 fn migration_0021_normalize_session_cwd_slashes(
     conn: &mut Connection,
@@ -122,6 +375,27 @@ fn migration_0021_normalize_session_cwd_slashes(
         }
     }
     Ok(())
+}
+
+fn migration_0022_session_lifecycle(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_lifecycle (
+            session_id INTEGER PRIMARY KEY,
+            resolved_at TEXT,
+            archived_at TEXT,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );",
+    )
+}
+
+fn migration_0023_session_pins(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_pins (
+            session_id INTEGER PRIMARY KEY,
+            pinned_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );",
+    )
 }
 
 /// Protocol-owned automation session bindings.
@@ -721,6 +995,51 @@ fn migration_0015_event_source_identity(conn: &mut Connection) -> Result<(), rus
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_event_journal_source_identity \
          ON event_journal(session_id, source_node_id, source_seq) \
          WHERE source_node_id IS NOT NULL AND source_seq IS NOT NULL;",
+    )?;
+    tx.commit()
+}
+
+/// Producer-assigned per-session event sequence (`ordered-session-events`).
+///
+/// Adds `event_journal.session_seq` with a unique index on
+/// `(session_id, session_seq)` (local rows only, see below) and backfills
+/// locally produced legacy rows from
+/// their `stream_seq` order (1..n per session). Relayed legacy rows
+/// (`source_node_id` set or remote origin) stay `NULL`: the host's per-session
+/// numbering is unknown for them, and numbering them locally could collide
+/// with the host values later relayed events carry. Replay orders by
+/// `session_seq` and falls back to `stream_seq`, so legacy order is unchanged.
+///
+/// Downgrade note: an older binary ignores the column but assigns journal order
+/// itself, so restore a pre-migration backup to roll back.
+fn migration_0024_event_journal_session_seq(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let has_column: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('event_journal') WHERE name = 'session_seq')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !has_column {
+        tx.execute_batch("ALTER TABLE event_journal ADD COLUMN session_seq INTEGER;")?;
+    }
+    tx.execute_batch(
+        "UPDATE event_journal SET session_seq = (
+             SELECT n FROM (
+                 SELECT event_id AS id,
+                        ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY stream_seq) AS n
+                 FROM event_journal
+                 WHERE source_node_id IS NULL AND origin != 'remote'
+             ) AS numbered
+             WHERE numbered.id = event_journal.event_id
+         )
+         WHERE session_seq IS NULL AND source_node_id IS NULL AND origin != 'remote';
+         -- Uniqueness covers this node's own numbering only. Relayed rows keep
+         -- the host's numbers (a separate sequence, deduplicated by source
+         -- identity), so they must not collide with local ones.
+         DROP INDEX IF EXISTS idx_event_journal_session_order;
+         CREATE UNIQUE INDEX idx_event_journal_session_order
+             ON event_journal(session_id, session_seq)
+             WHERE session_seq IS NOT NULL AND source_node_id IS NULL;",
     )?;
     tx.commit()
 }

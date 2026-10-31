@@ -68,7 +68,7 @@ async fn plain_file_and_inline_sections_receive_runtime_cache_defaults() {
         .await
         .unwrap();
     let mut config = serde_json::json!({"system": resolved, "api_mode": "responses"});
-    crate::model_heuristics::ModelDefaults::for_model("openai", "gpt-5.6")
+    crate::model_heuristics::ModelDefaults::for_model("openai", "gpt-5.6", None)
         .apply_to(&mut config, "session");
     assert_eq!(config["system"][0]["text"], "stable instructions");
     assert_eq!(
@@ -353,6 +353,45 @@ system = ["You are a test agent"]
 }
 
 #[tokio::test]
+async fn test_load_config_accepts_parallel_edit_guard_middleware() {
+    // Mirrors the example in docs/docs/agent/configuration.md and middleware.md.
+    let inline = r#"
+[agent]
+provider = "test"
+model = "test-model"
+tools = []
+system = ["You are a test agent"]
+
+[[middleware]]
+type = "parallel_edit_guard"
+mode = "deny"
+
+[[middleware]]
+type = "parallel_edit_guard"
+enabled = false
+"#;
+
+    let cfg = load_config(ConfigSource::Toml(inline.to_string()))
+        .await
+        .expect("parallel_edit_guard config should load");
+
+    match cfg {
+        Config::Single(single) => {
+            assert_eq!(single.middleware.len(), 2);
+            assert!(
+                single
+                    .middleware
+                    .iter()
+                    .all(|m| m.middleware_type == "parallel_edit_guard")
+            );
+            assert_eq!(single.middleware[0].config["mode"], "deny");
+            assert_eq!(single.middleware[1].config["enabled"], false);
+        }
+        Config::Multi(_) => panic!("expected single-agent config"),
+    }
+}
+
+#[tokio::test]
 async fn test_load_config_accepts_profile_metadata_for_single_and_quorum() {
     let single = r#"
 [profile]
@@ -418,8 +457,8 @@ async fn test_load_config_path_with_profile_metadata_resolves_file_references() 
     let prompt_path = prompt_dir.join(prompt_file);
     let config_path = temp_config_path("profile-single");
     let config = format!(
-        "[profile]\nid = \"file-profile\"\n\n[agent]\nprovider = \"test\"\nmodel = \"test-model\"\ntools = []\nsystem = [{{ file = \"{}\" }}]\n",
-        prompt_path.display()
+        "[profile]\nid = \"file-profile\"\n\n[agent]\nprovider = \"test\"\nmodel = \"test-model\"\ntools = []\nsystem = [{{ file = {} }}]\n",
+        crate::test_utils::toml_path_value(&prompt_path)
     );
     std::fs::write(&config_path, config).expect("failed to write temp config");
 
@@ -445,8 +484,8 @@ async fn test_load_config_path_resolves_file_references() {
     let prompt_path = prompt_dir.join(prompt_file);
     let config_path = temp_config_path("single");
     let config = format!(
-        "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\ntools = []\nsystem = [{{ file = \"{}\" }}]\n",
-        prompt_path.display()
+        "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\ntools = []\nsystem = [{{ file = {} }}]\n",
+        crate::test_utils::toml_path_value(&prompt_path)
     );
     std::fs::write(&config_path, config).expect("failed to write temp config");
 
@@ -1228,6 +1267,35 @@ name = "team-b"
 }
 
 #[test]
+fn test_mesh_iroh_dns_parses_and_round_trips() {
+    assert!(MeshTomlConfig::default().iroh_dns.is_none());
+    let config: MeshTomlConfig = toml::from_str(
+        r#"
+        enabled = true
+        transport = "iroh"
+        [iroh_dns]
+        system_defaults = false
+        fallback = "never"
+        [[iroh_dns.nameservers]]
+        addr = "127.0.0.1:5353"
+        protocol = "https"
+        tls_server_name = "dns.internal"
+    "#,
+    )
+    .unwrap();
+    let dns = config.iroh_dns.as_ref().unwrap();
+    assert!(dns.validate().is_ok());
+    assert_eq!(
+        dns.nameservers[0].tls_server_name.as_deref(),
+        Some("dns.internal")
+    );
+    let round_trip: MeshTomlConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(round_trip.iroh_dns, config.iroh_dns);
+    assert!(toml::from_str::<MeshTomlConfig>("[iroh_dns]\nfallback = 'typo'").is_err());
+    assert!(toml::from_str::<MeshTomlConfig>("[iroh_dns]\nunknown = true").is_err());
+}
+
+#[test]
 fn test_mesh_iroh_gso_parses_on_and_off() {
     assert!(MeshTomlConfig::default().iroh_gso);
     for enabled in [false, true] {
@@ -1254,4 +1322,213 @@ enabled = false
     assert!(config.mesh.iroh_gso);
     assert!(config.mesh.lan.is_none());
     assert!(config.mesh.iroh.is_empty());
+}
+
+// ── [agent.workspace] / [quorum.workspace] / delegate isolation ──────────
+
+#[test]
+fn workspace_settings_default_to_disabled_and_absent_section_is_unchanged() {
+    let single: SingleAgentConfig = toml::from_str(
+        r#"
+[agent]
+provider = "p"
+model = "m"
+"#,
+    )
+    .unwrap();
+    assert_eq!(single.agent.workspace, WorkspaceSettings::default());
+    assert!(!single.agent.workspace.enabled);
+    assert_eq!(
+        single.agent.workspace.baseline,
+        crate::worktree::BaselineMode::Commit
+    );
+}
+
+#[test]
+fn workspace_settings_round_trip_and_reject_unknown_keys() {
+    let parsed: WorkspaceSettings = toml::from_str(
+        "enabled = true\nstorage_root = \"/data/wt\"\nbaseline = \"current_working_tree\"\n",
+    )
+    .unwrap();
+    assert!(parsed.enabled);
+    assert_eq!(parsed.storage_root.as_deref(), Some(Path::new("/data/wt")));
+    assert_eq!(
+        parsed.baseline,
+        crate::worktree::BaselineMode::CurrentWorkingTree
+    );
+    let back: WorkspaceSettings = toml::from_str(&toml::to_string(&parsed).unwrap()).unwrap();
+    assert_eq!(back, parsed);
+
+    let err = toml::from_str::<WorkspaceSettings>("enabled = true\nmode = \"always\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown field"), "{err}");
+}
+
+#[test]
+fn workspace_storage_root_resolves_against_config_dir() {
+    let rel = WorkspaceSettings {
+        storage_root: Some("wt".into()),
+        ..WorkspaceSettings::enabled()
+    }
+    .anchored_at(Path::new("/etc/qmt"));
+    assert_eq!(rel.storage_root.as_deref(), Some(Path::new("/etc/qmt/wt")));
+
+    let abs = WorkspaceSettings {
+        storage_root: Some("/abs/wt".into()),
+        ..WorkspaceSettings::enabled()
+    }
+    .anchored_at(Path::new("/etc/qmt"));
+    assert_eq!(abs.storage_root.as_deref(), Some(Path::new("/abs/wt")));
+
+    // `~/` is left for tilde expansion, never anchored to the config dir.
+    let tilde = WorkspaceSettings {
+        storage_root: Some("~/wt".into()),
+        ..WorkspaceSettings::enabled()
+    }
+    .anchored_at(Path::new("/etc/qmt"));
+    assert_eq!(tilde.storage_root.as_deref(), Some(Path::new("~/wt")));
+}
+
+#[test]
+fn workspace_schema_is_generated_for_both_config_roots() {
+    for schema in [
+        serde_json::to_value(schemars::schema_for!(SingleAgentConfig)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(QuorumConfig)).unwrap(),
+    ] {
+        let props = schema
+            .pointer("/$defs/WorkspaceSettings/properties")
+            .and_then(|v| v.as_object())
+            .expect("WorkspaceSettings must be in the schema");
+        for key in ["enabled", "storage_root", "baseline"] {
+            assert!(props.contains_key(key), "missing {key}");
+        }
+    }
+}
+
+fn quorum_toml(extra_quorum: &str, delegate_isolation: &str) -> String {
+    format!(
+        r#"
+[quorum]
+cwd = "."
+{extra_quorum}
+
+[planner]
+provider = "p"
+model = "m"
+
+[[delegates]]
+id = "coder"
+provider = "p"
+model = "m"
+{delegate_isolation}
+"#
+    )
+}
+
+#[tokio::test]
+async fn delegate_isolation_defaults_to_inherit_and_isolated_requires_the_service() {
+    let ok = load_config(ConfigSource::Toml(quorum_toml("", "")))
+        .await
+        .unwrap();
+    let Config::Multi(ok) = ok else {
+        panic!("quorum")
+    };
+    assert_eq!(
+        ok.delegates[0].isolation,
+        crate::worktree::DelegationIsolation::Inherit
+    );
+
+    let err = load_config(ConfigSource::Toml(quorum_toml(
+        "",
+        "isolation = \"isolated\"",
+    )))
+    .await
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("coder"), "{err:#}");
+
+    let enabled = quorum_toml("workspace = { enabled = true }", "isolation = \"isolated\"");
+    // `workspace` must be a table below [quorum]; the inline form above is valid TOML.
+    load_config(ConfigSource::Toml(enabled)).await.unwrap();
+
+    // `shared` never needs the service.
+    load_config(ConfigSource::Toml(quorum_toml(
+        "",
+        "isolation = \"shared\"",
+    )))
+    .await
+    .unwrap();
+}
+
+/// The shipped `output_limit_recovery` example loads, and its middleware entry
+/// decodes into the middleware's own config with the documented defaults.
+#[tokio::test]
+async fn output_limit_recovery_example_loads_with_the_documented_defaults() {
+    use crate::middleware::OutputLimitConfig;
+
+    let config = load_config(ConfigSource::Toml(
+        include_str!("../../examples/confs/output_limit_recovery.toml").into(),
+    ))
+    .await
+    .unwrap();
+    let Config::Single(config) = config else {
+        panic!("single config");
+    };
+    let entry = config
+        .middleware
+        .iter()
+        .find(|entry| entry.middleware_type == "output_limit_recovery")
+        .expect("example declares the middleware");
+
+    let cfg: OutputLimitConfig = serde_json::from_value(entry.config.clone()).unwrap();
+    // The example spells out every default, so it must equal them.
+    assert_eq!(cfg, OutputLimitConfig::default());
+}
+
+/// 21.12: the shipped example/embedded profiles only gain commented-out
+/// workspace blocks, so they still parse with the service disabled and every
+/// delegate on the default `inherit` isolation.
+#[tokio::test]
+async fn example_profiles_keep_workspace_disabled_and_delegates_inheriting() {
+    let single = include_str!("../../examples/confs/single_coder.toml");
+    // `coder_agent.toml` has been invalid TOML since before this change (a
+    // commented-out `[delegates.parameters]` header leaves duplicate keys), so
+    // it can only be checked textually.
+    let coder_agent = include_str!("../../examples/confs/coder_agent.toml");
+    assert!(
+        coder_agent
+            .lines()
+            .filter(|l| l.contains("workspace") || l.contains("isolation"))
+            .all(|l| l.trim_start().starts_with('#')),
+        "workspace/isolation blocks in coder_agent.toml must stay commented out"
+    );
+    let quorums = [include_str!("../../examples/confs/coder_delegate.toml")];
+    // File-relative prompt references need a real path; only the sections
+    // under test matter, so parse them as raw TOML tables first.
+    let mut table: toml::Value = toml::from_str(single).unwrap();
+    assert!(
+        table["agent"].get("workspace").is_none(),
+        "block stays commented out"
+    );
+    table.as_table_mut().unwrap().remove("profile");
+    let single: SingleAgentConfig = table.try_into().unwrap();
+    assert_eq!(single.agent.workspace, WorkspaceSettings::default());
+
+    for raw in quorums {
+        let table: toml::Value = toml::from_str(raw).unwrap();
+        assert!(
+            table["quorum"].get("workspace").is_none(),
+            "block stays commented out"
+        );
+        let mut table = table;
+        table.as_table_mut().unwrap().remove("profile");
+        let quorum: QuorumConfig = table.try_into().unwrap();
+        assert!(!quorum.quorum.workspace.enabled);
+        assert!(
+            quorum
+                .delegates
+                .iter()
+                .all(|d| d.isolation == crate::worktree::DelegationIsolation::Inherit)
+        );
+    }
 }

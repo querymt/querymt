@@ -16,7 +16,6 @@ use crate::acp::protocol::AuthMethod;
 use crate::agent::core::{
     AgentMode, DelegationContextConfig, SnapshotPolicy, ToolConfig, ToolPolicy,
 };
-use crate::agent::remote::SessionActorRef;
 use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{DelegationWaitPolicy, McpServerConfig, RuntimeExecutionPolicy};
 use crate::delegation::AgentRegistry;
@@ -34,7 +33,23 @@ use crate::tools::ToolRegistry;
 #[derive(Clone)]
 pub(crate) struct SessionBridgeRoute {
     pub bridge: ClientBridgeSender,
-    pub session_ref: SessionActorRef,
+}
+
+impl AgentConfig {
+    /// Workspace-query capability for a locally hosted session.
+    ///
+    /// Returns the transport connection currently attached to the session on
+    /// this node, if any. Sessions hosted on remote nodes never have an entry
+    /// in the local route table, so they report no capability.
+    pub(crate) fn workspace_query_bridge_for_session(
+        &self,
+        session_id: &str,
+    ) -> Option<ClientBridgeSender> {
+        self.session_bridges
+            .lock()
+            .ok()
+            .and_then(|bridges| bridges.get(session_id).map(|route| route.bridge.clone()))
+    }
 }
 
 /// Shared agent configuration and infrastructure.
@@ -63,7 +78,8 @@ pub struct AgentConfig {
     /// Lock-free reads via `ArcSwap`. `None` = use model heuristic defaults.
     pub default_reasoning_effort: Arc<ArcSwap<Option<ReasoningEffort>>>,
     pub tool_config: ToolConfig,
-    pub tool_registry: ToolRegistry,
+    /// Immutable after build; shared (not copied) with tool-aware middleware.
+    pub tool_registry: Arc<ToolRegistry>,
     pub middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,
     pub auth_methods: Vec<AuthMethod>,
 
@@ -103,8 +119,17 @@ pub struct AgentConfig {
     pub knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
     /// Slash command registry for prompt expansion and ACP advertising.
     pub slash_command_registry: crate::slash_commands::SlashCommandRegistry,
+    /// The slash command discovery configuration, retained so workspace-bound
+    /// sessions can re-resolve prompt sources from their bound checkout.
+    pub slash_commands_config: Option<crate::config::SlashCommandsConfig>,
     /// Hook command registry for lifecycle policy checks.
     pub hooks: Hooks,
+    /// Managed Git worktree workspace service for isolated session creation.
+    ///
+    /// `None` keeps every session local (existing behavior). When set, new
+    /// sessions may request isolated worktree execution and existing sessions
+    /// resolve their persisted workspace binding before startup.
+    pub workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
 }
 
 impl AgentConfig {
@@ -113,6 +138,9 @@ impl AgentConfig {
     /// Used by `AgentBuilder::build()` to swap in the final middleware chain
     /// without manually cloning every field.
     pub(crate) fn with_middleware(mut self, drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
+        for driver in &drivers {
+            driver.bind_agent(&self.tool_registry, &self.event_sink);
+        }
         self.middleware_drivers = drivers;
         self
     }
@@ -136,6 +164,21 @@ impl AgentConfig {
         }
 
         CompositeDriver::new(drivers)
+    }
+
+    /// Manual budget pricing configured on the middleware chain, if any.
+    /// Snapshotted onto each paid attempt and valued separately from
+    /// reported API spend.
+    pub fn budget_pricing(&self) -> Option<querymt::providers::ModelPricing> {
+        self.create_driver().budget_pricing()
+    }
+
+    /// Per-cycle price cap (USD) from the configured middleware, if any.
+    /// Enforced before every paid attempt, best effort.
+    pub fn budget_cap_usd(&self) -> Option<f64> {
+        self.create_driver()
+            .get_limits()
+            .and_then(|limits| limits.max_cost_usd)
     }
 
     /// Returns the session limits from configured middleware.
@@ -179,52 +222,46 @@ impl AgentConfig {
             )
     }
 
-    /// Emits an event through the EventSink (auto-classifies as durable/ephemeral).
+    /// Emits an event through the session's ordered stream (auto-classifies as
+    /// durable/ephemeral).
     ///
-    /// For durable events this spawns an async task that persists and publishes.
-    /// For ephemeral events this publishes immediately (no persistence).
+    /// The event is numbered (`session_seq`) synchronously, before this call
+    /// returns. Durable events are then persisted in order by the session's
+    /// writer and published after they are persisted; ephemeral events publish
+    /// immediately unless an earlier durable event is still unpublished.
     pub fn emit_event(&self, session_id: &str, kind: AgentEventKind) {
-        use crate::events::{Durability, classify_durability};
+        self.event_sink.session_stream(session_id).emit(kind);
+    }
 
-        // Ephemeral events: publish immediately via sink, no persistence.
-        if classify_durability(&kind) == Durability::Ephemeral {
-            self.event_sink.emit_ephemeral(session_id, kind);
-            return;
+    /// Best-effort removal of a deleted session's run lease file. The file is
+    /// removed only after the lease is acquired, so a live run keeps it.
+    pub fn remove_run_lease_file(&self, session_id: &str) {
+        if let Some(root) = self.storage.run_lease_root() {
+            crate::session::run_lease::RunLeaseRoot::new(root).remove_if_free(session_id);
         }
+    }
 
-        // Durable events: persist via EventSink journal in a spawned task.
-        let sink = self.event_sink.clone();
-        let session_id = session_id.to_string();
-        let parent = if crate::event_fanout::EventFanout::is_delegation_event(&kind) {
-            tracing::Span::current()
-        } else {
-            tracing::Span::none()
-        };
-
-        use tracing::Instrument;
-        tokio::spawn(
-            async move {
-                if let Err(err) = sink.emit_durable(&session_id, kind).await {
-                    log::warn!(
-                        "failed to emit durable event for session {}: {}",
-                        session_id,
-                        err
-                    );
-                }
-            }
-            .instrument(parent),
-        );
+    /// Publishes an ephemeral event and returns its `session_seq`, so a prompt
+    /// response can be held until the event has been delivered.
+    pub fn emit_ephemeral_event(&self, session_id: &str, kind: AgentEventKind) -> i64 {
+        self.event_sink
+            .session_stream(session_id)
+            .emit_ephemeral_seq(kind)
     }
 
     /// Persists and publishes a durable event, returning the `DurableEvent`.
     ///
-    /// Use this path when caller-side ordering matters (awaited).
+    /// Use this path when caller-side ordering matters (awaited). The event is
+    /// ordered with every other event of the session.
     pub async fn emit_event_persisted(
         &self,
         session_id: &str,
         kind: AgentEventKind,
     ) -> crate::session::error::SessionResult<DurableEvent> {
-        self.event_sink.emit_durable(session_id, kind).await
+        self.event_sink
+            .session_stream(session_id)
+            .emit_persisted(kind)
+            .await
     }
 
     /// Subscribes to agent events via the fanout (live stream).
@@ -239,9 +276,9 @@ impl AgentConfig {
         self.agent_registry.clone()
     }
 
-    /// Access the tool registry (clone).
+    /// Shared handle to the tool registry (cheap `Arc` clone).
     pub fn tool_registry_arc(&self) -> Arc<ToolRegistry> {
-        Arc::new(self.tool_registry.clone())
+        self.tool_registry.clone()
     }
 
     /// Access the workspace manager actor ref.
@@ -257,6 +294,13 @@ impl AgentConfig {
     /// Access the knowledge store, if configured.
     pub fn knowledge_store(&self) -> Option<Arc<dyn crate::knowledge::KnowledgeStore>> {
         self.knowledge_store.clone()
+    }
+
+    /// Managed worktree workspace service, when configured.
+    ///
+    /// `None` means every session executes locally (existing behavior).
+    pub fn workspace_service(&self) -> Option<Arc<crate::worktree::WorkspaceService>> {
+        self.workspace_service.clone()
     }
 
     /// Determines if a tool should trigger snapshotting.
@@ -522,6 +566,8 @@ mod tests {
         assert!(config.requires_permission_for_tool("write_file"));
         assert!(config.requires_permission_for_tool("edit"));
         assert!(config.requires_permission_for_tool("multiedit"));
+        // Integration rewrites tracked files and advances the branch.
+        assert!(config.requires_permission_for_tool("accept_delegation_result"));
         assert!(config.requires_permission_for_tool("delete_file"));
         assert!(config.requires_permission_for_tool("shell"));
         // read-only tools do NOT require permission
@@ -584,6 +630,69 @@ mod tests {
     async fn workspace_manager_actor_returns_ref() {
         let (config, _td) = make_config().await;
         let _actor = config.workspace_manager_actor();
+    }
+
+    /// Probe for "Replay matches live order": a tool-call start and end
+    /// emitted back to back must be journaled start-before-end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn back_to_back_tool_events_keep_production_order_in_journal() {
+        const PAIRS: usize = 50;
+        let (config, _td) = make_config().await;
+
+        for i in 0..PAIRS {
+            let tool_call_id = format!("tc-{i}");
+            config.emit_event(
+                "s-probe",
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: "shell".into(),
+                    arguments: "{}".into(),
+                },
+            );
+            config.emit_event(
+                "s-probe",
+                AgentEventKind::ToolCallEnd {
+                    tool_call_id,
+                    tool_name: "shell".into(),
+                    is_error: false,
+                    result: "ok".into(),
+                },
+            );
+        }
+
+        let journal = config.event_sink.journal().clone();
+        let events = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let events = journal
+                    .load_session_stream("s-probe", None, None)
+                    .await
+                    .expect("load journal");
+                if events.len() >= PAIRS * 2 {
+                    break events;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("all durable events persisted");
+
+        let ids: Vec<String> = events
+            .iter()
+            .map(|event| match &event.kind {
+                AgentEventKind::ToolCallStart { tool_call_id, .. } => {
+                    format!("start:{tool_call_id}")
+                }
+                AgentEventKind::ToolCallEnd { tool_call_id, .. } => format!("end:{tool_call_id}"),
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        let expected: Vec<String> = (0..PAIRS)
+            .flat_map(|i| [format!("start:tc-{i}"), format!("end:tc-{i}")])
+            .collect();
+        assert_eq!(
+            ids, expected,
+            "journal replay order must equal production order"
+        );
     }
 
     #[tokio::test]

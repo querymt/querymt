@@ -13,7 +13,7 @@ use crate::session::store::{
 use async_trait::async_trait;
 use mockall::mock;
 use querymt::LLMParams;
-use querymt::chat::{ChatMessage, ChatOutput, FinishReason, Tool};
+use querymt::chat::{ChatCall, ChatCapabilities, ChatMessage, ChatOutput, FinishReason, Tool};
 use querymt::completion::{CompletionRequest, CompletionResponse};
 use querymt::error::LLMError;
 use querymt::plugin::host::{PluginLoader, PluginType, ProviderConfig, ProviderPlugin};
@@ -118,6 +118,10 @@ mock! {
             task_id: Option<&'c str>,
         ) -> SessionResult<()>;
         async fn get_session_fork_info(&self, session_id: &str) -> SessionResult<Option<ForkInfo>>;
+        async fn get_session_ref_by_internal_id(
+            &self,
+            session_internal_id: i64,
+        ) -> SessionResult<Option<(String, Option<std::path::PathBuf>)>>;
         async fn list_child_sessions(&self, parent_id: &str) -> SessionResult<Vec<String>>;
         async fn create_task(&self, task: Task) -> SessionResult<Task>;
         async fn get_task(&self, task_id: &str) -> SessionResult<Option<Task>>;
@@ -240,11 +244,38 @@ mock! {
 // MockLlmProvider
 // ============================================================================
 
+/// Mock-friendly view of a chat call.
+///
+/// `mockall` cannot match `&ChatCall<'_>`, so expectations are set on this
+/// flattened shape (`expect_chat` for tool-less calls, `expect_chat_with_tools`
+/// otherwise) and [`MockLlmProvider`]'s `ChatProvider` impl adapts to it.
+#[async_trait]
+pub trait MockedChat {
+    fn supports_streaming(&self) -> bool;
+    async fn chat(&self, messages: &[ChatMessage]) -> Result<ChatOutput, LLMError>;
+    async fn chat_with_tools<'a, 'b, 'c>(
+        &'a self,
+        messages: &'b [ChatMessage],
+        tools: Option<&'c [Tool]>,
+    ) -> Result<ChatOutput, LLMError>;
+}
+
+/// Routes a [`ChatCall`] to the matching [`MockedChat`] expectation.
+async fn route_mocked_chat<M: MockedChat + Sync>(
+    mock: &M,
+    call: &ChatCall<'_>,
+) -> Result<ChatOutput, LLMError> {
+    match call.tools {
+        Some(_) => mock.chat_with_tools(call.messages, call.tools).await,
+        None => mock.chat(call.messages).await,
+    }
+}
+
 mock! {
     pub LlmProvider {}
 
     #[async_trait]
-    impl querymt::chat::ChatProvider for LlmProvider {
+    impl MockedChat for LlmProvider {
         fn supports_streaming(&self) -> bool;
         async fn chat(&self, messages: &[ChatMessage]) -> Result<ChatOutput, LLMError>;
         async fn chat_with_tools<'a, 'b, 'c>(
@@ -275,6 +306,17 @@ mock! {
     }
 }
 
+#[async_trait]
+impl querymt::chat::ChatProvider for MockLlmProvider {
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE.with_streaming(MockedChat::supports_streaming(self))
+    }
+
+    async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+        route_mocked_chat(self, call).await
+    }
+}
+
 // ============================================================================
 // SharedLlmProvider - Thread-safe wrapper around MockLlmProvider
 // ============================================================================
@@ -296,25 +338,9 @@ impl SharedLlmProvider {
 
 #[async_trait]
 impl querymt::chat::ChatProvider for SharedLlmProvider {
-    fn supports_streaming(&self) -> bool {
-        false
-    }
-
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<ChatOutput, LLMError> {
+    async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
         let provider = self.inner.lock().await;
-        provider.chat(messages).await
-    }
-
-    async fn chat_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<ChatOutput, LLMError> {
-        let provider = self.inner.lock().await;
-        match tools {
-            Some(_) => provider.chat_with_tools(messages, tools).await,
-            None => provider.chat(messages).await,
-        }
+        route_mocked_chat(&*provider, call).await
     }
 }
 
@@ -589,13 +615,12 @@ impl MockCompactionProvider {
 
 #[async_trait]
 impl querymt::chat::ChatProvider for MockCompactionProvider {
-    fn supports_streaming(&self) -> bool {
-        false
-    }
-
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<ChatOutput, LLMError> {
+    async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        self.received_messages.lock().await.push(messages.to_vec());
+        self.received_messages
+            .lock()
+            .await
+            .push(call.messages.to_vec());
 
         let mut responses = self.responses.lock().await;
         match responses.pop_front() {
@@ -605,15 +630,6 @@ impl querymt::chat::ChatProvider for MockCompactionProvider {
                 "No more mock responses available".to_string(),
             )),
         }
-    }
-
-    async fn chat_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        _tools: Option<&[Tool]>,
-    ) -> Result<ChatOutput, LLMError> {
-        // For compaction testing, we don't use tools
-        self.chat(messages).await
     }
 }
 

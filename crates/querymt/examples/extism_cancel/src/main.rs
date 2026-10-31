@@ -154,7 +154,7 @@ async fn main() -> Result<()> {
             builder = builder.stream(true);
             let llm = builder.build().await?;
 
-            let mut stream = llm.chat_stream_with_tools(&messages, llm.tools()).await?;
+            let mut stream = llm.chat_stream(&querymt::chat::ChatCall::new(&messages).maybe_tools(llm.tools())).await?;
 
             let started = Arc::new(AtomicBool::new(false));
             let started_consumer = started.clone();
@@ -203,7 +203,7 @@ async fn main() -> Result<()> {
             info!("starting non-streaming chat request (will cancel via timeout)");
             let res = tokio::time::timeout(
                 std::time::Duration::from_secs(args.cancel_after_secs),
-                llm.chat_with_tools(&messages, llm.tools()),
+                llm.chat(&querymt::chat::ChatCall::new(&messages).maybe_tools(llm.tools())),
             )
             .await;
 

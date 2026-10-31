@@ -1,6 +1,8 @@
 #[cfg(feature = "remote")]
 use crate::agent::remote::NodeId;
+use crate::middleware::ModelProfile;
 use crate::model::{AgentMessage, MessagePart, OutputTarget};
+use crate::model_heuristics::OutputCaps;
 use crate::model_info::get_model_info;
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::provider_config::{ProviderConfigMode, resolve_provider_config};
@@ -8,10 +10,10 @@ use crate::session::store::{LLMConfig, Session, SessionExecutionConfig, SessionS
 use arc_swap::ArcSwap;
 use querymt::LLMParams;
 use querymt::plugin::host::{PluginRegistry, ProviderResolver};
-use querymt::providers::ModelPricing;
+use querymt::providers::{BillingClass, ModelPricing};
 use querymt::{
     LLMProvider,
-    chat::{ChatMessage, ChatOutput, ChatRole},
+    chat::{ChatCall, ChatMessage, ChatOutput, ChatRole, GenerationOptions},
     error::LLMError,
 };
 use std::sync::Arc;
@@ -29,6 +31,52 @@ type ProviderCacheEntry = (i64, Option<String>, bool, Arc<dyn LLMProvider>);
 /// Lock-free single-entry provider cache.  Reads (every turn) use `ArcSwap::load`,
 /// writes (model switch, mesh fallback toggle) use `ArcSwap::store`.
 type ProviderCache = Arc<ArcSwap<Option<ProviderCacheEntry>>>;
+
+/// Keeps the requested per-request overrides the provider honours.
+///
+/// Dropped overrides are logged at debug level; the request then runs with the
+/// provider's configured values.
+pub(crate) fn supported_overrides(
+    provider: &dyn LLMProvider,
+    requested: GenerationOptions,
+) -> GenerationOptions {
+    let supported = provider.capabilities().options.retain_supported(requested);
+    if supported != requested {
+        tracing::debug!(
+            ?requested,
+            ?supported,
+            "provider does not honour some per-request generation options; skipping them"
+        );
+    }
+    supported
+}
+
+/// Billing class plus the pricing snapshot bound at dispatch.
+#[derive(Debug, Clone)]
+pub struct BillingBasis {
+    pub billing: BillingClass,
+    pub pricing: Option<ModelPricing>,
+}
+
+impl BillingBasis {
+    /// Classify `provider/model` from the current catalog. Subscription and
+    /// OAuth-backed providers are `Excluded` and never carry catalog pricing.
+    pub fn resolve(provider: &str, model: &str, oauth_backed: bool) -> Self {
+        if oauth_backed || is_non_billable_oauth_provider(provider) {
+            return Self {
+                billing: BillingClass::Excluded,
+                pricing: None,
+            };
+        }
+        let pricing = get_model_info(provider, model).map(|info| info.pricing);
+        let billing = match &pricing {
+            None => BillingClass::Unknown,
+            Some(p) if p.is_explicit_zero() => BillingClass::ZeroPriced,
+            Some(_) => BillingClass::Metered,
+        };
+        Self { billing, pricing }
+    }
+}
 
 fn is_non_billable_oauth_provider(provider: &str) -> bool {
     matches!(provider, "codex" | "kimi-code")
@@ -196,18 +244,37 @@ impl SessionProvider {
         parent_session_id: Option<&str>,
         execution_config: &SessionExecutionConfig,
     ) -> SessionResult<SessionHandle> {
-        let fork_origin = if parent_session_id.is_some() {
-            Some(crate::session::domain::ForkOrigin::Delegation)
-        } else {
-            None
-        };
+        // A parent given here always means delegation; other lineage goes
+        // through `create_session_with_isolation_intent` explicitly.
+        let fork_origin = parent_session_id.map(|_| crate::session::domain::ForkOrigin::Delegation);
+        self.create_session_with_isolation_intent(
+            cwd,
+            parent_session_id,
+            fork_origin,
+            execution_config,
+            None,
+        )
+        .await
+    }
+
+    /// Create a session whose non-runnable isolation barrier (when `intent`
+    /// is present) is persisted atomically with the session row.
+    pub async fn create_session_with_isolation_intent(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+        parent_session_id: Option<&str>,
+        fork_origin: Option<crate::session::domain::ForkOrigin>,
+        execution_config: &SessionExecutionConfig,
+        intent: Option<crate::session::store::PendingForkIsolation>,
+    ) -> SessionResult<SessionHandle> {
         let mut session = self
             .history_store
-            .create_session(
+            .create_session_with_isolation_intent(
                 None,
                 cwd.clone(),
                 parent_session_id.map(|s| s.to_string()),
                 fork_origin,
+                intent,
             )
             .await?;
 
@@ -419,7 +486,7 @@ impl SessionProvider {
             .map(|built| built.provider)
     }
 
-    async fn build_provider_snapshot(
+    pub(crate) async fn build_provider_snapshot(
         &self,
         req: ProviderRequest<'_>,
     ) -> SessionResult<ProviderSnapshot> {
@@ -429,10 +496,20 @@ impl SessionProvider {
         let api_key_override = req.api_key_override;
         let session_id = req.session_id;
 
-        // ── Case 1: Explicit remote node requested ─────────────────────────────
+        #[cfg(feature = "remote")]
+        let explicitly_local = req.provider_node_id.is_some_and(|node| {
+            node == "local"
+                || self
+                    .mesh
+                    .load()
+                    .as_deref()
+                    .is_some_and(|mesh| mesh.peer_id().to_string() == node)
+        });
+        // An owner-local selection can arrive with an explicit node ID from a viewer.
+        // Resolve it locally, without falling back to another node on failure.
         #[cfg(feature = "remote")]
         if let Some(node_id) = req.provider_node_id
-            && node_id != "local"
+            && !explicitly_local
         {
             if !self.provider_resolver.allows_remote_fallback() {
                 return Err(SessionError::InvalidOperation(format!(
@@ -466,7 +543,7 @@ impl SessionProvider {
                     p
                 })
                 .or_else(|| Some(serde_json::json!({"_remote_session_id": session_id})));
-            return Ok(ProviderSnapshot::unverified(Arc::new(
+            return ProviderSnapshot::remote(
                 querymt_remote::MeshChatProvider::from_node_id(
                     mesh,
                     &node_id,
@@ -474,7 +551,8 @@ impl SessionProvider {
                     model,
                 )
                 .with_params(remote_params),
-            )));
+            )
+            .await;
         }
 
         // ── Case 2: Try local provider ─────────────────────────────────────────
@@ -494,7 +572,8 @@ impl SessionProvider {
                 let mesh_guard = self.mesh.load();
                 let mesh_handle = mesh_guard.as_deref();
 
-                if self.provider_resolver.allows_remote_fallback()
+                if !explicitly_local
+                    && self.provider_resolver.allows_remote_fallback()
                     && allow_mesh_fallback
                     && let Some(mesh) = mesh_handle
                 {
@@ -524,7 +603,7 @@ impl SessionProvider {
                             .or_else(|| {
                                 Some(serde_json::json!({"_remote_session_id": session_id}))
                             });
-                        return Ok(ProviderSnapshot::unverified(Arc::new(
+                        return ProviderSnapshot::remote(
                             querymt_remote::MeshChatProvider::from_node_id(
                                 mesh,
                                 &node_id,
@@ -532,7 +611,8 @@ impl SessionProvider {
                                 model,
                             )
                             .with_params(remote_params),
-                        )));
+                        )
+                        .await;
                     }
                 }
                 return Err(SessionError::ProviderError(local_error));
@@ -553,6 +633,8 @@ impl SessionProvider {
         .await?;
 
         let settings = resolved_cfg.generation_settings;
+        let output_caps = resolved_cfg.output_caps;
+        let reasoning_effort = resolved_cfg.reasoning_effort;
 
         #[cfg(feature = "oauth")]
         let builder_config = resolved_cfg.builder_config;
@@ -612,6 +694,8 @@ impl SessionProvider {
                 return Ok(ProviderSnapshot {
                     provider: Arc::from(provider),
                     settings,
+                    output_caps,
+                    reasoning_effort,
                 });
             }
 
@@ -631,6 +715,8 @@ impl SessionProvider {
                 return Ok(ProviderSnapshot {
                     provider: Arc::from(Box::new(adapter) as Box<dyn LLMProvider>),
                     settings,
+                    output_caps,
+                    reasoning_effort,
                 });
             }
 
@@ -643,6 +729,8 @@ impl SessionProvider {
             return Ok(ProviderSnapshot {
                 provider: Arc::from(provider),
                 settings,
+                output_caps,
+                reasoning_effort,
             });
         }
 
@@ -650,6 +738,8 @@ impl SessionProvider {
         Ok(ProviderSnapshot {
             provider: Arc::from(provider),
             settings,
+            output_caps,
+            reasoning_effort,
         })
     }
 }
@@ -672,17 +762,50 @@ impl Clone for SessionProvider {
     }
 }
 
-struct ProviderSnapshot {
+pub(crate) struct ProviderSnapshot {
     provider: Arc<dyn LLMProvider>,
     settings: crate::agent::utils::genai::GenerationSettings,
+    /// Output caps resolved with the provider; `None` when unknown.
+    output_caps: Option<OutputCaps>,
+    /// Reasoning effort the provider was configured with, when any.
+    reasoning_effort: Option<querymt::chat::ReasoningEffort>,
 }
 
 impl ProviderSnapshot {
     #[cfg(feature = "remote")]
-    fn unverified(provider: Arc<dyn LLMProvider>) -> Self {
+    async fn remote(provider: querymt_remote::MeshChatProvider) -> SessionResult<Self> {
+        let info = provider.negotiate_contract().await?;
+        Ok(Self::from_remote_contract(Arc::new(provider), &info))
+    }
+
+    #[cfg(feature = "remote")]
+    fn from_remote_contract(
+        provider: Arc<dyn LLMProvider>,
+        info: &querymt_remote::ProviderContractInfo,
+    ) -> Self {
         Self {
             provider,
             settings: Default::default(),
+            output_caps: info
+                .generation
+                .initial_max_tokens
+                .zip(info.generation.output_ceiling)
+                .map(|(initial, ceiling)| OutputCaps { initial, ceiling }),
+            reasoning_effort: info.generation.reasoning_effort,
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn contract_info(&self) -> querymt_remote::ProviderContractInfo {
+        querymt_remote::ProviderContractInfo {
+            item_aware_chat_version: Some(querymt_remote::ITEM_AWARE_CHAT_CONTRACT_VERSION),
+            protocol_version: Some(querymt_remote::provider_protocol::MESH_PROTOCOL_VERSION),
+            capabilities: self.provider.capabilities(),
+            generation: querymt_remote::provider_protocol::ProviderGenerationProfile {
+                initial_max_tokens: self.output_caps.map(|caps| caps.initial),
+                output_ceiling: self.output_caps.map(|caps| caps.ceiling),
+                reasoning_effort: self.reasoning_effort,
+            },
         }
     }
 }
@@ -709,8 +832,12 @@ pub struct SessionHandle {
     provider_node_id: Option<String>,
     /// Session execution config resolved once at construction time (turn-pinned).
     execution_config: Option<SessionExecutionConfig>,
-    /// Lazily cached LLM provider for this turn.
-    cached_llm_provider: tokio::sync::OnceCell<ProviderSnapshot>,
+    /// Lazily cached LLM provider for this turn, shared by every clone of the
+    /// handle. The handle is turn-pinned (config and route are immutable), so
+    /// all clones resolve the same provider; sharing means it is built once per
+    /// turn instead of once per clone (the state machine clones the handle on
+    /// every step). A failed init is not cached, so retries still rebuild.
+    cached_llm_provider: Arc<tokio::sync::OnceCell<ProviderSnapshot>>,
 }
 
 impl Clone for SessionHandle {
@@ -721,10 +848,7 @@ impl Clone for SessionHandle {
             llm_config: self.llm_config.clone(),
             provider_node_id: self.provider_node_id.clone(),
             execution_config: self.execution_config.clone(),
-            // Each clone gets its own OnceCell; the first `.provider()` call
-            // will still hit the global cache (cheap Arc::clone on hit) so
-            // this is fine — it just won't share the local cell.
-            cached_llm_provider: tokio::sync::OnceCell::new(),
+            cached_llm_provider: Arc::clone(&self.cached_llm_provider),
         }
     }
 }
@@ -765,7 +889,7 @@ impl SessionHandle {
             llm_config,
             provider_node_id,
             execution_config,
-            cached_llm_provider: tokio::sync::OnceCell::new(),
+            cached_llm_provider: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -795,15 +919,51 @@ impl SessionHandle {
                     .with_session_id(&self.session.public_id);
                 #[cfg(feature = "remote")]
                 let request = request.with_provider_node_id(self.provider_node_id.as_deref());
-                self.provider.build_provider_snapshot(request).await
+                // Only the cold build is traced: the cached path is a pointer
+                // read and must not add a span to every step.
+                let span = tracing::info_span!(
+                    "agent.provider.build",
+                    provider = %config.provider,
+                    model = %config.model,
+                );
+                tracing::Instrument::instrument(
+                    self.provider.build_provider_snapshot(request),
+                    span,
+                )
+                .await
             })
             .await
             .map(|built| Arc::clone(&built.provider))
     }
 
-    pub(crate) fn record_generation_settings(&self, span: &tracing::Span) {
+    /// The facts about this turn's model: output caps, what the provider
+    /// honours per request, configured effort and pricing.
+    ///
+    /// Builds (and caches) the provider if needed. When the provider cannot be
+    /// built the profile is empty (no caps, no per-request options); the real
+    /// request surfaces the error. A model switch builds a new handle and so a
+    /// new profile.
+    pub(crate) async fn profile(&self) -> Arc<ModelProfile> {
+        let Ok(provider) = self.provider().await else {
+            return Arc::new(ModelProfile::default());
+        };
+        let built = self.cached_llm_provider.get();
+        Arc::new(ModelProfile {
+            caps: built.and_then(|built| built.output_caps),
+            capabilities: provider.capabilities(),
+            reasoning_effort: built.and_then(|built| built.reasoning_effort),
+        })
+    }
+
+    /// Record the request settings on the chat span: the configured values
+    /// with this request's applied overrides on top.
+    pub(crate) fn record_generation_settings(
+        &self,
+        span: &tracing::Span,
+        applied: GenerationOptions,
+    ) {
         if let Some(built) = self.cached_llm_provider.get() {
-            built.settings.record(span);
+            built.settings.with_overrides(applied).record(span);
         }
     }
 
@@ -891,14 +1051,39 @@ impl SessionHandle {
         provider.call_tool(name, args).await
     }
 
-    /// Submit messages to the LLM without auto-saving
-    pub async fn submit_request(&self, messages: &[ChatMessage]) -> Result<ChatOutput, LLMError> {
+    /// Submit a chat call to the LLM without auto-saving.
+    ///
+    /// Per-request options the provider does not honour are dropped (see
+    /// [`supported_overrides`]); the request then runs with the configured
+    /// values.
+    ///
+    /// This is a paid request, so the caller supplies the `ledger` that
+    /// records it: the start is durable before dispatch and the attempt is
+    /// settled with the reported usage (or its absence). There is no
+    /// unrecorded variant.
+    pub async fn submit_request(
+        &self,
+        call: &ChatCall<'_>,
+        ledger: &crate::accounting::DispatchLedger,
+    ) -> Result<ChatOutput, LLMError> {
         let provider = self.provider().await?;
-        provider.chat(messages).await
+        let options = supported_overrides(provider.as_ref(), call.options);
+        let call = call.options(options);
+        crate::accounting::run_attempt(
+            &ledger.operation,
+            ledger.basis.clone(),
+            &tokio_util::sync::CancellationToken::new(),
+            || provider.chat(&call),
+        )
+        .await
     }
 
     /// Higher-level chat interface (used by CLI) that handles conversion and storage
-    pub async fn chat(&self, messages: &[ChatMessage]) -> SessionResult<ChatOutput> {
+    pub async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        ledger: &crate::accounting::DispatchLedger,
+    ) -> SessionResult<ChatOutput> {
         // 1. Store incoming messages (User or Tool Result)
         for msg in messages {
             let agent_msg = self.convert_chat_to_agent(msg);
@@ -909,7 +1094,9 @@ impl SessionHandle {
         let llm_messages = self.history().await?;
 
         // 3. Call LLM
-        let response = self.submit_request(&llm_messages).await?;
+        let response = self
+            .submit_request(&ChatCall::new(&llm_messages), ledger)
+            .await?;
 
         // 4. Store response
         let response_msg: ChatMessage = response.clone().into();
@@ -928,24 +1115,43 @@ impl SessionHandle {
     /// resolver attached — OAuth providers always do, static-key providers
     /// never do. This avoids threading a boolean through the provider stack.
     pub fn get_pricing(&self) -> Option<ModelPricing> {
-        if self
-            .llm_config
-            .as_ref()
-            .is_some_and(|config| is_non_billable_oauth_provider(&config.provider))
-        {
-            return None;
-        }
+        self.billing_basis().pricing
+    }
 
-        if let Some(provider) = self.cached_llm_provider.get()
-            && provider.provider.key_resolver().is_some()
-        {
-            return None;
-        }
+    /// Billing class and pricing snapshot that apply to this session's
+    /// provider/model right now. Subscription/OAuth-backed providers are
+    /// `Excluded` and never carry catalog pricing; a model with no catalog
+    /// entry is `Unknown`.
+    pub fn billing_basis(&self) -> BillingBasis {
+        self.billing_basis_inner(None)
+    }
 
-        self.llm_config
-            .as_ref()
-            .and_then(|config| get_model_info(&config.provider, &config.model))
-            .map(|info| info.pricing)
+    /// Like [`Self::billing_basis`], but priced for `model` served by this
+    /// session's provider (for example a dedicated compaction model).
+    pub fn billing_basis_for_model(&self, model: &str) -> BillingBasis {
+        self.billing_basis_inner(Some(model))
+    }
+
+    fn billing_basis_inner(&self, model: Option<&str>) -> BillingBasis {
+        let oauth_backed = self
+            .cached_llm_provider
+            .get()
+            .is_some_and(|provider| provider.provider.key_resolver().is_some());
+        match self.llm_config.as_ref() {
+            Some(config) => BillingBasis::resolve(
+                &config.provider,
+                model.unwrap_or(&config.model),
+                oauth_backed,
+            ),
+            None => BillingBasis {
+                billing: if oauth_backed {
+                    BillingClass::Excluded
+                } else {
+                    BillingClass::Unknown
+                },
+                pricing: None,
+            },
+        }
     }
 
     pub fn convert_chat_to_agent(&self, msg: &ChatMessage) -> AgentMessage {
@@ -1089,11 +1295,15 @@ impl std::str::FromStr for AuthMethod {
 }
 
 /// Read the preferred auth method for a provider from SecretStore.
-pub(crate) fn preferred_auth_method(provider_name: &str) -> Option<AuthMethod> {
-    querymt_utils::secret_store::SecretStore::new()
-        .ok()
-        .and_then(|s| s.get(&format!("auth_method_{}", provider_name)))
-        .and_then(|v| v.parse::<AuthMethod>().ok())
+pub(crate) fn preferred_auth_method(provider_name: &str) -> SessionResult<Option<AuthMethod>> {
+    let key = format!("auth_method_{provider_name}");
+    let store = querymt_utils::secret_store::SecretStore::new().map_err(|error| {
+        SessionError::InvalidOperation(format!("Failed to open secret store: {error}"))
+    })?;
+    let value = store.try_get(&key).map_err(|error| {
+        SessionError::InvalidOperation(format!("Failed to read auth preference: {error}"))
+    })?;
+    Ok(value.and_then(|value| value.parse::<AuthMethod>().ok()))
 }
 
 /// Resolve an API key for a provider, respecting the user's preferred auth method.
@@ -1106,19 +1316,83 @@ pub(crate) fn preferred_auth_method(provider_name: &str) -> Option<AuthMethod> {
 /// `env_var_name` may be `None` for OAuth-only providers (e.g. Codex). In that case
 /// only the OAuth path is attempted; stored-key and env-var are skipped.
 ///
-/// When `preferred` is `None`, the default order is: OAuth → stored key → env var.
-/// When set, the preferred source is tried first, then the remaining sources in order.
+/// An absent or unreadable preference uses the default order: OAuth, stored key, env var.
+/// Otherwise the preferred source is tried first, then the remaining sources in order.
+/// Preference and stored-key errors are returned only if no credential source succeeds.
 pub(crate) async fn resolve_api_key_with_preference(
     provider_name: &str,
     env_var_name: Option<&str>,
-    preferred: Option<&AuthMethod>,
+    preferred: SessionResult<Option<AuthMethod>>,
     use_oauth_resolver: &mut bool,
-) -> Option<String> {
-    #[cfg(not(feature = "oauth"))]
-    let _ = use_oauth_resolver;
+) -> SessionResult<Option<String>> {
+    resolve_credential_chain(preferred, use_oauth_resolver, |method| async move {
+        match method {
+            AuthMethod::OAuth => {
+                #[cfg(feature = "oauth")]
+                {
+                    use crate::auth::get_or_refresh_token;
+                    match get_or_refresh_token(provider_name).await {
+                        Ok(token) => {
+                            log::debug!("Using OAuth token for provider: {}", provider_name);
+                            return Ok(Some(token));
+                        }
+                        Err(error) => {
+                            log::debug!("OAuth unavailable for {}: {}", provider_name, error);
+                        }
+                    }
+                }
+            }
+            AuthMethod::ApiKey => {
+                if let Some(name) = env_var_name {
+                    let store =
+                        querymt_utils::secret_store::SecretStore::new().map_err(|error| {
+                            SessionError::InvalidOperation(format!(
+                                "Failed to open secret store: {error}"
+                            ))
+                        })?;
+                    if let Some(key) = store.try_get(name).map_err(|error| {
+                        SessionError::InvalidOperation(format!(
+                            "Failed to read stored API key for provider '{provider_name}': {error}"
+                        ))
+                    })? {
+                        log::debug!(
+                            "Using stored API key for provider: {} ({})",
+                            provider_name,
+                            name
+                        );
+                        return Ok(Some(key));
+                    }
+                    log::debug!("No stored API key for {} ({})", provider_name, name);
+                }
+            }
+            AuthMethod::EnvVar => {
+                if let Some(name) = env_var_name {
+                    if let Ok(key) = std::env::var(name) {
+                        log::debug!("Using env var for provider: {} ({})", provider_name, name);
+                        return Ok(Some(key));
+                    }
+                    log::debug!("Env var {} not set", name);
+                }
+            }
+        }
+        Ok(None)
+    })
+    .await
+}
 
-    // Build the resolution order based on preference
-    let order: Vec<AuthMethod> = match preferred {
+async fn resolve_credential_chain<Fut>(
+    preferred: SessionResult<Option<AuthMethod>>,
+    use_oauth_resolver: &mut bool,
+    mut lookup: impl FnMut(AuthMethod) -> Fut,
+) -> SessionResult<Option<String>>
+where
+    Fut: std::future::Future<Output = SessionResult<Option<String>>>,
+{
+    let (preferred, mut first_error) = match preferred {
+        Ok(method) => (method, None),
+        Err(error) => (None, Some(error)),
+    };
+    let order = match preferred {
         Some(AuthMethod::OAuth) | None => {
             vec![AuthMethod::OAuth, AuthMethod::ApiKey, AuthMethod::EnvVar]
         }
@@ -1130,54 +1404,22 @@ pub(crate) async fn resolve_api_key_with_preference(
         }
     };
 
-    for method in &order {
-        match method {
-            AuthMethod::OAuth => {
-                #[cfg(feature = "oauth")]
-                {
-                    use crate::auth::get_or_refresh_token;
-                    match get_or_refresh_token(provider_name).await {
-                        Ok(token) => {
-                            log::debug!("Using OAuth token for provider: {}", provider_name);
-                            *use_oauth_resolver = true;
-                            return Some(token);
-                        }
-                        Err(e) => {
-                            log::debug!("OAuth unavailable for {}: {}", provider_name, e);
-                        }
-                    }
+    for method in order {
+        let is_oauth = method == AuthMethod::OAuth;
+        match lookup(method).await {
+            Ok(Some(key)) => {
+                if is_oauth {
+                    *use_oauth_resolver = true;
                 }
+                return Ok(Some(key));
             }
-            AuthMethod::ApiKey => {
-                // Stored key requires an env_var_name (used as keyring key)
-                if let Some(name) = env_var_name {
-                    if let Some(key) = querymt_utils::secret_store::SecretStore::new()
-                        .ok()
-                        .and_then(|s| s.get(name))
-                    {
-                        log::debug!(
-                            "Using stored API key for provider: {} ({})",
-                            provider_name,
-                            name
-                        );
-                        return Some(key);
-                    }
-                    log::debug!("No stored API key for {} ({})", provider_name, name);
-                }
-            }
-            AuthMethod::EnvVar => {
-                if let Some(name) = env_var_name {
-                    if let Ok(key) = std::env::var(name) {
-                        log::debug!("Using env var for provider: {} ({})", provider_name, name);
-                        return Some(key);
-                    }
-                    log::debug!("Env var {} not set", name);
-                }
+            Ok(None) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
             }
         }
     }
-
-    None
+    first_error.map_or(Ok(None), Err)
 }
 
 /// Per-call parameters for building an LLM provider via
@@ -1247,12 +1489,11 @@ impl<'a> ProviderRequest<'a> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use querymt::chat::{ChatMessage, ChatOutput, FinishReason, StreamChunk};
+    use querymt::chat::{ChatOutput, FinishReason};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
     use querymt::plugin::LLMProviderFactory;
     use std::collections::HashMap;
-    use std::pin::Pin;
 
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
@@ -1260,6 +1501,33 @@ pub mod tests {
     use crate::agent::core::AgentMode;
     use crate::agent::session_control::{SessionControlState, SessionModelBinding};
     use crate::test_utils::{MockSessionStore, empty_plugin_registry, mock_session};
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn remote_snapshot_preserves_host_resolved_caps_and_effort() {
+        for caps in [
+            OutputCaps {
+                initial: 32_000,
+                ceiling: 128_000,
+            },
+            OutputCaps {
+                initial: 20_000,
+                ceiling: 20_000,
+            },
+        ] {
+            let host = ProviderSnapshot {
+                provider: Arc::new(MockProvider::new()),
+                settings: Default::default(),
+                output_caps: Some(caps),
+                reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
+            };
+            let contract = host.contract_info();
+            let remote = ProviderSnapshot::from_remote_contract(host.provider.clone(), &contract);
+            assert_eq!(remote.output_caps, Some(caps));
+            assert_eq!(remote.reasoning_effort, host.reasoning_effort);
+            assert_eq!(contract.capabilities, host.provider.capabilities());
+        }
+    }
 
     #[tokio::test]
     async fn handle_construction_uses_atomic_control_snapshot_during_model_transition() {
@@ -1374,25 +1642,17 @@ pub mod tests {
 
     #[async_trait::async_trait]
     impl querymt::chat::ChatProvider for MockProvider {
-        async fn chat_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[querymt::chat::Tool]>,
-        ) -> Result<ChatOutput, LLMError> {
+        async fn chat(&self, _call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
             Ok(MockChatResponse {
                 content: self.response_text.clone(),
             }
             .into())
         }
 
-        async fn chat_stream_with_tools(
+        async fn chat_stream(
             &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[querymt::chat::Tool]>,
-        ) -> Result<
-            Pin<Box<dyn tokio_stream::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
-            LLMError,
-        > {
+            _call: &ChatCall<'_>,
+        ) -> Result<querymt::chat::ChatStream, LLMError> {
             let (_tx, rx) = mpsc::channel(1);
             Ok(Box::pin(ReceiverStream::new(rx)))
         }
@@ -1471,10 +1731,11 @@ pub mod tests {
             llm_config: Some(mock_llm_config()),
             provider_node_id: None,
             execution_config: None,
-            cached_llm_provider: tokio::sync::OnceCell::new(),
+            cached_llm_provider: Arc::new(tokio::sync::OnceCell::new()),
         };
 
-        let error = handle.chat(&[]).await.unwrap_err();
+        let ledger = crate::accounting::test_ledger().await;
+        let error = handle.chat(&[], &ledger).await.unwrap_err();
 
         assert!(matches!(error, SessionError::InvalidOperation(_)));
     }
@@ -1507,92 +1768,153 @@ pub mod tests {
         ));
     }
 
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn explicit_owner_node_uses_local_factory_not_mesh() {
+        use crate::session::sqlite_storage::SqliteStorage;
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let registry = Arc::new(PluginRegistry::empty());
+        registry.register_static(Arc::new(InvalidConfigFactory));
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let provider =
+            SessionProvider::new(registry, storage, LLMParams::new()).with_mesh(Some(mesh.clone()));
+        let local_node = mesh.peer_id().to_string();
+        let result = provider
+            .build_provider(
+                ProviderRequest::new("invalid-config", "test-model")
+                    .with_provider_node_id(Some(&local_node)),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(SessionError::ProviderError(LLMError::InvalidRequest(_)))
+        ));
+        let other_node = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_string();
+        let remote_error = provider
+            .build_provider(
+                ProviderRequest::new("invalid-config", "test-model")
+                    .with_provider_node_id(Some(&other_node)),
+            )
+            .await
+            .err()
+            .expect("an unavailable remote host fails during negotiation");
+        assert!(
+            remote_error.to_string().contains("provider_host::"),
+            "a different node must use mesh negotiation, not the local factory: {remote_error}"
+        );
+    }
+
     // ── resolve_api_key_with_preference tests ─────────────────────────────────
 
-    /// Use a unique env var name per test to avoid cross-test interference.
-    fn unique_env_var(suffix: &str) -> String {
-        format!("QMT_TEST_API_KEY_{}", suffix)
+    #[tokio::test]
+    async fn resolve_env_fallback_or_first_storage_error() {
+        for (pref_error, store_error, env_key, expected) in [
+            (Some("preference"), None, Some("env"), Ok(Some("env"))),
+            (None, Some("store init"), Some("env"), Ok(Some("env"))),
+            (None, Some("store read"), Some("env"), Ok(Some("env"))),
+            (
+                Some("preference"),
+                Some("store read"),
+                None,
+                Err("preference"),
+            ),
+            (Some("preference"), None, None, Err("preference")),
+            (None, Some("store read"), None, Err("store read")),
+            (None, None, None, Ok(None)),
+        ] {
+            let preferred = pref_error.map_or(Ok(None), |message| {
+                Err(SessionError::InvalidOperation(message.into()))
+            });
+            let mut use_oauth = false;
+            let result = resolve_credential_chain(preferred, &mut use_oauth, |method| {
+                std::future::ready(match method {
+                    AuthMethod::ApiKey => store_error.map_or(Ok(None), |message| {
+                        Err(SessionError::InvalidOperation(message.into()))
+                    }),
+                    AuthMethod::EnvVar => Ok(env_key.map(str::to_string)),
+                    AuthMethod::OAuth => Ok(None),
+                })
+            })
+            .await;
+            match expected {
+                Ok(key) => assert_eq!(result.unwrap().as_deref(), key),
+                Err(message) => assert!(matches!(
+                    result, Err(SessionError::InvalidOperation(actual)) if actual == message
+                )),
+            }
+            assert!(!use_oauth);
+        }
     }
 
     #[tokio::test]
-    async fn resolve_env_var_preferred() {
-        let var = unique_env_var("ENV_PREF");
-        // SAFETY: test-only; each test uses a unique env var name.
-        unsafe { std::env::set_var(&var, "key-from-env") };
-
-        let mut use_oauth = false;
-        let result = super::resolve_api_key_with_preference(
-            "test-provider",
-            Some(&var),
-            Some(&AuthMethod::EnvVar),
-            &mut use_oauth,
-        )
-        .await;
-
-        assert_eq!(result.as_deref(), Some("key-from-env"));
-        assert!(!use_oauth);
-        unsafe { std::env::remove_var(&var) };
+    async fn resolve_preference_order_and_short_circuit() {
+        use AuthMethod::{ApiKey, EnvVar, OAuth};
+        for (preferred, winner, expected) in [
+            (None, EnvVar, vec![OAuth, ApiKey, EnvVar]),
+            (Some(ApiKey), EnvVar, vec![ApiKey, EnvVar]),
+            (Some(ApiKey), OAuth, vec![ApiKey, EnvVar, OAuth]),
+            (Some(EnvVar), ApiKey, vec![EnvVar, ApiKey]),
+            (Some(OAuth), OAuth, vec![OAuth]),
+        ] {
+            let mut attempted = Vec::new();
+            let mut use_oauth = false;
+            let result = resolve_credential_chain(Ok(preferred), &mut use_oauth, |method| {
+                let result = if method == winner {
+                    Ok(Some("key".into()))
+                } else if method == ApiKey {
+                    Err(SessionError::InvalidOperation("stored key".into()))
+                } else {
+                    Ok(None)
+                };
+                attempted.push(method);
+                std::future::ready(result)
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.as_deref(), Some("key"));
+            assert_eq!(attempted, expected);
+            assert_eq!(use_oauth, winner == OAuth);
+        }
     }
 
+    #[cfg(feature = "oauth")]
     #[tokio::test]
-    async fn resolve_env_var_as_fallback_no_preference() {
-        let var = unique_env_var("ENV_FALLBACK");
-        // SAFETY: test-only; each test uses a unique env var name.
-        unsafe { std::env::set_var(&var, "fallback-key") };
-
+    async fn resolve_oauth_after_preference_error() {
         let mut use_oauth = false;
-        let result = super::resolve_api_key_with_preference(
-            "test-provider",
-            Some(&var),
-            None, // default order: OAuth → stored key → env var
+        let result = resolve_credential_chain(
+            Err(SessionError::InvalidOperation("preference".into())),
             &mut use_oauth,
+            |method| {
+                assert_eq!(method, AuthMethod::OAuth);
+                std::future::ready(Ok(Some("token".into())))
+            },
         )
-        .await;
-
-        // OAuth and stored key will fail, should fall back to env var
-        assert_eq!(result.as_deref(), Some("fallback-key"));
-        unsafe { std::env::remove_var(&var) };
-    }
-
-    #[tokio::test]
-    async fn resolve_returns_none_when_no_sources() {
-        let var = unique_env_var("NONE_EXIST");
-        // SAFETY: test-only; each test uses a unique env var name.
-        unsafe { std::env::remove_var(&var) };
-
-        let mut use_oauth = false;
-        let result = super::resolve_api_key_with_preference(
-            "no-such-provider",
-            Some(&var),
-            None,
-            &mut use_oauth,
-        )
-        .await;
-
-        assert!(result.is_none());
-        assert!(!use_oauth);
-    }
-
-    #[tokio::test]
-    async fn resolve_oauth_only_provider_no_env_var_name() {
-        // OAuth-only providers pass env_var_name=None.
-        // Without a valid OAuth token, should return None.
-        let mut use_oauth = false;
-        let result = super::resolve_api_key_with_preference(
-            "codex-like",
-            None, // no env var name
-            None,
-            &mut use_oauth,
-        )
-        .await;
-
-        assert!(result.is_none());
+        .await
+        .unwrap();
+        assert_eq!(result.as_deref(), Some("token"));
+        assert!(use_oauth);
     }
 
     #[test]
     fn static_pricing_omits_non_billable_oauth_providers() {
         assert!(SessionProvider::get_pricing("codex", "gpt-5").is_none());
         assert!(SessionProvider::get_pricing("kimi-code", "kimi-k2.5").is_none());
+    }
+
+    #[test]
+    fn billing_basis_excludes_subscription_providers_without_catalog_pricing() {
+        for provider in ["codex", "kimi-code"] {
+            let basis = BillingBasis::resolve(provider, "any-model", false);
+            assert_eq!(basis.billing, BillingClass::Excluded);
+            assert!(basis.pricing.is_none());
+        }
+        // An OAuth-resolved key on an otherwise metered provider is excluded too.
+        let basis = BillingBasis::resolve("openai", "gpt-5", true);
+        assert_eq!(basis.billing, BillingClass::Excluded);
+        assert!(basis.pricing.is_none());
     }
 
     #[test]

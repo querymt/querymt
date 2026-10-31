@@ -34,6 +34,7 @@ impl ToolTrait for KnowledgeIngestTool {
                 description: "Ingest raw information into the knowledge store. Use this to save important facts, insights, or patterns for later retrieval and consolidation.".to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "text": {
                             "type": "string",

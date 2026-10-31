@@ -20,6 +20,21 @@ impl RemoteProviderBackend for AgentConfigProviderBackend {
         params_for_remote_provider(self.config.provider.initial_params())
     }
 
+    async fn contract_info(
+        &self,
+        request: ProviderBuildRequest,
+    ) -> Result<querymt_remote::ProviderContractInfo, Self::Error> {
+        self.config
+            .provider
+            .build_provider_snapshot(
+                ProviderRequest::new(&request.provider_name, &request.model)
+                    .with_params(request.params.as_ref()),
+            )
+            .await
+            .map(|snapshot| snapshot.contract_info())
+            .map_err(|error| RemoteProviderHostError::Internal(error.to_string()))
+    }
+
     async fn build_provider(
         &self,
         request: ProviderBuildRequest,

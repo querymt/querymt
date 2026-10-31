@@ -179,6 +179,7 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
         ProfileRuntime {
             metadata: root_metadata,
             agent: agent.clone(),
+            provider_lock: None,
         },
     ));
 

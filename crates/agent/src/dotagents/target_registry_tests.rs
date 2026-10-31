@@ -193,6 +193,7 @@ fn explicit_config_precedence_beats_protocol_layers() {
     let mut explicit = DefaultAgentRegistry::new();
     explicit.register(
         AgentInfo {
+            isolation: Default::default(),
             id: "shared".to_string(),
             name: "Explicit Shared".to_string(),
             description: String::new(),
@@ -270,6 +271,7 @@ fn protocol_targets_do_not_replace_explicit_targets() {
     let mut explicit = DefaultAgentRegistry::new();
     explicit.register(
         AgentInfo {
+            isolation: Default::default(),
             id: "shared".to_string(),
             name: "Explicit Shared".to_string(),
             description: "explicit".to_string(),
@@ -504,6 +506,7 @@ fn collision_resolution_merges_before_explicit_precedence() {
     let mut explicit = DefaultAgentRegistry::new();
     explicit.register(
         AgentInfo {
+            isolation: Default::default(),
             id: "a".to_string(),
             name: "A explicit".to_string(),
             description: String::new(),

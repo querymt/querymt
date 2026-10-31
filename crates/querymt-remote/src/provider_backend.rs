@@ -39,12 +39,27 @@ pub trait RemoteProviderBackend: Send + Sync {
         &self,
         request: ProviderBuildRequest,
     ) -> Result<Arc<dyn LLMProvider>, Self::Error>;
+
+    /// Resolve facts before the first chat request. Backends with generation
+    /// defaults override this to report the settings of the provider they build.
+    async fn contract_info(
+        &self,
+        request: ProviderBuildRequest,
+    ) -> Result<crate::ProviderContractInfo, Self::Error> {
+        let provider = self.build_provider(request).await?;
+        Ok(crate::ProviderContractInfo {
+            item_aware_chat_version: Some(crate::ITEM_AWARE_CHAT_CONTRACT_VERSION),
+            protocol_version: Some(crate::provider_protocol::MESH_PROTOCOL_VERSION),
+            capabilities: provider.capabilities(),
+            generation: Default::default(),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, Tool};
+    use querymt::chat::{ChatCall, ChatOutput, ChatProvider};
     use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
     use querymt::embedding::EmbeddingProvider;
     use querymt::error::LLMError;
@@ -58,31 +73,7 @@ mod tests {
 
     #[async_trait]
     impl ChatProvider for DummyProvider {
-        fn supports_streaming(&self) -> bool {
-            false
-        }
-
-        async fn chat_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<ChatOutput, LLMError> {
-            Err(LLMError::NotImplemented("dummy".into()))
-        }
-
-        async fn chat_stream_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<
-            std::pin::Pin<
-                Box<
-                    dyn futures_util::Stream<Item = Result<querymt::chat::StreamChunk, LLMError>>
-                        + Send,
-                >,
-            >,
-            LLMError,
-        > {
+        async fn chat(&self, _call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
             Err(LLMError::NotImplemented("dummy".into()))
         }
     }

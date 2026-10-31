@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
-use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool as ToolTrait, ToolContext, ToolError,
+    single_path_write_access,
+};
 
 pub struct WriteFileTool;
 
@@ -35,6 +38,7 @@ impl ToolTrait for WriteFileTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "path": {
                             "type": "string",
@@ -61,6 +65,10 @@ impl ToolTrait for WriteFileTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        single_path_write_access(args, "path", cwd)
+    }
+
     async fn call(
         &self,
         args: Value,
@@ -83,24 +91,29 @@ impl ToolTrait for WriteFileTool {
 
         let path = context.resolve_path(path_arg)?;
 
-        if create_dirs && let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
+        // Mutating phase runs under the checkout mutation gate when the
+        // session has one (see `run_under_mutation_gate`).
+        crate::tools::run_under_mutation_gate(context, async {
+            if create_dirs && let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| ToolError::ProviderError(format!("mkdir failed: {}", e)))?;
+            }
+
+            tokio::fs::write(&path, content)
                 .await
-                .map_err(|e| ToolError::ProviderError(format!("mkdir failed: {}", e)))?;
-        }
+                .map_err(|e| ToolError::ProviderError(format!("write failed: {}", e)))?;
 
-        tokio::fs::write(&path, content)
-            .await
-            .map_err(|e| ToolError::ProviderError(format!("write failed: {}", e)))?;
+            let result = json!({
+                "path": path.display().to_string(),
+                "bytes": content.len()
+            });
 
-        let result = json!({
-            "path": path.display().to_string(),
-            "bytes": content.len()
-        });
-
-        serde_json::to_string(&result)
-            .map(|s| vec![ToolResultPart::text(s)])
-            .map_err(|e| ToolError::ProviderError(format!("serialize failed: {}", e)))
+            serde_json::to_string(&result)
+                .map(|s| vec![ToolResultPart::text(s)])
+                .map_err(|e| ToolError::ProviderError(format!("serialize failed: {}", e)))
+        })
+        .await
     }
 }
 
@@ -120,6 +133,30 @@ mod tests {
     use crate::tools::AgentToolContext;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn file_access_writes_normalised_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = dunce::canonicalize(temp_dir.path()).unwrap();
+        let tool = WriteFileTool::new();
+
+        // Target does not exist yet and its parent directory does not either.
+        let access = tool.file_access(&json!({"path": "new/dir/a.md"}), Some(&root));
+
+        assert_eq!(access, FileAccess::writes([root.join("new/dir/a.md")]));
+    }
+
+    #[test]
+    fn file_access_is_none_for_invalid_args() {
+        let tool = WriteFileTool::new();
+        let cwd = std::env::temp_dir();
+
+        assert_eq!(tool.file_access(&json!({}), Some(&cwd)), FileAccess::None);
+        assert_eq!(
+            tool.file_access(&json!({"path": ["a.md"]}), Some(&cwd)),
+            FileAccess::None
+        );
+    }
 
     #[tokio::test]
     async fn test_write_file() {

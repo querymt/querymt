@@ -1,0 +1,36 @@
+# Output-Limit Recovery Example
+#
+# When a model reply is cut off by the output-token limit, the agent recovers
+# instead of ending the run:
+#
+#   1. escalate:  the cut-off reply is discarded and the same request is retried
+#                 once per turn at the model's output ceiling (needs a provider
+#                 that honours a per-request `max_tokens`, e.g. Anthropic).
+#   2. continue:  if the reply is still cut off, the run continues with a
+#                 temporary instruction (resume without recap, split large
+#                 writes), up to `max_continuations` times per turn.
+#
+# The middleware is on by default with the values below. Add this entry only to
+# change them, or set `enabled = false` to turn recovery off.
+
+[agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+tools = ["read_tool", "edit", "write_file", "multiedit", "shell"]
+system = "You are a helpful coding assistant."
+
+[[middleware]]
+type = "output_limit_recovery"
+enabled = true
+# Retry a cut-off request once at the model's output ceiling.
+escalate = true
+# Continuation attempts per turn after the ceiling was hit.
+max_continuations = 3
+# After a cut-off that produced only reasoning, lower the reasoning effort for
+# the continuation request (when the provider honours it).
+lower_effort_on_thinking_only = true
+# Temporary instruction added to continuation requests and removed after the
+# next reply that is not cut off. `{cap}` expands to the cap that was hit.
+instruction = """Your previous response was cut off by the output-token limit ({cap} tokens). \
+Continue directly from where you stopped without repeating or summarising earlier output. \
+Split large file writes or edits into several smaller tool calls, and keep reasoning brief."""

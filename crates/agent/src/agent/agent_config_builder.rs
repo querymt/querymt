@@ -75,7 +75,9 @@ pub struct AgentConfigBuilder {
     schedule_repository: Option<Arc<dyn crate::session::repo_schedule::ScheduleRepository>>,
     knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
     slash_command_registry: crate::slash_commands::SlashCommandRegistry,
+    slash_commands_config: Option<crate::config::SlashCommandsConfig>,
     hooks: Hooks,
+    workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
 }
 
 impl AgentConfigBuilder {
@@ -134,7 +136,9 @@ impl AgentConfigBuilder {
             schedule_repository: storage.schedule_repository(),
             knowledge_store: storage.knowledge_store(),
             slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
+            slash_commands_config: None,
             hooks: Hooks::disabled(),
+            workspace_service: None,
         }
     }
 
@@ -187,7 +191,9 @@ impl AgentConfigBuilder {
             schedule_repository: storage.schedule_repository(),
             knowledge_store: storage.knowledge_store(),
             slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
+            slash_commands_config: None,
             hooks: Hooks::disabled(),
+            workspace_service: None,
         }
     }
 
@@ -197,6 +203,10 @@ impl AgentConfigBuilder {
             self.event_journal.clone(),
             self.event_fanout.clone(),
         ));
+        let tool_registry = Arc::new(self.tool_registry);
+        for driver in &self.middleware_drivers {
+            driver.bind_agent(&tool_registry, &event_sink);
+        }
         AgentConfig {
             provider: self.provider,
             storage: self.storage,
@@ -208,7 +218,7 @@ impl AgentConfigBuilder {
             default_mode: self.default_mode,
             default_reasoning_effort: Arc::new(ArcSwap::from_pointee(None)),
             tool_config: self.tool_config,
-            tool_registry: self.tool_registry,
+            tool_registry,
             middleware_drivers: self.middleware_drivers,
             auth_methods: self.auth_methods,
             max_steps: self.max_steps,
@@ -231,7 +241,9 @@ impl AgentConfigBuilder {
             schedule_repository: self.schedule_repository,
             knowledge_store: self.knowledge_store,
             slash_command_registry: self.slash_command_registry,
+            slash_commands_config: self.slash_commands_config,
             hooks: self.hooks,
+            workspace_service: self.workspace_service,
         }
     }
 
@@ -502,6 +514,30 @@ impl AgentConfigBuilder {
         self
     }
 
+    /// Retain the slash command discovery configuration alongside the built
+    /// registry so workspace-bound sessions can re-resolve prompt sources
+    /// from their bound checkout.
+    pub fn with_slash_commands_config(
+        mut self,
+        config: Option<crate::config::SlashCommandsConfig>,
+    ) -> Self {
+        self.slash_commands_config = config;
+        self
+    }
+
+    /// Set the managed Git worktree workspace service.
+    ///
+    /// When configured, new sessions may request isolated worktree execution
+    /// and load/resume resolve persisted workspace bindings before startup.
+    /// Omitted (default): every session executes locally.
+    pub fn with_workspace_service(
+        mut self,
+        service: Arc<crate::worktree::WorkspaceService>,
+    ) -> Self {
+        self.workspace_service = Some(service);
+        self
+    }
+
     // ── Tools ─────────────────────────────────────────────────────────────
 
     /// Sets the tool policy.
@@ -652,6 +688,16 @@ impl AgentConfigBuilder {
     /// Mutably push a middleware driver (for quorum helper function).
     pub fn push_middleware(&mut self, driver: Arc<dyn MiddlewareDriver>) {
         self.middleware_drivers.push(driver);
+    }
+
+    /// Whether a middleware driver with this `name()` was already pushed.
+    pub fn has_middleware_named(&self, name: &str) -> bool {
+        self.middleware_drivers.iter().any(|d| d.name() == name)
+    }
+
+    /// Clone of the current tool registry.
+    pub fn tool_registry_snapshot(&self) -> ToolRegistry {
+        self.tool_registry.clone()
     }
 
     /// Borrow the `SessionProvider` (used by `DelegationMiddleware` constructor in quorum).

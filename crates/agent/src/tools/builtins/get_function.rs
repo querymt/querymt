@@ -8,7 +8,9 @@ use serde_json::{Value, json};
 use std::path::Path;
 
 use crate::index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind};
-use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, path_list_read_access,
+};
 
 use super::helpers::{parse_paths, resolve_root, resolve_target};
 
@@ -41,6 +43,7 @@ impl Tool for GetFunctionTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "paths": {
                             "type": "array",
@@ -75,6 +78,10 @@ impl Tool for GetFunctionTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        path_list_read_access(args, "paths", cwd)
+    }
+
     async fn call(
         &self,
         args: Value,
@@ -90,7 +97,7 @@ impl Tool for GetFunctionTool {
 
         let mut file_results = Vec::new();
         for path_str in &path_strs {
-            let target = resolve_target(path_str, &root, context)?;
+            let target = resolve_target(path_str, &root);
             let content = tokio::fs::read_to_string(&target)
                 .await
                 .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {e}")))?;
@@ -241,6 +248,33 @@ fn matches_function_kind(kind: SymbolKind) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::FileAccess as Access;
+
+    #[test]
+    fn file_access_reads_every_path() {
+        let dir = TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let access = GetFunctionTool::new().file_access(
+            &json!({"paths": ["a.rs", "./b.rs"], "names": ["x"]}),
+            Some(&root),
+        );
+        assert_eq!(
+            access,
+            Access::reads([root.join("a.rs"), root.join("b.rs")])
+        );
+    }
+
+    #[test]
+    fn file_access_is_none_for_invalid_args() {
+        let cwd = std::env::temp_dir();
+        let tool = GetFunctionTool::new();
+        assert_eq!(tool.file_access(&json!({}), Some(&cwd)), Access::None);
+        assert_eq!(
+            tool.file_access(&json!({"paths": ["a.rs"]}), None),
+            Access::None
+        );
+    }
+
     use super::*;
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
@@ -250,6 +284,29 @@ mod tests {
             ToolResultPart::Text { text } => text,
             _ => panic!("expected text content"),
         }
+    }
+
+    #[tokio::test]
+    async fn relative_path_is_resolved_against_root_not_cwd() {
+        let cwd_dir = TempDir::new().unwrap();
+        let root_dir = TempDir::new().unwrap();
+        tokio::fs::write(root_dir.path().join("lib.rs"), "fn alpha() {}\n")
+            .await
+            .unwrap();
+        let context =
+            AgentToolContext::basic("session".to_string(), Some(cwd_dir.path().to_path_buf()));
+        let tool = GetFunctionTool::new();
+        let args = json!({"paths": ["lib.rs"], "names": ["alpha"], "root": root_dir.path()});
+
+        let cwd = dunce::canonicalize(cwd_dir.path()).unwrap();
+        let expected = dunce::canonicalize(root_dir.path().join("lib.rs")).unwrap();
+        assert_eq!(
+            tool.file_access(&args, Some(&cwd)),
+            crate::tools::FileAccess::reads([expected])
+        );
+
+        let result = text_content(tool.call(args, &context).await.unwrap());
+        assert!(result.contains("00001| fn alpha()"));
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@ impl LocalAgentHandle {
                 "refresh_in_progress": meta.refresh_in_progress,
                 "remote_timeout_count": meta.remote_timeout_count,
                 "remote_node_count": meta.remote_node_count,
+                "remote_node_availability": meta.remote_node_availability,
             }
         }))
     }
@@ -32,6 +33,7 @@ impl LocalAgentHandle {
                 "refresh_in_progress": meta.refresh_in_progress,
                 "remote_timeout_count": meta.remote_timeout_count,
                 "remote_node_count": meta.remote_node_count,
+                "remote_node_availability": meta.remote_node_availability,
                 "refresh_trigger": handle.disposition().as_str(),
                 "started_new_refresh": handle.started_new_refresh(),
                 "wait_for_completion": handle.waits_for_completion(),
@@ -58,7 +60,7 @@ impl LocalAgentHandle {
         let parsed: ModelInfoRequest = serde_json::from_str(req.params.get())
             .map_err(|e| Error::from(crate::error::AgentError::Serialization(e.to_string())))?;
 
-        let registry = querymt::providers::read_providers_from_cache();
+        let registry = querymt::providers::providers_registry();
         let mut info_map = serde_json::Map::new();
 
         match registry {

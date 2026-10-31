@@ -157,6 +157,11 @@ pub struct MeshTomlConfig {
     #[serde(default = "default_true")]
     pub iroh_gso: bool,
 
+    /// DNS policy for the shared iroh endpoint; absent preserves upstream defaults.
+    /// Disabling public DNS fallback does not disable N0's public pkarr services.
+    #[serde(default)]
+    pub iroh_dns: Option<querymt_remote::IrohDnsConfig>,
+
     /// Whether `provider_node_id = None` may fall back to mesh provider discovery.
     ///
     /// Default: `false` (local-only unless an explicit `provider_node_id` is set).
@@ -234,6 +239,7 @@ impl Default for MeshTomlConfig {
             discovery: MeshDiscoveryConfig::default(),
             transport: MeshTransportConfig::default(),
             iroh_gso: true,
+            iroh_dns: None,
             auto_fallback: false,
             peers: Vec::new(),
             request_timeout_secs: default_mesh_request_timeout_secs(),

@@ -1,5 +1,5 @@
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use opentelemetry::InstrumentationScope;
@@ -11,7 +11,8 @@ use opentelemetry_sdk::{
     Resource,
     error::OTelSdkResult,
     logs::{LogExporter, LogProcessor, SdkLogRecord, SdkLoggerProvider},
-    trace::{RandomIdGenerator, SdkTracerProvider},
+    metrics::SdkMeterProvider,
+    trace::{IdGenerator, RandomIdGenerator, SdkTracerProvider},
 };
 use opentelemetry_semantic_conventions::{SCHEMA_URL, resource::SERVICE_VERSION};
 use tracing_log::LogTracer;
@@ -31,9 +32,36 @@ pub fn default_otlp_endpoint() -> &'static str {
     DEFAULT_OTLP_ENDPOINT
 }
 
-/// Build a resource with service name & version
+/// Build a resource identifying the service and the exporting process.
 pub fn resource(service_name: &str, service_version: &str) -> Resource {
+    static PROCESS_ATTRIBUTES: OnceLock<Vec<opentelemetry::KeyValue>> = OnceLock::new();
+    let process_attributes = PROCESS_ATTRIBUTES.get_or_init(|| {
+        let mut attributes = vec![
+            opentelemetry::KeyValue::new(
+                "service.instance.id",
+                RandomIdGenerator::default().new_trace_id().to_string(),
+            ),
+            opentelemetry::KeyValue::new("process.pid", i64::from(std::process::id())),
+        ];
+        let hostname = std::env::var("HOSTNAME")
+            .ok()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                std::env::var("COMPUTERNAME")
+                    .ok()
+                    .filter(|name| !name.trim().is_empty())
+            })
+            .or_else(|| std::fs::read_to_string("/etc/hostname").ok());
+        if let Some(hostname) = hostname.filter(|name| !name.trim().is_empty()) {
+            attributes.push(opentelemetry::KeyValue::new(
+                "host.name",
+                hostname.trim().to_string(),
+            ));
+        }
+        attributes
+    });
     Resource::builder()
+        .with_attributes(process_attributes.clone())
         .with_service_name(service_name.to_string())
         .with_schema_url(
             [opentelemetry::KeyValue::new(
@@ -56,6 +84,8 @@ pub enum TelemetryInitError {
     TracerProvider(String),
     /// Failed to create the OTLP logger provider (log exporter).
     LoggerProvider(String),
+    /// Failed to create the OTLP meter provider (metric exporter).
+    MeterProvider(String),
     /// Failed to install the global tracing subscriber
     /// (typically because one was already installed).
     Subscriber,
@@ -67,6 +97,7 @@ impl fmt::Display for TelemetryInitError {
             Self::LogTracer => write!(f, "failed to install LogTracer"),
             Self::TracerProvider(ctx) => write!(f, "failed to init OTLP tracer provider: {ctx}"),
             Self::LoggerProvider(ctx) => write!(f, "failed to init OTLP logger provider: {ctx}"),
+            Self::MeterProvider(ctx) => write!(f, "failed to init OTLP meter provider: {ctx}"),
             Self::Subscriber => write!(f, "failed to set global tracing subscriber"),
         }
     }
@@ -152,6 +183,29 @@ pub fn init_logger_provider(
         service_version,
         exporter,
     ))
+}
+
+/// Initialize an OTLP meter provider.
+///
+/// Counters recorded through `opentelemetry::global::meter` (for example
+/// `querymt.tool.args_repaired`) are exported by this provider.
+pub fn init_meter_provider(
+    service_name: &str,
+    service_version: &str,
+    endpoint: &str,
+) -> Result<SdkMeterProvider, TelemetryInitError> {
+    use opentelemetry_otlp::WithTonicConfig;
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .with_tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots())
+        .build()
+        .map_err(|e| TelemetryInitError::MeterProvider(e.to_string()))?;
+
+    Ok(SdkMeterProvider::builder()
+        .with_resource(resource(service_name, service_version))
+        .with_periodic_exporter(exporter)
+        .build())
 }
 
 #[derive(Debug)]
@@ -270,7 +324,7 @@ pub fn try_setup_telemetry_with_layers(
         // Two separate instances because EnvFilter is not Clone.
         let telemetry_level =
             std::env::var("QMT_TELEMETRY_LEVEL").unwrap_or_else(|_| "info".into());
-        let trace_filter = EnvFilter::new(&telemetry_level);
+        let trace_filter = telemetry_trace_filter(&telemetry_level);
         let log_filter = EnvFilter::new(&telemetry_level);
 
         let endpoint = config.resolve_endpoint();
@@ -282,6 +336,10 @@ pub fn try_setup_telemetry_with_layers(
         let logger_provider =
             init_logger_provider(config.service_name, config.service_version, &endpoint)?;
         let otel_log_layer = OpenTelemetryTracingBridge::new(&logger_provider);
+
+        let meter_provider =
+            init_meter_provider(config.service_name, config.service_version, &endpoint)?;
+        opentelemetry::global::set_meter_provider(meter_provider.clone());
 
         layers.push(
             OpenTelemetryLayer::new(tracer)
@@ -299,7 +357,7 @@ pub fn try_setup_telemetry_with_layers(
 
         // Store the providers so [`flush_telemetry`] can flush them on shutdown.
         // The providers are kept alive for the entire process lifetime.
-        store_providers(tracer_provider, logger_provider);
+        store_providers(tracer_provider, logger_provider, meter_provider);
 
         return Ok(Some(endpoint));
     }
@@ -314,15 +372,39 @@ pub fn try_setup_telemetry_with_layers(
     Ok(None)
 }
 
+fn telemetry_trace_filter(level: &str) -> EnvFilter {
+    use tracing_subscriber::filter::LevelFilter;
+
+    let explicit_iroh = level.split(',').map(str::trim).any(|directive| {
+        let target = directive
+            .split(['=', '['])
+            .next()
+            .unwrap_or_default()
+            .trim();
+        target == "iroh" || target.starts_with("iroh::")
+    });
+    let global_level = level
+        .split(',')
+        .filter_map(|directive| directive.trim().parse::<LevelFilter>().ok())
+        .next_back();
+    // Default suppression must not enable spans disabled by a stricter global level.
+    if explicit_iroh || global_level.is_some_and(|level| level <= LevelFilter::WARN) {
+        EnvFilter::new(level)
+    } else {
+        EnvFilter::new(format!("iroh=warn,{level}"))
+    }
+}
+
 // ─── Convenience wrapper (panics on failure) ───────────────────────────────────
 // ─── Provider storage for shutdown flush ──────────────────────────────────────
 
 /// Global storage for the OTLP providers so they can be flushed on shutdown.
-static PROVIDERS: Mutex<Option<(SdkTracerProvider, SdkLoggerProvider)>> = Mutex::new(None);
+static PROVIDERS: Mutex<Option<(SdkTracerProvider, SdkLoggerProvider, SdkMeterProvider)>> =
+    Mutex::new(None);
 
-fn store_providers(tracer: SdkTracerProvider, logger: SdkLoggerProvider) {
+fn store_providers(tracer: SdkTracerProvider, logger: SdkLoggerProvider, meter: SdkMeterProvider) {
     match PROVIDERS.lock() {
-        Ok(mut guard) => *guard = Some((tracer, logger)),
+        Ok(mut guard) => *guard = Some((tracer, logger, meter)),
         Err(e) => {
             // Mutex poisoned — unlikely, but don't panic during init.
             log::warn!("Failed to store OTLP providers for later flush: {e}");
@@ -339,7 +421,7 @@ fn store_providers(tracer: SdkTracerProvider, logger: SdkLoggerProvider) {
 pub fn flush_telemetry() {
     let providers = PROVIDERS.lock().ok().and_then(|mut g| g.take());
     match providers {
-        Some((tracer_provider, logger_provider)) => {
+        Some((tracer_provider, logger_provider, meter_provider)) => {
             log::info!("Flushing OTLP telemetry providers…");
             if let Err(e) = tracer_provider.force_flush() {
                 log::warn!("OTLP tracer provider force_flush failed: {e}");
@@ -347,12 +429,18 @@ pub fn flush_telemetry() {
             if let Err(e) = logger_provider.force_flush() {
                 log::warn!("OTLP logger provider force_flush failed: {e}");
             }
+            if let Err(e) = meter_provider.force_flush() {
+                log::warn!("OTLP meter provider force_flush failed: {e}");
+            }
             // shutdown() internally flushes then releases resources.
             if let Err(e) = tracer_provider.shutdown() {
                 log::warn!("OTLP tracer provider shutdown failed: {e}");
             }
             if let Err(e) = logger_provider.shutdown() {
                 eprintln!("OTLP logger provider shutdown failed: {e}");
+            }
+            if let Err(e) = meter_provider.shutdown() {
+                log::warn!("OTLP meter provider shutdown failed: {e}");
             }
         }
         None => {
@@ -386,6 +474,86 @@ mod tests {
         SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
     };
     use opentelemetry_sdk::logs::InMemoryLogExporter;
+
+    #[test]
+    fn trace_filter_preserves_strict_global_levels_and_explicit_iroh_directives() {
+        for level in [
+            "off",
+            "OFF",
+            "off,my_adapter=debug",
+            "error",
+            "error,my_adapter=trace",
+            "warn",
+            "info,iroh=trace",
+            "off,iroh=trace",
+            "info,iroh::endpoint=debug",
+            "info,iroh[transport]=trace",
+        ] {
+            assert_eq!(
+                telemetry_trace_filter(level).to_string(),
+                EnvFilter::new(level).to_string(),
+                "{level}"
+            );
+        }
+        let subscriber =
+            tracing_subscriber::registry().with(telemetry_trace_filter("off,my_adapter=debug"));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!tracing::enabled!(target: "iroh::transport", tracing::Level::WARN));
+            assert!(!tracing::enabled!(target: "other", tracing::Level::ERROR));
+            assert!(tracing::enabled!(target: "my_adapter", tracing::Level::DEBUG));
+        });
+    }
+
+    #[test]
+    fn trace_filter_does_not_mistake_unrelated_iroh_text_for_a_target() {
+        for level in [
+            "info",
+            "info,my_iroh_adapter=debug",
+            "info,other=trace",
+            "off,info",
+        ] {
+            let subscriber = tracing_subscriber::registry().with(telemetry_trace_filter(level));
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(
+                    !tracing::enabled!(target: "iroh::transport", tracing::Level::INFO),
+                    "{level}"
+                );
+                assert!(
+                    tracing::enabled!(target: "iroh::transport", tracing::Level::WARN),
+                    "{level}"
+                );
+                assert!(
+                    tracing::enabled!(target: "other", tracing::Level::INFO),
+                    "{level}"
+                );
+            });
+        }
+        let level = "info,other[span{field=iroh}]=debug";
+        assert_eq!(
+            telemetry_trace_filter(level).to_string(),
+            EnvFilter::new(format!("iroh=warn,{level}")).to_string()
+        );
+    }
+
+    #[test]
+    fn traces_and_logs_share_stable_process_identity() {
+        let traces = resource("test", "1");
+        let logs = resource("test", "1");
+        let instance = |resource: &Resource| {
+            resource
+                .iter()
+                .find(|(key, _)| key.as_str() == "service.instance.id")
+                .map(|(_, value)| value.clone())
+        };
+        assert!(instance(&traces).is_some());
+        assert_eq!(instance(&traces), instance(&logs));
+        assert!(
+            traces
+                .iter()
+                .any(|(key, value)| key.as_str() == "process.pid"
+                    && value == &opentelemetry::Value::I64(i64::from(std::process::id())))
+        );
+    }
 
     fn log_record() -> SdkLogRecord {
         SdkLoggerProvider::builder()

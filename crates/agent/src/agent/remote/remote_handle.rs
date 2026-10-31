@@ -415,6 +415,36 @@ impl AgentHandle for RemoteAgentHandle {
         self.create_remote_session_inner(cwd).await
     }
 
+    async fn set_session_lifecycle(
+        &self,
+        session_id: &str,
+        patch: crate::session::lifecycle::SessionLifecyclePatch,
+    ) -> crate::session::error::SessionResult<crate::session::lifecycle::SessionLifecycle> {
+        use crate::agent::remote::SetRemoteSessionLifecycle;
+        use crate::session::error::SessionError;
+
+        patch.validate()?;
+        if session_id.is_empty() {
+            return Err(SessionError::InvalidOperation(
+                "session id must not be empty".into(),
+            ));
+        }
+        let node_manager = self
+            .lookup_remote_node_manager()
+            .await
+            .map_err(|error| SessionError::InvalidOperation(error.to_string()))?;
+        ask_remote_with_timeout(
+            &node_manager,
+            &SetRemoteSessionLifecycle {
+                session_id: session_id.to_owned(),
+                patch,
+            },
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .map_err(|error| SessionError::InvalidOperation(error.to_string()))
+    }
+
     fn subscribe_events(&self) -> broadcast::Receiver<EventEnvelope> {
         self.event_fanout.subscribe()
     }
@@ -426,6 +456,9 @@ impl AgentHandle for RemoteAgentHandle {
     fn emit_event(&self, session_id: &str, kind: AgentEventKind) {
         let envelope = EventEnvelope::Ephemeral(EphemeralEvent {
             session_id: session_id.to_string(),
+            // Local annotation on a remote-hosted session: the host owns the
+            // session's sequence, so this event is unsequenced.
+            session_seq: 0,
             timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
             origin: EventOrigin::Local,
             source_node: None,

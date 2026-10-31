@@ -9,8 +9,9 @@ use querymt::error::ProviderErrorKind;
 use querymt::{
     HTTPLLMProvider,
     chat::{
-        ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
-        http::{ChatStreamParser, HTTPChatProvider},
+        ChatCall, ChatCapabilities, ChatOutput, StreamChunk, StructuredOutputFormat, Tool,
+        ToolChoice,
+        http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -155,34 +156,38 @@ impl HTTPChatProvider for Zai {
         classify_openai_http_error_with(response, Some(classify_zai_error))
     }
 
-    fn chat_request(
+    fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        openai_chat_request(self, messages, tools)
+        call: &ChatCall<'_>,
+        stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
+        let request = if stream {
+            let mut cfg = self.clone();
+            cfg.stream = Some(true);
+            openai_chat_request(&cfg, call.messages, call.tools)
+        } else {
+            openai_chat_request(self, call.messages, call.tools)
+        }?;
+        Ok(PreparedChatRequest::stateless(request))
     }
 
-    fn chat_stream_request(
+    fn parse_chat(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        let mut cfg = self.clone();
-        cfg.stream = Some(true);
-        openai_chat_request(&cfg, messages, tools)
-    }
-
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        response: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         openai_parse_chat_with(self, response, Some(classify_zai_error))
     }
 
-    fn supports_streaming(&self) -> bool {
-        true
+    fn chat_stream_parser(
+        &self,
+        _context: serde_json::Value,
+    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        Ok(Box::new(ZaiStreamParser::default()))
     }
 
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        Ok(Box::new(ZaiStreamParser::default()))
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE.with_streaming(true)
     }
 }
 
@@ -322,7 +327,7 @@ mod tests {
             assert_error_kind(&http_error, ProviderErrorKind::QuotaExceeded, false);
 
             let body_error = provider
-                .parse_chat(error_response(200, code.clone()))
+                .parse_chat(error_response(200, code.clone()), serde_json::Value::Null)
                 .unwrap_err();
             assert_error_kind(&body_error, ProviderErrorKind::QuotaExceeded, false);
 
@@ -362,7 +367,7 @@ mod tests {
         let http_error = provider.classify_chat_error(&response(429));
         assert_error_kind(&http_error, ProviderErrorKind::RateLimited, true);
 
-        let body_error = provider.parse_chat(response(200)).unwrap_err();
+        let body_error = provider.parse_chat(response(200), serde_json::Value::Null).unwrap_err();
         assert_error_kind(&body_error, ProviderErrorKind::RateLimited, true);
 
         let chunk = format!(

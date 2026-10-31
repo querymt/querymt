@@ -29,6 +29,7 @@ pub struct ParsedUpdatedDelegation {
     pub context: Option<String>,
     pub constraints: Option<String>,
     pub expected_output: Option<String>,
+    pub isolation: Option<crate::worktree::DelegationIsolation>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -396,6 +397,9 @@ fn parsed_updated_delegation(wire: &UpdatedDelegationWire) -> ParsedUpdatedDeleg
         context: wire.context.clone(),
         constraints: wire.constraints.clone(),
         expected_output: wire.expected_output.clone(),
+        isolation: wire
+            .isolation
+            .map(crate::worktree::DelegationIsolation::from),
     }
 }
 
@@ -487,6 +491,7 @@ mod tests {
                 context: None,
                 constraints: None,
                 expected_output: None,
+                isolation: None,
             })
         );
         assert_eq!(parsed.additional_context.as_deref(), Some("remember tests"));

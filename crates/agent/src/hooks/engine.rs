@@ -104,6 +104,9 @@ pub struct UpdatedDelegation {
     pub context: Option<String>,
     pub constraints: Option<String>,
     pub expected_output: Option<String>,
+    /// Execution isolation override for this delegate. `None` keeps the
+    /// request's value.
+    pub isolation: Option<crate::worktree::DelegationIsolation>,
 }
 
 #[derive(Debug, Clone)]
@@ -320,6 +323,8 @@ pub struct PreDelegationRequest {
     pub context: Option<String>,
     pub constraints: Option<String>,
     pub expected_output: Option<String>,
+    /// Isolation requested on the delegate tool call, before policy hooks.
+    pub isolation: crate::worktree::DelegationIsolation,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -334,6 +339,7 @@ pub struct PreDelegationResult {
 #[derive(Debug, Clone)]
 pub struct DelegationStartRequest {
     pub session_id: String,
+    pub parent_cwd: Option<PathBuf>,
     pub turn_id: String,
     pub cwd: Option<PathBuf>,
     pub model: String,
@@ -356,6 +362,7 @@ pub struct DelegationStartResult {
 #[derive(Debug, Clone)]
 pub struct PostDelegationRequest {
     pub session_id: String,
+    pub parent_cwd: Option<PathBuf>,
     pub turn_id: String,
     pub cwd: Option<PathBuf>,
     pub model: String,
@@ -1242,6 +1249,8 @@ impl Hooks {
             return Ok(PreDelegationResult::default());
         }
         let input = PreDelegationCommandInput {
+            parent_session_id: request.session_id.clone(),
+            parent_cwd: cwd_string(request.cwd.as_deref()),
             session_id: request.session_id,
             turn_id: request.turn_id,
             transcript_path: NullableString::from_string(None),
@@ -1285,6 +1294,7 @@ impl Hooks {
                             context: updated.context,
                             constraints: updated.constraints,
                             expected_output: updated.expected_output,
+                            isolation: updated.isolation,
                         });
                     }
                     if matches!(parsed.decision, Some(ParsedDecision::Block)) {
@@ -1315,6 +1325,8 @@ impl Hooks {
             return Ok(DelegationStartResult::default());
         }
         let input = DelegationStartCommandInput {
+            parent_session_id: request.session_id.clone(),
+            parent_cwd: cwd_string(request.parent_cwd.as_deref()),
             session_id: request.session_id,
             turn_id: request.turn_id,
             transcript_path: NullableString::from_string(None),
@@ -1352,6 +1364,8 @@ impl Hooks {
             return Ok(PostDelegationResult::default());
         }
         let input = PostDelegationCommandInput {
+            parent_session_id: request.session_id.clone(),
+            parent_cwd: cwd_string(request.parent_cwd.as_deref()),
             session_id: request.session_id,
             turn_id: request.turn_id,
             transcript_path: NullableString::from_string(None),

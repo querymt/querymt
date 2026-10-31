@@ -1,5 +1,102 @@
 //! Helper functions for creating test fixtures
 
+/// In-memory metric capture for tests. Installs one process-wide meter provider
+/// on first use (run tests with `cargo nextest run`, one process per test);
+/// assertions should compare counter deltas so they stay independent of other
+/// calls recorded in the same process.
+pub(crate) mod genai_metrics {
+    use opentelemetry::Value;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+    use std::sync::OnceLock;
+
+    static STATE: OnceLock<(InMemoryMetricExporter, SdkMeterProvider)> = OnceLock::new();
+
+    fn state() -> &'static (InMemoryMetricExporter, SdkMeterProvider) {
+        STATE.get_or_init(|| {
+            let exporter = InMemoryMetricExporter::default();
+            let provider = SdkMeterProvider::builder()
+                .with_reader(PeriodicReader::builder(exporter.clone()).build())
+                .build();
+            opentelemetry::global::set_meter_provider(provider.clone());
+            (exporter, provider)
+        })
+    }
+
+    /// Install the capture provider. Call before the code under test records.
+    pub(crate) fn install() {
+        let _ = state();
+    }
+
+    /// Number of recorded samples of f64 histogram `name` for `model`. With
+    /// `error = None` only points without an `error.type` attribute count;
+    /// otherwise only points carrying exactly that `error.type`.
+    pub(crate) fn histogram_count(name: &str, model: &str, error: Option<&str>) -> u64 {
+        let (exporter, provider) = state();
+        exporter.reset();
+        provider.force_flush().expect("flush metrics");
+        let mut total = 0;
+        for resource in exporter.get_finished_metrics().expect("finished metrics") {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics().filter(|metric| metric.name() == name) {
+                    if let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data()
+                    {
+                        for point in histogram.data_points() {
+                            let attrs: Vec<_> = point.attributes().collect();
+                            let find = |key: &str| {
+                                attrs
+                                    .iter()
+                                    .find(|kv| kv.key.as_str() == key)
+                                    .map(|kv| &kv.value)
+                            };
+                            let model_matches = find("gen_ai.request.model")
+                                == Some(&Value::from(model.to_owned()));
+                            let error_matches = match error {
+                                None => find("error.type").is_none(),
+                                Some(kind) => {
+                                    find("error.type") == Some(&Value::from(kind.to_owned()))
+                                }
+                            };
+                            if model_matches && error_matches {
+                                total += point.count();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// Current cumulative value of counter `name` summed over every data point
+    /// whose attributes include all of `want`.
+    pub(crate) fn sum(name: &str, want: &[(&str, Value)]) -> u64 {
+        let (exporter, provider) = state();
+        exporter.reset();
+        provider.force_flush().expect("flush metrics");
+        let mut total = 0;
+        for resource in exporter.get_finished_metrics().expect("finished metrics") {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics().filter(|metric| metric.name() == name) {
+                    if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                        for point in sum.data_points() {
+                            let attrs: Vec<_> = point.attributes().collect();
+                            if want.iter().all(|(key, value)| {
+                                attrs
+                                    .iter()
+                                    .any(|kv| kv.key.as_str() == *key && &kv.value == value)
+                            }) {
+                                total += point.value();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        total
+    }
+}
+
 /// Isolated, capture-based trace tests; never installs global telemetry or uses OTLP.
 pub(crate) mod genai_trace {
     use opentelemetry::trace::TracerProvider as _;
@@ -175,6 +272,7 @@ pub fn mock_tool_call(id: &str, name: &str, args: &str) -> ToolCall {
             name: name.to_string(),
             arguments: args.to_string(),
         },
+        invalid_input: false,
     }
 }
 
@@ -258,23 +356,42 @@ pub fn register_mock_provider(registry: &PluginRegistry) {
     )));
 }
 
-pub fn mock_plugin_registry(
+/// Renders a filesystem path as a quoted TOML string value (including the
+/// surrounding quotes), escaping it correctly for the TOML grammar.
+///
+/// Interpolating `path.display()` into `"..."` is wrong on Windows: TOML basic
+/// strings treat `\` as an escape, so `C:\Users\...` fails to parse (`\U`).
+pub fn toml_path_value(path: &std::path::Path) -> String {
+    toml::Value::String(path.to_string_lossy().into_owned()).to_string()
+}
+
+/// Builds a [`PluginRegistry`] with a single `mock` provider backed by `factory`,
+/// writing its config into `dir`.
+pub fn mock_plugin_registry_in(
+    dir: &std::path::Path,
     factory: Arc<TestProviderFactory>,
-) -> Result<(PluginRegistry, TempDir)> {
-    let temp_dir = TempDir::new()?;
-    let wasm_path = temp_dir.path().join("mock.wasm");
+) -> Result<PluginRegistry> {
+    let wasm_path = dir.join("mock.wasm");
     std::fs::write(&wasm_path, "")?;
-    let config_path = temp_dir.path().join("providers.toml");
+    let config_path = dir.join("providers.toml");
     std::fs::write(
         &config_path,
         format!(
-            "[[providers]]\nname = \"mock\"\npath = \"{}\"\n",
-            wasm_path.display()
+            "[[providers]]\nname = \"mock\"\npath = {}\n",
+            toml_path_value(&wasm_path)
         ),
     )?;
 
     let mut registry = PluginRegistry::from_path(&config_path)?;
     registry.register_loader(Box::new(TestPluginLoader { factory }));
+    Ok(registry)
+}
+
+pub fn mock_plugin_registry(
+    factory: Arc<TestProviderFactory>,
+) -> Result<(PluginRegistry, TempDir)> {
+    let temp_dir = TempDir::new()?;
+    let registry = mock_plugin_registry_in(temp_dir.path(), factory)?;
     Ok((registry, temp_dir))
 }
 
@@ -324,14 +441,22 @@ impl UndoTestFixture {
 
     /// Create a session and return its public ID
     pub async fn create_session(&self) -> Result<String> {
+        self.create_session_with_cwd(self.worktree.path()).await
+    }
+
+    /// Create a session bound to an explicit workspace cwd and return its
+    /// public ID. The session actor is registered against the same cwd so
+    /// undo/redo operate on that workspace.
+    pub async fn create_session_with_cwd(&self, cwd: &std::path::Path) -> Result<String> {
         let session = self
             .storage
             .session_store()
-            .create_session(None, Some(self.worktree.path().to_path_buf()), None, None)
+            .create_session(None, Some(cwd.to_path_buf()), None, None)
             .await?;
 
         // Spawn a SessionActor via the kameo registry
-        self.register_session_actor(&session.public_id).await;
+        self.register_session_actor_with_cwd(&session.public_id, cwd)
+            .await;
 
         Ok(session.public_id)
     }
@@ -357,11 +482,21 @@ impl UndoTestFixture {
 
     /// Helper to spawn a SessionActor for a session (needed for undo/redo via kameo)
     async fn register_session_actor(&self, session_id: &str) {
+        self.register_session_actor_with_cwd(session_id, self.worktree.path())
+            .await;
+    }
+
+    /// Spawn a SessionActor whose runtime cwd binds to an explicit workspace
+    pub(crate) async fn register_session_actor_with_cwd(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+    ) {
         use crate::agent::session_actor::SessionActor;
         use kameo::actor::Spawn;
 
         let runtime = crate::agent::core::SessionRuntime::new(
-            Some(self.worktree.path().to_path_buf()),
+            Some(cwd.to_path_buf()),
             std::collections::HashMap::new(),
             crate::agent::core::McpToolState::empty(),
         );
@@ -451,8 +586,18 @@ impl UndoTestFixture {
 
     /// Take a snapshot and record TurnSnapshotStart
     pub async fn take_pre_snapshot(&self, session_id: &str) -> Result<(String, String)> {
-        let snapshot_id = self.backend.track(self.worktree.path()).await?;
-        let turn_id = Uuid::now_v7().to_string();
+        self.take_pre_snapshot_with_cwd(session_id, self.worktree.path())
+            .await
+    }
+
+    /// Take a snapshot in an explicit workspace and record TurnSnapshotStart
+    pub async fn take_pre_snapshot_with_cwd(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+    ) -> Result<(String, String)> {
+        let snapshot_id = self.backend.track(cwd).await?;
+        let turn_id = Uuid::new_v4().to_string();
 
         let msg = AgentMessage {
             id: Uuid::new_v4().to_string(),
@@ -461,6 +606,8 @@ impl UndoTestFixture {
             parts: vec![MessagePart::TurnSnapshotStart {
                 turn_id: turn_id.clone(),
                 snapshot_id: snapshot_id.clone(),
+                workspace_root: Some(cwd.to_path_buf()),
+                inherited: false,
             }],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
@@ -482,11 +629,23 @@ impl UndoTestFixture {
         turn_id: &str,
         pre_snapshot: &str,
     ) -> Result<Vec<String>> {
-        let post_snapshot = self.backend.track(self.worktree.path()).await?;
+        self.take_post_snapshot_with_cwd(session_id, turn_id, pre_snapshot, self.worktree.path())
+            .await
+    }
+
+    /// Take a post-snapshot in an explicit workspace and record TurnSnapshotPatch
+    pub async fn take_post_snapshot_with_cwd(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        pre_snapshot: &str,
+        cwd: &std::path::Path,
+    ) -> Result<Vec<String>> {
+        let post_snapshot = self.backend.track(cwd).await?;
         let pre_snapshot_string = pre_snapshot.to_string();
         let changed_paths = self
             .backend
-            .diff(self.worktree.path(), &pre_snapshot_string, &post_snapshot)
+            .diff(cwd, &pre_snapshot_string, &post_snapshot)
             .await?;
 
         let changed_strs: Vec<String> = changed_paths
@@ -502,6 +661,8 @@ impl UndoTestFixture {
                 turn_id: turn_id.to_string(),
                 snapshot_id: post_snapshot,
                 changed_paths: changed_strs.clone(),
+                workspace_root: Some(cwd.to_path_buf()),
+                inherited: false,
             }],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
@@ -522,9 +683,20 @@ impl UndoTestFixture {
         Ok(())
     }
 
+    /// Convenience: write a file under an explicit workspace
+    pub fn write_file_in(&self, cwd: &std::path::Path, name: &str, content: &str) -> Result<()> {
+        std::fs::write(cwd.join(name), content)?;
+        Ok(())
+    }
+
     /// Convenience: read a file from the worktree
     pub fn read_file(&self, name: &str) -> Result<String> {
         Ok(std::fs::read_to_string(self.worktree.path().join(name))?)
+    }
+
+    /// Convenience: read a file under an explicit workspace
+    pub fn read_file_in(&self, cwd: &std::path::Path, name: &str) -> Result<String> {
+        Ok(std::fs::read_to_string(cwd.join(name))?)
     }
 
     /// Perform undo operation via AgentHandle
@@ -568,6 +740,7 @@ impl DelegateTestFixture {
         let mut registry = DefaultAgentRegistry::new();
         registry.register(
             AgentInfo {
+                isolation: Default::default(),
                 id: "coder".to_string(),
                 name: "Coder".to_string(),
                 description: "Delegate coder".to_string(),
@@ -597,5 +770,19 @@ impl DelegateTestFixture {
             delegate,
             delegate_storage,
         })
+    }
+}
+
+#[cfg(test)]
+mod toml_path_value_tests {
+    use super::toml_path_value;
+    use std::path::Path;
+
+    #[test]
+    fn toml_path_value_round_trips_windows_style_paths() {
+        let raw = r#"C:\Users\RUNNER~1\AppData\Local\Temp\.tmpfnisBA\it's "x"\mock.wasm"#;
+        let doc = format!("path = {}\n", toml_path_value(Path::new(raw)));
+        let parsed: toml::Table = toml::from_str(&doc).expect("valid TOML");
+        assert_eq!(parsed["path"].as_str(), Some(raw));
     }
 }

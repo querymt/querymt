@@ -1,75 +1,76 @@
 # AGENTS.md
 
-## Preferences
-- Developer preferences are high priority; follow them strictly.
-- If you are being corrected by developer while doing something or asked to redo, extract the preference and add it here.
-- Keep changes minimal and focused; avoid drive-by refactors.
-- Use `log`/`tracing` macros (match the surrounding crate) instead of `println!/eprintln!`.
-- After any Rust code changes, run `cargo check` (target the smallest package possible, e.g. `-p querymt-cli`).
-- Run `cargo fmt` only after `cargo check` passes.
-- Add tests when introducing behavior changes if the crate has an existing test pattern.
+## Working Rules
+
+- Keep changes minimal and focused; avoid drive-by refactors and unrelated cleanup.
+- Preserve existing staged, unstaged and untracked work.
+- Keep this file limited to durable, repository-wide guidance. Do not automatically
+  append task-specific corrections.
+- Never write to, migrate, replace or delete the user's existing session database.
+  Use a fresh test database or an online backup made through a read-only source
+  connection; all test writes stay in the test database.
+- Never stop or restart user-run QueryMT services or pre-existing `qmtcode` processes.
+  Use separate test instances and stop only processes created for the current test.
 
 ## Repository Overview
-- Language: Rust workspace (mixed editions; workspace defaults to 2024 but some crates may pin 2021).
-- Workspace root: `Cargo.toml` (members under `crates/`).
-- Key packages:
-  - `querymt` (core library)
-  - `querymt-cli`
-  - `querymt-agent` (agent + optional embedded dashboard from `querymt-desktop`)
-  - `querymt-service` (Axum service; bin `qmt-service`)
-  - Provider crates under `crates/providers/*`
-- Toolchain: `rust-toolchain.toml` (stable + clippy + rustfmt; includes `wasm32-wasip1`).
 
-## Build, Lint, and Test Commands
+- Workspace members and toolchain are defined in `Cargo.toml` and `rust-toolchain.toml`.
+- `querymt`: core library; `querymt-cli`: the `qmt` CLI.
+- `querymt-agent`: agent runtime and optional embedded dashboard.
+- `querymt-remote`: shared mesh and remote-provider primitives.
+- `querymt-service-client`: service OAuth and API client primitives, not a server.
+- Provider crates live under `crates/providers/`.
 
-When running any of the commands below, prefer delegating to a subagent when available for efficiency.
+## Development Environment
 
-### Workspace
-- Check: `cargo check`
-- Format: `cargo fmt --all`
-- Format (CI-style): `cargo fmt --all -- --check`
-- Lint: `cargo clippy --all-targets -- -D warnings`
-- Tests: `cargo test`
+- Detect Nix first. When available, use the project devShell (`nix develop` or
+  `nix develop -c <command>`); an active project direnv shell is sufficient.
+- Without Nix, use the supported native toolchain and dependencies. Check `flake.nix`
+  for supported Nix platforms; diagnose setup failures rather than silently
+  switching toolchains or environments.
+- Run the commands below from the repository root inside the selected environment.
 
-### Package-scoped (preferred for iteration)
-- `cargo check -p querymt`
-- `cargo check -p querymt-cli`
-- `cargo check -p querymt-agent`
-- `cargo check -p querymt-service`
+## Validation
 
-### Agent crate (matches CI)
-- `cargo clippy -p querymt-agent --all-targets --features dashboard,oauth,remote -- -D warnings`
+- After Rust edits, run `cargo check` for the smallest affected package and relevant
+  features. Run `cargo fmt` only after that check passes.
+- Use focused red/green tests where applicable: demonstrate the actual failure,
+  then verify the fix. Each added case must protect a distinct required behavior
+  or real regression; prefer extending existing tests and fixtures.
+- Do not add tests solely to prove deleted functionality stays deleted, repeat
+  implementation logic or constants, or multiply equivalent input combinations.
+  Avoid brittle assertions on incidental values and unrelated lifecycle checks.
+- Keep test scaffolding proportional to the change. Reuse existing checks before
+  adding helpers, dependencies or frameworks; moving excess into another file
+  is not simplification. Trim redundant cases without weakening the real regression.
+- Start with package-scoped checks; replace `<package>` and `<test_filter>`:
+  ```sh
+  cargo check -p <package>
+  cargo test -p <package> <test_filter>
+  cargo fmt -p <package> -- --check
+  cargo clippy -p <package> --all-targets -- -D warnings
+  ```
+- Expand validation to affected consumers and feature combinations. Consult the
+  relevant `.github/workflows/` file for CI commands/features and `.config/nextest.toml`
+  for test timeouts.
+- Whole-workspace checks are optional broader validation, not the default iteration
+  loop. Native providers can require expensive builds or model downloads; inspect
+  their workflows before selecting tests. Do not apply `--all-features` indiscriminately.
+- Report checks actually run, failures and remaining gaps. Do not describe partial
+  validation as complete. Documentation-only edits do not require a Rust build.
 
-### Dashboard
-- The Svelte dashboard source lives in the separate `querymt-desktop` repository.
-- Automatic pinned-source dashboard builds require Node.js and npm, then run the embedded tests/build.
-- `QMT_UI_DIST` optionally selects a prebuilt local directory or `.tar.gz` archive and takes priority over other UI selection.
-- A plain `QMT_UI_REVISION` selects a Git SHA, tag, or ref to build from source.
-- Content-pinned release forms are `sha256:<64hex>` (latest release) and `<release>@sha256:<64hex>` (including `latest@sha256:<64hex>`).
+## Dashboard Boundary
 
-## Code Style Guidelines
+- UI implementation and testing belong to the separate `querymt-desktop` repository.
+  Report required UI follow-up rather than expanding backend work into that repo.
+- For backend-only checks with `dashboard` enabled, use the `QMT_UI_DIST` fixture
+  in `.github/workflows/test-agent.yml` instead of rebuilding the frontend.
 
-### Formatting
-- Use `rustfmt` defaults.
-- Prefer readable code over manual alignment.
+## Code Conventions
 
-### Imports
-- Group imports: `std` first, then external crates, then `crate`/`super`.
-- Avoid glob imports in library code.
-
-### Error Handling
-- Prefer propagating errors with `?`.
-- Avoid `unwrap/expect` in non-test code.
-- `anyhow::Result` is fine for binaries/examples; libraries should use their existing error conventions.
-
-### Logging and Tracing
-- Prefer structured logging via `log::*` or `tracing::*` depending on the crate.
-- Include enough context to debug provider/service failures (model, provider, request id) but avoid logging secrets.
-
-### Async
-- Prefer Tokio for async entry points.
-- Avoid blocking in async contexts; use `spawn_blocking` when needed.
-
-### API Surface
-- Keep public APIs small; use `pub(crate)` for internals.
-- Avoid changing wire formats/config fields unless explicitly requested.
+- Follow surrounding code, rustfmt and existing error conventions.
+- Use the surrounding crate's `log`/`tracing` conventions for diagnostics; preserve
+  intentional CLI/protocol output. Include useful failure context without secrets.
+- Implement backward compatibility only when explicitly requested by the user.
+  Do not add compatibility layers or preserve legacy behavior by default. If a change
+  appears to require backward compatibility, flag it for user review before implementing it.

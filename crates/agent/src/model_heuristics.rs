@@ -8,8 +8,23 @@
 //! (Qwen, Gemini, GLM, MiniMax, Kimi, GPT-5, Claude, etc.) and provider-specific
 //! API requirements (OpenAI store flag, Google thinkingConfig, etc.).
 
+use querymt::providers::ModelInfo;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+
+/// Output-token cap used when the configuration does not set `max_tokens`
+/// and the model does not advertise a smaller output limit.
+const DEFAULT_OUTPUT_CAP: u32 = 32_000;
+
+/// Output-token caps for a session: where requests start and how far an
+/// escalation may go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputCaps {
+    /// Cap sent with ordinary requests.
+    pub initial: u32,
+    /// Highest cap escalation may request. Never below `initial`.
+    pub ceiling: u32,
+}
 
 /// Heuristic defaults for a given provider + model combination.
 ///
@@ -22,6 +37,8 @@ pub struct ModelDefaults {
     pub top_p: Option<f32>,
     pub top_k: Option<u32>,
     pub max_tokens: Option<u32>,
+    /// Model output-token limit from model metadata, when known.
+    pub output_limit: Option<u32>,
     /// Provider-specific structured options (e.g. `extra_body`, `usage`, `reasoning_effort`).
     pub provider_options: HashMap<String, Value>,
     /// Provider ID for provider-specific transformations
@@ -30,15 +47,59 @@ pub struct ModelDefaults {
 
 impl ModelDefaults {
     /// Compute heuristic defaults for a provider + model pair.
-    pub fn for_model(provider: &str, model: &str) -> Self {
+    ///
+    /// `model_info` supplies the model's output limit, which bounds the default
+    /// `max_tokens` and becomes the escalation ceiling (see [`Self::output_caps`]).
+    pub fn for_model(provider: &str, model: &str, model_info: Option<&ModelInfo>) -> Self {
+        let output_limit = model_info
+            .and_then(|info| info.limits.output)
+            .and_then(|limit| u32::try_from(limit).ok())
+            .filter(|&limit| limit > 0);
         Self {
             temperature: default_temperature(model),
             top_p: default_top_p(model),
             top_k: default_top_k(model),
-            max_tokens: default_max_tokens(provider),
+            max_tokens: default_max_tokens(provider, output_limit),
+            output_limit,
             provider_options: default_provider_options(provider, model),
             provider: provider.to_string(),
         }
+    }
+
+    /// Whether model metadata can change the output caps for `provider`.
+    ///
+    /// Metadata lookups parse the models.dev cache, so callers should skip them
+    /// when this is `false`: an explicit `max_tokens` is its own ceiling, and a
+    /// provider without a default cap has nothing to escalate from.
+    pub fn wants_model_info(provider: &str, config: &Value) -> bool {
+        default_max_tokens(provider, None).is_some() && config.get("max_tokens").is_none()
+    }
+
+    /// Output caps that result from applying these defaults to `config`.
+    ///
+    /// Call this with the config *before* [`Self::apply_to`]: an explicit
+    /// `max_tokens` is used as-is and is its own ceiling, so escalation never
+    /// exceeds an explicit choice. Otherwise the cap starts at the default and
+    /// may escalate up to the model's output limit. Returns `None` when no cap
+    /// is known (the provider decides), in which case there is nothing to escalate.
+    pub fn output_caps(&self, config: &Value) -> Option<OutputCaps> {
+        let explicit = config
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .and_then(|tokens| u32::try_from(tokens).ok());
+        if let Some(cap) = explicit {
+            return Some(OutputCaps {
+                initial: cap,
+                ceiling: cap,
+            });
+        }
+        let initial = self.max_tokens?;
+        Some(OutputCaps {
+            initial,
+            ceiling: self
+                .output_limit
+                .map_or(initial, |limit| limit.max(initial)),
+        })
     }
 
     /// Apply these defaults to a JSON config object.
@@ -176,7 +237,10 @@ fn default_temperature(model: &str) -> Option<f32> {
     if id.contains("qwen") {
         return Some(0.55);
     }
-    // Claude: let Anthropic's API use its own default
+    // Claude: leave unset. The Anthropic provider omits `temperature` (and
+    // `top_p`/`top_k`) whenever the model rejects them (Opus 4.7+, Claude 5+,
+    // Fable, Mythos) or when thinking is sent, so a default here would only be
+    // dropped or risk a rejected request.
     if id.contains("claude") {
         return None;
     }
@@ -229,13 +293,10 @@ fn default_top_k(model: &str) -> Option<u32> {
     None
 }
 
-fn default_max_tokens(provider: &str) -> Option<u32> {
+fn default_max_tokens(provider: &str, output_limit: Option<u32>) -> Option<u32> {
     // Anthropic requires max_tokens to be set explicitly
-    if provider == "anthropic" {
-        return Some(32_000);
-    }
-
-    None
+    (provider == "anthropic")
+        .then(|| output_limit.map_or(DEFAULT_OUTPUT_CAP, |limit| limit.min(DEFAULT_OUTPUT_CAP)))
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +321,21 @@ fn default_provider_options(provider: &str, model: &str) -> HashMap<String, Valu
     if provider == "openrouter" {
         opts.insert("usage".into(), json!({"include": true}));
     }
+
+    // Strict tool use for the builtin edit tools. The provider has no
+    // built-in list; `apply_to` only fills it when the user hasn't set it.
+    if provider == "anthropic" {
+        opts.insert(
+            "strict_tools".into(),
+            json!(crate::tools::builtins::DEFAULT_STRICT_TOOLS),
+        );
+    }
+
+    // Claude thinking effort is intentionally absent here: session effort "auto" stays unset
+    // and the Anthropic provider resolves it per model class (default-on
+    // adaptive models keep API defaults, opt-in adaptive models get adaptive
+    // thinking, budget models get none). Inserting an effort would turn "auto"
+    // into an explicit effort in stored configs and the session UI.
 
     // Default reasoning effort for model families that benefit from it.
     if id.contains("gemini-3") {
@@ -298,62 +374,148 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
+    // Output caps (initial cap + escalation ceiling)
+    // -----------------------------------------------------------------------
+
+    fn info_with_output_limit(limit: u64) -> ModelInfo {
+        let mut info = ModelInfo::default();
+        info.limits.output = Some(limit);
+        info
+    }
+
+    #[test]
+    fn output_caps_for_large_output_model_start_at_32k_with_model_ceiling() {
+        let info = info_with_output_limit(128_000);
+        let d = ModelDefaults::for_model("anthropic", "claude-sonnet-5-5", Some(&info));
+        assert_eq!(d.max_tokens, Some(32_000));
+        assert_eq!(
+            d.output_caps(&json!({})),
+            Some(OutputCaps {
+                initial: 32_000,
+                ceiling: 128_000
+            })
+        );
+    }
+
+    #[test]
+    fn output_caps_clamp_initial_cap_to_small_output_limit() {
+        let info = info_with_output_limit(8_192);
+        let d = ModelDefaults::for_model("anthropic", "claude-3-haiku", Some(&info));
+        assert_eq!(
+            d.output_caps(&json!({})),
+            Some(OutputCaps {
+                initial: 8_192,
+                ceiling: 8_192
+            })
+        );
+    }
+
+    #[test]
+    fn output_caps_for_unknown_anthropic_model_use_32k_for_both() {
+        let d = ModelDefaults::for_model("anthropic", "claude-unknown", None);
+        assert_eq!(
+            d.output_caps(&json!({})),
+            Some(OutputCaps {
+                initial: 32_000,
+                ceiling: 32_000
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_max_tokens_is_its_own_ceiling() {
+        let info = info_with_output_limit(128_000);
+        let d = ModelDefaults::for_model("anthropic", "claude-sonnet-5-5", Some(&info));
+        assert_eq!(
+            d.output_caps(&json!({"max_tokens": 20_000})),
+            Some(OutputCaps {
+                initial: 20_000,
+                ceiling: 20_000
+            })
+        );
+    }
+
+    #[test]
+    fn model_info_is_only_wanted_when_it_can_change_the_caps() {
+        assert!(ModelDefaults::wants_model_info("anthropic", &json!({})));
+        assert!(!ModelDefaults::wants_model_info(
+            "anthropic",
+            &json!({"max_tokens": 20_000})
+        ));
+        assert!(!ModelDefaults::wants_model_info("openai", &json!({})));
+    }
+
+    #[test]
+    fn output_caps_are_unknown_without_any_cap_source() {
+        let d = ModelDefaults::for_model("openai", "gpt-4o", None);
+        assert_eq!(d.output_caps(&json!({})), None);
+    }
+
+    #[test]
+    fn non_anthropic_model_with_output_limit_keeps_provider_default_cap() {
+        let info = info_with_output_limit(16_384);
+        let d = ModelDefaults::for_model("openai", "gpt-4o", Some(&info));
+        assert_eq!(d.max_tokens, None);
+        assert_eq!(d.output_limit, Some(16_384));
+    }
+
+    // -----------------------------------------------------------------------
     // Temperature heuristics
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_qwen_temperature() {
-        let d = ModelDefaults::for_model("alibaba", "qwen-2.5-coder");
+        let d = ModelDefaults::for_model("alibaba", "qwen-2.5-coder", None);
         assert_eq!(d.temperature, Some(0.55));
     }
 
     #[test]
     fn test_claude_no_temperature() {
-        let d = ModelDefaults::for_model("anthropic", "claude-sonnet-4-20250514");
+        let d = ModelDefaults::for_model("anthropic", "claude-sonnet-4-20250514", None);
         assert_eq!(d.temperature, None);
     }
 
     #[test]
     fn test_gemini_temperature() {
-        let d = ModelDefaults::for_model("google", "gemini-2.5-pro");
+        let d = ModelDefaults::for_model("google", "gemini-2.5-pro", None);
         assert_eq!(d.temperature, Some(1.0));
     }
 
     #[test]
     fn test_glm_temperature() {
-        let d = ModelDefaults::for_model("zai", "glm-4.6");
+        let d = ModelDefaults::for_model("zai", "glm-4.6", None);
         assert_eq!(d.temperature, Some(1.0));
-        let d = ModelDefaults::for_model("zai", "glm-4.7");
+        let d = ModelDefaults::for_model("zai", "glm-4.7", None);
         assert_eq!(d.temperature, Some(1.0));
     }
 
     #[test]
     fn test_minimax_temperature() {
-        let d = ModelDefaults::for_model("minimax", "minimax-m2");
+        let d = ModelDefaults::for_model("minimax", "minimax-m2", None);
         assert_eq!(d.temperature, Some(1.0));
     }
 
     #[test]
     fn test_kimi_k2_base_temperature() {
-        let d = ModelDefaults::for_model("moonshot", "kimi-k2");
+        let d = ModelDefaults::for_model("moonshot", "kimi-k2", None);
         assert_eq!(d.temperature, Some(0.6));
     }
 
     #[test]
     fn test_kimi_k2_thinking_temperature() {
-        let d = ModelDefaults::for_model("moonshot", "kimi-k2-thinking");
+        let d = ModelDefaults::for_model("moonshot", "kimi-k2-thinking", None);
         assert_eq!(d.temperature, Some(1.0));
     }
 
     #[test]
     fn test_kimi_k2_5_temperature() {
-        let d = ModelDefaults::for_model("moonshot", "kimi-k2.5");
+        let d = ModelDefaults::for_model("moonshot", "kimi-k2.5", None);
         assert_eq!(d.temperature, Some(1.0));
     }
 
     #[test]
     fn test_unknown_model_no_temperature() {
-        let d = ModelDefaults::for_model("some-provider", "some-model");
+        let d = ModelDefaults::for_model("some-provider", "some-model", None);
         assert_eq!(d.temperature, None);
     }
 
@@ -363,31 +525,31 @@ mod tests {
 
     #[test]
     fn test_qwen_top_p() {
-        let d = ModelDefaults::for_model("alibaba", "qwen-2.5-coder");
+        let d = ModelDefaults::for_model("alibaba", "qwen-2.5-coder", None);
         assert_eq!(d.top_p, Some(1.0));
     }
 
     #[test]
     fn test_gemini_top_p() {
-        let d = ModelDefaults::for_model("google", "gemini-2.5-pro");
+        let d = ModelDefaults::for_model("google", "gemini-2.5-pro", None);
         assert_eq!(d.top_p, Some(0.95));
     }
 
     #[test]
     fn test_minimax_top_p() {
-        let d = ModelDefaults::for_model("minimax", "minimax-m2");
+        let d = ModelDefaults::for_model("minimax", "minimax-m2", None);
         assert_eq!(d.top_p, Some(0.95));
     }
 
     #[test]
     fn test_kimi_k2_5_top_p() {
-        let d = ModelDefaults::for_model("moonshot", "kimi-k2.5");
+        let d = ModelDefaults::for_model("moonshot", "kimi-k2.5", None);
         assert_eq!(d.top_p, Some(0.95));
     }
 
     #[test]
     fn test_claude_no_top_p() {
-        let d = ModelDefaults::for_model("anthropic", "claude-sonnet-4-20250514");
+        let d = ModelDefaults::for_model("anthropic", "claude-sonnet-4-20250514", None);
         assert_eq!(d.top_p, None);
     }
 
@@ -397,25 +559,25 @@ mod tests {
 
     #[test]
     fn test_minimax_m2_top_k() {
-        let d = ModelDefaults::for_model("minimax", "minimax-m2");
+        let d = ModelDefaults::for_model("minimax", "minimax-m2", None);
         assert_eq!(d.top_k, Some(20));
     }
 
     #[test]
     fn test_minimax_m2_1_top_k() {
-        let d = ModelDefaults::for_model("minimax", "minimax-m2.1");
+        let d = ModelDefaults::for_model("minimax", "minimax-m2.1", None);
         assert_eq!(d.top_k, Some(40));
     }
 
     #[test]
     fn test_gemini_top_k() {
-        let d = ModelDefaults::for_model("google", "gemini-2.5-pro");
+        let d = ModelDefaults::for_model("google", "gemini-2.5-pro", None);
         assert_eq!(d.top_k, Some(64));
     }
 
     #[test]
     fn test_claude_no_top_k() {
-        let d = ModelDefaults::for_model("anthropic", "claude-sonnet-4-20250514");
+        let d = ModelDefaults::for_model("anthropic", "claude-sonnet-4-20250514", None);
         assert_eq!(d.top_k, None);
     }
 
@@ -425,13 +587,57 @@ mod tests {
 
     #[test]
     fn test_anthropic_max_tokens() {
-        let d = ModelDefaults::for_model("anthropic", "claude-sonnet-4-20250514");
+        let d = ModelDefaults::for_model("anthropic", "claude-sonnet-4-20250514", None);
         assert_eq!(d.max_tokens, Some(32_000));
     }
 
     #[test]
+    fn test_anthropic_defaults_never_insert_reasoning_effort() {
+        for model in [
+            "claude-sonnet-4-20250514",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-6",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-mythos-preview",
+            "us.anthropic.claude-opus-4-7-v1:0",
+        ] {
+            let d = ModelDefaults::for_model("anthropic", model, None);
+            assert!(
+                !d.provider_options.contains_key("reasoning_effort"),
+                "{model}: auto must be resolved by the provider"
+            );
+            assert_eq!(d.temperature, None, "{model}");
+        }
+    }
+
+    #[test]
+    fn anthropic_defaults_strict_tools_only_when_unset() {
+        let d = ModelDefaults::for_model("anthropic", "claude-sonnet-5-5", None);
+
+        let mut config = json!({});
+        d.apply_to(&mut config, "sid");
+        assert_eq!(
+            config["strict_tools"],
+            json!(["edit", "multiedit", "replace_symbol"])
+        );
+
+        // Explicit user values (including an empty list) win.
+        for explicit in [json!([]), json!(["glob"])] {
+            let mut config = json!({"strict_tools": explicit.clone()});
+            d.apply_to(&mut config, "sid");
+            assert_eq!(config["strict_tools"], explicit);
+        }
+
+        let other = ModelDefaults::for_model("openai", "gpt-4o", None);
+        assert!(!other.provider_options.contains_key("strict_tools"));
+    }
+
+    #[test]
     fn test_openai_no_max_tokens() {
-        let d = ModelDefaults::for_model("openai", "gpt-4o");
+        let d = ModelDefaults::for_model("openai", "gpt-4o", None);
         assert_eq!(d.max_tokens, None);
     }
 
@@ -441,27 +647,27 @@ mod tests {
 
     #[test]
     fn test_openai_extra_body_store_false() {
-        let d = ModelDefaults::for_model("openai", "gpt-4o");
+        let d = ModelDefaults::for_model("openai", "gpt-4o", None);
         let extra = d.provider_options.get("extra_body").unwrap();
         assert_eq!(extra["store"], json!(false));
     }
 
     #[test]
     fn test_openai_extra_body_prompt_cache_key() {
-        let d = ModelDefaults::for_model("openai", "gpt-4o");
+        let d = ModelDefaults::for_model("openai", "gpt-4o", None);
         let extra = d.provider_options.get("extra_body").unwrap();
         assert_eq!(extra["prompt_cache_key"], json!("__session_id__"));
     }
 
     #[test]
     fn test_google_no_raw_thinking_config_heuristic() {
-        let d = ModelDefaults::for_model("google", "gemini-2.5-pro");
+        let d = ModelDefaults::for_model("google", "gemini-2.5-pro", None);
         assert!(!d.provider_options.contains_key("thinkingConfig"));
     }
 
     #[test]
     fn test_google_gemini3_sets_reasoning_effort() {
-        let d = ModelDefaults::for_model("google", "gemini-3-pro");
+        let d = ModelDefaults::for_model("google", "gemini-3-pro", None);
         assert_eq!(
             d.provider_options.get("reasoning_effort"),
             Some(&json!("high"))
@@ -470,7 +676,7 @@ mod tests {
 
     #[test]
     fn test_openrouter_usage() {
-        let d = ModelDefaults::for_model("openrouter", "some-model");
+        let d = ModelDefaults::for_model("openrouter", "some-model", None);
         assert_eq!(
             d.provider_options.get("usage"),
             Some(&json!({"include": true}))
@@ -479,7 +685,7 @@ mod tests {
 
     #[test]
     fn test_openrouter_gemini3_sets_reasoning_effort() {
-        let d = ModelDefaults::for_model("openrouter", "gemini-3-pro");
+        let d = ModelDefaults::for_model("openrouter", "gemini-3-pro", None);
         assert_eq!(
             d.provider_options.get("reasoning_effort"),
             Some(&json!("high"))
@@ -488,7 +694,7 @@ mod tests {
 
     #[test]
     fn test_zai_thinking() {
-        let d = ModelDefaults::for_model("zai", "glm-4.6");
+        let d = ModelDefaults::for_model("zai", "glm-4.6", None);
         let extra = d.provider_options.get("extra_body").unwrap();
         assert_eq!(
             extra.get("thinking"),
@@ -498,7 +704,7 @@ mod tests {
 
     #[test]
     fn test_gpt5_reasoning_effort() {
-        let d = ModelDefaults::for_model("openai", "gpt-5");
+        let d = ModelDefaults::for_model("openai", "gpt-5", None);
         let extra = d.provider_options.get("extra_body").unwrap();
         assert_eq!(
             d.provider_options.get("reasoning_effort"),
@@ -511,7 +717,7 @@ mod tests {
 
     #[test]
     fn test_gpt5_pro_no_reasoning_effort() {
-        let d = ModelDefaults::for_model("openai", "gpt-5-pro");
+        let d = ModelDefaults::for_model("openai", "gpt-5-pro", None);
         let extra = d.provider_options.get("extra_body").unwrap();
         assert!(!d.provider_options.contains_key("reasoning_effort"));
         // OpenAI defaults should still be present
@@ -520,13 +726,13 @@ mod tests {
 
     #[test]
     fn test_gpt5_chat_no_reasoning_effort() {
-        let d = ModelDefaults::for_model("openai", "gpt-5-chat");
+        let d = ModelDefaults::for_model("openai", "gpt-5-chat", None);
         assert!(!d.provider_options.contains_key("reasoning_effort"));
     }
 
     #[test]
     fn test_gpt5_dot_verbosity() {
-        let d = ModelDefaults::for_model("openai", "gpt-5.1");
+        let d = ModelDefaults::for_model("openai", "gpt-5.1", None);
         let extra = d.provider_options.get("extra_body").unwrap();
         assert_eq!(extra["verbosity"], json!("medium"));
         // Should also have reasoning effort default and OpenAI defaults
@@ -540,7 +746,7 @@ mod tests {
 
     #[test]
     fn test_gpt5_dot_azure_no_verbosity() {
-        let d = ModelDefaults::for_model("azure", "gpt-5.1");
+        let d = ModelDefaults::for_model("azure", "gpt-5.1", None);
         // Azure doesn't get OpenAI defaults, but does get reasoning effort default
         assert_eq!(
             d.provider_options.get("reasoning_effort"),
@@ -550,7 +756,7 @@ mod tests {
 
     #[test]
     fn test_gpt5_codex_no_verbosity() {
-        let d = ModelDefaults::for_model("openai", "gpt-5-codex");
+        let d = ModelDefaults::for_model("openai", "gpt-5-codex", None);
         let extra = d.provider_options.get("extra_body").unwrap();
         assert!(extra.get("verbosity").is_none());
         // OpenAI provider should get generic reasoning_effort default
@@ -563,7 +769,7 @@ mod tests {
 
     #[test]
     fn test_gpt5_dot_codex_provider_no_verbosity() {
-        let d = ModelDefaults::for_model("codex", "gpt-5.2");
+        let d = ModelDefaults::for_model("codex", "gpt-5.2", None);
         let extra = d.provider_options.get("extra_body").unwrap();
         assert!(extra.get("verbosity").is_none());
         // Codex provider should get generic reasoning_effort default
@@ -575,7 +781,7 @@ mod tests {
 
     #[test]
     fn test_unknown_provider_no_options() {
-        let d = ModelDefaults::for_model("some-provider", "some-model");
+        let d = ModelDefaults::for_model("some-provider", "some-model", None);
         assert!(d.provider_options.is_empty());
     }
 
@@ -585,7 +791,7 @@ mod tests {
 
     #[test]
     fn test_apply_to_respects_user_temperature() {
-        let d = ModelDefaults::for_model("alibaba", "qwen-2.5-coder");
+        let d = ModelDefaults::for_model("alibaba", "qwen-2.5-coder", None);
         assert_eq!(d.temperature, Some(0.55));
 
         let mut config = json!({"model": "qwen-2.5-coder", "temperature": 0.8});
@@ -597,7 +803,7 @@ mod tests {
 
     #[test]
     fn test_apply_to_fills_missing_temperature() {
-        let d = ModelDefaults::for_model("alibaba", "qwen-2.5-coder");
+        let d = ModelDefaults::for_model("alibaba", "qwen-2.5-coder", None);
         let mut config = json!({"model": "qwen-2.5-coder"});
         d.apply_to(&mut config, "session-1");
 
@@ -607,7 +813,7 @@ mod tests {
 
     #[test]
     fn test_apply_to_fills_all_sampling_params() {
-        let d = ModelDefaults::for_model("google", "gemini-2.5-pro");
+        let d = ModelDefaults::for_model("google", "gemini-2.5-pro", None);
         let mut config = json!({"model": "gemini-2.5-pro"});
         d.apply_to(&mut config, "session-1");
 
@@ -618,7 +824,7 @@ mod tests {
 
     #[test]
     fn test_apply_to_substitutes_session_id_in_extra_body() {
-        let d = ModelDefaults::for_model("openai", "gpt-4o");
+        let d = ModelDefaults::for_model("openai", "gpt-4o", None);
         let mut config = json!({"model": "gpt-4o"});
         d.apply_to(&mut config, "sess-abc-123");
 
@@ -631,7 +837,7 @@ mod tests {
 
     #[test]
     fn test_openai_responses_heuristics_build_cacheable_request() {
-        let defaults = ModelDefaults::for_model("openai", "gpt-5");
+        let defaults = ModelDefaults::for_model("openai", "gpt-5", None);
         let messages = vec![querymt::chat::ChatMessage::user().text("hello").build()];
         for session_id in ["session-1", "session-1", "session-2"] {
             let mut config = json!({
@@ -653,7 +859,7 @@ mod tests {
 
     #[test]
     fn test_codex_apply_to_omits_storage_default() {
-        let defaults = ModelDefaults::for_model("codex", "gpt-5.1-codex");
+        let defaults = ModelDefaults::for_model("codex", "gpt-5.1-codex", None);
         let mut config = json!({"model": "gpt-5.1-codex"});
         defaults.apply_to(&mut config, "session-1");
         assert_eq!(config["extra_body"]["prompt_cache_key"], "session-1");
@@ -662,7 +868,7 @@ mod tests {
 
     #[test]
     fn test_responses_preserves_user_extra_body_conflicts() {
-        let defaults = ModelDefaults::for_model("openai", "gpt-5");
+        let defaults = ModelDefaults::for_model("openai", "gpt-5", None);
         let mut config = json!({
             "model": "gpt-5", "api_key": "sk-test", "api_mode": "responses",
             "extra_body": {"promptCacheKey": "custom-key", "store": false}
@@ -679,7 +885,7 @@ mod tests {
 
     #[test]
     fn test_apply_to_user_extra_body_wins() {
-        let d = ModelDefaults::for_model("openai", "gpt-4o");
+        let d = ModelDefaults::for_model("openai", "gpt-4o", None);
         let mut config = json!({
             "model": "gpt-4o",
             "extra_body": { "prompt_cache_key": "custom-key", "store": true }
@@ -696,7 +902,7 @@ mod tests {
 
     #[test]
     fn test_apply_to_non_object_is_noop() {
-        let d = ModelDefaults::for_model("google", "gemini-2.5-pro");
+        let d = ModelDefaults::for_model("google", "gemini-2.5-pro", None);
         let mut config = json!("not-an-object");
         d.apply_to(&mut config, "session-1");
 
@@ -709,13 +915,13 @@ mod tests {
 
     #[test]
     fn test_is_empty_for_unknown() {
-        let d = ModelDefaults::for_model("unknown", "unknown");
+        let d = ModelDefaults::for_model("unknown", "unknown", None);
         assert!(d.is_empty());
     }
 
     #[test]
     fn test_is_not_empty_for_known() {
-        let d = ModelDefaults::for_model("google", "gemini-2.5-pro");
+        let d = ModelDefaults::for_model("google", "gemini-2.5-pro", None);
         assert!(!d.is_empty());
     }
 
@@ -725,7 +931,7 @@ mod tests {
 
     #[test]
     fn test_anthropic_system_caching_string() {
-        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219");
+        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
         let mut config = json!({"system": "You are a helpful assistant."});
         defaults.apply_to(&mut config, "session-1");
         assert_eq!(
@@ -738,7 +944,7 @@ mod tests {
 
     #[test]
     fn test_anthropic_system_caching_string_array() {
-        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219");
+        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
         let mut config = json!({"system": ["Part 1", "Part 2"]});
         defaults.apply_to(&mut config, "session-1");
         assert_eq!(
@@ -752,7 +958,7 @@ mod tests {
 
     #[test]
     fn anthropic_defaults_preserve_portable_instruction_hints() {
-        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219");
+        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
         let instruction = json!({"text": "stable", "cache": {"ephemeral": {"ttl_seconds": 1800}}});
         let mut config = json!({"system": [instruction.clone()]});
         defaults.apply_to(&mut config, "session");
@@ -762,7 +968,7 @@ mod tests {
 
     #[test]
     fn test_anthropic_system_caching_existing_blocks() {
-        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219");
+        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
         let mut config = json!({"system": [{"type": "text", "text": "Already a block"}]});
         defaults.apply_to(&mut config, "session-1");
         assert_eq!(
@@ -775,7 +981,7 @@ mod tests {
 
     #[test]
     fn test_anthropic_system_caching_preserves_existing_cache_control() {
-        let d = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219");
+        let d = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
         let mut config = json!({
             "model": "claude-3-7-sonnet-20250219",
             "system": [
@@ -797,7 +1003,7 @@ mod tests {
     #[test]
     fn stable_system_sections_get_portable_defaults_for_responses_and_codex() {
         for provider in ["openai", "codex"] {
-            let defaults = ModelDefaults::for_model(provider, "gpt-6.1-sol");
+            let defaults = ModelDefaults::for_model(provider, "gpt-6.1-sol", None);
             let explicit =
                 json!({"text": "explicit", "cache": {"ephemeral": {"ttl_seconds": 1800}}});
             let mut config = json!({
@@ -822,7 +1028,7 @@ mod tests {
 
     #[test]
     fn default_system_hints_reach_responses_with_provider_default_ttl() {
-        let defaults = ModelDefaults::for_model("openai", "gpt-5.6");
+        let defaults = ModelDefaults::for_model("openai", "gpt-5.6", None);
         let mut config = json!({"api_key": "sk-test", "model": "gpt-5.6", "api_mode": "responses", "system": ["stable", "later"]});
         defaults.apply_to(&mut config, "session");
         let provider: qmt_openai::OpenAI = serde_json::from_value(config).unwrap();
@@ -842,7 +1048,7 @@ mod tests {
 
     #[test]
     fn test_non_anthropic_no_system_transformation() {
-        let d = ModelDefaults::for_model("openai", "gpt-4o");
+        let d = ModelDefaults::for_model("openai", "gpt-4o", None);
         let mut config = json!({
             "model": "gpt-4o",
             "system": "You are a helpful assistant."
@@ -856,7 +1062,7 @@ mod tests {
 
     #[test]
     fn test_codex_provider_prompt_cache_key() {
-        let d = ModelDefaults::for_model("codex", "gpt-5.1-codex");
+        let d = ModelDefaults::for_model("codex", "gpt-5.1-codex", None);
         let extra = d.provider_options.get("extra_body").unwrap();
         assert_eq!(extra["prompt_cache_key"], json!("__session_id__"));
         assert!(extra.get("store").is_none());
@@ -864,7 +1070,7 @@ mod tests {
 
     #[test]
     fn test_gpt5_codex_reasoning_object() {
-        let d = ModelDefaults::for_model("codex", "gpt-5.1-codex");
+        let d = ModelDefaults::for_model("codex", "gpt-5.1-codex", None);
         let extra = d.provider_options.get("extra_body").unwrap();
         assert_eq!(
             d.provider_options.get("reasoning_effort"),
@@ -877,7 +1083,7 @@ mod tests {
 
     #[test]
     fn test_gpt5_codex_max_reasoning_object() {
-        let d = ModelDefaults::for_model("codex", "gpt-5.1-codex-max");
+        let d = ModelDefaults::for_model("codex", "gpt-5.1-codex-max", None);
         let _extra = d.provider_options.get("extra_body").unwrap();
         assert_eq!(
             d.provider_options.get("reasoning_effort"),

@@ -28,7 +28,7 @@ tracing-log = "0.2"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["logs"] }
+opentelemetry_sdk = { version = "0.32", features = ["logs", "metrics"] }
 opentelemetry-otlp = { version = "0.32", features = ["metrics", "grpc-tonic", "logs", "tls-ring", "tls-webpki-roots"] }
 tonic = { version = "0.14", default-features = false, features = ["tls-webpki-roots"] }
 opentelemetry-appender-tracing = { version = "0.32", features = ["log"] }
@@ -39,14 +39,14 @@ keyring-core = { version = "1.0", optional = true }
 serde_json = { workspace = true, optional = true }
 
 # OAuth dependencies (optional, behind oauth feature)
-anthropic-auth = { version = "0.1", default-features = false, features = ["async", "callback-server", "rustls-tls"], optional = true }
+anthropic-auth = { version = "0.2", default-features = false, features = ["async", "callback-server", "rustls-tls"], optional = true }
 openai-auth = { version = "1.0", features = ["async", "callback-server"], optional = true }
 kimi-auth = { git = "https://github.com/querymt/kimi-auth", tag = "v0.1.0", default-features = false, features = ["async", "rustls-tls"], optional = true }
 async-trait = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 anyhow = { version = "1.0", optional = true }
 url = { workspace = true, optional = true }
-tokio = { version = "1.0", features = ["time"], optional = true }
+tokio = { version = "1.0", features = ["time", "sync", "rt"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 base64 = { workspace = true, optional = true }
 sha2 = { version = "0.11", optional = true }
@@ -67,3 +67,4 @@ dbus-secret-service-keyring-store = { version = "1.0", features = ["crypto-rust"
 
 [dev-dependencies]
 opentelemetry_sdk = { version = "0.32", features = ["testing"] }
+tokio = { version = "1.0", features = ["macros", "rt", "time", "test-util"] }

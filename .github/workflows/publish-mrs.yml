@@ -48,7 +48,7 @@ jobs:
             arch: amd64
             target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            features: "cuda cudnn flash-attn"
+            features: "cuda flash-attn"
             feature_tag: cuda12.8-sm80
             needs_cuda: "true"
             cuda_version: "12.8"
@@ -58,7 +58,7 @@ jobs:
             arch: amd64
             target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            features: "cuda cudnn flash-attn"
+            features: "cuda flash-attn"
             feature_tag: cuda12.8-sm86
             needs_cuda: "true"
             cuda_version: "12.8"
@@ -68,7 +68,7 @@ jobs:
             arch: amd64
             target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            features: "cuda cudnn flash-attn"
+            features: "cuda flash-attn"
             feature_tag: cuda12.8-sm89
             needs_cuda: "true"
             cuda_version: "12.8"
@@ -78,7 +78,7 @@ jobs:
             arch: amd64
             target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            features: "cuda cudnn flash-attn"
+            features: "cuda flash-attn"
             feature_tag: cuda12.8-sm120
             needs_cuda: "true"
             cuda_version: "12.8"
@@ -89,7 +89,7 @@ jobs:
             arch: arm64
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
-            features: "cuda cudnn"
+            features: "cuda"
             feature_tag: cuda12.8-sm87
             needs_cuda: "true"
             cuda_version: "12.8"

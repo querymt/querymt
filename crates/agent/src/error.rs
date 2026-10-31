@@ -37,6 +37,10 @@ pub enum AgentError {
     #[error("session semaphore closed")]
     SessionSemaphoreClosed,
 
+    /// Another process on this machine holds the session's run lease.
+    #[error("session is running in another process")]
+    SessionRunningElsewhere { session_id: String },
+
     #[error("session execution timeout: {details}")]
     SessionTimeout { details: String },
 
@@ -100,6 +104,15 @@ pub enum AgentError {
 
     #[error("mesh admission rejected: {reason}")]
     AdmissionRejected { reason: String },
+
+    /// The remote node does not support the session interaction contract
+    /// (it lacks the interaction messages). All mesh nodes must be upgraded.
+    #[error("remote node '{node}' must be upgraded: it does not support session interactions")]
+    RemoteNodeUpgradeRequired { node: String },
+
+    /// A submitted interaction answer failed validation; the interaction stays pending.
+    #[error("invalid interaction response: {detail}")]
+    InvalidInteractionResponse { detail: String },
 
     #[error("turn control error: {message}")]
     TurnControl { kind: String, message: String },
@@ -167,6 +180,23 @@ impl From<AgentError> for AcpError {
                 "expected": expected,
                 "found": found,
             }));
+        }
+        if let AgentError::RemoteNodeUpgradeRequired { node } = &e {
+            return AcpError::new(-32603, e.to_string()).data(serde_json::json!({
+                "category": "remote_upgrade_required",
+                "node": node,
+                "message": e.to_string(),
+            }));
+        }
+        if let AgentError::SessionRunningElsewhere { session_id } = &e {
+            return AcpError::new(-32603, e.to_string()).data(serde_json::json!({
+                "category": "session_running_elsewhere",
+                "session_id": session_id,
+                "message": e.to_string(),
+            }));
+        }
+        if let AgentError::InvalidInteractionResponse { detail } = &e {
+            return AcpError::invalid_params().data(detail.clone());
         }
         if let AgentError::RemoteTransport(failure) = &e {
             return AcpError::new(-32603, e.to_string()).data(serde_json::json!({
@@ -307,6 +337,20 @@ mod tests {
         assert_eq!(error.code, ErrorCode::InternalError);
         assert!(error.message.contains("expected 30"));
         assert!(error.message.contains("found 31"));
+    }
+
+    #[test]
+    fn session_running_elsewhere_maps_to_descriptive_acp_error() {
+        let acp: AcpError = AgentError::SessionRunningElsewhere {
+            session_id: "s-1".to_string(),
+        }
+        .into();
+        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.message, "session is running in another process");
+        assert_eq!(
+            acp.data.as_ref().and_then(|d| d.get("session_id")),
+            Some(&serde_json::json!("s-1"))
+        );
     }
 
     #[test]

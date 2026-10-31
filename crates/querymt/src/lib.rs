@@ -216,7 +216,46 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
+/// Returned cache-write duration breakdown.
+///
+/// Tiers *partition* [`Usage::cache_write`]: they are a breakdown of the
+/// aggregate, never additional tokens, and no total (context, telemetry,
+/// billing) may add them on top of it. `None` is *absent* (the provider did
+/// not say), which is distinct from an explicit `Some(0)`. Tier counts that
+/// disagree with the aggregate are inconsistent; valuation reports that as
+/// uncertainty instead of choosing one side.
+#[cfg_attr(feature = "type-generation", typeshare::typeshare)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheWriteTiers {
+    /// Tokens written with a five-minute lifetime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_minute: Option<u32>,
+    /// Tokens written with a one-hour lifetime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_hour: Option<u32>,
+}
+
+impl CacheWriteTiers {
+    /// Field-wise maximum, keeping a value that only one side reports.
+    pub fn merge_max(self, other: CacheWriteTiers) -> CacheWriteTiers {
+        let max = |a: Option<u32>, b: Option<u32>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        CacheWriteTiers {
+            five_minute: max(self.five_minute, other.five_minute),
+            one_hour: max(self.one_hour, other.one_hour),
+        }
+    }
+}
+
 /// Represents the usage of tokens in a tool call, supporting multiple JSON formats.
+///
+/// The five token counters are mutually exclusive categories: each token of an
+/// attempt appears in exactly one of `input_tokens` (uncached input),
+/// `output_tokens` (non-reasoning output), `reasoning_tokens`, `cache_read`, or
+/// `cache_write`. Totals add all five once; [`Usage::cache_write_tiers`] is
+/// detail about `cache_write` and is never added.
 #[cfg_attr(feature = "type-generation", typeshare::typeshare)]
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq, Default)]
 pub struct Usage {
@@ -250,6 +289,11 @@ pub struct Usage {
     /// Tokens used to create a new cache entry.
     #[serde(default, alias = "cache_creation_input_tokens")]
     pub cache_write: u32,
+
+    /// Optional duration breakdown of `cache_write` (see [`CacheWriteTiers`]).
+    /// `None` means the provider reported no breakdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tiers: Option<CacheWriteTiers>,
 }
 
 impl Usage {
@@ -267,6 +311,10 @@ impl Usage {
             reasoning_tokens: self.reasoning_tokens.max(other.reasoning_tokens),
             cache_read: self.cache_read.max(other.cache_read),
             cache_write: self.cache_write.max(other.cache_write),
+            cache_write_tiers: match (self.cache_write_tiers, other.cache_write_tiers) {
+                (Some(a), Some(b)) => Some(a.merge_max(b)),
+                (a, b) => a.or(b),
+            },
         }
     }
 }
@@ -307,6 +355,7 @@ mod tests {
             cache_read: 100,
             cache_write: 50,
             reasoning_tokens: 0,
+            cache_write_tiers: None,
         };
         let from_message_delta = Usage {
             input_tokens: 0,   // absent in JSON, defaults to 0
@@ -314,6 +363,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reasoning_tokens: 0,
+            cache_write_tiers: None,
         };
 
         let merged = from_message_start.merge_max(from_message_delta);
@@ -326,6 +376,47 @@ mod tests {
     }
 
     #[test]
+    fn cache_write_tiers_distinguish_absent_from_zero_through_serde() {
+        let absent: Usage = serde_json::from_str(r#"{"cache_write":300}"#).unwrap();
+        assert_eq!(absent.cache_write_tiers, None);
+        assert!(!serde_json::to_string(&absent).unwrap().contains("tiers"));
+
+        let zero_hour: Usage = serde_json::from_str(
+            r#"{"cache_write":300,"cache_write_tiers":{"five_minute":300,"one_hour":0}}"#,
+        )
+        .unwrap();
+        let tiers = zero_hour.cache_write_tiers.unwrap();
+        assert_eq!((tiers.five_minute, tiers.one_hour), (Some(300), Some(0)));
+
+        // A tier reported by only one side survives; explicit zero is kept.
+        let json = serde_json::to_string(&zero_hour).unwrap();
+        let back: Usage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, zero_hour);
+        let partial: Usage =
+            serde_json::from_str(r#"{"cache_write_tiers":{"five_minute":5}}"#).unwrap();
+        assert_eq!(partial.cache_write_tiers.unwrap().one_hour, None);
+    }
+
+    #[test]
+    fn merge_max_keeps_tier_detail_reported_by_only_one_event() {
+        let start = Usage {
+            cache_write: 300,
+            cache_write_tiers: Some(CacheWriteTiers {
+                five_minute: Some(200),
+                one_hour: Some(100),
+            }),
+            ..Usage::default()
+        };
+        let delta = Usage {
+            output_tokens: 15,
+            ..Usage::default()
+        };
+        let merged = start.clone().merge_max(delta);
+        assert_eq!(merged.cache_write_tiers, start.cache_write_tiers);
+        assert_eq!(merged.cache_write, 300);
+    }
+
+    #[test]
     fn test_merge_max_single_event_is_identity() {
         let usage = Usage {
             input_tokens: 10,
@@ -333,6 +424,7 @@ mod tests {
             cache_read: 5,
             cache_write: 3,
             reasoning_tokens: 7,
+            cache_write_tiers: None,
         };
         let merged = usage.clone().merge_max(Usage::default());
         assert_eq!(merged, usage);

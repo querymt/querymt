@@ -103,6 +103,11 @@ async fn build_config_from_toml_value(
             }
         }
 
+        if let PromptResolution::ResolveFiles { base_path } = &resolution {
+            config.agent.workspace =
+                std::mem::take(&mut config.agent.workspace).anchored_at(base_path);
+        }
+
         Config::Single(Box::new(config))
     } else if value.get("quorum").is_some() || value.get("planner").is_some() {
         // Multi-agent config
@@ -138,6 +143,12 @@ async fn build_config_from_toml_value(
                 }
             }
         }
+
+        if let PromptResolution::ResolveFiles { base_path } = &resolution {
+            config.quorum.workspace =
+                std::mem::take(&mut config.quorum.workspace).anchored_at(base_path);
+        }
+        validate_delegate_isolation(&config)?;
 
         Config::Multi(Box::new(config))
     } else {
@@ -240,6 +251,26 @@ pub(crate) fn validate_peer_delegates(
         }
     }
     Ok(())
+}
+
+/// A delegate configured `isolated` needs the quorum's workspace service; fail
+/// at load time rather than at the first delegation.
+pub(crate) fn validate_delegate_isolation(config: &QuorumConfig) -> Result<()> {
+    if config.quorum.workspace.enabled {
+        return Ok(());
+    }
+    match config
+        .delegates
+        .iter()
+        .find(|d| d.isolation == crate::worktree::DelegationIsolation::Isolated)
+    {
+        Some(delegate) => Err(anyhow!(
+            "delegate '{}' has `isolation = \"isolated\"` but `[quorum.workspace] enabled` is false; \
+             enable the workspace service or use `inherit`/`shared`",
+            delegate.id
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Validate MCP servers have unique names

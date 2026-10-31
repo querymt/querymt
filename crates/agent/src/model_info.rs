@@ -1,5 +1,13 @@
 use log::warn;
-use querymt::providers::{ModelInfo, read_providers_from_cache};
+use querymt::providers::{ModelInfo, ModelPricing, PricingSource, providers_registry};
+
+/// A manual pricing rate that is negative or not finite.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[error("invalid manual pricing: {field} = {value} (must be finite and nonnegative)")]
+pub struct InvalidManualPricing {
+    pub field: &'static str,
+    pub value: f64,
+}
 
 /// Source for model information (capabilities, constraints, pricing)
 ///
@@ -16,6 +24,13 @@ pub enum ModelInfoSource {
         supports_reasoning: bool,
         input_cost_per_million: Option<f64>,
         output_cost_per_million: Option<f64>,
+        /// Cache-read rate. Never inferred from the input rate.
+        cache_read_cost_per_million: Option<f64>,
+        /// Base cache-write rate (five-minute or unspecified duration).
+        cache_write_cost_per_million: Option<f64>,
+        /// Optional explicit one-hour cache-write rate. Never derived from
+        /// the base write rate.
+        cache_write_1h_cost_per_million: Option<f64>,
     },
     /// Dynamic lookup from session's current model
     /// Fetches fresh model info on each use
@@ -34,6 +49,9 @@ impl ModelInfoSource {
             supports_reasoning: false,
             input_cost_per_million: None,
             output_cost_per_million: None,
+            cache_read_cost_per_million: None,
+            cache_write_cost_per_million: None,
+            cache_write_1h_cost_per_million: None,
         }
     }
 
@@ -75,6 +93,79 @@ impl ModelInfoSource {
         self
     }
 
+    /// Set explicit cache rates (USD per million tokens) for manual source.
+    pub fn cache_pricing(
+        mut self,
+        read: Option<f64>,
+        write: Option<f64>,
+        write_1h: Option<f64>,
+    ) -> Self {
+        if let Self::Manual {
+            ref mut cache_read_cost_per_million,
+            ref mut cache_write_cost_per_million,
+            ref mut cache_write_1h_cost_per_million,
+            ..
+        } = self
+        {
+            *cache_read_cost_per_million = read;
+            *cache_write_cost_per_million = write;
+            *cache_write_1h_cost_per_million = write_1h;
+        }
+        self
+    }
+
+    /// The manual budget pricing, if this is a manual source with any rate.
+    ///
+    /// Every configured rate must be finite and nonnegative; otherwise the
+    /// configuration is invalid. Unset rates stay unset: cache categories are
+    /// never priced at the input rate, so a used category without a rate
+    /// yields a partial budget valuation.
+    pub fn budget_pricing(&self) -> Result<Option<ModelPricing>, InvalidManualPricing> {
+        let Self::Manual {
+            input_cost_per_million,
+            output_cost_per_million,
+            cache_read_cost_per_million,
+            cache_write_cost_per_million,
+            cache_write_1h_cost_per_million,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        let rates = [
+            ("input_cost_per_million", *input_cost_per_million),
+            ("output_cost_per_million", *output_cost_per_million),
+            ("cache_read_cost_per_million", *cache_read_cost_per_million),
+            (
+                "cache_write_cost_per_million",
+                *cache_write_cost_per_million,
+            ),
+            (
+                "cache_write_1h_cost_per_million",
+                *cache_write_1h_cost_per_million,
+            ),
+        ];
+        for (field, rate) in rates {
+            if let Some(rate) = rate
+                && (!rate.is_finite() || rate < 0.0)
+            {
+                return Err(InvalidManualPricing { field, value: rate });
+            }
+        }
+        if rates.iter().all(|(_, rate)| rate.is_none()) {
+            return Ok(None);
+        }
+        Ok(Some(ModelPricing {
+            input: *input_cost_per_million,
+            output: *output_cost_per_million,
+            cache_read: *cache_read_cost_per_million,
+            cache_write: *cache_write_cost_per_million,
+            cache_write_1h: *cache_write_1h_cost_per_million,
+            source: Some(PricingSource::Manual),
+            ..Default::default()
+        }))
+    }
+
     /// Set capability flags for manual source
     pub fn capabilities(mut self, tools: bool, attachments: bool, reasoning: bool) -> Self {
         if let Self::Manual {
@@ -97,7 +188,7 @@ impl ModelInfoSource {
 /// This is a convenience function that handles cache reading and logging.
 /// Returns None if registry can't be loaded or model not found.
 pub fn get_model_info(provider: &str, model: &str) -> Option<ModelInfo> {
-    match read_providers_from_cache() {
+    match providers_registry() {
         Ok(registry) => registry.get_model(provider, model).cloned(),
         Err(e) => {
             warn!("Failed to load providers registry: {}", e);
@@ -159,6 +250,65 @@ mod tests {
             assert!(!supports_attachments);
         } else {
             panic!("Expected Manual variant");
+        }
+    }
+
+    #[test]
+    fn budget_pricing_carries_cache_rates_and_never_defaults_them() {
+        let source =
+            ModelInfoSource::manual()
+                .pricing(3.0, 15.0)
+                .cache_pricing(Some(0.3), None, Some(6.0));
+        let p = source.budget_pricing().unwrap().unwrap();
+        assert_eq!(p.input, Some(3.0));
+        assert_eq!(p.output, Some(15.0));
+        assert_eq!(p.cache_read, Some(0.3));
+        assert_eq!(p.cache_write, None, "unset write rate is not inferred");
+        assert_eq!(p.cache_write_1h, Some(6.0));
+        assert_eq!(p.source, Some(PricingSource::Manual));
+    }
+
+    #[test]
+    fn budget_pricing_is_absent_without_rates_or_for_session_source() {
+        assert_eq!(ModelInfoSource::manual().budget_pricing(), Ok(None));
+        assert_eq!(ModelInfoSource::FromSession.budget_pricing(), Ok(None));
+    }
+
+    #[test]
+    fn budget_pricing_accepts_explicit_zero_rates() {
+        let p = ModelInfoSource::manual()
+            .cache_pricing(Some(0.0), Some(0.0), None)
+            .budget_pricing()
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.cache_read, Some(0.0));
+    }
+
+    #[test]
+    fn budget_pricing_rejects_negative_and_non_finite_rates() {
+        for (bad, field) in [
+            (
+                ModelInfoSource::manual().pricing(-1.0, 1.0),
+                "input_cost_per_million",
+            ),
+            (
+                ModelInfoSource::manual().pricing(1.0, f64::NAN),
+                "output_cost_per_million",
+            ),
+            (
+                ModelInfoSource::manual().cache_pricing(Some(f64::INFINITY), None, None),
+                "cache_read_cost_per_million",
+            ),
+            (
+                ModelInfoSource::manual().cache_pricing(None, Some(-0.5), None),
+                "cache_write_cost_per_million",
+            ),
+            (
+                ModelInfoSource::manual().cache_pricing(None, None, Some(f64::NEG_INFINITY)),
+                "cache_write_1h_cost_per_million",
+            ),
+        ] {
+            assert_eq!(bad.budget_pricing().unwrap_err().field, field);
         }
     }
 

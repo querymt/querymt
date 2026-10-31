@@ -161,6 +161,53 @@ mod tests {
         );
     }
 
+    /// A session actor that died (e.g. its link to a disconnected peer died)
+    /// must not be handed out again on resume: the node manager has to evict
+    /// the stale entry and materialize a fresh, live actor.
+    #[tokio::test]
+    async fn test_resume_after_session_actor_died_rematerializes() {
+        let fixture = NodeManagerFixture::new().await;
+        let actor_ref = fixture.actor_ref.clone();
+
+        let created = actor_ref
+            .ask(CreateRemoteSession {
+                cwd: Some("/tmp/test-dead-actor".to_string()),
+            })
+            .await
+            .expect("create should succeed");
+        let session_id = created.session_id;
+
+        let dead = fixture
+            .registry
+            .lock()
+            .await
+            .local_actor_ref(&session_id)
+            .cloned()
+            .expect("session actor registered");
+        let dead_id = dead.id();
+        dead.kill();
+        dead.wait_for_shutdown().await;
+        assert!(!dead.is_alive());
+
+        let resumed = actor_ref
+            .ask(ResumeRemoteSession {
+                session_id: session_id.clone(),
+            })
+            .await
+            .expect("resume after actor death should succeed");
+        assert_eq!(resumed.session_id, session_id);
+
+        let fresh = fixture
+            .registry
+            .lock()
+            .await
+            .local_actor_ref(&session_id)
+            .cloned()
+            .expect("fresh session actor registered");
+        assert!(fresh.is_alive(), "resume must yield a live actor");
+        assert_ne!(fresh.id(), dead_id, "resume must spawn a new actor");
+    }
+
     /// Test that GetNodeInfo responds quickly while session creation is in progress.
     ///
     /// This is the core test for Phase 2: lightweight control-plane operations

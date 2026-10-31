@@ -8,6 +8,10 @@ use super::{
 };
 use crate::Usage;
 
+/// Terminal detail reported when a reply is cut off by the output token limit
+/// while tool calls are still being streamed.
+pub const LENGTH_CUTOFF_DETAIL: &str = "output token limit";
+
 /// Item-aware stream events. Providers emit metadata before semantic events to declare
 /// structured mode. Compatibility projections are produced only at explicit boundaries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -210,6 +214,11 @@ pub struct ChatStreamAccumulator {
     structured_items: BTreeMap<usize, ChatOutputItem>,
     completed_items: BTreeSet<usize>,
     pending_legacy_calls: BTreeSet<usize>,
+    /// Every flat-chunk call index that received a start this attempt, so a
+    /// delta after completion is not mistaken for a delta without a start.
+    started_legacy_calls: BTreeSet<usize>,
+    /// Orphan delta indexes already reported, so each warns once per attempt.
+    warned_orphan_calls: BTreeSet<usize>,
     terminal_detail: Option<String>,
     terminal_seen: bool,
 }
@@ -222,6 +231,8 @@ impl Default for ChatStreamAccumulator {
             structured_items: BTreeMap::new(),
             completed_items: BTreeSet::new(),
             pending_legacy_calls: BTreeSet::new(),
+            started_legacy_calls: BTreeSet::new(),
+            warned_orphan_calls: BTreeSet::new(),
             terminal_detail: None,
             terminal_seen: false,
         }
@@ -280,6 +291,10 @@ impl ChatStreamAccumulator {
                 self.select_legacy();
                 append_legacy_signature(&mut self.output.items, signature);
             }
+            StreamChunk::RedactedThinking(data) => {
+                self.select_legacy();
+                append_legacy_redacted(&mut self.output.items, data);
+            }
             StreamChunk::ToolUseComplete {
                 index,
                 tool_call,
@@ -313,11 +328,24 @@ impl ChatStreamAccumulator {
             }
             StreamChunk::ToolUseStart { index, .. } => {
                 self.select_legacy();
+                self.started_legacy_calls.insert(*index);
                 self.pending_legacy_calls.insert(*index);
             }
             StreamChunk::ToolUseInputDelta { index, .. } => {
                 self.select_legacy();
-                self.pending_legacy_calls.insert(*index);
+                // Only an explicit start opens a pending call. A delta for an
+                // index that was never started cannot become an executable
+                // call, so it is reported (index only, never argument text)
+                // and otherwise ignored, once per index.
+                if self.pending_legacy_calls.contains(index) {
+                    // Normal delta for an open call.
+                } else if self.started_legacy_calls.contains(index) {
+                    log::debug!("tool call argument delta for index {index} after completion");
+                } else if self.warned_orphan_calls.insert(*index) {
+                    log::warn!(
+                        "provider contract violation: tool call argument delta for index {index} without a start"
+                    );
+                }
             }
         }
         Ok(())
@@ -360,6 +388,17 @@ impl ChatStreamAccumulator {
         match status {
             Some(ChatOutputStatus::Completed) => {
                 if !incomplete_legacy_calls.is_empty() {
+                    // A length stop inside a tool call is an output-limit
+                    // cut-off, not a transient stream failure: report it as
+                    // incomplete so it is never retried as-is.
+                    if output.finish_reason == Some(FinishReason::Length) {
+                        let mut output = output;
+                        output.status = Some(ChatOutputStatus::Incomplete);
+                        return ChatStreamFinish::Incomplete {
+                            output,
+                            detail: Some(LENGTH_CUTOFF_DETAIL.to_string()),
+                        };
+                    }
                     return ChatStreamFinish::Failed {
                         error: ChatStreamAccumulatorError::IncompleteToolCalls(
                             incomplete_legacy_calls,
@@ -658,8 +697,15 @@ fn append_legacy_message_text(items: &mut Vec<ChatOutputItem>, delta: &str) {
     }));
 }
 
+/// Whether a reasoning item is still open for text/signature deltas: it has
+/// neither a signature nor opaque (redacted) content yet.
+fn is_open_reasoning(reasoning: &super::ChatReasoningItem) -> bool {
+    reasoning.signature.is_none() && reasoning.encrypted_content.is_none()
+}
+
 fn append_legacy_reasoning(items: &mut Vec<ChatOutputItem>, delta: &str) {
     if let Some(ChatOutputItem::Reasoning(reasoning)) = items.last_mut()
+        && is_open_reasoning(reasoning)
         && let Some(part) = reasoning.content.last_mut()
     {
         part.text.push_str(delta);
@@ -676,13 +722,47 @@ fn append_legacy_reasoning(items: &mut Vec<ChatOutputItem>, delta: &str) {
     }));
 }
 
-fn append_legacy_signature(items: &mut [ChatOutputItem], signature: &str) {
-    if let Some(reasoning) = items.iter_mut().rev().find_map(|item| match item {
-        ChatOutputItem::Reasoning(reasoning) => Some(reasoning),
-        _ => None,
-    }) {
+/// Attach a signature to the open reasoning item at the end of the output.
+/// When there is none (an empty thinking block, e.g. omitted display), create
+/// an empty reasoning item that carries the signature so blocks map one-to-one.
+fn append_legacy_signature(items: &mut Vec<ChatOutputItem>, signature: &str) {
+    if let Some(ChatOutputItem::Reasoning(reasoning)) = items.last_mut()
+        && is_open_reasoning(reasoning)
+    {
         reasoning.signature = Some(signature.to_string());
+        return;
     }
+    items.push(ChatOutputItem::Reasoning(super::ChatReasoningItem {
+        id: None,
+        summary: Vec::new(),
+        content: Vec::new(),
+        encrypted_content: None,
+        signature: Some(signature.to_string()),
+        status: None,
+        extensions: Default::default(),
+    }));
+}
+
+/// Marker extension identifying redacted Anthropic thinking blocks.
+pub const ANTHROPIC_BLOCK_EXTENSION: &str = "anthropic_block";
+/// Value of [`ANTHROPIC_BLOCK_EXTENSION`] for `redacted_thinking` blocks.
+pub const ANTHROPIC_REDACTED_THINKING: &str = "redacted_thinking";
+
+fn append_legacy_redacted(items: &mut Vec<ChatOutputItem>, data: &str) {
+    let mut extensions = super::Extensions::new();
+    extensions.insert(
+        ANTHROPIC_BLOCK_EXTENSION.to_string(),
+        serde_json::Value::String(ANTHROPIC_REDACTED_THINKING.to_string()),
+    );
+    items.push(ChatOutputItem::Reasoning(super::ChatReasoningItem {
+        id: None,
+        summary: Vec::new(),
+        content: Vec::new(),
+        encrypted_content: Some(data.to_string()),
+        signature: None,
+        status: None,
+        extensions,
+    }));
 }
 
 #[cfg(test)]
@@ -875,6 +955,121 @@ mod tests {
         assert_eq!(output.thinking().as_deref(), Some("full thought"));
     }
 
+    fn reasoning_items(output: &ChatOutput) -> Vec<&super::super::ChatReasoningItem> {
+        output
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ChatOutputItem::Reasoning(r) => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn legacy_consecutive_signed_blocks_stay_separate() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        for chunk in [
+            StreamChunk::Thinking("one".into()),
+            StreamChunk::ThinkingSignature("S1".into()),
+            StreamChunk::Text("progress".into()),
+            StreamChunk::Thinking("two".into()),
+            StreamChunk::ThinkingSignature("S2".into()),
+        ] {
+            accumulator.push(&chunk).unwrap();
+        }
+        let output = accumulator.output();
+        let items = reasoning_items(&output);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].signature.as_deref(), Some("S1"));
+        assert_eq!(items[0].content[0].text, "one");
+        assert_eq!(items[1].signature.as_deref(), Some("S2"));
+        assert_eq!(items[1].content[0].text, "two");
+
+        // Back-to-back blocks with no text between them must not merge either.
+        let mut accumulator = ChatStreamAccumulator::new();
+        for chunk in [
+            StreamChunk::Thinking("a".into()),
+            StreamChunk::ThinkingSignature("A".into()),
+            StreamChunk::Thinking("b".into()),
+            StreamChunk::ThinkingSignature("B".into()),
+        ] {
+            accumulator.push(&chunk).unwrap();
+        }
+        let output = accumulator.output();
+        let items = reasoning_items(&output);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].signature.as_deref(), Some("A"));
+        assert_eq!(items[1].signature.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn legacy_empty_signed_block_creates_empty_signed_item() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        accumulator
+            .push(&StreamChunk::ThinkingSignature("S".into()))
+            .unwrap();
+        let output = accumulator.output();
+        let items = reasoning_items(&output);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].signature.as_deref(), Some("S"));
+        assert!(items[0].visible_text().is_empty());
+    }
+
+    #[test]
+    fn legacy_single_block_is_unchanged() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        for chunk in [
+            StreamChunk::Thinking("full ".into()),
+            StreamChunk::Thinking("thought".into()),
+            StreamChunk::ThinkingSignature("S".into()),
+        ] {
+            accumulator.push(&chunk).unwrap();
+        }
+        let output = accumulator.output();
+        let items = reasoning_items(&output);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content[0].text, "full thought");
+        assert_eq!(items[0].signature.as_deref(), Some("S"));
+    }
+
+    #[test]
+    fn redacted_thinking_becomes_marked_encrypted_item() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        for chunk in [
+            StreamChunk::RedactedThinking("DATA".into()),
+            StreamChunk::Thinking("next".into()),
+            StreamChunk::ThinkingSignature("S".into()),
+        ] {
+            accumulator.push(&chunk).unwrap();
+        }
+        let output = accumulator.output();
+        let items = reasoning_items(&output);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].encrypted_content.as_deref(), Some("DATA"));
+        assert!(items[0].signature.is_none());
+        assert!(items[0].visible_text().is_empty());
+        assert_eq!(
+            items[0]
+                .extensions
+                .get(super::ANTHROPIC_BLOCK_EXTENSION)
+                .and_then(|v| v.as_str()),
+            Some(super::ANTHROPIC_REDACTED_THINKING)
+        );
+        // Following thinking text must not be appended onto the redacted item.
+        assert_eq!(items[1].content[0].text, "next");
+        assert_eq!(items[1].signature.as_deref(), Some("S"));
+    }
+
+    #[test]
+    fn redacted_thinking_chunk_debug_redacts_and_round_trips() {
+        let chunk = StreamChunk::RedactedThinking("SECRET-DATA".into());
+        assert!(!format!("{chunk:?}").contains("SECRET-DATA"));
+        let json = serde_json::to_string(&chunk).unwrap();
+        let back: StreamChunk = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, StreamChunk::RedactedThinking(d) if d == "SECRET-DATA"));
+    }
+
     #[test]
     fn completed_snapshot_replaces_deltas_and_repeated_snapshot_is_idempotent() {
         let started = message("");
@@ -1053,6 +1248,139 @@ mod tests {
             ChatStreamFinish::Failed { error, .. } => assert_eq!(
                 error,
                 ChatStreamAccumulatorError::IncompleteToolCalls(vec![3])
+            ),
+            other => panic!("expected failed outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_length_stop_with_unfinished_tool_call_is_incomplete() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        accumulator
+            .push(&StreamChunk::ToolUseStart {
+                index: 0,
+                id: "call_0".into(),
+                name: "write_file".into(),
+            })
+            .unwrap();
+        accumulator
+            .push(&StreamChunk::Done {
+                finish_reason: FinishReason::Length,
+            })
+            .unwrap();
+        match accumulator.finish() {
+            ChatStreamFinish::Incomplete { output, detail } => {
+                assert_eq!(detail.as_deref(), Some(LENGTH_CUTOFF_DETAIL));
+                assert_eq!(output.finish_reason, Some(FinishReason::Length));
+                assert_eq!(output.status, Some(ChatOutputStatus::Incomplete));
+            }
+            other => panic!("expected incomplete outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_length_stop_without_open_calls_still_completes() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        accumulator
+            .push(&StreamChunk::Text("partial".into()))
+            .unwrap();
+        accumulator
+            .push(&StreamChunk::Done {
+                finish_reason: FinishReason::Length,
+            })
+            .unwrap();
+        assert!(accumulator.finish().is_completed());
+    }
+
+    fn legacy_tool_complete(index: usize, id: &str) -> StreamChunk {
+        StreamChunk::ToolUseComplete {
+            index,
+            tool_call: ToolCall {
+                id: id.into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "lookup".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    #[test]
+    fn legacy_orphan_argument_delta_does_not_fail_response() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        for chunk in [
+            StreamChunk::ToolUseStart {
+                index: 0,
+                id: "call_0".into(),
+                name: "lookup".into(),
+            },
+            StreamChunk::ToolUseInputDelta {
+                index: 1,
+                partial_json: "{\"a\":".into(),
+            },
+            StreamChunk::ToolUseInputDelta {
+                index: 1,
+                partial_json: "1}".into(),
+            },
+            legacy_tool_complete(0, "call_0"),
+            // A late delta for a completed call is not an orphan.
+            StreamChunk::ToolUseInputDelta {
+                index: 0,
+                partial_json: "x".into(),
+            },
+            StreamChunk::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ] {
+            accumulator.push(&chunk).unwrap();
+        }
+        // Index 1 is reported once; the late delta for 0 is not reported.
+        assert_eq!(
+            accumulator.warned_orphan_calls,
+            BTreeSet::from([1]),
+            "one orphan warning, for index 1 only"
+        );
+        match accumulator.finish() {
+            ChatStreamFinish::Completed(output) => {
+                let calls: Vec<_> = output
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ChatOutputItem::FunctionCall(call) => Some(call.arguments.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(calls, ["{}"], "completed call unchanged");
+            }
+            other => panic!("expected completed outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_started_call_with_deltas_but_no_completion_still_fails() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        for chunk in [
+            StreamChunk::ToolUseStart {
+                index: 1,
+                id: "call_1".into(),
+                name: "lookup".into(),
+            },
+            StreamChunk::ToolUseInputDelta {
+                index: 1,
+                partial_json: "{\"a\":1}".into(),
+            },
+            StreamChunk::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ] {
+            accumulator.push(&chunk).unwrap();
+        }
+        match accumulator.finish() {
+            ChatStreamFinish::Failed { error, .. } => assert_eq!(
+                error,
+                ChatStreamAccumulatorError::IncompleteToolCalls(vec![1])
             ),
             other => panic!("expected failed outcome, got {other:?}"),
         }

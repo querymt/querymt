@@ -304,7 +304,8 @@ async fn bind_test_profile(f: &HandleFixture, session_id: &str, profile_id: &str
             session_id,
             test_profile_metadata(profile_id, profile_id, None).session_binding(),
         )
-        .await;
+        .await
+        .expect("bind test profile");
 }
 
 async fn register_bound_test_session(f: &HandleFixture, session_id: &str, profile_id: &str) {
@@ -358,7 +359,7 @@ async fn profile_config_options(
     session_id: Option<&str>,
 ) -> Vec<SessionConfigOption> {
     f.handle
-        .session_config_options(
+        .session_profile_config_options(
             session_id,
             AgentMode::Build,
             **f.handle.config.default_reasoning_effort.load(),
@@ -455,7 +456,8 @@ impl RealStorageHandleFixture {
         let storage = Arc::new(
             crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                 .await
-                .expect("create storage"),
+                .expect("create storage")
+                .with_run_lease_root(temp_dir.path().join("run-leases")),
         );
 
         let mut initial_config = LLMParams::new().provider("mock").model("mock-model");
@@ -481,7 +483,7 @@ impl LocalAgentHandle {
     fn should_return_without_force_stop(
         status: crate::agent::messages::SessionRuntimeStatus,
     ) -> bool {
-        matches!(status, crate::agent::messages::SessionRuntimeStatus::Idle)
+        status.phase == crate::agent::messages::SessionRuntimePhase::Idle
     }
 }
 
@@ -498,3 +500,5 @@ mod schedule_get_remote;
 mod schedule_notifications;
 mod scheduler;
 mod session_ops_ext;
+mod worktree_ops_ext;
+mod worktree_slash_commands;

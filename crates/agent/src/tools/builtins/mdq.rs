@@ -6,7 +6,10 @@ use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
-use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool as ToolTrait, ToolContext, ToolError,
+    single_path_read_access,
+};
 
 pub struct MdqTool;
 
@@ -37,6 +40,7 @@ impl ToolTrait for MdqTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "path": {
                             "type": "string",
@@ -62,6 +66,10 @@ Text matching: unquoted = case-insensitive; quoted = case-sensitive; `^...$` anc
 
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[CapabilityRequirement::Filesystem]
+    }
+
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        single_path_read_access(args, "path", cwd)
     }
 
     async fn call(
@@ -119,6 +127,26 @@ Text matching: unquoted = case-insensitive; quoted = case-sensitive; `^...$` anc
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::FileAccess as Access;
+
+    #[test]
+    fn file_access_reads_the_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let tool = MdqTool::new();
+        assert_eq!(
+            tool.file_access(
+                &serde_json::json!({"path": "doc.md", "selector": "#"}),
+                Some(&root)
+            ),
+            Access::reads([root.join("doc.md")])
+        );
+        assert_eq!(
+            tool.file_access(&serde_json::json!({}), Some(&root)),
+            Access::None
+        );
+    }
+
     use super::*;
 
     fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {

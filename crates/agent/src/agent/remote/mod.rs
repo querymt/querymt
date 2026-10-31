@@ -107,7 +107,7 @@ pub use actor_ref::SessionActorRef;
 pub use cached_transport::{CachedDynMeshTransport, CachedMeshTransport};
 pub use event_forwarder::EventForwarder;
 #[cfg(feature = "remote")]
-pub use event_relay::{EventRelayActor, RelayedEvent};
+pub use event_relay::{EventRelayActor, RelayLagged, RelayedEvent};
 #[cfg(feature = "remote")]
 pub use mesh::join_mesh_via_invite;
 #[cfg(feature = "remote")]
@@ -119,12 +119,16 @@ pub use node_id::NodeId;
 pub use node_manager::{
     CreateRemoteSchedule, CreateRemoteScheduleResponse, CreateRemoteSession,
     CreateRemoteSessionResponse, DeleteRemoteSchedule, ForkRemoteSession,
-    ForkRemoteSessionResponse, GetNodeInfo, GetRemoteSessionProfile, ListRemoteSchedules,
-    ListRemoteSchedulesResponse, ListRemoteSessions, PauseRemoteSchedule, RemoteNodeManager,
-    RemoteSessionProfile, ResumeRemoteSchedule, ResumeRemoteSession, StopRemoteSessionRuntime,
+    ForkRemoteSessionResponse, GetNodeInfo, GetRemoteSessionLifecycle, GetRemoteSessionProfile,
+    ListRemoteSchedules, ListRemoteSchedulesResponse, ListRemoteSessions,
+    ListRemoteSessionsWithLifecycle, PauseRemoteSchedule, RemoteNodeManager, RemoteSessionProfile,
+    ResumeRemoteSchedule, ResumeRemoteSession, SetRemoteSessionLifecycle, StopRemoteSessionRuntime,
     TriggerRemoteSchedule,
 };
-pub use node_manager::{ListRemoteSessionsResponse, NodeInfo, RemoteSessionSnapshot};
+pub use node_manager::{
+    ListRemoteSessionsResponse, ListRemoteSessionsWithLifecycleResponse, NodeInfo,
+    RemoteSessionLifecycleSnapshot, RemoteSessionSnapshot,
+};
 #[cfg(feature = "remote")]
 pub use querymt_remote::MeshChatProvider;
 #[cfg(feature = "remote")]

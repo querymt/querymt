@@ -1,12 +1,13 @@
 use crate::chat_format::parse_assistant_format_with_state;
 use crate::common_chat::ChatTemplateResult;
 use crate::config::LlamaCppConfig;
+use crate::generation::decode_token_piece;
 use crate::multimodal::MultimodalContext;
 use crate::response::{GeneratedText, GenerationTermination};
 use crate::tools::prefill::prefill_for_tool_generation;
 use crate::tools::sampler::{SamplingParams, build_structured_sampler, build_tool_sampler};
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::MtmdBitmap;
 use querymt::Usage;
 use querymt::error::LLMError;
@@ -37,9 +38,8 @@ pub(crate) fn generate_with_tools(
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut preserved = HashSet::new();
         for value in &result.preserved_tokens {
-            if let Ok(tokens) = model.str_to_token(value, AddBos::Never)
-                && tokens.len() == 1
-            {
+            let tokens = model.vocab().tokenize(value.as_bytes(), false, true);
+            if tokens.len() == 1 {
                 preserved.insert(tokens[0]);
             }
         }
@@ -52,10 +52,7 @@ pub(crate) fn generate_with_tools(
             temperature,
             Some(sampler),
             |token| {
-                let special = preserved.contains(&token);
-                let piece = model
-                    .token_to_piece(token, &mut decoder, special, None)
-                    .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+                let piece = decode_token_piece(model, &mut decoder, &preserved, token)?;
                 output.push_str(&piece);
                 Ok(result
                     .additional_stops
@@ -78,6 +75,7 @@ pub(crate) fn generate_with_tools(
                 cache_read: 0,
                 cache_write: 0,
                 reasoning_tokens: 0,
+                cache_write_tiers: None,
             },
             termination: stats.termination,
         });
@@ -101,6 +99,7 @@ pub(crate) fn generate_with_tools(
                 cache_read: 0,
                 cache_write: 0,
                 reasoning_tokens: 0,
+                cache_write_tiers: None,
             },
             termination: GenerationTermination::MaxTokens,
         });
@@ -111,10 +110,9 @@ pub(crate) fn generate_with_tools(
     // Build preserved token set for special handling
     let mut preserved = HashSet::new();
     for token_str in &result.preserved_tokens {
-        if let Ok(preserved_tokens) = model.str_to_token(token_str, AddBos::Never) {
-            if preserved_tokens.len() == 1 {
-                preserved.insert(preserved_tokens[0]);
-            }
+        let tokens = model.vocab().tokenize(token_str.as_bytes(), false, true);
+        if tokens.len() == 1 {
+            preserved.insert(tokens[0]);
         }
     }
 
@@ -141,20 +139,14 @@ pub(crate) fn generate_with_tools(
 
     while state.n_cur < state.n_len_total {
         let token = sampler.sample(&state.ctx, batch.n_tokens() - 1);
-        if model.is_eog_token(token) {
+        if model.vocab().is_eog(token) {
             eog_hit = true;
             termination = GenerationTermination::Eog;
             break;
         }
 
         let special = preserved.contains(&token);
-        let bytes = model
-            .token_to_piece_bytes(token, 128, special, None)
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-        let chunk = match model.token_to_piece(token, &mut decoder, special, None) {
-            Ok(piece) => piece,
-            Err(_) => String::from_utf8_lossy(&bytes).to_string(),
-        };
+        let chunk = decode_token_piece(model, &mut decoder, &preserved, token)?;
 
         if !first_token_logged {
             first_token_logged = true;
@@ -223,6 +215,7 @@ pub(crate) fn generate_with_tools(
             cache_read: 0,
             cache_write: 0,
             reasoning_tokens: 0,
+            cache_write_tiers: None,
         },
         termination,
     })

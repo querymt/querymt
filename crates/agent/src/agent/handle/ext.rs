@@ -2,13 +2,14 @@ use super::*;
 
 impl LocalAgentHandle {
     pub(super) async fn handle_ext_capabilities(&self) -> Result<ExtResponse, Error> {
-        super::utils::ext_json_response(&crate::control::capabilities::get_capabilities(self))
+        let capabilities = crate::control::capabilities::get_capabilities(self);
+        super::utils::ext_json_response(&capabilities)
     }
 
     pub(super) async fn handle_ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
         match req.method.as_ref() {
             "querymt/models" => self.handle_ext_models().await,
-            "querymt/profiles" => self.handle_ext_profiles().await,
+            "querymt/profiles" => self.handle_ext_profiles(req).await,
             "querymt/profile/agents" => self.handle_ext_profile_agents(req).await,
             "querymt/profile/setActive" => self.handle_ext_set_active_profile(req).await,
             "querymt/session/setDelegateModel" => self.handle_ext_set_delegate_model(req).await,
@@ -48,6 +49,18 @@ impl LocalAgentHandle {
             "querymt/session/undo" => self.handle_ext_session_undo(req).await,
             "querymt/session/redo" => self.handle_ext_session_redo(req).await,
             "querymt/session/undoStack" => self.handle_ext_session_undo_stack(req).await,
+            "querymt/session/getLifecycle" => self.handle_ext_session_get_lifecycle(req).await,
+            "querymt/session/setLifecycle" => self.handle_ext_session_set_lifecycle(req).await,
+            "querymt/session/setPinned" => self.handle_ext_session_set_pinned(req).await,
+            "querymt/worktree/create" => self.handle_ext_worktree_create(req).await,
+            "querymt/worktree/handoff" => self.handle_ext_worktree_handoff(req).await,
+            "querymt/worktree/list" => self.handle_ext_worktree_list().await,
+            "querymt/worktree/status" => self.handle_ext_worktree_status(req).await,
+            "querymt/worktree/result" => self.handle_ext_worktree_result(req).await,
+            "querymt/worktree/publish" => self.handle_ext_worktree_publish(req).await,
+            "querymt/worktree/remove" => self.handle_ext_worktree_remove(req).await,
+            "querymt/worktree/recover" => self.handle_ext_worktree_recover(req).await,
+            "querymt/worktree/archive" => self.handle_ext_worktree_archive(req).await,
             "querymt/capabilities" => self.handle_ext_capabilities().await,
             "querymt/mesh/status" => self.handle_ext_mesh_status().await,
             "querymt/mesh/join" => self.handle_ext_mesh_join(req).await,

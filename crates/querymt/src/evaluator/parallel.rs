@@ -9,7 +9,7 @@ use futures::future::join_all;
 
 use crate::{
     LLMProvider,
-    chat::{ChatMessage, Tool},
+    chat::{ChatCall, ChatMessage, Tool},
     completion::CompletionRequest,
     error::LLMError,
 };
@@ -89,7 +89,7 @@ impl ParallelEvaluator {
                 let messages = messages.to_vec();
                 async move {
                     let start = Instant::now();
-                    let result = provider.chat(&messages).await;
+                    let result = provider.chat(&ChatCall::new(&messages)).await;
                     let elapsed = start.elapsed().as_millis();
                     (id, result, elapsed)
                 }
@@ -144,7 +144,7 @@ impl ParallelEvaluator {
                 async move {
                     let start = Instant::now();
                     let result = provider
-                        .chat_with_tools(&messages, tools_clone.as_deref())
+                        .chat(&ChatCall::new(&messages).maybe_tools(tools_clone.as_deref()))
                         .await;
                     let elapsed = start.elapsed().as_millis();
                     (id, result, elapsed)

@@ -35,8 +35,13 @@ pub struct Turn {
     pub provider: Option<String>,
     /// Token usage for this turn.
     pub usage: Option<querymt::Usage>,
-    /// Cost in USD for this turn.
+    /// Complete supported cost in USD for this turn's logical operation, or
+    /// `None` when it is unknown or incomplete. Never a fabricated zero; a
+    /// legacy request end with no accounting basis is not trusted.
     pub cost_usd: Option<f64>,
+    /// Operation/attempt identities and known subtotal behind `cost_usd`.
+    /// Used to avoid counting the same attempts twice in exports.
+    pub accounting: Option<crate::accounting::RequestAccounting>,
     /// Finish reason reported by the LLM.
     pub finish_reason: Option<querymt::chat::FinishReason>,
     /// Unix timestamp of the LLM response.
@@ -187,16 +192,25 @@ fn extract_turn(
     let end_event = &events[end_idx];
 
     // Extract usage/cost/finish_reason from LlmRequestEnd
-    let (usage, cost_usd, finish_reason) = if let AgentEventKind::LlmRequestEnd {
+    let (usage, cost_usd, finish_reason, accounting) = if let AgentEventKind::LlmRequestEnd {
         usage,
         cost_usd,
         finish_reason,
+        accounting,
         ..
     } = &end_event.kind
     {
-        (usage.clone(), *cost_usd, *finish_reason)
+        // A request end without accounting is a legacy generation record;
+        // its cost has no recorded basis and is not exported as a charge.
+        let trusted_cost = accounting.as_ref().and(*cost_usd);
+        (
+            usage.clone(),
+            trusted_cost,
+            *finish_reason,
+            accounting.clone(),
+        )
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
     let mut assistant_content = String::new();
@@ -274,6 +288,7 @@ fn extract_turn(
         provider,
         usage,
         cost_usd,
+        accounting,
         finish_reason,
         timestamp: end_event.timestamp,
     }
@@ -286,6 +301,7 @@ mod tests {
 
     fn make_event(seq: i64, ts: i64, kind: AgentEventKind) -> AgentEvent {
         AgentEvent {
+            session_seq: 0,
             seq,
             timestamp: ts,
             session_id: "test-session".to_string(),
@@ -332,6 +348,7 @@ mod tests {
                     cumulative_cost_usd: Some(0.001),
                     context_tokens: 15,
                     metrics: ExecutionMetrics { steps: 1, turns: 1 },
+                    accounting: None,
                 },
             ),
         ];
@@ -343,7 +360,43 @@ mod tests {
         assert!(turns[0].tool_calls.is_empty());
         assert!(turns[0].tool_results.is_empty());
         assert_eq!(turns[0].usage.as_ref().unwrap().input_tokens, 10);
-        assert_eq!(turns[0].cost_usd, Some(0.001));
+        // A legacy request end has no accounting basis: its cost is not
+        // exported as a charge.
+        assert_eq!(turns[0].cost_usd, None);
+        assert!(turns[0].accounting.is_none());
+    }
+
+    #[test]
+    fn accounted_turn_keeps_cost_and_attempt_identities() {
+        let events = vec![
+            make_event(1, 100, AgentEventKind::LlmRequestStart { message_count: 1 }),
+            make_event(
+                2,
+                101,
+                AgentEventKind::LlmRequestEnd {
+                    usage: None,
+                    tool_calls: 0,
+                    finish_reason: None,
+                    cost_usd: Some(0.002),
+                    cumulative_cost_usd: Some(0.002),
+                    context_tokens: 1,
+                    metrics: ExecutionMetrics { steps: 1, turns: 1 },
+                    accounting: Some(crate::accounting::RequestAccounting {
+                        operation_id: "op-1".into(),
+                        attempt_ids: vec!["a1".into(), "a2".into()],
+                        known_subtotal_usd: 0.002,
+                        complete: true,
+                        reasons: vec![],
+                    }),
+                },
+            ),
+        ];
+        let (turns, _) = materialize_turns(&events);
+        assert_eq!(turns[0].cost_usd, Some(0.002));
+        assert_eq!(
+            turns[0].accounting.as_ref().unwrap().attempt_ids,
+            vec!["a1", "a2"]
+        );
     }
 
     #[test]
@@ -398,6 +451,7 @@ mod tests {
                     cumulative_cost_usd: None,
                     context_tokens: 50,
                     metrics: ExecutionMetrics { steps: 1, turns: 1 },
+                    accounting: None,
                 },
             ),
         ];
@@ -469,6 +523,7 @@ mod tests {
                     cumulative_cost_usd: None,
                     context_tokens: 50,
                     metrics: ExecutionMetrics { steps: 1, turns: 1 },
+                    accounting: None,
                 },
             ),
         ];
@@ -584,6 +639,7 @@ mod tests {
                     cumulative_cost_usd: None,
                     context_tokens: 0,
                     metrics: ExecutionMetrics::default(),
+                    accounting: None,
                 },
             ),
             // Model changes
@@ -628,6 +684,7 @@ mod tests {
                     cumulative_cost_usd: None,
                     context_tokens: 0,
                     metrics: ExecutionMetrics::default(),
+                    accounting: None,
                 },
             ),
         ];
@@ -664,6 +721,7 @@ mod tests {
                     cumulative_cost_usd: None,
                     context_tokens: 0,
                     metrics: ExecutionMetrics::default(),
+                    accounting: None,
                 },
             ),
         ];
@@ -710,6 +768,7 @@ mod tests {
                     cumulative_cost_usd: None,
                     context_tokens: 0,
                     metrics: ExecutionMetrics::default(),
+                    accounting: None,
                 },
             ),
         ];

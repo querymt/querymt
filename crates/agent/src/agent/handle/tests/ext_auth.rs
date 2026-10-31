@@ -1,6 +1,49 @@
 use super::*;
 
 #[tokio::test]
+async fn static_factory_is_accepted_before_auth_key_resolution() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let registry = fixture.config.provider.plugin_registry();
+    assert!(
+        !registry
+            .config
+            .providers
+            .iter()
+            .any(|provider| provider.name == "mock"),
+        "fixture precondition: mock is registered only as a static factory"
+    );
+    let shared = crate::test_utils::SharedLlmProvider::new(
+        crate::test_utils::MockLlmProvider::new(),
+        vec![],
+    );
+    registry.register_static(std::sync::Arc::new(
+        crate::test_utils::TestProviderFactory::new(shared),
+    ));
+
+    let result = ext_method_json(
+        &fixture.handle,
+        "querymt/auth/setApiToken",
+        serde_json::json!({ "provider": "mock", "api_key": "test-key-not-persisted" }),
+    )
+    .await;
+
+    assert_eq!(result["success"], false);
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not have a known API key name")
+    );
+    assert!(
+        !result["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not configured")
+    );
+    assert!(!result.to_string().contains("test-key-not-persisted"));
+}
+
+#[tokio::test]
 async fn set_api_token_rejects_empty_key() {
     let f = HandleFixture::new().await;
     let result = ext_method_json(
@@ -202,4 +245,48 @@ async fn set_and_clear_api_token_roundtrip() {
     )
     .await;
     assert_eq!(clear_again["success"], true);
+}
+
+#[tokio::test]
+async fn static_auth_extensions_filter_status_and_validate_without_credentials() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let shared = SharedLlmProvider::new(MockLlmProvider::new(), vec![]);
+    fixture
+        .config
+        .provider
+        .plugin_registry()
+        .register_static(Arc::new(TestProviderFactory::new(shared)));
+    let status = ext_method_json(
+        &fixture.handle,
+        "querymt/auth/status",
+        serde_json::json!({"provider": "not-registered-test-provider"}),
+    )
+    .await;
+    assert_eq!(status["providers"], serde_json::json!([]));
+    let clear = ext_method_json(
+        &fixture.handle,
+        "querymt/auth/clearApiToken",
+        serde_json::json!({"provider": "mock"}),
+    )
+    .await;
+    assert_eq!(clear["success"], false);
+    assert!(
+        clear["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not have a known API key name")
+    );
+    let preference = ext_method_json(
+        &fixture.handle,
+        "querymt/auth/setMethod",
+        serde_json::json!({"provider": "mock", "method": "password"}),
+    )
+    .await;
+    assert_eq!(preference["success"], false);
+    assert!(
+        preference["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown auth method")
+    );
 }

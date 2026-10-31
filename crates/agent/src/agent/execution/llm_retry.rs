@@ -19,12 +19,13 @@ use tracing::{Span, instrument};
 /// Uses provider hints or exponential backoff and respects cancellation via the token.
 #[instrument(
     name = "agent.llm.call_with_retry",
-    skip(config, cancel_token, call_fn),
-    fields(session_id = %session_id, attempt = tracing::field::Empty, retrying = tracing::field::Empty)
+    skip(config, cancel_token, call_fn, operation),
+    fields(session_id = %session_id, operation = %operation, attempt = tracing::field::Empty, retrying = tracing::field::Empty)
 )]
 pub(super) async fn call_with_retry<T, F, Fut>(
     config: &AgentConfig,
     session_id: &str,
+    operation: &'static str,
     cancel_token: &CancellationToken,
     call_fn: F,
 ) -> Result<T, LLMError>
@@ -258,7 +259,7 @@ pub(super) fn stream_chunk_commits_output(chunk: &StreamChunk) -> bool {
     match chunk {
         StreamChunk::Structured(_) => true,
         StreamChunk::Text(text) | StreamChunk::Thinking(text) => !text.is_empty(),
-        StreamChunk::ThinkingSignature(_) => true,
+        StreamChunk::ThinkingSignature(_) | StreamChunk::RedactedThinking(_) => true,
         StreamChunk::ToolUseStart { .. } | StreamChunk::ToolUseComplete { .. } => true,
         StreamChunk::ToolUseInputDelta { partial_json, .. } => !partial_json.is_empty(),
         StreamChunk::Usage(_) | StreamChunk::Done { .. } => false,
@@ -734,7 +735,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
 
-        let result = call_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", "chat", &token, || {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -757,7 +758,7 @@ mod tests {
         let call_count2 = call_count.clone();
         let provider: Arc<dyn querymt::LLMProvider> = Arc::new(MockLlmProvider::new());
 
-        let result = call_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", "chat", &token, || {
             let count = call_count2.clone();
             let provider = Arc::clone(&provider);
             async move {
@@ -784,7 +785,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
 
-        let result = call_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", "chat", &token, || {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -805,7 +806,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
 
-        let result = call_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", "chat", &token, || {
             let count = call_count2.clone();
             async move {
                 let attempt = count.fetch_add(1, Ordering::SeqCst);
@@ -832,7 +833,7 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
 
-        let result = call_with_retry(&config, "test-session", &token, || async {
+        let result = call_with_retry(&config, "test-session", "chat", &token, || async {
             Ok::<ChatOutput, _>(
                 crate::test_utils::MockChatResponse::text_only("should not get here").into(),
             )
@@ -854,7 +855,7 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             token_clone.cancel();
         });
-        let result = call_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", "chat", &token, || {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -884,7 +885,7 @@ mod tests {
         let attempt_count = Arc::new(AtomicUsize::new(0));
         let attempt_count_for_call = Arc::clone(&attempt_count);
 
-        let result = call_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", "chat", &token, || {
             let attempt_count = Arc::clone(&attempt_count_for_call);
             async move {
                 if attempt_count.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -926,7 +927,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
 
-        let result = call_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", "chat", &token, || {
             let count = call_count2.clone();
             async move {
                 if count.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -972,7 +973,7 @@ mod tests {
         let mut events = config.subscribe_events();
         let token = CancellationToken::new();
 
-        let result = call_with_retry(&config, "test-session", &token, || async {
+        let result = call_with_retry(&config, "test-session", "chat", &token, || async {
             Err::<ChatOutput, _>(LLMError::AuthError("bad key".into()))
         })
         .await;
@@ -992,7 +993,7 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             token_clone.cancel();
         });
-        let result = call_with_retry(&config, "test-session", &token, || async {
+        let result = call_with_retry(&config, "test-session", "chat", &token, || async {
             Err::<ChatOutput, _>(LLMError::from(
                 ProviderFailure::new(ProviderErrorKind::ServerOverloaded, "busy")
                     .with_retry_after_secs(Some(60)),
@@ -1014,7 +1015,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
 
-        let result = call_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", "chat", &token, || {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -1054,7 +1055,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
 
-        let result = call_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", "chat", &token, || {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -1089,7 +1090,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
 
-        let result = call_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", "chat", &token, || {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);

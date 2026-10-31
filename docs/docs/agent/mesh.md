@@ -198,6 +198,50 @@ struct literals must add `iroh_gso: true` to preserve previous behavior.
 - Nodes behind NAT or firewalls
 - Cloud + on-premises hybrid setups
 
+#### Iroh DNS Policy
+
+Iroh 1.3 uses system DNS with deferred public fallback by default. The N0 preset
+also resolves endpoint addresses through HTTPS pkarr alongside DNS, improving
+endpoint-ID-only dialing without changing reliable actor/provider streams.
+
+Override DNS policy for the shared iroh endpoint, including hybrid runtimes:
+
+```toml
+[mesh]
+enabled = true
+transport = "iroh"
+
+[mesh.iroh_dns]
+system_defaults = true
+fallback = "never"
+
+# Optional additional primary resolver; replace with your actual DNS server.
+[[mesh.iroh_dns.nameservers]]
+addr = "192.0.2.53:443"
+protocol = "https"
+tls_server_name = "dns.internal"
+```
+
+Fallback modes are `deferred` (query fallback after primary failures), `eager`
+(race primary and fallback), `if_system_empty` (fallback only when no system
+nameservers are available), and `never`. Without system defaults, `if_system_empty`
+behaves like eager fallback, following upstream semantics. Nameserver protocols
+are `udp`, `tcp`, `tls`, and `https`; encrypted protocols optionally accept
+`tls_server_name`. To replace public fallback resolvers, configure
+`[[mesh.iroh_dns.fallback_nameservers]]` using the same nameserver fields.
+
+Omitting `iroh_dns` preserves upstream defaults. Public fallback can disclose
+queries or bypass corporate DNS policy; use explicit policy where required.
+Disabling DNS fallback does **not** disable N0's public pkarr publisher/resolver
+or relays and is not a private-network mode.
+
+Settings apply at endpoint startup across all Iroh scopes. `qmtcode` preserves
+the startup config/profile DNS policy for hosting, invite joins, reconnects, and
+profile switches; restart to change it. Rust callers set
+`MeshRuntimeConfig::iroh_dns` (`None` preserves defaults), or use
+`join_mesh_via_invite_with_dns` for ad-hoc invite joins. Exhaustive runtime-config
+struct literals must add `iroh_dns: None` to preserve existing behavior.
+
 #### Comparison Table
 
 | Feature | LAN Transport | Iroh Transport |
@@ -1017,6 +1061,29 @@ stateDiagram-v2
 
 **Mixed-version compatibility.** New protocol fields (direct relay capability, source cursor, connection state, structured error codes) are additive with serde defaults, so older peers ignore them. New clients fall back to the generation-specific DHT relay name when talking to hosts that predate capability handoff, and hosts that predate cursor backfill are reported as potentially stale history rather than connection failure. Legacy `LoadSession`/`AttachRemoteSession` remain supported wrappers over the unified open operation, and legacy `prompt` RPCs are fulfilled with acknowledged submissions.
 
+### Session Interactions
+
+Tool permission requests and form questions (elicitation) follow the same lifecycle whether a session runs on the local agent or on a remote mesh node. A client never needs location-specific handling.
+
+1. **Request.** The session registers a pending interaction on its host node and emits a durable event (`PermissionRequested` or `ElicitationRequested`). The event is relayed to every attached client through the normal event path.
+2. **Delivery.** The transport the client is connected to (WebSocket or stdio) claims the delivery through the session and sends a standard ACP request: `session/request_permission` or `elicitation/create`. Claims, re-delivery and recovery go through the session actor, so a question from a remote session is discoverable and answerable through the local agent the client is connected to.
+3. **Resolution.** The client's answer is submitted to the owning session. Only the first valid answer for an interaction is accepted; later answers get a not-pending or stale result. An invalid form answer is rejected, the tool keeps waiting and the question is re-delivered for correction.
+4. **Retirement.** Cancelling the run, or the tool exiting, retires the interaction. A late answer is rejected as not pending and a reconnect cannot revive it.
+
+Sessions and prompts carry no per-connection client bridge. `session/prompt` works the same for remote sessions as for local ones.
+
+**Unanswered permission waits.** A permission-required tool call that is not decided by a cached "always" choice, tool policy or hook waits for an explicit user answer. It is not granted because no client is attached, delivery failed, the client disconnected, the response timed out or the answer was malformed. The request stays pending and is delivered again to the next authorized client that attaches.
+
+> **Unattended runs.** Scheduled or headless runs that previously relied on implicit auto-grant now stay paused at the first unanswered permission until a user answers or the run is cancelled. Restrict the enabled `tools` list, set `mutating_tools` / `assume_mutating` so only intended tools need permission, or add `permission_request` hooks that allow or deny explicitly for those runs. See [Hooks](hooks.md).
+
+**"Always" choices.** Answering "Always allow" or "Always reject" applies to later calls of the same tool in that session, for local and remote sessions alike.
+
+**Editor workspace queries.** The `language_query` tool needs a locally hosted session with an attached editor connection. For a session on a remote node it returns an "unavailable" result that names remote sessions, and the run continues.
+
+**All nodes must be upgraded together.** This contract adds new session messages to the mesh wire protocol. Mixed-version meshes are not supported, and there is no fallback to bridge-based or auto-granted behavior. If the local agent attaches to or prompts a session on a node that lacks the interaction messages, the operation fails with `RemoteNodeUpgradeRequired`. Clients receive it as an ACP error (code `-32603`) with `data.category = "remote_upgrade_required"` and `data.node` set to the outdated node. Upgrade that node, and every other node in the mesh, to the same agent version. Rolling back means reverting the agent on all nodes together.
+
+**Prompt response ordering.** The response to `session/prompt` is sent only after the requesting connection has delivered every `session/update` the prompt produced, for remote-hosted sessions as well as local ones. The wait is bounded: if the relay disconnects, the connection lags and cannot fully recover, or the 30 second safety limit passes, the response is sent anyway and a warning is logged. See [Event ordering across nodes](#event-ordering-across-nodes).
+
 ### Session Persistence
 
 Remote sessions are persisted on the host node:
@@ -1502,6 +1569,38 @@ let peers = mesh.connected_peers().await;
 println!("Connected to {} peers", peers.len());
 ```
 
+### Iroh Transport Diagnostics
+
+The `querymt/mesh/status` response includes an optional `iroh` snapshot. It is
+`null` for disabled/LAN-only runtimes. For an iroh endpoint it contains:
+
+- `closed`: whether the endpoint has shut down.
+- `relays`: home relay URLs, connected state, the last human-readable error, and
+  an optional `auth_denied_reason` from relay authentication.
+- `metrics`: optional cumulative relay and address-lookup counters.
+
+Snapshots read the current relay-status watcher on demand and create no observer
+task. Empty relay status can mean initial startup or disabled relays. Relay
+failure does not imply that direct peer connections have failed. Relay auth denial
+is distinct from mesh admission/invite rejection; its reason is for display, not
+programmatic string matching. Treat these diagnostics as operational information
+and do not expose them to untrusted clients.
+
+Enable counters with `querymt-agent`'s `remote-metrics` feature (which includes
+`remote`), or `querymt-remote`'s `iroh-metrics` feature (which includes `kameo-mesh`).
+The adapter also offers an independent `metrics` feature. Without the remote
+metrics feature, `metrics` is `null`, not a misleading set of zero counters.
+Counters include successful/failed/closed/rate-limited relay connections, total
+and failed lookups, and results/errors for N0's `dns` and `pkarr` services.
+Counters are decimal strings to preserve 64-bit precision in JavaScript clients.
+They reset when the endpoint restarts and are not an atomic cross-counter sample.
+Rate-limited connections count affected connections, not individual warnings.
+
+Rust callers can use `MeshHandle::iroh_diagnostics()` or
+`MeshRuntimeHandle::iroh_diagnostics()`. These diagnostics do not change peer
+liveness, authorization, routing, or application reconnect/backoff behavior.
+Batched unreliable datagrams are deliberately not used for actor/provider traffic.
+
 ### Event Logging
 
 Enable mesh logging:
@@ -1643,3 +1742,7 @@ cargo run --features remote -- --mesh=/ip4/192.168.1.100/tcp/9000
 - [Delegation](delegation.md) - Remote delegation patterns
 - [Examples](examples.md) - Mesh networking examples
 - [API Reference](api_reference.md) - Mesh API types and functions
+
+## Event ordering across nodes
+
+Relayed session events keep the host's per-session `session_seq`. The relay fetches durable events it missed from the host when it sees a gap, or when the host's forwarder reports that it fell behind (which also covers a loss at the end of a burst). A `session/prompt` response on an attached node follows the updates relayed for that prompt. All nodes of a mesh must run a version that supports this. See [Event Ordering](event-ordering.md).

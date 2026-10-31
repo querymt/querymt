@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 use crate::index::symbol_index::SymbolIndex;
-use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, path_list_read_access,
+};
 
 use super::helpers::{parse_paths, resolve_root, resolve_target};
 
@@ -52,6 +54,7 @@ impl Tool for FindSymbolReferencesTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "paths": {
                             "type": "array",
@@ -92,6 +95,10 @@ impl Tool for FindSymbolReferencesTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        path_list_read_access(args, "paths", cwd)
+    }
+
     async fn call(
         &self,
         args: Value,
@@ -112,7 +119,7 @@ impl Tool for FindSymbolReferencesTool {
         let mut matches: Vec<RefMatch> = Vec::new();
 
         for search_path in &search_paths {
-            let resolved = resolve_target(search_path, &root, context)?;
+            let resolved = resolve_target(search_path, &root);
             if resolved.is_file() {
                 self.search_file(
                     &resolved,
@@ -310,6 +317,19 @@ fn format_matches(matches: &[RefMatch], root: &Path, truncated: bool) -> String 
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::FileAccess as Access;
+
+    #[test]
+    fn file_access_reads_search_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let access = FindSymbolReferencesTool::new().file_access(
+            &serde_json::json!({"paths": ["src"], "symbols": ["x"]}),
+            Some(&root),
+        );
+        assert_eq!(access, Access::reads([root.join("src")]));
+    }
+
     use super::*;
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
@@ -319,6 +339,33 @@ mod tests {
             ToolResultPart::Text { text } => text,
             _ => panic!("expected text content"),
         }
+    }
+
+    #[tokio::test]
+    async fn relative_path_is_resolved_against_root_not_cwd() {
+        let cwd_dir = TempDir::new().unwrap();
+        let root_dir = TempDir::new().unwrap();
+        tokio::fs::write(root_dir.path().join("lib.rs"), "fn parse_config() {}\n")
+            .await
+            .unwrap();
+        let context =
+            AgentToolContext::basic("session".to_string(), Some(cwd_dir.path().to_path_buf()));
+        let tool = FindSymbolReferencesTool::new();
+        let args = serde_json::json!({
+            "paths": ["lib.rs"],
+            "symbols": ["parse_config"],
+            "root": root_dir.path()
+        });
+
+        let cwd = dunce::canonicalize(cwd_dir.path()).unwrap();
+        let expected = dunce::canonicalize(root_dir.path().join("lib.rs")).unwrap();
+        assert_eq!(
+            tool.file_access(&args, Some(&cwd)),
+            FileAccess::reads([expected])
+        );
+
+        let result = text_content(tool.call(args, &context).await.unwrap());
+        assert!(result.contains("parse_config"), "{result}");
     }
 
     #[tokio::test]

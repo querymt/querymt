@@ -29,6 +29,36 @@ use crate::session::error::{SessionError, SessionResult};
 
 use migrations::apply_migrations;
 
+/// Switch file databases to WAL with `synchronous=NORMAL`.
+///
+/// The ordered per-session event writer batches durable events, and the
+/// `event_emit` benchmark showed streaming latency stays within its threshold
+/// only when commits do not each pay a full fsync (see the `ordered-session-events`
+/// design). `synchronous=NORMAL` in WAL mode may lose the most recent commits
+/// on power loss but cannot corrupt the database. In-memory databases are left
+/// unchanged. A failure to enable WAL (for example on a filesystem without
+/// shared-memory support) is logged and the default journal mode is kept.
+fn configure_journal_durability(
+    conn: &Connection,
+    path: &std::path::Path,
+) -> Result<(), rusqlite::Error> {
+    if path.as_os_str() == ":memory:" || path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    match conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0)) {
+        Ok(mode) if mode.eq_ignore_ascii_case("wal") => {
+            conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        }
+        Ok(mode) => {
+            log::warn!("SQLite journal_mode stayed '{mode}'; keeping default durability settings");
+        }
+        Err(err) => {
+            log::warn!("failed to enable SQLite WAL mode: {err}; keeping default settings");
+        }
+    }
+    Ok(())
+}
+
 /// A unified SQLite storage implementation.
 ///
 /// This implementation provides all storage functionality in a single struct:
@@ -58,6 +88,8 @@ use migrations::apply_migrations;
 #[derive(Clone)]
 pub struct SqliteStorage {
     pub(super) conn: Arc<Mutex<Connection>>,
+    /// Directory of per-session run leases; `None` for in-memory databases.
+    run_lease_root: Option<PathBuf>,
 }
 
 impl SqliteStorage {
@@ -74,6 +106,18 @@ impl SqliteStorage {
         self.conn.clone()
     }
 
+    /// Directory holding this database's per-session run leases.
+    pub fn run_lease_root(&self) -> Option<PathBuf> {
+        self.run_lease_root.clone()
+    }
+
+    /// Override the run lease root (tests opt in with a temp directory).
+    #[cfg(test)]
+    pub fn with_run_lease_root(mut self, root: PathBuf) -> Self {
+        self.run_lease_root = Some(root);
+        self
+    }
+
     pub async fn connect(path: PathBuf) -> SessionResult<Self> {
         Self::connect_with_options(path, true).await
     }
@@ -85,10 +129,12 @@ impl SqliteStorage {
     /// export) that must not alter the existing data.
     pub async fn connect_with_options(path: PathBuf, migrate: bool) -> SessionResult<Self> {
         let db_path = path.clone();
+        let run_lease_root = crate::session::run_lease::run_lease_root_for_db(&path);
         let conn = tokio::task::spawn_blocking(move || -> Result<Connection, rusqlite::Error> {
             let mut conn = Connection::open(&db_path)?;
             conn.execute("PRAGMA foreign_keys = ON;", [])?;
             if migrate {
+                configure_journal_durability(&conn, &db_path)?;
                 apply_migrations(&mut conn)?;
             }
             Ok(conn)
@@ -99,6 +145,7 @@ impl SqliteStorage {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            run_lease_root,
         })
     }
 

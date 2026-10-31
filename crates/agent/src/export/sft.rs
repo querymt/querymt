@@ -707,6 +707,7 @@ mod tests {
             provider: Some("test-provider".to_string()),
             usage: None,
             cost_usd: None,
+            accounting: None,
             finish_reason: None,
             timestamp: 1000,
         }
@@ -733,6 +734,7 @@ mod tests {
             provider: Some("test-provider".to_string()),
             usage: None,
             cost_usd: None,
+            accounting: None,
             finish_reason: None,
             timestamp: 1000,
         }

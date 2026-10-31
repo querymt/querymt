@@ -79,6 +79,8 @@ impl LocalAgentHandle {
             remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
             #[cfg(feature = "remote")]
             remote_connect_gates: Default::default(),
+            #[cfg(feature = "remote")]
+            remote_connect_cooldowns: Default::default(),
             model_inventory,
             oauth_service,
             profiles: Arc::new(ArcSwap::from_pointee(None)),
@@ -124,15 +126,159 @@ impl LocalAgentHandle {
         } else {
             self.config.slash_command_registry.clone()
         };
-        if registry.is_empty() {
+        // Prompt sources resolve from the session's bound checkout when it
+        // participates in workspace isolation, so prompts and prompt
+        // includes reflect the workspace's contents instead of the agent
+        // builder's working directory. Local sessions keep the registry
+        // built at agent startup.
+        //
+        // A live session advertises exactly the registry it expands prompts
+        // with (installed once at materialization), so the catalog and
+        // invocation cannot diverge while the session is active. Only
+        // sessions without a live local actor re-resolve from the checkout.
+        let registry = match self.live_session_slash_registry(session_id).await {
+            Some(Some(live)) => (*live).clone(),
+            Some(None) => registry,
+            None => self
+                .workspace_catalog_registry(session_id)
+                .await
+                .unwrap_or(registry),
+        };
+        let mut update = crate::slash_commands::acp::registry_to_acp_update(&registry);
+        if self.config.workspace_service().is_some() {
+            update
+                .available_commands
+                .retain(|cmd| cmd.name != "/worktree");
+            update.available_commands.push(crate::acp::protocol::AvailableCommand::new(
+                "/worktree", "Create, hand off, archive and inspect isolated sessions; conservative removal, no automatic integration",
+            ).input(crate::acp::protocol::AvailableCommandInput::Unstructured(
+                crate::acp::protocol::UnstructuredCommandInput::new("create [ref] [name] | create --include-local-changes [name] | list | status [id] | result [id] | publish [id] | handoff [name] [--summary] | archive [id] | remove [id] [--archive] | recover <id>"),
+            )));
+        }
+        if update.available_commands.is_empty() {
             return None;
         }
-        Some(crate::slash_commands::acp::build_commands_notification(
-            session_id, &registry,
+        Some(crate::acp::protocol::SessionNotification::new(
+            session_id.to_owned(),
+            crate::acp::protocol::SessionUpdate::AvailableCommandsUpdate(update),
         ))
     }
 
-    pub(super) async fn session_config_options(
+    /// The slash registry of the live local session actor.
+    ///
+    /// - `None`: no live local actor for `session_id`.
+    /// - `Some(None)`: live session without a session-scoped registry
+    ///   (legacy local session; the agent-level registry applies).
+    /// - `Some(Some(registry))`: the registry the actor expands with.
+    async fn live_session_slash_registry(
+        &self,
+        session_id: &str,
+    ) -> Option<Option<Arc<crate::slash_commands::SlashCommandRegistry>>> {
+        let actor = {
+            let registry = self.registry_lock().await;
+            registry.local_actor_ref(session_id).cloned()
+        }?;
+        actor
+            .ask(crate::agent::messages::GetSessionSlashRegistry)
+            .mailbox_timeout(std::time::Duration::from_secs(5))
+            .reply_timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .ok()
+    }
+
+    /// Prompt catalog re-resolved from the session's bound workspace
+    /// checkout, when applicable.
+    ///
+    /// Returns `None` — keeping the agent-level registry — for local
+    /// sessions, absent workspace service, or disabled/absent discovery
+    /// config.
+    async fn workspace_catalog_registry(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::slash_commands::SlashCommandRegistry> {
+        let service = self.config.workspace_service()?;
+        let slash_config = self.config.slash_commands_config.as_ref()?;
+        if !slash_config.enabled {
+            return None;
+        }
+        // Same rule the session actor uses to expand prompts: any session
+        // executing inside a managed checkout (the owner, or a shared child
+        // such as a non-isolated delegate) resolves sources from that
+        // checkout's root, so the advertised catalog and execution agree.
+        let root = match service
+            .resolve_existing_session(session_id, None)
+            .await
+            .ok()?
+        {
+            Some(binding) => crate::worktree::resolve_repository(&binding.effective_cwd)
+                .map(|repo| repo.checkout.root)
+                .unwrap_or(binding.effective_cwd),
+            None => {
+                let cwd = self
+                    .config
+                    .provider
+                    .history_store()
+                    .get_session(session_id)
+                    .await
+                    .ok()??
+                    .cwd?;
+                let repo = crate::worktree::resolve_repository(&cwd).ok()?;
+                service
+                    .registry()
+                    .get_workspace_by_checkout(&repo.checkout.root)
+                    .await
+                    .ok()??;
+                repo.checkout.root
+            }
+        };
+        Some(
+            crate::slash_commands::SlashCommandRegistry::registry_for_workspace(
+                slash_config,
+                &root,
+            ),
+        )
+    }
+
+    pub(crate) async fn session_config_options(
+        &self,
+        session_id: Option<&str>,
+        mode: AgentMode,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<Vec<SessionConfigOption>, Error> {
+        if let Some(session_id) = session_id {
+            let session_ref = self.session_ref_for_agent_session(session_id).await?;
+            let state = session_ref
+                .get_session_control()
+                .await
+                .map_err(Error::from)?;
+            // Remote profiles belong to the owner, not this viewing node.
+            let mut options = if session_ref.is_remote() {
+                crate::agent::session_registry::config_options(
+                    state.active_mode,
+                    state.reasoning_effort,
+                )
+            } else {
+                self.session_profile_config_options(
+                    Some(session_id),
+                    state.active_mode,
+                    state.reasoning_effort,
+                )
+                .await?
+            };
+            let binding = state.effective_model;
+            options.push(crate::agent::session_registry::model_config_option(
+                &binding.provider,
+                &binding.model,
+                binding.provider_node_id.as_deref(),
+            ));
+            return Ok(options);
+        }
+        self.session_profile_config_options(None, mode, reasoning_effort)
+            .await
+    }
+
+    pub(super) async fn session_profile_config_options(
         &self,
         session_id: Option<&str>,
         mode: AgentMode,
@@ -175,9 +321,9 @@ impl LocalAgentHandle {
         )
     }
 
-    /// Mode is read from the attached owner, never inferred from this node's profile.
+    /// Configuration is read from the attached owner, never this node's profile.
     #[cfg(feature = "remote")]
-    pub(crate) async fn remote_session_mode_config_options(
+    pub(crate) async fn remote_session_config_options(
         &self,
         session_id: &str,
     ) -> Result<Vec<SessionConfigOption>, Error> {
@@ -193,11 +339,21 @@ impl LocalAgentHandle {
                     "sessionId": session_id,
                 }))
             })?;
-        let mode = session_ref.get_mode().await.map_err(Error::from)?;
-        Ok(crate::agent::session_registry::config_options(mode, None)
-            .into_iter()
-            .filter(|option| option.id.0.as_ref() == "mode")
-            .collect())
+        let state = session_ref
+            .get_session_control()
+            .await
+            .map_err(Error::from)?;
+        let mut options = crate::agent::session_registry::config_options(
+            state.active_mode,
+            state.reasoning_effort,
+        );
+        let binding = state.effective_model;
+        options.push(crate::agent::session_registry::model_config_option(
+            &binding.provider,
+            &binding.model,
+            binding.provider_node_id.as_deref(),
+        ));
+        Ok(options)
     }
 
     /// Acquire the registry lock with tracing for wait and hold durations.
@@ -246,12 +402,12 @@ impl LocalAgentHandle {
         self.config.workspace_manager_actor()
     }
 
-    /// Sets the process-wide client bridge used by the single-client stdio transport.
+    /// Sets the process-wide outbound channel used for agent-wide extension
+    /// notifications (schedules, control) by the single-client stdio transport.
     pub async fn set_bridge(&self, bridge: ClientBridgeSender) {
         if let Ok(mut handle) = self.bridge.lock() {
-            *handle = Some(bridge.clone());
+            *handle = Some(bridge);
         }
-        self.registry.lock().await.set_bridge(bridge);
     }
 
     pub fn subscribe_ext_notifications(&self) -> broadcast::Receiver<ExtNotification> {
@@ -262,23 +418,23 @@ impl LocalAgentHandle {
         let _ = self.ext_notifications.send(notification);
     }
 
-    /// Assigns the active ACP bridge to one materialized session.
+    /// Records the active ACP connection for one materialized session.
+    ///
+    /// The route is transport-owned state used only for the editor workspace
+    /// query capability of locally hosted sessions; the session actor itself
+    /// holds no bridge.
     pub async fn set_session_bridge(
         &self,
         session_id: &str,
         bridge: ClientBridgeSender,
     ) -> Result<(), Error> {
-        let session_ref = self.session_ref_for_agent_session(session_id).await?;
-        session_ref
-            .set_bridge(bridge.clone())
-            .await
-            .map_err(Error::from)?;
+        // Fail fast for unknown sessions; the route itself holds no session ref.
+        self.session_ref_for_agent_session(session_id).await?;
         if let Ok(mut bridges) = self.config.session_bridges.lock() {
             bridges.insert(
                 session_id.to_string(),
                 crate::agent::agent_config::SessionBridgeRoute {
                     bridge: bridge.clone(),
-                    session_ref: session_ref.clone(),
                 },
             );
         }
@@ -288,125 +444,60 @@ impl LocalAgentHandle {
         {
             bridges.insert(
                 session_id.to_string(),
-                crate::agent::agent_config::SessionBridgeRoute {
-                    bridge,
-                    session_ref,
-                },
+                crate::agent::agent_config::SessionBridgeRoute { bridge },
             );
         }
         Ok(())
     }
 
     pub async fn clear_session_bridge(&self, session_id: &str, connection_id: Arc<str>) -> bool {
-        let session_ref = match self.session_ref_for_agent_session(session_id).await {
-            Ok(session_ref) => Some(session_ref),
-            Err(_) => self
-                .find_session_bridge_route(session_id)
-                .await
-                .map(|route| route.session_ref),
-        };
-        let Some(session_ref) = session_ref else {
-            return false;
-        };
-        match session_ref.clear_bridge(connection_id.clone()).await {
-            Ok(true) => {
-                self.remove_session_bridge_routes(session_id, &connection_id)
-                    .await;
-                true
-            }
-            Ok(false) => false,
-            Err(err) => {
-                log::debug!("Failed to clear ACP bridge for session {session_id}: {err}");
-                self.remove_session_bridge_routes(session_id, &connection_id)
-                    .await;
-                true
-            }
-        }
+        self.remove_session_bridge_routes(session_id, &connection_id)
+            .await
     }
 
-    async fn find_session_bridge_route(
+    /// Removes every route for `session_id` that belongs to `connection_id`.
+    /// Returns whether any route was removed.
+    async fn remove_session_bridge_routes(
         &self,
         session_id: &str,
-    ) -> Option<crate::agent::agent_config::SessionBridgeRoute> {
-        if let Some(route) = Self::find_session_bridge_route_in_handle(self, session_id) {
-            return Some(route);
-        }
+        connection_id: &Arc<str>,
+    ) -> bool {
+        let mut removed =
+            Self::remove_session_bridge_routes_from_handle(self, session_id, connection_id);
         if let Some(profiles) = self.profiles() {
             for runtime in profiles.materialized_runtimes().await {
-                if let Some(route) =
-                    Self::find_session_bridge_route_in_handle(&runtime.agent().handle(), session_id)
-                {
-                    return Some(route);
-                }
-            }
-        }
-        None
-    }
-
-    fn find_session_bridge_route_in_handle(
-        handle: &LocalAgentHandle,
-        session_id: &str,
-    ) -> Option<crate::agent::agent_config::SessionBridgeRoute> {
-        if let Some(route) = handle
-            .config
-            .session_bridges
-            .lock()
-            .ok()
-            .and_then(|bridges| bridges.get(session_id).cloned())
-        {
-            return Some(route);
-        }
-        handle
-            .config
-            .agent_registry
-            .list_agents()
-            .into_iter()
-            .filter_map(|target| handle.config.agent_registry.get_handle(&target.id))
-            .filter_map(|handle| {
-                handle
-                    .as_any()
-                    .downcast_ref::<LocalAgentHandle>()
-                    .and_then(|local_handle| {
-                        local_handle
-                            .config
-                            .session_bridges
-                            .lock()
-                            .ok()
-                            .and_then(|bridges| bridges.get(session_id).cloned())
-                    })
-            })
-            .next()
-    }
-
-    async fn remove_session_bridge_routes(&self, session_id: &str, connection_id: &Arc<str>) {
-        Self::remove_session_bridge_routes_from_handle(self, session_id, connection_id);
-        if let Some(profiles) = self.profiles() {
-            for runtime in profiles.materialized_runtimes().await {
-                Self::remove_session_bridge_routes_from_handle(
+                removed |= Self::remove_session_bridge_routes_from_handle(
                     &runtime.agent().handle(),
                     session_id,
                     connection_id,
                 );
             }
         }
+        removed
     }
 
     fn remove_session_bridge_routes_from_handle(
         handle: &LocalAgentHandle,
         session_id: &str,
         connection_id: &Arc<str>,
-    ) {
-        Self::remove_session_bridge(&handle.config, session_id, connection_id);
+    ) -> bool {
+        let mut removed = Self::remove_session_bridge(&handle.config, session_id, connection_id);
         for target in handle.config.agent_registry.list_agents() {
             if let Some(agent_handle) = handle.config.agent_registry.get_handle(&target.id)
                 && let Some(local_handle) = agent_handle.as_any().downcast_ref::<LocalAgentHandle>()
             {
-                Self::remove_session_bridge(&local_handle.config, session_id, connection_id);
+                removed |=
+                    Self::remove_session_bridge(&local_handle.config, session_id, connection_id);
             }
         }
+        removed
     }
 
-    fn remove_session_bridge(config: &AgentConfig, session_id: &str, connection_id: &Arc<str>) {
+    fn remove_session_bridge(
+        config: &AgentConfig,
+        session_id: &str,
+        connection_id: &Arc<str>,
+    ) -> bool {
         if let Ok(mut bridges) = config.session_bridges.lock()
             && bridges
                 .get(session_id)
@@ -414,7 +505,9 @@ impl LocalAgentHandle {
                 == Some(connection_id.as_ref())
         {
             bridges.remove(session_id);
+            return true;
         }
+        false
     }
 
     /// Emits an event for external observers.
@@ -547,45 +640,40 @@ impl LocalAgentHandle {
                 .prepare_new_session(req)
                 .await?;
             let session_id = prepared.session_id.clone();
-            let session_ref = {
-                let mut registry = profile_handle.registry_lock().await;
-                registry.register_prepared_session(&prepared).await
-            };
-            let bridge = profile_handle
-                .bridge
-                .lock()
-                .ok()
-                .and_then(|guard| guard.clone());
-            profile_handle
-                .session_materializer
-                .finalize_session(&prepared, bridge)
-                .await?;
-            profiles
+            if let Err(error) = profiles
                 .bind_session_to_runtime(session_id.clone(), &runtime)
                 .await
-                .map_err(|err| {
-                    Error::internal_error().data(serde_json::json!({
-                        "message": format_prefixed_error_chain("Failed to bind session to profile", &err),
-                        "profileId": profile_id,
-                        "sessionId": session_id,
-                    }))
-                })?;
-
+            {
+                prepared.actor_ref.kill();
+                let cleanup = profile_handle
+                    .config
+                    .provider
+                    .history_store()
+                    .delete_session(&session_id)
+                    .await;
+                return Err(Error::internal_error().data(serde_json::json!({
+                    "message": format_prefixed_error_chain("Failed to bind session to profile", &error),
+                    "profileId": profile_id,
+                    "sessionId": session_id,
+                    "cleanupError": cleanup.err().map(|error| error.to_string()),
+                })));
+            }
+            let session_ref = crate::agent::session_registry::register_prepared_session(
+                &profile_handle.registry,
+                &prepared,
+            )
+            .await;
+            profile_handle
+                .session_materializer
+                .finalize_session(&prepared)
+                .await?;
             let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
             let reasoning_effort = profile_handle
                 .session_reasoning_effort(&session_ref, &session_id)
                 .await;
-            let profile_list = profiles.list_profiles().await.map_err(|err| {
-                Error::internal_error().data(serde_json::json!({
-                    "message": format_prefixed_error_chain("Failed to list profiles", &err),
-                }))
-            })?;
-            let config_options = crate::agent::session_registry::config_options_with_profiles(
-                current_mode,
-                reasoning_effort,
-                Some(profile_id.as_str()),
-                &profile_list,
-            );
+            let config_options = self
+                .session_config_options(Some(&session_id), current_mode, reasoning_effort)
+                .await?;
             let mut meta = serde_json::Map::new();
             meta.insert(
                 "querymt".to_string(),
@@ -606,16 +694,13 @@ impl LocalAgentHandle {
         let session_id = prepared.session_id.clone();
 
         // Phase 2: Register session (fast, registry lock held for microseconds only)
-        let session_ref = {
-            let mut registry = self.registry_lock().await;
-            registry.register_prepared_session(&prepared).await
-        };
+        let session_ref =
+            crate::agent::session_registry::register_prepared_session(&self.registry, &prepared)
+                .await;
 
         // Phase 3: Finalize session (post-registration work, NO registry lock held)
-        // Pass the bridge for setup outside the lock
-        let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
         self.session_materializer
-            .finalize_session(&prepared, bridge)
+            .finalize_session(&prepared)
             .await?;
 
         // Get current per-session settings for the response.
@@ -628,9 +713,31 @@ impl LocalAgentHandle {
             .session_config_options(Some(&session_id), current_mode, reasoning_effort)
             .await?;
 
-        Ok(NewSessionResponse::new(session_id)
+        let response = NewSessionResponse::new(session_id.clone())
             .modes(crate::agent::session_registry::mode_state(current_mode))
-            .config_options(config_options))
+            .config_options(config_options);
+
+        // Disclose the resolved binding for isolated sessions only; a local
+        // session's response is unchanged.
+        let Some(service) = self.config.workspace_service() else {
+            return Ok(response);
+        };
+        let binding = service
+            .resolve_existing_session(&session_id, None)
+            .await
+            .map_err(|err| Error::internal_error().data(err.to_string()))?;
+        Ok(match binding {
+            Some(binding) => response.meta(
+                serde_json::json!({
+                    crate::acp::shared::QUERYMT_META_NAMESPACE: {
+                        crate::worktree::SESSION_WORKSPACE_META_KEY: binding.disclosure(),
+                    },
+                })
+                .as_object()
+                .cloned(),
+            ),
+            None => response,
+        })
     }
 
     /// Load an existing session. MCP attachments are resolved internally by
@@ -704,15 +811,43 @@ impl LocalAgentHandle {
                 );
             }
             let config_options = self
-                .remote_session_mode_config_options(&session_id)
+                .remote_session_config_options(&session_id)
                 .await
                 .unwrap_or_else(|error| {
-                    tracing::warn!(session_id, error = %error, "remote mode unavailable during session load");
+                    tracing::warn!(session_id, error = %error, "remote configuration unavailable during session load");
                     Vec::new()
                 });
             return Ok(LoadSessionResponse::new()
                 .config_options(config_options)
                 .meta(meta));
+        }
+
+        // A read-only session (previous owner, archived workspace) replays its
+        // history but never materializes: no actor, no lease, no cwd inside a
+        // checkout it no longer owns.
+        if let Some(reason) = self
+            .session_materializer
+            .read_only_reason(&session_id)
+            .await?
+        {
+            // Snapshot and workspace disclosure come from the runtime that
+            // owns the session, not necessarily this handle.
+            let bound = self.bound_session_handle(&session_id).await?;
+            let meta_handle = bound
+                .as_ref()
+                .and_then(|(handle, _)| handle.as_any().downcast_ref::<LocalAgentHandle>())
+                .unwrap_or(self);
+            let mut meta = meta_handle
+                .session_load_snapshot_meta(&session_id)
+                .await?
+                .unwrap_or_default();
+            let namespace = meta
+                .entry(crate::acp::shared::QUERYMT_META_NAMESPACE.to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(namespace) = namespace.as_object_mut() {
+                namespace.insert("sessionAccess".to_string(), reason.access_meta());
+            }
+            return Ok(LoadSessionResponse::new().meta(meta));
         }
 
         if let Some(profiles) = self.profiles() {
@@ -753,10 +888,9 @@ impl LocalAgentHandle {
                 profile_handle.set_bridge(bridge).await;
             }
 
-            let existing_session_ref = {
-                let registry = profile_handle.registry_lock().await;
-                registry.get(&session_id).cloned()
-            };
+            let existing_session_ref =
+                crate::agent::session_registry::live_session(&profile_handle.registry, &session_id)
+                    .await;
             let session_ref = if let Some(session_ref) = existing_session_ref {
                 session_ref
             } else {
@@ -766,18 +900,15 @@ impl LocalAgentHandle {
                     .await?
                 {
                     PreparedSessionResult::Prepared(prepared) => {
-                        let session_ref = {
-                            let mut registry = profile_handle.registry_lock().await;
-                            registry.register_prepared_session(&prepared).await
-                        };
-                        let bridge = profile_handle
-                            .bridge
-                            .lock()
-                            .ok()
-                            .and_then(|guard| guard.clone());
+                        let session_ref =
+                            crate::agent::session_registry::register_prepared_session(
+                                &profile_handle.registry,
+                                &prepared,
+                            )
+                            .await;
                         profile_handle
                             .session_materializer
-                            .finalize_session(&prepared, bridge)
+                            .finalize_session(&prepared)
                             .await?;
                         session_ref
                     }
@@ -793,12 +924,22 @@ impl LocalAgentHandle {
                     "message": format_prefixed_error_chain("Failed to list profiles", &err),
                 }))
             })?;
-            let config_options = crate::agent::session_registry::config_options_with_profiles(
+            let mut config_options = crate::agent::session_registry::config_options_with_profiles(
                 current_mode,
                 reasoning_effort,
                 Some(binding.profile_id.as_str()),
                 &profile_list,
             );
+            let state = session_ref
+                .get_session_control()
+                .await
+                .map_err(Error::from)?;
+            let model = state.effective_model;
+            config_options.push(crate::agent::session_registry::model_config_option(
+                &model.provider,
+                &model.model,
+                model.provider_node_id.as_deref(),
+            ));
             let mut response = LoadSessionResponse::new()
                 .modes(crate::agent::session_registry::mode_state(current_mode))
                 .config_options(config_options);
@@ -814,10 +955,8 @@ impl LocalAgentHandle {
         // Single-flight check: Check if session is already materialized
         // Clone the session_ref out of the registry to avoid holding the lock
         // during the async get_mode() call.
-        let existing_session_ref = {
-            let registry = self.registry_lock().await;
-            registry.get(&session_id).cloned()
-        };
+        let existing_session_ref =
+            crate::agent::session_registry::live_session(&self.registry, &session_id).await;
 
         if let Some(session_ref) = existing_session_ref {
             // Registry lock is now dropped, safe to make async actor calls.
@@ -847,22 +986,19 @@ impl LocalAgentHandle {
             .await?
         {
             PreparedSessionResult::Prepared(prepared) => {
-                let session_ref = {
-                    let mut registry = self.registry_lock().await;
-                    registry.register_prepared_session(&prepared).await
-                };
+                let session_ref = crate::agent::session_registry::register_prepared_session(
+                    &self.registry,
+                    &prepared,
+                )
+                .await;
                 (Some(prepared), session_ref)
             }
             PreparedSessionResult::AlreadyRegistered(session_ref) => (None, session_ref),
         };
 
         // Phase 3: Finalize session (post-registration work, NO registry lock held)
-        // Pass the bridge for setup outside the lock
         if let Some(prepared) = prepared.as_ref() {
-            let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
-            self.session_materializer
-                .finalize_session(prepared, bridge)
-                .await?;
+            self.session_materializer.finalize_session(prepared).await?;
         }
 
         // Get current per-session settings for the response.
@@ -885,30 +1021,55 @@ impl LocalAgentHandle {
         Ok(response)
     }
 
+    /// `_meta` for a `session/load` response: the history snapshot (when a
+    /// view store exists) plus, for managed sessions only, the
+    /// `querymt.sessionWorkspace` disclosure. Local sessions carry no
+    /// workspace entry.
     async fn session_load_snapshot_meta(
         &self,
         session_id: &str,
     ) -> std::result::Result<Option<serde_json::Map<String, serde_json::Value>>, Error> {
-        let Some(view_store) = self.config.storage.view_store() else {
-            return Ok(None);
-        };
-        let snapshot = crate::session::load_session_snapshot(self, view_store, session_id)
-            .await
-            .map_err(|error| {
+        let mut meta = serde_json::Map::new();
+        if let Some(view_store) = self.config.storage.view_store() {
+            let snapshot = crate::session::load_session_snapshot(self, view_store, session_id)
+                .await
+                .map_err(|error| {
+                    Error::internal_error().data(serde_json::json!({
+                        "message": format!("Failed to build session load snapshot: {error}"),
+                        "sessionId": session_id,
+                    }))
+                })?;
+            let snapshot = serde_json::to_value(snapshot).map_err(|error| {
                 Error::internal_error().data(serde_json::json!({
-                    "message": format!("Failed to build session load snapshot: {error}"),
+                    "message": format!("Failed to serialize session load snapshot: {error}"),
                     "sessionId": session_id,
                 }))
             })?;
-        let snapshot = serde_json::to_value(snapshot).map_err(|error| {
-            Error::internal_error().data(serde_json::json!({
-                "message": format!("Failed to serialize session load snapshot: {error}"),
-                "sessionId": session_id,
-            }))
-        })?;
-        let mut meta = serde_json::Map::new();
-        meta.insert("querymt/sessionLoadSnapshot.v1".to_string(), snapshot);
-        Ok(Some(meta))
+            meta.insert("querymt/sessionLoadSnapshot.v1".to_string(), snapshot);
+        }
+
+        // A read-only session has no attachable binding (its workspace is
+        // archived or was handed off); `sessionAccess` discloses its state.
+        let read_only = self
+            .session_materializer
+            .read_only_reason(session_id)
+            .await?
+            .is_some();
+        if !read_only
+            && let Some(service) = self.config.workspace_service()
+            && let Some(binding) = service
+                .resolve_existing_session(session_id, None)
+                .await
+                .map_err(|err| Error::internal_error().data(err.to_string()))?
+        {
+            meta.insert(
+                crate::acp::shared::QUERYMT_META_NAMESPACE.to_string(),
+                serde_json::json!({
+                    crate::worktree::SESSION_WORKSPACE_META_KEY: binding.disclosure(),
+                }),
+            );
+        }
+        Ok((!meta.is_empty()).then_some(meta))
     }
 
     /// Gracefully shutdown the agent and all background tasks.

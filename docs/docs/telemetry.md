@@ -42,6 +42,19 @@ produces a tree of child spans describing every step that was executed.
 | `agent.prompt.execute` | Top-level prompt execution |
 | `agent.execution.turn` | A single execution turn |
 | `agent.execution.history_load` | Loading session history |
+| `agent.execution.driver_create` | Building the middleware driver for the turn |
+| `agent.execution.profile` | Resolving the turn's model profile (builds the provider on first use) |
+| `agent.execution.context_init` | Building the initial conversation context |
+| `agent.provider.build` | Cold provider build for the turn (once per turn; later steps reuse it) |
+| `agent.llm.call_with_retry` | Retry wrapper; `operation` is `provider_init` or `chat` |
+| `agent.tools.collect` | Collecting and hashing tool definitions (`tool_count`, `tools_bytes`) |
+| `agent.hooks.context` | Running context hooks before the request |
+| `agent.request.cache_breakpoints` | Applying cache hints to the request messages |
+| `agent.accounting.open` | Opening the durable accounting record before dispatch |
+| `providers.registry.load` | (Re)parsing the models.dev registry (`reason`: `cold` or `changed`, `bytes`, `parse_ms`) |
+| `http_adapter.credential_refresh` | Refreshing the provider credential |
+| `http_adapter.prepare_request` | Building the HTTP request (`http.request.body.size`) |
+| `http_adapter.send` | Sending the request, up to response headers |
 | `agent.execution.middleware.*` | Middleware phases (`turn_start`, `step_start`, `after_llm`, `processing_tool_calls`) |
 
 **Tool calls**
@@ -127,9 +140,20 @@ Built-in skill and shell tools may add `gen_ai.skill.name`,
 Normal chat adds `gen_ai.conversation.compacted=true` when the request retains
 a verified compaction summary.
 
-Unavailable fields are omitted. For streaming, `gen_ai.response.time_to_first_chunk`
-is measured in seconds from the first generation request to the first received
-chunk, not the first visible token.
+Unavailable fields are omitted. For streaming, these are measured in seconds from
+the first generation request (request setup and retry waits count; provider
+construction does not):
+
+| Attribute | Meaning |
+|---|---|
+| `llm.time_to_first_byte` | The response headers arrived |
+| `gen_ai.response.time_to_first_chunk` | The first stream chunk of any kind, including metadata |
+| `llm.time_to_first_token` | The first chunk carrying model output (text, reasoning or tool-call data) |
+| `qmt.stream.chunk_count`, `qmt.stream.wait_ms`, `qmt.stream.process_ms`, `qmt.stream.max_gap_ms` | Aggregates: time waiting on the network vs. handling chunks locally, and the longest gap between chunks |
+
+`llm.time_to_first_token` is the client-side time. It is intentionally not named
+`gen_ai.server.time_to_first_token`, which the GenAI conventions reserve for
+server-side measurements. Otelite reads `llm.time_to_first_token` for its TTFT column.
 
 #### What metadata is attached to spans
 
@@ -146,6 +170,59 @@ Spans may carry lightweight metadata such as:
     arguments/results, file contents, or API keys. This is not a blanket privacy
     guarantee for preexisting diagnostic logs or span events: verbose logging
     can include payload previews, so use it only with appropriate data controls.
+
+### Metrics
+
+The agent exports counters and histograms through the same OTLP endpoint as traces and
+logs (periodic export; `QMT_NO_TELEMETRY` disables them as well).
+
+**Latency histograms** (seconds; attributes `gen_ai.operation.name`,
+`gen_ai.provider.name`, `gen_ai.request.model`):
+
+| Metric | Extra attributes | Meaning |
+|---|---|---|
+| `gen_ai.client.operation.duration` | `error.type` on failure (`cancelled` or `_OTHER`) | One logical model request, retries included |
+| `qmt.gen_ai.client.time_to_first_byte` | | Request dispatch to response headers (streaming only) |
+| `qmt.gen_ai.client.time_to_first_token` | | Request dispatch to the first model-output chunk (streaming only) |
+| `qmt.agent.step.overhead` | `phase=pre_request` | Agent time between starting a step and dispatching its request |
+
+| Metric | Attributes | Meaning |
+|---|---|---|
+| `querymt.tool.args_repaired` | `tool`, `rule` | One increment per argument repair actually applied before validation. `rule` is `alias`, `wrap`, `json_string`, `int_string` or `scalar_to_array`. |
+| `querymt.tool.calls` | `tool`, `repaired`, `outcome` | One increment per tool call. `repaired` is `true` when at least one repair was applied. `outcome` is `success`, `error` (the tool ran or its pipeline failed) or `rejected` (never ran: conflicting spellings, hook block, validation failure or middleware rejection). |
+
+Repairs are counted once per call, when its arguments are prepared: both the
+normalisation of the model's arguments and the normalisation of a pre-tool hook
+replacement count, but scheduling, middleware review, execution and re-normalising an
+already canonical value do not. A repaired call is also marked on its
+`execute_tool` span with `querymt.tool.args_repairs`, the list of applied rule
+names (never argument values).
+
+Rule counters alone cannot tell whether a repair helped, because a call can be
+repaired and still fail. Use `querymt.tool.calls` for that:
+
+```text
+# repaired calls that ran fine vs. repaired calls that still failed, per tool
+sum by (tool, outcome) (querymt_tool_calls_total{repaired="true"})
+
+# share of repaired calls that did not succeed
+sum(querymt_tool_calls_total{repaired="true", outcome!="success"})
+  / sum(querymt_tool_calls_total{repaired="true"})
+
+# which repairs fire most
+sum by (tool, rule) (increase(querymt_tool_args_repaired_total[7d]))
+```
+
+(Metric names are shown in Prometheus form; other backends may render dots
+differently.)
+
+**Retention.** QueryMT does not retain metrics itself. Counters are cumulative and
+kept for as long as your collector/backend keeps them; choose a window of at least
+seven days to compare release periods. Failure and volume figures that must be
+independent of telemetry come from the session execution records (stored tool
+results, with `is_error` and the effective arguments), which live as long as the
+session history. If the metrics backend is unavailable, report repair outcomes as
+unavailable instead of inferring them from failed calls.
 
 ### Logs
 

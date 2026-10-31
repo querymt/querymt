@@ -229,7 +229,7 @@ source identity and remote sync progress migrations already present on `main`.
 
 The planner decides to delegate and creates a delegation request.
 
-If hooks are enabled, `pre_delegation` runs before the delegation is recorded. It can block the delegation entirely or rewrite fields such as `target_agent_id`, `objective`, `context`, `constraints`, and `expected_output`.
+If hooks are enabled, `pre_delegation` runs before the delegation is recorded. It can block the delegation entirely or rewrite fields such as `target_agent_id`, `objective`, `context`, `constraints`, `expected_output`, and `isolation`.
 
 The planner-side tool result is updated when a delegation is blocked, so the model sees `Delegation blocked by hook: ...` instead of a misleading queued message.
 
@@ -246,8 +246,13 @@ pub struct Delegation {
     pub task_id: Option<String>,        // Associated task ID
     pub planning_summary: Option<String>,// Summary of planning conversation
     pub verification_spec: Option<VerificationSpec>, // Optional verification
+    pub isolation: DelegationIsolation, // Resolved execution workspace policy
 }
 ```
+
+`isolation` is the resolved execution-workspace policy: `shared` (legacy behavior — the delegate runs in the parent's checkout) or `isolated` (a private managed Git worktree seeded from the parent's current code state; see [Git Worktree Workspaces](worktrees.md)). The `delegate` tool accepts an optional `isolation` argument (`inherit` | `isolated` | `shared`); `inherit` resolves from the parent session — isolated parents isolate every delegate by default, local parents keep shared execution. Explicit `shared` overrides on isolated parents are disclosed as shared execution, and a requested isolation that cannot be satisfied fails the delegation instead of falling back to sharing.
+
+In a quorum, each `[[delegates]]` entry may also set `isolation = "inherit" | "isolated" | "shared"` (default `inherit`) — the configured analogue of the tool argument. Precedence is: an explicit non-`inherit` value on the `delegate` tool call, then the target delegate's configured value, then inheritance from the parent session's execution mode. The resolved policy and where it came from (`request`, `delegate_config` or `inherited`) are persisted with the delegation and disclosed in the tool result. `isolated` requires `[quorum.workspace] enabled = true` and is rejected at load/build time otherwise. See [Git Worktree Workspaces](worktrees.md).
 
 ### 2. Session Creation
 
@@ -274,6 +279,16 @@ session_ref
     .set_planning_context(planning_summary)
     .await?;
 ```
+
+#### Cost of the planning summary
+
+Generating the planning summary is a paid request made by the **parent**. It is recorded in the parent session's cost accounting with the `delegation_summary` purpose and charged to the **parent cycle that requested the delegation**, even when the summary finishes after the parent has started a newer cycle. The delegated child's own generation is recorded under the child session and is never charged to the parent a second time.
+
+- The summary uses its own configured provider and model, so its billing class and pricing come from that provider, not from the parent's.
+- A refusal, truncated or empty summary still incurs whatever usage the provider reported; that cost is retained even though the summary is discarded.
+- A timeout or transport failure leaves the cost uncertain rather than zero.
+- When no provider request is made (the parent history already ends in a compaction summary, or is below the summarization threshold), nothing is recorded.
+- If the accounting record cannot be written, the summary is skipped and the delegation proceeds without it. No paid request is made without a recorded start.
 
 ### 4. Task Execution
 
@@ -510,6 +525,9 @@ let delegation = Delegation {
     task_id: None,
     planning_summary: None,
     verification_spec: None,
+    // `Inherit` (default): isolated parents isolate delegates, local parents
+    // share. Use `Shared` or `Isolated` to force a mode.
+    isolation: DelegationIsolation::Inherit,
 };
 
 // Request delegation

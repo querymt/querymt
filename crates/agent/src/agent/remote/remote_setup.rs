@@ -189,7 +189,7 @@ pub async fn register_remote_agents_from_config(
 /// exists, then return an `AgentInfo` for registration.
 #[tracing::instrument(
     name = "remote.setup.register_remote_agent",
-    skip(mesh, _peer_addr),
+    skip(mesh, peer_addr),
     fields(
         peer = %remote.peer,
         agent_id = %remote.id,
@@ -200,9 +200,10 @@ pub async fn register_remote_agents_from_config(
 async fn register_remote_agent(
     mesh: &MeshHandle,
     remote: &RemoteAgentConfig,
-    _peer_addr: &str,
+    peer_addr: &str,
 ) -> Result<(AgentInfo, Option<String>)> {
-    use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
+    use crate::agent::remote::{GetNodeInfo, NodeId, RemoteNodeManager};
+    use libp2p::multiaddr::Protocol;
     use querymt_remote::ask_remote_with_timeout;
 
     // Prefer peer-specific DHT names so multi-peer meshes do not bind to the
@@ -210,13 +211,22 @@ async fn register_remote_agent(
     let lookup_timeout = std::time::Duration::from_secs(5);
     let runtime = MeshRuntimeHandle::from(mesh.clone());
     let mut found_ref = None;
-    let mut target_node_id = None;
+    let mut target_node_id = mesh
+        .resolve_peer_node_id(&remote.peer)
+        .await
+        .map(|node_id| node_id.to_string())
+        .or_else(|| {
+            // A terminal /p2p address component identifies the owner without a name resolver.
+            let addr = peer_addr.parse::<libp2p::Multiaddr>().ok()?;
+            match addr.iter().last()? {
+                Protocol::P2p(peer_id) => Some(NodeId::from_peer_id(peer_id).to_string()),
+                _ => None,
+            }
+        });
 
-    if let Some(resolved) = mesh.resolve_peer_node_id(&remote.peer).await {
-        let resolved_id = resolved.to_string();
-        target_node_id = Some(resolved_id.clone());
+    if let Some(owner_node_id) = target_node_id.clone() {
         for scope in runtime.active_scopes() {
-            let dht_name = super::scope::scoped_node_manager_for_peer(&scope, &resolved_id);
+            let dht_name = super::scope::scoped_node_manager_for_peer(&scope, &owner_node_id);
             match runtime
                 .lookup_actor_with_timeout::<RemoteNodeManager>(dht_name.clone(), lookup_timeout)
                 .await
@@ -274,6 +284,7 @@ async fn register_remote_agent(
     }
 
     let info = AgentInfo {
+        isolation: Default::default(),
         id: remote.id.clone(),
         name: remote.name.clone(),
         description: remote.description.clone(),

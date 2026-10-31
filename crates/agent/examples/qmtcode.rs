@@ -70,7 +70,7 @@ const DEFAULT_MESH_STREAM_RECONNECT_GRACE: std::time::Duration =
     about = "Run QueryMT coder agent in ACP mode, API mode, dashboard mode, or as a mesh node"
 )]
 #[command(
-    after_help = "Examples:\n  qmtcode --acp\n  qmtcode --acp-ws\n  qmtcode --acp-ws=0.0.0.0:42069\n  qmtcode --api\n  qmtcode --api=0.0.0.0:8080\n  qmtcode --dashboard\n  qmtcode --dashboard=0.0.0.0:8080\n  qmtcode --mesh\n  qmtcode --mesh=/ip4/0.0.0.0/tcp/9001\n  qmtcode --api --mesh\n  qmtcode --mesh --mesh-invite\n  qmtcode --mesh --mesh-invite=\"My Mesh\"\n  qmtcode --mesh-join=qmt://mesh/join/TOKEN\n  qmtcode path/to/config.toml --acp"
+    after_help = "Examples:\n  qmtcode --acp\n  qmtcode --acp-ws\n  qmtcode --acp-ws=0.0.0.0:42069\n  qmtcode --api\n  qmtcode --api=0.0.0.0:8080\n  qmtcode --dashboard\n  qmtcode --dashboard=0.0.0.0:8080\n  qmtcode --mesh\n  qmtcode --mesh=/ip4/0.0.0.0/tcp/9001\n  qmtcode --api --mesh\n  qmtcode --mesh --mesh-invite\n  qmtcode --mesh --mesh-invite=\"My Mesh\"\n  qmtcode --mesh-join=qmt://mesh/join/TOKEN\n  qmtcode --mesh --mesh-peer=/ip4/127.0.0.1/tcp/9001/p2p/PEER_ID\n  qmtcode path/to/config.toml --acp"
 )]
 #[cfg_attr(
     all(feature = "api", feature = "dashboard"),
@@ -202,6 +202,56 @@ struct Cli {
     #[cfg(feature = "remote")]
     #[arg(long, value_name = "token")]
     mesh_join: Option<String>,
+
+    /// Dial a static mesh peer at startup (repeatable). Implies --mesh.
+    ///
+    /// The address must include the peer id (`/p2p/<peer_id>`), which the remote
+    /// node prints as `peer_id=` at startup. Combined with `[[mesh.peers]]` from
+    /// the config. Useful for reaching a node through an SSH port forward.
+    ///
+    /// Example:
+    ///   --mesh-peer=/ip4/127.0.0.1/tcp/9001/p2p/12D3KooW...
+    #[cfg(feature = "remote")]
+    #[arg(
+        long,
+        value_name = "multiaddr",
+        action = ArgAction::Append,
+        conflicts_with = "mesh_join"
+    )]
+    mesh_peer: Vec<String>,
+}
+
+/// Peers declared in `[[mesh.peers]]` of the loaded config.
+#[cfg(feature = "remote")]
+fn mesh_peers(config: &Config) -> Vec<String> {
+    let peers = match config {
+        Config::Single(config) => &config.mesh.peers,
+        Config::Multi(config) => &config.mesh.peers,
+    };
+    peers.iter().map(|peer| peer.addr.clone()).collect()
+}
+
+/// Merge CLI and TOML static peers (CLI first, duplicates removed) and require
+/// every address to carry a `/p2p/<peer_id>` component.
+#[cfg(feature = "remote")]
+fn merge_mesh_peers(cli_peers: &[String], toml_peers: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut merged: Vec<String> = Vec::new();
+    for addr in cli_peers.iter().chain(toml_peers) {
+        let addr = addr.trim();
+        let parsed: libp2p::Multiaddr = addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid mesh peer address '{addr}': {e}"))?;
+        anyhow::ensure!(
+            parsed
+                .iter()
+                .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))),
+            "mesh peer '{addr}' must include /p2p/<peer_id> (the remote prints it as peer_id= at startup)"
+        );
+        if !merged.iter().any(|existing| existing == addr) {
+            merged.push(addr.to_string());
+        }
+    }
+    Ok(merged)
 }
 
 fn qmtcode_profile_catalog(profiles_dirs: &[PathBuf]) -> anyhow::Result<LocalProfileCatalog> {
@@ -238,11 +288,20 @@ fn configure_mesh_iroh_gso(mut config: Config, override_value: Option<bool>) -> 
     (config, iroh_gso)
 }
 
-// Keep the process-wide endpoint setting consistent across profile switches/reloads.
+#[cfg(feature = "remote")]
+fn mesh_dns(config: &Config) -> Option<querymt_remote::IrohDnsConfig> {
+    match config {
+        Config::Single(config) => config.mesh.iroh_dns.clone(),
+        Config::Multi(config) => config.mesh.iroh_dns.clone(),
+    }
+}
+
+// Keep the process-wide endpoint settings consistent across profile switches/reloads.
 #[cfg(feature = "remote")]
 struct MeshGsoProfileCatalog {
     inner: LocalProfileCatalog,
     iroh_gso: bool,
+    iroh_dns: Option<querymt_remote::IrohDnsConfig>,
 }
 
 #[cfg(feature = "remote")]
@@ -257,7 +316,11 @@ impl ProfileCatalog for MeshGsoProfileCatalog {
         id: &str,
     ) -> anyhow::Result<querymt_agent::profiles::ProfileDocument> {
         let mut document = self.inner.load_profile(id).await?;
-        let (config, _) = configure_mesh_iroh_gso(document.config, Some(self.iroh_gso));
+        let (mut config, _) = configure_mesh_iroh_gso(document.config, Some(self.iroh_gso));
+        match &mut config {
+            Config::Single(config) => config.mesh.iroh_dns = self.iroh_dns.clone(),
+            Config::Multi(config) => config.mesh.iroh_dns = self.iroh_dns.clone(),
+        }
         document.config = config;
         Ok(document)
     }
@@ -449,7 +512,8 @@ async fn run(
     let has_mesh_invite = false;
 
     #[cfg(feature = "remote")]
-    let has_mesh = cli.mesh.is_some() || has_mesh_join || has_mesh_invite;
+    let has_mesh =
+        cli.mesh.is_some() || has_mesh_join || has_mesh_invite || !cli.mesh_peer.is_empty();
     #[cfg(not(feature = "remote"))]
     let has_mesh = has_mesh_join || has_mesh_invite;
 
@@ -501,6 +565,10 @@ async fn run(
 
     #[cfg(feature = "remote")]
     let mesh_iroh_gso;
+    #[cfg(feature = "remote")]
+    let mesh_iroh_dns;
+    #[cfg(feature = "remote")]
+    let mesh_toml_peers;
 
     let runner = if let Some(config_path) = &cli.config_file {
         eprintln!("Loading agent from: {}", config_path.display());
@@ -509,6 +577,8 @@ async fn run(
         let config = {
             let (config, gso) = configure_mesh_iroh_gso(config, cli.mesh_iroh_gso);
             mesh_iroh_gso = gso;
+            mesh_iroh_dns = mesh_dns(&config);
+            mesh_toml_peers = mesh_peers(&config);
             config
         };
         from_config_value_with_infra(config, shared_infra.clone()).await?
@@ -518,11 +588,14 @@ async fn run(
         #[cfg(feature = "remote")]
         let profile_catalog = {
             let document = profile_catalog.load_profile(&selected_profile).await?;
-            let (_, gso) = configure_mesh_iroh_gso(document.config, cli.mesh_iroh_gso);
+            let (config, gso) = configure_mesh_iroh_gso(document.config, cli.mesh_iroh_gso);
             mesh_iroh_gso = gso;
+            mesh_iroh_dns = mesh_dns(&config);
+            mesh_toml_peers = mesh_peers(&config);
             MeshGsoProfileCatalog {
                 inner: profile_catalog,
                 iroh_gso: gso,
+                iroh_dns: mesh_iroh_dns.clone(),
             }
         };
         let catalog: Arc<dyn ProfileCatalog> = Arc::new(profile_catalog);
@@ -549,7 +622,7 @@ async fn run(
     #[cfg(feature = "remote")]
     if let Some(ref token) = cli.mesh_join {
         use querymt_agent::agent::remote::invite::SignedInviteGrant;
-        use querymt_agent::agent::remote::mesh::join_mesh_via_invite_with_gso;
+        use querymt_agent::agent::remote::mesh::join_mesh_via_invite_with_dns;
 
         let invite =
             SignedInviteGrant::decode(token).map_err(|e| format!("Invalid invite token: {e}"))?;
@@ -568,7 +641,9 @@ async fn run(
             invite.grant.inviter_peer_id
         );
 
-        match join_mesh_via_invite_with_gso(&invite, None, mesh_iroh_gso).await {
+        match join_mesh_via_invite_with_dns(&invite, None, mesh_iroh_gso, mesh_iroh_dns.clone())
+            .await
+        {
             Ok(runtime) => {
                 let mesh = runtime.as_mesh_handle().clone();
                 eprintln!("Joined mesh: peer_id={}", mesh.peer_id());
@@ -588,7 +663,7 @@ async fn run(
 
     #[cfg(feature = "remote")]
     let effective_mesh = cli.mesh.clone().or_else(|| {
-        if has_mesh_invite {
+        if has_mesh_invite || !cli.mesh_peer.is_empty() {
             Some(DEFAULT_MESH_ADDR.to_string())
         } else {
             None
@@ -638,12 +713,13 @@ async fn run(
             },
             iroh_enabled: true,
             iroh_gso: mesh_iroh_gso,
+            iroh_dns: mesh_iroh_dns.clone(),
             iroh_scopes,
             identity_file: None,
             request_timeout: DEFAULT_MESH_REQUEST_TIMEOUT,
             stream_reconnect_grace: DEFAULT_MESH_STREAM_RECONNECT_GRACE,
             node_name: None,
-            peers: Vec::new(),
+            peers: merge_mesh_peers(&cli.mesh_peer, &mesh_toml_peers)?,
             auto_fallback: false,
         };
 
@@ -668,6 +744,9 @@ async fn run(
                         runtime_config.iroh_scopes.len()
                     ),
                     (false, true) => eprintln!("Mesh transports: none"),
+                }
+                if !runtime_config.peers.is_empty() {
+                    eprintln!("Mesh static peers: {}", runtime_config.peers.join(", "));
                 }
 
                 if let Some(name) = &cli.mesh_invite {
@@ -1074,6 +1153,7 @@ system = "inline"
             let catalog = MeshGsoProfileCatalog {
                 inner: inner.clone(),
                 iroh_gso: gso,
+                iroh_dns: Some(querymt_remote::IrohDnsConfig::default()),
             };
             assert_eq!(catalog.watch_roots(), inner.watch_roots());
             assert_eq!(
@@ -1082,6 +1162,7 @@ system = "inline"
             );
             for id in ["single", "multi"] {
                 let document = catalog.load_profile(id).await.unwrap();
+                assert_eq!(mesh_dns(&document.config), catalog.iroh_dns);
                 let (_, resolved) = configure_mesh_iroh_gso(document.config, None);
                 assert_eq!(resolved, gso);
             }
@@ -1095,6 +1176,48 @@ system = "inline"
         assert!(help.contains("--mesh-iroh-gso <true|false>"));
         assert!(help.contains("QMT_MESH_IROH_GSO"));
         assert!(help.contains("CLI > QMT_MESH_IROH_GSO > config/profile TOML > true"));
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn mesh_peer_flag_is_repeatable_and_conflicts_with_join() {
+        let cli = Cli::try_parse_from([
+            "qmtcode",
+            "--mesh-peer=/ip4/127.0.0.1/tcp/9001/p2p/A",
+            "--mesh-peer=/ip4/127.0.0.1/tcp/9002/p2p/B",
+        ])
+        .unwrap();
+        assert_eq!(cli.mesh_peer.len(), 2);
+        assert!(
+            Cli::try_parse_from([
+                "qmtcode",
+                "--mesh-join=TOKEN",
+                "--mesh-peer=/ip4/127.0.0.1/tcp/9001/p2p/A",
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn merge_mesh_peers_requires_peer_id_and_dedups() {
+        let id = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let with_id = format!("/ip4/127.0.0.1/tcp/9001/p2p/{id}");
+
+        let merged = merge_mesh_peers(
+            std::slice::from_ref(&with_id),
+            std::slice::from_ref(&with_id),
+        )
+        .unwrap();
+        assert_eq!(merged, vec![with_id.clone()]);
+
+        let err = merge_mesh_peers(&["/ip4/127.0.0.1/tcp/9001".to_string()], &[]).unwrap_err();
+        assert!(err.to_string().contains("/p2p/<peer_id>"));
+
+        assert!(merge_mesh_peers(&["not-a-multiaddr".to_string()], &[]).is_err());
+        assert!(merge_mesh_peers(&[], &[with_id]).is_ok());
     }
 
     #[cfg(not(feature = "remote"))]

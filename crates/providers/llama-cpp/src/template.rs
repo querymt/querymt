@@ -4,6 +4,7 @@ use crate::config::LlamaCppConfig;
 use crate::messages;
 use llama_cpp_2::model::LlamaModel;
 use minijinja::Environment;
+use minijinja::value::Serde;
 use querymt::chat::{ChatMessage, ReasoningEffort, Tool};
 use querymt::error::LLMError;
 use querymt_utils::str_utils::truncate_str_tail;
@@ -138,7 +139,7 @@ fn render_template_source(
     MINIJINJA_ENV
         .template_from_str(template)
         .map_err(|e| LLMError::ProviderError(format!("Failed to compile chat template: {e}")))?
-        .render(context)
+        .render(Serde(context))
         .map_err(|e| LLMError::ProviderError(format!("Failed to render chat template: {e}")))
 }
 
@@ -256,8 +257,8 @@ fn render_template(
         messages: messages_value,
         tools: tools_value,
         add_generation_prompt,
-        bos_token: token_piece(model, model.token_bos()),
-        eos_token: token_piece(model, model.token_eos()),
+        bos_token: token_piece(model, model.vocab().bos()),
+        eos_token: token_piece(model, model.vocab().eos()),
         enable_thinking,
         reasoning_effort,
         reasoning_preservation: ReasoningPreservationContext::new(cfg.preserve_reasoning),
@@ -296,8 +297,8 @@ fn render_template(
 }
 
 fn token_piece(model: &LlamaModel, token: llama_cpp_2::token::LlamaToken) -> String {
-    model
-        .token_to_piece(token, &mut encoding_rs::UTF_8.new_decoder(), true, None)
+    let bytes = model.vocab().token_to_piece(token, true, None);
+    crate::generation::decode_piece(&mut encoding_rs::UTF_8.new_decoder(), &bytes)
         .unwrap_or_default()
 }
 

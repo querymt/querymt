@@ -16,20 +16,19 @@ use crate::session::runtime::RuntimeContext;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::session::store::{SessionExecutionConfig, SessionStore};
 use crate::test_utils::{
-    MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, TestPluginLoader,
-    TestProviderFactory, mock_querymt_tool_call,
+    MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory,
+    mock_plugin_registry, mock_plugin_registry_in, mock_querymt_tool_call,
 };
 use kameo::actor::Spawn;
 use mockall::Sequence;
 use querymt::LLMParams;
 use querymt::chat::FinishReason;
 use querymt::chat::{ChatRole, ReasoningEffort};
-use querymt::plugin::host::PluginRegistry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 // Mock implementations moved to crate::test_utils::mocks
 
@@ -415,6 +414,7 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
                 .unwrap();
             let delegation = store
                 .create_delegation(Delegation {
+                    isolation: Default::default(),
                     id: 0,
                     public_id: String::new(),
                     session_id: session.id,
@@ -437,6 +437,8 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
             let kind = AgentEventKind::DelegationRequested {
                 delegation: delegation.clone(),
                 tool_call_id: None,
+                batch_id: None,
+                cycle_id: None,
             };
             let unrelated = tracing::info_span!(parent: None, "unrelated-relay");
             async {
@@ -458,6 +460,7 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
                             .event_sink
                             .fanout()
                             .publish(EventEnvelope::Durable(DurableEvent {
+                                session_seq: 0,
                                 event_id: "replayed".into(),
                                 stream_seq: 1,
                                 session_id: harness.exec_ctx.session_id.clone(),
@@ -575,10 +578,38 @@ impl MiddlewareDriver for AlwaysStopMiddleware {
     }
 }
 
-/// A middleware that fires `ContextThreshold` on the **first** `BeforeLlmCall`
-/// and then passes through on subsequent calls. This simulates the real
-/// `ContextMiddleware` detecting that the context window is full, which causes
-/// the execution state machine to attempt AI compaction before continuing.
+/// Hold a delegate before its first LLM call to make cancellation deterministic.
+struct CancellationGateMiddleware {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl MiddlewareDriver for CancellationGateMiddleware {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> crate::middleware::Result<ExecutionState> {
+        match state {
+            before @ ExecutionState::BeforeLlmCall { .. } => {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(before)
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn reset(&self) {}
+
+    fn name(&self) -> &'static str {
+        "CancellationGateMiddleware"
+    }
+}
+
+/// Fires `ContextThreshold` on the first `BeforeLlmCall`, then passes through.
+/// This simulates a full context window that triggers AI compaction.
 struct ContextThresholdOnceMiddleware {
     fired: std::sync::atomic::AtomicBool,
 }
@@ -625,6 +656,10 @@ impl MiddlewareDriver for ContextThresholdOnceMiddleware {
 enum DelegateBehavior {
     AlwaysOk,
     AlwaysFail,
+    PauseBeforeLlmCall {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    },
     /// Delegate's execution is stopped by middleware (e.g. context threshold).
     /// This simulates a premature stop that should be treated as a delegation failure.
     StoppedByMiddleware,
@@ -662,21 +697,7 @@ impl TestHarness {
             tools: Vec::new().into_boxed_slice(),
         };
         let factory = Arc::new(TestProviderFactory::new(shared_provider));
-        let temp_dir = TempDir::new().expect("temp dir");
-        let wasm_path = temp_dir.path().join("mock.wasm");
-        std::fs::write(&wasm_path, "").expect("write wasm");
-        let config_path = temp_dir.path().join("providers.toml");
-        std::fs::write(
-            &config_path,
-            format!(
-                "[[providers]]\nname = \"mock\"\npath = \"{}\"\n",
-                wasm_path.display()
-            ),
-        )
-        .expect("write config");
-
-        let mut registry = PluginRegistry::from_path(&config_path).expect("registry");
-        registry.register_loader(Box::new(TestPluginLoader { factory }));
+        let (registry, temp_dir) = mock_plugin_registry(factory).expect("plugin registry");
         let registry = Arc::new(registry);
 
         // Use a single shared in-memory SQLite store for orchestrator and delegates.
@@ -796,7 +817,6 @@ impl TestHarness {
         crate::agent::execution::execute_cycle_state_machine(
             &self.config,
             &mut self.exec_ctx,
-            None,
             crate::agent::core::AgentMode::Build,
         )
         .await
@@ -925,6 +945,18 @@ impl TestHarness {
             .expect("child sessions")
     }
 
+    async fn session_lifecycle(
+        &self,
+        session_id: &str,
+    ) -> crate::session::lifecycle::SessionLifecycle {
+        self.config
+            .provider
+            .history_store()
+            .get_session_lifecycle(session_id)
+            .await
+            .expect("session lifecycle")
+    }
+
     async fn child_llm_params(&self) -> (String, LLMParams) {
         let store = self.config.provider.history_store();
         let child_sessions = store
@@ -962,7 +994,7 @@ async fn build_delegate_handle(
     let delegate_provider = Arc::new(Mutex::new(MockLlmProvider::new()));
     {
         let mut mock = delegate_provider.lock().await;
-        match behavior {
+        match &behavior {
             DelegateBehavior::AlwaysOk => {
                 mock.expect_chat()
                     .times(0..)
@@ -974,6 +1006,11 @@ async fn build_delegate_handle(
                         "Invalid patch: line mismatch".to_string(),
                     ))
                 });
+            }
+            DelegateBehavior::PauseBeforeLlmCall { .. } => {
+                mock.expect_chat()
+                    .times(0..)
+                    .returning(|_| Ok(MockChatResponse::text_only("Task complete").into()));
             }
             DelegateBehavior::StoppedByMiddleware => {
                 // The LLM will never be called because the middleware stops execution
@@ -1029,24 +1066,10 @@ async fn build_delegate_handle(
     let delegate_factory = Arc::new(TestProviderFactory::new(delegate_shared));
 
     let delegate_temp_dir = TempDir::new().expect("temp dir");
-    let delegate_wasm_path = delegate_temp_dir.path().join("mock.wasm");
-    std::fs::write(&delegate_wasm_path, "").expect("write wasm");
-    let delegate_config_path = delegate_temp_dir.path().join("providers.toml");
-    std::fs::write(
-        &delegate_config_path,
-        format!(
-            "[[providers]]\nname = \"mock\"\npath = \"{}\"\n",
-            delegate_wasm_path.display()
-        ),
-    )
-    .expect("write config");
-
-    let mut delegate_plugin_registry =
-        PluginRegistry::from_path(&delegate_config_path).expect("registry");
-    delegate_plugin_registry.register_loader(Box::new(TestPluginLoader {
-        factory: delegate_factory,
-    }));
-    let delegate_plugin_registry = Arc::new(delegate_plugin_registry);
+    let delegate_plugin_registry = Arc::new(
+        mock_plugin_registry_in(delegate_temp_dir.path(), delegate_factory)
+            .expect("plugin registry"),
+    );
 
     let mut delegate_params = LLMParams::new().provider("mock").model("mock-model");
     delegate_params.reasoning_effort = reasoning_effort;
@@ -1072,6 +1095,13 @@ async fn build_delegate_handle(
     .with_tool_policy(ToolPolicy::ProviderOnly)
     .with_max_steps(1)
     .with_execution_timeout_secs(30);
+
+    if let DelegateBehavior::PauseBeforeLlmCall { entered, release } = &behavior {
+        builder = builder.with_middleware(CancellationGateMiddleware {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+    }
 
     if matches!(behavior, DelegateBehavior::StoppedByMiddleware) {
         builder = builder.with_middleware(AlwaysStopMiddleware);
@@ -1111,6 +1141,7 @@ async fn build_delegate_handle(
 
 fn agent_info(id: &str) -> AgentInfo {
     AgentInfo {
+        isolation: Default::default(),
         id: id.to_string(),
         name: format!("{} name", id),
         description: format!("{} description", id),
@@ -1178,12 +1209,6 @@ async fn delegate_session_inherits_parent_connection_bridge() {
     };
     #[cfg(not(feature = "remote"))]
     let crate::agent::remote::SessionActorRef::Local(child) = child;
-    let inherited = child
-        .ask(crate::agent::messages::GetBridge)
-        .await
-        .expect("query child bridge")
-        .expect("child bridge");
-    assert_eq!(inherited.connection_id(), Some("conn"));
     let routed_child = target
         .config
         .session_bridges
@@ -1269,6 +1294,7 @@ async fn delegate_setup_failure_removes_inherited_bridge_route() {
         .into_iter()
         .next()
         .expect("child session");
+    assert!(harness.session_lifecycle(&child_session_id).await.resolved);
     let target = harness
         .config
         .agent_registry
@@ -1445,6 +1471,7 @@ async fn timeout_cleanup_cancels_requested_delegation_before_it_can_start() {
         .expect("session lookup")
         .expect("parent session");
     let delegation = Delegation {
+        isolation: Default::default(),
         id: 0,
         public_id: String::new(),
         session_id: session.id,
@@ -1499,6 +1526,7 @@ async fn timeout_cleanup_does_not_overwrite_terminal_delegation() {
         .expect("session lookup")
         .expect("parent session");
     let delegation = Delegation {
+        isolation: Default::default(),
         id: 0,
         public_id: String::new(),
         session_id: session.id,
@@ -1830,10 +1858,53 @@ async fn test_delegation_failure_recovery() {
     let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
+    let child_session_id = harness
+        .child_sessions()
+        .await
+        .into_iter()
+        .next()
+        .expect("failed delegation child");
+    let child_lifecycle = harness.session_lifecycle(&child_session_id).await;
+    assert!(child_lifecycle.resolved);
+    assert!(!child_lifecycle.archived);
+    let parent_session_id = harness.exec_ctx.session_id.clone();
+    let parent_lifecycle = harness.session_lifecycle(&parent_session_id).await;
+    assert!(!parent_lifecycle.resolved);
+    assert!(!parent_lifecycle.archived);
+
+    let store = harness.config.provider.history_store();
+    let failed_delegation = store
+        .list_delegations(&parent_session_id)
+        .await
+        .expect("list failed delegation")
+        .into_iter()
+        .find(|delegation| delegation.status == DelegationStatus::Failed)
+        .expect("failed delegation record");
+    store
+        .patch_session_lifecycle(
+            &child_session_id,
+            &crate::session::lifecycle::SessionLifecyclePatch {
+                resolved: Some(false),
+                archived: None,
+            },
+        )
+        .await
+        .expect("explicitly reopen failed delegate");
+    assert_eq!(
+        store
+            .claim_delegation(&failed_delegation.public_id)
+            .await
+            .expect("replay claim"),
+        crate::session::domain::DelegationClaim::InvalidState(DelegationStatus::Failed)
+    );
+    assert!(
+        !harness.session_lifecycle(&child_session_id).await.resolved,
+        "replaying a failed attempt must not undo an explicit reopen"
+    );
 }
 
 #[tokio::test]
-async fn test_delegation_completion_message_format() {
+async fn test_delegation_completion_message_format_and_replay_safety() {
     let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
     let delegate_call = mock_querymt_tool_call(
         "call-1",
@@ -1888,6 +1959,758 @@ async fn test_delegation_completion_message_format() {
     let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
+    let store = harness.config.provider.history_store();
+    let parent_session_id = harness.exec_ctx.session_id.clone();
+    let child_session_id = harness
+        .child_sessions()
+        .await
+        .into_iter()
+        .next()
+        .expect("completed delegation child");
+    let child_lifecycle = harness.session_lifecycle(&child_session_id).await;
+    assert!(child_lifecycle.resolved);
+    assert!(!child_lifecycle.archived);
+    let parent_lifecycle = harness.session_lifecycle(&parent_session_id).await;
+    assert!(!parent_lifecycle.resolved);
+    assert!(!parent_lifecycle.archived);
+
+    store
+        .patch_session_lifecycle(
+            &child_session_id,
+            &crate::session::lifecycle::SessionLifecyclePatch {
+                resolved: Some(false),
+                archived: None,
+            },
+        )
+        .await
+        .expect("explicitly reopen completed delegate");
+    let completed_delegation = store
+        .list_delegations(&parent_session_id)
+        .await
+        .expect("list completed delegations")
+        .into_iter()
+        .find(|delegation| delegation.status == DelegationStatus::Complete)
+        .expect("completed delegation record");
+
+    // A replayed terminal request is ignored, while a new delegation remains allowed.
+    harness.config.event_sink.emit_ephemeral(
+        &parent_session_id,
+        AgentEventKind::DelegationRequested {
+            delegation: completed_delegation,
+            tool_call_id: None,
+            batch_id: None,
+            cycle_id: None,
+        },
+    );
+    let parent = store
+        .get_session(&parent_session_id)
+        .await
+        .expect("parent lookup")
+        .expect("parent session");
+    let retry_delegation = store
+        .create_delegation(Delegation {
+            id: 0,
+            public_id: String::new(),
+            session_id: parent.id,
+            task_id: None,
+            target_agent_id: "agent".to_string(),
+            objective: "Retry task".to_string(),
+            objective_hash: crate::hash::RapidHash::new(b"Retry task"),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: None,
+            status: DelegationStatus::Requested,
+            isolation: Default::default(),
+            retry_count: 0,
+            created_at: OffsetDateTime::now_utc(),
+            completed_at: None,
+            planning_summary: None,
+        })
+        .await
+        .expect("create a new delegation attempt");
+    harness.config.event_sink.emit_ephemeral(
+        &parent_session_id,
+        AgentEventKind::DelegationRequested {
+            delegation: retry_delegation.clone(),
+            tool_call_id: None,
+            batch_id: None,
+            cycle_id: None,
+        },
+    );
+    // The delegation status is persisted before the child session is resolved,
+    // so wait for both to avoid observing the gap between the two updates.
+    let retry_child_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let current = store
+                .get_delegation(&retry_delegation.public_id)
+                .await
+                .expect("retry delegation lookup")
+                .expect("retry delegation");
+            if current.status == DelegationStatus::Complete
+                && let Some(retry_child_id) = harness
+                    .child_sessions()
+                    .await
+                    .into_iter()
+                    .find(|session_id| session_id != &child_session_id)
+                && harness.session_lifecycle(&retry_child_id).await.resolved
+            {
+                break retry_child_id;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("new delegation attempt did not complete and resolve its child");
+    assert!(harness.session_lifecycle(&retry_child_id).await.resolved);
+    assert!(
+        !harness.session_lifecycle(&child_session_id).await.resolved,
+        "replaying a completed attempt must not undo an explicit reopen"
+    );
+    harness.stop_harness_orchestrator();
+}
+
+#[tokio::test]
+async fn wait_timeout_cancellation_resolves_child_and_preserves_reopen() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut harness = TestHarness::new(
+        vec![],
+        DelegateBehavior::PauseBeforeLlmCall {
+            entered: entered.clone(),
+            release: release.clone(),
+        },
+    )
+    .await;
+    let mut config = (*harness.config).clone();
+    config.delegation_wait_policy = crate::config::DelegationWaitPolicy::All;
+    config.delegation_wait_timeout_secs = 1;
+    harness.config = Arc::new(config);
+    let store = harness.config.provider.history_store();
+    let parent_session_id = harness.exec_ctx.session_id.clone();
+    let mut run = Box::pin(harness.run_single_delegation());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            outcome = &mut run => panic!("cycle ended before child creation: {outcome:?}"),
+            _ = entered.notified() => {}
+        }
+    })
+    .await
+    .expect("child did not reach cancellation gate");
+    let child_session_id = store
+        .list_child_sessions(&parent_session_id)
+        .await
+        .expect("child sessions")
+        .into_iter()
+        .next()
+        .expect("created child");
+    let lifecycle = store
+        .patch_session_lifecycle(
+            &child_session_id,
+            &crate::session::lifecycle::SessionLifecyclePatch {
+                resolved: None,
+                archived: Some(true),
+            },
+        )
+        .await
+        .expect("archive still-running child");
+    assert!(!lifecycle.resolved);
+
+    // Do not request cancellation here: the real wait-all timer must do it.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("wait timeout did not unblock the parent");
+    assert_eq!(outcome, CycleOutcome::Completed);
+    let history = store
+        .get_effective_history(&parent_session_id)
+        .await
+        .expect("parent history");
+    assert!(history.iter().any(|message| {
+        message.parts.iter().any(|part| {
+            matches!(part,
+                MessagePart::Text { content }
+                    if content.contains("timed out after 1s of inactivity (cancel requested)")
+            )
+        })
+    }));
+    let delegation = store
+        .list_delegations(&parent_session_id)
+        .await
+        .expect("delegations")
+        .into_iter()
+        .next()
+        .expect("delegation");
+    let finalized = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let current = store
+                .get_delegation(&delegation.public_id)
+                .await
+                .expect("delegation lookup")
+                .expect("delegation");
+            let lifecycle = harness.session_lifecycle(&child_session_id).await;
+            if current.status == DelegationStatus::Cancelled && lifecycle.resolved {
+                assert!(lifecycle.archived);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    release.notify_one();
+    finalized.expect("wait-timeout cancelled attempt did not resolve its child");
+    assert!(!harness.session_lifecycle(&parent_session_id).await.resolved);
+    assert!(!harness.session_lifecycle(&parent_session_id).await.archived);
+
+    store
+        .patch_session_lifecycle(
+            &child_session_id,
+            &crate::session::lifecycle::SessionLifecyclePatch {
+                resolved: Some(false),
+                archived: None,
+            },
+        )
+        .await
+        .expect("explicit reopen");
+    crate::agent::execution::cleanup_timed_out_delegations(
+        &harness.config,
+        &harness.exec_ctx,
+        std::slice::from_ref(&delegation.public_id),
+    )
+    .await;
+    harness.config.event_sink.emit_ephemeral(
+        &parent_session_id,
+        AgentEventKind::DelegationCancelRequested {
+            delegation_id: delegation.public_id.clone(),
+        },
+    );
+    harness.config.event_sink.emit_ephemeral(
+        &parent_session_id,
+        AgentEventKind::DelegationRequested {
+            delegation,
+            tool_call_id: None,
+            batch_id: None,
+            cycle_id: None,
+        },
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let lifecycle = harness.session_lifecycle(&child_session_id).await;
+    assert!(
+        !lifecycle.resolved,
+        "terminal replay must not undo a reopen"
+    );
+    assert!(lifecycle.archived);
+    assert_eq!(harness.child_sessions().await.len(), 1);
+    harness.stop_harness_orchestrator();
+}
+
+#[tokio::test]
+async fn cancelled_delegation_resolves_child_after_terminal_claim() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut harness = TestHarness::new(
+        vec![],
+        DelegateBehavior::PauseBeforeLlmCall {
+            entered: entered.clone(),
+            release: release.clone(),
+        },
+    )
+    .await;
+    let config = harness.config.clone();
+    let store = config.provider.history_store();
+    let parent_session_id = harness.exec_ctx.session_id.clone();
+    let mut run = Box::pin(harness.run_single_delegation());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            outcome = &mut run => {
+                panic!("delegated cycle ended before the child reached its cancellation gate: {outcome:?}");
+            }
+            _ = entered.notified() => {}
+        }
+    })
+    .await
+    .expect("delegated child did not reach the cancellation gate");
+
+    let child_session_id = store
+        .list_child_sessions(&parent_session_id)
+        .await
+        .expect("child sessions")
+        .into_iter()
+        .next()
+        .expect("created child session");
+    assert!(
+        !store
+            .get_session_lifecycle(&child_session_id)
+            .await
+            .expect("child lifecycle")
+            .resolved,
+        "a newly created child starts open before a terminal outcome"
+    );
+    let delegation = store
+        .list_delegations(&parent_session_id)
+        .await
+        .expect("list delegation")
+        .into_iter()
+        .find(|delegation| delegation.status == DelegationStatus::Running)
+        .expect("running delegation");
+    config.event_sink.emit_ephemeral(
+        &parent_session_id,
+        AgentEventKind::DelegationCancelRequested {
+            delegation_id: delegation.public_id.clone(),
+        },
+    );
+
+    let cancellation_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let current = store
+                .get_delegation(&delegation.public_id)
+                .await
+                .expect("delegation lookup")
+                .expect("delegation");
+            let lifecycle = store
+                .get_session_lifecycle(&child_session_id)
+                .await
+                .expect("child lifecycle");
+            if current.status == DelegationStatus::Cancelled && lifecycle.resolved {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    release.notify_one();
+    cancellation_result.expect("cancelled attempt did not resolve its child");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("delegation cycle did not finish after cancellation");
+    assert_eq!(outcome, CycleOutcome::Completed);
+
+    let child_lifecycle = harness.session_lifecycle(&child_session_id).await;
+    assert!(child_lifecycle.resolved);
+    assert!(!child_lifecycle.archived);
+    let parent_lifecycle = harness.session_lifecycle(&parent_session_id).await;
+    assert!(!parent_lifecycle.resolved);
+    assert!(!parent_lifecycle.archived);
+    harness.stop_harness_orchestrator();
+}
+
+#[tokio::test]
+async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct() {
+    use crate::control::delegation_notifications::{DelegationActivity, DelegationStage};
+    let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    harness.stop_harness_orchestrator();
+    let config = harness.config.clone();
+    let store = config.provider.history_store();
+    let parent_id = harness.exec_ctx.session_id.clone();
+    let parent = store.get_session(&parent_id).await.unwrap().unwrap();
+    let release_file = harness._temp_dir.path().join("verification-release");
+    let entered_file = harness._temp_dir.path().join("verification-entered");
+    let delegation = store
+        .create_delegation(Delegation {
+            id: 0,
+            public_id: String::new(),
+            session_id: parent.id,
+            task_id: None,
+            target_agent_id: "agent".into(),
+            objective: "bounded verification cleanup".into(),
+            objective_hash: crate::hash::RapidHash::new(b"bounded verification cleanup"),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: Some(crate::verification::VerificationSpec {
+                description: "wait for test release".into(),
+                strategy: Default::default(),
+                steps: vec![crate::verification::VerificationStep::ToolCall {
+                    tool_name: "shell".into(),
+                    arguments: serde_json::json!({"command": "sh", "args": ["-c", ": > \"$2\"; i=0; while test ! -f \"$1\" && test $i -lt 500; do i=$((i+1)); sleep 0.01; done; test -f \"$1\"", "qmt-verification", release_file, entered_file], "workdir": harness._temp_dir.path()}),
+                    expectation: crate::verification::Expectation::Success,
+                    error_message: None,
+                }],
+            }),
+            status: DelegationStatus::Requested,
+            isolation: Default::default(),
+            retry_count: 0,
+            created_at: OffsetDateTime::now_utc(),
+            completed_at: None,
+            planning_summary: None,
+        })
+        .await
+        .unwrap();
+    let mut verification_tools = crate::tools::ToolRegistry::new();
+    verification_tools.add(Arc::new(crate::tools::builtins::ShellTool::new()));
+    let orchestrator = Arc::new(
+        DelegationOrchestrator::new(
+            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
+            config.event_sink.clone(),
+            store.clone(),
+            config.agent_registry.clone(),
+            Arc::new(verification_tools),
+            config.hooks.clone(),
+            None,
+        )
+        .with_verification(true)
+        .with_cancel_grace_secs(2),
+    );
+    let listener = orchestrator.start_listening(config.event_sink.fanout());
+    let mut events = config.subscribe_events();
+    config.emit_event(
+        &parent_id,
+        AgentEventKind::DelegationRequested {
+            delegation: delegation.clone(),
+            tool_call_id: None,
+            batch_id: None,
+            cycle_id: None,
+        },
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(
+                event.kind(),
+                AgentEventKind::DelegationStageChanged {
+                    stage: Some(DelegationStage::Verifying),
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !entered_file.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("actual verification shell must be waiting before cancellation");
+    let activity = config.event_sink.live_delegation_activity(&parent_id);
+    let child_id = activity[0].child_session_id.clone().unwrap();
+    let delegate = config.agent_registry.get_handle("agent").unwrap();
+    let local = delegate
+        .as_any()
+        .downcast_ref::<crate::agent::LocalAgentHandle>()
+        .unwrap();
+    let child = local
+        .observe_session_runtimes(std::slice::from_ref(&child_id))
+        .await
+        .remove(&child_id)
+        .unwrap();
+    assert_eq!(
+        child.phase,
+        crate::agent::messages::SessionRuntimePhase::Idle
+    );
+    assert_eq!(activity[0].stage, Some(DelegationStage::Verifying));
+    #[cfg(feature = "remote")]
+    {
+        use crate::send_agent::SendAgent;
+        use crate::session::backend::StorageBackend;
+        use kameo::actor::Spawn;
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let owner = crate::agent::LocalAgentHandle::from_config(config.clone());
+        owner.set_mesh(mesh.clone());
+        owner
+            .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                parent_id.clone(),
+                std::path::PathBuf::new(),
+            ))
+            .await
+            .unwrap();
+        let expected = owner
+            .observe_session_runtimes(std::slice::from_ref(&parent_id))
+            .await
+            .remove(&parent_id)
+            .unwrap();
+        assert_eq!(
+            expected.phase,
+            crate::agent::messages::SessionRuntimePhase::Idle
+        );
+        assert_eq!(
+            expected.delegation_activity[0].stage,
+            Some(DelegationStage::Verifying)
+        );
+        let manager = crate::agent::remote::RemoteNodeManager::spawn(
+            crate::agent::remote::RemoteNodeManager::new(
+                config.clone(),
+                owner.registry.clone(),
+                Some(mesh.clone()),
+                owner.scheduler_handle.clone(),
+            )
+            .with_node_name("verifier-owner".to_string()),
+        );
+        mesh.register_actor(
+            manager.clone(),
+            crate::agent::remote::scope::scoped_node_manager_for_peer(
+                &crate::agent::remote::scope::MeshScopeId::lan_default(),
+                mesh.peer_id(),
+            ),
+        )
+        .await;
+        let viewer = crate::test_utils::TestAgent::new().await;
+        viewer.handle.set_mesh(mesh.clone());
+        let node = mesh.peer_id().to_string();
+        viewer
+            .storage
+            .session_store()
+            .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+                session_id: parent_id.clone(),
+                node_id: node.clone(),
+                peer_label: "verifier-owner".into(),
+                cwd: None,
+                created_at: 0,
+                title: None,
+            })
+            .await
+            .unwrap();
+        let loaded = viewer
+            .handle
+            .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                parent_id.clone(),
+                std::path::PathBuf::new(),
+            ))
+            .await
+            .unwrap();
+        let attached = viewer
+            .handle
+            .ext_method(crate::acp::protocol::ExtRequest::new(
+                "querymt/remote/attachSession",
+                Arc::from(
+                    serde_json::value::to_raw_value(
+                        &serde_json::json!({"node_id": node, "session_id": parent_id}),
+                    )
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        let attached: serde_json::Value = serde_json::from_str(attached.0.get()).unwrap();
+        for snapshot in [
+            &loaded.meta.as_ref().unwrap()["querymt/sessionLoadSnapshot.v1"],
+            &attached["snapshot"],
+        ] {
+            assert_eq!(
+                snapshot["runtimeStatus"],
+                serde_json::to_value(&expected).unwrap(),
+                "actual remote route omitted existing live verifier"
+            );
+            let live = snapshot["delegationUpdates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["delegationId"] == delegation.public_id)
+                .unwrap();
+            assert_eq!(live["activity"], "live");
+            assert_eq!(live["stage"], "verifying");
+            assert_eq!(
+                live["sessionSeq"],
+                serde_json::to_value(activity[0].session_seq).unwrap()
+            );
+            assert!(!snapshot["audit"]["events"].as_array().unwrap().is_empty());
+            let events: Vec<crate::events::AgentEvent> =
+                serde_json::from_value(snapshot["audit"]["events"].clone()).unwrap();
+            assert_eq!(
+                snapshot["cursor"],
+                serde_json::to_value(crate::session::cursor_from_events(&events)).unwrap()
+            );
+            assert_eq!(
+                snapshot["accounting"],
+                serde_json::to_value(crate::accounting::AccountingSnapshot::from_events(
+                    &parent_id,
+                    events.iter().map(|event| &event.kind),
+                ))
+                .unwrap(),
+                "idle/verifying owner snapshot must include accounting at its audit cursor"
+            );
+        }
+        viewer.handle.shutdown().await;
+        manager.kill();
+        manager.wait_for_shutdown().await;
+        owner.shutdown().await;
+    }
+    assert!(
+        store
+            .transition_delegation_status(
+                &delegation.public_id,
+                DelegationStatus::Running,
+                DelegationStatus::Cancelled
+            )
+            .await
+            .unwrap()
+    );
+    config.emit_event(
+        &parent_id,
+        AgentEventKind::DelegationCancelRequested {
+            delegation_id: delegation.public_id.clone(),
+        },
+    );
+    config.emit_event(
+        &parent_id,
+        AgentEventKind::DelegationCancelled {
+            delegation_id: delegation.public_id.clone(),
+        },
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(
+                event.kind(),
+                AgentEventKind::DelegationStageChanged {
+                    stage: Some(DelegationStage::CancelRequested),
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let during = config.event_sink.live_delegation_activity(&parent_id);
+    assert_eq!(during[0].activity, DelegationActivity::Live);
+    assert_eq!(
+        during[0].state,
+        crate::control::delegation_notifications::DelegationUpdateState::Cancelled
+    );
+    assert_eq!(during[0].stage, Some(DelegationStage::CancelRequested));
+    tokio::fs::write(release_file, "released").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(
+                event.kind(),
+                AgentEventKind::DelegationStageChanged { stage: None, .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        config
+            .event_sink
+            .live_delegation_activity(&parent_id)
+            .is_empty()
+    );
+    orchestrator.cancel_active_delegations().await;
+    listener.abort();
+}
+
+#[tokio::test]
+async fn verification_failure_resolves_terminal_delegate_child() {
+    let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    harness.stop_harness_orchestrator();
+    let config = harness.config.clone();
+    let store = config.provider.history_store();
+    let parent_session_id = harness.exec_ctx.session_id.clone();
+    let parent = store
+        .get_session(&parent_session_id)
+        .await
+        .expect("parent lookup")
+        .expect("parent session");
+    let delegation = store
+        .create_delegation(Delegation {
+            id: 0,
+            public_id: String::new(),
+            session_id: parent.id,
+            task_id: None,
+            target_agent_id: "agent".to_string(),
+            objective: "run and fail verification".to_string(),
+            objective_hash: crate::hash::RapidHash::new(b"run and fail verification"),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: Some(crate::verification::VerificationSpec {
+                description: "require a missing file".to_string(),
+                steps: vec![crate::verification::VerificationStep::FileAssertion {
+                    path: harness._temp_dir.path().join("missing-verification-file"),
+                    exists: true,
+                    contains: None,
+                    matches_regex: None,
+                }],
+                strategy: Default::default(),
+            }),
+            status: DelegationStatus::Requested,
+            isolation: Default::default(),
+            retry_count: 0,
+            created_at: OffsetDateTime::now_utc(),
+            completed_at: None,
+            planning_summary: None,
+        })
+        .await
+        .expect("create verification delegation");
+    let orchestrator = Arc::new(
+        DelegationOrchestrator::new(
+            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
+            config.event_sink.clone(),
+            store.clone(),
+            config.agent_registry.clone(),
+            config.tool_registry_arc(),
+            config.hooks.clone(),
+            None,
+        )
+        .with_verification(true),
+    );
+    let listener = orchestrator.start_listening(config.event_sink.fanout());
+    config.event_sink.emit_ephemeral(
+        &parent_session_id,
+        AgentEventKind::DelegationRequested {
+            delegation: delegation.clone(),
+            tool_call_id: None,
+            batch_id: None,
+            cycle_id: None,
+        },
+    );
+
+    let child_session_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let current = store
+                .get_delegation(&delegation.public_id)
+                .await
+                .expect("delegation lookup")
+                .expect("delegation");
+            if current.status == DelegationStatus::Failed {
+                let children = store
+                    .list_child_sessions(&parent_session_id)
+                    .await
+                    .expect("list delegate children");
+                if let Some(child_session_id) = children.first() {
+                    let lifecycle = store
+                        .get_session_lifecycle(child_session_id)
+                        .await
+                        .expect("child lifecycle");
+                    if lifecycle.resolved {
+                        break child_session_id.clone();
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("verification failure did not resolve its child");
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        loop {
+            if config
+                .event_sink
+                .live_delegation_activity(&parent_session_id)
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("finished failed verification must release live workflow ownership");
+    listener.abort();
+
+    let child_lifecycle = harness.session_lifecycle(&child_session_id).await;
+    assert!(child_lifecycle.resolved);
+    assert!(!child_lifecycle.archived);
+    let parent_lifecycle = harness.session_lifecycle(&parent_session_id).await;
+    assert!(!parent_lifecycle.resolved);
+    assert!(!parent_lifecycle.archived);
 }
 
 #[tokio::test]
@@ -1968,6 +2791,7 @@ async fn test_delegation_guard_blocks_duplicate() {
     }];
 
     let delegation = Delegation {
+        isolation: Default::default(),
         id: 1,
         public_id: "del-1".to_string(),
         session_id: 1,
@@ -2045,6 +2869,7 @@ async fn test_delegation_guard_blocks_max_retries() {
     }];
 
     let delegation = Delegation {
+        isolation: Default::default(),
         id: 1,
         public_id: "del-1".to_string(),
         session_id: 1,

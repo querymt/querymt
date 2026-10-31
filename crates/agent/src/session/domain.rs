@@ -235,6 +235,13 @@ pub struct Delegation {
     pub verification_spec: Option<crate::verification::VerificationSpec>,
     /// AI-generated summary of parent planning conversation for coder context
     pub planning_summary: Option<String>,
+    /// Execution isolation for this delegate. Requested policy from the
+    /// delegate tool/request, persisted as the resolved policy (`shared` or
+    /// `isolated`) once the parent's execution mode is known. Legacy rows
+    /// without the column deserialize as `inherit`.
+    #[serde(default)]
+    #[typeshare(serialized_as = "string")]
+    pub isolation: crate::worktree::DelegationIsolation,
     pub status: DelegationStatus,
     /// Number of retry attempts for this objective
     pub retry_count: u32,
@@ -262,6 +269,17 @@ pub enum ForkPointType {
 pub enum ForkOrigin {
     User,
     Delegation,
+    /// A sibling started from a source session with no history copied
+    /// (`/worktree create` children and handoff successors).
+    Worktree,
+}
+
+impl ForkOrigin {
+    /// Origins listed as visible forks/children (delegates are hidden). The
+    /// SQL twin is `VISIBLE_FORK_ORIGINS` in the view store.
+    pub fn is_visible_fork(origin: &str) -> bool {
+        matches!(origin, "user" | "worktree")
+    }
 }
 
 impl std::fmt::Display for ForkOrigin {
@@ -269,6 +287,7 @@ impl std::fmt::Display for ForkOrigin {
         match self {
             ForkOrigin::User => write!(f, "user"),
             ForkOrigin::Delegation => write!(f, "delegation"),
+            ForkOrigin::Worktree => write!(f, "worktree"),
         }
     }
 }
@@ -280,6 +299,7 @@ impl std::str::FromStr for ForkOrigin {
         match s {
             "user" => Ok(ForkOrigin::User),
             "delegation" => Ok(ForkOrigin::Delegation),
+            "worktree" => Ok(ForkOrigin::Worktree),
             _ => Err(format!("Unknown fork origin: {}", s)),
         }
     }
@@ -317,6 +337,14 @@ pub struct RevertState {
     pub snapshot_id: String,
     /// Backend type used (e.g., "git")
     pub backend_id: String,
+    /// Workspace provenance: the checkout the snapshot was captured
+    /// against. `None` for frames recorded before provenance existed —
+    /// those keep legacy behavior (treated as same-workspace). Frames
+    /// recorded against a different workspace than the current execution
+    /// cwd are rejected before any restore, so a cross-workspace redo can
+    /// never partially restore files.
+    #[serde(default)]
+    pub workspace_root: Option<std::path::PathBuf>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
@@ -520,6 +548,11 @@ mod tests {
     fn test_fork_origin_display_and_parse() {
         assert_eq!(ForkOrigin::User.to_string(), "user");
         assert_eq!(ForkOrigin::Delegation.to_string(), "delegation");
+        assert_eq!(ForkOrigin::Worktree.to_string(), "worktree");
+        assert_eq!(
+            "worktree".parse::<ForkOrigin>().unwrap(),
+            ForkOrigin::Worktree
+        );
 
         let user: ForkOrigin = "user".parse().unwrap();
         assert_eq!(user, ForkOrigin::User);

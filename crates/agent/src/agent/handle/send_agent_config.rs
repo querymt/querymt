@@ -32,6 +32,9 @@ impl LocalAgentHandle {
         req: SetSessionModelRequest,
     ) -> Result<SetSessionModelResponse, Error> {
         let session_id = req.session_id.to_string();
+        self.session_materializer
+            .ensure_writable(&session_id)
+            .await?;
         #[cfg(feature = "remote")]
         let session_ref = self
             .session_ref_for_operation(&session_id, session_operation::SessionOperation::SetModel)
@@ -79,6 +82,9 @@ impl LocalAgentHandle {
             .parse::<AgentMode>()
             .map_err(|e| Error::invalid_params().data(serde_json::json!({ "error": e })))?;
         let session_id = req.session_id.to_string();
+        self.session_materializer
+            .ensure_writable(&session_id)
+            .await?;
 
         #[cfg(feature = "remote")]
         self.execute_session_operation(
@@ -113,6 +119,9 @@ impl LocalAgentHandle {
         };
 
         let session_id = req.session_id.0.to_string();
+        self.session_materializer
+            .ensure_writable(&session_id)
+            .await?;
 
         match config_id {
             "model" => {
@@ -227,7 +236,7 @@ impl LocalAgentHandle {
                     .session_reasoning_effort(&session_ref, &session_id)
                     .await;
                 let config_options = self
-                    .session_config_options(Some(&session_id), mode, effort)
+                    .session_profile_config_options(Some(&session_id), mode, effort)
                     .await?;
                 Ok(crate::acp::protocol::SetSessionConfigOptionResponse::new(
                     config_options,
@@ -257,7 +266,7 @@ impl LocalAgentHandle {
                         .map_err(session_operation::SessionOperationError::into_acp_error)?;
                     if resolved.session_ref.is_remote() {
                         return Ok(crate::acp::protocol::SetSessionConfigOptionResponse::new(
-                            self.remote_session_mode_config_options(&session_id).await?,
+                            self.remote_session_config_options(&session_id).await?,
                         ));
                     }
                 }

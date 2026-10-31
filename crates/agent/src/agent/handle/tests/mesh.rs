@@ -14,6 +14,15 @@ async fn test_querymt_mesh_status_without_mesh_is_disabled() {
     assert_eq!(result["has_invite_store"], false);
     assert_eq!(result["has_mesh_state_store"], false);
     assert_eq!(result["scopes"], serde_json::json!([]));
+    assert!(result["iroh"].is_null());
+    assert!(result["hostname"].is_null());
+    let mut legacy = result;
+    legacy.as_object_mut().unwrap().remove("hostname");
+    let status: crate::control::mesh::MeshStatusInfo = serde_json::from_value(legacy).unwrap();
+    assert!(
+        status.hostname.is_none(),
+        "older status responses remain compatible"
+    );
 }
 
 #[cfg(feature = "remote")]
@@ -31,7 +40,7 @@ async fn test_querymt_mesh_nodes_returns_shared_shape() {
 
 #[cfg(feature = "remote")]
 #[tokio::test]
-async fn test_querymt_mesh_status_with_test_mesh_reports_runtime_details() {
+async fn test_querymt_mesh_status_with_composite_mesh_reports_runtime_details() {
     let f = HandleFixture::new().await;
     let mesh = get_test_mesh().await.clone();
     f.handle.set_mesh(mesh.clone());
@@ -40,9 +49,14 @@ async fn test_querymt_mesh_status_with_test_mesh_reports_runtime_details() {
 
     assert_eq!(result["enabled"], true);
     assert_eq!(result["peer_id"], mesh.peer_id().to_string());
+    assert_eq!(result["hostname"], mesh.local_hostname());
     assert_eq!(result["has_invite_store"], true);
     assert_eq!(result["has_mesh_state_store"], true);
     assert!(result["scopes"].is_array());
+    assert!(
+        result["iroh"].is_object(),
+        "composite runtime exposes its iroh endpoint diagnostics"
+    );
 }
 
 #[cfg(feature = "remote")]
@@ -65,38 +79,6 @@ async fn test_querymt_mesh_list_invites_with_test_mesh_returns_shared_shape() {
     let listed =
         ext_method_json(&f.handle, "querymt/mesh/listInvites", serde_json::json!({})).await;
     assert!(listed["invites"].is_array());
-}
-
-#[cfg(feature = "remote")]
-#[tokio::test]
-async fn test_querymt_mesh_create_invite_with_lan_mesh_returns_clear_error() {
-    let f = HandleFixture::new().await;
-    let mesh = get_test_mesh().await.clone();
-    f.handle.set_mesh(mesh);
-
-    let req = crate::acp::protocol::ExtRequest::new(
-        "querymt/mesh/createInvite",
-        std::sync::Arc::from(
-            serde_json::value::RawValue::from_string(
-                serde_json::json!({ "mesh_name": "test-mesh", "max_uses": 2, "ttl": "1h" })
-                    .to_string(),
-            )
-            .unwrap(),
-        ),
-    );
-    let err = f
-        .handle
-        .ext_method(req)
-        .await
-        .expect_err("lan-only mesh should reject invite creation");
-    assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidRequest);
-    let data = err.data.expect("structured error data");
-    assert!(
-        data["error"]
-            .as_str()
-            .expect("error string")
-            .contains("iroh transport")
-    );
 }
 
 #[cfg(feature = "remote")]

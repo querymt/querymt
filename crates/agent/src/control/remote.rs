@@ -52,6 +52,8 @@ pub struct RemoteSessionsRequest {
 pub struct CreateRemoteSessionRequest {
     pub node_id: String,
     #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default = "default_attach")]
     pub attach: bool,
@@ -98,20 +100,20 @@ fn default_attach() -> bool {
     true
 }
 
-/// Return owner-confirmed mode options, leaving unavailable metadata empty.
+/// Return owner-confirmed configuration options, leaving unavailable metadata empty.
 #[cfg(feature = "remote")]
-async fn attached_remote_mode_options(
+async fn attached_remote_config_options(
     agent: &LocalAgentHandle,
     session_id: &str,
 ) -> Vec<serde_json::Value> {
-    match agent.remote_session_mode_config_options(session_id).await {
+    match agent.remote_session_config_options(session_id).await {
         Ok(options) => options.into_iter().filter_map(|option| {
             serde_json::to_value(option).map_err(|error| {
-                tracing::warn!(session_id, error = %error, "could not serialize remote mode option");
+                tracing::warn!(session_id, error = %error, "could not serialize remote configuration option");
             }).ok()
         }).collect(),
         Err(error) => {
-            tracing::warn!(session_id, error = %error, "remote mode unavailable during attach");
+            tracing::warn!(session_id, error = %error, "remote configuration unavailable during attach");
             Vec::new()
         }
     }
@@ -210,7 +212,11 @@ pub async fn create_remote_session(
     {
         let nm_ref = agent.find_node_manager(&request.node_id).await?;
         let response = agent
-            .create_remote_session(&nm_ref, request.cwd.clone())
+            .create_remote_session_with_profile(
+                &nm_ref,
+                request.cwd.clone(),
+                request.profile_id.clone(),
+            )
             .await?;
 
         if !request.attach {
@@ -236,7 +242,7 @@ pub async fn create_remote_session(
         let profile = agent
             .remote_session_profile(&request.node_id, &response.session_id)
             .await;
-        let config_options = attached_remote_mode_options(agent, &response.session_id).await;
+        let config_options = attached_remote_config_options(agent, &response.session_id).await;
         Ok(RemoteSessionAttachInfo {
             session_id: response.session_id,
             node_id: request.node_id,
@@ -270,7 +276,7 @@ pub async fn attach_remote_session(
         let profile = agent
             .remote_session_profile(&request.node_id, &request.session_id)
             .await;
-        let config_options = attached_remote_mode_options(agent, &request.session_id).await;
+        let config_options = attached_remote_config_options(agent, &request.session_id).await;
         Ok(RemoteSessionAttachInfo {
             session_id: request.session_id,
             node_id: request.node_id,

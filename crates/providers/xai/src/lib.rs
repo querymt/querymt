@@ -16,10 +16,11 @@ use querymt::{
     HTTPLLMProvider,
     auth::ApiKeyResolver,
     chat::{
-        ChatInputPart, ChatMessage, ChatMessagePart, ChatOutput, ChatOutputItem, ChatReasoningPart,
-        ChatRole, MediaSource, ReasoningEffort, ReasoningPartKind, StreamChunk,
-        StructuredOutputFormat, StructuredStreamEvent, Tool, ToolChoice, ToolResultPart,
-        http::{ChatStreamParser, HTTPChatProvider},
+        ChatCall, ChatCapabilities, ChatInputPart, ChatMessage, ChatMessagePart, ChatOutput,
+        ChatOutputItem, ChatReasoningPart, ChatRole, MediaSource, ReasoningEffort,
+        ReasoningPartKind, StreamChunk, StructuredOutputFormat, StructuredStreamEvent, Tool,
+        ToolChoice, ToolResultPart,
+        http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -182,53 +183,25 @@ impl HTTPChatProvider for Xai {
         }
     }
 
-    fn chat_request(
+    fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        let cfg = self.with_resolved_key();
-        let use_responses = self.should_use_responses_api();
-        let mut request = if use_responses {
-            // Responses-style path for xAI (modeled after codex_responses)
-            xai_responses_chat_request(&cfg, messages, tools)?
-        } else {
-            openai_chat_request(&cfg, messages, tools)?
-        };
-        // Auto-inject x-grok-conv-id for xAI endpoints (Responses or host x.ai)
-        let host = self.base_url.host_str().unwrap_or("");
-        let auto_inject = use_responses || host.contains("x.ai");
-        if auto_inject {
-            let conv_id = self
-                .conversation_id
-                .clone()
-                .unwrap_or_else(|| "session-auto".to_string());
-            let (mut parts, body) = request.into_parts();
-            parts.headers.insert(
-                http::header::HeaderName::from_static("x-grok-conv-id"),
-                conv_id.parse().unwrap(),
-            );
-            request = Request::from_parts(parts, body);
-        }
-        Ok(request)
-    }
-
-    fn chat_stream_request(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
+        call: &ChatCall<'_>,
+        stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
         let mut cfg = self.with_resolved_key();
-        cfg.stream = Some(true);
+        if stream {
+            cfg.stream = Some(true);
+        }
         let use_responses = cfg.should_use_responses_api();
         let mut request = if use_responses {
-            xai_responses_chat_request(&cfg, messages, tools)?
+            // Responses-style path for xAI (modeled after codex_responses)
+            xai_responses_chat_request(&cfg, call.messages, call.tools)?
         } else {
-            openai_chat_request(&cfg, messages, tools)?
+            openai_chat_request(&cfg, call.messages, call.tools)?
         };
+        // Auto-inject x-grok-conv-id for xAI endpoints (Responses or host x.ai)
         let host = cfg.base_url.host_str().unwrap_or("");
-        let auto_inject = use_responses || host.contains("x.ai");
-        if auto_inject {
+        if use_responses || host.contains("x.ai") {
             let conv_id = cfg
                 .conversation_id
                 .clone()
@@ -240,10 +213,14 @@ impl HTTPChatProvider for Xai {
             );
             request = Request::from_parts(parts, body);
         }
-        Ok(request)
+        Ok(PreparedChatRequest::stateless(request))
     }
 
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+    fn parse_chat(
+        &self,
+        response: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         let output = if self.should_use_responses_api() {
             let tool_state_buffer = Arc::new(Mutex::new(HashMap::new()));
             codex_parse_chat_with_state(response, &tool_state_buffer)?
@@ -253,14 +230,17 @@ impl HTTPChatProvider for Xai {
         Ok(promote_xai_summary_plaintext(output))
     }
 
-    fn supports_streaming(&self) -> bool {
-        true
-    }
-
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+    fn chat_stream_parser(
+        &self,
+        _context: serde_json::Value,
+    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
         Ok(Box::new(XaiStreamParser::new(
             self.should_use_responses_api(),
         )))
+    }
+
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE.with_streaming(true)
     }
 }
 
@@ -1294,7 +1274,8 @@ mod tests {
         let messages = vec![ChatMessage::user().text("hello").build()];
 
         let req = xai
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("chat request should build");
 
         assert_eq!(auth_header(&req), Some("Bearer resolver-token"));
@@ -1307,7 +1288,8 @@ mod tests {
 
         let messages = vec![ChatMessage::user().text("hello").build()];
         let req = xai
-            .chat_stream_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), true)
+            .map(|p| p.request)
             .expect("chat stream request should build");
         let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
 
@@ -1362,7 +1344,7 @@ mod tests {
     fn stream_parser_returns_classified_codex_error() {
         let mut xai = test_xai("xai-key");
         xai.conversation_id = Some("conversation-id".to_string());
-        let mut parser = xai.chat_stream_parser().unwrap();
+        let mut parser = xai.chat_stream_parser(serde_json::Value::Null).unwrap();
         let chunk = br#"data: {"type":"response.failed","response":{"error":{"message":"busy","code":"server_is_overloaded"}}}
 
 "#;
@@ -1436,7 +1418,8 @@ mod tests {
         }];
 
         let req = xai
-            .chat_request(&messages, Some(&tools))
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(Some(&tools)), false)
+            .map(|p| p.request)
             .expect("responses request should build");
         let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
 
@@ -1536,7 +1519,8 @@ mod tests {
         ];
 
         let req = xai
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("responses request should build");
         let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
         let outputs: Vec<&Value> = body["input"]
@@ -1587,7 +1571,8 @@ mod tests {
         let messages = vec![ChatMessage::user().text("hello").build()];
 
         let req = xai
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("responses request should build");
         let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
 
@@ -1664,7 +1649,8 @@ mod tests {
         ];
 
         let req = xai
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("structured replay should build");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         let input = body["input"].as_array().unwrap();
@@ -1721,7 +1707,8 @@ mod tests {
 
         let messages = vec![ChatMessage::user().text("continue").build(), assistant];
         let req = xai
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("structured replay should build");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         let reasoning = &body["input"][1];
@@ -1767,7 +1754,8 @@ mod tests {
         let assistant = ChatMessage::from_assistant_output(output);
         let messages = vec![ChatMessage::user().text("continue").build(), assistant];
         let req = xai
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("structured replay should build");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         let reasoning = &body["input"][1];
@@ -1821,7 +1809,8 @@ mod tests {
             ChatMessage::from_assistant_output(output),
         ];
         let req = xai
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("legacy reasoning must flatten");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         let input = body["input"].as_array().unwrap();
@@ -1859,7 +1848,8 @@ mod tests {
 
         let messages = vec![ChatMessage::user().text("go").build(), assistant];
         let error = xai
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect_err("unsupported continuation must fail, not silently drop");
         assert!(
             matches!(error, LLMError::InvalidRequest(ref msg)

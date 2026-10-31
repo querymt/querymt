@@ -7,8 +7,8 @@ use futures::future::join_all;
 use querymt::{
     LLMProvider,
     chat::{
-        ChatMessage, ChatMessagePartDelta, ChatOutput, ChatStreamAccumulator, ChatStreamFinish,
-        StreamChunk, StructuredStreamEvent, ToolResultPart, chunk_is_terminal,
+        ChatCall, ChatMessage, ChatMessagePartDelta, ChatOutput, ChatStreamAccumulator,
+        ChatStreamFinish, StreamChunk, StructuredStreamEvent, ToolResultPart, chunk_is_terminal,
     },
     error::LLMError,
 };
@@ -143,17 +143,15 @@ async fn unified_chat(
     messages: &[ChatMessage],
     provider: &Box<dyn LLMProvider>,
 ) -> Result<StreamOrResponse, LLMError> {
-    if provider.supports_streaming() {
-        match provider
-            .chat_stream_with_tools(messages, provider.tools())
-            .await
-        {
+    let call = ChatCall::new(messages).maybe_tools(provider.tools());
+    if provider.capabilities().streaming {
+        match provider.chat_stream(&call).await {
             Ok(stream) => return Ok(StreamOrResponse::Stream(stream)),
             Err(LLMError::NotImplemented(_)) => {}
             Err(e) => return Err(e),
         }
     }
-    let resp = provider.chat_with_tools(messages, provider.tools()).await?;
+    let resp = provider.chat(&call).await?;
     Ok(StreamOrResponse::Response(resp))
 }
 

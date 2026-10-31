@@ -6,7 +6,8 @@
 //! - Summary view (quick status for UI)
 
 use crate::events::{AgentEvent, AgentEventKind, DurableEvent, EventOrigin};
-use crate::session::error::SessionResult;
+use crate::session::error::{SessionError, SessionResult};
+use crate::session::lifecycle::{SessionLifecycle, SessionLifecycleFilter};
 use async_trait::async_trait;
 use querymt::chat::FinishReason;
 use serde::{Deserialize, Serialize};
@@ -122,17 +123,68 @@ pub struct NewDurableEvent {
     /// `None` for locally produced events and for relayed events that carry
     /// no usable source cursor.
     pub source_seq: Option<i64>,
+    /// Producer-assigned per-session sequence (see `DurableEvent::session_seq`).
+    /// For relayed events this is the host's value. `None` leaves the column
+    /// unset (annotation events and callers outside a session sequencer).
+    pub session_seq: Option<i64>,
     pub kind: AgentEventKind,
 }
 
-/// Durable event journal — single source of truth for event ordering.
+/// Run lifecycle marker used by [`last_unfinished_run_in`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunLifecycle {
+    Started,
+    Completed,
+}
+
+/// Fold run lifecycle events (in journal order) to the latest run that was
+/// started and never completed.
+pub(crate) fn last_unfinished_run_in(
+    events: impl IntoIterator<Item = (RunLifecycle, String)>,
+) -> Option<String> {
+    let mut open: Vec<String> = Vec::new();
+    for (lifecycle, run_id) in events {
+        match lifecycle {
+            RunLifecycle::Started => open.push(run_id),
+            RunLifecycle::Completed => open.retain(|id| *id != run_id),
+        }
+    }
+    open.pop()
+}
+
+/// Durable event journal — persistence and replay of a session's events.
 ///
-/// Sequence assignment is the authority of the journal implementation.
-/// Producers never set `stream_seq`; it is assigned atomically on append.
+/// Ordering authority is split in two:
+/// - Producers set `session_seq` (the per-session production order) before
+///   appending; session replay orders by it.
+/// - The journal still assigns `stream_seq` atomically on append; it is the
+///   insert-order cursor for global-stream consumers and the host cursor for
+///   remote dedup and backfill.
 #[async_trait]
 pub trait EventJournal: Send + Sync {
     /// Persist a durable event and return it with assigned `event_id` and `stream_seq`.
     async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent>;
+
+    /// Persist consecutive durable events in order, returning one result per
+    /// input. Implementations should write the batch in a single transaction;
+    /// the default appends one by one.
+    async fn append_durable_batch(
+        &self,
+        events: &[NewDurableEvent],
+    ) -> Vec<SessionResult<DurableEvent>> {
+        let mut results = Vec::with_capacity(events.len());
+        for event in events {
+            results.push(self.append_durable(event).await);
+        }
+        results
+    }
+
+    /// Highest producer `session_seq` persisted for a session (0 when none).
+    /// Synchronous because a session's sequence counter is created at emit
+    /// time, which is not async; it runs once per session per process.
+    fn max_session_seq_blocking(&self, _session_id: &str) -> i64 {
+        0
+    }
 
     /// Load the durable event stream for a session, optionally starting after a cursor.
     /// `None` loads all matching events; `Some(limit)` returns at most that many.
@@ -142,6 +194,95 @@ pub trait EventJournal: Send + Sync {
         after_seq: Option<i64>,
         limit: Option<usize>,
     ) -> SessionResult<Vec<DurableEvent>>;
+
+    /// Recover correlated terminal delegation signals after a lost live wakeup.
+    async fn load_delegation_terminals(
+        &self,
+        session_id: &str,
+        delegation_ids: &[String],
+    ) -> SessionResult<Vec<DurableEvent>> {
+        if delegation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let events = self.load_session_stream(session_id, None, None).await?;
+        Ok(events
+            .into_iter()
+            .filter(|event| match &event.kind {
+                crate::events::AgentEventKind::DelegationCompleted { delegation_id, .. }
+                | crate::events::AgentEventKind::DelegationFailed { delegation_id, .. }
+                | crate::events::AgentEventKind::DelegationCancelled { delegation_id } => {
+                    delegation_ids.contains(delegation_id)
+                }
+                _ => false,
+            })
+            .collect())
+    }
+
+    /// Load one page of a session's durable events strictly in `stream_seq`
+    /// order, with no production-order restoration.
+    ///
+    /// Pages served to other nodes (backfill, gap recovery) must have a
+    /// strictly increasing `stream_seq`, because the receiver uses it as its
+    /// cursor and rejects pages that go backwards. The default falls back to
+    /// [`Self::load_session_stream`] and re-sorts.
+    async fn load_session_page(
+        &self,
+        session_id: &str,
+        after_seq: Option<i64>,
+        limit: Option<usize>,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        let mut events = self
+            .load_session_stream(session_id, after_seq, limit)
+            .await?;
+        events.sort_by_key(|event| event.stream_seq);
+        Ok(events)
+    }
+
+    /// Run id of the most recent `run_started` that has no `run_completed`,
+    /// considering only events produced by this node (`EventOrigin::Local`).
+    /// Mirrored events of a remote host are ignored: that host owns and closes
+    /// its runs.
+    ///
+    /// The default scans the whole session stream; storage backends should
+    /// override it with an indexed query over run lifecycle rows only.
+    async fn last_unfinished_run(&self, session_id: &str) -> SessionResult<Option<String>> {
+        let events = self.load_session_stream(session_id, None, None).await?;
+        Ok(last_unfinished_run_in(events.into_iter().filter_map(
+            |event| match event.kind {
+                _ if event.origin != EventOrigin::Local => None,
+                crate::events::AgentEventKind::RunStarted { run_id, .. } => {
+                    Some((RunLifecycle::Started, run_id))
+                }
+                crate::events::AgentEventKind::RunCompleted { run_id, .. } => {
+                    Some((RunLifecycle::Completed, run_id))
+                }
+                _ => None,
+            },
+        )))
+    }
+
+    /// Load a session's durable events with `session_seq` in
+    /// `(after_session_seq, up_to_session_seq]` (`None` = no upper bound), in
+    /// production order. Used by live consumers to recover events they missed
+    /// (broadcast lag or a sequence gap). Unsequenced rows (`session_seq` 0)
+    /// are never returned.
+    ///
+    /// The default filters the full stream; storage backends should override
+    /// it with an indexed range read.
+    async fn load_session_range(
+        &self,
+        session_id: &str,
+        after_session_seq: i64,
+        up_to_session_seq: Option<i64>,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        let mut events = self.load_session_stream(session_id, None, None).await?;
+        events.retain(|event| {
+            event.session_seq > after_session_seq
+                && up_to_session_seq.is_none_or(|upper| event.session_seq <= upper)
+        });
+        events.sort_by_key(|event| event.session_seq);
+        Ok(events)
+    }
 
     /// Load events across all sessions (global stream), after a given sequence.
     /// `None` loads all matching events; `Some(limit)` returns at most that many.
@@ -155,6 +296,12 @@ pub trait EventJournal: Send + Sync {
     /// Used by undo cleanup to prune the event journal when the user commits
     /// a new prompt after an undo so that the reverted turns do not reappear
     /// on page reload.
+    ///
+    /// Accounting is exempt: `llm_attempt_started` / `llm_attempt_settled`
+    /// records, and legacy `llm_request_end` records that carry no
+    /// `accounting` detail (evidence of generation with no accounting basis),
+    /// are never deleted, so rewinding cannot erase incurred spend. Retained
+    /// records are not renumbered. Deleting the whole session is separate.
     ///
     /// Returns the number of deleted rows.
     async fn delete_session_events_from(
@@ -320,6 +467,148 @@ pub trait ViewStore: Send + Sync {
         &self,
         limit_per_workspace: usize,
     ) -> SessionResult<RecentModelsView>;
+
+    /// Whether this view store can authoritatively provide lifecycle metadata.
+    fn supports_session_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// Whether lifecycle filters are supported across all lifecycle-aware queries.
+    fn supports_session_lifecycle_filtering(&self) -> bool {
+        false
+    }
+
+    /// Batch-fetch lifecycle metadata for listed sessions.
+    async fn get_session_list_lifecycles(
+        &self,
+        _session_ids: &[String],
+    ) -> SessionResult<HashMap<String, SessionLifecycle>> {
+        Err(SessionError::InvalidOperation(
+            "Session lifecycle is unsupported by this view store".into(),
+        ))
+    }
+
+    /// Lifecycle-aware variant of [`ViewStore::get_session_list_view`].
+    async fn get_session_list_view_with_lifecycle(
+        &self,
+        filter: Option<SessionListFilter>,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<SessionListView> {
+        if lifecycle.is_filtered() {
+            return Err(SessionError::InvalidOperation(
+                "Session lifecycle filtering is unsupported by this view store".into(),
+            ));
+        }
+        self.get_session_list_view(filter).await
+    }
+
+    /// Lifecycle-aware variant of [`ViewStore::browse_session_groups`].
+    async fn browse_session_groups_with_lifecycle(
+        &self,
+        cursor: Option<String>,
+        group_limit: usize,
+        session_limit_per_group: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
+        if lifecycle.is_filtered() {
+            return Err(SessionError::InvalidOperation(
+                "Session lifecycle filtering is unsupported by this view store".into(),
+            ));
+        }
+        self.browse_session_groups(cursor, group_limit, session_limit_per_group, session_scope)
+            .await
+    }
+
+    /// Lifecycle-aware variant of [`ViewStore::list_group_sessions`].
+    async fn list_group_sessions_with_lifecycle(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(SessionGroup, usize)> {
+        if lifecycle.is_filtered() {
+            return Err(SessionError::InvalidOperation(
+                "Session lifecycle filtering is unsupported by this view store".into(),
+            ));
+        }
+        self.list_group_sessions(cwd, cursor, limit, session_scope)
+            .await
+    }
+
+    /// Lifecycle-aware variant of [`ViewStore::list_session_items`].
+    async fn list_session_items_with_lifecycle(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)> {
+        if lifecycle.is_filtered() {
+            return Err(SessionError::InvalidOperation(
+                "Session lifecycle filtering is unsupported by this view store".into(),
+            ));
+        }
+        self.list_session_items(cwd, cursor, limit, session_scope)
+            .await
+    }
+
+    /// ACP flat-list variant that composes an optional persisted pin filter in storage.
+    async fn list_session_items_with_pins(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+        pinned: Option<bool>,
+    ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)> {
+        if pinned.is_some() {
+            return Err(SessionError::InvalidOperation(
+                "Session pin filtering is unsupported by this view store".into(),
+            ));
+        }
+        self.list_session_items_with_lifecycle(cwd, cursor, limit, session_scope, lifecycle)
+            .await
+    }
+
+    /// Lifecycle-aware variant of [`ViewStore::search_sessions`].
+    async fn search_sessions_with_lifecycle(
+        &self,
+        query: String,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
+        if lifecycle.is_filtered() {
+            return Err(SessionError::InvalidOperation(
+                "Session lifecycle filtering is unsupported by this view store".into(),
+            ));
+        }
+        self.search_sessions(query, cursor, limit, session_scope)
+            .await
+    }
+
+    /// Lifecycle-aware variant of [`ViewStore::list_session_children`].
+    async fn list_session_children_with_lifecycle(
+        &self,
+        parent_session_id: String,
+        cursor: Option<String>,
+        limit: usize,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(SessionGroup, usize)> {
+        if lifecycle.is_filtered() {
+            return Err(SessionError::InvalidOperation(
+                "Session lifecycle filtering is unsupported by this view store".into(),
+            ));
+        }
+        self.list_session_children(parent_session_id, cursor, limit)
+            .await
+    }
 }
 
 /// Helper trait for redacting sensitive content
@@ -447,9 +736,52 @@ impl SessionScope {
     }
 }
 
+/// Durable managed-workspace provenance; execution cwd stays on the session item.
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionWorkspaceView {
+    pub workspace_id: String,
+    pub repository_id: String,
+    /// Project grouping key: the cwd this workspace was created from.
+    /// Stable across archive and removal.
+    #[serde(default)]
+    pub source_cwd: String,
+    pub project_name: String,
+    pub checkout_path: String,
+    pub branch: String,
+    pub baseline_mode: String,
+    pub baseline_commit: Option<String>,
+    pub lifecycle: String,
+    pub last_error: Option<String>,
+    /// Session that currently owns (writes in) the checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_session_id: Option<String>,
+    /// Session ownership was handed off to, once handoff exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handed_off_to: Option<String>,
+}
+
+impl SessionWorkspaceView {
+    /// The `_meta.querymt.workspace` object disclosed on session listings.
+    pub fn to_meta(&self) -> serde_json::Value {
+        serde_json::json!({
+            "workspaceId": self.workspace_id,
+            "branch": self.branch,
+            "checkoutPath": self.checkout_path,
+            "sourceCwd": self.source_cwd,
+            "baselineMode": self.baseline_mode,
+            "lifecycle": self.lifecycle,
+            "ownerSessionId": self.owner_session_id,
+            "handedOffTo": self.handed_off_to,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionListItem {
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<SessionWorkspaceView>,
     pub name: Option<String>,
     pub cwd: Option<String>,
     pub title: Option<String>,
@@ -466,9 +798,29 @@ pub struct SessionListItem {
     /// Whether this session has child sessions
     pub has_children: bool,
     pub fork_count: usize,
+    /// A persisted fork-isolation intent is still outstanding: the fork is
+    /// not runnable (load/resume fail closed) until explicit recovery
+    /// completes provisioning. Set for pending and failed isolated fork
+    /// creation alike; the workspace view, when present, carries the
+    /// workspace-level lifecycle (e.g. `failed`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending_isolation: bool,
 }
 
-/// Group of sessions by CWD
+impl SessionListItem {
+    /// Managed sessions group under the cwd their workspace was created
+    /// from, local ones under their own cwd.
+    pub fn group_key(&self) -> Option<String> {
+        self.workspace
+            .as_ref()
+            .map(|w| w.source_cwd.as_str())
+            .filter(|cwd| !cwd.is_empty())
+            .map(str::to_owned)
+            .or_else(|| self.cwd.clone())
+    }
+}
+
+/// Group of sessions by project cwd (the source cwd for managed sessions).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionGroup {
     pub cwd: Option<String>,
@@ -701,6 +1053,7 @@ mod tests {
     fn test_session_list_item_construction() {
         let item = SessionListItem {
             session_id: "sess-x".to_string(),
+            workspace: None,
             name: Some("My Session".to_string()),
             cwd: Some("/home/user/project".to_string()),
             title: None,
@@ -711,6 +1064,7 @@ mod tests {
             session_kind: None,
             has_children: false,
             fork_count: 0,
+            pending_isolation: false,
         };
         assert_eq!(item.session_id, "sess-x");
         assert!(!item.has_children);

@@ -16,20 +16,147 @@ use crate::events::{
 };
 use crate::session::error::SessionResult;
 use crate::session::projection::{EventJournal, NewDurableEvent};
+use crate::session_event_stream::SessionEventStream;
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Single ingress API for all event producers.
 ///
-/// Owns the journal (storage boundary) and fanout (transport boundary).
+/// Owns the journal (storage boundary) and fanout (transport boundary), and
+/// one [`SessionEventStream`] per session, which numbers and orders every
+/// locally produced event of that session.
 pub struct EventSink {
     journal: Arc<dyn EventJournal>,
     fanout: Arc<EventFanout>,
+    streams: Mutex<StreamRegistry>,
+    /// One shared accounting projection per live session, so every component
+    /// that records or reads spend (execution, compaction, delegation
+    /// summaries) sees the same totals. Released with the session's stream.
+    accounting: Mutex<
+        std::collections::HashMap<
+            String,
+            Arc<tokio::sync::OnceCell<Arc<crate::accounting::SessionAccounting>>>,
+        >,
+    >,
+}
+
+#[derive(Default)]
+struct StreamRegistry {
+    live: HashMap<String, Arc<SessionEventStream>>,
+    /// Last sequence number assigned by a retired stream. Ephemeral events
+    /// consume numbers that the journal never sees, so a replacement stream
+    /// must continue after this tip, not just after the journal's maximum.
+    retired_tips: HashMap<String, i64>,
 }
 
 impl EventSink {
     /// Create a new EventSink.
     pub fn new(journal: Arc<dyn EventJournal>, fanout: Arc<EventFanout>) -> Self {
-        Self { journal, fanout }
+        Self {
+            journal,
+            fanout,
+            streams: Mutex::new(StreamRegistry::default()),
+            accounting: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The session's shared accounting projection, hydrated from the journal
+    /// on first use. Concurrent callers share one hydration.
+    pub async fn session_accounting(
+        &self,
+        session_id: &str,
+    ) -> Result<Arc<crate::accounting::SessionAccounting>, crate::accounting::AccountingError> {
+        let cell = self
+            .accounting
+            .lock()
+            .entry(session_id.to_string())
+            .or_default()
+            .clone();
+        cell.get_or_try_init(|| {
+            crate::accounting::SessionAccounting::hydrate(session_id, self.journal.clone())
+        })
+        .await
+        .cloned()
+    }
+
+    pub(crate) fn live_delegation_activity(
+        &self,
+        session_id: &str,
+    ) -> Vec<crate::control::delegation_notifications::DelegationUpdateNotification> {
+        self.fanout.live_delegation_activity(session_id)
+    }
+
+    /// The ordered emit handle of a session, created on first use.
+    ///
+    /// All emitters of one session (actor, execution task, delegation,
+    /// scheduler) share this handle, so they share one `session_seq` counter.
+    /// Must be called inside a Tokio runtime.
+    pub fn session_stream(&self, session_id: &str) -> Arc<SessionEventStream> {
+        if let Some(stream) = self.streams.lock().live.get(session_id) {
+            return stream.clone();
+        }
+
+        // The journal lookup may wait on the storage connection, so it runs
+        // without the registry lock. It can be stale by the time the lock is
+        // retaken; the retained tip of a retired stream covers that case.
+        let durable_base = self.journal.max_session_seq_blocking(session_id).max(0);
+
+        let mut registry = self.streams.lock();
+        // A concurrent caller may have created the stream meanwhile.
+        if let Some(stream) = registry.live.get(session_id) {
+            return stream.clone();
+        }
+        let retired_tip = registry.retired_tips.remove(session_id).unwrap_or(0);
+        let stream = SessionEventStream::with_base(
+            session_id,
+            self.journal.clone(),
+            self.fanout.clone(),
+            durable_base.max(retired_tip),
+        );
+        registry.live.insert(session_id.to_string(), stream.clone());
+        stream
+    }
+
+    /// Release a session's ordered stream (and its writer task) when the
+    /// session actor stops.
+    ///
+    /// Waits until everything already emitted is persisted and published, then
+    /// removes the stream only if it is idle and nobody else holds it. A later
+    /// emit creates a fresh stream that continues after the highest number the
+    /// retired stream assigned (and the journal's highest number), so numbers
+    /// consumed by ephemeral events are never reused. Returns whether the
+    /// stream was released.
+    pub async fn retire_session_stream(&self, session_id: &str) -> bool {
+        let Some(stream) = self.streams.lock().live.get(session_id).cloned() else {
+            // No ordered stream, but the accounting projection must not outlive
+            // the session's retirement.
+            self.accounting.lock().remove(session_id);
+            return false;
+        };
+        stream.flush().await;
+
+        let mut registry = self.streams.lock();
+        // The map's entry plus our local clone are the two expected owners.
+        let released = registry
+            .live
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &stream))
+            && stream.is_idle()
+            && Arc::strong_count(&stream) == 2;
+        if released {
+            self.accounting.lock().remove(session_id);
+            registry.live.remove(session_id);
+            registry
+                .retired_tips
+                .insert(session_id.to_string(), stream.tip());
+        }
+        released
+    }
+
+    /// Number of live per-session streams (diagnostics and tests).
+    pub fn session_stream_count(&self) -> usize {
+        self.streams.lock().live.len()
     }
 
     /// Emit a durable event. Persists to journal (awaited), then publishes to fanout.
@@ -44,7 +171,11 @@ impl EventSink {
             .await
     }
 
-    /// Emit a durable event with explicit origin metadata (for remote events).
+    /// Emit a durable event with explicit origin metadata.
+    ///
+    /// Locally produced events go through the session's ordered stream.
+    /// Events of another origin carry no local production order: they are
+    /// stored unsequenced (`session_seq` unset) and published after the write.
     pub async fn emit_durable_with_origin(
         &self,
         session_id: &str,
@@ -52,23 +183,25 @@ impl EventSink {
         origin: EventOrigin,
         source_node: Option<String>,
     ) -> SessionResult<DurableEvent> {
-        let parent = (origin == EventOrigin::Local && EventFanout::is_delegation_event(&kind))
-            .then(tracing::Span::current);
+        if origin == EventOrigin::Local {
+            return self
+                .session_stream(session_id)
+                .emit_persisted_with(kind, origin, source_node)
+                .await;
+        }
+
         let new_event = NewDurableEvent {
             session_id: session_id.to_string(),
-            origin: origin.clone(),
-            source_node: source_node.clone(),
+            origin,
+            source_node,
             source_node_id: None,
             source_seq: None,
-            kind: kind.clone(),
+            session_seq: None,
+            kind,
         };
-
         let persisted = self.journal.append_durable(&new_event).await?;
-
-        // Publish to fanout for live subscribers
         self.fanout
-            .publish_with_context(EventEnvelope::Durable(persisted.clone()), parent);
-
+            .publish(EventEnvelope::Durable(persisted.clone()));
         Ok(persisted)
     }
 
@@ -79,6 +212,10 @@ impl EventSink {
     /// this is a full no-op — `Ok(None)` is returned and the fanout is NOT
     /// republished, so duplicate replay after reconnect never doubles local
     /// delivery.
+    ///
+    /// `session_seq` is the host's per-session sequence; it is stored as-is so
+    /// one cursor describes the session on every node. `None` (or `0`) for
+    /// events from nodes that do not number them.
     pub async fn emit_durable_from_source(
         &self,
         session_id: &str,
@@ -86,6 +223,7 @@ impl EventSink {
         source_node: Option<String>,
         source_node_id: String,
         source_seq: i64,
+        session_seq: Option<i64>,
     ) -> SessionResult<Option<DurableEvent>> {
         let new_event = NewDurableEvent {
             session_id: session_id.to_string(),
@@ -93,6 +231,7 @@ impl EventSink {
             source_node,
             source_node_id: Some(source_node_id),
             source_seq: Some(source_seq),
+            session_seq: session_seq.filter(|seq| *seq > 0),
             kind,
         };
 
@@ -108,12 +247,14 @@ impl EventSink {
         }
     }
 
-    /// Emit an ephemeral event. Published to fanout only — never persisted.
+    /// Emit a locally produced ephemeral event through the session's ordered
+    /// stream. Never persisted.
     pub fn emit_ephemeral(&self, session_id: &str, kind: AgentEventKind) {
-        self.emit_ephemeral_with_origin(session_id, kind, EventOrigin::Local, None);
+        self.session_stream(session_id).emit_ephemeral(kind);
     }
 
-    /// Emit an ephemeral event with explicit origin.
+    /// Emit an unsequenced ephemeral event with explicit origin (connection
+    /// annotations such as remote-stream status). Published to fanout only.
     pub fn emit_ephemeral_with_origin(
         &self,
         session_id: &str,
@@ -121,12 +262,42 @@ impl EventSink {
         origin: EventOrigin,
         source_node: Option<String>,
     ) {
+        self.publish_ephemeral(session_id, kind, origin, source_node, 0);
+    }
+
+    /// Republish an ephemeral event relayed from a remote host, keeping the
+    /// host's `session_seq`.
+    pub fn emit_ephemeral_relayed(
+        &self,
+        session_id: &str,
+        kind: AgentEventKind,
+        source_node: Option<String>,
+        session_seq: i64,
+    ) {
+        self.publish_ephemeral(
+            session_id,
+            kind,
+            EventOrigin::Remote,
+            source_node,
+            session_seq.max(0),
+        );
+    }
+
+    fn publish_ephemeral(
+        &self,
+        session_id: &str,
+        kind: AgentEventKind,
+        origin: EventOrigin,
+        source_node: Option<String>,
+        session_seq: i64,
+    ) {
         let ephemeral = EphemeralEvent {
             session_id: session_id.to_string(),
+            session_seq,
             timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
-            origin: origin.clone(),
-            source_node: source_node.clone(),
-            kind: kind.clone(),
+            origin,
+            source_node,
+            kind,
         };
 
         self.fanout.publish(EventEnvelope::Ephemeral(ephemeral));
@@ -174,6 +345,86 @@ mod tests {
         let journal = storage.event_journal();
         let fanout = Arc::new(EventFanout::new());
         EventSink::new(journal, fanout)
+    }
+
+    // ── session stream release ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn retiring_a_stream_drains_it_and_a_new_one_never_reuses_numbers() {
+        let sink = make_sink().await;
+        for _ in 0..3 {
+            // Queued, not awaited: retire must wait for the writer.
+            sink.session_stream("s1").emit(AgentEventKind::Cancelled);
+        }
+        assert_eq!(sink.session_stream_count(), 1);
+
+        assert!(sink.retire_session_stream("s1").await);
+        assert_eq!(sink.session_stream_count(), 0, "no stream left behind");
+        assert!(!sink.retire_session_stream("s1").await, "already released");
+
+        let next = sink
+            .emit_durable("s1", AgentEventKind::SessionCreated)
+            .await
+            .unwrap();
+        assert_eq!(next.session_seq, 4, "numbering continues after the drain");
+        let stored = sink
+            .journal()
+            .load_session_stream("s1", None, None)
+            .await
+            .unwrap();
+        let seqs: Vec<i64> = stored.iter().map(|e| e.session_seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn retired_stream_tip_covers_ephemeral_numbers() {
+        let sink = make_sink().await;
+        sink.emit_durable("s1", AgentEventKind::SessionCreated)
+            .await
+            .unwrap();
+        sink.emit_ephemeral(
+            "s1",
+            AgentEventKind::AssistantContentDelta {
+                content: "t".into(),
+                message_id: "m1".into(),
+            },
+        );
+        let tip = sink.session_stream("s1").tip();
+        assert_eq!(tip, 2);
+
+        assert!(sink.retire_session_stream("s1").await);
+        let next = sink
+            .emit_durable("s1", AgentEventKind::Cancelled)
+            .await
+            .unwrap();
+        assert_eq!(next.session_seq, 3, "ephemeral number 2 is not reused");
+    }
+
+    #[tokio::test]
+    async fn concurrent_session_stream_calls_share_one_stream() {
+        let sink = Arc::new(make_sink().await);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let sink = sink.clone();
+                tokio::spawn(async move { sink.session_stream("s1") })
+            })
+            .collect();
+        let mut streams = Vec::new();
+        for handle in handles {
+            streams.push(handle.await.unwrap());
+        }
+        assert!(streams.iter().all(|s| Arc::ptr_eq(s, &streams[0])));
+        assert_eq!(sink.session_stream_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn retire_keeps_a_stream_that_is_still_in_use() {
+        let sink = make_sink().await;
+        let held = sink.session_stream("s1");
+        assert!(!sink.retire_session_stream("s1").await);
+        assert_eq!(sink.session_stream_count(), 1);
+        drop(held);
+        assert!(sink.retire_session_stream("s1").await);
     }
 
     // ── emit_durable ───────────────────────────────────────────────────
@@ -285,6 +536,7 @@ mod tests {
                 Some("peer-a".to_string()),
                 "node-a".to_string(),
                 7,
+                None,
             )
             .await
             .unwrap();
@@ -302,6 +554,7 @@ mod tests {
                 Some("peer-a".to_string()),
                 "node-a".to_string(),
                 7,
+                None,
             )
             .await
             .unwrap();
@@ -323,6 +576,7 @@ mod tests {
                 Some("peer-a".to_string()),
                 "node-a".to_string(),
                 8,
+                None,
             )
             .await
             .unwrap();

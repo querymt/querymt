@@ -90,3 +90,14 @@ jobs:
 
           maturin develop --manifest-path "${{ matrix.manifest_path }}"
           ${{ matrix.smoke_command }}
+
+      - name: Run Python worktree tests
+        if: matrix.cargo_package == 'querymt-agent-py'
+        shell: bash
+        env:
+          GIT_CONFIG_GLOBAL: /dev/null
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          python -m pip install pytest
+          QMT_HOME="$(mktemp -d)" python -m pytest crates/py/querymt-agent-py/tests -q

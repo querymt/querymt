@@ -1,5 +1,5 @@
 use ::querymt::chat::{
-    ChatInputPart, ChatMessage, ChatRole, FinishReason, MediaKind, StreamChunk, Tool,
+    ChatCall, ChatInputPart, ChatMessage, ChatRole, FinishReason, MediaKind, StreamChunk, Tool,
 };
 use ::querymt::dynamic::PluginRegistryDynamicExt;
 use ::querymt::plugin::host::PluginRegistry;
@@ -75,6 +75,12 @@ struct PyUsage {
     cache_read: u32,
     #[pyo3(get)]
     cache_write: u32,
+    /// Five-minute share of `cache_write`; `None` when the provider gave no breakdown.
+    #[pyo3(get)]
+    cache_write_5m_tokens: Option<u32>,
+    /// One-hour share of `cache_write`; `None` when the provider gave no breakdown.
+    #[pyo3(get)]
+    cache_write_1h_tokens: Option<u32>,
 }
 
 #[pyclass(name = "ToolCall", skip_from_py_object)]
@@ -194,14 +200,17 @@ impl PyProvider {
         let provider = Arc::clone(&self.inner);
         let messages = py_messages_to_rust(messages.bind(py)).map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let response = provider.chat(&messages).await.map_err(into_py_err)?;
+            let response = provider
+                .chat(&ChatCall::new(&messages))
+                .await
+                .map_err(into_py_err)?;
             let response = chat_output_to_python(&response);
             Python::attach(|py| Py::new(py, response))
         })
     }
 
     fn supports_streaming(&self) -> bool {
-        self.inner.supports_streaming()
+        self.inner.capabilities().streaming
     }
 
     #[pyo3(signature = (messages, tools=None))]
@@ -217,7 +226,7 @@ impl PyProvider {
             .map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let response = provider
-                .chat_with_tools(&messages, tools.as_deref())
+                .chat(&ChatCall::new(&messages).maybe_tools(tools.as_deref()))
                 .await
                 .map_err(into_py_err)?;
             let response = chat_output_to_python(&response);
@@ -233,7 +242,10 @@ impl PyProvider {
         let provider = Arc::clone(&self.inner);
         let messages = py_messages_to_rust(messages.bind(py)).map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let stream = provider.chat_stream(&messages).await.map_err(into_py_err)?;
+            let stream = provider
+                .chat_stream(&ChatCall::new(&messages))
+                .await
+                .map_err(into_py_err)?;
             let stream = stream_to_python(stream);
             Python::attach(|py| Py::new(py, stream))
         })
@@ -252,7 +264,7 @@ impl PyProvider {
             .map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let stream = provider
-                .chat_stream_with_tools(&messages, tools.as_deref())
+                .chat_stream(&ChatCall::new(&messages).maybe_tools(tools.as_deref()))
                 .await
                 .map_err(into_py_err)?;
             let stream = stream_to_python(stream);
@@ -282,6 +294,7 @@ impl PyMeshRuntime {
                 }),
                 iroh_enabled: false,
                 iroh_gso: true,
+                iroh_dns: None,
                 iroh_scopes: Vec::new(),
                 identity_file: None,
                 request_timeout: Duration::from_secs(request_timeout_secs),
@@ -471,6 +484,8 @@ fn usage_to_python(usage: Usage) -> PyUsage {
         reasoning_tokens: usage.reasoning_tokens,
         cache_read: usage.cache_read,
         cache_write: usage.cache_write,
+        cache_write_5m_tokens: usage.cache_write_tiers.and_then(|t| t.five_minute),
+        cache_write_1h_tokens: usage.cache_write_tiers.and_then(|t| t.one_hour),
     }
 }
 
@@ -519,6 +534,9 @@ fn stream_chunk_to_python(chunk: StreamChunk) -> PyStreamChunk {
             "thinking_signature",
             serde_json::json!({ "signature": signature }),
         ),
+        StreamChunk::RedactedThinking(data) => {
+            ("redacted_thinking", serde_json::json!({ "data": data }))
+        }
         StreamChunk::ToolUseStart { index, id, name } => (
             "tool_use_start",
             serde_json::json!({ "index": index, "id": id, "name": name }),
@@ -554,6 +572,8 @@ fn stream_chunk_to_python(chunk: StreamChunk) -> PyStreamChunk {
                 "reasoning_tokens": usage.reasoning_tokens,
                 "cache_read": usage.cache_read,
                 "cache_write": usage.cache_write,
+                "cache_write_5m_tokens": usage.cache_write_tiers.and_then(|t| t.five_minute),
+                "cache_write_1h_tokens": usage.cache_write_tiers.and_then(|t| t.one_hour),
             }),
         ),
         StreamChunk::Done { finish_reason } => (
@@ -1319,6 +1339,38 @@ mod tests {
         assert_eq!(chunk.data["index"], 2);
         assert_eq!(chunk.data["id"], "call-1");
         assert_eq!(chunk.data["name"], "lookup");
+    }
+
+    #[test]
+    fn python_usage_projection_keeps_missing_tier_counts_distinct_from_zero() {
+        let base = Usage {
+            cache_write: 300,
+            ..Usage::default()
+        };
+        let absent = usage_to_python(base.clone());
+        assert_eq!(
+            (absent.cache_write_5m_tokens, absent.cache_write_1h_tokens),
+            (None, None)
+        );
+
+        let tiered = Usage {
+            cache_write_tiers: Some(::querymt::CacheWriteTiers {
+                five_minute: Some(300),
+                one_hour: Some(0),
+            }),
+            ..base
+        };
+        let py_usage = usage_to_python(tiered.clone());
+        assert_eq!(py_usage.cache_write, 300);
+        assert_eq!(py_usage.cache_write_5m_tokens, Some(300));
+        assert_eq!(py_usage.cache_write_1h_tokens, Some(0));
+
+        let chunk = stream_chunk_to_python(StreamChunk::Usage(tiered));
+        assert_eq!(chunk.kind, "usage");
+        assert_eq!(chunk.data["cache_write_5m_tokens"], 300);
+        assert_eq!(chunk.data["cache_write_1h_tokens"], 0);
+        let chunk = stream_chunk_to_python(StreamChunk::Usage(Usage::default()));
+        assert!(chunk.data["cache_write_5m_tokens"].is_null());
     }
 
     #[test]

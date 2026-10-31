@@ -42,6 +42,7 @@ impl ToolTrait for WebFetchTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "url": {
                             "type": "string",

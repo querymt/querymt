@@ -1,0 +1,117 @@
+[
+  {
+    "structured": {
+      "type": "response_metadata",
+      "response_id": "msg_fixture_cut",
+      "status": "in_progress",
+      "usage": {
+        "input_tokens": 25,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read": 0,
+        "cache_write": 0
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "item_started",
+      "output_index": 0,
+      "item": {
+        "type": "message",
+        "role": "Assistant",
+        "parts": [
+          {
+            "type": "text",
+            "text": ""
+          }
+        ]
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "message_part_started",
+      "output_index": 0,
+      "content_index": 0,
+      "part": {
+        "type": "text",
+        "text": ""
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "message_part_delta",
+      "output_index": 0,
+      "content_index": 0,
+      "delta": {
+        "type": "text",
+        "delta": "Writing the file now."
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "item_completed",
+      "output_index": 0,
+      "item": {
+        "type": "message",
+        "role": "Assistant",
+        "parts": [
+          {
+            "type": "text",
+            "text": "Writing the file now."
+          }
+        ]
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "item_started",
+      "output_index": 1,
+      "item": {
+        "type": "function_call",
+        "call_id": "toolu_cut",
+        "name": "write_file",
+        "arguments": ""
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "function_arguments_delta",
+      "output_index": 1,
+      "delta": "{\"path\": \"big.rs\""
+    }
+  },
+  {
+    "structured": {
+      "type": "item_completed",
+      "output_index": 1,
+      "item": {
+        "type": "function_call",
+        "call_id": "toolu_cut",
+        "name": "write_file",
+        "arguments": "{\"path\": \"big.rs\"",
+        "anthropic.invalid_input": true
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "response_terminal",
+      "status": "incomplete",
+      "usage": {
+        "input_tokens": 25,
+        "output_tokens": 100,
+        "reasoning_tokens": 0,
+        "cache_read": 0,
+        "cache_write": 0
+      },
+      "finish_reason": "Length",
+      "detail": "output token limit"
+    }
+  }
+]

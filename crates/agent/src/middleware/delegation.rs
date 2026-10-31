@@ -78,6 +78,10 @@ impl DelegationMiddleware {
                     agent.capabilities.join(", ")
                 ));
             }
+            output.push_str(&format!(
+                "**Default workspace isolation:** {}\n",
+                agent.isolation
+            ));
             output.push('\n');
         }
 
@@ -344,6 +348,10 @@ impl DelegationContextMiddleware {
                     agent.capabilities.join(", ")
                 ));
             }
+            output.push_str(&format!(
+                "**Default workspace isolation:** {}\n",
+                agent.isolation
+            ));
             output.push('\n');
         }
 

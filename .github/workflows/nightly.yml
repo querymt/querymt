@@ -119,3 +119,19 @@ jobs:
             --prerelease \
             --target "${{ github.sha }}" \
             artifacts/*
+
+      # Tell querymt-desktop that a fresh nightly qmtcode release exists so it
+      # can build its own nightly against it. GITHUB_TOKEN cannot dispatch
+      # events to another repository, so this needs a PAT (fine-grained,
+      # querymt-desktop only, Contents: Read & Write) stored as a secret.
+      - name: Trigger querymt-desktop nightly
+        env:
+          GH_TOKEN: ${{ secrets.DESKTOP_NIGHTLY_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::DESKTOP_NIGHTLY_DISPATCH_TOKEN is not set; skipping querymt-desktop nightly trigger"
+            exit 0
+          fi
+          gh api repos/querymt/querymt-desktop/dispatches \
+            -f event_type=qmtcode-nightly \
+            -f "client_payload[querymt_sha]=${{ github.sha }}"

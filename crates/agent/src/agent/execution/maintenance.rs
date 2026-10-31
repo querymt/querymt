@@ -42,6 +42,44 @@ async fn emit_compaction_event(config: &AgentConfig, session_id: &str, kind: Age
     }
 }
 
+/// The accounting ledger for one compaction operation.
+///
+/// Uses the cycle the compaction was initiated from. The billing basis is the
+/// session provider's (that provider handles the request), priced for the
+/// compaction model actually used.
+async fn compaction_ledger(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    model: &str,
+) -> Result<crate::accounting::DispatchLedger, anyhow::Error> {
+    let cycle = exec_ctx
+        .cycle_accounting(&config.event_sink)
+        .await
+        .map_err(|error| anyhow::anyhow!("accounting unavailable: {error}"))?;
+    let recorder = Arc::new(crate::accounting::AttemptRecorder::with_projection(
+        config.event_sink.session_stream(&exec_ctx.session_id),
+        cycle.session_accounting().clone(),
+    ));
+    let provider = exec_ctx
+        .llm_config()
+        .map(|c| c.provider.clone())
+        .unwrap_or_default();
+    Ok(crate::accounting::DispatchLedger {
+        operation: Arc::new(
+            crate::accounting::AttemptOperation::new(
+                recorder,
+                cycle,
+                crate::accounting::AttemptPurpose::Compaction,
+                provider,
+                model,
+            )
+            .with_budget_pricing(config.budget_pricing())
+            .with_budget_cap(config.budget_cap_usd()),
+        ),
+        basis: exec_ctx.session_handle.billing_basis_for_model(model),
+    })
+}
+
 /// Run pruning on tool results to reduce context size.
 ///
 /// This marks low-value tool results as compacted based on the pruning configuration.
@@ -242,6 +280,15 @@ pub(super) async fn run_ai_compaction(
                 return Err(error);
             }
         };
+        // Compaction is a paid request: its attempts are recorded against the
+        // initiating cycle and session, never inferred from message history.
+        let ledger = match compaction_ledger(config, exec_ctx, model).await {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                emit_compaction_failure(config, session_id, &compaction_id, &error).await;
+                return Err(error);
+            }
+        };
         let retry_config = crate::session::compaction::RetryConfig {
             max_retries: config.execution_policy.compaction.retry.max_retries,
             initial_backoff_ms: config.execution_policy.compaction.retry.initial_backoff_ms,
@@ -257,11 +304,27 @@ pub(super) async fn run_ai_compaction(
                 exec_ctx
                     .execution_config()
                     .and_then(|cfg| cfg.max_prompt_bytes),
+                &ledger,
             )
             .await
         {
             Ok(result) => result,
             Err(error) => {
+                // The cycle budget gate refused a paid compaction dispatch:
+                // nothing was sent. End the cycle as a price-limit stop, as
+                // the main path does, not as a compaction/accounting error.
+                // The started compaction still gets its terminal event.
+                if let Some((cap, spent)) = ledger.operation.budget_refusal() {
+                    let reason = anyhow::anyhow!(
+                        "compaction not dispatched: price limit reached: ${spent:.4} >= ${cap:.2}"
+                    );
+                    emit_compaction_failure(config, session_id, &compaction_id, &reason).await;
+                    return Ok(ExecutionState::Stopped {
+                        message: format!("Price limit reached: ${spent:.4} >= ${cap:.2}").into(),
+                        stop_type: StopType::PriceLimit,
+                        context: current_state.context().cloned(),
+                    });
+                }
                 let error = anyhow::anyhow!("Compaction failed: {}", error);
                 emit_compaction_failure(config, session_id, &compaction_id, &error).await;
                 return Err(error);
@@ -424,7 +487,8 @@ pub(super) async fn run_ai_compaction(
                 ctx.provider.clone(),
                 ctx.model.clone(),
             )
-            .with_session_mode(ctx.session_mode),
+            .with_session_mode(ctx.session_mode)
+            .with_profile(ctx.profile.clone()),
         )
     } else {
         return Err(anyhow::anyhow!("No context available for compaction"));
@@ -749,14 +813,16 @@ mod tests {
             super::super::execute_cycle_state_machine(
                 &config,
                 &mut exec_ctx,
-                None,
                 crate::agent::core::AgentMode::Build,
             ),
         )
         .await
         .unwrap()
         .unwrap();
-        assert!(matches!(outcome, super::super::CycleOutcome::Stopped(_)));
+        assert!(matches!(
+            outcome,
+            super::super::CycleOutcome::Stopped { .. }
+        ));
         let after = config
             .provider
             .history_store()
@@ -829,5 +895,228 @@ mod tests {
         assert_eq!(summary, expected);
         assert!(context_tokens.unwrap() > 0);
         assert_compaction_journal_matches(&config, &exec_ctx.session_id, &compaction_events).await;
+    }
+
+    mod accounting_tests {
+        use super::*;
+        use crate::accounting::{AccountingReason, AttemptPurpose, CycleAccounting};
+
+        fn usage() -> querymt::Usage {
+            querymt::Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                reasoning_tokens: 5,
+                cache_read: 50,
+                cache_write: 20,
+                cache_write_tiers: None,
+            }
+        }
+
+        fn response(text: &str) -> ChatOutput {
+            let mut out = ChatOutput::from_projections(
+                None,
+                Some(text.into()),
+                None,
+                None,
+                Some(FinishReason::Stop),
+            );
+            out.usage = Some(usage());
+            out
+        }
+
+        async fn totals(exec: &ExecutionContext) -> crate::accounting::ScopeTotals {
+            exec.cycle_accounting
+                .get()
+                .expect("compaction opens the cycle's accounting")
+                .session_totals()
+        }
+
+        #[tokio::test]
+        async fn successful_compaction_charges_the_initiating_cycle_as_compaction_purpose() {
+            let (config, mut exec_ctx, state, _tempdir) =
+                fixture(Hooks::disabled(), Some(response("A usable summary"))).await;
+            run_ai_compaction(&config, &mut exec_ctx, &state)
+                .await
+                .unwrap();
+
+            let cycle = exec_ctx.cycle_accounting.get().unwrap();
+            let by_cycle = cycle.cycle_totals();
+            assert_eq!(by_cycle.priced_attempts, 1);
+            assert_eq!(by_cycle.unresolved_attempts, 0);
+            let accounting = cycle.session_accounting();
+            let compaction = accounting.read(|r| r.purpose(AttemptPurpose::Compaction));
+            assert_eq!(compaction.unresolved_attempts, 0);
+            assert_eq!(
+                accounting.read(|r| r.purpose(AttemptPurpose::MainResponse)),
+                Default::default(),
+                "auxiliary spend is not main-response spend"
+            );
+            // Usage was reported, so the attempt is a settled metered attempt
+            // even though the mock catalog has no price for it.
+            assert_eq!(totals(&exec_ctx).await.priced_attempts, 1);
+        }
+
+        #[tokio::test]
+        async fn rejected_summary_and_retry_both_settle_before_failure() {
+            // Both mock calls return an empty summary: validation rejects each.
+            let (config, mut exec_ctx, state, _tempdir) =
+                fixture(Hooks::disabled(), Some(response("  "))).await;
+            let mut events = config.subscribe_events();
+            let error = run_ai_compaction(&config, &mut exec_ctx, &state)
+                .await
+                .expect_err("empty summary must fail");
+            assert!(error.to_string().contains("empty summary"), "{error:#}");
+            let _ = take_compaction_events(&mut events);
+
+            let t = totals(&exec_ctx).await;
+            assert_eq!(t.unresolved_attempts, 0, "every attempt is settled");
+            assert_eq!(
+                t.priced_attempts, 2,
+                "the refused summary and its retry both cost"
+            );
+            assert!(
+                t.reasons()
+                    .iter()
+                    .all(|r| matches!(r, AccountingReason::Valuation { .. })),
+                "uncertainty is only about missing prices: {:?}",
+                t.reasons()
+            );
+        }
+
+        #[tokio::test]
+        async fn compaction_reduces_effective_context_while_increasing_spend() {
+            let (config, mut exec_ctx, state, _tempdir) =
+                fixture(Hooks::disabled(), Some(response("A usable summary"))).await;
+            let before = state.context().unwrap().stats.clone();
+            assert_eq!(before.context_tokens, 100_000);
+
+            let next = run_ai_compaction(&config, &mut exec_ctx, &state)
+                .await
+                .unwrap();
+            let after = next.context().unwrap().stats.clone();
+
+            // Effective context shrinks to the post-compaction estimate ...
+            assert!(after.context_tokens < before.context_tokens);
+            assert!(after.context_tokens > 0);
+            // ... while spend (the ledger) grows.
+            let t = totals(&exec_ctx).await;
+            assert_eq!(t.priced_attempts, 1);
+            assert!(t.tokens.input > 0);
+
+            // The summary's own usage never replaces main usage or steps.
+            assert_eq!(after.steps, before.steps);
+            assert_eq!(after.total_input_tokens, before.total_input_tokens);
+            assert_eq!(after.total_output_tokens, before.total_output_tokens);
+            assert_eq!(after.reasoning_tokens, before.reasoning_tokens);
+            assert_eq!(after.cache_read_tokens, before.cache_read_tokens);
+            assert_eq!(after.cache_write_tokens, before.cache_write_tokens);
+            assert_ne!(
+                after.context_tokens as u64,
+                u64::from(usage().input_tokens + usage().output_tokens),
+                "context is not the summary request's usage"
+            );
+        }
+
+        #[tokio::test]
+        async fn auxiliary_tokens_are_a_separate_purpose_total() {
+            let (config, mut exec_ctx, state, _tempdir) =
+                fixture(Hooks::disabled(), Some(response("A usable summary"))).await;
+            run_ai_compaction(&config, &mut exec_ctx, &state)
+                .await
+                .unwrap();
+            let accounting = exec_ctx
+                .cycle_accounting
+                .get()
+                .unwrap()
+                .session_accounting();
+            let compaction = accounting.read(|r| r.purpose(AttemptPurpose::Compaction));
+            let main = accounting.read(|r| r.purpose(AttemptPurpose::MainResponse));
+            assert_eq!(compaction.tokens.input, 100);
+            assert_eq!(compaction.tokens.reasoning, 5);
+            assert_eq!(compaction.tokens.cache_read, 50);
+            assert_eq!(compaction.tokens.cache_write, 20);
+            assert_eq!(main.tokens, Default::default());
+            assert_eq!(accounting.read(|r| r.session().tokens), compaction.tokens);
+        }
+
+        #[tokio::test]
+        async fn hook_provided_summary_dispatches_nothing_and_charges_nothing() {
+            let (config, mut exec_ctx, state, _tempdir) =
+                fixture(custom_summary_hooks("Hook summary", None), None).await;
+            run_ai_compaction(&config, &mut exec_ctx, &state)
+                .await
+                .unwrap();
+            assert!(
+                exec_ctx.cycle_accounting.get().is_none(),
+                "no provider request, so no accounting was opened"
+            );
+        }
+
+        #[tokio::test]
+        async fn maintenance_cycle_has_its_own_identity_and_session_totals() {
+            let (config, mut exec_ctx, state, _tempdir) =
+                fixture(Hooks::disabled(), Some(response("Summary"))).await;
+            // Compaction outside a prompt runs under a dedicated maintenance cycle.
+            let accounting = exec_ctx
+                .runtime
+                .accounting(&exec_ctx.session_id, &config.event_sink)
+                .await
+                .unwrap();
+            let maintenance = CycleAccounting::begin_maintenance(accounting.clone());
+            assert!(maintenance.is_maintenance());
+            let id = maintenance.cycle_id().to_string();
+            exec_ctx = exec_ctx.with_cycle_accounting(maintenance);
+
+            run_ai_compaction(&config, &mut exec_ctx, &state)
+                .await
+                .unwrap();
+            assert_eq!(accounting.read(|r| r.cycle(&id).priced_attempts), 1);
+
+            // A later prompt cycle starts at zero while session spend remains.
+            let prompt_cycle = CycleAccounting::begin(accounting);
+            assert!(!prompt_cycle.is_maintenance());
+            assert_eq!(prompt_cycle.cycle_totals(), Default::default());
+            assert_eq!(prompt_cycle.session_totals().priced_attempts, 1);
+        }
+
+        #[tokio::test]
+        async fn budget_refusal_ends_compaction_as_a_price_limit_stop() {
+            // No provider call is expected: the fixture's mock fails on any.
+            let (mut config, mut exec_ctx, state, _tempdir) =
+                fixture(Hooks::disabled(), None).await;
+            // A zero cap is already reached by a cycle with no spend.
+            config
+                .middleware_drivers
+                .push(Arc::new(crate::middleware::LimitsMiddleware::new(
+                    crate::middleware::LimitsConfig::default().max_price_usd(0.0),
+                )));
+            let mut events = config.subscribe_events();
+
+            let next = run_ai_compaction(&config, &mut exec_ctx, &state)
+                .await
+                .expect("a refused dispatch is a stop, not an error");
+            let ExecutionState::Stopped {
+                stop_type, message, ..
+            } = next
+            else {
+                panic!("expected a stop, got {next:?}");
+            };
+            assert_eq!(stop_type, StopType::PriceLimit);
+            assert!(message.contains("Price limit reached"), "{message}");
+
+            // The started compaction still gets exactly one terminal event.
+            let compaction_events = take_compaction_events(&mut events);
+            assert!(
+                matches!(
+                    compaction_events.last().map(|e| &e.kind),
+                    Some(AgentEventKind::CompactionFailed { .. })
+                ),
+                "{compaction_events:?}"
+            );
+            // Nothing was dispatched, so nothing was recorded or charged.
+            let t = totals(&exec_ctx).await;
+            assert_eq!(t.priced_attempts, 0);
+            assert_eq!(t.unresolved_attempts, 0);
+        }
     }
 }

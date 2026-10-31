@@ -1,10 +1,8 @@
 use crate::agent::utils::u32_from_usize;
 use crate::events::StopType;
 use crate::middleware::factory::MiddlewareFactory;
-use crate::middleware::{
-    AgentStats, ConversationContext, ExecutionState, MiddlewareDriver, Result,
-};
-use crate::model_info::{ModelInfoSource, get_model_info};
+use crate::middleware::{ConversationContext, ExecutionState, MiddlewareDriver, Result};
+use crate::model_info::{InvalidManualPricing, ModelInfoSource};
 use async_trait::async_trait;
 use log::{debug, trace};
 use parking_lot::Mutex;
@@ -100,7 +98,18 @@ pub struct LimitsMiddleware {
 }
 
 impl LimitsMiddleware {
+    /// Build the middleware, rejecting invalid manual pricing (a negative or
+    /// non-finite rate). Configuration entry points use this so a bad rate
+    /// fails validation instead of silently disabling budget valuation.
+    pub fn try_new(config: LimitsConfig) -> std::result::Result<Self, InvalidManualPricing> {
+        config.model_info_source.budget_pricing()?;
+        Ok(Self::new(config))
+    }
+
     pub fn new(config: LimitsConfig) -> Self {
+        if let Err(error) = config.model_info_source.budget_pricing() {
+            log::error!("LimitsMiddleware: {error}; manual budget valuation is disabled");
+        }
         debug!(
             "Creating LimitsMiddleware with max_steps={:?}, max_turns={:?}, max_price_usd={:?}",
             config.max_steps, config.max_turns, config.max_price_usd
@@ -109,36 +118,6 @@ impl LimitsMiddleware {
         Self {
             config,
             last_model: Mutex::new(None),
-        }
-    }
-
-    /// Calculate total cost for current context
-    fn total_cost(&self, stats: &AgentStats, context: &ConversationContext) -> Option<f64> {
-        // Reasoning tokens are billed at the output rate (no separate pricing).
-        let billable_output = stats.total_output_tokens + stats.reasoning_tokens;
-        match &self.config.model_info_source {
-            ModelInfoSource::FromSession => {
-                // Use ModelInfo.calculate_cost() method
-                get_model_info(&context.provider, &context.model)?
-                    .calculate_cost(stats.total_input_tokens, billable_output)
-            }
-            ModelInfoSource::Manual {
-                input_cost_per_million,
-                output_cost_per_million,
-                ..
-            } => {
-                let input = (*input_cost_per_million)?;
-                let output = (*output_cost_per_million)?;
-
-                // Use ModelPricing.calculate_cost() method
-                let pricing = ModelPricing {
-                    input: Some(input),
-                    output: Some(output),
-                    cache_read: None,
-                    cache_write: None,
-                };
-                pricing.calculate_cost(stats.total_input_tokens, billable_output)
-            }
         }
     }
 
@@ -201,17 +180,20 @@ impl MiddlewareDriver for LimitsMiddleware {
                     });
                 }
 
+                // Shared cycle-accounting check: this cycle's committed budget
+                // view (cache and auxiliary attempts included), never a
+                // revaluation of token counters. Prior cycles do not count.
                 if let Some(max_price) = self.config.max_price_usd
-                    && let Some(total_cost) = self.total_cost(&context.stats, context)
-                    && total_cost > max_price
+                    && context.stats.budget_cost_usd >= max_price
                 {
+                    let total_cost = context.stats.budget_cost_usd;
                     debug!(
-                        "LimitsMiddleware: stopping execution, cost ${:.4} > max ${}",
+                        "LimitsMiddleware: stopping execution, cost ${:.4} >= max ${}",
                         total_cost, max_price
                     );
                     return Ok(ExecutionState::Stopped {
                         message: format!(
-                            "Price limit exceeded: ${:.4} > ${:.2}",
+                            "Price limit reached: ${:.4} >= ${:.2}",
                             total_cost, max_price
                         )
                         .into(),
@@ -224,6 +206,17 @@ impl MiddlewareDriver for LimitsMiddleware {
             }
             _ => Ok(state),
         }
+    }
+
+    fn budget_pricing(&self) -> Option<ModelPricing> {
+        // Configuration entry points validate via `try_new`; a directly
+        // constructed middleware with an invalid rate yields no budget
+        // valuation (logged at construction) rather than a bogus price.
+        self.config
+            .model_info_source
+            .budget_pricing()
+            .ok()
+            .flatten()
     }
 
     fn reset(&self) {
@@ -429,17 +422,6 @@ impl PriceLimitMiddleware {
             output_cost_per_million,
         }
     }
-
-    fn total_cost(&self, stats: &AgentStats) -> f64 {
-        // Reasoning tokens are billed at the output rate (no separate pricing).
-        let billable_output = stats.total_output_tokens + stats.reasoning_tokens;
-        let input_cost =
-            (stats.total_input_tokens as f64 / 1_000_000.0) * self.input_cost_per_million;
-        let output_cost = (billable_output as f64 / 1_000_000.0) * self.output_cost_per_million;
-        let total = input_cost + output_cost;
-        trace!("PriceLimitMiddleware: total cost = ${:.4}", total);
-        total
-    }
 }
 
 #[async_trait]
@@ -456,16 +438,16 @@ impl MiddlewareDriver for PriceLimitMiddleware {
 
         match state {
             ExecutionState::BeforeLlmCall { ref context } => {
-                let total_cost = self.total_cost(&context.stats);
+                let total_cost = context.stats.budget_cost_usd;
 
-                if total_cost > self.max_cost {
+                if total_cost >= self.max_cost {
                     debug!(
-                        "PriceLimitMiddleware: stopping execution, cost ${:.4} > max ${}",
+                        "PriceLimitMiddleware: stopping execution, cost ${:.4} >= max ${}",
                         total_cost, self.max_cost
                     );
                     Ok(ExecutionState::Stopped {
                         message: format!(
-                            "Price limit exceeded: ${:.4} > ${:.2}",
+                            "Price limit reached: ${:.4} >= ${:.2}",
                             total_cost, self.max_cost
                         )
                         .into(),
@@ -474,7 +456,7 @@ impl MiddlewareDriver for PriceLimitMiddleware {
                     })
                 } else {
                     trace!(
-                        "PriceLimitMiddleware: cost ${:.4} <= max ${}, allowing execution",
+                        "PriceLimitMiddleware: cost ${:.4} < max ${}, allowing execution",
                         total_cost, self.max_cost
                     );
                     Ok(state)
@@ -488,6 +470,17 @@ impl MiddlewareDriver for PriceLimitMiddleware {
                 Ok(state)
             }
         }
+    }
+
+    fn budget_pricing(&self) -> Option<ModelPricing> {
+        // The configured rates are the manual budget valuation, snapshotted
+        // onto each attempt. Cache rates stay unset, never inferred.
+        Some(ModelPricing {
+            input: Some(self.input_cost_per_million),
+            output: Some(self.output_cost_per_million),
+            source: Some(querymt::providers::PricingSource::Manual),
+            ..Default::default()
+        })
     }
 
     fn reset(&self) {
@@ -513,6 +506,129 @@ mod tests {
     use crate::middleware::{AgentStats, ConversationContext};
     use std::sync::Arc;
 
+    #[test]
+    fn try_new_rejects_invalid_manual_rates() {
+        let bad = LimitsConfig::default()
+            .model_info_source(ModelInfoSource::manual().cache_pricing(Some(-1.0), None, None));
+        let err = LimitsMiddleware::try_new(bad).err().expect("rejected");
+        assert_eq!(err.field, "cache_read_cost_per_million");
+    }
+
+    #[test]
+    fn middleware_exposes_manual_budget_pricing_to_the_driver_chain() {
+        let config = LimitsConfig::default().model_info_source(
+            ModelInfoSource::manual().pricing(3.0, 15.0).cache_pricing(
+                Some(0.3),
+                Some(3.75),
+                Some(6.0),
+            ),
+        );
+        let driver: Arc<dyn MiddlewareDriver> =
+            Arc::new(LimitsMiddleware::try_new(config).unwrap());
+        let pricing = crate::middleware::CompositeDriver::new(vec![driver])
+            .budget_pricing()
+            .expect("budget pricing");
+        assert_eq!(pricing.cache_write_1h, Some(6.0));
+
+        let none: Arc<dyn MiddlewareDriver> =
+            Arc::new(LimitsMiddleware::new(LimitsConfig::default()));
+        assert!(
+            crate::middleware::CompositeDriver::new(vec![none])
+                .budget_pricing()
+                .is_none()
+        );
+    }
+
+    async fn factory_agent_config() -> (crate::agent::agent_config::AgentConfig, tempfile::TempDir)
+    {
+        use crate::agent::agent_config_builder::AgentConfigBuilder;
+        use crate::session::sqlite_storage::SqliteStorage;
+        use crate::test_utils::helpers::empty_plugin_registry;
+        let (registry, temp_dir) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let llm = querymt::LLMParams::new().provider("mock").model("mock");
+        (
+            AgentConfigBuilder::new(Arc::new(registry), storage, llm).build(),
+            temp_dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn factory_parses_manual_rates_into_budget_pricing() {
+        let (agent_config, _td) = factory_agent_config().await;
+        let driver = LimitsFactory
+            .create(
+                &serde_json::json!({
+                    "max_price_usd": 1.0,
+                    "input_cost_per_million": 3.0,
+                    "output_cost_per_million": 15.0,
+                    "cache_read_cost_per_million": 0.3,
+                    "cache_write_cost_per_million": 3.75,
+                    "cache_write_1h_cost_per_million": 6.0,
+                }),
+                &agent_config,
+            )
+            .unwrap();
+        let p = driver.budget_pricing().expect("budget pricing");
+        assert_eq!(
+            (
+                p.input,
+                p.output,
+                p.cache_read,
+                p.cache_write,
+                p.cache_write_1h
+            ),
+            (Some(3.0), Some(15.0), Some(0.3), Some(3.75), Some(6.0))
+        );
+    }
+
+    /// The `limits` example in `docs/docs/agent/middleware.md` must parse.
+    #[tokio::test]
+    async fn documented_price_limit_example_parses() {
+        let docs = include_str!("../../../../docs/docs/agent/middleware.md");
+        let start = docs
+            .find("#### Price limits")
+            .expect("price limits section");
+        let block = docs[start..]
+            .split("```toml")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("toml example");
+        let value: toml::Value = toml::from_str(block).expect("example is valid TOML");
+        let entry = value["middleware"][0].clone();
+        assert_eq!(entry["type"].as_str(), Some("limits"));
+        let json = serde_json::to_value(&entry).unwrap();
+
+        let (agent_config, _td) = factory_agent_config().await;
+        let driver = LimitsFactory.create(&json, &agent_config).unwrap();
+        let p = driver.budget_pricing().expect("budget pricing");
+        assert_eq!(
+            (p.cache_read, p.cache_write, p.cache_write_1h),
+            (Some(0.3), Some(3.75), Some(6.0))
+        );
+        assert_eq!(driver.get_limits().and_then(|l| l.max_cost_usd), Some(1.0));
+    }
+
+    #[tokio::test]
+    async fn factory_without_manual_rates_has_no_budget_pricing() {
+        let (agent_config, _td) = factory_agent_config().await;
+        let driver = LimitsFactory
+            .create(&serde_json::json!({"max_steps": 5}), &agent_config)
+            .unwrap();
+        assert!(driver.budget_pricing().is_none());
+    }
+
+    #[tokio::test]
+    async fn factory_rejects_invalid_manual_rates() {
+        let (agent_config, _td) = factory_agent_config().await;
+        let result = LimitsFactory.create(
+            &serde_json::json!({"cache_write_cost_per_million": -2.0}),
+            &agent_config,
+        );
+        let error = result.err().expect("negative rate must be rejected");
+        assert!(error.to_string().contains("cache_write_cost_per_million"));
+    }
+
     #[tokio::test]
     async fn test_max_steps_stop() {
         let middleware = MaxStepsMiddleware::new(5);
@@ -528,6 +644,9 @@ mod tests {
             provider: "mock".into(),
             model: "mock-model".into(),
             session_mode: crate::agent::core::AgentMode::Build,
+            request_overrides: Default::default(),
+            profile: Default::default(),
+            last_applied: Default::default(),
         });
 
         let state = ExecutionState::BeforeLlmCall { context };
@@ -557,6 +676,9 @@ mod tests {
             provider: "mock".into(),
             model: "mock-model".into(),
             session_mode: crate::agent::core::AgentMode::Build,
+            request_overrides: Default::default(),
+            profile: Default::default(),
+            last_applied: Default::default(),
         });
 
         let state = ExecutionState::BeforeLlmCall { context };
@@ -579,6 +701,15 @@ pub struct LimitsFactory;
 /// max_steps = 100    # Total LLM API calls (including tool use)
 /// max_turns = 20     # User/Assistant message pairs
 /// max_price_usd = 1.0
+///
+/// # Optional manual budget rates (USD per million tokens). Valued separately
+/// # from reported API spend; unset cache rates stay unset (never defaulted to
+/// # the input rate), so used-but-unpriced cache categories are partial.
+/// input_cost_per_million = 3.0
+/// output_cost_per_million = 15.0
+/// cache_read_cost_per_million = 0.3
+/// cache_write_cost_per_million = 3.75
+/// cache_write_1h_cost_per_million = 6.0
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -590,6 +721,25 @@ struct LimitsFactoryConfig {
     max_turns: Option<usize>,
     /// Maximum total cost in USD
     max_price_usd: Option<f64>,
+    input_cost_per_million: Option<f64>,
+    output_cost_per_million: Option<f64>,
+    cache_read_cost_per_million: Option<f64>,
+    cache_write_cost_per_million: Option<f64>,
+    cache_write_1h_cost_per_million: Option<f64>,
+}
+
+impl LimitsFactoryConfig {
+    fn has_manual_rates(&self) -> bool {
+        [
+            self.input_cost_per_million,
+            self.output_cost_per_million,
+            self.cache_read_cost_per_million,
+            self.cache_write_cost_per_million,
+            self.cache_write_1h_cost_per_million,
+        ]
+        .iter()
+        .any(Option::is_some)
+    }
 }
 
 impl Default for LimitsFactoryConfig {
@@ -599,6 +749,11 @@ impl Default for LimitsFactoryConfig {
             max_steps: None,
             max_turns: None,
             max_price_usd: None,
+            input_cost_per_million: None,
+            output_cost_per_million: None,
+            cache_read_cost_per_million: None,
+            cache_write_cost_per_million: None,
+            cache_write_1h_cost_per_million: None,
         }
     }
 }
@@ -633,6 +788,25 @@ impl MiddlewareFactory for LimitsFactory {
             limits_config = limits_config.max_price_usd(max_price_usd);
         }
 
-        Ok(Arc::new(LimitsMiddleware::new(limits_config)))
+        if cfg.has_manual_rates() {
+            let mut source = ModelInfoSource::manual().cache_pricing(
+                cfg.cache_read_cost_per_million,
+                cfg.cache_write_cost_per_million,
+                cfg.cache_write_1h_cost_per_million,
+            );
+            if let ModelInfoSource::Manual {
+                ref mut input_cost_per_million,
+                ref mut output_cost_per_million,
+                ..
+            } = source
+            {
+                *input_cost_per_million = cfg.input_cost_per_million;
+                *output_cost_per_million = cfg.output_cost_per_million;
+            }
+            limits_config = limits_config.model_info_source(source);
+        }
+
+        // Invalid (negative / non-finite) manual rates fail validation.
+        Ok(Arc::new(LimitsMiddleware::try_new(limits_config)?))
     }
 }

@@ -16,7 +16,13 @@ impl LocalAgentHandle {
         let statuses = self
             .oauth_service
             .auth_status(parsed.provider.as_deref())
-            .await;
+            .await
+            .map_err(|error| {
+                Error::internal_error().data(serde_json::json!({
+                    "message": "Failed to read auth status",
+                    "detail": error,
+                }))
+            })?;
         ext_json_response(&serde_json::json!({ "providers": statuses }))
     }
 

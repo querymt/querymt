@@ -23,14 +23,13 @@ pub(crate) mod fixtures {
     use kameo::actor::{ActorRef, Spawn};
     use querymt::LLMParams;
     use querymt::LLMProvider;
-    use querymt::chat::{ChatMessage, ChatOutput, FinishReason, StreamChunk, Tool};
+    use querymt::chat::{ChatOutput, FinishReason, StreamChunk};
     use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
     use querymt::embedding::EmbeddingProvider;
     use querymt::error::LLMError;
     use querymt::plugin::host::PluginRegistry;
     use querymt_remote::ProviderHostActor;
     use std::path::PathBuf;
-    use std::pin::Pin;
     use std::sync::{Arc, OnceLock};
     use tempfile::TempDir;
     use tokio::sync::{Mutex, OnceCell};
@@ -124,8 +123,10 @@ pub(crate) mod fixtures {
                                 directory:
                                     querymt_remote::mesh_runtime_config::DirectoryMode::default(),
                             }),
-                            iroh_enabled: false,
-                            iroh_gso: true,
+                            // Admission tests need identity-scoped invite and membership stores.
+                            iroh_enabled: true,
+                            iroh_gso: false,
+                            iroh_dns: None,
                             iroh_scopes: Vec::new(),
                             identity_file: Some(identity_path),
                             request_timeout: std::time::Duration::from_secs(300),
@@ -242,11 +243,7 @@ pub(crate) mod fixtures {
 
     #[async_trait::async_trait]
     impl querymt::chat::ChatProvider for MockLLMProvider {
-        async fn chat_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<ChatOutput, LLMError> {
+        async fn chat(&self, _call: &querymt::chat::ChatCall<'_>) -> Result<ChatOutput, LLMError> {
             let mut count = self.call_count.lock().await;
             *count += 1;
             Ok(MockChatResp {
@@ -256,14 +253,10 @@ pub(crate) mod fixtures {
             .into())
         }
 
-        async fn chat_stream_with_tools(
+        async fn chat_stream(
             &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<
-            Pin<Box<dyn futures_util::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
-            LLMError,
-        > {
+            _call: &querymt::chat::ChatCall<'_>,
+        ) -> Result<querymt::chat::ChatStream, LLMError> {
             use futures_util::stream;
             let text = self.response_text.clone();
             let chunks = vec![
@@ -333,6 +326,7 @@ pub(crate) mod fixtures {
     /// ```
     pub struct NodeManagerFixture {
         pub actor_ref: ActorRef<RemoteNodeManager>,
+        pub registry: Arc<Mutex<SessionRegistry>>,
         pub config: Arc<AgentConfig>,
         pub _tempdir: TempDir,
     }
@@ -344,13 +338,14 @@ pub(crate) mod fixtures {
             let registry = Arc::new(Mutex::new(SessionRegistry::new(f.config.clone())));
             let nm = RemoteNodeManager::new(
                 f.config.clone(),
-                registry,
+                registry.clone(),
                 None,
                 Arc::new(parking_lot::Mutex::new(None)),
             );
             let actor_ref = RemoteNodeManager::spawn(nm);
             Self {
                 actor_ref,
+                registry,
                 config: f.config,
                 _tempdir: f._tempdir,
             }
@@ -364,13 +359,14 @@ pub(crate) mod fixtures {
             registry.lock().await.set_mesh(Some(mesh.clone()));
             let nm = RemoteNodeManager::new(
                 f.config.clone(),
-                registry,
+                registry.clone(),
                 Some(mesh.clone()),
                 Arc::new(parking_lot::Mutex::new(None)),
             );
             let actor_ref = RemoteNodeManager::spawn(nm);
             Self {
                 actor_ref,
+                registry,
                 config: f.config,
                 _tempdir: f._tempdir,
             }

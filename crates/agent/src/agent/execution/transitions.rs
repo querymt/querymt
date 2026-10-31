@@ -6,7 +6,8 @@
 //! - AfterLlm → ProcessingToolCalls or Complete (response handling)
 //! - ProcessingToolCalls → BeforeLlmCall or WaitingForEvent (parallel tool execution)
 
-use crate::acp::client_bridge::ClientBridgeSender;
+use super::tool_calls::{Disposition, PreparedCall};
+use super::wave_plan::{CallInfo, plan_waves, serialized_call_count};
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::session_actor::ensure_pre_turn_snapshot_ready;
@@ -16,8 +17,9 @@ use crate::events::{
     reasoning_summary_part_id,
 };
 use crate::middleware::{
-    ExecutionState, LlmResponse, PreparedModelRequest, ToolCall as MiddlewareToolCall,
-    ToolFunction, ToolResult, calculate_context_tokens,
+    CompositeDriver, ExecutionState, LlmResponse, PreparedBatch, PreparedCallVerdict,
+    PreparedModelRequest, PreparedToolCall, ToolCall as MiddlewareToolCall, ToolFunction,
+    ToolResult, apply_usage_to_stats, calculate_context_tokens,
 };
 use crate::model::{AgentMessage, MessagePart};
 use anyhow::Context as _;
@@ -27,9 +29,9 @@ use futures_util::future::join_all;
 use log::{debug, trace, warn};
 use querymt::ToolCall;
 use querymt::chat::{
-    CacheHint, ChatMessage, ChatMessagePartDelta, ChatOutput, ChatOutputItem, ChatOutputStatus,
-    ChatRole, ChatStreamAccumulator, ChatStreamAccumulatorError, ChatStreamFinish, FinishReason,
-    ReasoningPartKind, StreamChunk, StructuredStreamEvent,
+    CacheHint, ChatCall, ChatMessage, ChatMessagePartDelta, ChatOutput, ChatOutputItem,
+    ChatOutputStatus, ChatRole, ChatStreamAccumulator, ChatStreamAccumulatorError,
+    ChatStreamFinish, FinishReason, ReasoningPartKind, StreamChunk, StructuredStreamEvent,
 };
 use querymt::error::LLMError;
 use querymt::error::{ProviderErrorKind, ProviderFailure};
@@ -72,6 +74,7 @@ pub(super) async fn transition_before_llm_call(
     let provider = match super::llm_retry::call_with_retry(
         config,
         &exec_ctx.session_id,
+        "provider_init",
         &exec_ctx.cancellation_token,
         || {
             let session_handle = exec_ctx.session_handle.clone();
@@ -97,15 +100,38 @@ pub(super) async fn transition_before_llm_call(
         }
     };
 
-    let tools = config.collect_tools(
-        provider,
-        Some(exec_ctx.runtime.as_ref()),
-        Some(&exec_ctx.tool_config),
-    );
+    // A failed eager initialization may have left the turn with an empty profile.
+    // Provider retries must refresh it before request options are filtered.
+    let context = if context.profile.capabilities != provider.capabilities() {
+        Arc::new(
+            (**context)
+                .clone()
+                .with_profile(exec_ctx.session_handle.profile().await),
+        )
+    } else {
+        context.clone()
+    };
 
-    let tools_json =
-        serde_json::to_vec(&tools).context("Failed to serialize tools for hash computation")?;
-    let new_hash = crate::hash::RapidHash::new(&tools_json);
+    let collect_span = info_span!(
+        "agent.tools.collect",
+        tool_count = tracing::field::Empty,
+        tools_bytes = tracing::field::Empty
+    );
+    let (tools, tools_json, new_hash) = {
+        // Synchronous block: the guard never crosses an await.
+        let _guard = collect_span.enter();
+        let tools = config.collect_tools(
+            provider,
+            Some(exec_ctx.runtime.as_ref()),
+            Some(&exec_ctx.tool_config),
+        );
+        let tools_json =
+            serde_json::to_vec(&tools).context("Failed to serialize tools for hash computation")?;
+        let new_hash = crate::hash::RapidHash::new(&tools_json);
+        collect_span.record("tool_count", tools.len() as u64);
+        collect_span.record("tools_bytes", tools_json.len() as u64);
+        (tools, tools_json, new_hash)
+    };
 
     let current_hash = exec_ctx.runtime.mcp_tool_state.load().tools_hash;
     let changed = current_hash.is_none_or(|h| h != new_hash);
@@ -140,6 +166,11 @@ pub(super) async fn transition_before_llm_call(
         .and_then(|info| info.limits.context)
         .unwrap_or(u32::MAX as u64)
         .min(u32::MAX as u64) as u32;
+    let hook_span = info_span!(
+        "agent.hooks.context",
+        trigger,
+        message_count = messages.len() as u64
+    );
     let hook_result = config
         .hooks
         .run_context(crate::hooks::ContextHookRequest {
@@ -153,6 +184,7 @@ pub(super) async fn transition_before_llm_call(
             context_window,
             messages,
         })
+        .instrument(hook_span)
         .await?;
     for notice in hook_result.notices {
         config.emit_event(
@@ -165,6 +197,20 @@ pub(super) async fn transition_before_llm_call(
         );
     }
     messages = hook_result.messages.unwrap_or_default();
+    // Providers reject a tool call without its result. Reaching this point
+    // with one is a bug upstream; answer it so the run survives, and make it loud.
+    let unanswered = crate::model::answer_unanswered_tool_calls(&mut messages);
+    if !unanswered.is_empty() {
+        log::error!(
+            "Session {}: request had unanswered tool call(s) {:?}; answered them as cancelled",
+            exec_ctx.session_id,
+            unanswered
+        );
+        debug_assert!(
+            unanswered.is_empty(),
+            "request had unanswered tool calls: {unanswered:?}"
+        );
+    }
     // Tool definitions are model input; reuse the serialization already used for their hash.
     let tool_tokens = if tools.is_empty() {
         0
@@ -173,7 +219,7 @@ pub(super) async fn transition_before_llm_call(
     };
     validate_tool_context_budget(tool_tokens, context_window)?;
     let estimated_tokens = hook_result.estimated_tokens.saturating_add(tool_tokens);
-    if estimated_tokens > context_window as usize {
+    if estimated_tokens >= context_window as usize {
         return Ok(ExecutionState::Stopped {
             message: format!(
                 "Prepared request is approximately {} tokens, exceeding the {} token context window",
@@ -184,13 +230,25 @@ pub(super) async fn transition_before_llm_call(
             context: Some(context.clone()),
         });
     }
-    let messages = apply_cache_breakpoints(&messages);
+    // Clones the whole history, so its cost grows with the conversation.
+    let messages = info_span!(
+        "agent.request.cache_breakpoints",
+        message_count = messages.len() as u64
+    )
+    .in_scope(|| apply_cache_breakpoints(&messages));
+    // Re-evaluate room after history, steering, tools, and context hooks are prepared.
+    let mut options = context.request_overrides;
+    if let Some(cap) = options.max_tokens {
+        let room = context_window.saturating_sub(estimated_tokens as u32);
+        options.max_tokens = Some(cap.min(room));
+    }
     Ok(ExecutionState::CallLlm {
         context: context.clone(),
         request: Arc::new(PreparedModelRequest {
             messages: Arc::from(messages.into_boxed_slice()),
             tools: Arc::from(tools.into_boxed_slice()),
             estimated_tokens,
+            options,
         }),
     })
 }
@@ -239,6 +297,55 @@ fn contextualize_llm_error(
 /// Map a failed LLM setup/call into either `Cancelled` or a contextualized error.
 ///
 /// Cancel must never bubble as `Err`; it is an execution state, not a provider failure.
+fn accounting_failure(error: crate::accounting::AccountingError) -> anyhow::Error {
+    anyhow::anyhow!("accounting failure: {error}")
+}
+
+/// The logical accounting operation for one main model request. Its retries
+/// are separate attempts. Failing to open accounting is an execution error:
+/// no paid request may be sent without a ledger.
+async fn main_attempt_operation(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+) -> Result<crate::accounting::AttemptOperation, anyhow::Error> {
+    let cycle = exec_ctx
+        .cycle_accounting(&config.event_sink)
+        .await
+        .map_err(|error| anyhow::anyhow!("accounting unavailable: {error}"))?;
+    let recorder = Arc::new(crate::accounting::AttemptRecorder::with_projection(
+        config.event_sink.session_stream(&exec_ctx.session_id),
+        cycle.session_accounting().clone(),
+    ));
+    let (provider, model) = exec_ctx
+        .llm_config()
+        .map(|c| (c.provider.clone(), c.model.clone()))
+        .unwrap_or_default();
+    Ok(crate::accounting::AttemptOperation::new(
+        recorder,
+        cycle,
+        crate::accounting::AttemptPurpose::MainResponse,
+        provider,
+        model,
+    )
+    .with_budget_pricing(config.budget_pricing())
+    .with_budget_cap(config.budget_cap_usd()))
+}
+
+/// A paid dispatch the cycle budget gate refused ends the cycle as a
+/// price-limit stop, not an execution failure. Nothing was sent.
+fn budget_stop(
+    operation: &crate::accounting::AttemptOperation,
+    context: &Arc<crate::middleware::ConversationContext>,
+) -> Option<ExecutionState> {
+    operation
+        .budget_refusal()
+        .map(|(cap, spent)| ExecutionState::Stopped {
+            message: format!("Price limit reached: ${spent:.4} >= ${cap:.2}").into(),
+            stop_type: StopType::PriceLimit,
+            context: Some(context.clone()),
+        })
+}
+
 fn map_failed_llm_call(
     error: LLMError,
     streaming: bool,
@@ -269,6 +376,44 @@ fn validate_stream_terminal(
     }
 
     Ok(finish_reason)
+}
+
+/// Result text for a tool call that was not executed because the reply was incomplete.
+///
+/// A length cut-off tells the model how to avoid it next time; any other
+/// incomplete cause keeps the generic wording.
+fn skipped_call_text(finish_reason: Option<FinishReason>, detail: &str) -> String {
+    match finish_reason {
+        Some(FinishReason::Length) => {
+            "Error: tool call skipped because the response was truncated \
+by the output token limit; split the write into smaller calls."
+                .to_string()
+        }
+        _ => format!("Error: tool call skipped because the response was incomplete. {detail}"),
+    }
+}
+
+/// Persist synthesized tool results, then stop the run on the output token limit.
+///
+/// A length cut-off must end in `Stopped` (so stop recovery can act on it), but
+/// the skipped results still have to be stored to keep the
+/// tool_use/tool_result history invariant.
+async fn store_results_then_stop_on_length(
+    config: &AgentConfig,
+    results: Arc<[ToolResult]>,
+    context: Arc<crate::middleware::ConversationContext>,
+    exec_ctx: &mut ExecutionContext,
+) -> Result<ExecutionState, anyhow::Error> {
+    let next =
+        super::tool_calls::store_all_tool_results(config, &results, &context, exec_ctx).await?;
+    Ok(match next {
+        ExecutionState::BeforeLlmCall { context } => ExecutionState::Stopped {
+            message: "Model hit token limit".into(),
+            stop_type: StopType::ModelTokenLimit,
+            context: Some(context),
+        },
+        other => other,
+    })
 }
 
 /// Wrap an accumulator violation as a transient provider stream failure.
@@ -509,6 +654,30 @@ fn dedupe_tool_calls_by_call_id(calls: Vec<ToolCall>) -> Vec<ToolCall> {
         .collect()
 }
 
+/// Executable calls of a canonical output, deduplicated by call identity.
+///
+/// Provider invalid-input markers live on the canonical function-call items and
+/// would be lost in the projection to `querymt::ToolCall`, so they are read from
+/// the items here and carried explicitly on the middleware call.
+fn middleware_calls_from_output(output: &ChatOutput) -> Vec<MiddlewareToolCall> {
+    let marked_invalid: std::collections::HashSet<&str> = output
+        .function_calls()
+        .filter(|call| call.is_marked_invalid())
+        .map(|call| call.call_id.as_str())
+        .collect();
+    dedupe_tool_calls_by_call_id(output.tool_calls().unwrap_or_default())
+        .into_iter()
+        .map(|tc| MiddlewareToolCall {
+            invalid_input: marked_invalid.contains(tc.id.as_str()),
+            id: tc.id,
+            function: ToolFunction {
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+            },
+        })
+        .collect()
+}
+
 /// Split function calls into executable calls and synthesized error results.
 ///
 /// Local execution is gated on response validation: a call executes only when
@@ -530,26 +699,15 @@ fn gate_function_calls_for_execution(
             );
             continue;
         }
-        let valid_arguments = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-            .map(|value| value.is_object())
-            .unwrap_or(false);
-        if valid_arguments {
-            executable.push(call.clone());
-        } else {
+        if super::tool_calls::has_invalid_input(call) {
+            // Log the call identity only, never the raw arguments.
             warn!(
-                "Gating tool call {} ({}): arguments are not a JSON object",
+                "Gating tool call {} ({}): invalid input (provider-marked, malformed or not a JSON object)",
                 call.id, call.function.name
             );
-            gated_results.push(ToolResult::new(
-                call.id.clone(),
-                vec![querymt::chat::ToolResultPart::Text {
-                    text: "Error: function call arguments are not a valid JSON object; the call was not executed."
-                        .to_string(),
-                }],
-                true,
-                Some(call.function.name.clone()),
-                Some(call.function.arguments.clone()),
-            ));
+            gated_results.push(super::tool_calls::invalid_input_result(call));
+        } else {
+            executable.push(call.clone());
         }
     }
     (executable, gated_results)
@@ -603,6 +761,19 @@ pub(super) async fn transition_call_llm(
         return Ok(ExecutionState::Cancelled);
     }
 
+    // Overrides last for exactly this request. Options the provider does not
+    // honour are dropped (and logged); `applied` records what was really sent.
+    let options = context
+        .profile
+        .capabilities
+        .options
+        .retain_supported(request.options);
+    if options != request.options {
+        debug!(
+            "provider does not honour some per-request generation options; skipping them (requested={:?}, applied={:?})",
+            request.options, options
+        );
+    }
     config.emit_event(
         session_id,
         AgentEventKind::LlmRequestStart {
@@ -616,6 +787,15 @@ pub(super) async fn transition_call_llm(
 
     let session_handle = &exec_ctx.session_handle;
     let messages_with_cache = request_messages;
+    // Recorded on every exit path (success, error, cancel) when dropped.
+    let chat_timer = crate::agent::utils::llm_metrics::ChatTimer::start(
+        genai::provider_name(&context.provider),
+        &context.model,
+        &exec_ctx.cancellation_token,
+    );
+    let operation = main_attempt_operation(config, exec_ctx)
+        .instrument(info_span!("agent.accounting.open"))
+        .await?;
 
     // Pre-allocated message_id for streaming path so that delta events and the
     // final AssistantMessageStored share the same ID.
@@ -630,30 +810,44 @@ pub(super) async fn transition_call_llm(
         match super::llm_retry::call_with_retry(
             config,
             session_id,
+            "chat",
             &exec_ctx.cancellation_token,
             || {
                 let messages_with_cache = &messages_with_cache;
                 let cancel = cancel.clone();
+                let operation = &operation;
                 async move {
-                    tokio::select! {
-                        result = session_handle.submit_request(messages_with_cache) => {
-                            result
-                        }
-                        _ = cancel.cancelled() => {
-                            Err(querymt::error::LLMError::Cancelled)
-                        }
-                    }
+                    // Provider resolution is local: a failure here is not a
+                    // paid attempt. Billing is bound once it is resolved.
+                    let provider = tokio::select! {
+                        result = session_handle.provider() => result.map_err(LLMError::from)?,
+                        _ = cancel.cancelled() => return Err(LLMError::Cancelled),
+                    };
+                    // Per-request options the provider does not honour are dropped.
+                    let options =
+                        crate::session::provider::supported_overrides(provider.as_ref(), options);
+                    let call = ChatCall::new(messages_with_cache).options(options);
+                    crate::accounting::run_attempt(
+                        operation,
+                        session_handle.billing_basis(),
+                        &cancel,
+                        || provider.chat(&call),
+                    )
+                    .await
                 }
             },
         )
         .await
         {
             Ok(resp) => {
-                session_handle.record_generation_settings(&chat_span);
+                session_handle.record_generation_settings(&chat_span, options);
                 resp
             }
             Err(e) => {
-                session_handle.record_generation_settings(&chat_span);
+                session_handle.record_generation_settings(&chat_span, options);
+                if let Some(stop) = budget_stop(&operation, context) {
+                    return Ok(stop);
+                }
                 return map_failed_llm_call(e, false, context);
             }
         }
@@ -661,6 +855,7 @@ pub(super) async fn transition_call_llm(
         let provider = match super::llm_retry::call_with_retry(
             config,
             session_id,
+            "provider_init",
             &exec_ctx.cancellation_token,
             || {
                 let cancel = exec_ctx.cancellation_token.clone();
@@ -685,8 +880,8 @@ pub(super) async fn transition_call_llm(
             }
         };
 
-        session_handle.record_generation_settings(&chat_span);
-        if provider.supports_streaming() {
+        session_handle.record_generation_settings(&chat_span, options);
+        if provider.capabilities().streaming {
             tracing::Span::current().record("gen_ai.request.stream", true);
             // === STREAMING PATH (all capable providers) ===
             let message_id = Uuid::new_v4().to_string();
@@ -777,7 +972,7 @@ pub(super) async fn transition_call_llm(
                 max_stream_retries,
                 config.execution_policy.rate_limit.max_attempts(),
             );
-            let mut first_chunk = genai::FirstChunk::default();
+            let mut timing = genai::StreamTiming::default();
             let streamed_output: ChatOutput = 'stream: loop {
                 let mut semantic_output_seen = false;
 
@@ -810,16 +1005,48 @@ pub(super) async fn transition_call_llm(
                     return Ok(ExecutionState::Cancelled);
                 }
 
-                first_chunk.start();
-                let mut stream = match provider
-                    .chat_stream_with_tools(messages_with_cache, Some(tools.as_ref()))
+                // Durable start before the request is sent; a failure here
+                // means nothing was dispatched.
+                let mut attempt = match operation
+                    .begin(
+                        crate::accounting::DispatchMode::Streaming,
+                        session_handle.billing_basis(),
+                    )
                     .await
                 {
-                    Ok(stream) => stream,
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        if let Some(stop) = budget_stop(&operation, context) {
+                            return Ok(stop);
+                        }
+                        return Err(accounting_failure(error));
+                    }
+                };
+                let mut response_started = false;
+
+                timing.start();
+                let mut stream = match provider
+                    .chat_stream(
+                        &ChatCall::new(messages_with_cache)
+                            .tools(tools.as_ref())
+                            .options(options),
+                    )
+                    .await
+                {
+                    Ok(stream) => {
+                        timing.headers_received(&chat_span);
+                        stream
+                    }
                     Err(error) => match super::llm_retry::handle_stream_failure(
                         config,
                         session_id,
-                        error,
+                        {
+                            attempt
+                                .settle_error(&error, false, None)
+                                .await
+                                .map_err(accounting_failure)?;
+                            error
+                        },
                         &mut retry_budget,
                         false,
                         Some(message_id.clone()),
@@ -839,11 +1066,13 @@ pub(super) async fn transition_call_llm(
 
                 // ── Inner consume loop ───────────────────────────────────────
                 loop {
+                    timing.wait_begin();
                     let item = super::llm_retry::next_stream_chunk(
                         &mut stream,
                         &exec_ctx.cancellation_token,
                     )
                     .await;
+                    timing.wait_end();
 
                     let chunk = match item {
                         Ok(chunk) => chunk,
@@ -871,7 +1100,17 @@ pub(super) async fn transition_call_llm(
                         Err(error) => match super::llm_retry::handle_stream_failure(
                             config,
                             session_id,
-                            error,
+                            {
+                                attempt
+                                    .settle_error(
+                                        &error,
+                                        response_started,
+                                        accumulator.output().usage,
+                                    )
+                                    .await
+                                    .map_err(accounting_failure)?;
+                                error
+                            },
                             &mut retry_budget,
                             semantic_output_seen,
                             Some(message_id.clone()),
@@ -889,7 +1128,8 @@ pub(super) async fn transition_call_llm(
                         },
                     };
 
-                    first_chunk.received(&chat_span);
+                    timing.chunk_received(&chat_span, genai::chunk_commits_output(&chunk));
+                    response_started = true;
                     semantic_output_seen |= super::llm_retry::stream_chunk_commits_output(&chunk);
 
                     // Canonical accumulation. Accumulator violations are provider
@@ -902,7 +1142,14 @@ pub(super) async fn transition_call_llm(
                         match super::llm_retry::handle_stream_failure(
                             config,
                             session_id,
-                            stream_accumulation_error(error),
+                            {
+                                let error = stream_accumulation_error(error);
+                                attempt
+                                    .settle_error(&error, true, accumulator.output().usage)
+                                    .await
+                                    .map_err(accounting_failure)?;
+                                error
+                            },
                             &mut retry_budget,
                             semantic_output_seen,
                             Some(message_id.clone()),
@@ -963,6 +1210,14 @@ pub(super) async fn transition_call_llm(
                                     drain_trailing_usage(&mut stream, &exec_ctx.cancellation_token)
                                         .await;
                                 if exec_ctx.cancellation_token.is_cancelled() {
+                                    let partial = crate::accounting::merge_usage(
+                                        accumulator.output().usage,
+                                        drained_usage.take(),
+                                    );
+                                    attempt
+                                        .settle_error(&LLMError::Cancelled, true, partial)
+                                        .await
+                                        .map_err(accounting_failure)?;
                                     return Ok(ExecutionState::Cancelled);
                                 }
                                 break;
@@ -1004,6 +1259,15 @@ pub(super) async fn transition_call_llm(
                             );
                             let _ = signature;
                         }
+                        StreamChunk::RedactedThinking(data) => {
+                            // Opaque provider state: no UI output, never logged.
+                            trace!(
+                                "stream chunk: session={} message_id={} type=redacted_thinking len={}",
+                                session_id,
+                                message_id,
+                                data.len()
+                            );
+                        }
                         StreamChunk::ToolUseComplete { tool_call, .. } => {
                             // Flush before tool use so UI sees final text before tool starts
                             trace!(
@@ -1013,6 +1277,8 @@ pub(super) async fn transition_call_llm(
                             flush_buffers!(true);
                         }
                         StreamChunk::Usage(u) => {
+                            // Keep streamed usage so an abandoned attempt settles with it.
+                            attempt.observe_usage(Some(u.clone()));
                             trace!(
                                 "stream chunk: session={} message_id={} type=usage input={} output={} reasoning={}",
                                 session_id,
@@ -1041,6 +1307,14 @@ pub(super) async fn transition_call_llm(
                                     drain_trailing_usage(&mut stream, &exec_ctx.cancellation_token)
                                         .await;
                                 if exec_ctx.cancellation_token.is_cancelled() {
+                                    let partial = crate::accounting::merge_usage(
+                                        accumulator.output().usage,
+                                        drained_usage.take(),
+                                    );
+                                    attempt
+                                        .settle_error(&LLMError::Cancelled, true, partial)
+                                        .await
+                                        .map_err(accounting_failure)?;
                                     return Ok(ExecutionState::Cancelled);
                                 }
 
@@ -1052,7 +1326,17 @@ pub(super) async fn transition_call_llm(
                                     match super::llm_retry::handle_stream_failure(
                                         config,
                                         session_id,
-                                        error,
+                                        {
+                                            let rejected = merge_drained_usage(
+                                                accumulator.output(),
+                                                drained_usage.take(),
+                                            );
+                                            attempt
+                                                .settle_rejected_output(&rejected, false)
+                                                .await
+                                                .map_err(accounting_failure)?;
+                                            error
+                                        },
                                         &mut retry_budget,
                                         semantic_output_seen,
                                         Some(message_id.clone()),
@@ -1097,7 +1381,12 @@ pub(super) async fn transition_call_llm(
                 // calls are attempt failures and never dispatch tools.
                 match accumulator.finish() {
                     ChatStreamFinish::Completed(output) => {
-                        break 'stream merge_drained_usage(output, drained_usage.take());
+                        let output = merge_drained_usage(output, drained_usage.take());
+                        attempt
+                            .settle_output(&output)
+                            .await
+                            .map_err(accounting_failure)?;
+                        break 'stream output;
                     }
                     ChatStreamFinish::Incomplete { output, .. } => {
                         warn!(
@@ -1106,9 +1395,14 @@ pub(super) async fn transition_call_llm(
                         );
                         // Preserve partial output and the terminal status; the
                         // incomplete cause is handled downstream without retries.
-                        break 'stream merge_drained_usage(output, drained_usage.take());
+                        let output = merge_drained_usage(output, drained_usage.take());
+                        attempt
+                            .settle_output(&output)
+                            .await
+                            .map_err(accounting_failure)?;
+                        break 'stream output;
                     }
-                    ChatStreamFinish::Failed { error, .. } => {
+                    ChatStreamFinish::Failed { output, error } => {
                         debug!(
                             "Stream failed terminal validation: session={} message_id={}",
                             session_id, message_id
@@ -1116,7 +1410,15 @@ pub(super) async fn transition_call_llm(
                         match super::llm_retry::handle_stream_failure(
                             config,
                             session_id,
-                            stream_accumulation_error(error),
+                            {
+                                let error = stream_accumulation_error(error);
+                                let rejected = merge_drained_usage(output, drained_usage.take());
+                                attempt
+                                    .settle_rejected_output(&rejected, true)
+                                    .await
+                                    .map_err(accounting_failure)?;
+                                error
+                            },
                             &mut retry_budget,
                             semantic_output_seen,
                             Some(message_id.clone()),
@@ -1135,6 +1437,14 @@ pub(super) async fn transition_call_llm(
                     }
                 }
             }; // end outer retry loop ('stream)
+
+            timing.finish(&chat_span);
+            crate::agent::utils::llm_metrics::stream_latency(
+                genai::provider_name(&context.provider),
+                &context.model,
+                timing.first_byte_secs(),
+                timing.first_token_secs(),
+            );
 
             // Final flush of any remaining buffered content (no timer reset needed)
             flush_buffers!(false);
@@ -1171,61 +1481,65 @@ pub(super) async fn transition_call_llm(
             match super::llm_retry::call_with_retry(
                 config,
                 session_id,
+                "chat",
                 &exec_ctx.cancellation_token,
                 || {
                     let provider = &provider;
                     let messages_with_cache = &messages_with_cache;
                     let tools = tools.as_ref();
                     let cancel = cancel.clone();
+                    let operation = &operation;
                     async move {
-                        tokio::select! {
-                            result = provider.chat_with_tools(messages_with_cache, Some(tools)) => {
-                                result
-                            }
-                            _ = cancel.cancelled() => {
-                                Err(querymt::error::LLMError::Cancelled)
-                            }
-                        }
+                        let call = ChatCall::new(messages_with_cache)
+                            .tools(tools)
+                            .options(options);
+                        crate::accounting::run_attempt(
+                            operation,
+                            session_handle.billing_basis(),
+                            &cancel,
+                            || provider.chat(&call),
+                        )
+                        .await
                     }
                 },
             )
             .await
             {
                 Ok(resp) => resp,
-                Err(e) => return map_failed_llm_call(e, false, context),
+                Err(e) => {
+                    if let Some(stop) = budget_stop(&operation, context) {
+                        return Ok(stop);
+                    }
+                    return map_failed_llm_call(e, false, context);
+                }
             }
         }
     };
 
     // Canonical output is authoritative; the flattened fields below are
     // compatibility projections of it.
+    // Stop the clock at the end of the model round trip, not after the bookkeeping below.
+    chat_timer.succeeded();
     genai::output(&output);
     let response_content = output.text().unwrap_or_default();
     let response_thinking = output.thinking();
     let response_thinking_signature = output.signature();
-    let tool_calls = dedupe_tool_calls_by_call_id(output.tool_calls().unwrap_or_default());
+    let llm_tool_calls = middleware_calls_from_output(&output);
+    let tool_calls = &llm_tool_calls;
     let usage = output.usage.clone();
     let finish_reason = output.finish_reason;
 
-    let (request_cost, cumulative_cost) = if let Some(usage_info) = &usage {
-        let pricing = session_handle.get_pricing();
-        // Reasoning tokens are billed at the output rate (no separate pricing).
-        let billable_output = usage_info.output_tokens as u64 + usage_info.reasoning_tokens as u64;
-        let request_cost = pricing
-            .as_ref()
-            .and_then(|p| p.calculate_cost(usage_info.input_tokens as u64, billable_output));
-        let cumulative_cost = pricing.as_ref().and_then(|p| {
-            p.calculate_cost(
-                context.stats.total_input_tokens + usage_info.input_tokens as u64,
-                context.stats.total_output_tokens
-                    + usage_info.reasoning_tokens as u64
-                    + billable_output,
-            )
-        });
-        (request_cost, cumulative_cost)
-    } else {
-        (None, None)
-    };
+    // Presentation only: both figures are views of recorded settlements. The
+    // request cost covers every attempt of this logical operation (retries
+    // included) and the cumulative figure is the session's recorded total.
+    // Each is `None` unless it is a complete supported estimate.
+    let request_cost = operation.totals().complete_total_usd();
+    let cumulative_cost = exec_ctx
+        .cycle_accounting(&config.event_sink)
+        .await
+        .map_err(|error| anyhow::anyhow!("accounting unavailable: {error}"))?
+        .session_totals()
+        .complete_total_usd();
 
     debug!(
         "Session {} received provider response ({} chars, {} tool call(s), finish: {:?}, cost: ${:.4?})",
@@ -1255,21 +1569,12 @@ pub(super) async fn transition_call_llm(
                 ),
                 turns: u32_from_usize(context.stats.turns, "context.stats.turns", Some(session_id)),
             },
+            accounting: Some(operation.request_accounting()),
         },
     );
 
-    let llm_tool_calls: Vec<MiddlewareToolCall> = tool_calls
-        .into_iter()
-        .map(|tc| MiddlewareToolCall {
-            id: tc.id.clone(),
-            function: ToolFunction {
-                name: tc.function.name.clone(),
-                arguments: tc.function.arguments.clone(),
-            },
-        })
-        .collect();
-
     let mut llm_response = LlmResponse::new(response_content, llm_tool_calls, usage, finish_reason)
+        .with_applied(options)
         .with_thinking(response_thinking)
         .with_thinking_signature(response_thinking_signature)
         .with_output(Some(output));
@@ -1277,9 +1582,21 @@ pub(super) async fn transition_call_llm(
         llm_response = llm_response.with_message_id(mid);
     }
 
+    // The overrides were consumed by this request; later states must not see
+    // them. What the request was sent with travels on as `last_applied`.
+    let context = if context.request_overrides.is_empty() && context.last_applied == options {
+        context.clone()
+    } else {
+        Arc::new(
+            context
+                .without_request_overrides()
+                .with_last_applied(options),
+        )
+    };
+
     Ok(ExecutionState::AfterLlm {
         response: Arc::new(llm_response),
-        context: context.clone(),
+        context,
     })
 }
 
@@ -1406,52 +1723,59 @@ pub(super) async fn transition_after_llm(
         source_model: Some(context.model.to_string()),
     };
 
-    exec_ctx
-        .add_message(assistant_msg.clone())
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to store assistant message: {}", e))?;
+    // A thinking-only reply cut off by the output limit is not history: it is
+    // neither persisted nor announced, but its usage below is still counted.
+    let store_reply = !response.is_thinking_only_length_cutoff();
+    if store_reply {
+        exec_ctx
+            .add_message(assistant_msg.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to store assistant message: {}", e))?;
 
-    let reasoning_parts = response
-        .output
-        .as_ref()
-        .map(reasoning_parts_from_output)
-        .unwrap_or_default();
-    config.emit_event(
-        &exec_ctx.session_id,
-        AgentEventKind::AssistantMessageStored {
-            content: response.content.clone(),
-            thinking: response.thinking.clone(),
-            reasoning_parts,
-            message_id: Some(assistant_msg.id.clone()),
-        },
-    );
+        let reasoning_parts = response
+            .output
+            .as_ref()
+            .map(reasoning_parts_from_output)
+            .unwrap_or_default();
+        config.emit_event(
+            &exec_ctx.session_id,
+            AgentEventKind::AssistantMessageStored {
+                content: response.content.clone(),
+                thinking: response.thinking.clone(),
+                reasoning_parts,
+                message_id: Some(assistant_msg.id.clone()),
+            },
+        );
+    } else {
+        debug!(
+            "Not storing thinking-only reply cut off by the output limit: session={}",
+            exec_ctx.session_id
+        );
+    }
 
     let mut messages = (*context.messages).to_vec();
-    // Same-turn continuation is still talking to the provider that just
-    // produced this output. Re-converting through `to_chat_message()` with no
-    // target treats the destination as unknown and portable-projects encrypted
-    // reasoning away before the tool result is appended.
-    messages.push(if let Some(output) = structured_output.clone() {
-        ChatMessage::from_assistant_output(output)
-    } else {
-        assistant_msg
-            .to_chat_message()
-            .map_err(|error| anyhow::anyhow!("Invalid stored assistant content: {error}"))?
-    });
+    if store_reply {
+        // Same-turn continuation is still talking to the provider that just
+        // produced this output. Re-converting through `to_chat_message()` with no
+        // target treats the destination as unknown and portable-projects encrypted
+        // reasoning away before the tool result is appended.
+        messages.push(if let Some(output) = structured_output.clone() {
+            ChatMessage::from_assistant_output(output)
+        } else {
+            assistant_msg
+                .to_chat_message()
+                .map_err(|error| anyhow::anyhow!("Invalid stored assistant content: {error}"))?
+        });
+    }
 
     let mut updated_stats = (*context.stats).clone();
     updated_stats.steps += 1;
-    if let Some(token_usage) = &response.usage {
-        updated_stats.total_input_tokens += token_usage.input_tokens as u64;
-        updated_stats.total_output_tokens += token_usage.output_tokens as u64;
-        updated_stats.reasoning_tokens += token_usage.reasoning_tokens as u64;
-        updated_stats.cache_read_tokens += token_usage.cache_read as u64;
-        updated_stats.cache_write_tokens += token_usage.cache_write as u64;
-        updated_stats.context_tokens = calculate_context_tokens(Some(token_usage)) as usize;
-
-        if let Some(pricing) = exec_ctx.session_handle.get_pricing() {
-            updated_stats.update_costs(&pricing);
-        }
+    apply_usage_to_stats(&mut updated_stats, response.usage.as_ref());
+    // Monetary fields are a view of this cycle's recorded components, never a
+    // revaluation of token counters at current rates. Applied even when this
+    // response reported no usage, so recorded charges stay visible.
+    if let Some(cycle) = exec_ctx.cycle_accounting.get() {
+        updated_stats.apply_recorded_costs(&cycle.cycle_totals());
     }
 
     let new_context = Arc::new(
@@ -1463,6 +1787,8 @@ pub(super) async fn transition_after_llm(
             context.model.clone(),
         )
         .with_session_mode(context.session_mode)
+        .with_profile(context.profile.clone())
+        .with_last_applied(response.applied)
         .with_fragments(context.fragments.clone()),
     );
 
@@ -1483,30 +1809,40 @@ pub(super) async fn transition_after_llm(
     let (mut executable_calls, mut gated_results) =
         gate_function_calls_for_execution(&response.tool_calls);
 
-    if output_status == Some(ChatOutputStatus::Incomplete) {
-        // An incomplete terminal never authorizes execution, even when some
-        // items completed. Synthesize skipped results for every call and stop.
+    // A length finish reason is a cut-off whatever status the provider
+    // reported: Anthropic flushes interrupted tool blocks as completed (but
+    // invalid) calls, so such a reply arrives as `Completed` + `Length`.
+    let is_length_cutoff = response.is_length_cutoff();
+    if output_status == Some(ChatOutputStatus::Incomplete) || is_length_cutoff {
+        // An incomplete or cut-off terminal never authorizes execution, even
+        // when some items completed. Every call gets exactly one error result:
+        // invalid calls keep their `INVALID_JSON` result, the rest are skipped.
         let detail = response
             .output
             .as_ref()
             .map(|_| "response is incomplete".to_string())
             .unwrap_or_default();
-        let skipped: Vec<ToolResult> =
-            std::mem::take(&mut executable_calls)
-                .into_iter()
-                .map(|call| {
-                    ToolResult::new(
-                        call.id.clone(),
-                        vec![querymt::chat::ToolResultPart::Text { text: format!(
-                        "Error: tool call skipped because the response was incomplete. {detail}"
-                    ).to_string() }],
-                        true,
-                        Some(call.function.name.clone()),
-                        Some(call.function.arguments.clone()),
-                    )
-                })
-                .collect();
-        gated_results.extend(skipped);
+        let skipped_text = skipped_call_text(response.finish_reason, &detail);
+        if is_length_cutoff {
+            // Invalid calls also get the split-the-write guidance.
+            for result in &mut gated_results {
+                result.content.push(querymt::chat::ToolResultPart::Text {
+                    text: skipped_text.clone(),
+                });
+            }
+        }
+        let to_skip: Vec<MiddlewareToolCall> = std::mem::take(&mut executable_calls);
+        gated_results.extend(to_skip.into_iter().map(|call| {
+            ToolResult::new(
+                call.id,
+                vec![querymt::chat::ToolResultPart::Text {
+                    text: skipped_text.clone(),
+                }],
+                true,
+                Some(call.function.name),
+                Some(call.function.arguments),
+            )
+        }));
 
         if gated_results.is_empty() {
             let (message, stop_type) = match response.finish_reason {
@@ -1527,11 +1863,17 @@ pub(super) async fn transition_after_llm(
             });
         }
 
-        // Store the synthesized results (no execution) before stopping by
-        // routing through the tool-result storage step with no remaining calls.
+        let results: Arc<[ToolResult]> = Arc::from(gated_results.into_boxed_slice());
+
+        if response.finish_reason == Some(FinishReason::Length) {
+            return store_results_then_stop_on_length(config, results, new_context, exec_ctx).await;
+        }
+
+        // Store the synthesized results (no execution) by routing through the
+        // tool-result storage step with no remaining calls.
         return Ok(ExecutionState::ProcessingToolCalls {
             remaining_calls: Arc::from(Vec::new().into_boxed_slice()),
-            results: Arc::from(gated_results.into_boxed_slice()),
+            results,
             context: new_context,
         });
     }
@@ -1557,11 +1899,15 @@ pub(super) async fn transition_after_llm(
             context: new_context,
         }),
 
-        Some(FinishReason::Length) => Ok(ExecutionState::Stopped {
-            message: "Model hit token limit".into(),
-            stop_type: StopType::ModelTokenLimit,
-            context: Some(new_context),
-        }),
+        Some(FinishReason::Length) => {
+            // Cut-offs with tool calls were answered and stopped above.
+            debug_assert!(!has_dispatchable_calls);
+            Ok(ExecutionState::Stopped {
+                message: "Model hit token limit".into(),
+                stop_type: StopType::ModelTokenLimit,
+                context: Some(new_context),
+            })
+        }
 
         Some(FinishReason::ContentFilter) => Ok(ExecutionState::Stopped {
             message: "Response blocked by content filter".into(),
@@ -1590,8 +1936,11 @@ pub(super) async fn transition_after_llm(
 
 /// Transition from ProcessingToolCalls to BeforeLlmCall or WaitingForEvent.
 ///
-/// This executes parallel-safe runs concurrently while preserving stateful and
-/// clarification boundaries, then either:
+/// The batch is planned into ordered waves (see `wave_plan::plan_waves`).
+/// Calls in one wave have no file conflicts and run concurrently; calls that
+/// conflict on a file run in later waves in the model's original order, and
+/// stateful / clarification calls act as solo barrier waves. Results are
+/// stored in the original call order. Then either:
 /// - Returns to BeforeLlmCall with results (normal flow)
 /// - Enters WaitingForEvent if a delegation was initiated
 ///
@@ -1609,22 +1958,23 @@ pub(super) async fn transition_after_llm(
 /// history invariant is always maintained.
 #[instrument(
     name = "agent.transition.processing_tool_calls",
-    skip(config, remaining_calls, results, context, exec_ctx, bridge),
+    skip(config, driver, remaining_calls, results, context, exec_ctx),
     fields(
         session_id = %exec_ctx.session_id,
         remaining_calls = remaining_calls.len(),
         completed_results = results.len(),
-        execution_mode = tracing::field::Empty,
+        wave_count = tracing::field::Empty,
+        serialized_calls = tracing::field::Empty,
         state_reload_ms = tracing::field::Empty,
     )
 )]
 pub(super) async fn transition_processing_tool_calls(
     config: &AgentConfig,
+    driver: &CompositeDriver,
     remaining_calls: &Arc<[MiddlewareToolCall]>,
     results: &Arc<[ToolResult]>,
     context: &Arc<crate::middleware::ConversationContext>,
     exec_ctx: &mut ExecutionContext,
-    bridge: Option<&ClientBridgeSender>,
 ) -> Result<ExecutionState, anyhow::Error> {
     debug!(
         "ProcessingToolCalls: session={}, remaining={}, completed={}",
@@ -1654,290 +2004,150 @@ pub(super) async fn transition_processing_tool_calls(
         return Ok(next_state);
     }
 
-    let execution_class = |call: &MiddlewareToolCall| {
-        config
-            .tool_registry
-            .find(&call.function.name)
-            .map(|tool| tool.execution_class())
-            .unwrap_or(crate::tools::ToolExecutionClass::ParallelSafe)
-    };
-    let has_execution_boundary = remaining_calls
+    // Calls are prepared (normalised, hooked, validated, access-declared) one
+    // execution-barrier-delimited segment at a time, in model order. A segment is
+    // a run of `ParallelSafe` calls or a single barrier call; nothing beyond a
+    // stateful or clarification barrier is prepared until the barrier has
+    // completed, so later hooks observe its effects.
+    let classes: Vec<crate::tools::ToolExecutionClass> = remaining_calls
         .iter()
-        .any(|call| execution_class(call) != crate::tools::ToolExecutionClass::ParallelSafe);
-    if has_execution_boundary {
-        tracing::Span::current().record("execution_mode", "mixed_boundary");
-        debug!(
-            "Executing mixed tool batch with stateful boundaries for session {}",
-            exec_ctx.session_id
-        );
-        let mut all_results = (**results).to_vec();
-        let mut unprocessed_start = if already_cancelled { Some(0) } else { None };
-        let mut cancelled = already_cancelled;
-        let mut stateful_executed = false;
-        let mut call_index = 0;
-
-        while call_index < remaining_calls.len() && !cancelled {
-            let class = execution_class(&remaining_calls[call_index]);
-            if class == crate::tools::ToolExecutionClass::ParallelSafe {
-                let group_end = remaining_calls[call_index..]
-                    .iter()
-                    .position(|call| {
-                        execution_class(call) != crate::tools::ToolExecutionClass::ParallelSafe
-                    })
-                    .map_or(remaining_calls.len(), |offset| call_index + offset);
-                let exec_ctx_ref: &ExecutionContext = exec_ctx;
-                let futures = remaining_calls[call_index..group_end].iter().map(|call| {
-                    let call = call.clone();
-                    let cancel = exec_ctx_ref.cancellation_token.clone();
-                    async move {
-                        tokio::select! {
-                            result = super::tool_calls::execute_tool_call(
-                                config, &call, exec_ctx_ref, bridge,
-                            ) => result,
-                            _ = cancel.cancelled() => Ok(ToolResult::new(
-                                call.id.clone(),
-                                vec![querymt::chat::ToolResultPart::Text { text: "Error: Cancelled by user".to_string() }],
-                                true,
-                                Some(call.function.name.clone()),
-                                Some(call.function.arguments.clone()),
-                            )),
-                        }
-                    }
-                });
-                for (result, call) in join_all(futures)
-                    .await
-                    .into_iter()
-                    .zip(remaining_calls[call_index..group_end].iter())
-                {
-                    match result {
-                        Ok(tool_result) => all_results.push(tool_result),
-                        Err(error) => all_results.push(ToolResult::new(
-                            call.id.clone(),
-                            vec![querymt::chat::ToolResultPart::Text {
-                                text: format!("Error: internal tool execution failed: {error}")
-                                    .to_string(),
-                            }],
-                            true,
-                            Some(call.function.name.clone()),
-                            Some(call.function.arguments.clone()),
-                        )),
-                    }
-                }
-                call_index = group_end;
-                if exec_ctx.cancellation_token.is_cancelled() {
-                    cancelled = true;
-                    unprocessed_start = Some(call_index);
-                }
-                continue;
-            }
-
-            let call = &remaining_calls[call_index];
-            stateful_executed |= class == crate::tools::ToolExecutionClass::SerialStateful;
-            let cancel = exec_ctx.cancellation_token.clone();
-            let result = tokio::select! {
-                result = super::tool_calls::execute_tool_call(config, call, exec_ctx, bridge) => result,
-                _ = cancel.cancelled() => Ok(ToolResult::new(
-                    call.id.clone(),
-                    vec![querymt::chat::ToolResultPart::Text {
-                        text: "Error: Cancelled by user".to_string(),
-                    }],
-                    true,
-                    Some(call.function.name.clone()),
-                    Some(call.function.arguments.clone()),
-                )),
-            };
-            let mut clarification_applied = false;
-            match result {
-                Ok(tool_result) => {
-                    if class == crate::tools::ToolExecutionClass::ClarificationBoundary
-                        && !tool_result.is_error
-                    {
-                        let clarification = tool_result
-                            .content
-                            .iter()
-                            .filter_map(|block| block.as_text())
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if !clarification.trim().is_empty() {
-                            let summary = exec_ctx
-                                .state
-                                .current_intent
-                                .as_ref()
-                                .map(|intent| intent.summary.clone())
-                                .unwrap_or_else(|| clarification.clone());
-                            match exec_ctx
-                                .state
-                                .update_intent_projection(
-                                    summary,
-                                    None,
-                                    Some(clarification.clone()),
-                                    "clarification_answer".to_string(),
-                                    Some(call.id.clone()),
-                                )
-                                .await
-                            {
-                                Ok(_) => {
-                                    clarification_applied = true;
-                                    if let Some(objective) = exec_ctx.run_objective.as_mut() {
-                                        objective.amend(
-                                            crate::agent::objective::ObjectiveDirective {
-                                                text: clarification.clone(),
-                                                source: crate::agent::objective::ObjectiveSource::ClarificationAnswer,
-                                                source_ref: Some(call.id.clone()),
-                                                accepted_at_ms: None,
-                                                application_boundary: Some(
-                                                    "clarification_boundary".to_string(),
-                                                ),
-                                            },
-                                        );
-                                    }
-                                }
-                                Err(error) => warn!(
-                                    "Failed to persist clarification intent projection for tool call {}: {}",
-                                    call.id, error
-                                ),
-                            }
-                        }
-                    }
-                    all_results.push(tool_result)
-                }
-                Err(error) => all_results.push(ToolResult::new(
-                    call.id.clone(),
-                    vec![querymt::chat::ToolResultPart::Text {
-                        text: format!("Error: internal tool execution failed: {error}").to_string(),
-                    }],
-                    true,
-                    Some(call.function.name.clone()),
-                    Some(call.function.arguments.clone()),
-                )),
-            }
-            call_index += 1;
-            if exec_ctx.cancellation_token.is_cancelled() {
-                cancelled = true;
-                unprocessed_start = Some(call_index);
-            } else if clarification_applied {
-                unprocessed_start = Some(call_index);
-                break;
-            }
-        }
-
-        if let Some(start) = unprocessed_start {
-            for call in remaining_calls.iter().skip(start) {
-                let message = if cancelled {
-                    "Error: Cancelled by user"
-                } else {
-                    "Skipped because a user clarification changed the run objective; the model must reconsider this action."
-                };
-                all_results.push(ToolResult::new(
-                    call.id.clone(),
-                    vec![querymt::chat::ToolResultPart::Text {
-                        text: message.to_string(),
-                    }],
-                    true,
-                    Some(call.function.name.clone()),
-                    Some(call.function.arguments.clone()),
-                ));
-            }
-        }
-        if stateful_executed {
-            let reload_started = std::time::Instant::now();
-            match exec_ctx.state.load_working_context().await {
-                Ok(()) => {
-                    if let Some(objective) = exec_ctx.run_objective.as_mut() {
-                        objective.set_task(
-                            exec_ctx.state.active_task.as_ref(),
-                            crate::agent::objective::ObjectiveSource::TaskUpdated,
-                        );
-                    }
-                }
-                Err(error) => warn!(
-                    "Failed to refresh working context after stateful tool execution: {}",
-                    error
-                ),
-            }
-            tracing::Span::current().record(
-                "state_reload_ms",
-                reload_started.elapsed().as_millis() as u64,
-            );
-        }
-        let next_state = super::tool_calls::store_all_tool_results(
-            config,
-            &Arc::from(all_results.into_boxed_slice()),
-            context,
-            exec_ctx,
-        )
-        .await?;
-        if cancelled {
-            return Ok(ExecutionState::Cancelled);
-        }
-        return Ok(next_state);
-    }
-
-    tracing::Span::current().record("execution_mode", "parallel");
+        .map(|call| {
+            config
+                .tool_registry
+                .find(&call.function.name)
+                .map(|tool| tool.execution_class())
+                .unwrap_or(crate::tools::ToolExecutionClass::ParallelSafe)
+        })
+        .collect();
+    let segments = split_segments(&classes);
     debug!(
-        "Executing {} tool calls in parallel for session {}",
+        "Executing {} tool calls in {} segment(s) for session {}",
         remaining_calls.len(),
+        segments.len(),
         exec_ctx.session_id
     );
 
-    // Wrap each individual tool future with a per-call cancel race.
-    //
-    // When the cancel signal fires, each future resolves immediately with a
-    // synthetic error result rather than waiting for the underlying work to
-    // finish. This lets `join_all` complete quickly on cancellation without
-    // leaving orphaned `tool_use` blocks in history.
-    //
-    // We reborrow `exec_ctx` as a plain `&ExecutionContext` (immutable) so it
-    // can be shared across all futures — `execute_tool_call` only needs `&`.
-    let exec_ctx_ref: &ExecutionContext = exec_ctx;
-    let mut futures = Vec::with_capacity(remaining_calls.len());
-    for call in remaining_calls.iter() {
-        let per_call_cancel = exec_ctx_ref.cancellation_token.clone();
-        let call = call.clone();
-        futures.push(async move {
-            tokio::select! {
-                result = super::tool_calls::execute_tool_call(
-                    config, &call, exec_ctx_ref, bridge,
-                ) => result,
-                _ = per_call_cancel.cancelled() => {
-                    // Produce a synthetic cancelled result so history stays valid.
-                    Ok(ToolResult::new(
-                        call.id.clone(),
-                        vec![querymt::chat::ToolResultPart::Text { text: "Error: Cancelled by user".to_string() }],
-                        true,
-                        Some(call.function.name.clone()),
-                        Some(call.function.arguments.clone()),
-                    ))
+    // One slot per call so results can be stored in the model's original order
+    // regardless of the order in which waves completed.
+    let mut slots: Vec<Option<ToolResult>> = (0..remaining_calls.len()).map(|_| None).collect();
+    let mut cancelled = already_cancelled;
+    let mut clarification_applied = false;
+    let mut wave_count = 0u64;
+    let mut serialized_calls = 0u64;
+    let mut state_reload_ms = 0u64;
+
+    for segment in &segments {
+        if cancelled || clarification_applied {
+            break;
+        }
+        if exec_ctx.cancellation_token.is_cancelled() {
+            cancelled = true;
+            break;
+        }
+
+        let indices: Vec<usize> = match segment {
+            Segment::Parallel(indices) => indices.clone(),
+            Segment::Barrier(index) => vec![*index],
+        };
+        let segment_plan =
+            prepare_segment(config, driver, remaining_calls, &indices, exec_ctx).await?;
+        for (index, result) in segment_plan.immediate {
+            slots[index] = Some(result);
+        }
+        let mut prepared: Vec<Option<(PreparedCall, crate::tools::FileAccess)>> =
+            (0..remaining_calls.len()).map(|_| None).collect();
+        let mut call_infos: Vec<CallInfo> = Vec::with_capacity(segment_plan.ready.len());
+        let mut ready_indices: Vec<usize> = Vec::with_capacity(segment_plan.ready.len());
+        for (index, call, access) in segment_plan.ready {
+            call_infos.push(CallInfo {
+                class: classes[index],
+                access: access.clone(),
+            });
+            ready_indices.push(index);
+            prepared[index] = Some((call, access));
+        }
+
+        match segment {
+            Segment::Parallel(_) => {
+                // Plan the prepared calls into waves; calls inside a wave never
+                // conflict on a file and run concurrently.
+                let waves = plan_waves(&call_infos);
+                wave_count += waves.len() as u64;
+                serialized_calls += serialized_call_count(&call_infos, &waves) as u64;
+                for wave in &waves {
+                    if exec_ctx.cancellation_token.is_cancelled() {
+                        cancelled = true;
+                        break;
+                    }
+                    // Reborrow immutably so the context can be shared across the
+                    // wave; execution only needs `&ExecutionContext`.
+                    let exec_ctx_ref: &ExecutionContext = exec_ctx;
+                    let futures = wave.iter().map(|&position| {
+                        let index = ready_indices[position];
+                        let call = &remaining_calls[index];
+                        let (prepared_call, _) =
+                            prepared[index].take().expect("prepared call executes once");
+                        async move {
+                            (
+                                index,
+                                run_prepared_tool_call(config, call, prepared_call, exec_ctx_ref)
+                                    .await,
+                            )
+                        }
+                    });
+                    for (index, result) in join_all(futures).await {
+                        slots[index] = Some(result);
+                    }
                 }
             }
-        });
-    }
-
-    let tool_results = join_all(futures).await;
-
-    let was_cancelled = already_cancelled || exec_ctx.cancellation_token.is_cancelled();
-
-    let mut all_results = (**results).to_vec();
-    for (result, call) in tool_results.into_iter().zip(remaining_calls.iter()) {
-        match result {
-            Ok(tool_result) => all_results.push(tool_result),
-            Err(e) => {
-                warn!(
-                    "Tool call {} ({}) failed with infrastructure error: {}. \
-                     Synthesizing error result to maintain tool_use/tool_result invariant.",
-                    call.id, call.function.name, e
-                );
-                all_results.push(ToolResult::new(
-                    call.id.clone(),
-                    vec![querymt::chat::ToolResultPart::Text {
-                        text: format!("Error: internal tool execution failed: {}", e).to_string(),
-                    }],
-                    true,
-                    Some(call.function.name.clone()),
-                    Some(call.function.arguments.clone()),
-                ));
+            Segment::Barrier(index) => {
+                let index = *index;
+                if let Some((prepared_call, _)) = prepared[index].take() {
+                    wave_count += 1;
+                    let class = classes[index];
+                    let call = &remaining_calls[index];
+                    let result =
+                        run_prepared_tool_call(config, call, prepared_call, exec_ctx).await;
+                    if class == crate::tools::ToolExecutionClass::ClarificationBoundary
+                        && !result.is_error
+                    {
+                        clarification_applied =
+                            apply_clarification_answer(exec_ctx, call, &result).await;
+                    }
+                    slots[index] = Some(result);
+                    if class == crate::tools::ToolExecutionClass::SerialStateful {
+                        // Following calls are prepared against the updated state.
+                        state_reload_ms += reload_working_context(exec_ctx).await;
+                    }
+                }
             }
         }
+
+        if exec_ctx.cancellation_token.is_cancelled() {
+            cancelled = true;
+        }
+    }
+
+    let span = tracing::Span::current();
+    span.record("wave_count", wave_count);
+    span.record("serialized_calls", serialized_calls);
+    span.record("state_reload_ms", state_reload_ms);
+
+    let was_cancelled = cancelled || exec_ctx.cancellation_token.is_cancelled();
+
+    // Exactly one result per call: calls that never started (cancellation, or
+    // a clarification that changed the run objective) get a synthetic result.
+    let mut all_results = (**results).to_vec();
+    all_results.reserve(remaining_calls.len());
+    for (call, slot) in remaining_calls.iter().zip(slots) {
+        all_results.push(slot.unwrap_or_else(|| {
+            let message = if was_cancelled {
+                "Error: Cancelled by user"
+            } else {
+                "Skipped because a user clarification changed the run objective; the model must reconsider this action."
+            };
+            synthetic_error_result(call, message)
+        }));
     }
 
     debug!(
@@ -1970,6 +2180,267 @@ pub(super) async fn transition_processing_tool_calls(
     Ok(next_state)
 }
 
+/// A run of calls prepared together: either consecutive `ParallelSafe` calls or
+/// one execution-barrier call (stateful or clarification).
+#[derive(Debug, PartialEq, Eq)]
+enum Segment {
+    Parallel(Vec<usize>),
+    Barrier(usize),
+}
+
+/// Split a batch (by execution class, in model order) into barrier-delimited
+/// segments. Every call index appears in exactly one segment, in order.
+fn split_segments(classes: &[crate::tools::ToolExecutionClass]) -> Vec<Segment> {
+    let mut segments: Vec<Segment> = Vec::new();
+    for (index, class) in classes.iter().enumerate() {
+        if *class == crate::tools::ToolExecutionClass::ParallelSafe {
+            match segments.last_mut() {
+                Some(Segment::Parallel(indices)) => indices.push(index),
+                _ => segments.push(Segment::Parallel(vec![index])),
+            }
+        } else {
+            segments.push(Segment::Barrier(index));
+        }
+    }
+    segments
+}
+
+/// Outcome of preparing one segment.
+struct SegmentPlan {
+    /// Calls whose final result is already known (rejected or failed during
+    /// preparation, or rejected by middleware review): `(call index, result)`.
+    immediate: Vec<(usize, ToolResult)>,
+    /// Executable calls with the file access declared for their effective
+    /// arguments, in model order: `(call index, prepared call, access)`.
+    ready: Vec<(usize, PreparedCall, crate::tools::FileAccess)>,
+}
+
+/// Prepare the calls of one segment in model order, declare their file access
+/// from the effective arguments and let middleware review the prepared batch.
+///
+/// Cancellation is observed before each call is prepared; calls not reached keep
+/// no result here and receive the ordered cancellation result later. Their
+/// pre-tool hooks do not run.
+async fn prepare_segment(
+    config: &AgentConfig,
+    driver: &CompositeDriver,
+    calls: &[MiddlewareToolCall],
+    indices: &[usize],
+    exec_ctx: &ExecutionContext,
+) -> Result<SegmentPlan, anyhow::Error> {
+    let mut immediate: Vec<(usize, ToolResult)> = Vec::new();
+    let mut prepared: Vec<(usize, PreparedCall)> = Vec::new();
+
+    for &index in indices {
+        if exec_ctx.cancellation_token.is_cancelled() {
+            break;
+        }
+        let call = &calls[index];
+        let outcome = tokio::select! {
+            biased;
+            _ = exec_ctx.cancellation_token.cancelled() => break,
+            outcome = super::tool_calls::prepare_tool_call(config, call, exec_ctx) => outcome,
+        };
+        match outcome {
+            Ok(prepared_call) => match prepared_call.disposition {
+                Disposition::Rejected(ref result) => {
+                    super::tool_calls::record_rejected_outcome(
+                        call,
+                        !prepared_call.repairs.is_empty(),
+                    );
+                    immediate.push((index, (**result).clone()));
+                }
+                Disposition::Ready => prepared.push((index, prepared_call)),
+            },
+            Err(error) => {
+                warn!(
+                    "Tool call {} ({}) failed during preparation: {}. \
+                     Synthesizing error result to maintain tool_use/tool_result invariant.",
+                    call.id, call.function.name, error
+                );
+                immediate.push((
+                    index,
+                    synthetic_error_result(
+                        call,
+                        &format!("Error: internal tool execution failed: {error}"),
+                    ),
+                ));
+            }
+        }
+    }
+
+    // File access is declared once, for the final effective arguments.
+    let cwd = exec_ctx.cwd().map(|path| path.to_path_buf());
+    let accesses = config
+        .tool_registry
+        .file_access_batch(
+            prepared
+                .iter()
+                .map(|(index, call)| (calls[*index].function.name.clone(), call.args.clone()))
+                .collect(),
+            cwd.clone(),
+        )
+        .await;
+
+    let verdicts = {
+        let views: Vec<PreparedToolCall<'_>> = prepared
+            .iter()
+            .zip(&accesses)
+            .map(|((index, call), access)| PreparedToolCall {
+                call: &calls[*index],
+                args: &call.args,
+                access,
+            })
+            .collect();
+        driver
+            .run_prepared_tool_calls(&PreparedBatch {
+                session_id: &exec_ctx.session_id,
+                cwd: cwd.as_deref(),
+                calls: &views,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("Middleware error: {error}"))?
+    };
+
+    let mut ready = Vec::with_capacity(prepared.len());
+    for (((index, call), access), verdict) in prepared.into_iter().zip(accesses).zip(verdicts) {
+        match verdict {
+            PreparedCallVerdict::Proceed => ready.push((index, call, access)),
+            PreparedCallVerdict::Reject(result) => {
+                super::tool_calls::record_rejected_outcome(&calls[index], !call.repairs.is_empty());
+                immediate.push((index, *result));
+            }
+        }
+    }
+    Ok(SegmentPlan { immediate, ready })
+}
+
+/// Reload the working context after a stateful tool ran so later calls are
+/// prepared against the updated state. Returns the elapsed milliseconds.
+async fn reload_working_context(exec_ctx: &mut ExecutionContext) -> u64 {
+    let started = Instant::now();
+    match exec_ctx.state.load_working_context().await {
+        Ok(()) => {
+            if let Some(objective) = exec_ctx.run_objective.as_mut() {
+                objective.set_task(
+                    exec_ctx.state.active_task.as_ref(),
+                    crate::agent::objective::ObjectiveSource::TaskUpdated,
+                );
+            }
+        }
+        Err(error) => warn!(
+            "Failed to refresh working context after stateful tool execution: {}",
+            error
+        ),
+    }
+    started.elapsed().as_millis() as u64
+}
+
+/// Build a synthetic error result for a call that did not produce one.
+fn synthetic_error_result(call: &MiddlewareToolCall, text: &str) -> ToolResult {
+    ToolResult::new(
+        call.id.clone(),
+        vec![querymt::chat::ToolResultPart::Text {
+            text: text.to_string(),
+        }],
+        true,
+        Some(call.function.name.clone()),
+        Some(call.function.arguments.clone()),
+    )
+}
+
+/// Execute one prepared call, racing it against the cancellation token.
+///
+/// A cancelled call resolves immediately with a synthetic `"Cancelled by user"`
+/// result, and an infrastructure error becomes an error result, so the
+/// `tool_use` → `tool_result` history invariant always holds. The prepared
+/// call is consumed: arguments are never re-parsed and hooks never re-run.
+async fn run_prepared_tool_call(
+    config: &AgentConfig,
+    call: &MiddlewareToolCall,
+    prepared: PreparedCall,
+    exec_ctx: &ExecutionContext,
+) -> ToolResult {
+    let cancel = exec_ctx.cancellation_token.clone();
+    tokio::select! {
+        result = super::tool_calls::execute_prepared_tool_call(config, call, prepared, exec_ctx) => {
+            match result {
+                Ok(tool_result) => tool_result,
+                Err(error) => {
+                    warn!(
+                        "Tool call {} ({}) failed with infrastructure error: {}. \
+                         Synthesizing error result to maintain tool_use/tool_result invariant.",
+                        call.id, call.function.name, error
+                    );
+                    synthetic_error_result(
+                        call,
+                        &format!("Error: internal tool execution failed: {error}"),
+                    )
+                }
+            }
+        }
+        _ = cancel.cancelled() => synthetic_error_result(call, "Error: Cancelled by user"),
+    }
+}
+
+/// Fold a successful clarification answer into the run objective.
+///
+/// Returns `true` when the answer was persisted and applied, which means the
+/// rest of the batch must be skipped so the model can reconsider.
+async fn apply_clarification_answer(
+    exec_ctx: &mut ExecutionContext,
+    call: &MiddlewareToolCall,
+    tool_result: &ToolResult,
+) -> bool {
+    let clarification = tool_result
+        .content
+        .iter()
+        .filter_map(|block| block.as_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if clarification.trim().is_empty() {
+        return false;
+    }
+
+    let summary = exec_ctx
+        .state
+        .current_intent
+        .as_ref()
+        .map(|intent| intent.summary.clone())
+        .unwrap_or_else(|| clarification.clone());
+    match exec_ctx
+        .state
+        .update_intent_projection(
+            summary,
+            None,
+            Some(clarification.clone()),
+            "clarification_answer".to_string(),
+            Some(call.id.clone()),
+        )
+        .await
+    {
+        Ok(_) => {
+            if let Some(objective) = exec_ctx.run_objective.as_mut() {
+                objective.amend(crate::agent::objective::ObjectiveDirective {
+                    text: clarification,
+                    source: crate::agent::objective::ObjectiveSource::ClarificationAnswer,
+                    source_ref: Some(call.id.clone()),
+                    accepted_at_ms: None,
+                    application_boundary: Some("clarification_boundary".to_string()),
+                });
+            }
+            true
+        }
+        Err(error) => {
+            warn!(
+                "Failed to persist clarification intent projection for tool call {}: {}",
+                call.id, error
+            );
+            false
+        }
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 //  Tests
 // ══════════════════════════════════════════════════════════════════════════
@@ -1994,6 +2465,7 @@ mod tests {
                 messages: vec![ChatMessage::user().text("SECRET_PROMPT").build()].into(),
                 tools: Arc::from([]),
                 estimated_tokens: 1,
+                options: Default::default(),
             })
         }
 
@@ -2146,6 +2618,7 @@ mod tests {
                             messages: Arc::from(messages),
                             tools: Arc::from([]),
                             estimated_tokens: 1,
+                            options: Default::default(),
                         })
                     };
                     transition_call_llm(&config, &context, &request, &exec).await
@@ -2171,25 +2644,28 @@ mod tests {
             }
         }
 
-        type TimedChunks = Result<Vec<(u64, Result<StreamChunk, LLMError>)>, LLMError>;
+        pub(super) type TimedChunks = Result<Vec<(u64, Result<StreamChunk, LLMError>)>, LLMError>;
 
         #[derive(Clone)]
         struct TimedProvider {
             attempts: Arc<std::sync::Mutex<std::collections::VecDeque<TimedChunks>>>,
             clock: Arc<std::sync::Mutex<(Option<Instant>, Option<f64>)>>,
             streaming: bool,
+            /// Per-request options each physical request was sent with.
+            options_seen: Arc<std::sync::Mutex<Vec<querymt::chat::GenerationOptions>>>,
+            /// Options the provider claims to honour.
+            support: Arc<std::sync::Mutex<querymt::chat::GenerationOptionSupport>>,
         }
 
         #[async_trait::async_trait]
         impl querymt::chat::ChatProvider for TimedProvider {
-            fn supports_streaming(&self) -> bool {
-                self.streaming
+            fn capabilities(&self) -> querymt::chat::ChatCapabilities {
+                querymt::chat::ChatCapabilities::NONE
+                    .with_streaming(self.streaming)
+                    .with_options(*self.support.lock().unwrap())
             }
-            async fn chat_with_tools(
-                &self,
-                _: &[ChatMessage],
-                _: Option<&[querymt::chat::Tool]>,
-            ) -> Result<ChatOutput, LLMError> {
+            async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+                self.options_seen.lock().unwrap().push(call.options);
                 Ok(ChatOutput::from_projections(
                     None,
                     Some("SECRET_RESPONSE".into()),
@@ -2198,12 +2674,11 @@ mod tests {
                     Some(FinishReason::Stop),
                 ))
             }
-            async fn chat_stream_with_tools(
+            async fn chat_stream(
                 &self,
-                _: &[ChatMessage],
-                _: Option<&[querymt::chat::Tool]>,
-            ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
-            {
+                call: &ChatCall<'_>,
+            ) -> Result<querymt::chat::ChatStream, LLMError> {
+                self.options_seen.lock().unwrap().push(call.options);
                 self.clock
                     .lock()
                     .unwrap()
@@ -2256,7 +2731,7 @@ mod tests {
         }
         impl querymt::LLMProvider for TimedProvider {}
 
-        struct TimedFactory {
+        pub(super) struct TimedFactory {
             provider: TimedProvider,
             binding: std::sync::Mutex<serde_json::Value>,
             configs: std::sync::Mutex<Vec<serde_json::Value>>,
@@ -2308,7 +2783,7 @@ mod tests {
                 })
             }
         }
-        async fn timed_fixture(
+        pub(super) async fn timed_fixture(
             streaming: bool,
             attempts: Vec<TimedChunks>,
             name: &'static str,
@@ -2321,6 +2796,8 @@ mod tests {
                     streaming,
                     attempts: Arc::new(std::sync::Mutex::new(attempts.into())),
                     clock: Default::default(),
+                    options_seen: Default::default(),
+                    support: Default::default(),
                 },
                 binding: std::sync::Mutex::new(
                     serde_json::json!({"temperature":0.25, "max_tokens":123, "top_p":0.75}),
@@ -2357,6 +2834,1252 @@ mod tests {
                 fixture.config.clone(),
             ));
             (fixture, factory)
+        }
+
+        /// Run one streamed reply through `transition_call_llm` and
+        /// `transition_after_llm`, returning the final state and every event
+        /// that was emitted meanwhile.
+        async fn run_streamed_reply(
+            chunks: Vec<StreamChunk>,
+        ) -> (
+            ExecutionState,
+            Vec<crate::events::AgentEventKind>,
+            Arc<TimedFactory>,
+        ) {
+            let attempts = vec![Ok(chunks.into_iter().map(|chunk| (0, Ok(chunk))).collect())];
+            let (fixture, factory) = timed_fixture(true, attempts, "openai", None).await;
+            let mut events = fixture.config.subscribe_events();
+            let mut exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+
+            // Tools must be present: a tool-less request takes the non-streaming path.
+            let mut prepared = (*request()).clone();
+            prepared.tools = vec![serde_json::from_value(serde_json::json!({
+                "type": "function",
+                "function": {"name": "write_file", "description": "", "parameters": {"type": "object"}}
+            }))
+            .unwrap()]
+            .into();
+            let state = transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec)
+                .await
+                .expect("call llm");
+            let ExecutionState::AfterLlm { response, context } = state else {
+                panic!("expected AfterLlm, got {}", state.name());
+            };
+            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
+                .await
+                .expect("after llm");
+
+            let mut seen = Vec::new();
+            while let Ok(Ok(envelope)) =
+                tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            {
+                seen.push(envelope.kind().clone());
+            }
+            (state, seen, factory)
+        }
+
+        #[tokio::test]
+        async fn length_cutoff_inside_tool_call_skips_the_call_and_stops_without_retry() {
+            // One call completes, a second is cut off mid-arguments. The
+            // incomplete reply must not execute the completed call either.
+            let (state, events, factory) = run_streamed_reply(vec![
+                StreamChunk::ToolUseStart {
+                    index: 0,
+                    id: "call_0".into(),
+                    name: "write_file".into(),
+                },
+                StreamChunk::ToolUseComplete {
+                    index: 0,
+                    tool_call: ToolCall {
+                        id: "call_0".into(),
+                        call_type: "function".into(),
+                        function: querymt::FunctionCall {
+                            name: "write_file".into(),
+                            arguments: "{\"path\":\"a.rs\"}".into(),
+                        },
+                    },
+                    extensions: Default::default(),
+                },
+                StreamChunk::ToolUseStart {
+                    index: 1,
+                    id: "call_1".into(),
+                    name: "write_file".into(),
+                },
+                StreamChunk::ToolUseInputDelta {
+                    index: 1,
+                    partial_json: "{\"path\":\"b.rs\",\"content\":\"fn main() {".into(),
+                },
+                StreamChunk::Done {
+                    finish_reason: FinishReason::Length,
+                },
+            ])
+            .await;
+
+            assert!(
+                !events
+                    .iter()
+                    .any(|kind| matches!(kind, crate::events::AgentEventKind::LlmRetryWait { .. })),
+                "a length cut-off must not be retried as a transient stream failure"
+            );
+            assert!(
+                factory.provider.attempts.lock().unwrap().is_empty(),
+                "exactly one physical attempt is expected"
+            );
+
+            let ExecutionState::Stopped {
+                stop_type, context, ..
+            } = state
+            else {
+                panic!("expected Stopped, got {}", state.name());
+            };
+            assert_eq!(stop_type, StopType::ModelTokenLimit);
+
+            let context = context.expect("stopped state keeps its context");
+            let result_text = context
+                .messages
+                .iter()
+                .filter(|message| message.has_tool_result())
+                .map(|message| format!("{message:?}"))
+                .collect::<String>();
+            assert!(
+                result_text.contains("split the write into smaller calls"),
+                "skipped result must tell the model to split the write: {result_text}"
+            );
+        }
+
+        fn flushed_call(index: usize, id: &str, arguments: &str, invalid: bool) -> StreamChunk {
+            let mut extensions = querymt::chat::Extensions::new();
+            if invalid {
+                extensions.insert(
+                    querymt::chat::INVALID_INPUT_EXTENSION.to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+            StreamChunk::ToolUseComplete {
+                index,
+                tool_call: ToolCall {
+                    id: id.into(),
+                    call_type: "function".into(),
+                    function: querymt::FunctionCall {
+                        name: "write_file".into(),
+                        arguments: arguments.into(),
+                    },
+                },
+                extensions,
+            }
+        }
+
+        /// The stopped context's tool results, keyed by call id.
+        fn stopped_results(
+            state: ExecutionState,
+        ) -> (Vec<querymt::chat::ChatMessage>, HashMap<String, String>) {
+            let ExecutionState::Stopped {
+                stop_type, context, ..
+            } = state
+            else {
+                panic!("expected Stopped, got {}", state.name());
+            };
+            assert_eq!(stop_type, StopType::ModelTokenLimit);
+            let messages = context.expect("context kept").messages.to_vec();
+            let results = messages
+                .iter()
+                .flat_map(|message| message.input().unwrap_or_default().to_vec())
+                .filter_map(|part| part.as_tool_result().cloned())
+                .map(|result| {
+                    assert!(result.is_error, "cut-off results are errors");
+                    let text = result
+                        .parts
+                        .iter()
+                        .filter_map(|part| match part {
+                            querymt::chat::ToolResultPart::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (result.call_id, text)
+                })
+                .collect();
+            (messages, results)
+        }
+
+        /// Session 01a16d18: Anthropic flushes the interrupted block as a
+        /// completed call marked invalid, so the reply is `Completed` +
+        /// `Length`. The call must still be answered, with `INVALID_JSON`.
+        #[tokio::test]
+        async fn completed_length_reply_with_flushed_invalid_call_answers_it() {
+            let (state, _, _) = run_streamed_reply(vec![
+                StreamChunk::Text("Writing reconcile.rs now.".into()),
+                StreamChunk::ToolUseStart {
+                    index: 1,
+                    id: "toolu_cut".into(),
+                    name: "write_file".into(),
+                },
+                flushed_call(1, "toolu_cut", r#"{"path": "reconcile.rs""#, true),
+                StreamChunk::Done {
+                    finish_reason: FinishReason::Length,
+                },
+            ])
+            .await;
+
+            let (messages, results) = stopped_results(state);
+            assert_eq!(results.len(), 1, "exactly one result: {results:?}");
+            let text = &results["toolu_cut"];
+            assert!(text.contains("INVALID_JSON"), "{text}");
+            assert!(text.contains("split the write"), "{text}");
+            // The result directly follows the assistant call.
+            let call_at = messages
+                .iter()
+                .position(|m| m.has_tool_use())
+                .expect("assistant call kept");
+            assert!(messages[call_at + 1].has_tool_result());
+        }
+
+        #[tokio::test]
+        async fn valid_call_before_a_length_cutoff_is_skipped_not_run() {
+            let (state, _, factory) = run_streamed_reply(vec![
+                StreamChunk::ToolUseStart {
+                    index: 0,
+                    id: "call_ok".into(),
+                    name: "write_file".into(),
+                },
+                flushed_call(0, "call_ok", r#"{"path":"a.rs","content":"x"}"#, false),
+                StreamChunk::ToolUseStart {
+                    index: 1,
+                    id: "call_cut".into(),
+                    name: "write_file".into(),
+                },
+                flushed_call(1, "call_cut", r#"{"path":"b.rs""#, true),
+                StreamChunk::Done {
+                    finish_reason: FinishReason::Length,
+                },
+            ])
+            .await;
+
+            assert!(factory.provider.attempts.lock().unwrap().is_empty());
+            let (_, results) = stopped_results(state);
+            assert_eq!(results.len(), 2, "{results:?}");
+            assert!(!results["call_ok"].contains("INVALID_JSON"));
+            assert!(results["call_ok"].contains("split the write"));
+            assert!(results["call_cut"].contains("INVALID_JSON"));
+            assert!(results["call_cut"].contains("split the write"));
+        }
+
+        // ── Anthropic structured streams ────────────────────────────────────
+        // Fixtures are the exact output of the Anthropic stream parser for a
+        // checked-in SSE transcript; `qmt-anthropic` asserts they stay current.
+
+        fn anthropic_fixture(name: &str) -> Vec<StreamChunk> {
+            let path = format!(
+                "{}/../providers/anthropic/tests/fixtures/{name}.json",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture"))
+                .expect("fixture chunks")
+        }
+
+        fn has_retry_wait(events: &[crate::events::AgentEventKind]) -> bool {
+            events
+                .iter()
+                .any(|kind| matches!(kind, crate::events::AgentEventKind::LlmRetryWait { .. }))
+        }
+
+        /// Session 01a18903: an opaque server-tool block alongside local calls
+        /// used to fail every turn with unfinished tool call indexes and burn
+        /// retries. Both local calls dispatch once; the opaque block never does.
+        #[tokio::test]
+        async fn anthropic_structured_stream_dispatches_local_calls_once_and_stores_history() {
+            let (state, events, factory) =
+                run_streamed_reply(anthropic_fixture("structured_tool_turn")).await;
+
+            assert!(!has_retry_wait(&events), "no llm_retry_wait: {events:?}");
+            assert!(factory.provider.attempts.lock().unwrap().is_empty());
+            let ExecutionState::ProcessingToolCalls {
+                remaining_calls,
+                context,
+                ..
+            } = state
+            else {
+                panic!("expected ProcessingToolCalls, got {}", state.name());
+            };
+            let ids: Vec<&str> = remaining_calls
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect();
+            assert_eq!(
+                ids,
+                ["toolu_a", "toolu_b"],
+                "each local call dispatched once"
+            );
+
+            // Stored history keeps every block in order: signed reasoning, text,
+            // the opaque server block, then both calls.
+            let assistant = context
+                .messages
+                .iter()
+                .find(|message| message.has_tool_use())
+                .expect("assistant message in history");
+            let items = &assistant.output().expect("assistant output kept").items;
+            assert_eq!(items.len(), 5, "{items:?}");
+            let ChatOutputItem::Reasoning(reasoning) = &items[0] else {
+                panic!("expected reasoning first: {items:?}");
+            };
+            assert_eq!(reasoning.signature.as_deref(), Some("SIG"));
+            assert_eq!(reasoning.visible_text(), "let me look");
+            assert!(matches!(&items[1], ChatOutputItem::Message(_)));
+            assert!(
+                matches!(&items[2], ChatOutputItem::Opaque(o) if o.original_type == "server_tool_use")
+            );
+            let calls: Vec<(&str, &str)> = items[3..]
+                .iter()
+                .filter_map(|item| match item {
+                    ChatOutputItem::FunctionCall(c) => {
+                        Some((c.call_id.as_str(), c.arguments.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                calls,
+                [
+                    ("toolu_a", r#"{"path":"a.rs"}"#),
+                    ("toolu_b", r#"{"path":"b.rs"}"#)
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn anthropic_structured_stream_projects_text_and_thinking_to_the_ui() {
+            let (_, events, _) =
+                run_streamed_reply(anthropic_fixture("structured_tool_turn")).await;
+
+            let text: String = events
+                .iter()
+                .filter_map(|kind| match kind {
+                    crate::events::AgentEventKind::AssistantContentDelta { content, .. } => {
+                        Some(content.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, "Checking both files.");
+
+            let thinking: Vec<(&str, Option<&str>)> = events
+                .iter()
+                .filter_map(|kind| match kind {
+                    crate::events::AgentEventKind::AssistantThinkingDelta {
+                        content,
+                        part_id,
+                        ..
+                    } => Some((content.as_str(), part_id.as_deref())),
+                    _ => None,
+                })
+                .collect();
+            assert!(!thinking.is_empty(), "thinking deltas must reach the UI");
+            let joined: String = thinking.iter().map(|(content, _)| *content).collect();
+            assert_eq!(joined, "let me look");
+            assert!(
+                thinking.iter().all(|(_, part)| *part == thinking[0].1),
+                "one part id per reasoning item: {thinking:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn anthropic_max_tokens_with_open_tool_block_reaches_output_limit_recovery() {
+            let (state, events, factory) =
+                run_streamed_reply(anthropic_fixture("structured_max_tokens")).await;
+
+            assert!(!has_retry_wait(&events), "a length cut-off must not retry");
+            assert!(factory.provider.attempts.lock().unwrap().is_empty());
+            // `stopped_results` also asserts the stop type is the model token limit.
+            let (_, results) = stopped_results(state);
+            assert_eq!(results.len(), 1, "exactly one result: {results:?}");
+            let text = &results["toolu_cut"];
+            assert!(text.contains("INVALID_JSON"), "{text}");
+            assert!(text.contains("split the write"), "{text}");
+        }
+
+        #[test]
+        fn length_cutoff_is_classified_by_finish_reason_only() {
+            let reply = |finish| LlmResponse::new(String::new(), Vec::new(), None, Some(finish));
+            assert!(reply(FinishReason::Length).is_length_cutoff());
+            assert!(!reply(FinishReason::ToolCalls).is_length_cutoff());
+        }
+
+        fn write_file_tool() -> querymt::chat::Tool {
+            serde_json::from_value(serde_json::json!({
+                "type": "function",
+                "function": {"name": "write_file", "description": "", "parameters": {"type": "object"}}
+            }))
+            .unwrap()
+        }
+
+        /// A model profile for a streaming provider honouring `support`.
+        fn profile_with(
+            support: querymt::chat::GenerationOptionSupport,
+            caps: Option<crate::model_heuristics::OutputCaps>,
+        ) -> Arc<crate::middleware::ModelProfile> {
+            Arc::new(crate::middleware::ModelProfile {
+                caps,
+                capabilities: querymt::chat::ChatCapabilities::NONE
+                    .with_streaming(true)
+                    .with_options(support),
+                ..Default::default()
+            })
+        }
+
+        fn profiled_context(
+            session_id: &str,
+            profile: Arc<crate::middleware::ModelProfile>,
+        ) -> Arc<ConversationContext> {
+            Arc::new(
+                (*crate::test_utils::test_context(session_id, 0))
+                    .clone()
+                    .with_profile(profile),
+            )
+        }
+
+        fn stop_chunks() -> Vec<(u64, Result<StreamChunk, LLMError>)> {
+            vec![(
+                0,
+                Ok(StreamChunk::Done {
+                    finish_reason: FinishReason::Stop,
+                }),
+            )]
+        }
+
+        #[tokio::test]
+        async fn before_llm_call_copies_context_overrides_into_the_request() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
+            let context = Arc::new(
+                (*crate::test_utils::test_context(&exec.session_id, 0))
+                    .clone()
+                    .with_request_overrides(overrides),
+            );
+
+            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+                .await
+                .expect("before llm call");
+            let ExecutionState::CallLlm { request, context } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            assert_eq!(request.options, overrides);
+            assert_eq!(
+                context.profile.capabilities,
+                exec.session_handle.provider().await.unwrap().capabilities(),
+                "successful initialization must replace a stale or empty profile"
+            );
+        }
+
+        #[tokio::test]
+        async fn recovery_cap_is_clamped_after_preparing_the_request() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let mut context = (*crate::test_utils::test_context(&exec.session_id, 0)).clone();
+            context.messages = Arc::from([ChatMessage::user().text("continue the report").build()]);
+            context.request_overrides = querymt::chat::GenerationOptions::NONE
+                .with_max_tokens(u32::MAX)
+                .with_reasoning_effort(querymt::chat::ReasoningEffort::Low);
+            let window = crate::model_info::get_model_info(&context.provider, &context.model)
+                .and_then(|info| info.limits.context)
+                .unwrap_or(u64::from(u32::MAX))
+                .min(u64::from(u32::MAX)) as u32;
+            let state = transition_before_llm_call(&fixture.config, &Arc::new(context), &exec)
+                .await
+                .unwrap();
+            let ExecutionState::CallLlm { request, .. } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            assert!(request.estimated_tokens > 0);
+            assert_eq!(
+                request.options.max_tokens,
+                Some(window - request.estimated_tokens as u32)
+            );
+            assert_eq!(
+                request.options.reasoning_effort,
+                Some(querymt::chat::ReasoningEffort::Low)
+            );
+        }
+
+        #[tokio::test]
+        async fn override_applies_to_exactly_one_request() {
+            let (fixture, factory) = timed_fixture(
+                true,
+                vec![Ok(stop_chunks()), Ok(stop_chunks())],
+                "openai",
+                None,
+            )
+            .await;
+            *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
+            let exec = fixture.execution_context().await;
+            let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
+            let context = Arc::new(
+                (*profiled_context(
+                    &exec.session_id,
+                    profile_with(querymt::chat::GenerationOptionSupport::ALL, None),
+                ))
+                .clone()
+                .with_request_overrides(overrides),
+            );
+            let mut prepared = (*request()).clone();
+            prepared.tools = vec![write_file_tool()].into();
+            prepared.options = overrides;
+
+            let state = transition_call_llm(
+                &fixture.config,
+                &context,
+                &Arc::new(prepared.clone()),
+                &exec,
+            )
+            .await
+            .expect("first request");
+            let ExecutionState::AfterLlm {
+                response,
+                context: next,
+            } = state
+            else {
+                panic!("expected AfterLlm, got {}", state.name());
+            };
+            assert_eq!(response.applied, overrides);
+            assert_eq!(next.last_applied, overrides);
+            assert!(
+                next.request_overrides.is_empty(),
+                "the consumed override must not carry into the next state"
+            );
+
+            // The follow-up request is prepared from the cleared context.
+            prepared.options = next.request_overrides;
+            let state = transition_call_llm(&fixture.config, &next, &Arc::new(prepared), &exec)
+                .await
+                .expect("second request");
+            let ExecutionState::AfterLlm { response, .. } = state else {
+                panic!("expected AfterLlm, got {}", state.name());
+            };
+            assert_eq!(response.applied, querymt::chat::GenerationOptions::NONE);
+
+            assert_eq!(
+                *factory.provider.options_seen.lock().unwrap(),
+                vec![overrides, querymt::chat::GenerationOptions::NONE]
+            );
+        }
+
+        #[tokio::test]
+        async fn override_is_skipped_for_providers_that_do_not_support_it() {
+            let (fixture, factory) =
+                timed_fixture(true, vec![Ok(stop_chunks())], "openai", None).await;
+            // `support` defaults to none.
+            let exec = fixture.execution_context().await;
+            let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let mut prepared = (*request()).clone();
+            prepared.tools = vec![write_file_tool()].into();
+            prepared.options = overrides;
+
+            let state = transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec)
+                .await
+                .expect("request");
+            let ExecutionState::AfterLlm { response, .. } = state else {
+                panic!("expected AfterLlm, got {}", state.name());
+            };
+
+            assert_eq!(
+                *factory.provider.options_seen.lock().unwrap(),
+                vec![querymt::chat::GenerationOptions::NONE],
+                "unsupported overrides must not reach the provider"
+            );
+            assert_eq!(
+                response.applied,
+                querymt::chat::GenerationOptions::NONE,
+                "the response reports what was really sent"
+            );
+        }
+
+        #[tokio::test]
+        async fn session_profile_carries_caps_capabilities_and_effort() {
+            let (fixture, factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
+            factory.binding.lock().unwrap()["reasoning_effort"] = serde_json::json!("high");
+            let exec = fixture.execution_context().await;
+
+            let profile = exec.session_handle.profile().await;
+
+            // The binding's explicit max_tokens is its own ceiling.
+            assert_eq!(
+                profile.caps,
+                Some(crate::model_heuristics::OutputCaps {
+                    initial: 123,
+                    ceiling: 123,
+                })
+            );
+            assert!(profile.capabilities.streaming);
+            assert_eq!(
+                profile.capabilities.options,
+                querymt::chat::GenerationOptionSupport::ALL
+            );
+            assert_eq!(
+                profile.reasoning_effort,
+                Some(querymt::chat::ReasoningEffort::High)
+            );
+        }
+
+        #[tokio::test]
+        async fn model_switch_replaces_the_profile() {
+            let (fixture, factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
+            let before = fixture.execution_context().await;
+            let old = before.session_handle.profile().await;
+            assert!(old.capabilities.options.max_tokens);
+
+            // A switch rebinds the session to another model: the next turn builds a
+            // new handle, and with it a new profile (new caps, new capabilities).
+            *factory.provider.support.lock().unwrap() =
+                querymt::chat::GenerationOptionSupport::NONE;
+            factory.binding.lock().unwrap()["max_tokens"] = serde_json::json!(999);
+            fixture.config.provider.clear_provider_cache().await;
+            let after = fixture.execution_context().await;
+            let new = after.session_handle.profile().await;
+
+            assert!(!Arc::ptr_eq(&old, &new));
+            assert_eq!(
+                new.capabilities.options,
+                querymt::chat::GenerationOptionSupport::NONE
+            );
+            assert_eq!(new.caps.map(|caps| caps.initial), Some(999));
+            // The old turn keeps its own, unchanged profile.
+            assert_eq!(old.caps.map(|caps| caps.initial), Some(123));
+        }
+
+        #[tokio::test]
+        async fn chat_span_records_the_escalated_max_tokens() {
+            let (fixture, factory) = timed_fixture(
+                true,
+                vec![Ok(stop_chunks()), Ok(stop_chunks())],
+                "openai",
+                Some("oci://ghcr.io/querymt/openai:latest"),
+            )
+            .await;
+            let support = querymt::chat::GenerationOptionSupport::ALL;
+            *factory.provider.support.lock().unwrap() = support;
+            let exec = fixture.execution_context().await;
+            let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
+            let profile = profile_with(support, None);
+            let plain = profiled_context(&exec.session_id, profile.clone());
+            let escalated = Arc::new((*plain).clone().with_request_overrides(overrides));
+            let mut prepared = (*request()).clone();
+            prepared.tools = vec![write_file_tool()].into();
+            let plain_request = Arc::new(prepared.clone());
+            prepared.options = overrides;
+            let escalated_request = Arc::new(prepared);
+
+            let (_, spans) = capture(async {
+                transition_call_llm(&fixture.config, &escalated, &escalated_request, &exec)
+                    .await
+                    .expect("escalated request");
+                transition_call_llm(&fixture.config, &plain, &plain_request, &exec)
+                    .await
+                    .expect("plain request");
+            })
+            .await;
+
+            let max_tokens: Vec<_> = spans
+                .iter()
+                .filter(|span| attr(span, "gen_ai.operation.name") == Some(&Value::from("chat")))
+                .map(|span| attr(span, "gen_ai.request.max_tokens").cloned())
+                .collect();
+            assert_eq!(max_tokens.len(), 2);
+            assert!(
+                max_tokens.contains(&Some(Value::I64(64_000))),
+                "{max_tokens:?}"
+            );
+            // The configured value (binding override) returns once the override is spent.
+            assert!(
+                max_tokens.contains(&Some(Value::I64(123))),
+                "{max_tokens:?}"
+            );
+        }
+
+        fn text_reply(text: &str, finish_reason: FinishReason) -> TimedChunks {
+            Ok(vec![
+                (0, Ok(StreamChunk::Text(text.into()))),
+                (0, Ok(StreamChunk::Done { finish_reason })),
+            ])
+        }
+
+        #[tokio::test]
+        async fn escalated_request_uses_the_ceiling_and_history_keeps_only_the_second_reply() {
+            use crate::middleware::MiddlewareDriver;
+
+            let (fixture, factory) = timed_fixture(
+                true,
+                vec![
+                    text_reply("first, cut off", FinishReason::Length),
+                    text_reply("second, complete", FinishReason::Stop),
+                ],
+                "openai",
+                None,
+            )
+            .await;
+            *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
+            let mut exec = fixture.execution_context().await;
+            let middleware = crate::middleware::OutputLimitRecoveryMiddleware::default();
+            let mut prepared = (*request()).clone();
+            prepared.tools = vec![write_file_tool()].into();
+            let context = profiled_context(
+                &exec.session_id,
+                profile_with(
+                    querymt::chat::GenerationOptionSupport::ALL,
+                    Some(crate::model_heuristics::OutputCaps {
+                        initial: 32_000,
+                        ceiling: 128_000,
+                    }),
+                ),
+            );
+
+            // First request: cut off at the initial cap.
+            let state = transition_call_llm(
+                &fixture.config,
+                &context,
+                &Arc::new(prepared.clone()),
+                &exec,
+            )
+            .await
+            .expect("first request");
+            assert_eq!(state.name(), "AfterLlm");
+            let state = middleware
+                .on_after_llm(state, Some(&exec.runtime))
+                .await
+                .expect("middleware");
+            let ExecutionState::BeforeLlmCall { context } = state else {
+                panic!("expected escalation to BeforeLlmCall, got {}", state.name());
+            };
+            assert_eq!(context.request_overrides.max_tokens, Some(128_000));
+
+            // Retry: same request at the ceiling.
+            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+                .await
+                .expect("before llm call");
+            let ExecutionState::CallLlm { context, request } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            // The fixture config has no tools; restore the first request's so the
+            // retry takes the same streaming path.
+            let mut retry = (*request).clone();
+            retry.tools = prepared.tools.clone();
+            let state = transition_call_llm(&fixture.config, &context, &Arc::new(retry), &exec)
+                .await
+                .expect("second request");
+            let state = middleware
+                .on_after_llm(state, Some(&exec.runtime))
+                .await
+                .expect("middleware");
+            let ExecutionState::AfterLlm { response, context } = state else {
+                panic!("expected AfterLlm, got {}", state.name());
+            };
+            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
+                .await
+                .expect("after llm");
+
+            assert_eq!(
+                *factory.provider.options_seen.lock().unwrap(),
+                vec![
+                    querymt::chat::GenerationOptions::NONE,
+                    querymt::chat::GenerationOptions::NONE.with_max_tokens(128_000),
+                ]
+            );
+            let history = state
+                .context()
+                .expect("final state keeps its context")
+                .messages
+                .iter()
+                .map(|message| format!("{message:?}"))
+                .collect::<String>();
+            assert!(history.contains("second, complete"), "{history}");
+            assert!(
+                !history.contains("first, cut off"),
+                "the discarded reply must not reach history: {history}"
+            );
+        }
+
+        fn thinking_reply(finish_reason: FinishReason) -> TimedChunks {
+            Ok(vec![
+                (0, Ok(StreamChunk::Thinking("pondering the file".into()))),
+                (0, Ok(StreamChunk::Done { finish_reason })),
+            ])
+        }
+
+        /// Replays the sequence that motivated output-limit recovery: a
+        /// thinking-only cut-off, an escalation, another cut-off at the
+        /// ceiling, a continuation, and finally a normal reply.
+        #[tokio::test]
+        async fn thinking_only_cutoff_escalates_then_continues_then_succeeds() {
+            use crate::middleware::MiddlewareDriver;
+            use querymt::chat::{GenerationOptions, ReasoningEffort};
+
+            let (fixture, factory) = timed_fixture(
+                true,
+                vec![
+                    thinking_reply(FinishReason::Length),
+                    thinking_reply(FinishReason::Length),
+                    text_reply("done", FinishReason::Stop),
+                ],
+                "openai",
+                None,
+            )
+            .await;
+            *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
+            let mut exec = fixture.execution_context().await;
+            let middleware = crate::middleware::OutputLimitRecoveryMiddleware::default();
+            let tools: Arc<[querymt::chat::Tool]> = vec![write_file_tool()].into();
+            let instruction_marker = "cut off by the output-token limit";
+
+            // Request 1: initial cap, thinking only, cut off -> escalate.
+            let context = profiled_context(
+                &exec.session_id,
+                profile_with(
+                    querymt::chat::GenerationOptionSupport::ALL,
+                    Some(crate::model_heuristics::OutputCaps {
+                        initial: 32_000,
+                        ceiling: 128_000,
+                    }),
+                ),
+            );
+            let mut prepared = (*request()).clone();
+            prepared.tools = tools.clone();
+            let state = transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec)
+                .await
+                .expect("request 1");
+            let state = middleware
+                .on_after_llm(state, Some(&exec.runtime))
+                .await
+                .expect("middleware 1");
+            let ExecutionState::BeforeLlmCall { context } = state else {
+                panic!("expected escalation, got {}", state.name());
+            };
+            assert_eq!(context.request_overrides.max_tokens, Some(128_000));
+
+            // Request 2: ceiling, thinking only again -> not escalated twice, stops.
+            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+                .await
+                .expect("before 2");
+            let ExecutionState::CallLlm { context, request } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            let mut retry = (*request).clone();
+            retry.tools = tools.clone();
+            let state = transition_call_llm(&fixture.config, &context, &Arc::new(retry), &exec)
+                .await
+                .expect("request 2");
+            let state = middleware
+                .on_after_llm(state, Some(&exec.runtime))
+                .await
+                .expect("middleware 2");
+            let ExecutionState::AfterLlm { response, context } = state else {
+                panic!("expected AfterLlm, got {}", state.name());
+            };
+            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
+                .await
+                .expect("after 2");
+            assert!(
+                matches!(
+                    state,
+                    ExecutionState::Stopped {
+                        stop_type: StopType::ModelTokenLimit,
+                        ..
+                    }
+                ),
+                "got {}",
+                state.name()
+            );
+
+            // Stop -> continuation with instruction, ceiling and lowered effort.
+            let state = middleware
+                .on_stopped(state, Some(&exec.runtime))
+                .await
+                .expect("on_stopped");
+            let ExecutionState::BeforeLlmCall { context } = state else {
+                panic!("expected continuation, got {}", state.name());
+            };
+            assert_eq!(
+                context.request_overrides,
+                GenerationOptions::NONE
+                    .with_max_tokens(128_000)
+                    .with_reasoning_effort(ReasoningEffort::Medium)
+            );
+
+            // Request 3: carries the instruction and succeeds.
+            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+                .await
+                .expect("before 3");
+            let ExecutionState::CallLlm { context, request } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            assert!(
+                request
+                    .messages
+                    .iter()
+                    .any(|message| format!("{message:?}").contains(instruction_marker)),
+                "continuation request must include the instruction"
+            );
+            let mut last = (*request).clone();
+            last.tools = tools;
+            let state = transition_call_llm(&fixture.config, &context, &Arc::new(last), &exec)
+                .await
+                .expect("request 3");
+            let state = middleware
+                .on_after_llm(state, Some(&exec.runtime))
+                .await
+                .expect("middleware 3");
+            let ExecutionState::AfterLlm { response, context } = state else {
+                panic!("expected AfterLlm, got {}", state.name());
+            };
+            assert!(
+                context
+                    .fragments
+                    .iter()
+                    .all(|f| f.key != "output_limit_recovery"),
+                "instruction must be gone after the normal reply"
+            );
+            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
+                .await
+                .expect("after 3");
+
+            assert_eq!(state.name(), "Complete");
+            assert_eq!(
+                *factory.provider.options_seen.lock().unwrap(),
+                vec![
+                    GenerationOptions::NONE,
+                    GenerationOptions::NONE.with_max_tokens(128_000),
+                    GenerationOptions::NONE
+                        .with_max_tokens(128_000)
+                        .with_reasoning_effort(ReasoningEffort::Medium),
+                ]
+            );
+            let history = state
+                .context()
+                .expect("final context")
+                .messages
+                .iter()
+                .map(|message| format!("{message:?}"))
+                .collect::<String>();
+            assert!(history.contains("done"), "{history}");
+            assert!(
+                !history.contains("pondering the file"),
+                "thinking-only replies must not be stored: {history}"
+            );
+        }
+
+        /// One model step as the execution loop runs it: step-start middleware,
+        /// request preparation, the call, and after-llm middleware. Asserts the
+        /// prepared request answers every tool call.
+        async fn model_step(
+            config: &Arc<AgentConfig>,
+            exec: &ExecutionContext,
+            middleware: &crate::middleware::OutputLimitRecoveryMiddleware,
+            tools: &Arc<[querymt::chat::Tool]>,
+            context: Arc<crate::middleware::ConversationContext>,
+        ) -> ExecutionState {
+            use crate::middleware::MiddlewareDriver;
+            let state = middleware
+                .on_step_start(ExecutionState::BeforeLlmCall { context }, None)
+                .await
+                .unwrap();
+            let ExecutionState::BeforeLlmCall { context } = state else {
+                panic!("expected BeforeLlmCall");
+            };
+            let state = transition_before_llm_call(config, &context, exec)
+                .await
+                .expect("before llm call");
+            let ExecutionState::CallLlm { context, request } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            let mut probe = request.messages.to_vec();
+            assert!(
+                crate::model::answer_unanswered_tool_calls(&mut probe).is_empty(),
+                "request must answer every call"
+            );
+            let mut request = (*request).clone();
+            request.tools = tools.clone();
+            let state = transition_call_llm(config, &context, &Arc::new(request), exec)
+                .await
+                .expect("call llm");
+            middleware.on_after_llm(state, None).await.unwrap()
+        }
+
+        /// Replays session 01a16d18: escalation succeeds, a later step of the
+        /// same turn is cut off inside a flushed (invalid) `write_file`, and
+        /// the continuation must keep the escalated cap and answer the call.
+        #[tokio::test]
+        async fn later_cutoff_in_an_escalated_turn_keeps_the_cap_and_answers_the_call() {
+            use crate::middleware::MiddlewareDriver;
+            use querymt::chat::GenerationOptions;
+
+            let (fixture, factory) = timed_fixture(
+                true,
+                vec![
+                    text_reply("first, cut off", FinishReason::Length),
+                    text_reply("researching", FinishReason::Stop),
+                    Ok(vec![
+                        (0, Ok(StreamChunk::Text("Writing reconcile.rs now.".into()))),
+                        (
+                            0,
+                            Ok(StreamChunk::ToolUseStart {
+                                index: 1,
+                                id: "toolu_cut".into(),
+                                name: "write_file".into(),
+                            }),
+                        ),
+                        (
+                            0,
+                            Ok(flushed_call(
+                                1,
+                                "toolu_cut",
+                                r#"{"path": "reconcile.rs""#,
+                                true,
+                            )),
+                        ),
+                        (
+                            0,
+                            Ok(StreamChunk::Done {
+                                finish_reason: FinishReason::Length,
+                            }),
+                        ),
+                    ]),
+                    text_reply("continued", FinishReason::Stop),
+                ],
+                "openai",
+                None,
+            )
+            .await;
+            *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
+            let mut exec = fixture.execution_context().await;
+            let middleware = crate::middleware::OutputLimitRecoveryMiddleware::default();
+            let tools: Arc<[querymt::chat::Tool]> = vec![write_file_tool()].into();
+            let context = profiled_context(
+                &exec.session_id,
+                profile_with(
+                    querymt::chat::GenerationOptionSupport::ALL,
+                    Some(crate::model_heuristics::OutputCaps {
+                        initial: 32_000,
+                        ceiling: 128_000,
+                    }),
+                ),
+            );
+
+            let config = fixture.config.clone();
+            let mw = &middleware;
+
+            // 1: cut off at 32k -> escalate.
+            let ExecutionState::BeforeLlmCall { context } =
+                model_step(&config, &exec, mw, &tools, context).await
+            else {
+                panic!("expected escalation");
+            };
+            // 2: escalated retry succeeds.
+            let ExecutionState::AfterLlm { response, context } =
+                model_step(&config, &exec, mw, &tools, context).await
+            else {
+                panic!("expected AfterLlm");
+            };
+            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
+                .await
+                .unwrap();
+            let context = state.context().expect("context").clone();
+            // 3: a later step of the same turn starts without overrides, is sent at
+            // 128k, and is cut off inside a flushed invalid call.
+            assert!(context.request_overrides.is_empty());
+            let ExecutionState::AfterLlm { response, context } =
+                model_step(&config, &exec, mw, &tools, context).await
+            else {
+                panic!("a second cut-off must not escalate again");
+            };
+            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
+                .await
+                .unwrap();
+            assert!(matches!(
+                state,
+                ExecutionState::Stopped {
+                    stop_type: StopType::ModelTokenLimit,
+                    ..
+                }
+            ));
+            // 4: continuation at the escalated cap, with the call answered.
+            let ExecutionState::BeforeLlmCall { context } =
+                middleware.on_stopped(state, None).await.unwrap()
+            else {
+                panic!("expected continuation");
+            };
+            let ExecutionState::AfterLlm { .. } =
+                model_step(&config, &exec, mw, &tools, context).await
+            else {
+                panic!("expected AfterLlm");
+            };
+
+            let max_tokens: Vec<_> = factory
+                .provider
+                .options_seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|options: &GenerationOptions| options.max_tokens)
+                .collect();
+            assert_eq!(
+                max_tokens,
+                vec![None, Some(128_000), Some(128_000), Some(128_000)]
+            );
+        }
+
+        fn reasoning_item(text: &str) -> ChatOutputItem {
+            ChatOutputItem::Reasoning(querymt::chat::ChatReasoningItem {
+                id: None,
+                summary: Vec::new(),
+                content: vec![querymt::chat::ChatReasoningPart::text(text.to_string())],
+                encrypted_content: None,
+                signature: None,
+                status: None,
+                extensions: Default::default(),
+            })
+        }
+
+        /// Feed a `Length` reply with the given items through `transition_after_llm`.
+        /// Returns the resulting state and whether `AssistantMessageStored` was emitted.
+        async fn after_length_reply(
+            items: Vec<ChatOutputItem>,
+            content: &str,
+            thinking: Option<&str>,
+        ) -> (ExecutionState, bool) {
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(
+                MockLlmProvider::new(),
+                vec![],
+            ))
+            .await;
+            let mut events = fixture.config.subscribe_events();
+            let mut exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let usage = Usage {
+                input_tokens: 10,
+                output_tokens: 32_000,
+                ..Usage::default()
+            };
+            let output = ChatOutput {
+                items,
+                usage: Some(usage.clone()),
+                finish_reason: Some(FinishReason::Length),
+                ..ChatOutput::default()
+            };
+            let response = Arc::new(
+                LlmResponse::new(
+                    content.to_string(),
+                    Vec::new(),
+                    Some(usage),
+                    Some(FinishReason::Length),
+                )
+                .with_thinking(thinking.map(str::to_owned))
+                .with_output(Some(output)),
+            );
+
+            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
+                .await
+                .expect("after llm");
+
+            let mut stored = false;
+            while let Ok(Ok(envelope)) =
+                tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            {
+                stored |= matches!(
+                    envelope.kind(),
+                    crate::events::AgentEventKind::AssistantMessageStored { .. }
+                );
+            }
+            (state, stored)
+        }
+
+        #[tokio::test]
+        async fn thinking_only_length_reply_is_not_stored_but_is_counted() {
+            let (state, stored) =
+                after_length_reply(vec![reasoning_item("pondering")], "", Some("pondering")).await;
+
+            assert!(
+                !stored,
+                "no AssistantMessageStored for a thinking-only cut-off"
+            );
+            let ExecutionState::Stopped {
+                stop_type, context, ..
+            } = state
+            else {
+                panic!("expected Stopped, got {}", state.name());
+            };
+            assert_eq!(stop_type, StopType::ModelTokenLimit);
+            let context = context.expect("context kept");
+            assert!(
+                context.messages.is_empty(),
+                "the reply must not enter history"
+            );
+            assert_eq!(context.stats.steps, 1);
+            assert_eq!(context.stats.total_output_tokens, 32_000);
+            assert_eq!(context.stats.total_input_tokens, 10);
+        }
+
+        #[tokio::test]
+        async fn mixed_length_reply_with_text_is_still_stored() {
+            let message = ChatOutputItem::Message(querymt::chat::ChatMessageItem {
+                id: None,
+                role: ChatRole::Assistant,
+                phase: None,
+                status: None,
+                parts: vec![querymt::chat::ChatMessagePart::Text {
+                    text: "partial".into(),
+                    annotations: Vec::new(),
+                    extensions: Default::default(),
+                }],
+                extensions: Default::default(),
+            });
+            let (state, stored) = after_length_reply(
+                vec![reasoning_item("pondering"), message],
+                "partial",
+                Some("pondering"),
+            )
+            .await;
+
+            assert!(stored, "a reply with visible text is kept");
+            let ExecutionState::Stopped {
+                stop_type, context, ..
+            } = state
+            else {
+                panic!("expected Stopped, got {}", state.name());
+            };
+            assert_eq!(stop_type, StopType::ModelTokenLimit);
+            assert_eq!(context.expect("context kept").messages.len(), 1);
+        }
+
+        #[test]
+        fn thinking_only_classification_requires_length_and_no_visible_output() {
+            let reasoning_only = ChatOutput {
+                items: vec![reasoning_item("x")],
+                ..ChatOutput::default()
+            };
+            let cut = |finish| {
+                LlmResponse::new(String::new(), Vec::new(), None, Some(finish))
+                    .with_output(Some(reasoning_only.clone()))
+            };
+            assert!(cut(FinishReason::Length).is_thinking_only_length_cutoff());
+            assert!(!cut(FinishReason::Stop).is_thinking_only_length_cutoff());
+
+            let with_call = LlmResponse::new(
+                String::new(),
+                vec![middleware_call("call_1", "{}")],
+                None,
+                Some(FinishReason::Length),
+            );
+            assert!(!with_call.is_thinking_only_length_cutoff());
+        }
+
+        #[tokio::test]
+        async fn non_length_incomplete_tool_call_keeps_the_generic_skip_text() {
+            let text = skipped_call_text(Some(FinishReason::ContentFilter), "detail");
+            assert!(text.contains("response was incomplete"));
+            assert!(!text.contains("split the write"));
         }
 
         #[tokio::test]
@@ -2669,6 +4392,16 @@ mod tests {
                             attr(chat, "gen_ai.response.time_to_first_chunk").is_some(),
                             streaming
                         );
+                        // TTFT and TTFB use the names Otelite reads, never the server-side spec name.
+                        assert_eq!(attr(chat, "llm.time_to_first_token").is_some(), streaming);
+                        assert_eq!(attr(chat, "llm.time_to_first_byte").is_some(), streaming);
+                        assert!(attr(chat, "gen_ai.server.time_to_first_token").is_none());
+                        if let (Some(Value::F64(chunk)), Some(Value::F64(token))) = (
+                            attr(chat, "gen_ai.response.time_to_first_chunk"),
+                            attr(chat, "llm.time_to_first_token"),
+                        ) {
+                            assert!(token >= chunk, "token={token} chunk={chunk}");
+                        }
                         assert_eq!(
                             attr(chat, "gen_ai.request.stream"),
                             streaming.then_some(&Value::Bool(true))
@@ -2708,6 +4441,82 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn cloned_session_handles_share_one_provider_build() {
+            let (fixture, factory) = timed_fixture(
+                true,
+                vec![],
+                "openai",
+                Some("oci://ghcr.io/querymt/openai:latest"),
+            )
+            .await;
+            let exec = fixture.execution_context().await;
+            assert_eq!(factory.resolutions.load(Ordering::Relaxed), 0);
+
+            // The state machine clones the handle on every step; each clone must
+            // reuse the turn's provider instead of rebuilding it.
+            let first = exec.session_handle.provider().await.unwrap();
+            for _ in 0..3 {
+                let clone = exec.session_handle.clone();
+                let again = clone.provider().await.unwrap();
+                assert!(Arc::ptr_eq(&first, &again));
+            }
+            assert_eq!(factory.resolutions.load(Ordering::Relaxed), 1);
+
+            // A clone taken before the first build shares the same cell.
+            let (fixture, factory) = timed_fixture(
+                true,
+                vec![],
+                "openai",
+                Some("oci://ghcr.io/querymt/openai:latest"),
+            )
+            .await;
+            let exec = fixture.execution_context().await;
+            let early_clone = exec.session_handle.clone();
+            let from_clone = early_clone.provider().await.unwrap();
+            let from_original = exec.session_handle.provider().await.unwrap();
+            assert!(Arc::ptr_eq(&from_clone, &from_original));
+            assert_eq!(factory.resolutions.load(Ordering::Relaxed), 1);
+        }
+
+        #[tokio::test]
+        async fn pre_request_phases_are_traced_and_provider_init_is_not_a_chat_retry() {
+            let (fixture, _factory) = timed_fixture(
+                true,
+                vec![],
+                "openai",
+                Some("oci://ghcr.io/querymt/openai:latest"),
+            )
+            .await;
+            let exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let (_, spans) = capture(async {
+                let _ = transition_before_llm_call(&fixture.config, &context, &exec).await;
+            })
+            .await;
+            let names: Vec<&str> = spans.iter().map(|s| s.name.as_ref()).collect();
+            for expected in [
+                "agent.transition.before_llm_call",
+                "agent.provider.build",
+                "agent.tools.collect",
+                "agent.hooks.context",
+                "agent.request.cache_breakpoints",
+            ] {
+                assert!(names.contains(&expected), "missing {expected}: {names:?}");
+            }
+            let init = spans
+                .iter()
+                .find(|s| s.name == "agent.llm.call_with_retry")
+                .expect("provider init retry span");
+            assert_eq!(attr(init, "operation"), Some(&Value::from("provider_init")));
+            let tools = spans
+                .iter()
+                .find(|s| s.name == "agent.tools.collect")
+                .unwrap();
+            assert!(attr(tools, "tool_count").is_some());
+            assert!(attr(tools, "tools_bytes").is_some());
+        }
+
+        #[tokio::test]
         async fn genai_nonstream_retry_exports_one_logical_chat_and_typed_totals() {
             let attempts = Arc::new(AtomicUsize::new(0));
             let counter = attempts.clone();
@@ -2733,6 +4542,7 @@ mod tests {
                     cache_read: 5,
                     cache_write: 7,
                     reasoning_tokens: 9,
+                    cache_write_tiers: None,
                 });
                 output.provenance = Some(ChatOutputProvenance {
                     provider: "codex".into(),
@@ -3261,6 +5071,7 @@ mod tests {
                 name: "lookup".into(),
                 arguments: arguments.into(),
             },
+            invalid_input: false,
         }
     }
 
@@ -3344,11 +5155,76 @@ mod tests {
                     name: tc.function.name,
                     arguments: tc.function.arguments,
                 },
+                invalid_input: false,
             })
             .collect();
         let (executable, gated) = gate_function_calls_for_execution(&middleware_calls);
         assert!(executable.is_empty(), "invalid call must not execute");
         assert_eq!(gated.len(), 1);
+    }
+
+    /// Assemble a stream the way the provider emits it, then project to middleware calls.
+    fn assembled_calls(chunks: Vec<querymt::chat::StreamChunk>) -> Vec<MiddlewareToolCall> {
+        let mut accumulator = querymt::chat::streaming::ChatStreamAccumulator::new();
+        for chunk in &chunks {
+            accumulator.push(chunk).unwrap();
+        }
+        middleware_calls_from_output(&accumulator.output())
+    }
+
+    fn complete_chunk(id: &str, arguments: &str, invalid: bool) -> querymt::chat::StreamChunk {
+        let mut extensions = querymt::chat::Extensions::new();
+        if invalid {
+            extensions.insert(
+                querymt::chat::INVALID_INPUT_EXTENSION.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        querymt::chat::StreamChunk::ToolUseComplete {
+            index: 0,
+            tool_call: querymt::ToolCall {
+                id: id.into(),
+                call_type: "function".into(),
+                function: querymt::FunctionCall {
+                    name: "lookup".into(),
+                    arguments: arguments.into(),
+                },
+            },
+            extensions,
+        }
+    }
+
+    #[test]
+    fn invalid_marker_survives_assembly_even_when_the_buffer_is_valid_json() {
+        let calls = assembled_calls(vec![complete_chunk("c1", r#"{"q":1}"#, true)]);
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].invalid_input,
+            "marker carried onto middleware call"
+        );
+        assert_eq!(
+            calls[0].function.arguments, r#"{"q":1}"#,
+            "raw arguments kept"
+        );
+
+        // The gate rejects it with one INVALID_JSON result and does not dispatch it.
+        let (executable, gated) = gate_function_calls_for_execution(&calls);
+        assert!(executable.is_empty());
+        assert_eq!(gated.len(), 1);
+        assert!(gated[0].is_error);
+    }
+
+    #[test]
+    fn unmarked_valid_call_is_executable_and_marker_is_per_call() {
+        let calls = assembled_calls(vec![
+            complete_chunk("ok", r#"{"q":1}"#, false),
+            complete_chunk("bad", r#"{"q":1}"#, true),
+        ]);
+        let (executable, gated) = gate_function_calls_for_execution(&calls);
+        assert_eq!(executable.len(), 1);
+        assert_eq!(executable[0].id, "ok");
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0].call_id, "bad");
     }
 
     // ── map_failed_llm_call ───────────────────────────────────────────────────
@@ -3529,6 +5405,1009 @@ mod tests {
                 assert!(ttl_seconds.is_none(), "ttl should be None");
             }
             other => panic!("expected Ephemeral cache hint, got: {:?}", other),
+        }
+    }
+
+    mod cost_accounting_tests {
+        use super::*;
+        use crate::middleware::AgentStats;
+        use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
+        use querymt::Usage;
+        use querymt::chat::{ChatOutput, FinishReason};
+        use querymt::providers::{ModelInfo, ModelPricing, ProviderInfo, ProvidersRegistry};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Serializes mutation of the process-wide provider-cache location.
+        pub(super) static CACHE_ENV_LOCK: tokio::sync::Mutex<()> =
+            tokio::sync::Mutex::const_new(());
+
+        /// Points the provider cache at a temporary registry that prices
+        /// `mock/mock-model`, so no user cache or network fetch is involved.
+        pub(super) struct InjectedPricing {
+            _dir: tempfile::TempDir,
+            previous: Option<std::ffi::OsString>,
+        }
+
+        impl InjectedPricing {
+            pub(super) fn install(pricing: ModelPricing) -> Self {
+                Self::install_for("mock", pricing)
+            }
+
+            pub(super) fn install_for(provider_id: &str, pricing: ModelPricing) -> Self {
+                let dir = tempfile::TempDir::new().unwrap();
+                let model = ModelInfo {
+                    id: "mock-model".into(),
+                    name: "mock-model".into(),
+                    pricing,
+                    ..Default::default()
+                };
+                let provider = ProviderInfo {
+                    id: provider_id.into(),
+                    name: provider_id.into(),
+                    models: [("mock-model".to_string(), model)].into(),
+                    ..Default::default()
+                };
+                let registry = ProvidersRegistry {
+                    providers: [(provider_id.to_string(), provider)].into(),
+                };
+                std::fs::write(
+                    dir.path().join("models.dev.json"),
+                    serde_json::to_string(&registry).unwrap(),
+                )
+                .unwrap();
+                let previous = std::env::var_os("QMT_PROVIDER_CACHE_DIR");
+                // SAFETY: test-only mutation serialized by CACHE_ENV_LOCK and
+                // restored in Drop.
+                unsafe { std::env::set_var("QMT_PROVIDER_CACHE_DIR", dir.path()) };
+                Self {
+                    _dir: dir,
+                    previous,
+                }
+            }
+        }
+
+        impl Drop for InjectedPricing {
+            fn drop(&mut self) {
+                // SAFETY: see `install`.
+                unsafe {
+                    match self.previous.take() {
+                        Some(value) => std::env::set_var("QMT_PROVIDER_CACHE_DIR", value),
+                        None => std::env::remove_var("QMT_PROVIDER_CACHE_DIR"),
+                    }
+                }
+            }
+        }
+
+        fn usage_response(usage: Usage) -> ChatOutput {
+            let mut output = ChatOutput::from_projections(
+                None,
+                Some("ok".into()),
+                None,
+                None,
+                Some(FinishReason::Stop),
+            );
+            output.usage = Some(usage);
+            output
+        }
+
+        async fn request_end_costs(
+            events: &mut tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+        ) -> (Option<f64>, Option<f64>) {
+            loop {
+                let envelope = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                    .await
+                    .expect("timed out waiting for LlmRequestEnd")
+                    .expect("event channel closed");
+                if let AgentEventKind::LlmRequestEnd {
+                    cost_usd,
+                    cumulative_cost_usd,
+                    ..
+                } = envelope.kind()
+                {
+                    return (*cost_usd, *cumulative_cost_usd);
+                }
+            }
+        }
+
+        /// Records a mismatch instead of panicking so one run reports every
+        /// accounting defect.
+        fn expect_usd(failures: &mut Vec<String>, actual: Option<f64>, expected: f64, what: &str) {
+            match actual {
+                Some(actual) if (actual - expected).abs() < 1e-9 => {}
+                other => failures.push(format!("{what}: expected {expected}, got {other:?}")),
+            }
+        }
+
+        /// Rates per million tokens: input 3, output 15, cache read 0.3,
+        /// aggregate cache write 3.75.
+        #[tokio::test]
+        async fn request_end_costs_price_reasoning_once_and_keep_cache_and_history() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install(ModelPricing {
+                input: Some(3.0),
+                output: Some(15.0),
+                cache_read: Some(0.3),
+                cache_write: Some(3.75),
+                ..Default::default()
+            });
+
+            let call = Arc::new(AtomicUsize::new(0));
+            let counter = call.clone();
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().returning(move |_| {
+                Ok(usage_response(
+                    match counter.fetch_add(1, Ordering::SeqCst) {
+                        0 => Usage {
+                            input_tokens: 1_000,
+                            output_tokens: 100,
+                            reasoning_tokens: 900,
+                            cache_read: 2_000,
+                            cache_write: 500,
+                            cache_write_tiers: None,
+                        },
+                        _ => Usage {
+                            input_tokens: 200,
+                            output_tokens: 100,
+                            reasoning_tokens: 0,
+                            cache_read: 3_000,
+                            cache_write: 0,
+                            cache_write_tiers: None,
+                        },
+                    },
+                ))
+            });
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            let mut events = fixture.config.subscribe_events();
+            let request = Arc::new(PreparedModelRequest {
+                messages: vec![ChatMessage::user().text("hi").build()].into(),
+                tools: Arc::from([]),
+                estimated_tokens: 1,
+                options: querymt::chat::GenerationOptions::NONE,
+            });
+            let context_with = |stats: AgentStats| {
+                Arc::new(ConversationContext::new(
+                    exec.session_id.as_str().into(),
+                    Arc::from([]),
+                    Arc::new(stats),
+                    "mock".into(),
+                    "mock-model".into(),
+                ))
+            };
+
+            // First request: 1000 input + (100 + 900) output + 2000 reads + 500 writes.
+            transition_call_llm(
+                &fixture.config,
+                &context_with(AgentStats::default()),
+                &request,
+                &exec,
+            )
+            .await
+            .unwrap();
+            let first = request_end_costs(&mut events).await;
+            let first_cost = (3_000.0 + 15_000.0 + 600.0 + 1_875.0) / 1e6;
+            let mut failures = Vec::new();
+            expect_usd(
+                &mut failures,
+                first.0,
+                first_cost,
+                "first request cost includes cache",
+            );
+            expect_usd(
+                &mut failures,
+                first.1,
+                first_cost,
+                "first cumulative prices reasoning once, not twice",
+            );
+
+            // Second request starts from the stats the first request leaves behind.
+            let after_first = AgentStats {
+                total_input_tokens: 1_000,
+                total_output_tokens: 100,
+                reasoning_tokens: 900,
+                cache_read_tokens: 2_000,
+                cache_write_tokens: 500,
+                ..Default::default()
+            };
+            transition_call_llm(&fixture.config, &context_with(after_first), &request, &exec)
+                .await
+                .unwrap();
+            let second = request_end_costs(&mut events).await;
+            let second_cost = (600.0 + 1_500.0 + 900.0) / 1e6;
+            expect_usd(
+                &mut failures,
+                second.0,
+                second_cost,
+                "second request cost includes cache",
+            );
+            expect_usd(
+                &mut failures,
+                second.1,
+                first_cost + second_cost,
+                "second cumulative keeps earlier reasoning and cache charges",
+            );
+            assert!(
+                failures.is_empty(),
+                "accounting defects:\n{}",
+                failures.join("\n")
+            );
+        }
+    }
+
+    mod attempt_accounting_tests {
+        use super::cost_accounting_tests::{CACHE_ENV_LOCK, InjectedPricing};
+        use super::genai_trace_tests::{TimedChunks, timed_fixture};
+        use super::*;
+        use crate::accounting::{AccountingReason, AttemptOutcome, UsageDisposition};
+        use crate::session::backend::StorageBackend;
+        use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
+        use querymt::Usage;
+        use querymt::providers::ModelPricing;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn pricing() -> ModelPricing {
+            ModelPricing {
+                input: Some(3.0),
+                output: Some(15.0),
+                cache_read: Some(0.3),
+                cache_write: Some(3.75),
+                ..Default::default()
+            }
+        }
+
+        fn cost_value() -> f64 {
+            cost()
+        }
+
+        fn usage() -> Usage {
+            Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                reasoning_tokens: 5,
+                cache_read: 50,
+                cache_write: 20,
+                cache_write_tiers: None,
+            }
+        }
+
+        fn cost() -> f64 {
+            (100.0 * 3.0 + 15.0 * 15.0 + 50.0 * 0.3 + 20.0 * 3.75) / 1e6
+        }
+
+        fn output() -> ChatOutput {
+            let mut out = ChatOutput::from_projections(
+                None,
+                Some("ok".into()),
+                None,
+                None,
+                Some(FinishReason::Stop),
+            );
+            out.usage = Some(usage());
+            out
+        }
+
+        fn prepared(with_tools: bool) -> Arc<PreparedModelRequest> {
+            let tools: Vec<querymt::chat::Tool> = if with_tools {
+                vec![
+                    serde_json::from_value(serde_json::json!({"type":"function","function":{
+                        "name":"safe","description":"","parameters":{"type":"object"}}}))
+                    .unwrap(),
+                ]
+            } else {
+                Vec::new()
+            };
+            Arc::new(PreparedModelRequest {
+                messages: vec![ChatMessage::user().text("hi").build()].into(),
+                tools: tools.into(),
+                estimated_tokens: 1,
+                options: querymt::chat::GenerationOptions::NONE,
+            })
+        }
+
+        fn context(exec: &ExecutionContext, provider: &str) -> Arc<ConversationContext> {
+            Arc::new(ConversationContext::new(
+                exec.session_id.as_str().into(),
+                Arc::from([]),
+                Arc::new(crate::middleware::AgentStats::default()),
+                provider.into(),
+                "mock-model".into(),
+            ))
+        }
+
+        /// Accounting records persisted for the session, in journal order.
+        async fn ledger(agent: &TestAgent, session_id: &str) -> Vec<AgentEventKind> {
+            agent
+                .storage
+                .event_journal()
+                .load_session_stream(session_id, None, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|e| e.kind)
+                .filter(|k| {
+                    matches!(
+                        k,
+                        AgentEventKind::LlmAttemptStarted { .. }
+                            | AgentEventKind::LlmAttemptSettled { .. }
+                    )
+                })
+                .collect()
+        }
+
+        fn settlements(ledger: &[AgentEventKind]) -> Vec<&crate::accounting::AttemptSettlement> {
+            ledger
+                .iter()
+                .filter_map(|k| match k {
+                    AgentEventKind::LlmAttemptSettled { settlement } => Some(settlement),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn starts(ledger: &[AgentEventKind]) -> usize {
+            ledger
+                .iter()
+                .filter(|k| matches!(k, AgentEventKind::LlmAttemptStarted { .. }))
+                .count()
+        }
+
+        async fn session_totals(exec: &ExecutionContext) -> crate::accounting::ScopeTotals {
+            exec.cycle_accounting
+                .get()
+                .expect("cycle accounting is created on first dispatch")
+                .session_totals()
+        }
+
+        fn rate_limited() -> LLMError {
+            LLMError::RateLimited {
+                message: "slow down".into(),
+                retry_after_secs: Some(0),
+            }
+        }
+
+        #[tokio::test]
+        async fn non_streaming_retry_records_two_attempts_and_prices_only_the_success() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install(pricing());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = calls.clone();
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().returning(move |_| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(rate_limited())
+                } else {
+                    Ok(output())
+                }
+            });
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "mock"),
+                &prepared(false),
+                &exec,
+            )
+            .await
+            .unwrap();
+
+            let ledger = ledger(&fixture, &exec.session_id).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(starts(&ledger), 2, "each retry is its own attempt");
+            let settled = settlements(&ledger);
+            assert_eq!(settled.len(), 2);
+            assert_eq!(settled[0].disposition, UsageDisposition::NotBillable);
+            assert_eq!(settled[0].attempt.attempt_index, 0);
+            assert_eq!(settled[1].disposition, UsageDisposition::Final);
+            assert_eq!(settled[1].attempt.attempt_index, 1);
+            assert_eq!(
+                settled[0].attempt.operation_id,
+                settled[1].attempt.operation_id
+            );
+            assert_ne!(settled[0].attempt.attempt_id, settled[1].attempt.attempt_id);
+
+            let totals = session_totals(&exec).await;
+            assert_eq!(totals.priced_attempts, 1);
+            assert_eq!(totals.unresolved_attempts, 0);
+            assert!((totals.complete_total_usd().unwrap() - cost()).abs() < 1e-12);
+        }
+
+        #[tokio::test]
+        async fn non_streaming_with_tools_is_recorded_on_the_same_boundary() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install(pricing());
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat_with_tools().returning(|_, _| Ok(output()));
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "mock"),
+                &prepared(true),
+                &exec,
+            )
+            .await
+            .unwrap();
+            let totals = session_totals(&exec).await;
+            assert!((totals.complete_total_usd().unwrap() - cost()).abs() < 1e-12);
+        }
+
+        #[tokio::test]
+        async fn unconfirmed_failure_stays_uncertain_and_confirmed_rejection_does_not() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install(pricing());
+            for (error, uncertain) in [
+                (LLMError::ProviderError("connection reset".into()), true),
+                (LLMError::AuthError("bad key".into()), false),
+            ] {
+                let mut mock = MockLlmProvider::new();
+                let message = error.to_string();
+                mock.expect_chat().returning(move |_| {
+                    Err(if uncertain {
+                        LLMError::ProviderError(message.clone())
+                    } else {
+                        LLMError::AuthError(message.clone())
+                    })
+                });
+                let fixture =
+                    TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+                let exec = fixture.execution_context().await;
+                let result = transition_call_llm(
+                    &fixture.config,
+                    &context(&exec, "mock"),
+                    &prepared(false),
+                    &exec,
+                )
+                .await;
+                assert!(result.is_err());
+                let totals = session_totals(&exec).await;
+                assert_eq!(totals.unresolved_attempts, 0, "failure is settled");
+                // An unconfirmed failure is a metered attempt with unknown
+                // cost (incomplete); a confirmed rejection adds nothing.
+                assert_eq!(totals.priced_attempts, u32::from(uncertain));
+                assert_eq!(totals.incomplete_attempts, u32::from(uncertain));
+                assert_eq!(totals.known_subtotal_usd, 0.0);
+                assert_eq!(totals.complete_total_usd(), None);
+                assert_eq!(
+                    totals
+                        .reasons()
+                        .contains(&AccountingReason::UsageUnavailable),
+                    uncertain
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn cancelled_before_dispatch_creates_no_paid_attempt() {
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().times(0);
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            exec.cancellation_token.cancel();
+            let state = transition_call_llm(
+                &fixture.config,
+                &context(&exec, "mock"),
+                &prepared(false),
+                &exec,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(state, ExecutionState::Cancelled));
+            assert!(ledger(&fixture, &exec.session_id).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn budget_refusal_ends_the_main_path_as_a_price_limit_stop() {
+            for with_tools in [false, true] {
+                let mut mock = MockLlmProvider::new();
+                mock.expect_chat().times(0);
+                mock.expect_chat_with_tools().times(0);
+                let fixture =
+                    TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+                // A zero cap is already reached by a cycle with no spend.
+                let mut config = (*fixture.config).clone();
+                config
+                    .middleware_drivers
+                    .push(Arc::new(crate::middleware::LimitsMiddleware::new(
+                        crate::middleware::LimitsConfig::default().max_price_usd(0.0),
+                    )));
+                let exec = fixture.execution_context().await;
+                let state = transition_call_llm(
+                    &config,
+                    &context(&exec, "mock"),
+                    &prepared(with_tools),
+                    &exec,
+                )
+                .await
+                .expect("a refused dispatch is a stop, not an error");
+                let ExecutionState::Stopped {
+                    stop_type, message, ..
+                } = state
+                else {
+                    panic!("expected a price-limit stop, got {state:?}");
+                };
+                assert_eq!(stop_type, StopType::PriceLimit, "tools={with_tools}");
+                assert!(message.contains("Price limit reached"), "{message}");
+                assert!(
+                    ledger(&fixture, &exec.session_id).await.is_empty(),
+                    "a refused dispatch records no paid attempt"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn catalog_refresh_and_model_switch_never_reprice_earlier_attempts() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().returning(|_| Ok(output()));
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+
+            let first_pricing = InjectedPricing::install(pricing());
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "mock"),
+                &prepared(false),
+                &exec,
+            )
+            .await
+            .unwrap();
+            let first_cost = cost();
+            drop(first_pricing);
+
+            // The catalog is refreshed with doubled rates before the next call.
+            let doubled = ModelPricing {
+                input: Some(6.0),
+                output: Some(30.0),
+                cache_read: Some(0.6),
+                cache_write: Some(7.5),
+                ..Default::default()
+            };
+            let _second_pricing = InjectedPricing::install(doubled);
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "mock"),
+                &prepared(false),
+                &exec,
+            )
+            .await
+            .unwrap();
+
+            let ledger = ledger(&fixture, &exec.session_id).await;
+            let settled = settlements(&ledger);
+            assert_eq!(settled.len(), 2);
+            assert_eq!(
+                settled[0].pricing,
+                Some(pricing()),
+                "first keeps its snapshot"
+            );
+            assert_eq!(settled[1].pricing.as_ref().unwrap().input, Some(6.0));
+
+            let totals = session_totals(&exec).await;
+            assert!(
+                (totals.known_subtotal_usd - (first_cost + 2.0 * first_cost)).abs() < 1e-12,
+                "earlier attempt must not be revalued: {}",
+                totals.known_subtotal_usd
+            );
+
+            // Replay from the journal alone reproduces the same totals.
+            let replayed = crate::accounting::SessionAccounting::hydrate(
+                &exec.session_id,
+                fixture.storage.event_journal(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(replayed.read(|r| r.session().clone()), totals);
+        }
+
+        #[tokio::test]
+        async fn unpriced_model_is_recorded_as_incomplete_not_free() {
+            // No registry entry for this provider: billing class is unknown.
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("someone-else", pricing());
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().returning(|_| Ok(output()));
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "mock"),
+                &prepared(false),
+                &exec,
+            )
+            .await
+            .unwrap();
+            let totals = session_totals(&exec).await;
+            assert_eq!(totals.known_subtotal_usd, 0.0);
+            assert_eq!(totals.complete_total_usd(), None);
+            assert!(totals.reasons().contains(&AccountingReason::Valuation {
+                reason: querymt::providers::IncompleteReason::PricingUnavailable
+            }));
+        }
+
+        #[tokio::test]
+        async fn history_save_failure_after_settlement_keeps_the_recorded_charge() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install(pricing());
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().returning(|_| Ok(output()));
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let mut exec = fixture.execution_context().await;
+
+            let state = transition_call_llm(
+                &fixture.config,
+                &context(&exec, "mock"),
+                &prepared(false),
+                &exec,
+            )
+            .await
+            .unwrap();
+            let ExecutionState::AfterLlm { response, context } = state else {
+                panic!("expected AfterLlm");
+            };
+            let recorded = session_totals(&exec).await;
+            assert!((recorded.complete_total_usd().unwrap() - cost()).abs() < 1e-12);
+
+            // Make storing the assistant message fail.
+            fixture
+                .storage
+                .session_store()
+                .delete_session(&exec.session_id)
+                .await
+                .unwrap();
+            let result =
+                transition_after_llm(&fixture.config, &response, &context, &mut exec).await;
+            assert!(result.is_err(), "history save must fail");
+
+            // The charge is unaffected, live and from the journal alone.
+            assert_eq!(session_totals(&exec).await, recorded);
+            let replayed = crate::accounting::SessionAccounting::hydrate(
+                &exec.session_id,
+                fixture.storage.event_journal(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(replayed.read(|r| r.session().clone()), recorded);
+        }
+
+        #[tokio::test]
+        async fn accounting_storage_failure_is_an_execution_error_not_a_budget_outcome() {
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().times(0);
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            // A cap is configured, so a budget stop would be possible.
+            let mut config = (*fixture.config).clone();
+            config
+                .middleware_drivers
+                .push(Arc::new(crate::middleware::LimitsMiddleware::new(
+                    crate::middleware::LimitsConfig::default().max_price_usd(100.0),
+                )));
+            let exec = fixture.execution_context().await;
+            // Open accounting first, then make the journal unwritable so the
+            // durable attempt start cannot be recorded.
+            exec.cycle_accounting(&config.event_sink).await.unwrap();
+            fixture
+                .storage
+                .conn_for_test()
+                .lock()
+                .unwrap()
+                .execute_batch("DROP TABLE event_journal")
+                .unwrap();
+            let result =
+                transition_call_llm(&config, &context(&exec, "mock"), &prepared(false), &exec)
+                    .await;
+            let error = result.expect_err("storage failure must be an execution error");
+            assert!(error.to_string().contains("accounting"), "{error:#}");
+        }
+
+        type Events = tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>;
+
+        /// The next `LlmRequestEnd` as (cost, accounting), or `None` if none
+        /// arrives within the window.
+        async fn next_request_end(
+            events: &mut Events,
+            wait: Duration,
+        ) -> Option<(Option<f64>, Option<crate::accounting::RequestAccounting>)> {
+            let deadline = tokio::time::Instant::now() + wait;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let envelope = tokio::time::timeout(remaining, events.recv())
+                    .await
+                    .ok()?
+                    .ok()?;
+                if let AgentEventKind::LlmRequestEnd {
+                    cost_usd,
+                    accounting,
+                    ..
+                } = envelope.kind()
+                {
+                    return Some((*cost_usd, accounting.clone()));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn request_end_cost_spans_retries_and_includes_cache_charges() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("alias", pricing());
+            let (fixture, exec) = stream_fixture(vec![
+                Err(rate_limited()),
+                Ok(vec![
+                    (0, Ok(StreamChunk::Text("hello".into()))),
+                    (0, Ok(chunk_usage())),
+                    (
+                        0,
+                        Ok(StreamChunk::Done {
+                            finish_reason: FinishReason::Stop,
+                        }),
+                    ),
+                ]),
+            ])
+            .await;
+            let mut events = fixture.config.subscribe_events();
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "alias"),
+                &prepared(true),
+                &exec,
+            )
+            .await
+            .unwrap();
+
+            let (cost, accounting) = next_request_end(&mut events, Duration::from_secs(1))
+                .await
+                .expect("request end");
+            // cost() includes cache read and write charges; the rejected retry adds none.
+            assert!((cost.unwrap() - cost_value()).abs() < 1e-12);
+            let accounting = accounting.expect("accounting detail");
+            assert!(accounting.complete);
+            assert_eq!(accounting.attempt_ids.len(), 2);
+            assert!((accounting.known_subtotal_usd - cost_value()).abs() < 1e-12);
+
+            // The identifiers match the durable attempt records.
+            let ledger = ledger(&fixture, &exec.session_id).await;
+            let recorded: Vec<_> = settlements(&ledger)
+                .into_iter()
+                .map(|s| s.attempt.attempt_id.clone())
+                .collect();
+            assert_eq!(accounting.attempt_ids, recorded);
+            let operation_ids: std::collections::HashSet<_> = settlements(&ledger)
+                .into_iter()
+                .map(|s| s.attempt.operation_id.clone())
+                .collect();
+            assert_eq!(operation_ids.len(), 1);
+            assert_eq!(operation_ids.iter().next(), Some(&accounting.operation_id));
+        }
+
+        #[tokio::test]
+        async fn usage_bearing_retry_counts_once_and_marks_operation_partial() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("alias", pricing());
+            let (fixture, exec) = stream_fixture(vec![
+                // First attempt reports usage, then the connection drops.
+                Ok(vec![
+                    (0, Ok(chunk_usage())),
+                    (0, Err(LLMError::HttpError("reset".into()))),
+                ]),
+                Ok(vec![
+                    (0, Ok(StreamChunk::Text("hello".into()))),
+                    (0, Ok(chunk_usage())),
+                    (
+                        0,
+                        Ok(StreamChunk::Done {
+                            finish_reason: FinishReason::Stop,
+                        }),
+                    ),
+                ]),
+            ])
+            .await;
+            let mut events = fixture.config.subscribe_events();
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "alias"),
+                &prepared(true),
+                &exec,
+            )
+            .await
+            .unwrap();
+
+            let (cost, accounting) = next_request_end(&mut events, Duration::from_secs(1))
+                .await
+                .expect("request end");
+            let accounting = accounting.unwrap();
+            assert_eq!(accounting.attempt_ids.len(), 2);
+            // Both attempts' usage is charged exactly once each ...
+            assert!((accounting.known_subtotal_usd - 2.0 * cost_value()).abs() < 1e-12);
+            // ... but the interrupted attempt keeps the operation partial.
+            assert_eq!(
+                cost, None,
+                "a partial operation total is never published as complete"
+            );
+            assert!(!accounting.complete);
+            assert!(accounting.reasons.contains(&AccountingReason::PartialUsage));
+        }
+
+        #[tokio::test]
+        async fn cancelled_execution_is_accounted_without_a_request_end_event() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("alias", pricing());
+            let (fixture, exec) = stream_fixture(vec![Ok(vec![
+                (0, Ok(chunk_usage())),
+                (0, Ok(StreamChunk::Text("part".into()))),
+            ])])
+            .await;
+            let mut events = fixture.config.subscribe_events();
+            let context = context(&exec, "alias");
+            let request = prepared(true);
+            let mut future = Box::pin(transition_call_llm(
+                &fixture.config,
+                &context,
+                &request,
+                &exec,
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(400), &mut future)
+                    .await
+                    .is_err()
+            );
+            exec.cancellation_token.cancel();
+            assert!(matches!(future.await.unwrap(), ExecutionState::Cancelled));
+
+            assert!(
+                next_request_end(&mut events, Duration::from_millis(300))
+                    .await
+                    .is_none(),
+                "no normal request end for cancelled execution"
+            );
+            let totals = session_totals(&exec).await;
+            assert!((totals.known_subtotal_usd - cost_value()).abs() < 1e-12);
+            assert_eq!(totals.unresolved_attempts, 0);
+            assert_eq!(totals.complete_total_usd(), None);
+        }
+
+        fn chunk_usage() -> StreamChunk {
+            StreamChunk::Usage(usage())
+        }
+
+        async fn stream_fixture(attempts: Vec<TimedChunks>) -> (TestAgent, ExecutionContext) {
+            let (fixture, _factory) = timed_fixture(true, attempts, "openai", None).await;
+            let exec = fixture.execution_context().await;
+            (fixture, exec)
+        }
+
+        #[tokio::test]
+        async fn streaming_retry_after_setup_rejection_keeps_separate_accumulators() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("alias", pricing());
+            let (fixture, exec) = stream_fixture(vec![
+                Err(rate_limited()),
+                Ok(vec![
+                    (0, Ok(StreamChunk::Text("hello".into()))),
+                    (0, Ok(chunk_usage())),
+                    (
+                        0,
+                        Ok(StreamChunk::Done {
+                            finish_reason: FinishReason::Stop,
+                        }),
+                    ),
+                ]),
+            ])
+            .await;
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "alias"),
+                &prepared(true),
+                &exec,
+            )
+            .await
+            .unwrap();
+
+            let ledger = ledger(&fixture, &exec.session_id).await;
+            assert_eq!(starts(&ledger), 2);
+            let settled = settlements(&ledger);
+            assert_eq!(settled[0].disposition, UsageDisposition::NotBillable);
+            assert!(settled[0].usage.is_none(), "retry must not inherit usage");
+            assert_eq!(settled[1].disposition, UsageDisposition::Final);
+            assert_eq!(settled[1].usage.as_ref(), Some(&usage()));
+            let totals = session_totals(&exec).await;
+            assert!((totals.complete_total_usd().unwrap() - cost()).abs() < 1e-12);
+        }
+
+        #[tokio::test]
+        async fn streaming_failure_after_usage_is_partial_and_priced() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("alias", pricing());
+            let (fixture, exec) = stream_fixture(vec![Ok(vec![
+                (0, Ok(chunk_usage())),
+                (0, Ok(StreamChunk::Text("part".into()))),
+                (0, Err(LLMError::ProviderError("stream broke".into()))),
+            ])])
+            .await;
+            let result = transition_call_llm(
+                &fixture.config,
+                &context(&exec, "alias"),
+                &prepared(true),
+                &exec,
+            )
+            .await;
+            assert!(result.is_err());
+
+            let ledger = ledger(&fixture, &exec.session_id).await;
+            let settled = settlements(&ledger);
+            assert_eq!(settled.len(), 1);
+            assert_eq!(settled[0].disposition, UsageDisposition::Partial);
+            assert_eq!(settled[0].usage.as_ref(), Some(&usage()));
+            let totals = session_totals(&exec).await;
+            assert!((totals.known_subtotal_usd - cost()).abs() < 1e-12);
+            assert_eq!(totals.complete_total_usd(), None);
+            assert!(totals.reasons().contains(&AccountingReason::PartialUsage));
+        }
+
+        #[tokio::test]
+        async fn streaming_cancellation_preserves_available_partial_usage() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("alias", pricing());
+            // No terminal chunk: the provider stream stays pending.
+            let (fixture, exec) = stream_fixture(vec![Ok(vec![
+                (0, Ok(chunk_usage())),
+                (0, Ok(StreamChunk::Text("part".into()))),
+            ])])
+            .await;
+            let context = context(&exec, "alias");
+            let request = prepared(true);
+            let mut future = Box::pin(transition_call_llm(
+                &fixture.config,
+                &context,
+                &request,
+                &exec,
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(400), &mut future)
+                    .await
+                    .is_err()
+            );
+            exec.cancellation_token.cancel();
+            assert!(matches!(future.await.unwrap(), ExecutionState::Cancelled));
+
+            let ledger = ledger(&fixture, &exec.session_id).await;
+            let settled = settlements(&ledger);
+            assert_eq!(settled.len(), 1);
+            assert_eq!(settled[0].outcome, AttemptOutcome::Cancelled);
+            assert_eq!(settled[0].disposition, UsageDisposition::Partial);
+            assert_eq!(settled[0].usage.as_ref(), Some(&usage()));
+            assert_eq!(session_totals(&exec).await.unresolved_attempts, 0);
+        }
+
+        #[tokio::test]
+        async fn dropped_streaming_request_settles_instead_of_staying_unresolved() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("alias", pricing());
+            let (fixture, exec) = stream_fixture(vec![Ok(vec![(0, Ok(chunk_usage()))])]).await;
+            {
+                let context = context(&exec, "alias");
+                let request = prepared(true);
+                let mut future = Box::pin(transition_call_llm(
+                    &fixture.config,
+                    &context,
+                    &request,
+                    &exec,
+                ));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(400), &mut future)
+                        .await
+                        .is_err()
+                );
+                // Owning future dropped, as when a turn task is aborted.
+            }
+            for _ in 0..200 {
+                if session_totals(&exec).await.unresolved_attempts == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let ledger = ledger(&fixture, &exec.session_id).await;
+            assert_eq!(starts(&ledger), 1);
+            assert_eq!(settlements(&ledger)[0].outcome, AttemptOutcome::Cancelled);
+            assert_eq!(settlements(&ledger)[0].usage.as_ref(), Some(&usage()));
         }
     }
 }

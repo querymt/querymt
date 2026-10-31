@@ -16,6 +16,7 @@ use crate::acp::protocol::{
     ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
 };
 use crate::agent::LocalAgentHandle as AgentHandle;
+use crate::control::delegation_notifications::DelegationUpdateNotification;
 use crate::control::remote::{AttachRemoteSessionRequest, RemoteSessionAttachInfo};
 use crate::event_fanout::EventFanout;
 use crate::events::{AgentEvent, AgentEventKind, EventEnvelope, ReasoningPartStored};
@@ -25,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Weak};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc};
 
 /// Session subscriptions keyed by session id.
 ///
@@ -36,6 +37,7 @@ type SessionRequestLocks = Arc<Mutex<HashMap<(String, String), Weak<Mutex<()>>>>
 #[derive(Clone, Default)]
 pub struct SessionOwnerMap {
     owners: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    interaction_owners: Arc<Mutex<HashMap<String, String>>>,
     request_locks: SessionRequestLocks,
 }
 
@@ -43,6 +45,48 @@ impl SessionOwnerMap {
     /// Lock the session subscription map.
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, HashMap<String, HashSet<String>>> {
         self.owners.lock().await
+    }
+
+    /// Live human-input requests follow the input submitter, not every observer.
+    pub(crate) async fn owns_interactions(&self, session_id: &str, conn_id: &str) -> bool {
+        self.interaction_owner(session_id).await.as_deref() == Some(conn_id)
+    }
+
+    pub(crate) async fn interaction_owner(&self, session_id: &str) -> Option<String> {
+        let owners = self.owners.lock().await;
+        let subscribers = owners.get(session_id)?;
+        let mut interaction_owners = self.interaction_owners.lock().await;
+        if interaction_owners
+            .get(session_id)
+            .is_none_or(|owner| !subscribers.contains(owner))
+        {
+            let Some(owner) = subscribers.iter().min() else {
+                interaction_owners.remove(session_id);
+                return None;
+            };
+            interaction_owners.insert(session_id.to_string(), owner.clone());
+        }
+        interaction_owners.get(session_id).cloned()
+    }
+
+    pub(crate) async fn forget_interaction_owner(&self, session_id: &str, conn_id: &str) {
+        let mut owners = self.interaction_owners.lock().await;
+        if owners.get(session_id).is_some_and(|owner| owner == conn_id) {
+            owners.remove(session_id);
+        }
+    }
+
+    async fn set_interaction_owner(&self, session_id: &str, conn_id: &str) {
+        let owners = self.owners.lock().await;
+        if owners
+            .get(session_id)
+            .is_some_and(|subscribers| subscribers.contains(conn_id))
+        {
+            self.interaction_owners
+                .lock()
+                .await
+                .insert(session_id.to_string(), conn_id.to_string());
+        }
     }
 
     async fn request_lock(&self, session_id: &str, conn_id: &str) -> Arc<Mutex<()>> {
@@ -64,12 +108,18 @@ async fn subscribe_connection(
     session_id: String,
     conn_id: &str,
 ) -> bool {
+    let mut owners = session_owners.lock().await;
+    let inserted = owners
+        .entry(session_id.clone())
+        .or_default()
+        .insert(conn_id.to_string());
     session_owners
+        .interaction_owners
         .lock()
         .await
         .entry(session_id)
-        .or_default()
-        .insert(conn_id.to_string())
+        .or_insert_with(|| conn_id.to_string());
+    inserted
 }
 
 async fn unsubscribe_connection(session_owners: &SessionOwnerMap, session_id: &str, conn_id: &str) {
@@ -81,10 +131,10 @@ async fn unsubscribe_connection(session_owners: &SessionOwnerMap, session_id: &s
     if remove_session {
         owners.remove(session_id);
     }
+    session_owners
+        .forget_interaction_owner(session_id, conn_id)
+        .await;
 }
-
-/// Type alias for pending permission requests (tool_call_id -> response sender)
-pub type PermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<RequestPermissionOutcome>>>>;
 
 /// Type alias for pending elicitation requests (elicitation_id -> response sender)
 pub type PendingElicitationMap = crate::elicitation::PendingElicitationMap;
@@ -145,6 +195,30 @@ pub(crate) fn convert_elicitation_response(
     Ok(crate::elicitation::ElicitationResponse { action, content })
 }
 
+/// Convert a client's `session/request_permission` response into the answer
+/// carried by a pending permission interaction.
+///
+/// Only an explicitly selected option is an answer. A client-side `cancelled`
+/// outcome is not a decision (`Ok(None)`: the delivery ends, the request stays
+/// pending) and anything unparseable is an error handled as undelivered.
+pub(crate) fn convert_permission_response_value(
+    value: serde_json::Value,
+) -> Result<Option<crate::elicitation::ElicitationResponse>, Error> {
+    let response: crate::acp::protocol::RequestPermissionResponse = serde_json::from_value(value)
+        .map_err(|err| {
+        Error::invalid_params().data(format!("Invalid permission response: {err}"))
+    })?;
+    match response.outcome {
+        RequestPermissionOutcome::Selected(selected) => Ok(Some(
+            crate::elicitation::ElicitationResponse::permission_selected(
+                selected.option_id.0.as_ref(),
+            ),
+        )),
+        RequestPermissionOutcome::Cancelled => Ok(None),
+        _ => Err(Error::invalid_params().data("Unsupported permission outcome")),
+    }
+}
+
 pub(crate) fn convert_elicitation_response_value(
     value: serde_json::Value,
 ) -> Result<crate::elicitation::ElicitationResponse, Error> {
@@ -203,7 +277,6 @@ impl RpcDispatchOutput {
 pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
     agent: Arc<S>,
     session_owners: SessionOwnerMap,
-    pending_permissions: PermissionMap,
     pending_elicitations: PendingElicitationMap,
     conn_id: String,
     request: RpcMessage,
@@ -213,7 +286,6 @@ pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
         RpcDispatchState {
             agent,
             session_owners,
-            pending_permissions,
             pending_elicitations,
             conn_id,
             tx,
@@ -228,7 +300,6 @@ pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
 pub(crate) struct RpcDispatchState<S> {
     pub agent: Arc<S>,
     pub session_owners: SessionOwnerMap,
-    pub pending_permissions: PermissionMap,
     pub pending_elicitations: PendingElicitationMap,
     pub conn_id: String,
     pub tx: mpsc::Sender<String>,
@@ -242,7 +313,6 @@ pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
     let RpcDispatchState {
         agent,
         session_owners,
-        pending_permissions,
         pending_elicitations,
         conn_id,
         tx,
@@ -250,7 +320,6 @@ pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
     let output = handle_rpc_message_with_context(
         agent.as_ref(),
         &session_owners,
-        &pending_permissions,
         &pending_elicitations,
         &conn_id,
         request,
@@ -318,6 +387,9 @@ pub struct RpcDispatchContext {
     /// the negotiated client capabilities are parsed into it so the
     /// snapshot-vs-replay choice stays scoped to this connection.
     pub session_load: Option<Arc<std::sync::Mutex<AcpSessionLoadPreferences>>>,
+    /// The connection's delivery position. `session/prompt` waits on it so the
+    /// response follows the session updates the prompt produced.
+    pub(crate) delivery: Option<Arc<crate::acp::delivery::ConnectionDelivery>>,
 }
 
 impl RpcDispatchContext {
@@ -386,11 +458,18 @@ async fn attach_rpc_session_locked<S: SendAgent>(
     let ownership_inserted =
         subscribe_connection(session_owners, session_id.to_string(), conn_id).await;
     let Some(local_agent) = agent.as_any().downcast_ref::<AgentHandle>() else {
+        if bridge_required {
+            session_owners
+                .set_interaction_owner(session_id, conn_id)
+                .await;
+        }
         return Ok(ownership_inserted);
     };
-    if ownership_inserted && let Some(translator) = context.translator.as_ref() {
-        restore_session_usage(local_agent, session_id, translator).await;
-    }
+    let recovered = if ownership_inserted && let Some(translator) = context.translator.as_ref() {
+        restore_session_history(local_agent, session_id, translator).await
+    } else {
+        Vec::new()
+    };
     if let Some(bridge) = context.session_bridge.as_ref()
         && let Err(error) = local_agent
             .set_session_bridge(session_id, bridge.clone())
@@ -412,14 +491,69 @@ async fn attach_rpc_session_locked<S: SendAgent>(
         }
         return Err(error);
     }
+    if bridge_required {
+        session_owners
+            .set_interaction_owner(session_id, conn_id)
+            .await;
+        if let Some(recovery) = context.elicitation_recovery.as_ref() {
+            recovery
+                .authorize_live_owner(session_owners, conn_id, session_id, local_agent)
+                .await;
+        }
+    }
+    if let Some(bridge) = context.session_bridge.as_ref()
+        && let Err(error) = send_recovered_delegations(bridge, recovered).await
+    {
+        if ownership_inserted {
+            unsubscribe_connection(session_owners, session_id, conn_id).await;
+        }
+        return Err(error);
+    }
     Ok(ownership_inserted)
 }
 
-pub(crate) async fn restore_session_usage(
+pub(crate) async fn send_recovered_delegations(
+    bridge: &crate::acp::client_bridge::ClientBridgeSender,
+    updates: Vec<DelegationUpdateNotification>,
+) -> Result<(), Error> {
+    for update in updates {
+        let params =
+            serde_json::value::to_raw_value(&update).map_err(Error::into_internal_error)?;
+        bridge
+            .notify_ext(crate::acp::protocol::ExtNotification::new(
+                QMT_NOTIFICATION_DELEGATION_UPDATE,
+                Arc::from(params),
+            ))
+            .await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn restore_session_history(
     agent: &AgentHandle,
     session_id: &str,
     translator: &Arc<std::sync::Mutex<AcpLiveEventTranslator>>,
-) {
+) -> Vec<DelegationUpdateNotification> {
+    let needs_config = translator
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .config
+        .get(session_id)
+        .is_none_or(|config| config.snapshot().is_none());
+    if needs_config {
+        match agent
+            .session_config_options(Some(session_id), crate::agent::core::AgentMode::Build, None)
+            .await
+        {
+            Ok(options) => translator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .seed_config_options(session_id, &options),
+            Err(error) => {
+                tracing::warn!(session.id = %session_id, %error, "failed to restore ACP configuration")
+            }
+        }
+    }
     if translator
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -427,17 +561,17 @@ pub(crate) async fn restore_session_usage(
         .get(session_id)
         .is_some_and(|usage| usage.history_loaded)
     {
-        return;
+        return Vec::new();
     }
     let session_ref = agent.registry.lock().await.get(session_id).cloned();
     let Some(session_ref) = session_ref else {
-        return;
+        return Vec::new();
     };
     match session_ref.get_event_stream().await {
         Ok(events) => translator
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .seed_usage(session_id, &events),
+            .seed_history(session_id, &events),
         Err(error) => {
             tracing::warn!(session.id = %session_id, %error, "failed to restore ACP usage totals");
             translator
@@ -447,6 +581,7 @@ pub(crate) async fn restore_session_usage(
                 .entry(session_id.to_owned())
                 .or_default()
                 .partial = true;
+            Vec::new()
         }
     }
 }
@@ -488,6 +623,8 @@ pub const QMT_NOTIFICATION_SCHEDULES_CHANGED: &str = "querymt/schedules/changed"
 pub const QMT_NOTIFICATION_DELEGATION_UPDATE: &str = "querymt/session/delegationUpdate";
 pub const QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED: &str = "querymt/session/delegateModelsChanged";
 pub const QMT_NOTIFICATION_INPUT_STATE: &str = "querymt/session/inputState";
+pub const QMT_NOTIFICATION_RUNTIME_CHANGED: &str = "querymt/session/runtimeChanged";
+pub const QMT_NOTIFICATION_SESSION_PINS_CHANGED: &str = "querymt/session/pinsChanged";
 
 fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
@@ -565,6 +702,27 @@ pub fn delegate_models_changed_notification(
         )
         .expect("serialize delegate models changed notification"),
     )
+}
+
+pub(crate) async fn current_session_observations(
+    agent: &AgentHandle,
+    session_ids: &[String],
+    sources: &[Arc<EventFanout>],
+) -> (Vec<serde_json::Value>, Vec<DelegationUpdateNotification>) {
+    let runtimes = agent.observe_session_runtimes(session_ids).await;
+    let mut notifications = Vec::with_capacity(runtimes.len());
+    for (session_id, runtime) in runtimes {
+        notifications.push(ext_notification(
+            QMT_NOTIFICATION_RUNTIME_CHANGED,
+            serde_json::json!({"version": 1, "session_id": session_id, "runtime": runtime}),
+        ));
+    }
+    // Include historical cleanup tombstones: live-only refresh would leave a lost stage stuck busy.
+    let updates = sources
+        .iter()
+        .flat_map(|source| source.delegation_snapshots(session_ids))
+        .collect();
+    (notifications, updates)
 }
 
 pub fn delegation_update_notification(
@@ -795,6 +953,44 @@ where
     )
 }
 
+/// Notice title naming why a run stopped.
+fn stop_notice_title(stop_type: crate::events::StopType) -> &'static str {
+    use crate::events::StopType;
+    match stop_type {
+        StopType::ModelTokenLimit => "Output token limit reached",
+        StopType::StepLimit => "Step limit reached",
+        StopType::TurnLimit => "Turn limit reached",
+        StopType::PriceLimit => "Cost limit reached",
+        StopType::ContextThreshold => "Context limit reached",
+        StopType::ContentFilter => "Response blocked by content filter",
+        StopType::DelegationBlocked => "Delegation blocked",
+        StopType::Other => "Run stopped",
+    }
+}
+
+/// Notice title for one output-limit recovery step, e.g.
+/// "Output limit hit; retrying at 128000 tokens (1)".
+fn output_limit_recovery_title(
+    action: crate::events::OutputLimitRecoveryAction,
+    attempt: u32,
+    from: Option<u32>,
+    to: Option<u32>,
+) -> String {
+    use crate::events::OutputLimitRecoveryAction;
+    match (action, to) {
+        (OutputLimitRecoveryAction::Escalate, Some(to)) => {
+            format!("Output limit hit; retrying at {to} tokens")
+        }
+        (OutputLimitRecoveryAction::Escalate, None) => "Output limit hit; retrying".to_owned(),
+        (OutputLimitRecoveryAction::Continue, _) => match from {
+            Some(from) => {
+                format!("Output limit hit at {from} tokens; continuing (attempt {attempt})")
+            }
+            None => format!("Output limit hit; continuing (attempt {attempt})"),
+        },
+    }
+}
+
 /// Projects replayed session history with materialized state.
 ///
 /// Durable session-update state (configuration, metadata, usage, the current
@@ -831,14 +1027,10 @@ where
             ))),
             &mut notifications,
         );
-        let effort = materialized
-            .reasoning_effort
-            .as_deref()
-            .and_then(parse_reasoning_effort);
+    }
+    if let Some(options) = materialized.config.snapshot() {
         push(
-            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(session_config_options(
-                mode, effort,
-            ))),
+            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
             &mut notifications,
         );
     }
@@ -859,10 +1051,15 @@ where
     }
 
     // 3. Latest valid usage snapshot.
-    if let Some(used) = materialized.usage_used
-        && let Some(update) = materialized.usage.usage_update(used)
-    {
+    // Without a reliable context measurement/limit pair, accounting is still
+    // delivered through the metadata-only fallback.
+    let usage_update = materialized
+        .usage_used
+        .and_then(|used| materialized.usage.usage_update(used));
+    if let Some(update) = usage_update {
         push(SessionUpdate::UsageUpdate(update), &mut notifications);
+    } else if let Some(update) = materialized.usage.accounting_only_update() {
+        push(update, &mut notifications);
     }
 
     // 4. Current todo plan (retained only when non-empty).
@@ -951,18 +1148,17 @@ fn materialize_replay_state(
     let mut legacy_counter: usize = 0;
 
     for event in events {
-        state.usage.observe(event.seq, &event.kind);
+        state
+            .usage
+            .observe(&event.session_id, event.seq, &event.kind);
+        state.config.observe(&event.kind);
         let envelope = EventEnvelope::from(event.clone());
         match event.kind.clone() {
             AgentEventKind::SessionModeChanged { mode } => {
                 state.mode = Some(mode);
             }
-            AgentEventKind::SessionConfigChanged {
-                mode,
-                reasoning_effort,
-            } => {
+            AgentEventKind::SessionConfigChanged { mode, .. } => {
                 state.mode = Some(mode);
-                state.reasoning_effort = reasoning_effort;
             }
             AgentEventKind::SessionMetadataUpdated { title, updated_at } => {
                 state.metadata_touched = true;
@@ -975,15 +1171,13 @@ fn materialize_replay_state(
             }
             AgentEventKind::ProviderChanged { context_limit, .. } => {
                 state.usage.context_limit = context_limit;
+                // A measurement taken for the previous model is not validated
+                // for this one; live delivery invalidates it the same way.
+                state.usage_used = None;
             }
-            AgentEventKind::LlmRequestEnd {
-                context_tokens,
-                cumulative_cost_usd,
-                ..
-            } => {
-                if let Some(cost) = cumulative_cost_usd {
-                    state.usage.cumulative_cost_usd = Some(cost);
-                }
+            AgentEventKind::LlmRequestEnd { context_tokens, .. } => {
+                // Money comes from the shared reducer (observed above), never
+                // from the request-end cumulative cost.
                 if state.usage.context_limit.is_some() {
                     state.usage_used = Some(context_tokens);
                 } else {
@@ -1048,9 +1242,13 @@ fn materialize_replay_state(
                 });
                 open_legacy_start = None;
             }
-            AgentEventKind::CompactionSummaryChunk { .. } | AgentEventKind::HookNotice { .. } => {
-                // Live-only content: notices are never replayed and summary
-                // chunks would duplicate the materialized terminal summary.
+            AgentEventKind::CompactionSummaryChunk { .. }
+            | AgentEventKind::HookNotice { .. }
+            | AgentEventKind::MiddlewareStopped { .. }
+            | AgentEventKind::OutputLimitRecovery { .. } => {
+                // Live-only content: notices (hook, stop and recovery) are never
+                // replayed and summary chunks would duplicate the materialized
+                // terminal summary.
             }
             AgentEventKind::ToolCallStart {
                 ref tool_name,
@@ -1072,7 +1270,7 @@ fn materialize_replay_state(
 #[derive(Default)]
 struct MaterializedReplayState {
     mode: Option<crate::agent::core::AgentMode>,
-    reasoning_effort: Option<String>,
+    config: SessionConfigProjection,
     metadata_touched: bool,
     metadata_title: Option<Option<String>>,
     metadata_updated_at: Option<String>,
@@ -1172,18 +1370,29 @@ impl AcpSessionUpdateCapabilities {
     }
 }
 
+/// `_meta.querymt.accounting` key carrying the replacement accounting DTO.
+pub const QUERYMT_ACCOUNTING_META_KEY: &str = "accounting";
+
 /// Per-session usage projection state for the live context meter.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// Token telemetry (`_meta.querymt.usage` v1) is derived from main-request
+/// `LlmRequestEnd` events and keeps its scope. Money is derived only from the
+/// shared accounting reducer; request-end cumulative costs are never read.
+#[derive(Debug, Clone, Default)]
 struct SessionUsageProjection {
     context_limit: Option<u64>,
-    cumulative_cost_usd: Option<f64>,
+    /// Shared reducer over attempt records; created on first accounting
+    /// evidence so a session with none publishes no accounting payload.
+    accounting: Option<crate::accounting::AccountingReducer>,
+    /// Last main-context occupancy and the journal sequence that reported it.
+    context_used: Option<u64>,
+    used_seq: Option<i64>,
     latest_request: Option<TokenUsageBreakdown>,
     session_totals: Option<TokenUsageBreakdown>,
     partial: bool,
     request_seqs: HashSet<i64>,
     latest_request_seq: Option<i64>,
     provider_seq: Option<i64>,
-    cost_seq: Option<i64>,
     history_loaded: bool,
 }
 
@@ -1211,22 +1420,86 @@ impl From<&querymt::Usage> for TokenUsageBreakdown {
 }
 
 impl SessionUsageProjection {
-    fn observe(&mut self, seq: i64, kind: &AgentEventKind) {
+    /// Apply an accounting record. Returns whether it changed accounting
+    /// state (an identical redelivery does not).
+    fn apply_accounting(&mut self, session_id: &str, seq: i64, kind: &AgentEventKind) -> bool {
+        let reducer = self
+            .accounting
+            .get_or_insert_with(|| crate::accounting::AccountingReducer::new(session_id));
+        match reducer.apply_at(seq, kind) {
+            Ok(crate::accounting::Applied::New) => true,
+            Ok(_) => false,
+            Err(conflict) => {
+                tracing::warn!(
+                    session.id = %session_id,
+                    attempt.id = %conflict.attempt_id,
+                    detail = conflict.detail,
+                    "ignoring conflicting accounting record"
+                );
+                false
+            }
+        }
+    }
+
+    /// Record a main-context measurement (request end or compaction).
+    fn observe_context_used(&mut self, seq: i64, tokens: u64) {
+        if self.used_seq.is_none_or(|previous| seq > previous) {
+            self.context_used = Some(tokens);
+            self.used_seq = Some(seq);
+        }
+    }
+
+    /// The last main-context measurement, unless the active model changed
+    /// after it was taken (it was not validated for the new model).
+    fn reliable_used(&self) -> Option<u64> {
+        let used_seq = self.used_seq?;
+        self.provider_seq
+            .is_none_or(|provider| used_seq > provider)
+            .then_some(self.context_used)
+            .flatten()
+    }
+
+    fn accounting_snapshot(&self) -> Option<crate::accounting::AccountingSnapshot> {
+        self.accounting
+            .as_ref()
+            .map(crate::accounting::AccountingSnapshot::from_reducer)
+    }
+
+    /// Observe one event. Returns `true` when an accounting *settlement* (or a
+    /// legacy generation record) changed accounting state and the caller
+    /// should publish it. Attempt starts only update the reducer: publishing
+    /// them would flash an incomplete total during every in-flight request.
+    fn observe(&mut self, session_id: &str, seq: i64, kind: &AgentEventKind) -> bool {
         match kind {
+            AgentEventKind::LlmAttemptStarted { .. } => {
+                self.apply_accounting(session_id, seq, kind);
+                false
+            }
+            AgentEventKind::LlmAttemptSettled { .. } => {
+                self.apply_accounting(session_id, seq, kind)
+            }
             AgentEventKind::ProviderChanged { context_limit, .. } => {
                 if self.provider_seq.is_none_or(|previous| seq > previous) {
                     self.context_limit = *context_limit;
                     self.provider_seq = Some(seq);
                 }
+                false
             }
             AgentEventKind::LlmRequestEnd {
                 usage,
-                cumulative_cost_usd,
+                context_tokens,
+                accounting,
                 ..
             } => {
                 if !self.request_seqs.insert(seq) {
-                    return;
+                    return false;
                 }
+                self.observe_context_used(seq, *context_tokens);
+                let legacy_changed = if accounting.is_none() {
+                    self.apply_accounting(session_id, seq, kind)
+                } else {
+                    false
+                };
                 let request = usage.as_ref().map(TokenUsageBreakdown::from);
                 if let Some(request) = request.as_ref() {
                     let totals = self.session_totals.get_or_insert_default();
@@ -1252,37 +1525,149 @@ impl SessionUsageProjection {
                     self.latest_request = request;
                     self.latest_request_seq = Some(seq);
                 }
-                if let Some(cost) = cumulative_cost_usd
-                    && self.cost_seq.is_none_or(|previous| seq > previous)
-                {
-                    self.cumulative_cost_usd = Some(*cost);
-                    self.cost_seq = Some(seq);
-                }
+                legacy_changed
+            }
+            _ => false,
+        }
+    }
+
+    /// `_meta.querymt` namespace object: token telemetry (unchanged v1) and,
+    /// once accounting evidence exists, the replacement accounting DTO.
+    fn querymt_meta(
+        &self,
+        include_usage: bool,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let mut querymt = serde_json::Map::new();
+        if include_usage && !self.request_seqs.is_empty() {
+            querymt.insert(
+                "usage".to_string(),
+                serde_json::json!({
+                    "version": 1,
+                    "latestRequest": self.latest_request,
+                    "sessionTotals": self.session_totals,
+                    "partial": self.partial,
+                }),
+            );
+        }
+        if let Some(snapshot) = self.accounting_snapshot()
+            && let Ok(value) = serde_json::to_value(snapshot)
+        {
+            querymt.insert(QUERYMT_ACCOUNTING_META_KEY.to_string(), value);
+        }
+        (!querymt.is_empty()).then(|| {
+            serde_json::Map::from_iter([(
+                QUERYMT_META_NAMESPACE.to_string(),
+                serde_json::Value::Object(querymt),
+            )])
+        })
+    }
+
+    /// Builds a `usage_update` for the given current context occupancy, or
+    /// `None` when the effective context limit is unknown or meaningless.
+    ///
+    /// Standard `cost` is the session's complete supported estimate only; it
+    /// is omitted whenever that total is unavailable (partial, unresolved,
+    /// all-excluded or legacy history).
+    fn usage_update(&self, used: u64) -> Option<UsageUpdate> {
+        let size = self.context_limit.filter(|size| *size > 0)?;
+        let mut update = UsageUpdate::new(used, size);
+        if let Some(amount) = self
+            .accounting_snapshot()
+            .and_then(|snapshot| snapshot.session.complete_total_usd)
+        {
+            update = update.cost(crate::acp::protocol::Cost::new(amount, "USD"));
+        }
+        if let Some(meta) = self.querymt_meta(true) {
+            update = update.meta(meta);
+        }
+        Some(update)
+    }
+
+    /// Metadata-only accounting carrier for when no reliable context
+    /// measurement/limit pair exists. It never changes the title or the
+    /// activity timestamp and fabricates no context numbers.
+    fn accounting_only_update(&self) -> Option<SessionUpdate> {
+        let meta = self.querymt_meta(false)?;
+        meta.get(QUERYMT_META_NAMESPACE)?
+            .get(QUERYMT_ACCOUNTING_META_KEY)?;
+        let update = SessionInfoUpdate::new();
+        Some(SessionUpdate::SessionInfoUpdate(update.meta(meta)))
+    }
+
+    /// The carrier for an accounting change: `usage_update` when a reliable
+    /// main-context measurement and the active limit are available,
+    /// otherwise the metadata-only fallback. Independent of notice support.
+    fn accounting_update(&self) -> Option<SessionUpdate> {
+        self.reliable_used()
+            .and_then(|used| self.usage_update(used))
+            .map(SessionUpdate::UsageUpdate)
+            .or_else(|| self.accounting_only_update())
+    }
+}
+
+#[derive(Default)]
+struct SessionConfigProjection {
+    options: Vec<crate::acp::protocol::SessionConfigOption>,
+}
+
+impl SessionConfigProjection {
+    fn merge(
+        &mut self,
+        options: impl IntoIterator<Item = crate::acp::protocol::SessionConfigOption>,
+    ) {
+        for option in options {
+            if let Some(current) = self
+                .options
+                .iter_mut()
+                .find(|current| current.id == option.id)
+            {
+                *current = option;
+            } else {
+                self.options.push(option);
+            }
+        }
+    }
+
+    fn observe(&mut self, kind: &AgentEventKind) {
+        match kind {
+            AgentEventKind::SessionConfigChanged {
+                mode,
+                reasoning_effort,
+            } => {
+                self.merge(session_config_options(
+                    *mode,
+                    reasoning_effort.as_deref().and_then(parse_reasoning_effort),
+                ));
+            }
+            AgentEventKind::SessionModeChanged { mode } => {
+                self.merge(session_config_options(*mode, None).into_iter().take(1));
+            }
+            AgentEventKind::ProviderChanged {
+                provider,
+                model,
+                provider_node_id,
+                ..
+            } => {
+                self.merge([crate::agent::session_registry::model_config_option(
+                    provider,
+                    model,
+                    provider_node_id.as_deref(),
+                )]);
             }
             _ => {}
         }
     }
 
-    /// Builds a `usage_update` for the given current context occupancy, or
-    /// `None` when the effective context limit is unknown or meaningless.
-    fn usage_update(&self, used: u64) -> Option<UsageUpdate> {
-        let size = self.context_limit.filter(|size| *size > 0)?;
-        let mut update = UsageUpdate::new(used, size);
-        if let Some(amount) = self.cumulative_cost_usd {
-            update = update.cost(crate::acp::protocol::Cost::new(amount, "USD"));
-        }
-        if !self.request_seqs.is_empty() {
-            update = update.meta(serde_json::Map::from_iter([(
-                QUERYMT_META_NAMESPACE.to_string(),
-                serde_json::json!({ "usage": {
-                    "version": 1,
-                    "latestRequest": self.latest_request,
-                    "sessionTotals": self.session_totals,
-                    "partial": self.partial,
-                }}),
-            )]));
-        }
-        Some(update)
+    fn snapshot(&self) -> Option<Vec<crate::acp::protocol::SessionConfigOption>> {
+        // Do not replace client state with a partial snapshot or guessed defaults.
+        ["mode", "reasoning_effort", "model"]
+            .iter()
+            .all(|id| {
+                self.options
+                    .iter()
+                    .any(|option| option.id.0.as_ref() == *id)
+            })
+            .then(|| self.options.clone())
     }
 }
 
@@ -1292,6 +1677,7 @@ pub struct AcpLiveEventTranslator {
     delegation_updates: crate::control::delegation_notifications::DelegationUpdateProjector,
     capabilities: AcpSessionUpdateCapabilities,
     usage: HashMap<String, SessionUsageProjection>,
+    config: HashMap<String, SessionConfigProjection>,
     /// Sessions whose deterministic todo plan is currently announced to a
     /// plan-operations client, so an empty snapshot removes it exactly once.
     announced_todo_plans: HashSet<String>,
@@ -1313,6 +1699,7 @@ impl AcpLiveEventTranslator {
                 ),
             capabilities: AcpSessionUpdateCapabilities::default(),
             usage: HashMap::new(),
+            config: HashMap::new(),
             announced_todo_plans: HashSet::new(),
         }
     }
@@ -1329,48 +1716,95 @@ impl AcpLiveEventTranslator {
     }
 
     /// Merge history with any events already observed during attachment.
-    fn seed_usage(&mut self, session_id: &str, events: &[AgentEvent]) {
+    fn seed_history(
+        &mut self,
+        session_id: &str,
+        events: &[AgentEvent],
+    ) -> Vec<DelegationUpdateNotification> {
+        let previous: HashMap<_, _> = self
+            .delegation_updates
+            .snapshots()
+            .into_iter()
+            .filter(|update| update.session_id == session_id)
+            .map(|update| (update.delegation_id.clone(), update))
+            .collect();
         let usage = self.usage.entry(session_id.to_owned()).or_default();
         for event in events {
-            usage.observe(event.seq, &event.kind);
+            usage.observe(session_id, event.seq, &event.kind);
         }
+        self.delegation_updates.seed_history(session_id, events);
         usage.history_loaded = true;
+        // A queued observation can gain lifecycle or identity only during seeding.
+        // Deliver its enriched snapshot once, including a still-live fork.
+        self.delegation_updates
+            .snapshots()
+            .into_iter()
+            .filter(|update| {
+                update.session_id == session_id
+                    && (update.finished_at.is_some() || update.source_epoch.is_some())
+                    && previous.get(&update.delegation_id) != Some(update)
+            })
+            .collect()
     }
 
     /// Reuse load snapshots rather than issuing a second full history read.
-    pub(crate) fn seed_usage_from_meta(
+    pub(crate) fn seed_history_from_meta(
         &mut self,
         session_id: &str,
         meta: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) -> bool {
-        let Some(events) = meta
+    ) -> Option<Vec<DelegationUpdateNotification>> {
+        let events = meta
             .and_then(|meta| meta.get("querymt/sessionLoadSnapshot.v1"))
             .and_then(|snapshot| snapshot.get("audit"))
             .and_then(|audit| audit.get("events"))
-            .and_then(serde_json::Value::as_array)
-        else {
-            return false;
-        };
-        let usage = self.usage.entry(session_id.to_owned()).or_default();
+            .and_then(serde_json::Value::as_array)?;
+        let mut partial = false;
+        let mut history = Vec::new();
         for event in events {
             if !matches!(
                 event["kind"]["type"].as_str(),
-                Some("llm_request_end" | "provider_changed")
+                Some(
+                    "llm_request_end"
+                        | "provider_changed"
+                        | "llm_attempt_started"
+                        | "llm_attempt_settled"
+                        | "delegation_requested"
+                        | "session_forked"
+                        | "delegation_completed"
+                        | "delegation_failed"
+                        | "delegation_cancelled"
+                )
             ) {
                 continue;
             }
             match serde_json::from_value::<AgentEvent>(event.clone()) {
-                Ok(event) => usage.observe(event.seq, &event.kind),
-                Err(_) => usage.partial = true,
+                Ok(event) => history.push(event),
+                Err(_) => partial = true,
             }
         }
-        usage.history_loaded = true;
-        true
+        let recovered = self.seed_history(session_id, &history);
+        self.usage.entry(session_id.to_owned()).or_default().partial |= partial;
+        Some(recovered)
+    }
+
+    /// Seed options that have not already been observed on the live stream.
+    pub(crate) fn seed_config_options(
+        &mut self,
+        session_id: &str,
+        options: &[crate::acp::protocol::SessionConfigOption],
+    ) {
+        let config = self.config.entry(session_id.to_owned()).or_default();
+        for option in options {
+            if !config.options.iter().any(|current| current.id == option.id) {
+                config.options.push(option.clone());
+            }
+        }
     }
 
     /// Drops all per-session projection state for a closed session.
     pub fn forget_session(&mut self, session_id: &str) {
         self.usage.remove(session_id);
+        self.config.remove(session_id);
         self.announced_todo_plans.remove(session_id);
         self.streamed_assistant_messages
             .retain(|(session, _)| session != session_id);
@@ -1385,9 +1819,24 @@ impl AcpLiveEventTranslator {
         self.delegation_updates.project_envelope(event)
     }
 
+    pub(crate) fn restore_delegation_observations(
+        &mut self,
+        updates: &[DelegationUpdateNotification],
+    ) {
+        for update in updates {
+            self.delegation_updates.restore_observation(update.clone());
+        }
+    }
+
     /// Translates one internal event into zero or more ordered JSON-RPC
     /// notifications for the owning connection.
     pub fn translate_notifications(&mut self, event: &EventEnvelope) -> Vec<serde_json::Value> {
+        if let AgentEventKind::RuntimeChanged { runtime } = event.kind() {
+            return vec![serde_json::json!({
+                "jsonrpc": "2.0", "method": QMT_NOTIFICATION_RUNTIME_CHANGED,
+                "params": {"version": 1, "session_id": event.session_id(), "runtime": runtime}
+            })];
+        }
         if let AgentEventKind::DelegateModelsChanged { revision } = event.kind() {
             return vec![delegate_models_changed_notification(
                 event.session_id(),
@@ -1524,18 +1973,25 @@ impl AcpLiveEventTranslator {
         let session_id = event.session_id().to_owned();
         match event.kind() {
             AgentEventKind::SessionModeChanged { mode } => {
+                self.config
+                    .entry(session_id)
+                    .or_default()
+                    .observe(event.kind());
                 vec![SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
                     SessionModeId::from(mode.as_str().to_string()),
                 ))]
             }
-            AgentEventKind::SessionConfigChanged {
-                mode,
-                reasoning_effort,
-            } => {
-                let effort = reasoning_effort.as_deref().and_then(parse_reasoning_effort);
-                vec![SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
-                    session_config_options(*mode, effort),
-                ))]
+            AgentEventKind::SessionConfigChanged { .. } => {
+                let config = self.config.entry(session_id).or_default();
+                config.observe(event.kind());
+                config
+                    .snapshot()
+                    .map(|options| {
+                        vec![SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                            options,
+                        ))]
+                    })
+                    .unwrap_or_default()
             }
             AgentEventKind::SessionMetadataUpdated { title, updated_at } => {
                 let mut update = SessionInfoUpdate::new();
@@ -1551,19 +2007,49 @@ impl AcpLiveEventTranslator {
                 vec![SessionUpdate::SessionInfoUpdate(update)]
             }
             AgentEventKind::ProviderChanged { .. } => {
-                self.usage
-                    .entry(session_id)
-                    .or_default()
-                    .observe(event.seq(), event.kind());
-                Vec::new()
+                self.usage.entry(session_id.clone()).or_default().observe(
+                    &session_id,
+                    event.seq(),
+                    event.kind(),
+                );
+                let config = self.config.entry(session_id).or_default();
+                config.observe(event.kind());
+                config
+                    .snapshot()
+                    .map(|options| {
+                        vec![SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                            options,
+                        ))]
+                    })
+                    .unwrap_or_default()
             }
             AgentEventKind::LlmRequestEnd { context_tokens, .. } => {
-                let usage = self.usage.entry(session_id).or_default();
-                usage.observe(event.seq(), event.kind());
+                let usage = self.usage.entry(session_id.clone()).or_default();
+                usage.observe(&session_id, event.seq(), event.kind());
                 usage
                     .usage_update(*context_tokens)
                     .map(|update| vec![SessionUpdate::UsageUpdate(update)])
                     .unwrap_or_default()
+            }
+            // An attempt start only updates the reducer: publishing it would
+            // flash an incomplete total during every in-flight request.
+            AgentEventKind::LlmAttemptStarted { .. } => {
+                self.usage.entry(session_id.clone()).or_default().observe(
+                    &session_id,
+                    event.seq(),
+                    event.kind(),
+                );
+                Vec::new()
+            }
+            // A settlement changes accounting. Deliver it independently of
+            // notice support and of context size.
+            AgentEventKind::LlmAttemptSettled { .. } => {
+                let usage = self.usage.entry(session_id.clone()).or_default();
+                if usage.observe(&session_id, event.seq(), event.kind()) {
+                    usage.accounting_update().into_iter().collect()
+                } else {
+                    Vec::new()
+                }
             }
             AgentEventKind::HookNotice {
                 event_name,
@@ -1586,6 +2072,37 @@ impl AcpLiveEventTranslator {
                 vec![SessionUpdate::Notice(
                     Notice::new(severity, title).description(message.clone()),
                 )]
+            }
+            AgentEventKind::MiddlewareStopped {
+                stop_type, reason, ..
+            } => {
+                if !self.capabilities.notices {
+                    return Vec::new();
+                }
+                vec![SessionUpdate::Notice(
+                    Notice::new(NoticeSeverity::Warning, stop_notice_title(*stop_type))
+                        .description(reason.clone()),
+                )]
+            }
+            AgentEventKind::OutputLimitRecovery {
+                attempt,
+                action,
+                from_max_tokens,
+                to_max_tokens,
+                ..
+            } => {
+                if !self.capabilities.notices {
+                    return Vec::new();
+                }
+                vec![SessionUpdate::Notice(Notice::new(
+                    NoticeSeverity::Info,
+                    output_limit_recovery_title(
+                        *action,
+                        *attempt,
+                        *from_max_tokens,
+                        *to_max_tokens,
+                    ),
+                ))]
             }
             AgentEventKind::ToolCallStart {
                 tool_name,
@@ -1631,12 +2148,12 @@ impl AcpLiveEventTranslator {
                 }
                 // Post-compaction usage snapshots are stable, ungated updates.
                 if let Some(tokens) = context_tokens
-                    && let Some(update) = self
-                        .usage
-                        .get(&session_id)
-                        .and_then(|usage| usage.usage_update(*tokens))
+                    && let Some(usage) = self.usage.get_mut(&session_id)
                 {
-                    updates.push(SessionUpdate::UsageUpdate(update));
+                    usage.observe_context_used(event.seq(), *tokens);
+                    if let Some(update) = usage.usage_update(*tokens) {
+                        updates.push(SessionUpdate::UsageUpdate(update));
+                    }
                 }
                 updates
             }
@@ -1851,8 +2368,73 @@ fn translate_replayable_updates(event: &EventEnvelope) -> Vec<SessionUpdate> {
                     .raw_output(raw_output),
             ))]
         }
+        AgentEventKind::WorktreeCommandOutput { text } => vec![SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone()))),
+        )],
+        AgentEventKind::WorktreeOwnershipTransferred {
+            workspace_id,
+            successor_session_id,
+            summary_seeded,
+        } => vec![SessionUpdate::AgentMessageChunk(worktree_handoff_chunk(
+            workspace_id,
+            successor_session_id,
+            *summary_seeded,
+        ))],
+        AgentEventKind::WorktreeArchived {
+            workspace_id,
+            by_session_id,
+        } => vec![SessionUpdate::AgentMessageChunk(worktree_archived_chunk(
+            workspace_id,
+            by_session_id.as_deref(),
+        ))],
         _ => Vec::new(),
     }
+}
+
+/// Announcement of an archived workspace. The `message_id` is derived from the
+/// workspace so live delivery and replay agree on identity.
+fn worktree_archived_chunk(workspace_id: &str, by_session_id: Option<&str>) -> ContentChunk {
+    let text = format!(
+        "This session's workspace {workspace_id} was archived. This session is now \
+         read-only; run `/worktree remove` to delete the checkout."
+    );
+    let mut details = serde_json::json!({ "workspaceId": workspace_id });
+    if let Some(by) = by_session_id {
+        details["bySessionId"] = by.into();
+    }
+    ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
+        .message_id(MessageId::from(format!("worktree-archived-{workspace_id}")))
+        .meta(serde_json::Map::from_iter([(
+            QUERYMT_META_NAMESPACE.to_string(),
+            serde_json::json!({ "worktreeArchived": details }),
+        )]))
+}
+
+/// Announcement of an ownership handoff. The `message_id` is derived from the
+/// workspace and successor so live delivery and replay agree on identity.
+fn worktree_handoff_chunk(
+    workspace_id: &str,
+    successor_session_id: &str,
+    summary_seeded: bool,
+) -> ContentChunk {
+    let text = format!(
+        "This session's workspace {workspace_id} was handed off to session \
+         {successor_session_id}. This session is now read-only."
+    );
+    ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
+        .message_id(MessageId::from(format!(
+            "worktree-handoff-{workspace_id}-{successor_session_id}"
+        )))
+        .meta(serde_json::Map::from_iter([(
+            QUERYMT_META_NAMESPACE.to_string(),
+            serde_json::json!({
+                "worktreeHandoff": {
+                    "workspaceId": workspace_id,
+                    "successorSessionId": successor_session_id,
+                    "summarySeeded": summary_seeded,
+                }
+            }),
+        )]))
 }
 
 fn is_todo_write_tool(tool_name: &str) -> bool {
@@ -2000,7 +2582,6 @@ use crate::agent::session_registry::config_options as session_config_options;
 pub async fn handle_rpc_message<S: SendAgent>(
     agent: &S,
     session_owners: &SessionOwnerMap,
-    pending_permissions: &PermissionMap,
     pending_elicitations: &PendingElicitationMap,
     conn_id: &str,
     req: RpcMessage,
@@ -2008,7 +2589,6 @@ pub async fn handle_rpc_message<S: SendAgent>(
     handle_rpc_message_with_context(
         agent,
         session_owners,
-        pending_permissions,
         pending_elicitations,
         conn_id,
         req,
@@ -2020,7 +2600,6 @@ pub async fn handle_rpc_message<S: SendAgent>(
 pub async fn handle_rpc_message_with_context<S: SendAgent>(
     agent: &S,
     session_owners: &SessionOwnerMap,
-    pending_permissions: &PermissionMap,
     pending_elicitations: &PendingElicitationMap,
     conn_id: &str,
     req: RpcMessage,
@@ -2099,6 +2678,9 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             match response {
                                 Ok(r) => {
                                     let session_id = r.session_id.to_string();
+                                    if let (Some(translator), Some(options)) = (context.translator.as_ref(), r.config_options.as_ref()) {
+                                        translator.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).seed_config_options(&session_id, options);
+                                    }
                                     attach_rpc_session(
                                         agent,
                                         session_owners,
@@ -2136,10 +2718,18 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                 true,
                             )
                             .await?;
-                            agent
-                                .prompt_with_bridge(params, context.session_bridge.clone())
-                                .await
-                                .map(|r| serde_json::to_value(r).unwrap())
+                            let mut response = agent.prompt(params).await?;
+                            // The reply carries the last `session_seq` the run
+                            // produced. Hold the response until this connection
+                            // delivered every update up to it (bounded; a lost
+                            // delivery is logged and the response proceeds). A
+                            // missing tip means "no watermark".
+                            if let Some(tip) = crate::acp::delivery::take_event_tip(&mut response)
+                                && let Some(delivery) = context.delivery.as_ref()
+                            {
+                                delivery.hold_response_for_updates(&session_id, tip).await;
+                            }
+                            Ok(serde_json::to_value(response).unwrap())
                         }
                         Err(e) => Err(Error::invalid_params()
                             .data(serde_json::json!({"error": e.to_string()}))),
@@ -2185,9 +2775,12 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             match response {
                                 Ok(r) => {
                                     if let Some(translator) = context.translator.as_ref() {
-                                        translator.lock()
-                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                            .seed_usage_from_meta(&session_id, r.meta.as_ref());
+                                        let mut translator = translator.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                        if let Some(options) = r.config_options.as_ref() {
+                                            translator.seed_config_options(&session_id, options);
+                                        }
+                                        notifications.extend(translator.seed_history_from_meta(&session_id, r.meta.as_ref())
+                                            .unwrap_or_default().into_iter().map(delegation_update_notification));
                                     }
                                     let request_lock =
                                         session_owners.request_lock(&session_id, conn_id).await;
@@ -2375,28 +2968,6 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                     }
                 }
 
-                "permission_result" => {
-                    #[derive(Deserialize)]
-                    struct PermissionResultParams {
-                        tool_call_id: String,
-                        outcome: RequestPermissionOutcome,
-                    }
-                    match serde_json::from_value::<PermissionResultParams>(req.params) {
-                        Ok(params) => {
-                            let mut pending = pending_permissions.lock().await;
-                            if let Some(tx) = pending.remove(&params.tool_call_id) {
-                                let _ = tx.send(params.outcome);
-                                Ok(serde_json::Value::Null)
-                            } else {
-                                Err(Error::internal_error()
-                                    .data("No pending permission for this tool_call_id"))
-                            }
-                        }
-                        Err(e) => Err(Error::invalid_params()
-                            .data(serde_json::json!({"error": e.to_string()}))),
-                    }
-                }
-
                 "elicitation_result" => {
                     #[derive(Deserialize)]
                     struct ElicitationResultParams {
@@ -2578,7 +3149,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                 conn_id,
                                 &context,
                                 session_id,
-                                false,
+                                matches!(ext_method, "querymt/session/steer" | "querymt/session/queue"),
                             )
                             .await?
                         } else {
@@ -2726,54 +3297,54 @@ where
 /// names for direct readability in Grafana.  Extension and unknown methods
 /// get a single `acp.ext_method` span with the method name as attribute.
 fn acp_method_span(method: &str) -> tracing::Span {
-    use opentelemetry_semantic_conventions::attribute::{RPC_METHOD, RPC_SYSTEM};
+    use opentelemetry_semantic_conventions::attribute::{RPC_METHOD, RPC_SYSTEM_NAME};
 
     let names = &AGENT_METHOD_NAMES;
 
     match method {
         m if m == names.initialize => tracing::info_span!(
             "acp.initialize",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.authenticate => tracing::info_span!(
             "acp.authenticate",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.session_new => tracing::info_span!(
             "acp.new_session",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.session_prompt => tracing::info_span!(
             "acp.prompt",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.session_cancel => tracing::info_span!(
             "acp.cancel",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.session_load => tracing::info_span!(
             "acp.load_session",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.session_list => tracing::info_span!(
             "acp.list_sessions",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.session_close => tracing::info_span!(
             "acp.close_session",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.session_resume => tracing::info_span!(
             "acp.resume_session",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         // Extension methods and everything else: single acp.ext_method span
@@ -2781,7 +3352,7 @@ fn acp_method_span(method: &str) -> tracing::Span {
         // from ext_method so this is the only span for extension requests.
         _ => tracing::info_span!(
             "acp.ext_method",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
     }
@@ -2810,6 +3381,7 @@ mod tests {
         subscribe_connection(&subscriptions, "session".to_string(), "conn-b").await;
 
         let event = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "event".into(),
             stream_seq: 1,
             session_id: "session".into(),
@@ -2963,6 +3535,7 @@ mod tests {
 
         for (index, (kind, expected)) in cases.into_iter().enumerate() {
             let event = EventEnvelope::Durable(DurableEvent {
+                session_seq: 0,
                 event_id: format!("input-event-{index}"),
                 stream_seq: index as i64 + 1,
                 session_id: "s-1".into(),
@@ -3023,6 +3596,7 @@ mod tests {
 
     fn tool_start_event(tool_name: &str, arguments: serde_json::Value) -> EventEnvelope {
         EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-1".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3039,6 +3613,7 @@ mod tests {
 
     fn tool_end_event(tool_name: &str) -> EventEnvelope {
         EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-2".into(),
             stream_seq: 2,
             timestamp: 0,
@@ -3057,6 +3632,7 @@ mod tests {
     #[test]
     fn prompt_received_preserves_message_id() {
         let event = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-prompt".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3095,6 +3671,7 @@ mod tests {
             .map(|(index, block)| {
                 translator
                     .translate_update(&EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+                        session_seq: 0,
                         session_id: "s-1".to_string(),
                         timestamp: index as i64,
                         origin: EventOrigin::Local,
@@ -3138,6 +3715,7 @@ mod tests {
         ));
 
         let summary = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-prompt".into(),
             stream_seq: 4,
             timestamp: 4,
@@ -3244,6 +3822,7 @@ mod tests {
     #[test]
     fn assistant_updates_preserve_message_id() {
         let stored = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-stored".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3258,6 +3837,7 @@ mod tests {
             },
         });
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3292,6 +3872,7 @@ mod tests {
     #[test]
     fn live_translator_suppresses_stored_message_after_streaming_delta() {
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3302,6 +3883,7 @@ mod tests {
             },
         });
         let stored = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-stored".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3327,6 +3909,7 @@ mod tests {
     #[test]
     fn live_translator_forwards_non_streaming_stored_message() {
         let stored = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-stored".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3359,6 +3942,7 @@ mod tests {
     #[test]
     fn replay_translation_skips_streaming_deltas() {
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3391,6 +3975,7 @@ mod tests {
     #[test]
     fn live_translator_forwards_thinking_delta_as_agent_thought_chunk() {
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3429,6 +4014,7 @@ mod tests {
     #[test]
     fn replay_projects_each_summary_part_as_its_own_thought_chunk() {
         let stored = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-stored".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3476,6 +4062,7 @@ mod tests {
     #[test]
     fn live_translator_skips_empty_thinking_delta() {
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3500,6 +4087,7 @@ mod tests {
             "s-1",
             vec![
                 AgentEvent {
+                    session_seq: 0,
                     seq: 1,
                     timestamp: 1,
                     session_id: "s-1".to_string(),
@@ -3511,6 +4099,7 @@ mod tests {
                     },
                 },
                 AgentEvent {
+                    session_seq: 0,
                     seq: 2,
                     timestamp: 2,
                     session_id: "s-1".to_string(),
@@ -3524,6 +4113,7 @@ mod tests {
                     },
                 },
                 AgentEvent {
+                    session_seq: 0,
                     seq: 3,
                     timestamp: 3,
                     session_id: "s-1".to_string(),
@@ -3551,6 +4141,7 @@ mod tests {
     #[test]
     fn replay_uses_persisted_structured_prompt_blocks_when_available() {
         let event = AgentEvent {
+            session_seq: 0,
             seq: 1,
             timestamp: 1,
             session_id: "s-1".to_string(),
@@ -3637,6 +4228,7 @@ mod tests {
     #[test]
     fn malformed_todowrite_arguments_do_not_emit_update() {
         let event = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-3".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3939,14 +4531,12 @@ mod tests {
             ext_method_control: None,
         });
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(2);
 
         let prompt_task = tokio::spawn(dispatch_rpc_message(
             agent.clone(),
             session_owners.clone(),
-            pending_permissions.clone(),
             pending_elicitations.clone(),
             "conn-1".to_string(),
             RpcMessage {
@@ -3968,7 +4558,6 @@ mod tests {
         let cancel_task = tokio::spawn(dispatch_rpc_message(
             agent,
             session_owners,
-            pending_permissions,
             pending_elicitations,
             "conn-1".to_string(),
             rpc_cancel_message(None, serde_json::json!({"sessionId": "s-cancel"})),
@@ -4002,14 +4591,12 @@ mod tests {
     #[tokio::test]
     async fn session_cancel_notification_dispatches_without_response() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (agent, cancelled_session) = cancel_test_agent();
 
         let output = handle_rpc_message(
             &agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             rpc_cancel_message(None, serde_json::json!({"sessionId": "s-cancel"})),
@@ -4021,13 +4608,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_extensions_do_not_load_or_attach_sessions() {
+        let fixture = DelegateTestFixture::new()
+            .await
+            .expect("create agent fixture");
+        let store = fixture.planner.config.provider.history_store();
+        let session = store
+            .create_session(None, None, None, None)
+            .await
+            .expect("create stored session");
+        let session_id = session.public_id;
+        let session_owners = SessionOwnerMap::default();
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+
+        for (method, params) in [
+            (
+                "querymt/session/getLifecycle",
+                serde_json::json!({ "session_id": session_id }),
+            ),
+            (
+                "querymt/session/setLifecycle",
+                serde_json::json!({ "session_id": session_id, "resolved": true }),
+            ),
+        ] {
+            let output = handle_rpc_message(
+                fixture.planner.as_ref(),
+                &session_owners,
+                &pending_elicitations,
+                "conn-lifecycle",
+                RpcMessage {
+                    jsonrpc: "2.0".to_string(),
+                    method: method.to_string(),
+                    params,
+                    id: Some(serde_json::json!(1)),
+                },
+            )
+            .await;
+            assert!(
+                output.response.expect("extension response").error.is_none(),
+                "{method} should succeed without attaching"
+            );
+        }
+
+        assert!(!session_owners.lock().await.contains_key(&session_id));
+        assert!(
+            fixture
+                .planner
+                .registry
+                .lock()
+                .await
+                .get(&session_id)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn rejected_input_extension_rolls_back_only_new_session_ownership() {
         let session_owners = SessionOwnerMap::default();
         session_owners.lock().await.insert(
             "s-existing".to_string(),
             HashSet::from(["conn-ext".to_string(), "conn-other".to_string()]),
         );
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let agent = CancelTestAgent {
             cancelled_session: Arc::new(Mutex::new(None)),
@@ -4048,7 +4689,6 @@ mod tests {
             let output = handle_rpc_message(
                 &agent,
                 &session_owners,
-                &pending_permissions,
                 &pending_elicitations,
                 "conn-ext",
                 RpcMessage {
@@ -4104,19 +4744,16 @@ mod tests {
             ext_method_control: Some(control.clone()),
         });
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         let spawn_request = |id| {
             let agent = agent.clone();
             let session_owners = session_owners.clone();
-            let pending_permissions = pending_permissions.clone();
             let pending_elicitations = pending_elicitations.clone();
             tokio::spawn(async move {
                 handle_rpc_message(
                     agent.as_ref(),
                     &session_owners,
-                    &pending_permissions,
                     &pending_elicitations,
                     "conn-ext",
                     RpcMessage {
@@ -4189,7 +4826,6 @@ mod tests {
             "s-load-existing".to_string(),
             HashSet::from(["conn-hook".to_string(), "conn-other".to_string()]),
         );
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let context = RpcDispatchContext {
             session_hooks: Some(Arc::new(RejectPostAttachmentHooks {
@@ -4200,13 +4836,13 @@ mod tests {
             elicitation_recovery: None,
             translator: None,
             session_load: None,
+            delivery: None,
         };
 
         for session_id in ["s-load-new", "s-load-existing"] {
             let output = handle_rpc_message_with_context(
                 &agent,
                 &session_owners,
-                &pending_permissions,
                 &pending_elicitations,
                 "conn-hook",
                 RpcMessage {
@@ -4259,7 +4895,6 @@ mod tests {
             "s-remote-existing".to_string(),
             HashSet::from(["conn-hook".to_string(), "conn-other".to_string()]),
         );
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let context = RpcDispatchContext {
             session_hooks: Some(Arc::new(RejectPostAttachmentHooks {
@@ -4270,6 +4905,7 @@ mod tests {
             elicitation_recovery: None,
             translator: None,
             session_load: None,
+            delivery: None,
         };
 
         for (method, params) in [
@@ -4289,7 +4925,6 @@ mod tests {
             let output = handle_rpc_message_with_context(
                 &agent,
                 &session_owners,
-                &pending_permissions,
                 &pending_elicitations,
                 "conn-hook",
                 RpcMessage {
@@ -4337,12 +4972,10 @@ mod tests {
             ext_method_control: None,
         };
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let output = handle_rpc_message_with_context(
             &agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-lifecycle",
             RpcMessage {
@@ -4362,6 +4995,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: None,
                 session_load: None,
+                delivery: None,
             },
         )
         .await;
@@ -4393,12 +5027,10 @@ mod tests {
             ext_method_control: None,
         };
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let output = handle_rpc_message_with_context(
             &agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-prompt",
             RpcMessage {
@@ -4421,6 +5053,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: None,
                 session_load: None,
+                delivery: None,
             },
         )
         .await;
@@ -4440,7 +5073,6 @@ mod tests {
     #[tokio::test]
     async fn session_new_rpc_dispatches_to_agent_new_session() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -4539,7 +5171,6 @@ mod tests {
         let output = handle_rpc_message_with_context(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -4554,6 +5185,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: None,
                 session_load: None,
+                delivery: None,
             },
         )
         .await;
@@ -4603,12 +5235,10 @@ mod tests {
         params: serde_json::Value,
     ) -> RpcDispatchOutput {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         handle_rpc_message_with_context(
             agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -4623,6 +5253,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: None,
                 session_load: None,
+                delivery: None,
             },
         )
         .await
@@ -4651,12 +5282,10 @@ mod tests {
         let translator = Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new()));
         translator.lock().unwrap().set_capabilities(capabilities);
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         handle_rpc_message_with_context(
             agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -4675,6 +5304,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: Some(translator),
                 session_load: Some(Arc::new(std::sync::Mutex::new(preferences))),
+                delivery: None,
             },
         )
         .await
@@ -4720,6 +5350,7 @@ mod tests {
         ] {
             journal
                 .append_durable(&NewDurableEvent {
+                    session_seq: None,
                     session_id: session_id.clone(),
                     origin: EventOrigin::Local,
                     source_node: None,
@@ -4828,8 +5459,17 @@ mod tests {
                 .error
                 .is_none()
         );
-        assert_eq!(loaded.notifications.len(), 1);
-        assert_docs_catalog(&loaded.notifications[0], &session_id);
+        assert_eq!(loaded.notifications.len(), 2);
+        assert_docs_catalog(
+            loaded
+                .notifications
+                .iter()
+                .find(|notification| {
+                    notification["params"]["update"]["sessionUpdate"] == "available_commands_update"
+                })
+                .unwrap(),
+            &session_id,
+        );
 
         let resumed = dispatch_session_rpc(
             fixture.handle.as_ref(),
@@ -4854,14 +5494,12 @@ mod tests {
         registry.register(docs_slash_command());
         let fixture = crate::test_utils::TestAgent::with_slash_command_registry(registry).await;
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(8);
 
         dispatch_rpc_message(
             fixture.handle.clone(),
             session_owners,
-            pending_permissions,
             pending_elicitations,
             "conn-1".to_string(),
             RpcMessage {
@@ -4897,6 +5535,7 @@ mod tests {
         let journal = fixture.storage.event_journal();
         journal
             .append_durable(&NewDurableEvent {
+                session_seq: None,
                 session_id: session_id.clone(),
                 origin: EventOrigin::Local,
                 source_node: None,
@@ -4919,7 +5558,6 @@ mod tests {
             .expect("persist replay event");
 
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(64);
 
@@ -4927,7 +5565,6 @@ mod tests {
             RpcDispatchState {
                 agent: fixture.handle.clone(),
                 session_owners,
-                pending_permissions,
                 pending_elicitations,
                 conn_id: "conn-order".to_string(),
                 tx,
@@ -4974,7 +5611,6 @@ mod tests {
     #[tokio::test]
     async fn remote_attach_extension_records_session_owner_with_snake_case_payload() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -5078,7 +5714,6 @@ mod tests {
         let output = handle_rpc_message_with_context(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-9",
             RpcMessage {
@@ -5102,7 +5737,6 @@ mod tests {
     #[tokio::test]
     async fn remote_create_session_records_session_owner_from_snake_case_response() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -5205,7 +5839,6 @@ mod tests {
         let output = handle_rpc_message_with_context(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-9",
             RpcMessage {
@@ -5229,7 +5862,6 @@ mod tests {
     #[tokio::test]
     async fn session_load_records_session_owner_for_live_updates() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -5328,7 +5960,6 @@ mod tests {
         let output = handle_rpc_message_with_context(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-load",
             RpcMessage {
@@ -5356,7 +5987,6 @@ mod tests {
     #[tokio::test]
     async fn session_close_rpc_forwards_to_send_agent() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -5455,7 +6085,6 @@ mod tests {
         let output = handle_rpc_message(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -5482,7 +6111,6 @@ mod tests {
     #[tokio::test]
     async fn set_config_option_rpc_forwards_to_send_agent() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Minimal SendAgent that returns method_not_found for set_session_config_option
@@ -5583,7 +6211,6 @@ mod tests {
         let output = handle_rpc_message(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -5619,13 +6246,11 @@ mod tests {
         );
 
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations = fixture.planner.pending_elicitations();
 
         let output = handle_rpc_message(
             fixture.planner.as_ref(),
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -5823,10 +6448,13 @@ mod tests {
                 .map(|kv| (kv.key.as_str(), &kv.value))
                 .collect();
 
-            assert!(attrs.contains_key("rpc.system"), "missing rpc.system");
+            assert!(
+                attrs.contains_key("rpc.system.name"),
+                "missing rpc.system.name"
+            );
             assert!(attrs.contains_key("rpc.method"), "missing rpc.method");
 
-            assert_eq!(attrs["rpc.system"].as_str(), "jsonrpc");
+            assert_eq!(attrs["rpc.system.name"].as_str(), "jsonrpc");
             assert_eq!(
                 attrs["rpc.method"].as_str(),
                 AGENT_METHOD_NAMES.session_prompt
@@ -5922,6 +6550,7 @@ mod tests {
             for _ in 0..10_001 {
                 journal
                     .append_durable(&NewDurableEvent {
+                        session_seq: None,
                         session_id: session_id.clone(),
                         origin: EventOrigin::Local,
                         source_node: None,
@@ -5934,6 +6563,7 @@ mod tests {
             }
             journal
                 .append_durable(&NewDurableEvent {
+                    session_seq: None,
                     session_id: session_id.clone(),
                     origin: EventOrigin::Local,
                     source_node: None,
@@ -5956,6 +6586,7 @@ mod tests {
                 .expect("persist replay event");
             journal
                 .append_durable(&NewDurableEvent {
+                    session_seq: None,
                     session_id: session_id.clone(),
                     origin: EventOrigin::Local,
                     source_node: None,
@@ -6092,6 +6723,7 @@ mod session_update_tests {
 
     fn envelope(seq: i64, kind: AgentEventKind) -> EventEnvelope {
         EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: format!("evt-{seq}"),
             stream_seq: seq,
             timestamp: 0,
@@ -6104,6 +6736,7 @@ mod session_update_tests {
 
     fn agent_event(seq: i64, kind: AgentEventKind) -> AgentEvent {
         AgentEvent {
+            session_seq: 0,
             seq,
             timestamp: 0,
             session_id: "s-1".to_string(),
@@ -6153,8 +6786,72 @@ mod session_update_tests {
                 cumulative_cost_usd: cumulative_cost,
                 context_tokens,
                 metrics: Default::default(),
+                accounting: None,
             },
         )
+    }
+
+    /// A request end that carries accounting (not a legacy generation record).
+    fn accounted_end(seq: i64, context_tokens: u64) -> EventEnvelope {
+        envelope(seq, accounted_end_kind(context_tokens))
+    }
+
+    fn accounted_end_accounting() -> Option<crate::accounting::RequestAccounting> {
+        Some(crate::accounting::RequestAccounting {
+            operation_id: "op-1".into(),
+            attempt_ids: vec![],
+            known_subtotal_usd: 0.0,
+            complete: true,
+            reasons: vec![],
+        })
+    }
+
+    fn accounted_end_kind(context_tokens: u64) -> AgentEventKind {
+        AgentEventKind::LlmRequestEnd {
+            usage: None,
+            tool_calls: 0,
+            finish_reason: None,
+            cost_usd: None,
+            // Never read: money comes from the reducer.
+            cumulative_cost_usd: Some(999.0),
+            context_tokens,
+            metrics: Default::default(),
+            accounting: accounted_end_accounting(),
+        }
+    }
+
+    /// Cost of one complete `sample_settlement` attempt.
+    fn sample_cost() -> f64 {
+        (100.0 * 3.0 + 15.0 * 15.0 + 50.0 * 0.3 + 20.0 * 3.75) / 1e6
+    }
+
+    /// Settled main-response attempt (start + settlement events) for `cycle`.
+    fn attempt_events(
+        seq: i64,
+        id: &str,
+        cycle: &str,
+        purpose: crate::accounting::AttemptPurpose,
+        complete: bool,
+    ) -> Vec<EventEnvelope> {
+        use crate::accounting::tests::{sample_pricing, sample_settlement, sample_start};
+        let mut start = sample_start();
+        start.attempt.attempt_id = id.into();
+        start.attempt.session_id = "s-1".into();
+        start.attempt.cycle_id = cycle.into();
+        start.attempt.purpose = purpose;
+        let mut settlement = sample_settlement();
+        settlement.attempt = start.attempt.clone();
+        if !complete {
+            let mut pricing = sample_pricing();
+            pricing.cache_write = None;
+            settlement.valuation =
+                querymt::providers::value_usage(Some(&pricing), settlement.usage.as_ref());
+            settlement.pricing = Some(pricing);
+        }
+        vec![
+            envelope(seq, AgentEventKind::LlmAttemptStarted { start }),
+            envelope(seq + 1, AgentEventKind::LlmAttemptSettled { settlement }),
+        ]
     }
 
     fn provider_changed(seq: i64, limit: Option<u64>) -> EventEnvelope {
@@ -6308,11 +7005,113 @@ mod session_update_tests {
             },
         );
         for translator in [&mut full, &mut compaction_only, &mut legacy] {
+            translator.translate_updates(&provider_changed(0, None));
             assert!(matches!(
                 translator.translate_updates(&config).as_slice(),
                 [SessionUpdate::ConfigOptionUpdate(_)]
             ));
         }
+    }
+
+    #[test]
+    fn provider_change_projects_model_identity_to_all_clients() {
+        let event = envelope(
+            1,
+            AgentEventKind::ProviderChanged {
+                provider: "codex".into(),
+                model: "test-model".into(),
+                config_id: 1,
+                context_limit: None,
+                provider_node_id: Some("provider-node".into()),
+            },
+        );
+        let mut translator = AcpLiveEventTranslator::new();
+        let config = envelope(
+            0,
+            AgentEventKind::SessionConfigChanged {
+                mode: AgentMode::Plan,
+                reasoning_effort: Some("high".into()),
+            },
+        );
+        translator.translate_updates(&config);
+        let updates = translator.translate_updates(&event);
+        let SessionUpdate::ConfigOptionUpdate(update) = &updates[0] else {
+            panic!("model update");
+        };
+        let json = serde_json::to_value(update).unwrap();
+        let options = json["configOptions"].as_array().unwrap();
+        assert_eq!(options.len(), 3);
+        let model = options
+            .iter()
+            .find(|option| option["id"] == "model")
+            .unwrap();
+        assert_eq!(model["currentValue"], "codex/test-model");
+        assert_eq!(
+            model["_meta"]["querymt"]["modelEntry"]["node_id"],
+            "provider-node"
+        );
+        assert!(
+            options
+                .iter()
+                .any(|option| option["id"] == "mode" && option["currentValue"] == "plan")
+        );
+        let changed = envelope(
+            2,
+            AgentEventKind::SessionConfigChanged {
+                mode: AgentMode::Review,
+                reasoning_effort: None,
+            },
+        );
+        let updates = translator.translate_updates(&changed);
+        let SessionUpdate::ConfigOptionUpdate(update) = &updates[0] else {
+            panic!("config snapshot");
+        };
+        assert_eq!(
+            update.config_options.len(),
+            3,
+            "mode/reasoning changes keep the model selector"
+        );
+        let replay = replay_agent_events_materialized(
+            "s-1",
+            vec![
+                agent_event(0, config.kind().clone()),
+                agent_event(1, event.kind().clone()),
+                agent_event(2, changed.kind().clone()),
+            ],
+            &HashMap::new(),
+            &Default::default(),
+        );
+        let replay_config = replay
+            .iter()
+            .find_map(|notification| match &notification.update {
+                SessionUpdate::ConfigOptionUpdate(update) => Some(update),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(replay_config).unwrap(),
+            serde_json::to_value(update).unwrap()
+        );
+        let mut seeded = AcpLiveEventTranslator::new();
+        let mut options = update.config_options.clone();
+        options.push(crate::acp::protocol::SessionConfigOption::select(
+            "profile",
+            "Profile",
+            "alpha",
+            vec![crate::acp::protocol::SessionConfigSelectOption::new(
+                "alpha", "Alpha",
+            )],
+        ));
+        seeded.seed_config_options("s-1", &options);
+        let updates = seeded.translate_updates(&event);
+        let SessionUpdate::ConfigOptionUpdate(update) = &updates[0] else {
+            panic!("seeded snapshot");
+        };
+        assert_eq!(
+            update.config_options.len(),
+            4,
+            "live snapshots retain the profile selector too"
+        );
     }
 
     // ── 1.3 Zero-to-many ordering ──────────────────────────────────────────
@@ -6351,6 +7150,7 @@ mod session_update_tests {
             [SessionUpdate::CurrentModeUpdate(_)]
         ));
 
+        translator.translate_updates(&provider_changed(1, None));
         let updates = translator.translate_updates(&envelope(
             2,
             AgentEventKind::SessionConfigChanged {
@@ -6392,6 +7192,7 @@ mod session_update_tests {
         .unwrap();
         assert_eq!(mode_json["sessionUpdate"], "current_mode_update");
         assert_eq!(mode_json["currentModeId"], "build");
+        translator.translate_updates(&provider_changed(1, None));
 
         let config_json = serde_json::to_value(
             translator
@@ -6434,8 +7235,8 @@ mod session_update_tests {
         assert_eq!(usage_json["sessionUpdate"], "usage_update");
         assert_eq!(usage_json["used"], 42);
         assert_eq!(usage_json["size"], 100);
-        assert_eq!(usage_json["cost"]["amount"], 0.5);
-        assert_eq!(usage_json["cost"]["currency"], "USD");
+        // A legacy request-end cumulative cost is never trusted.
+        assert!(usage_json.get("cost").is_none_or(|cost| cost.is_null()));
 
         let plan_json = serde_json::to_value(
             translator
@@ -6566,6 +7367,7 @@ mod session_update_tests {
                     reasoning_tokens: 1024,
                     cache_read: 500,
                     cache_write: 20,
+                    cache_write_tiers: None,
                 }),
                 context_tokens: 1781,
                 cumulative_cost_usd: Some(0.5),
@@ -6573,6 +7375,7 @@ mod session_update_tests {
                 tool_calls: 0,
                 finish_reason: None,
                 metrics: Default::default(),
+                accounting: None,
             },
         )
     }
@@ -6614,8 +7417,8 @@ mod session_update_tests {
             agent_event(2, request_with_tokens(2).kind().clone()),
             agent_event(5, request_with_tokens(5).kind().clone()),
         ];
-        translator.seed_usage("s-1", &history);
-        translator.seed_usage("s-1", &history);
+        translator.seed_history("s-1", &history);
+        translator.seed_history("s-1", &history);
         let value =
             serde_json::to_value(translator.usage["s-1"].usage_update(100).unwrap()).unwrap();
         assert_eq!(value["size"], 200_000);
@@ -6639,6 +7442,7 @@ mod session_update_tests {
         for kind in kinds {
             journal
                 .append_durable(&NewDurableEvent {
+                    session_seq: None,
                     session_id: session_id.clone(),
                     origin: EventOrigin::Local,
                     source_node: None,
@@ -6661,13 +7465,128 @@ mod session_update_tests {
             serde_json::to_value(snapshot).unwrap(),
         )]);
         let mut translator = AcpLiveEventTranslator::new();
-        assert!(translator.seed_usage_from_meta(&session_id, Some(&meta)));
-        assert!(translator.seed_usage_from_meta(&session_id, Some(&meta)));
+        assert!(
+            translator
+                .seed_history_from_meta(&session_id, Some(&meta))
+                .is_some()
+        );
+        assert!(
+            translator
+                .seed_history_from_meta(&session_id, Some(&meta))
+                .is_some()
+        );
         let usage = &translator.usage[&session_id];
         assert!(usage.history_loaded);
         assert!(!usage.partial);
         assert_eq!(usage.context_limit, Some(100_000));
         assert_eq!(usage.session_totals.as_ref().unwrap().output_tokens, 162);
+    }
+
+    #[tokio::test]
+    async fn load_snapshot_carries_authoritative_accounting_without_context_or_replay() {
+        use crate::accounting::AttemptPurpose::{Compaction, MainResponse};
+        use crate::session::backend::StorageBackend;
+        use crate::session::projection::NewDurableEvent;
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = fixture.create_session().await;
+        let journal = fixture.storage.event_journal();
+        // No provider_changed: the context limit is unknown. A complete main
+        // attempt, then a compaction attempt with an unpriced category.
+        let mut records = attempt_events(1, "a1", "c1", MainResponse, true);
+        records.extend(attempt_events(3, "a2", "c1", Compaction, false));
+        for record in records {
+            let mut kind = record.kind().clone();
+            match &mut kind {
+                AgentEventKind::LlmAttemptStarted { start } => {
+                    start.attempt.session_id = session_id.clone()
+                }
+                AgentEventKind::LlmAttemptSettled { settlement } => {
+                    settlement.attempt.session_id = session_id.clone()
+                }
+                _ => {}
+            }
+            journal
+                .append_durable(&NewDurableEvent {
+                    session_seq: None,
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    source_node_id: None,
+                    source_seq: None,
+                    kind,
+                })
+                .await
+                .unwrap();
+        }
+        let snapshot = crate::session::load_session_snapshot(
+            fixture.handle.as_ref(),
+            fixture.storage.view_store().unwrap(),
+            &session_id,
+        )
+        .await
+        .unwrap();
+        let json = serde_json::to_value(&snapshot).unwrap();
+        let accounting = &json["accounting"];
+        assert_eq!(accounting["version"], 1);
+        assert!(accounting["session"]["completeTotalUsd"].is_null());
+        assert_eq!(accounting["session"]["pricedAttempts"], 2);
+        assert_eq!(accounting["session"]["incompleteAttempts"], 1);
+        assert_eq!(accounting["cycle"]["cycleId"], "c1");
+
+        // Seeding a connection from that snapshot reproduces the same state
+        // and, applied again together with captured-live duplicates, never
+        // double counts.
+        let meta = serde_json::Map::from_iter([(
+            "querymt/sessionLoadSnapshot.v1".to_string(),
+            json.clone(),
+        )]);
+        let mut translator = AcpLiveEventTranslator::new();
+        assert!(
+            translator
+                .seed_history_from_meta(&session_id, Some(&meta))
+                .is_some()
+        );
+        let seeded = translator.usage[&session_id].accounting_snapshot().unwrap();
+        assert_eq!(serde_json::to_value(&seeded).unwrap(), *accounting);
+        assert!(
+            translator
+                .seed_history_from_meta(&session_id, Some(&meta))
+                .is_some()
+        );
+        let again = translator.usage[&session_id].accounting_snapshot().unwrap();
+        assert_eq!(seeded, again);
+    }
+
+    #[test]
+    fn older_snapshot_cannot_resurrect_a_cleared_complete_total() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        // Live delivery already cleared the total (partial attempt seq 3-4).
+        let mut translator = AcpLiveEventTranslator::new();
+        settle_all(
+            &mut translator,
+            attempt_events(1, "a1", "c1", MainResponse, true),
+        );
+        settle_all(
+            &mut translator,
+            attempt_events(3, "a2", "c1", MainResponse, false),
+        );
+        // A stale snapshot taken after only the first (complete) attempt.
+        let stale: Vec<AgentEvent> = attempt_events(1, "a1", "c1", MainResponse, true)
+            .iter()
+            .map(|e| agent_event(e.seq(), e.kind().clone()))
+            .collect();
+        let meta = serde_json::Map::from_iter([(
+            "querymt/sessionLoadSnapshot.v1".to_string(),
+            serde_json::json!({ "audit": { "events": stale } }),
+        )]);
+        assert!(
+            translator
+                .seed_history_from_meta("s-1", Some(&meta))
+                .is_some()
+        );
+        let snapshot = translator.usage["s-1"].accounting_snapshot().unwrap();
+        assert!(snapshot.session.complete_total_usd.is_none());
+        assert_eq!(snapshot.session.priced_attempts, 2);
     }
 
     #[test]
@@ -6682,15 +7601,27 @@ mod session_update_tests {
         )]);
         let mut translator = AcpLiveEventTranslator::new();
         translator.translate_updates(&usage_end(3, 100, None));
-        assert!(translator.seed_usage_from_meta("s-1", Some(&meta)));
-        assert!(translator.seed_usage_from_meta("s-1", Some(&meta)));
+        assert!(
+            translator
+                .seed_history_from_meta("s-1", Some(&meta))
+                .is_some()
+        );
+        assert!(
+            translator
+                .seed_history_from_meta("s-1", Some(&meta))
+                .is_some()
+        );
         let usage = &translator.usage["s-1"];
         assert!(usage.history_loaded);
         assert_eq!(usage.session_totals.as_ref().unwrap().output_tokens, 162);
         assert!(usage.latest_request.is_none());
         assert!(usage.partial);
-        assert_eq!(usage.cumulative_cost_usd, Some(0.5));
-        assert!(!translator.seed_usage_from_meta("s-1", None));
+        // Legacy request-ends carry no accounting basis: their cumulative cost
+        // is not trusted and no complete total is claimed.
+        let snapshot = usage.accounting_snapshot().expect("legacy disclosure");
+        assert!(snapshot.session.complete_total_usd.is_none());
+        assert_eq!(snapshot.session.unaccounted_generations, 2);
+        assert!(translator.seed_history_from_meta("s-1", None).is_none());
     }
 
     #[test]
@@ -6714,7 +7645,7 @@ mod session_update_tests {
             })
             .unwrap();
         let mut translator = AcpLiveEventTranslator::new();
-        translator.seed_usage("s-1", &events);
+        translator.seed_history("s-1", &events);
         let live_usage =
             serde_json::to_value(translator.usage["s-1"].usage_update(100).unwrap()).unwrap();
         assert_eq!(replay_usage, live_usage);
@@ -6729,27 +7660,45 @@ mod session_update_tests {
     #[test]
     fn usage_uses_latest_limit_and_includes_cost_and_cached_tokens() {
         let mut translator = AcpLiveEventTranslator::new();
+        use crate::accounting::AttemptPurpose::MainResponse;
         translator.translate_updates(&provider_changed(1, Some(100_000)));
+        for event in attempt_events(2, "a1", "c1", MainResponse, true) {
+            translator.translate_updates(&event);
+        }
         // Cached tokens are already included in context_tokens.
-        let updates = translator.translate_updates(&usage_end(2, 12_345, Some(1.25)));
+        let updates = translator.translate_updates(&accounted_end(4, 12_345));
         let SessionUpdate::UsageUpdate(usage) = &updates[0] else {
             panic!("expected usage update");
         };
         assert_eq!(usage.used, 12_345);
         assert_eq!(usage.size, 100_000);
-        assert_eq!(usage.cost.as_ref().unwrap().amount, 1.25);
+        assert!((usage.cost.as_ref().unwrap().amount - sample_cost()).abs() < 1e-12);
 
-        // A different known limit applies to the next snapshot. A request
-        // without a fresh cost value keeps the last cumulative session cost.
-        translator.translate_updates(&provider_changed(3, Some(50_000)));
-        let updates = translator.translate_updates(&usage_end(4, 100, None));
+        // A different known limit applies to the next snapshot; the complete
+        // session total comes from the reducer and is retained.
+        translator.translate_updates(&provider_changed(5, Some(50_000)));
+        let updates = translator.translate_updates(&accounted_end(6, 100));
         let SessionUpdate::UsageUpdate(usage) = &updates[0] else {
             panic!("expected usage update");
         };
         assert_eq!(usage.size, 50_000);
-        assert_eq!(usage.cost.as_ref().unwrap().amount, 1.25);
+        assert!((usage.cost.as_ref().unwrap().amount - sample_cost()).abs() < 1e-12);
 
-        // With no cost observed anywhere, the cost field stays omitted.
+        // An unpriced nonzero category makes the session partial: standard
+        // cost is omitted instead of retaining the previous complete value,
+        // and the accounting metadata clears the total with an explicit null.
+        let mut last = Vec::new();
+        for event in attempt_events(7, "a2", "c1", MainResponse, false) {
+            last = translator.translate_updates(&event);
+        }
+        let partial = serde_json::to_value(&last[0]).unwrap();
+        assert!(partial.get("cost").is_none_or(|cost| cost.is_null()));
+        let accounting = &partial["_meta"]["querymt"]["accounting"]["session"];
+        assert!(accounting["completeTotalUsd"].is_null());
+        assert_eq!(accounting["complete"], false);
+        assert!(accounting["knownSubtotalUsd"].as_f64().unwrap() > sample_cost());
+
+        // With no accounting observed anywhere, no cost or accounting appears.
         let mut fresh = AcpLiveEventTranslator::new();
         fresh.translate_updates(&provider_changed(1, Some(50_000)));
         let updates = fresh.translate_updates(&usage_end(2, 100, None));
@@ -6757,6 +7706,274 @@ mod session_update_tests {
             panic!("expected usage update");
         };
         assert!(usage.cost.is_none());
+    }
+
+    fn settle_all(
+        translator: &mut AcpLiveEventTranslator,
+        events: Vec<EventEnvelope>,
+    ) -> Vec<SessionUpdate> {
+        let mut last = Vec::new();
+        for event in events {
+            last = translator.translate_updates(&event);
+        }
+        last
+    }
+
+    #[test]
+    fn attempt_start_alone_publishes_nothing() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let mut translator = AcpLiveEventTranslator::new();
+        let start = attempt_events(1, "a1", "c1", MainResponse, true).remove(0);
+        assert!(translator.translate_updates(&start).is_empty());
+    }
+
+    #[test]
+    fn unknown_context_delivers_accounting_through_metadata_only_session_info() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        // No notice/compaction capability and no known context limit.
+        let mut translator = AcpLiveEventTranslator::new();
+        assert!(!translator.capabilities().notices);
+        let updates = settle_all(
+            &mut translator,
+            attempt_events(1, "a1", "c1", MainResponse, true),
+        );
+        let [SessionUpdate::SessionInfoUpdate(_)] = updates.as_slice() else {
+            panic!("expected one metadata-only session_info_update, got {updates:?}");
+        };
+        let json = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(json["sessionUpdate"], "session_info_update");
+        // No session-summary fields change, and no context is fabricated.
+        assert!(json.get("title").is_none());
+        assert!(json.get("updatedAt").is_none());
+        assert!(json.get("used").is_none());
+        let accounting = &json["_meta"]["querymt"]["accounting"];
+        assert_eq!(accounting["version"], 1);
+        assert_eq!(accounting["session"]["complete"], true);
+        assert_eq!(accounting["cycle"]["cycleId"], "c1");
+        assert!(json["_meta"]["querymt"].get("usage").is_none());
+    }
+
+    #[test]
+    fn auxiliary_settlement_reuses_valid_main_context_and_keeps_usage_v1() {
+        use crate::accounting::AttemptPurpose::{Compaction, MainResponse};
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_updates(&provider_changed(1, Some(100_000)));
+        settle_all(
+            &mut translator,
+            attempt_events(2, "a1", "c1", MainResponse, true),
+        );
+        let main = translator.translate_updates(&request_with_tokens(4));
+        let main = serde_json::to_value(&main[0]).unwrap();
+        let aux = settle_all(
+            &mut translator,
+            attempt_events(5, "a2", "c1", Compaction, true),
+        );
+        let aux = serde_json::to_value(&aux[0]).unwrap();
+        assert_eq!(aux["sessionUpdate"], "usage_update");
+        // Main-context occupancy is not replaced by auxiliary tokens, and the
+        // main-request token telemetry keeps its v1 scope.
+        assert_eq!(aux["used"], main["used"]);
+        assert_eq!(
+            aux["_meta"]["querymt"]["usage"],
+            main["_meta"]["querymt"]["usage"]
+        );
+        assert_eq!(
+            aux["_meta"]["querymt"]["accounting"]["session"]["pricedAttempts"],
+            2
+        );
+    }
+
+    #[test]
+    fn model_switch_invalidates_prior_context_measurement() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_updates(&provider_changed(1, Some(100_000)));
+        translator.translate_updates(&accounted_end(2, 5_000));
+        translator.translate_updates(&provider_changed(3, Some(200_000)));
+        // The 5_000 measurement predates the switch; it is not paired with the
+        // new limit. Accounting still arrives through the fallback.
+        let updates = settle_all(
+            &mut translator,
+            attempt_events(4, "a1", "c1", MainResponse, true),
+        );
+        let json = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(json["sessionUpdate"], "session_info_update");
+        assert!(json["_meta"]["querymt"]["accounting"].is_object());
+    }
+
+    #[test]
+    fn partial_budget_warning_follows_notice_capability_but_accounting_always_arrives() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let notice = envelope(
+            9,
+            AgentEventKind::HookNotice {
+                event_name: "price_limit".to_string(),
+                message: "best-effort budget".to_string(),
+                is_error: false,
+            },
+        );
+        // Manual budget rates cannot price the used cache-write category.
+        let mut events = attempt_events(1, "a1", "c1", MainResponse, true);
+        let EventEnvelope::Durable(durable) = &mut events[1] else {
+            unreachable!()
+        };
+        let AgentEventKind::LlmAttemptSettled { settlement } = &mut durable.kind else {
+            unreachable!()
+        };
+        let mut manual = crate::accounting::tests::sample_pricing();
+        manual.cache_write = None;
+        settlement.budget_valuation = Some(querymt::providers::value_usage(
+            Some(&manual),
+            settlement.usage.as_ref(),
+        ));
+
+        // Capable client: the advisory notice is delivered, not an error.
+        let mut capable = AcpLiveEventTranslator::new();
+        capable.set_capabilities(plan_ops());
+        let delivered = capable.translate_updates(&notice);
+        let [SessionUpdate::Notice(n)] = delivered.as_slice() else {
+            panic!("capable client must receive the notice");
+        };
+        assert_eq!(n.severity, NoticeSeverity::Info);
+
+        // Client without notice support: no unsupported notice is sent, yet
+        // the best-effort condition is still carried by the accounting
+        // metadata, and the API estimate stays complete.
+        let mut legacy = AcpLiveEventTranslator::new();
+        assert!(legacy.translate_updates(&notice).is_empty());
+        let updates = settle_all(&mut legacy, events);
+        let json = serde_json::to_value(&updates[0]).unwrap();
+        let budget = &json["_meta"]["querymt"]["accounting"]["cycle"]["budget"];
+        assert_eq!(budget["bestEffort"], true);
+        assert!(budget["completeTotalUsd"].is_null());
+        assert_eq!(
+            json["_meta"]["querymt"]["accounting"]["session"]["complete"],
+            true
+        );
+    }
+
+    #[test]
+    fn duplicate_settlement_delivery_publishes_once() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let mut translator = AcpLiveEventTranslator::new();
+        let events = attempt_events(1, "a1", "c1", MainResponse, true);
+        let first = settle_all(&mut translator, events.clone());
+        assert_eq!(first.len(), 1);
+        let again = settle_all(&mut translator, events);
+        assert!(again.is_empty(), "identical redelivery changes nothing");
+    }
+
+    #[test]
+    fn replay_accounting_matches_live_for_the_same_records() {
+        use crate::accounting::AttemptPurpose::{Compaction, MainResponse};
+        let mut envelopes = vec![provider_changed(1, Some(100_000))];
+        envelopes.extend(attempt_events(2, "a1", "c1", MainResponse, true));
+        envelopes.push(accounted_end(4, 7_000));
+        envelopes.extend(attempt_events(5, "a2", "c1", Compaction, false));
+
+        let mut live = AcpLiveEventTranslator::new();
+        let mut live_update = Vec::new();
+        for event in &envelopes {
+            let updates = live.translate_updates(event);
+            if let Some(update) = updates.into_iter().next_back() {
+                live_update = vec![update];
+            }
+        }
+        let live_json = serde_json::to_value(&live_update[0]).unwrap();
+
+        let events: Vec<AgentEvent> = envelopes
+            .iter()
+            .map(|e| agent_event(e.seq(), e.kind().clone()))
+            .collect();
+        let replay = replay_updates(events, Default::default());
+        let replay_json = replay
+            .iter()
+            .find_map(|u| match u {
+                SessionUpdate::UsageUpdate(_) => Some(serde_json::to_value(u).unwrap()),
+                _ => None,
+            })
+            .expect("replayed usage update");
+        assert_eq!(
+            replay_json["_meta"]["querymt"]["accounting"],
+            live_json["_meta"]["querymt"]["accounting"]
+        );
+        assert_eq!(replay_json["used"], live_json["used"]);
+        // The partial compaction attempt clears the standard cost both ways.
+        assert!(replay_json.get("cost").is_none_or(|c| c.is_null()));
+        assert!(live_json.get("cost").is_none_or(|c| c.is_null()));
+    }
+
+    #[test]
+    fn replay_without_context_still_carries_accounting() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let events: Vec<AgentEvent> = attempt_events(1, "a1", "c1", MainResponse, true)
+            .iter()
+            .map(|e| agent_event(e.seq(), e.kind().clone()))
+            .collect();
+        let replay = replay_updates(events, Default::default());
+        let info = replay
+            .iter()
+            .find_map(|u| match u {
+                SessionUpdate::SessionInfoUpdate(_) => Some(serde_json::to_value(u).unwrap()),
+                _ => None,
+            })
+            .expect("metadata-only accounting update");
+        assert!(info["_meta"]["querymt"]["accounting"]["session"]["complete"] == true);
+        assert!(
+            !replay
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::UsageUpdate(_)))
+        );
+    }
+
+    #[test]
+    fn seeding_from_load_snapshot_restores_reducer_accounting() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let events: Vec<AgentEvent> = attempt_events(1, "a1", "c1", MainResponse, true)
+            .iter()
+            .map(|e| agent_event(e.seq(), e.kind().clone()))
+            .collect();
+        let meta = serde_json::Map::from_iter([(
+            "querymt/sessionLoadSnapshot.v1".to_string(),
+            serde_json::json!({ "audit": { "events": events } }),
+        )]);
+        let mut translator = AcpLiveEventTranslator::new();
+        assert!(
+            translator
+                .seed_history_from_meta("s-1", Some(&meta))
+                .is_some()
+        );
+        assert!(
+            translator
+                .seed_history_from_meta("s-1", Some(&meta))
+                .is_some()
+        );
+        let snapshot = translator.usage["s-1"].accounting_snapshot().unwrap();
+        assert_eq!(snapshot.session.priced_attempts, 1);
+        assert!(snapshot.session.complete);
+    }
+
+    #[test]
+    fn excluded_only_session_has_no_standard_cost() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_updates(&provider_changed(1, Some(100_000)));
+        let mut events = attempt_events(2, "a1", "c1", MainResponse, true);
+        let EventEnvelope::Durable(durable) = &mut events[1] else {
+            unreachable!()
+        };
+        let AgentEventKind::LlmAttemptSettled { settlement } = &mut durable.kind else {
+            unreachable!()
+        };
+        settlement.valuation = querymt::providers::UsageValuation::excluded();
+        settle_all(&mut translator, events);
+        let update = translator.translate_updates(&accounted_end(4, 100));
+        let json = serde_json::to_value(&update[0]).unwrap();
+        assert!(json.get("cost").is_none_or(|c| c.is_null()));
+        assert_eq!(
+            json["_meta"]["querymt"]["accounting"]["session"]["billing"],
+            "excluded"
+        );
     }
 
     #[test]
@@ -6809,10 +8026,19 @@ mod session_update_tests {
         let mut translator = AcpLiveEventTranslator::new();
         translator.set_capabilities(plan_ops());
         translator.translate_updates(&provider_changed(1, Some(100_000)));
-        translator.translate_updates(&usage_end(2, 90_000, Some(2.0)));
+        for event in attempt_events(
+            2,
+            "a1",
+            "c1",
+            crate::accounting::AttemptPurpose::MainResponse,
+            true,
+        ) {
+            translator.translate_updates(&event);
+        }
+        translator.translate_updates(&accounted_end(4, 90_000));
 
         let updates = translator.translate_updates(&envelope(
-            3,
+            5,
             AgentEventKind::CompactionEnd {
                 summary: "s".to_string(),
                 summary_len: 1,
@@ -6825,7 +8051,7 @@ mod session_update_tests {
         };
         assert_eq!(usage.used, 1_000);
         assert_eq!(usage.size, 100_000);
-        assert_eq!(usage.cost.as_ref().unwrap().amount, 2.0);
+        assert!((usage.cost.as_ref().unwrap().amount - sample_cost()).abs() < 1e-12);
     }
 
     // ── 4.1/4.2 Plan lifecycle ─────────────────────────────────────────────
@@ -6953,6 +8179,105 @@ mod session_update_tests {
         };
         assert_eq!(notice.severity, NoticeSeverity::Info);
         assert!(!notice.title.is_empty());
+    }
+
+    fn stop_event() -> AgentEventKind {
+        AgentEventKind::MiddlewareStopped {
+            stop_type: crate::events::StopType::ModelTokenLimit,
+            reason: "model hit its output limit".to_string(),
+            metrics: crate::events::ExecutionMetrics { steps: 1, turns: 1 },
+        }
+    }
+
+    fn recovery_event() -> AgentEventKind {
+        AgentEventKind::OutputLimitRecovery {
+            turn: 1,
+            attempt: 1,
+            action: crate::events::OutputLimitRecoveryAction::Escalate,
+            from_max_tokens: Some(32_000),
+            to_max_tokens: Some(128_000),
+            thinking_only: false,
+            discarded_message_id: None,
+        }
+    }
+
+    #[test]
+    fn output_limit_stop_and_recovery_become_live_notices_for_capable_clients() {
+        let mut capable = AcpLiveEventTranslator::new();
+        capable.set_capabilities(plan_ops());
+
+        let stop = capable.translate_updates(&envelope(1, stop_event()));
+        let [SessionUpdate::Notice(notice)] = stop.as_slice() else {
+            panic!("expected a stop notice, got {stop:?}");
+        };
+        assert_eq!(notice.severity, NoticeSeverity::Warning);
+        assert!(
+            notice.title.contains("Output token limit"),
+            "{}",
+            notice.title
+        );
+        assert_eq!(
+            notice.description.as_deref(),
+            Some("model hit its output limit")
+        );
+
+        let recovery = capable.translate_updates(&envelope(2, recovery_event()));
+        let [SessionUpdate::Notice(notice)] = recovery.as_slice() else {
+            panic!("expected a recovery notice, got {recovery:?}");
+        };
+        assert_eq!(notice.severity, NoticeSeverity::Info);
+        assert!(notice.title.contains("128000"), "{}", notice.title);
+    }
+
+    #[test]
+    fn clients_without_notice_support_get_no_stop_or_recovery_notice() {
+        let mut legacy = AcpLiveEventTranslator::new();
+        assert!(
+            legacy
+                .translate_updates(&envelope(1, stop_event()))
+                .is_empty()
+        );
+        assert!(
+            legacy
+                .translate_updates(&envelope(2, recovery_event()))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stop_and_recovery_notices_are_not_replayed() {
+        let events = vec![
+            agent_event(1, stop_event()),
+            agent_event(2, recovery_event()),
+        ];
+        let updates = replay_updates(events, plan_ops());
+        assert!(
+            updates
+                .iter()
+                .all(|update| !matches!(update, SessionUpdate::Notice(_))),
+            "{updates:?}"
+        );
+    }
+
+    #[test]
+    fn output_limit_stop_reports_max_tokens_without_querymt_meta() {
+        // Capable and non-capable clients get the same protocol-level reason.
+        let response = crate::acp::protocol::PromptResponse::new(
+            crate::acp::protocol::StopReason::from(crate::events::StopType::ModelTokenLimit),
+        );
+        assert_eq!(
+            response.stop_reason,
+            crate::acp::protocol::StopReason::MaxTokens
+        );
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(
+            json.get("_meta")
+                .and_then(|meta| meta.get("querymt"))
+                .is_none_or(
+                    |querymt| querymt.get("stopType").is_none() && querymt.get("reason").is_none()
+                ),
+            "{json}"
+        );
     }
 
     // ── 5.3 Compaction lifecycle projection ────────────────────────────────
@@ -7160,6 +8485,7 @@ mod session_update_tests {
                     cumulative_cost_usd: Some(3.0),
                     context_tokens: 50,
                     metrics: Default::default(),
+                    accounting: accounted_end_accounting(),
                 },
             ),
             agent_event(
@@ -7199,6 +8525,26 @@ mod session_update_tests {
                     event_name: "hook".to_string(),
                     message: "noisy".to_string(),
                     is_error: false,
+                },
+            ),
+            agent_event(
+                12,
+                AgentEventKind::LlmAttemptStarted {
+                    start: {
+                        let mut start = crate::accounting::tests::sample_start();
+                        start.attempt.session_id = "s-1".into();
+                        start
+                    },
+                },
+            ),
+            agent_event(
+                13,
+                AgentEventKind::LlmAttemptSettled {
+                    settlement: {
+                        let mut settlement = crate::accounting::tests::sample_settlement();
+                        settlement.attempt.session_id = "s-1".into();
+                        settlement
+                    },
                 },
             ),
         ];
@@ -7243,7 +8589,9 @@ mod session_update_tests {
             unreachable!()
         };
         assert_eq!(usage.used, 5);
-        assert_eq!(usage.cost.as_ref().unwrap().amount, 3.0);
+        // Replay prices from the shared reducer, never from the request-end
+        // cumulative cost (3.0 here).
+        assert!((usage.cost.as_ref().unwrap().amount - sample_cost()).abs() < 1e-12);
 
         let plans: Vec<&SessionUpdate> = updates
             .iter()
@@ -7283,6 +8631,7 @@ mod session_update_tests {
     #[test]
     fn replay_excludes_unsupported_preview_variants() {
         let events = vec![
+            agent_event(0, provider_changed(0, None).kind().clone()),
             agent_event(
                 1,
                 AgentEventKind::SessionConfigChanged {

@@ -31,6 +31,8 @@ dbus-secret-service = ["querymt-utils/dbus-secret-service"]
 # Adds libp2p-based P2P networking, mDNS peer discovery, and Kademlia DHT
 # for distributed actor registry. SessionActorRef gains a Remote variant.
 remote = ["kameo/remote", "dep:libp2p", "querymt-remote/kameo-mesh", "querymt-remote/qr"]
+# Collect relay and address-lookup counters in mesh diagnostics.
+remote-metrics = ["remote", "querymt-remote/iroh-metrics"]
 
 [dependencies]
 typeshare.workspace = true
@@ -51,10 +53,10 @@ serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error = "0.1"
 schemars.workspace = true
-jsonschema = "0.58"
+jsonschema = "0.60"
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "gzip", "brotli", "deflate"] }
-rusqlite = { version = "0.40", features = ["bundled", "uuid", "time"] }
+rusqlite = { version = "0.41", features = ["bundled", "uuid", "time"] }
 time = { version = "0.3", features = ["serde", "formatting", "macros", "local-offset"] }
 uuid = { version = "1.18", features = ["v4", "v7"] }
 rapidhash = "4.2"
@@ -67,7 +69,7 @@ grep-searcher = "0.1"
 grep-regex = "0.1"
 strsim = "0.11"
 once_cell = "1.21"
-parking_lot = "0.12"
+parking_lot = "0.13"
 moka = { version = "0.12", features = ["future", "sync"] }
 
 imara-diff = "0.2"
@@ -79,7 +81,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 mime_guess = "2.0"
 futures-util = "0.3"
 toml.workspace = true
-minijinja = { version = "2", default-features = false, features = ["serde"] }
+minijinja = { version = "3", default-features = false, features = ["serde"] }
 iana-time-zone = "0.1"
 regex.workspace = true
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
@@ -104,14 +106,17 @@ fast_html2md = { package = "fast_html2md", version = "0.0.63", features = ["scra
 mdq = "0.10.0"
 
 # Snapshot backend support
-gix = { version = "0.80", default-features = false, features = ["basic", "worktree-mutation", "attributes"] }
+gix = { version = "0.90", default-features = false, features = ["basic", "worktree-mutation", "attributes", "sha1", "status", "merge"] }
+gix-error = "0.5"
 dirs.workspace = true
+# Windows-safe canonicalize (avoids \\?\ UNC prefixes) for tool path identity
+dunce = "1"
 
 # OAuth support (optional, feature-gated) - now provided by querymt-utils
 
 # OpenTelemetry trace context extraction from ACP _meta
 opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
 opentelemetry-semantic-conventions = { version = "0.32", features = ["semconv_experimental"] }
 tracing-opentelemetry = "0.33"
 
@@ -142,7 +147,7 @@ tree-sitter-php = "0.25"
 # crates.io tree-sitter-kotlin 0.3.x pins tree-sitter 0.20, whose C runtime
 # (linked globally via build-script flags) breaks the tree-sitter 0.26 runtime
 # already in the graph. Master binds via tree-sitter-language only.
-tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", rev = "1852ea17b7f60fb3f9d84e0b1555d56b46b39fb1" }
+tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", rev = "5fd3624ac85221ab21fbfb0924a28bc70a3fd794" }
 tree-sitter-swift = "0.7"
 tree-sitter-json = "0.24"
 tree-sitter-yaml = "0.7"
@@ -178,9 +183,10 @@ tempfile = "3.0"
 clap = { version = "4.5", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
+opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "testing"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
 http.workspace = true
-jsonschema = "0.58"
+jsonschema = "0.60"
 tower = { version = "0.5", features = ["util"] }
 
 [[test]]
@@ -197,4 +203,8 @@ harness = false
 
 [[bench]]
 name = "session_load"
+harness = false
+
+[[bench]]
+name = "event_emit"
 harness = false

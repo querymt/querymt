@@ -13,7 +13,7 @@ use crate::tools::sampler::{SamplingParams, build_fallback_sampler, build_standa
 use futures::channel::mpsc;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
+use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
 use llama_cpp_2::mtmd::{MtmdBitmap, MtmdInputChunkType, MtmdInputText};
 use querymt::Usage;
 use querymt::chat::ChatMessage;
@@ -105,13 +105,72 @@ pub(crate) fn decode_token_piece(
     preserved: &HashSet<llama_cpp_2::token::LlamaToken>,
     token: llama_cpp_2::token::LlamaToken,
 ) -> Result<String, LLMError> {
-    let special = preserved.contains(&token);
     let bytes = model
-        .token_to_piece_bytes(token, 128, special, None)
-        .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-    match model.token_to_piece(token, decoder, special, None) {
-        Ok(piece) => Ok(piece),
-        Err(_) => Ok(String::from_utf8_lossy(&bytes).to_string()),
+        .vocab()
+        .token_to_piece(token, preserved.contains(&token), None);
+    decode_piece(decoder, &bytes)
+}
+
+pub(crate) fn decode_piece(
+    decoder: &mut encoding_rs::Decoder,
+    bytes: &[u8],
+) -> Result<String, LLMError> {
+    // Include space for an incomplete UTF-8 sequence retained from the previous token.
+    let capacity = decoder
+        .max_utf8_buffer_length(bytes.len())
+        .ok_or_else(|| LLMError::ProviderError("token output is too large to decode".into()))?;
+    let mut output = String::with_capacity(capacity);
+    let (result, read, _) = decoder.decode_to_string(bytes, &mut output, false);
+    if result != encoding_rs::CoderResult::InputEmpty || read != bytes.len() {
+        return Err(LLMError::ProviderError(
+            "UTF-8 decoder did not consume the complete token".into(),
+        ));
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+mod decoding_tests {
+    use super::decode_piece;
+
+    #[test]
+    fn preserves_utf8_split_across_tokens() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        assert_eq!(decode_piece(&mut decoder, &[0xf0, 0x9f]).unwrap(), "");
+        assert_eq!(decode_piece(&mut decoder, &[]).unwrap(), "");
+        assert_eq!(
+            decode_piece(&mut decoder, &[0x98, 0x80]).unwrap(),
+            "\u{1f600}"
+        );
+        assert_eq!(decode_piece(&mut decoder, b" done").unwrap(), " done");
+    }
+
+    #[test]
+    fn decodes_long_piece_after_incomplete_sequence() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        assert_eq!(decode_piece(&mut decoder, &[0xe2]).unwrap(), "");
+        let mut bytes = vec![0x82, 0xac];
+        bytes.extend_from_slice(&vec![b'a'; 1024]);
+        assert_eq!(
+            decode_piece(&mut decoder, &bytes).unwrap(),
+            format!("\u{20ac}{}", "a".repeat(1024))
+        );
+    }
+
+    #[test]
+    fn replaces_malformed_utf8_without_losing_following_text() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        assert_eq!(
+            decode_piece(&mut decoder, &[0xff, b'a']).unwrap(),
+            "\u{fffd}a"
+        );
+        assert_eq!(decode_piece(&mut decoder, b"b").unwrap(), "b");
+    }
+
+    #[test]
+    fn empty_piece_produces_no_text() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        assert_eq!(decode_piece(&mut decoder, &[]).unwrap(), "");
     }
 }
 
@@ -122,10 +181,9 @@ fn preserved_token_set(
     let mut preserved = HashSet::new();
     if let Some(result) = result {
         for token_str in &result.preserved_tokens {
-            if let Ok(tokens) = model.str_to_token(token_str, AddBos::Never) {
-                if tokens.len() == 1 {
-                    preserved.insert(tokens[0]);
-                }
+            let tokens = model.vocab().tokenize(token_str.as_bytes(), false, true);
+            if tokens.len() == 1 {
+                preserved.insert(tokens[0]);
             }
         }
     }
@@ -167,6 +225,7 @@ pub(crate) fn generate(
                 cache_read: 0,
                 cache_write: 0,
                 reasoning_tokens: 0,
+                cache_write_tiers: None,
             },
             termination: stats.termination,
         });
@@ -248,8 +307,8 @@ pub(crate) fn generate(
         };
 
         let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
+        let mut mm_ctx = mm_ctx.lock()?;
         let chunks = mm_ctx
-            .ctx
             .tokenize(input_text, &bitmap_refs)
             .map_err(|e| LLMError::ProviderError(format!("MTMD tokenization failed: {}", e)))?;
 
@@ -283,6 +342,7 @@ pub(crate) fn generate(
                     cache_read: 0,
                     cache_write: 0,
                     reasoning_tokens: 0,
+                    cache_write_tiers: None,
                 },
                 termination: GenerationTermination::MaxTokens,
             });
@@ -300,7 +360,7 @@ pub(crate) fn generate(
         // Evaluate chunks (handles both text and image encoding)
         let n_past = chunks
             .eval_chunks(
-                &mm_ctx.ctx,
+                &mut mm_ctx,
                 &mut ctx,
                 0, // n_past starts at 0
                 0, // seq_id
@@ -313,16 +373,7 @@ pub(crate) fn generate(
     } else {
         // Text-only path: standard tokenization
         let add_bos = cfg.add_bos.unwrap_or(true);
-        let tokens = model
-            .str_to_token(
-                prompt,
-                if add_bos {
-                    AddBos::Always
-                } else {
-                    AddBos::Never
-                },
-            )
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+        let tokens = model.vocab().tokenize(prompt.as_bytes(), add_bos, true);
 
         if tokens.is_empty() {
             return Err(LLMError::InvalidRequest(
@@ -342,6 +393,7 @@ pub(crate) fn generate(
                     cache_read: 0,
                     cache_write: 0,
                     reasoning_tokens: 0,
+                    cache_write_tiers: None,
                 },
                 termination: GenerationTermination::MaxTokens,
             });
@@ -406,7 +458,7 @@ pub(crate) fn generate(
         } else {
             sampler.sample(&ctx, batch.n_tokens() - 1)
         };
-        if model.is_eog_token(token) {
+        if model.vocab().is_eog(token) {
             if output_tokens == 0 && allow_fallback && !fallback_used {
                 sampler = build_fallback_sampler(params.seed);
                 fallback_used = true;
@@ -438,6 +490,7 @@ pub(crate) fn generate(
             cache_read: 0,
             cache_write: 0,
             reasoning_tokens: 0,
+            cache_write_tiers: None,
         },
         termination,
     })
@@ -504,6 +557,7 @@ pub(crate) fn generate_streaming_with_thinking(
                 cache_read: 0,
                 cache_write: 0,
                 reasoning_tokens: 0,
+                cache_write_tiers: None,
             },
             stats.termination,
         ));
@@ -577,8 +631,8 @@ pub(crate) fn generate_streaming_with_thinking(
             "generate_streaming_with_thinking: MTMD tokenization with {} bitmap(s)",
             bitmap_refs.len()
         );
+        let mut mm_ctx = mm_ctx.lock()?;
         let chunks = mm_ctx
-            .ctx
             .tokenize(input_text, &bitmap_refs)
             .map_err(|e| LLMError::ProviderError(format!("MTMD tokenization failed: {}", e)))?;
 
@@ -610,6 +664,7 @@ pub(crate) fn generate_streaming_with_thinking(
                     cache_read: 0,
                     cache_write: 0,
                     reasoning_tokens: 0,
+                    cache_write_tiers: None,
                 },
                 GenerationTermination::MaxTokens,
             ));
@@ -624,7 +679,7 @@ pub(crate) fn generate_streaming_with_thinking(
 
         let n_past = chunks
             .eval_chunks(
-                &mm_ctx.ctx,
+                &mut mm_ctx,
                 &mut ctx,
                 0, // n_past starts at 0
                 0, // seq_id
@@ -638,15 +693,8 @@ pub(crate) fn generate_streaming_with_thinking(
         // Text-only path: standard tokenization.
         let add_bos = cfg.add_bos.unwrap_or(true);
         let tokens = model
-            .str_to_token(
-                &result.prompt,
-                if add_bos {
-                    AddBos::Always
-                } else {
-                    AddBos::Never
-                },
-            )
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+            .vocab()
+            .tokenize(result.prompt.as_bytes(), add_bos, true);
         if tokens.is_empty() {
             return Err(LLMError::InvalidRequest(
                 "Prompt tokenization resulted in an empty sequence".into(),
@@ -660,6 +708,7 @@ pub(crate) fn generate_streaming_with_thinking(
                     cache_read: 0,
                     cache_write: 0,
                     reasoning_tokens: 0,
+                    cache_write_tiers: None,
                 },
                 GenerationTermination::MaxTokens,
             ));
@@ -713,7 +762,7 @@ pub(crate) fn generate_streaming_with_thinking(
 
     while n_cur < n_len_total {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-        if model.is_eog_token(token) {
+        if model.vocab().is_eog(token) {
             if output_tokens == 0 && allow_fallback && !fallback_used {
                 sampler = build_fallback_sampler(params.seed);
                 fallback_used = true;
@@ -738,6 +787,7 @@ pub(crate) fn generate_streaming_with_thinking(
                         cache_read: 0,
                         cache_write: 0,
                         reasoning_tokens: 0,
+                        cache_write_tiers: None,
                     },
                     GenerationTermination::ConsumerClosed,
                 ));
@@ -772,6 +822,7 @@ pub(crate) fn generate_streaming_with_thinking(
             cache_read: 0,
             cache_write: 0,
             reasoning_tokens: 0,
+            cache_write_tiers: None,
         },
         termination,
     ))

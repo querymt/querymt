@@ -65,10 +65,14 @@ impl MiddlewareRegistry {
         };
         // Register built-in factories
         registry.register(Arc::new(super::dedup_check::DedupCheckFactory));
+        registry.register(Arc::new(
+            super::parallel_edit_guard::ParallelEditGuardFactory,
+        ));
         registry.register(Arc::new(super::limits::LimitsFactory));
         registry.register(Arc::new(super::context::ContextFactory));
         registry.register(Arc::new(super::modes::AgentModeFactory));
         registry.register(Arc::new(super::modes::PlanModeCompatFactory));
+        registry.register(Arc::new(super::output_limit::OutputLimitRecoveryFactory));
         registry
     }
 

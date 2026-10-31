@@ -36,8 +36,15 @@ pub struct UserPromptRecord {
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionLoadSnapshot {
+    #[serde(rename = "runtimeStatus")]
+    pub runtime_status: crate::agent::messages::SessionRuntimeStatus,
     pub audit: AuditView,
     pub cursor: StreamCursor,
+    /// Authoritative replacement accounting at `cursor`, reduced from the same
+    /// audit events by the shared accounting reducer. Present even when
+    /// historical replay is skipped or the context limit is unknown.
+    #[typeshare(serialized_as = "AccountingSnapshot")]
+    pub accounting: crate::accounting::AccountingSnapshot,
     #[serde(rename = "delegationUpdates")]
     pub delegation_updates:
         Vec<crate::control::delegation_notifications::DelegationUpdateNotification>,
@@ -111,11 +118,35 @@ pub async fn load_session_snapshot(
     let audit = if let Some(bookmark) = bookmark {
         journal_backed_audit_view(agent, session_id, &bookmark.node_id).await?
     } else {
+        // Close a dead process's run before the audit view is read, so the
+        // served snapshot already contains the closing event.
+        crate::session::run_reconcile::reconcile_orphaned_run(&agent.config, session_id).await;
         view_store.get_audit_view(session_id, false).await?
     };
     let cursor = cursor_from_events(&audit.events);
-    let delegation_updates =
+    let accounting = crate::accounting::AccountingSnapshot::from_events(
+        session_id,
+        audit.events.iter().map(|event| &event.kind),
+    );
+    let mut delegation_updates =
         crate::control::delegation_notifications::delegation_updates_from_events(&audit.events);
+    let runtime_status = agent
+        .observe_session_runtimes(&[session_id.to_string()])
+        .await
+        .remove(session_id)
+        .unwrap_or_else(|| {
+            crate::agent::messages::SessionRuntimeStatus::unavailable("observation_unavailable")
+        });
+    for live in &runtime_status.delegation_activity {
+        if let Some(previous) = delegation_updates
+            .iter_mut()
+            .find(|entry| entry.delegation_id == live.delegation_id)
+        {
+            *previous = live.clone();
+        } else {
+            delegation_updates.push(live.clone());
+        }
+    }
     // Journal-backed sessions (remote attached, or merely bookmarked while
     // offline) live on their peer and have no local history rows, so
     // `get_history` reports `SessionNotFound`. Treat that as an empty history
@@ -139,8 +170,10 @@ pub async fn load_session_snapshot(
     };
     let user_prompts = Some(user_prompt_records(&messages));
     Ok(SessionLoadSnapshot {
+        runtime_status,
         audit,
         cursor,
+        accounting,
         delegation_updates,
         user_prompts,
     })
@@ -309,6 +342,15 @@ mod tests {
         store
             .expect_get_remote_session_bookmark()
             .returning(|_| Ok(None))
+            .times(2);
+        let observed_session = session.clone();
+        store
+            .expect_get_session()
+            .returning(move |_| Ok(Some(observed_session.clone())))
+            .times(1);
+        store
+            .expect_get_session_runtime_binding()
+            .returning(|_| Ok(None))
             .times(1);
         store
             .expect_get_history()
@@ -337,9 +379,57 @@ mod tests {
         assert!(error.to_string().contains("history unavailable"));
     }
 
+    #[tokio::test]
+    async fn snapshot_reconciles_orphaned_run_unless_lease_is_held() {
+        use crate::events::AgentEventKind;
+        use crate::session::run_reconcile::tests::{fixture, seed, started};
+
+        let f = fixture().await;
+        let agent = crate::agent::LocalAgentHandle::from_config(f.config.clone());
+        let held_id = f
+            .storage
+            .create_session(None, None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        let free_id = f
+            .storage
+            .create_session(None, None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        seed(&f.storage, &held_id, started("held-run")).await;
+        seed(&f.storage, &free_id, started("orphan")).await;
+
+        let last_event =
+            |snapshot: &SessionLoadSnapshot| snapshot.audit.events.last().map(|e| e.kind.clone());
+
+        // A live owner keeps its run open.
+        let lease = f.lease_root.try_acquire(&held_id).unwrap().unwrap();
+        let held = load_session_snapshot(&agent, f.storage.view_store().unwrap(), &held_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            last_event(&held),
+            Some(AgentEventKind::RunStarted { .. })
+        ));
+        drop(lease);
+
+        // An orphan is closed before the snapshot is served.
+        let free = load_session_snapshot(&agent, f.storage.view_store().unwrap(), &free_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            last_event(&free),
+            Some(AgentEventKind::RunCompleted { run_id, outcome, .. })
+                if run_id == "orphan" && outcome == "interrupted"
+        ));
+    }
+
     #[test]
     fn old_snapshot_without_user_prompts_deserializes() {
         let value = serde_json::json!({
+            "runtimeStatus": crate::agent::messages::SessionRuntimeStatus::unavailable("snapshot_fixture"),
             "audit": {
                 "session_id": "s1",
                 "events": [],
@@ -352,6 +442,9 @@ mod tests {
                 "generated_at": "1970-01-01T00:00:00Z"
             },
             "cursor": {"local_seq": 0, "remote_seq_by_source": {}},
+            "accounting": serde_json::to_value(
+                crate::accounting::AccountingSnapshot::default()
+            ).unwrap(),
             "delegationUpdates": []
         });
         let snapshot: SessionLoadSnapshot = serde_json::from_value(value).unwrap();
@@ -500,7 +593,8 @@ mod tests {
                     }))
                 }
             })
-            .times(1);
+            .times(2);
+        store.expect_get_session().returning(|_| Ok(None)).times(1);
         let (plugin_registry, _temp_dir) = empty_plugin_registry().unwrap();
         let provider = Arc::new(SessionProvider::new(
             Arc::new(plugin_registry),

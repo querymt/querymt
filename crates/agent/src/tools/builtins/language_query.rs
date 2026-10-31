@@ -149,6 +149,7 @@ impl ToolTrait for LanguageQueryTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "required": ["action"],
                     "properties": {
                         "action": {
@@ -200,7 +201,9 @@ impl ToolTrait for LanguageQueryTool {
             None => {
                 return Ok(vec![ToolResultPart::text(
                     "language_query is not available in this mode. \
-                     It requires a VS Code client with workspace query support. \
+                     It requires a locally hosted session with a VS Code client that \
+                     supports workspace queries, and is unavailable for sessions \
+                     running on a remote node. \
                      Use file reading and search tools instead.",
                 )]);
             }
@@ -243,6 +246,34 @@ mod tests {
         assert!(props.get("line").is_some());
         assert!(props.get("character").is_some());
         assert!(props.get("query").is_some());
+    }
+
+    /// A remote-hosted execution context never carries the workspace-query
+    /// capability, so the tool reports itself unavailable (naming remote
+    /// sessions) and the run continues instead of erroring or hanging.
+    #[tokio::test]
+    async fn remote_hosted_context_reports_unavailable_result() {
+        let tool = LanguageQueryTool::new();
+        let ctx = crate::tools::context_impl::AgentToolContext::basic(
+            "remote-session".into(),
+            Some("/project".into()),
+        );
+        assert!(ctx.workspace_query_bridge().is_none());
+
+        let parts = tool
+            .call(
+                json!({"action": "diagnostics", "uri": "/src/main.rs"}),
+                &ctx,
+            )
+            .await
+            .expect("unavailable capability is a result, not an error");
+
+        let text = match parts.as_slice() {
+            [ToolResultPart::Text { text }] => text.as_str(),
+            other => panic!("expected a single text result, got {other:?}"),
+        };
+        assert!(text.contains("not available"));
+        assert!(text.contains("remote"));
     }
 
     #[test]

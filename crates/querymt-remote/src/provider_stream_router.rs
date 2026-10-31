@@ -13,7 +13,7 @@ use kameo::Actor;
 use kameo::message::{Context, Message};
 use kameo::remote::_internal;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -21,6 +21,8 @@ use tokio::sync::mpsc;
 
 const DEFAULT_REPLAY_BUFFER_SIZE: usize = 1000;
 const DEFAULT_REQUEST_TTL_SECS: u64 = 300;
+const DEFAULT_GAP_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_MAX_HELD: usize = 1024;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RouterError {
@@ -31,7 +33,14 @@ pub enum RouterError {
 #[derive(Debug)]
 pub struct AttachStreamConsumer {
     pub request_id: String,
-    pub consumer_tx: mpsc::Sender<StreamRelayMessage>,
+    pub consumer_tx: mpsc::UnboundedSender<StreamRelayMessage>,
+}
+
+/// Local message scheduled when a sequence gap opens; fails the request if the
+/// gap is still unfilled after the router's gap timeout.
+#[derive(Debug, Clone)]
+pub struct CheckReorderGap {
+    pub request_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -44,18 +53,75 @@ pub struct DetachStreamConsumer {
     pub request_id: String,
 }
 
+/// Outcome of admitting a sequenced message.
+#[derive(Debug)]
+enum Admitted {
+    /// The message and every contiguous held successor, in order.
+    Ready(Vec<StreamRelayMessage>),
+    /// The message arrived early and is held until the gap fills.
+    Held,
+    /// Already delivered or already held.
+    Duplicate,
+}
+
+/// Per-request reorder buffer. Pure: no I/O, no timers.
+#[derive(Debug, Default)]
+struct ReorderBuffer {
+    /// Next sequence number to deliver.
+    next: u64,
+    held: BTreeMap<u64, StreamRelayMessage>,
+    /// When the current gap opened or last made progress.
+    stalled_since: Option<Instant>,
+}
+
+impl ReorderBuffer {
+    fn admit(&mut self, seq: u64, message: StreamRelayMessage) -> Admitted {
+        if seq < self.next || self.held.contains_key(&seq) {
+            return Admitted::Duplicate;
+        }
+        if seq > self.next {
+            self.held.insert(seq, message);
+            self.stalled_since.get_or_insert_with(Instant::now);
+            return Admitted::Held;
+        }
+        let mut ready = vec![message];
+        self.next += 1;
+        while let Some(successor) = self.held.remove(&self.next) {
+            ready.push(successor);
+            self.next += 1;
+        }
+        self.stalled_since = if self.held.is_empty() {
+            None
+        } else {
+            Some(Instant::now())
+        };
+        Admitted::Ready(ready)
+    }
+}
+
+enum GapCheck {
+    /// Nothing held, request finished, or the gap already closed.
+    Idle,
+    /// The gap outlived the timeout and the request was failed.
+    Failed,
+    /// The stall is younger than the timeout; check again after this long.
+    Recheck(Duration),
+}
+
 struct RoutedRequest {
     request_id: String,
     phase: RequestPhase,
     created_at: Instant,
     last_message_at: Instant,
-    consumer_tx: Option<mpsc::Sender<StreamRelayMessage>>,
+    consumer_tx: Option<mpsc::UnboundedSender<StreamRelayMessage>>,
     replay_buffer: VecDeque<StreamRelayMessage>,
     replay_buffer_size: usize,
+    reorder: ReorderBuffer,
+    max_held: usize,
 }
 
 impl RoutedRequest {
-    fn new(request_id: String, replay_buffer_size: usize) -> Self {
+    fn new(request_id: String, replay_buffer_size: usize, max_held: usize) -> Self {
         let now = Instant::now();
         Self {
             request_id,
@@ -65,6 +131,103 @@ impl RoutedRequest {
             consumer_tx: None,
             replay_buffer: VecDeque::with_capacity(replay_buffer_size.min(64)),
             replay_buffer_size,
+            reorder: ReorderBuffer::default(),
+            max_held,
+        }
+    }
+
+    /// Route a relay message. Unnumbered messages are delivered immediately;
+    /// numbered ones are delivered in host order. Returns `true` when a gap
+    /// check should be scheduled (a gap opened or its stall clock restarted).
+    fn route(&mut self, seq: Option<u64>, message: StreamRelayMessage) -> bool {
+        let Some(seq) = seq else {
+            self.deliver_or_buffer(message);
+            return false;
+        };
+        if self.is_terminal() {
+            self.last_message_at = Instant::now();
+            tracing::debug!(
+                target: "querymt_remote::provider::router",
+                request_id = %self.request_id,
+                seq,
+                phase = %self.phase,
+                "discarded sequenced relay message after terminal"
+            );
+            return false;
+        }
+        let stalled_before = self.reorder.stalled_since;
+        match self.reorder.admit(seq, message) {
+            Admitted::Ready(messages) => {
+                for message in messages {
+                    self.deliver_or_buffer(message);
+                }
+            }
+            Admitted::Held => {
+                self.last_message_at = Instant::now();
+                tracing::debug!(
+                    target: "querymt_remote::provider::router",
+                    request_id = %self.request_id,
+                    seq,
+                    next = self.reorder.next,
+                    held = self.reorder.held.len(),
+                    "held out-of-order relay message"
+                );
+                if self.reorder.held.len() > self.max_held {
+                    self.fail_gap();
+                    return false;
+                }
+            }
+            Admitted::Duplicate => {
+                self.last_message_at = Instant::now();
+                tracing::debug!(
+                    target: "querymt_remote::provider::router",
+                    request_id = %self.request_id,
+                    seq,
+                    next = self.reorder.next,
+                    "discarded duplicate relay message"
+                );
+            }
+        }
+        let stalled_after = self.reorder.stalled_since;
+        stalled_after.is_some() && stalled_after != stalled_before
+    }
+
+    /// End the stream with a retryable transport failure naming the first
+    /// missing sequence number. Held messages are discarded.
+    fn fail_gap(&mut self) {
+        let missing = self.reorder.next;
+        let held = self.reorder.held.len();
+        self.reorder.held.clear();
+        self.reorder.stalled_since = None;
+        tracing::warn!(
+            target: "querymt_remote::provider::router",
+            request_id = %self.request_id,
+            missing,
+            held,
+            "relay sequence gap; failing stream"
+        );
+        self.deliver_or_buffer(StreamRelayMessage::TransportFailed {
+            error: querymt::error::LLMError::Transport {
+                kind: querymt::error::TransportErrorKind::Other,
+                message: format!("relay sequence gap: missing seq {missing} (held {held})"),
+            }
+            .to_payload(),
+        });
+    }
+
+    fn check_gap(&mut self, gap_timeout: Duration) -> GapCheck {
+        if self.reorder.held.is_empty() || self.is_terminal() {
+            return GapCheck::Idle;
+        }
+        let Some(since) = self.reorder.stalled_since else {
+            return GapCheck::Idle;
+        };
+        let elapsed = since.elapsed();
+        if elapsed >= gap_timeout {
+            self.fail_gap();
+            GapCheck::Failed
+        } else {
+            GapCheck::Recheck(gap_timeout - elapsed)
         }
     }
 
@@ -109,7 +272,7 @@ impl RoutedRequest {
         }
 
         let message = if let Some(tx) = &self.consumer_tx {
-            match tx.try_send(message) {
+            match tx.send(message) {
                 Ok(()) => {
                     tracing::debug!(
                         target: "querymt_remote::provider::router",
@@ -135,20 +298,7 @@ impl RoutedRequest {
                     }
                     return;
                 }
-                Err(mpsc::error::TrySendError::Full(msg)) => {
-                    tracing::warn!(
-                        target: "querymt_remote::provider::router",
-                        request_id = %self.request_id,
-                        message_type,
-                        is_terminal,
-                        phase = %self.phase,
-                        buffered = self.replay_buffer.len(),
-                        "router consumer channel full; buffering message"
-                    );
-                    self.phase = RequestPhase::ConsumerDisconnected;
-                    msg
-                }
-                Err(mpsc::error::TrySendError::Closed(msg)) => {
+                Err(mpsc::error::SendError(msg)) => {
                     tracing::warn!(
                         target: "querymt_remote::provider::router",
                         request_id = %self.request_id,
@@ -212,6 +362,8 @@ pub struct ProviderStreamRouterActor {
     requests: Arc<Mutex<HashMap<String, RoutedRequest>>>,
     replay_buffer_size: usize,
     request_ttl: Duration,
+    gap_timeout: Duration,
+    max_held: usize,
 }
 
 impl ProviderStreamRouterActor {
@@ -220,7 +372,17 @@ impl ProviderStreamRouterActor {
             requests: Arc::new(Mutex::new(HashMap::new())),
             replay_buffer_size: replay_buffer_size.unwrap_or(DEFAULT_REPLAY_BUFFER_SIZE),
             request_ttl: Duration::from_secs(request_ttl_secs.unwrap_or(DEFAULT_REQUEST_TTL_SECS)),
+            gap_timeout: DEFAULT_GAP_TIMEOUT,
+            max_held: DEFAULT_MAX_HELD,
         }
+    }
+
+    /// Override the sequence-gap wait (default 15 s) and the held-message cap
+    /// (default 1024). Existing `new` callers keep the defaults.
+    pub fn with_gap_limits(mut self, gap_timeout: Duration, max_held: usize) -> Self {
+        self.gap_timeout = gap_timeout;
+        self.max_held = max_held;
+        self
     }
 
     pub fn register_request(&self, request_id: String) -> Result<(), RouterError> {
@@ -233,7 +395,7 @@ impl ProviderStreamRouterActor {
         }
         requests.insert(
             request_id.clone(),
-            RoutedRequest::new(request_id, self.replay_buffer_size),
+            RoutedRequest::new(request_id, self.replay_buffer_size, self.max_held),
         );
         Ok(())
     }
@@ -277,7 +439,7 @@ impl Message<RoutedStreamRelayMessage> for ProviderStreamRouterActor {
     async fn handle(
         &mut self,
         msg: RoutedStreamRelayMessage,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let message_type = match &msg.message {
             StreamRelayMessage::Chunk(_) => "chunk",
@@ -300,7 +462,7 @@ impl Message<RoutedStreamRelayMessage> for ProviderStreamRouterActor {
             return;
         };
 
-        request.deliver_or_buffer(msg.message);
+        let schedule_check = request.route(msg.seq, msg.message);
         tracing::trace!(
             target: "querymt_remote::provider::router",
             request_id = %msg.request_id,
@@ -310,7 +472,51 @@ impl Message<RoutedStreamRelayMessage> for ProviderStreamRouterActor {
             "routed message delivered or buffered"
         );
         drop(requests);
+        if schedule_check {
+            schedule_gap_check(
+                ctx.actor_ref().clone(),
+                msg.request_id.clone(),
+                self.gap_timeout,
+            );
+        }
         self.cleanup_expired_requests();
+    }
+}
+
+/// Send a `CheckReorderGap` to the router after `delay`, without keeping the
+/// actor alive while it waits.
+fn schedule_gap_check(
+    actor_ref: kameo::actor::ActorRef<ProviderStreamRouterActor>,
+    request_id: String,
+    delay: Duration,
+) {
+    let weak = actor_ref.downgrade();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        if let Some(actor_ref) = weak.upgrade() {
+            let _ = actor_ref.tell(CheckReorderGap { request_id }).await;
+        }
+    });
+}
+
+impl Message<CheckReorderGap> for ProviderStreamRouterActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: CheckReorderGap,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let outcome = {
+            let mut requests = self.requests.lock();
+            let Some(request) = requests.get_mut(&msg.request_id) else {
+                return;
+            };
+            request.check_gap(self.gap_timeout)
+        };
+        if let GapCheck::Recheck(remaining) = outcome {
+            schedule_gap_check(ctx.actor_ref().clone(), msg.request_id, remaining);
+        }
     }
 }
 
@@ -357,14 +563,9 @@ impl Message<AttachStreamConsumer> for ProviderStreamRouterActor {
         let mut terminal_replayed = false;
         while let Some(message) = request.replay_buffer.pop_front() {
             terminal_replayed = relay_message_is_terminal(&message);
-            match consumer_tx.try_send(message) {
+            match consumer_tx.send(message) {
                 Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(msg)) => {
-                    request.replay_buffer.push_front(msg);
-                    request.phase = RequestPhase::ConsumerDisconnected;
-                    break;
-                }
-                Err(mpsc::error::TrySendError::Closed(msg)) => {
+                Err(mpsc::error::SendError(msg)) => {
                     request.replay_buffer.push_front(msg);
                     request.consumer_tx = None;
                     request.phase = RequestPhase::ConsumerDisconnected;
@@ -545,7 +746,7 @@ mod tests {
     #[tokio::test]
     async fn attach_requires_preregistration() {
         let router_ref = ProviderStreamRouterActor::spawn(create_test_router());
-        let (tx, _rx) = mpsc::channel(8);
+        let (tx, _rx) = mpsc::unbounded_channel();
         let err = router_ref
             .ask(AttachStreamConsumer {
                 request_id: "missing".to_string(),
@@ -576,7 +777,7 @@ mod tests {
             }));
 
         let router_ref = ProviderStreamRouterActor::spawn(router);
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::unbounded_channel();
         router_ref
             .ask(AttachStreamConsumer {
                 request_id,
@@ -630,7 +831,7 @@ mod tests {
             })
             .await
             .expect("register should succeed");
-        let (tx, _rx) = mpsc::channel(8);
+        let (tx, _rx) = mpsc::unbounded_channel();
         router_ref
             .ask(AttachStreamConsumer {
                 request_id: request_id.clone(),
@@ -682,7 +883,7 @@ mod tests {
         router
             .register_request(request_id.clone())
             .expect("register request");
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::unbounded_channel();
         router
             .requests
             .lock()
@@ -749,40 +950,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consumer_backpressure_sets_disconnected_and_buffers_message() {
+    async fn slow_consumer_does_not_lose_or_reorder_messages() {
         let router = create_test_router();
         let request_id = "test-request-8".to_string();
-        router
-            .register_request(request_id.clone())
-            .expect("register request");
+        let mut rx = router_with_consumer(&router, &request_id);
 
-        let (tx, _rx) = mpsc::channel(1);
-        {
-            let mut requests = router.requests.lock();
-            let request = requests.get_mut(&request_id).expect("request exists");
-            request.consumer_tx = Some(tx);
+        for i in 0..500u64 {
+            deliver(
+                &router,
+                &request_id,
+                i,
+                StreamRelayMessage::Chunk(StreamChunk::Text(format!("msg-{i}"))),
+            );
         }
 
-        router
-            .requests
-            .lock()
-            .get_mut(&request_id)
-            .expect("request exists")
-            .deliver_or_buffer(StreamRelayMessage::Chunk(StreamChunk::Text(
-                "first".to_string(),
-            )));
-        router
-            .requests
-            .lock()
-            .get_mut(&request_id)
-            .expect("request exists")
-            .deliver_or_buffer(StreamRelayMessage::Chunk(StreamChunk::Text(
-                "second".to_string(),
-            )));
-
         let status = router.get_status(Some(&request_id));
-        assert_eq!(status[0].phase, RequestPhase::ConsumerDisconnected);
-        assert_eq!(status[0].buffered_messages, 1);
+        assert_eq!(status[0].phase, RequestPhase::Streaming);
+        assert_eq!(status[0].buffered_messages, 0);
+        for i in 0..500 {
+            match rx.try_recv() {
+                Ok(StreamRelayMessage::Chunk(StreamChunk::Text(text))) => {
+                    assert_eq!(text, format!("msg-{i}"));
+                }
+                other => panic!("message {i}: unexpected {other:?}"),
+            }
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -823,5 +1016,413 @@ mod tests {
             router.get_status(Some(&request_id))[0].phase,
             RequestPhase::Completed
         );
+    }
+
+    // ---- ordered relay helpers (fixture-driven) ----
+
+    use querymt::chat::{ChatOutput, ChatStreamAccumulator};
+
+    fn fixture_chunks() -> Vec<StreamChunk> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../providers/anthropic/tests/fixtures/structured_tool_turn.json"
+        );
+        let raw = std::fs::read_to_string(path).expect("read fixture");
+        serde_json::from_str(&raw).expect("parse fixture")
+    }
+
+    /// Group chunks into relay messages the way the host does.
+    fn host_batches(chunks: &[StreamChunk], size: usize) -> Vec<StreamRelayMessage> {
+        chunks
+            .chunks(size)
+            .map(|group| {
+                if group.len() == 1 {
+                    StreamRelayMessage::Chunk(group[0].clone())
+                } else {
+                    StreamRelayMessage::ChunkBatch(group.to_vec())
+                }
+            })
+            .collect()
+    }
+
+    fn accumulate_direct(chunks: &[StreamChunk]) -> ChatOutput {
+        let mut acc = ChatStreamAccumulator::new();
+        for chunk in chunks {
+            acc.push(chunk).expect("direct accumulation");
+        }
+        acc.finish_success().expect("direct finish")
+    }
+
+    /// Drain everything currently readable from the consumer and accumulate it.
+    fn accumulate_consumer(
+        rx: &mut mpsc::UnboundedReceiver<StreamRelayMessage>,
+    ) -> Result<ChatOutput, String> {
+        let mut acc = ChatStreamAccumulator::new();
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                StreamRelayMessage::Chunk(chunk) => {
+                    acc.push(&chunk).map_err(|e| e.to_string())?;
+                }
+                StreamRelayMessage::ChunkBatch(chunks) => {
+                    for chunk in &chunks {
+                        acc.push(chunk).map_err(|e| e.to_string())?;
+                    }
+                }
+                StreamRelayMessage::Heartbeat { .. }
+                | StreamRelayMessage::TransportDisconnected { .. }
+                | StreamRelayMessage::TransportReconnected { .. } => {}
+                other => return Err(format!("unexpected message: {other:?}")),
+            }
+        }
+        acc.finish_success().map_err(|e| e.to_string())
+    }
+
+    fn router_with_consumer(
+        router: &ProviderStreamRouterActor,
+        request_id: &str,
+    ) -> mpsc::UnboundedReceiver<StreamRelayMessage> {
+        router
+            .register_request(request_id.to_string())
+            .expect("register request");
+        let (tx, rx) = mpsc::unbounded_channel();
+        router
+            .requests
+            .lock()
+            .get_mut(request_id)
+            .expect("request exists")
+            .consumer_tx = Some(tx);
+        rx
+    }
+
+    /// Deliver a host-numbered message to the request the way the router
+    /// handler does.
+    fn deliver(
+        router: &ProviderStreamRouterActor,
+        request_id: &str,
+        seq: u64,
+        msg: StreamRelayMessage,
+    ) {
+        router
+            .requests
+            .lock()
+            .get_mut(request_id)
+            .expect("request exists")
+            .route(Some(seq), msg);
+    }
+
+    fn deliver_all(
+        router: &ProviderStreamRouterActor,
+        request_id: &str,
+        batches: &[StreamRelayMessage],
+        order: &[usize],
+    ) {
+        for &index in order {
+            deliver(router, request_id, index as u64, batches[index].clone());
+        }
+    }
+
+    fn fixture_router() -> ProviderStreamRouterActor {
+        ProviderStreamRouterActor::new(Some(10), Some(60))
+    }
+
+    #[tokio::test]
+    async fn in_order_delivery_matches_direct_accumulation() {
+        let chunks = fixture_chunks();
+        let expected = accumulate_direct(&chunks);
+        let batches = host_batches(&chunks, 16);
+        assert!(batches.len() >= 2);
+
+        let router = fixture_router();
+        let mut rx = router_with_consumer(&router, "r");
+        let order: Vec<usize> = (0..batches.len()).collect();
+        deliver_all(&router, "r", &batches, &order);
+
+        assert_eq!(accumulate_consumer(&mut rx).expect("accumulate"), expected);
+    }
+
+    #[tokio::test]
+    async fn swapped_adjacent_batches_are_reordered() {
+        let chunks = fixture_chunks();
+        let expected = accumulate_direct(&chunks);
+        let batches = host_batches(&chunks, 4);
+        assert!(batches.len() >= 4);
+
+        let router = fixture_router();
+        let mut rx = router_with_consumer(&router, "r");
+        let mut order: Vec<usize> = (0..batches.len()).collect();
+        order.swap(1, 2);
+        deliver_all(&router, "r", &batches, &order);
+
+        assert_eq!(accumulate_consumer(&mut rx).expect("accumulate"), expected);
+    }
+
+    #[tokio::test]
+    async fn terminal_batch_is_released_after_the_batch_before_it() {
+        let chunks = fixture_chunks();
+        let expected = accumulate_direct(&chunks);
+        let batches = host_batches(&chunks, 4);
+        let last = batches.len() - 1;
+
+        let router = fixture_router();
+        let mut rx = router_with_consumer(&router, "r");
+        let mut order: Vec<usize> = (0..batches.len()).collect();
+        order.swap(last - 1, last);
+        deliver_all(&router, "r", &batches, &order);
+
+        assert_eq!(accumulate_consumer(&mut rx).expect("accumulate"), expected);
+    }
+
+    // ---- ReorderBuffer ----
+
+    fn text(s: &str) -> StreamRelayMessage {
+        StreamRelayMessage::Chunk(StreamChunk::Text(s.to_string()))
+    }
+
+    fn ready_texts(admitted: Admitted) -> Vec<String> {
+        match admitted {
+            Admitted::Ready(messages) => messages
+                .into_iter()
+                .map(|m| match m {
+                    StreamRelayMessage::Chunk(StreamChunk::Text(t)) => t,
+                    other => panic!("unexpected {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reorder_buffer_releases_in_order_messages_immediately() {
+        let mut buf = ReorderBuffer::default();
+        assert_eq!(ready_texts(buf.admit(0, text("a"))), vec!["a"]);
+        assert_eq!(ready_texts(buf.admit(1, text("b"))), vec!["b"]);
+        assert!(buf.stalled_since.is_none());
+        assert_eq!(buf.next, 2);
+    }
+
+    #[test]
+    fn reorder_buffer_holds_early_message_and_releases_contiguous_successors() {
+        let mut buf = ReorderBuffer::default();
+        assert!(matches!(buf.admit(2, text("c")), Admitted::Held));
+        assert!(matches!(buf.admit(1, text("b")), Admitted::Held));
+        assert!(buf.stalled_since.is_some());
+        assert_eq!(ready_texts(buf.admit(0, text("a"))), vec!["a", "b", "c"]);
+        assert!(buf.held.is_empty());
+        assert!(buf.stalled_since.is_none());
+    }
+
+    #[test]
+    fn reorder_buffer_discards_delivered_and_held_duplicates() {
+        let mut buf = ReorderBuffer::default();
+        ready_texts(buf.admit(0, text("a")));
+        assert!(matches!(buf.admit(0, text("a")), Admitted::Duplicate));
+        assert!(matches!(buf.admit(2, text("c")), Admitted::Held));
+        assert!(matches!(buf.admit(2, text("c")), Admitted::Duplicate));
+        assert_eq!(buf.held.len(), 1);
+    }
+
+    #[test]
+    fn reorder_buffer_stall_clock_resets_on_progress_while_gap_remains() {
+        let mut buf = ReorderBuffer::default();
+        assert!(matches!(buf.admit(1, text("b")), Admitted::Held));
+        assert!(matches!(buf.admit(3, text("d")), Admitted::Held));
+        let first_stall = buf.stalled_since.expect("stall started");
+        std::thread::sleep(Duration::from_millis(5));
+        // Filling 0 releases 0 and 1, but 2 is still missing.
+        assert_eq!(ready_texts(buf.admit(0, text("a"))), vec!["a", "b"]);
+        let reset = buf.stalled_since.expect("gap remains");
+        assert!(reset > first_stall);
+        assert_eq!(ready_texts(buf.admit(2, text("c"))), vec!["c", "d"]);
+        assert!(buf.stalled_since.is_none());
+    }
+
+    // ---- shuffled delivery ----
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    #[tokio::test]
+    async fn shuffled_delivery_with_duplicates_always_matches_direct_accumulation() {
+        let chunks = fixture_chunks();
+        let expected = accumulate_direct(&chunks);
+        let batches = host_batches(&chunks, 2);
+        assert!(batches.len() >= 6);
+
+        for seed in 0..250u64 {
+            let mut rng = Lcg(seed.wrapping_add(1));
+            let mut order: Vec<usize> = (0..batches.len()).collect();
+            for i in (1..order.len()).rev() {
+                order.swap(i, (rng.next() as usize) % (i + 1));
+            }
+            // Inject duplicates of random batches at random positions.
+            for _ in 0..(rng.next() % 5) {
+                let dup = (rng.next() as usize) % batches.len();
+                let at = (rng.next() as usize) % (order.len() + 1);
+                order.insert(at, dup);
+            }
+
+            let router = fixture_router();
+            let mut rx = router_with_consumer(&router, "r");
+            deliver_all(&router, "r", &batches, &order);
+            assert_eq!(
+                accumulate_consumer(&mut rx).unwrap_or_else(|e| panic!("seed {seed}: {e}")),
+                expected,
+                "seed {seed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_during_gap_is_delivered_immediately_without_releasing_held_data() {
+        let router = fixture_router();
+        let mut rx = router_with_consumer(&router, "r");
+
+        deliver(&router, "r", 1, text("b"));
+        router
+            .requests
+            .lock()
+            .get_mut("r")
+            .expect("request exists")
+            .route(
+                None,
+                StreamRelayMessage::Heartbeat {
+                    phase: crate::ProviderStreamPhase::Streaming,
+                    elapsed_ms: 1,
+                    idle_ms: 0,
+                    chunk_count: 0,
+                },
+            );
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(StreamRelayMessage::Heartbeat { .. })
+        ));
+        assert!(rx.try_recv().is_err(), "held data must not be released");
+
+        deliver(&router, "r", 0, text("a"));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(StreamRelayMessage::Chunk(StreamChunk::Text(t))) if t == "a"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(StreamRelayMessage::Chunk(StreamChunk::Text(t))) if t == "b"
+        ));
+    }
+
+    // ---- gap detection ----
+
+    fn routed(seq: u64, message: StreamRelayMessage) -> RoutedStreamRelayMessage {
+        RoutedStreamRelayMessage {
+            request_id: "r".to_string(),
+            message,
+            seq: Some(seq),
+        }
+    }
+
+    async fn recv_within(
+        rx: &mut mpsc::UnboundedReceiver<StreamRelayMessage>,
+    ) -> Option<StreamRelayMessage> {
+        tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("consumer should receive or close within 3s")
+    }
+
+    fn gap_failure_reason(message: StreamRelayMessage) -> String {
+        match message {
+            StreamRelayMessage::TransportFailed { error } => {
+                querymt::error::LLMError::from_payload(error).to_string()
+            }
+            other => panic!("expected TransportFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unfilled_gap_fails_stream_once_after_timeout() {
+        let router = ProviderStreamRouterActor::new(Some(10), Some(60))
+            .with_gap_limits(Duration::from_millis(50), 1024);
+        let requests = Arc::clone(&router.requests);
+        let mut rx = router_with_consumer(&router, "r");
+        let router_ref = ProviderStreamRouterActor::spawn(router);
+
+        // seq 0 never arrives.
+        router_ref.tell(routed(1, text("b"))).await.expect("tell");
+        router_ref.tell(routed(2, text("c"))).await.expect("tell");
+
+        let failure = recv_within(&mut rx).await.expect("failure message");
+        let reason = gap_failure_reason(failure);
+        assert!(reason.contains("missing seq 0"), "{reason}");
+        assert!(reason.contains("held 2"), "{reason}");
+        assert!(
+            recv_within(&mut rx).await.is_none(),
+            "no held data and no second message after the failure"
+        );
+        let phase = requests.lock().get("r").expect("request").phase;
+        assert_eq!(phase, RequestPhase::Failed);
+    }
+
+    #[tokio::test]
+    async fn held_message_cap_fails_immediately() {
+        let router = ProviderStreamRouterActor::new(Some(10), Some(60))
+            .with_gap_limits(Duration::from_secs(60), 4);
+        let mut rx = router_with_consumer(&router, "r");
+
+        for seq in 1..=4u64 {
+            deliver(&router, "r", seq, text("x"));
+        }
+        assert!(rx.try_recv().is_err(), "four held messages are within cap");
+        deliver(&router, "r", 5, text("x"));
+
+        let reason = gap_failure_reason(rx.try_recv().expect("failure on fifth held"));
+        assert!(reason.contains("missing seq 0"), "{reason}");
+        assert!(rx.try_recv().is_err(), "held data must not be released");
+        assert_eq!(router.get_status(Some("r"))[0].phase, RequestPhase::Failed);
+    }
+
+    #[tokio::test]
+    async fn setup_failure_provider_error_with_seq_zero_reaches_consumer() {
+        let router = fixture_router();
+        let mut rx = router_with_consumer(&router, "r");
+        let error = querymt::error::LLMError::ProviderError("setup failed".into()).to_payload();
+
+        deliver(&router, "r", 0, StreamRelayMessage::ProviderError { error });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(StreamRelayMessage::ProviderError { .. })
+        ));
+        assert_eq!(router.get_status(Some("r"))[0].phase, RequestPhase::Failed);
+    }
+
+    #[tokio::test]
+    async fn gap_filled_before_timeout_raises_nothing() {
+        let router = ProviderStreamRouterActor::new(Some(10), Some(60))
+            .with_gap_limits(Duration::from_millis(100), 1024);
+        let requests = Arc::clone(&router.requests);
+        let mut rx = router_with_consumer(&router, "r");
+        let router_ref = ProviderStreamRouterActor::spawn(router);
+
+        router_ref.tell(routed(1, text("b"))).await.expect("tell");
+        router_ref.tell(routed(0, text("a"))).await.expect("tell");
+        // Wait past the timeout so the scheduled check has run.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        for expected in ["a", "b"] {
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(StreamRelayMessage::Chunk(StreamChunk::Text(t))) if t == expected
+            ));
+        }
+        assert!(rx.try_recv().is_err(), "no failure expected");
+        let phase = requests.lock().get("r").expect("request").phase;
+        assert_eq!(phase, RequestPhase::Streaming);
     }
 }

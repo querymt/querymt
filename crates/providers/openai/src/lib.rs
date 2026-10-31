@@ -6,8 +6,9 @@ use http::{Request, Response};
 use querymt::{
     HTTPLLMProvider,
     chat::{
-        ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
-        http::{ChatStreamParser, HTTPChatProvider},
+        ChatCall, ChatCapabilities, ChatOutput, StreamChunk, StructuredOutputFormat, Tool,
+        ToolChoice,
+        http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -229,48 +230,50 @@ impl HTTPChatProvider for OpenAI {
         api::classify_openai_http_error(response)
     }
 
-    fn chat_request(
+    fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        match self.api_mode {
+        call: &ChatCall<'_>,
+        stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
+        let build = |cfg: &Self| match cfg.api_mode {
             // Default path: behavior is unchanged and request snapshots are stable.
-            ApiMode::ChatCompletions => api::openai_chat_request(self, messages, tools),
+            ApiMode::ChatCompletions => api::openai_chat_request(cfg, call.messages, call.tools),
             // Opt-in only. This never falls back to Chat Completions after sending.
-            ApiMode::Responses => api::openai_responses_request(self, messages, tools),
-        }
+            ApiMode::Responses => api::openai_responses_request(cfg, call.messages, call.tools),
+        };
+        let request = if stream {
+            let mut cfg = self.clone();
+            cfg.stream = Some(true);
+            build(&cfg)
+        } else {
+            build(self)
+        }?;
+        Ok(PreparedChatRequest::stateless(request))
     }
 
-    fn chat_stream_request(
+    fn parse_chat(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        let mut cfg = self.clone();
-        cfg.stream = Some(true);
-        match cfg.api_mode {
-            ApiMode::ChatCompletions => api::openai_chat_request(&cfg, messages, tools),
-            ApiMode::Responses => api::openai_responses_request(&cfg, messages, tools),
-        }
-    }
-
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        response: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         match self.api_mode {
             ApiMode::ChatCompletions => api::openai_parse_chat(self, response),
             ApiMode::Responses => api::openai_parse_responses(self, response, None),
         }
     }
 
-    fn supports_streaming(&self) -> bool {
-        true
-    }
-
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+    fn chat_stream_parser(
+        &self,
+        _context: serde_json::Value,
+    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
         match self.api_mode {
             ApiMode::ChatCompletions => Ok(Box::new(OpenAIStreamParser::default())),
             ApiMode::Responses => Ok(Box::new(OpenAIResponsesStreamParser::default())),
         }
+    }
+
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE.with_streaming(true)
     }
 }
 
@@ -383,8 +386,8 @@ mod tests {
     use super::{ApiMode, OpenAI};
     use querymt::{
         chat::{
-            ChatInputPart, ChatMessage, ChatRole, MediaKind, MediaPart, MediaSource, StreamChunk,
-            Tool, ToolChoice, ToolResult, ToolResultPart,
+            ChatCall, ChatInputPart, ChatMessage, ChatRole, MediaKind, MediaPart, MediaSource,
+            StreamChunk, Tool, ToolChoice, ToolResult, ToolResultPart,
             http::{ChatStreamParser, HTTPChatProvider},
         },
         error::LLMError,
@@ -447,7 +450,8 @@ mod tests {
         )])];
 
         let req = provider
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("default request should build");
 
         assert!(
@@ -485,7 +489,8 @@ mod tests {
         )])];
 
         let req = provider
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("responses request should build");
 
         assert!(
@@ -531,7 +536,8 @@ mod tests {
         provider.tool_choice = Some(ToolChoice::Tool("read_file".to_string()));
 
         let req = provider
-            .chat_request(&messages, Some(&tools))
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(Some(&tools)), false)
+            .map(|p| p.request)
             .expect("responses request should build");
         let body: Value = serde_json::from_slice(req.body()).expect("body is valid json");
 
@@ -612,7 +618,8 @@ mod tests {
         ];
 
         let req = provider
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("responses request should build");
         let body: Value = serde_json::from_slice(req.body()).expect("body is valid json");
         let input = body["input"].as_array().expect("input is an array");
@@ -650,7 +657,10 @@ mod tests {
         let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
             "hello".to_string(),
         )])];
-        let req = provider.chat_request(&messages, None).unwrap();
+        let req = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(req.body()).unwrap();
 
         assert_eq!(
@@ -687,7 +697,8 @@ mod tests {
                 "hello".to_string(),
             )])];
             let error = provider
-                .chat_request(&messages, None)
+                .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+                .map(|p| p.request)
                 .expect_err("reserved override must fail");
             assert!(
                 matches!(error, LLMError::InvalidRequest(ref msg) if msg.contains(reserved)),
@@ -712,7 +723,8 @@ mod tests {
             "hello".to_string(),
         )])];
         let error = provider
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect_err("camelCase retention alias must fail");
         assert!(
             matches!(error, LLMError::InvalidRequest(ref msg) if msg.contains("previousResponseId")),
@@ -733,7 +745,8 @@ mod tests {
             "hello".to_string(),
         )])];
         let req = provider
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("unrelated passthrough must be allowed");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         assert_eq!(body["metadata"]["trace"], Value::String("abc".to_string()));
@@ -762,7 +775,8 @@ mod tests {
         )])];
 
         let req = provider
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("request controls should map");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
 
@@ -813,7 +827,8 @@ mod tests {
         )])];
 
         let error = provider
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect_err("top_k has no Responses equivalent");
         assert!(
             matches!(error, LLMError::InvalidRequest(ref msg) if msg.contains("top_k")),
@@ -827,7 +842,10 @@ mod tests {
         let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
             "hello".to_string(),
         )])];
-        let req = provider.chat_request(&messages, None).unwrap();
+        let req = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(req.body()).unwrap();
 
         assert!(body.get("instructions").is_none());
@@ -864,7 +882,8 @@ mod tests {
         )];
 
         let req = provider
-            .chat_request(&messages, Some(&tools))
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(Some(&tools)), false)
+            .map(|p| p.request)
             .expect("non-strict tool must build");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         assert_eq!(body["tools"][0]["strict"], Value::Bool(false));
@@ -891,7 +910,8 @@ mod tests {
         )];
 
         let error = provider
-            .chat_request(&messages, Some(&tools))
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(Some(&tools)), false)
+            .map(|p| p.request)
             .expect_err("incompatible strict schema must fail");
         assert!(
             matches!(error, LLMError::InvalidRequest(ref msg) if msg.contains("lookup")),
@@ -916,7 +936,8 @@ mod tests {
         )];
 
         let req = provider
-            .chat_request(&messages, Some(&tools))
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(Some(&tools)), false)
+            .map(|p| p.request)
             .expect("compatible strict schema must build");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         assert_eq!(body["tools"][0]["strict"], Value::Bool(true));
@@ -939,7 +960,8 @@ mod tests {
         )];
 
         let req = provider
-            .chat_request(&messages, Some(&tools))
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(Some(&tools)), false)
+            .map(|p| p.request)
             .expect("chat completions tool must build");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         assert!(
@@ -984,7 +1006,11 @@ mod tests {
         })]);
 
         let req = provider
-            .chat_request(&[assistant, result], None)
+            .prepare_chat_request(
+                &ChatCall::new(&[assistant, result]).maybe_tools(None),
+                false,
+            )
+            .map(|p| p.request)
             .expect("rich function output should build");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         let input = body["input"].as_array().unwrap();
@@ -1036,7 +1062,8 @@ mod tests {
         })]);
 
         let req = provider
-            .chat_request(&[result], None)
+            .prepare_chat_request(&ChatCall::new(&[result]).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("text result should build");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         assert_eq!(
@@ -1061,7 +1088,8 @@ mod tests {
         })]);
 
         let error = provider
-            .chat_request(&[result], None)
+            .prepare_chat_request(&ChatCall::new(&[result]).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect_err("unsupported output media must fail");
         assert!(
             matches!(error, LLMError::InvalidRequest(ref msg)
@@ -1113,7 +1141,7 @@ mod tests {
         });
 
         let response = provider
-            .parse_chat(responses_json_response(body))
+            .parse_chat(responses_json_response(body), serde_json::Value::Null)
             .expect("completed response should parse");
 
         let output = &response;
@@ -1173,7 +1201,7 @@ mod tests {
         });
 
         let response = provider
-            .parse_chat(responses_json_response(body))
+            .parse_chat(responses_json_response(body), serde_json::Value::Null)
             .expect("response should parse");
         let output = &response;
 
@@ -1221,7 +1249,7 @@ mod tests {
         });
 
         let response = provider
-            .parse_chat(responses_json_response(body))
+            .parse_chat(responses_json_response(body), serde_json::Value::Null)
             .expect("response should parse");
         let querymt::chat::ChatOutputItem::Reasoning(reasoning) = &response.items[0] else {
             panic!("expected reasoning item");
@@ -1246,7 +1274,7 @@ mod tests {
         });
 
         let response = provider
-            .parse_chat(responses_json_response(body))
+            .parse_chat(responses_json_response(body), serde_json::Value::Null)
             .expect("incomplete response should parse");
         let output = &response;
 
@@ -1279,7 +1307,7 @@ mod tests {
         });
 
         let response = provider
-            .parse_chat(responses_json_response(body))
+            .parse_chat(responses_json_response(body), serde_json::Value::Null)
             .expect("unknown item should parse");
         let output = &response;
 
@@ -1312,7 +1340,7 @@ mod tests {
         });
 
         let error = provider
-            .parse_chat(responses_json_response(body))
+            .parse_chat(responses_json_response(body), serde_json::Value::Null)
             .expect_err("failed status with error must surface provider failure");
         assert!(
             matches!(error, LLMError::ProviderResponseError(_)),
@@ -1329,7 +1357,9 @@ mod tests {
         use querymt::chat::{ChatOutputItem, ChatOutputStatus, StructuredStreamEvent};
 
         let provider = responses_provider();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
 
         let mut events = Vec::new();
         events.extend(
@@ -1420,7 +1450,9 @@ mod tests {
         use querymt::chat::{ChatOutputItem, StructuredStreamEvent};
 
         let provider = responses_provider();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let events = parser
             .parse_chunk(&sse(
                 r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","phase":"final_answer","custom_field":{"retained":true},"content":[{"type":"output_text","text":"Madrid"}]}}"#,
@@ -1450,7 +1482,9 @@ mod tests {
     #[test]
     fn responses_stream_ignores_framing_only_done_marker() {
         let provider = responses_provider();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let events = parser.parse_chunk(&sse("[DONE]")).unwrap();
         assert!(
             events.is_empty(),
@@ -1467,7 +1501,9 @@ mod tests {
         // indexed part, then text deltas arrive. Feeding the emitted events
         // through the shared accumulator must succeed and produce the text.
         let provider = responses_provider();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let mut accumulator = ChatStreamAccumulator::new();
 
         let mut feed = |parser: &mut Box<dyn ChatStreamParser>,
@@ -1528,7 +1564,9 @@ mod tests {
         // Defensive: a provider may omit `content_part.added`; the accumulator
         // must create the indexed part on demand instead of failing.
         let provider = responses_provider();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let mut accumulator = ChatStreamAccumulator::new();
 
         for payload in [
@@ -1557,7 +1595,9 @@ mod tests {
         // Reasoning summaries have the same part/delta ordering: the summary
         // part is declared by `reasoning_summary_part.added` before deltas.
         let provider = responses_provider();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let mut accumulator = ChatStreamAccumulator::new();
 
         for payload in [
@@ -1585,7 +1625,9 @@ mod tests {
         use querymt::chat::{ChatOutputItem, ChatOutputStatus, ChatStreamAccumulator};
 
         let provider = responses_provider();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let mut accumulator = ChatStreamAccumulator::new();
 
         for payload in [
@@ -1632,7 +1674,9 @@ mod tests {
         use querymt::chat::{ReasoningPartKind, StructuredStreamEvent};
 
         let provider = responses_provider();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let events = parser
             .parse_chunk(&sse(
                 r#"{"type":"response.reasoning_text.delta","output_index":0,"content_index":1,"delta":"part-two"}"#,
@@ -1659,7 +1703,9 @@ mod tests {
         use querymt::chat::{ChatOutputStatus, StructuredStreamEvent};
 
         let provider = responses_provider();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         parser
             .parse_chunk(&sse(
                 r#"{"type":"response.created","response":{"id":"resp_2"}}"#,
@@ -1701,7 +1747,9 @@ mod tests {
         use querymt::chat::{ChatOutputStatus, StructuredStreamEvent};
 
         let provider = responses_provider();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let events = parser
             .parse_chunk(&sse(
                 r#"{"type":"response.incomplete","response":{"id":"resp_3","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}"#,
@@ -1725,7 +1773,9 @@ mod tests {
     #[test]
     fn responses_stream_failed_surfaces_provider_failure() {
         let provider = responses_provider();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let error = parser
             .parse_chunk(&sse(
                 r#"{"type":"response.failed","response":{"id":"resp_4","status":"failed","error":{"code":"server_error","message":"boom"}}}"#,
@@ -1742,8 +1792,12 @@ mod tests {
         use querymt::chat::StructuredStreamEvent;
 
         let provider = responses_provider();
-        let mut parser_a = provider.chat_stream_parser().unwrap();
-        let mut parser_b = provider.chat_stream_parser().unwrap();
+        let mut parser_a = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
+        let mut parser_b = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
 
         // Parser A establishes a response and terminal.
         parser_a
@@ -1834,7 +1888,8 @@ mod tests {
         ]);
 
         let req = provider
-            .chat_request(&[message], None)
+            .prepare_chat_request(&ChatCall::new(&[message]).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("typed media must serialize");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         let content = body["input"][0]["content"].as_array().unwrap();
@@ -1900,7 +1955,10 @@ mod tests {
         .unwrap();
 
         let message = tagged_assistant_turn(vec![ChatMessagePart::Media(Box::new(url_media))]);
-        let req = provider.chat_request(&[message], None).unwrap();
+        let req = provider
+            .prepare_chat_request(&ChatCall::new(&[message]).maybe_tools(None), false)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         assert_eq!(
             body["input"][0]["content"][0]["image_url"],
@@ -1932,7 +1990,8 @@ mod tests {
 
         let message = tagged_assistant_turn(vec![ChatMessagePart::Media(Box::new(reference))]);
         let error = provider
-            .chat_request(&[message], None)
+            .prepare_chat_request(&ChatCall::new(&[message]).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect_err("cross-origin provider reference must not be forwarded as a URL");
         assert!(
             matches!(error, LLMError::InvalidRequest(ref msg) if msg.contains("file_abc")),
@@ -1965,7 +2024,7 @@ mod tests {
             ]
         });
         let response = provider
-            .parse_chat(responses_json_response(body))
+            .parse_chat(responses_json_response(body), serde_json::Value::Null)
             .expect("built-in media response should parse");
         let output = &response;
 
@@ -1995,7 +2054,9 @@ mod tests {
         assert!(!format!("{opaque:?}").contains("iVBORw0KGgoAAAANSUhEUg=="));
 
         // Streaming path retains the same opaque item and emits no call events.
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let mut streamed = Vec::new();
         streamed.extend(
             parser
@@ -2076,7 +2137,8 @@ mod tests {
         assert!(assistant.replace_output(output).is_ok());
 
         let error = provider
-            .chat_request(&[assistant], None)
+            .prepare_chat_request(&ChatCall::new(&[assistant]).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect_err("unsupported built-in replay must fail explicitly");
         assert!(
             matches!(
@@ -2181,7 +2243,8 @@ mod tests {
         ];
 
         let req = provider
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("responses replay should build");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         let input = body["input"].as_array().unwrap();
@@ -2268,7 +2331,11 @@ mod tests {
         };
 
         let req = provider
-            .chat_request(&[ChatMessage::from_assistant_output(output)], None)
+            .prepare_chat_request(
+                &ChatCall::new(&[ChatMessage::from_assistant_output(output)]).maybe_tools(None),
+                false,
+            )
+            .map(|p| p.request)
             .expect("responses replay should build");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         let reasoning = &body["input"][0];
@@ -2309,7 +2376,10 @@ mod tests {
                 .build(),
         ];
 
-        let request = provider.chat_request(&messages, None).unwrap();
+        let request = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[1]["type"], "function_call");
@@ -2346,7 +2416,11 @@ mod tests {
         };
 
         let request = provider
-            .chat_request(&[ChatMessage::from_assistant_output(output)], None)
+            .prepare_chat_request(
+                &ChatCall::new(&[ChatMessage::from_assistant_output(output)]).maybe_tools(None),
+                false,
+            )
+            .map(|p| p.request)
             .unwrap();
         let body = String::from_utf8(request.into_body()).unwrap();
         assert!(body.contains("visible"));
@@ -2378,7 +2452,8 @@ mod tests {
         assert!(assistant.replace_output(output).is_ok());
 
         let req = provider
-            .chat_request(&[assistant], None)
+            .prepare_chat_request(&ChatCall::new(&[assistant]).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("replay should build");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         assert_eq!(
@@ -2407,7 +2482,8 @@ mod tests {
         assert!(assistant.replace_output(output).is_ok());
 
         let error = provider
-            .chat_request(&[assistant], None)
+            .prepare_chat_request(&ChatCall::new(&[assistant]).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect_err("unsupported unknown continuation must fail");
         assert!(
             matches!(error, LLMError::InvalidRequest(ref msg) if msg.contains("future_action")),
@@ -2463,7 +2539,9 @@ mod tests {
         use querymt::chat::{ChatOutputStatus, ChatStreamAccumulator};
 
         let provider = responses_provider();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let mut accumulator = ChatStreamAccumulator::new();
 
         for payload in [
@@ -2493,7 +2571,9 @@ mod tests {
         use querymt::chat::{ChatOutputStatus, ChatStreamAccumulator, FinishReason};
 
         let provider = responses_provider();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let mut accumulator = ChatStreamAccumulator::new();
 
         for payload in [
@@ -2529,7 +2609,9 @@ mod tests {
         use querymt::chat::{ChatOutputStatus, ChatStreamAccumulator, ChatStreamFinish};
 
         let provider = responses_provider();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let mut accumulator = ChatStreamAccumulator::new();
 
         for payload in [
@@ -2588,7 +2670,8 @@ mod tests {
         let provider: OpenAI = serde_json::from_value(cfg).unwrap();
 
         let req = provider
-            .chat_stream_request(&[], None)
+            .prepare_chat_request(&ChatCall::new(&[]).maybe_tools(None), true)
+            .map(|p| p.request)
             .expect("stream request should build");
         let body: Value = serde_json::from_slice(req.body()).expect("body should be valid json");
         assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
@@ -2601,7 +2684,9 @@ mod tests {
             "model": "gpt-4o-mini"
         });
         let provider: OpenAI = serde_json::from_value(cfg).unwrap();
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let chunk = br#"data: {"error":{"message":"busy","code":"server_error"}}
 
 "#;
@@ -2619,10 +2704,10 @@ mod tests {
         let provider: OpenAI = serde_json::from_value(cfg).unwrap();
 
         let mut parser_a = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("parser A should initialize");
         let mut parser_b = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("parser B should initialize");
 
         let a_delta = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}

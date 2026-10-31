@@ -264,6 +264,7 @@ async fn test_max_steps_ignores_other_states() {
             messages: Arc::from([]),
             tools: Arc::from([]),
             estimated_tokens: 0,
+            options: Default::default(),
         }),
     };
     let result = middleware.on_step_start(state, None).await.unwrap();
@@ -291,83 +292,102 @@ async fn test_turn_limit_middleware() {
     assert!(matches!(result, ExecutionState::Stopped { .. }));
 }
 
-#[tokio::test]
-async fn test_price_limit_over_budget() {
-    let middleware = PriceLimitMiddleware::new(0.10, 3.0, 15.0);
+fn budget_context(budget_cost_usd: f64) -> Arc<ConversationContext> {
     let stats = Arc::new(AgentStats {
         steps: 1,
-        total_input_tokens: 100_000,
-        total_output_tokens: 10_000,
-        context_tokens: 0,
+        // Token counters are irrelevant to the check: only recorded cycle
+        // charges count.
+        total_input_tokens: 1_000_000_000,
+        total_output_tokens: 1_000_000_000,
+        budget_cost_usd,
         ..Default::default()
     });
-    let context = Arc::new(ConversationContext::new(
+    Arc::new(ConversationContext::new(
         "sess-1".into(),
         Arc::from([]),
         stats,
         "mock".into(),
         "mock-model".into(),
-    ));
-    let state = ExecutionState::BeforeLlmCall { context };
+    ))
+}
 
-    let result = middleware.on_step_start(state, None).await.unwrap();
-
-    assert!(matches!(
-        result,
+fn is_price_stop(state: &ExecutionState) -> bool {
+    matches!(
+        state,
         ExecutionState::Stopped {
             stop_type: StopType::PriceLimit,
             ..
         }
+    )
+}
+
+#[tokio::test]
+async fn test_price_limit_over_budget() {
+    let middleware = PriceLimitMiddleware::new(0.10, 3.0, 15.0);
+    let state = ExecutionState::BeforeLlmCall {
+        context: budget_context(0.25),
+    };
+    assert!(is_price_stop(
+        &middleware.on_step_start(state, None).await.unwrap()
+    ));
+}
+
+#[tokio::test]
+async fn test_price_limit_stops_exactly_at_the_cap() {
+    let middleware = PriceLimitMiddleware::new(0.10, 3.0, 15.0);
+    let state = ExecutionState::BeforeLlmCall {
+        context: budget_context(0.10),
+    };
+    assert!(is_price_stop(
+        &middleware.on_step_start(state, None).await.unwrap()
     ));
 }
 
 #[tokio::test]
 async fn test_price_limit_under_budget() {
     let middleware = PriceLimitMiddleware::new(1.0, 3.0, 15.0);
-    let stats = Arc::new(AgentStats {
-        steps: 1,
-        total_input_tokens: 10_000,
-        total_output_tokens: 1_000,
-        context_tokens: 0,
-        ..Default::default()
-    });
-    let context = Arc::new(ConversationContext::new(
-        "sess-1".into(),
-        Arc::from([]),
-        stats,
-        "mock".into(),
-        "mock-model".into(),
-    ));
-    let state = ExecutionState::BeforeLlmCall { context };
-
+    let state = ExecutionState::BeforeLlmCall {
+        context: budget_context(0.05),
+    };
     let result = middleware.on_step_start(state, None).await.unwrap();
-
     assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 }
 
 #[tokio::test]
-async fn test_price_limit_missing_config_passes_through() {
-    let config = LimitsConfig::default().max_price_usd(0.10);
-    let middleware = LimitsMiddleware::new(config);
-
-    let stats = Arc::new(AgentStats {
-        steps: 1,
-        total_input_tokens: 1_000_000,
-        total_output_tokens: 1_000_000,
-        context_tokens: 0,
-        ..Default::default()
-    });
-    let context = Arc::new(ConversationContext::new(
-        "sess-1".into(),
-        Arc::from([]),
-        stats,
-        "mock".into(),
-        "mock-model".into(),
-    ));
-    let state = ExecutionState::BeforeLlmCall { context };
-
+async fn test_new_cycle_with_zero_cycle_spend_is_not_exhausted() {
+    // Prior-cycle spend never reaches the stats of a new cycle.
+    let middleware = PriceLimitMiddleware::new(0.10, 3.0, 15.0);
+    let state = ExecutionState::BeforeLlmCall {
+        context: budget_context(0.0),
+    };
     let result = middleware.on_step_start(state, None).await.unwrap();
+    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+}
 
+#[tokio::test]
+async fn test_limits_middleware_enforces_the_same_cycle_budget() {
+    let middleware = LimitsMiddleware::new(LimitsConfig::default().max_price_usd(0.10));
+    let over = ExecutionState::BeforeLlmCall {
+        context: budget_context(0.10),
+    };
+    assert!(is_price_stop(
+        &middleware.on_step_start(over, None).await.unwrap()
+    ));
+    let under = ExecutionState::BeforeLlmCall {
+        context: budget_context(0.09),
+    };
+    let result = middleware.on_step_start(under, None).await.unwrap();
+    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+}
+
+#[tokio::test]
+async fn test_price_limit_without_known_spend_passes_through() {
+    // No recorded charge (for example an all-unpriced cycle): nothing to stop on.
+    let middleware = LimitsMiddleware::new(LimitsConfig::default().max_price_usd(0.10));
+    let state = ExecutionState::BeforeLlmCall {
+        context: budget_context(0.0),
+    };
+    let result = middleware.on_step_start(state, None).await.unwrap();
     assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 }
 

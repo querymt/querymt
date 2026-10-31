@@ -16,7 +16,6 @@ pub(crate) enum SessionOperation {
     LegacyPrompt,
     SubmitInput { has_key: bool },
     DiscardQueuedInput,
-    RuntimeState,
     Cancel,
     SetMode,
     SetModel,
@@ -28,7 +27,6 @@ impl SessionOperation {
             Self::LegacyPrompt => "legacy_prompt",
             Self::SubmitInput { .. } => "submit_input",
             Self::DiscardQueuedInput => "discard_queued_input",
-            Self::RuntimeState => "runtime_state",
             Self::Cancel => "cancel",
             Self::SetMode => "set_mode",
             Self::SetModel => "set_model",
@@ -37,7 +35,7 @@ impl SessionOperation {
 
     pub(crate) fn safety(self) -> SessionOperationSafety {
         match self {
-            Self::DiscardQueuedInput | Self::RuntimeState => SessionOperationSafety::Idempotent,
+            Self::DiscardQueuedInput => SessionOperationSafety::Idempotent,
             Self::SubmitInput { has_key: true } => SessionOperationSafety::IdempotentWithKey,
             Self::LegacyPrompt
             | Self::SubmitInput { has_key: false }
@@ -423,7 +421,7 @@ mod tests {
             RemoteTransportFailureKind::ActorUnavailable,
             DeliveryCertainty::NotDelivered,
         );
-        assert!(SessionOperation::RuntimeState.can_retry_after_recovery(&unknown, false));
+        assert!(SessionOperation::DiscardQueuedInput.can_retry_after_recovery(&unknown, false));
         assert!(SessionOperation::LegacyPrompt.can_retry_after_recovery(&not_delivered, false));
         assert!(
             SessionOperation::SubmitInput { has_key: true }
@@ -443,7 +441,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_recovery_retries_idempotent_operation_after_actor_replacement() {
         assert_actor_replacement_retry(
-            SessionOperation::RuntimeState,
+            SessionOperation::DiscardQueuedInput,
             DeliveryCertainty::Unknown,
             true,
         )
@@ -475,7 +473,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(20), async {
             for _ in 0..3 {
                 assert_actor_replacement_retry(
-                    SessionOperation::RuntimeState,
+                    SessionOperation::DiscardQueuedInput,
                     DeliveryCertainty::Unknown,
                     true,
                 )
@@ -593,10 +591,6 @@ mod tests {
     #[test]
     fn operation_safety_is_conservative() {
         assert_eq!(
-            SessionOperation::RuntimeState.safety(),
-            SessionOperationSafety::Idempotent
-        );
-        assert_eq!(
             SessionOperation::DiscardQueuedInput.safety(),
             SessionOperationSafety::Idempotent
         );
@@ -620,11 +614,11 @@ mod tests {
             RemoteTransportFailureKind::ActorUnavailable,
             DeliveryCertainty::NotDelivered,
         )));
-        assert!(!SessionOperation::RuntimeState.can_retry(&failure(
+        assert!(!SessionOperation::DiscardQueuedInput.can_retry(&failure(
             RemoteTransportFailureKind::ProtocolMismatch,
             DeliveryCertainty::NotDelivered,
         )));
-        assert!(SessionOperation::RuntimeState.can_retry(&failure(
+        assert!(SessionOperation::DiscardQueuedInput.can_retry(&failure(
             RemoteTransportFailureKind::ReplyTimeout,
             DeliveryCertainty::Unknown,
         )));
@@ -666,7 +660,7 @@ mod tests {
             .insert(session.public_id.clone(), actor.clone());
 
         let resolved = handle
-            .session_ref_for_operation(&session.public_id, SessionOperation::RuntimeState)
+            .session_ref_for_operation(&session.public_id, SessionOperation::DiscardQueuedInput)
             .await
             .expect("resolve local session");
         assert!(!resolved.session_ref.is_remote());
@@ -684,7 +678,7 @@ mod tests {
             .expect("save bookmark");
 
         let error = handle
-            .session_ref_for_operation(session_id, SessionOperation::RuntimeState)
+            .session_ref_for_operation(session_id, SessionOperation::DiscardQueuedInput)
             .await
             .err()
             .expect("offline node must fail recovery");
@@ -721,7 +715,7 @@ mod tests {
             .expect("save conflicting bookmark");
 
         let error = handle
-            .session_ref_for_operation(&session.public_id, SessionOperation::RuntimeState)
+            .session_ref_for_operation(&session.public_id, SessionOperation::DiscardQueuedInput)
             .await
             .err()
             .expect("conflict must fail");

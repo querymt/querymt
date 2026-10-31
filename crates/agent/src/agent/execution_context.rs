@@ -94,9 +94,18 @@ pub(crate) struct ExecutionContext {
     pub run_objective: Option<RunObjective>,
     /// Reports execution phase changes back to the owning session actor.
     pub phase_reporter:
-        Option<tokio::sync::mpsc::UnboundedSender<crate::agent::turn_control::RunPhase>>,
+        Option<tokio::sync::mpsc::UnboundedSender<Option<crate::agent::turn_control::RunPhase>>>,
     /// Delegations left running when steering interrupts a wait.
     pub suspended_delegations: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Immutable accounting handle for this execution cycle, created at the
+    /// cycle boundary. Cycle spend starts at zero; session spend is retained
+    /// by the session-owned projection it points at.
+    pub cycle_accounting: tokio::sync::OnceCell<crate::accounting::CycleAccounting>,
+    /// Budget-uncertainty reasons already reported for this cycle, so
+    /// repeated step-start snapshots never repeat a warning.
+    pub budget_warnings: crate::accounting::BudgetWarnings,
+    /// Retains a supplementary terminal read across bounded BeforeModel reconciliation.
+    pub suspended_recovery: tokio::sync::Mutex<Option<crate::agent::execution::DelegationRecovery>>,
 }
 
 impl ExecutionContext {
@@ -126,6 +135,9 @@ impl ExecutionContext {
             run_objective: None,
             phase_reporter: None,
             suspended_delegations: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            cycle_accounting: tokio::sync::OnceCell::new(),
+            budget_warnings: Default::default(),
+            suspended_recovery: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -187,15 +199,40 @@ impl ExecutionContext {
 
     pub fn with_phase_reporter(
         mut self,
-        reporter: tokio::sync::mpsc::UnboundedSender<crate::agent::turn_control::RunPhase>,
+        reporter: tokio::sync::mpsc::UnboundedSender<Option<crate::agent::turn_control::RunPhase>>,
     ) -> Self {
         self.phase_reporter = Some(reporter);
         self
     }
 
+    pub fn with_cycle_accounting(self, cycle: crate::accounting::CycleAccounting) -> Self {
+        let _ = self.cycle_accounting.set(cycle);
+        self
+    }
+
+    /// This cycle's accounting handle, created on first use from the
+    /// session-owned projection. A cycle has exactly one identity.
+    pub(crate) async fn cycle_accounting(
+        &self,
+        sink: &crate::event_sink::EventSink,
+    ) -> Result<&crate::accounting::CycleAccounting, crate::accounting::AccountingError> {
+        self.cycle_accounting
+            .get_or_try_init(|| async {
+                let accounting = self.runtime.accounting(&self.session_id, sink).await?;
+                Ok(crate::accounting::CycleAccounting::begin(accounting))
+            })
+            .await
+    }
+
+    pub fn report_runtime_change(&self) {
+        if let Some(reporter) = &self.phase_reporter {
+            let _ = reporter.send(None);
+        }
+    }
+
     pub fn report_phase(&self, phase: crate::agent::turn_control::RunPhase) {
         if let Some(reporter) = &self.phase_reporter {
-            let _ = reporter.send(phase);
+            let _ = reporter.send(Some(phase));
         }
     }
 
@@ -239,6 +276,9 @@ impl ExecutionContext {
         )
         .with_cancellation_token(self.cancellation_token.clone());
 
+        if let Some(gate) = self.runtime.mutation_gate.get() {
+            ctx = ctx.with_mutation_gate(gate.clone());
+        }
         if let Some(ref ks) = self.knowledge_store {
             ctx.with_knowledge_store(ks.clone());
         }
@@ -425,6 +465,30 @@ mod tests {
             tool_ctx.knowledge_store().is_some(),
             "knowledge_store should be Some when set on ExecutionContext"
         );
+    }
+
+    #[tokio::test]
+    async fn tool_context_propagates_checkout_mutation_gate() {
+        use crate::tools::context::ToolContext;
+        let (runtime, runtime_ctx, handle) = make_context_parts().await;
+        let storage = tempfile::TempDir::new().unwrap();
+        let checkout = tempfile::TempDir::new().unwrap();
+        let gate = Arc::new(
+            crate::worktree::CheckoutMutationGate::new(storage.path(), checkout.path()).unwrap(),
+        );
+        runtime.mutation_gate.set(gate.clone()).unwrap();
+        let ctx = ExecutionContext::new(
+            handle.session().public_id.clone(),
+            runtime,
+            runtime_ctx,
+            handle,
+            ToolConfig::default(),
+        );
+        let tools = ctx.tool_context(
+            Arc::new(crate::delegation::DefaultAgentRegistry::new()),
+            None,
+        );
+        assert!(Arc::ptr_eq(&gate, &tools.checkout_mutation_gate().unwrap()));
     }
 
     #[tokio::test]

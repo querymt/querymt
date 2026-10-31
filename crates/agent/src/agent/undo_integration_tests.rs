@@ -6,13 +6,52 @@
 //! - File restoration
 //! - Proper reverted files list
 
+use crate::agent::undo::UndoError;
 use crate::events::{AgentEventKind, EventOrigin};
+use crate::model::MessagePart;
 use crate::session::backend::StorageBackend;
+use crate::session::domain::ForkOrigin;
 use crate::session::projection::{EventJournal, NewDurableEvent};
 use crate::test_utils::UndoTestFixture;
 use anyhow::Result;
+use std::sync::Arc;
+use tempfile::TempDir;
 
 // ==================== Test Suite: Basic Undo with Message History ====================
+
+#[tokio::test]
+async fn test_undo_rejects_foreign_snapshot_before_any_restore() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file("test.txt", "original")?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "edit").await?;
+    let (turn, pre) = fixture.take_pre_snapshot(&session).await?;
+    fixture.write_file("test.txt", "modified")?;
+    fixture.take_post_snapshot(&session, &turn, &pre).await?;
+    let foreign = TempDir::new()?;
+    // Inject a direct foreign entry after a valid patch. Preflight must
+    // reject the whole selection, not restore the valid patch first.
+    let mut message =
+        crate::model::AgentMessage::new(session.clone(), querymt::chat::ChatRole::Assistant);
+    message.parts.push(MessagePart::TurnSnapshotStart {
+        turn_id: "foreign".into(),
+        snapshot_id: pre,
+        workspace_root: Some(foreign.path().to_path_buf()),
+        inherited: false,
+    });
+    fixture
+        .storage
+        .session_store()
+        .add_message(&session, message)
+        .await?;
+    let error = fixture.undo(&session, &target).await.unwrap_err();
+    assert!(
+        matches!(error, UndoError::WorkspaceMismatch { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(fixture.read_file("test.txt")?, "modified");
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_undo_single_agent_with_file_changes() -> Result<()> {
@@ -184,6 +223,59 @@ async fn test_undo_multiple_child_sessions() -> Result<()> {
     assert_eq!(fixture.read_file("a.txt")?, "a-original");
     assert_eq!(fixture.read_file("b.txt")?, "b-original");
     assert_eq!(result.reverted_files.len(), 2);
+
+    Ok(())
+}
+
+// Parent undo aggregates only shared-workspace children: an isolated
+// delegate (a child captured in its own workspace) is never restored into
+// the parent's checkout, and undo still succeeds.
+#[tokio::test]
+async fn test_parent_undo_skips_isolated_child() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    let isolated_cwd = TempDir::new()?;
+
+    fixture.write_file("a.txt", "a-original")?;
+
+    // Parent (shared worktree) plus a shared delegate child and an
+    // isolated delegate child (captured in its own workspace).
+    let parent_id = fixture.create_session().await?;
+    let shared_child = fixture.create_child_session(&parent_id).await?;
+    let isolated_child = fixture
+        .storage
+        .session_store()
+        .create_session(
+            None,
+            Some(isolated_cwd.path().to_path_buf()),
+            Some(parent_id.clone()),
+            Some(ForkOrigin::Delegation),
+        )
+        .await?
+        .public_id;
+
+    let user_msg_id = fixture.add_user_message(&parent_id, "Make changes").await?;
+
+    // Shared child modifies a.txt.
+    let (shared_step, shared_pre) = fixture.take_pre_snapshot(&shared_child).await?;
+    fixture.write_file("a.txt", "a-modified")?;
+    fixture
+        .take_post_snapshot(&shared_child, &shared_step, &shared_pre)
+        .await?;
+
+    // The isolated child's history also claims changes to a.txt — those
+    // patches belong to ITS workspace and must not touch the parent's.
+    let (iso_step, iso_pre) = fixture.take_pre_snapshot(&isolated_child).await?;
+    fixture.write_file("a.txt", "a-isolated")?;
+    fixture
+        .take_post_snapshot(&isolated_child, &iso_step, &iso_pre)
+        .await?;
+
+    assert_eq!(fixture.read_file("a.txt")?, "a-isolated");
+
+    // Undo succeeds and reverts only the shared child's delta.
+    let result = fixture.undo(&parent_id, &user_msg_id).await?;
+    assert_eq!(fixture.read_file("a.txt")?, "a-original");
+    assert_eq!(result.reverted_files, vec!["a.txt".to_string()]);
 
     Ok(())
 }
@@ -511,6 +603,7 @@ async fn append_prompt_event(
 ) -> i64 {
     journal
         .append_durable(&NewDurableEvent {
+            session_seq: None,
             session_id: session_id.to_string(),
             origin: EventOrigin::Local,
             source_node: None,
@@ -530,6 +623,7 @@ async fn append_prompt_event(
 async fn append_generic_event(journal: &dyn EventJournal, session_id: &str) -> i64 {
     journal
         .append_durable(&NewDurableEvent {
+            session_seq: None,
             session_id: session_id.to_string(),
             origin: EventOrigin::Local,
             source_node: None,
@@ -619,6 +713,87 @@ async fn test_cleanup_revert_prunes_event_journal() -> Result<()> {
         after.len()
     );
 
+    Ok(())
+}
+
+/// Rewinding past a turn that incurred charges prunes the conversation but
+/// keeps the accounting ledger, so session spend is unchanged and journal
+/// numbers are not reused or shifted.
+#[tokio::test]
+async fn test_cleanup_revert_keeps_accounting_for_undone_turn() -> Result<()> {
+    use crate::accounting::tests::{sample_settlement, sample_start};
+    use crate::accounting::{AttemptRecorder, SessionAccounting};
+    use crate::event_fanout::EventFanout;
+    use crate::session_event_stream::SessionEventStream;
+
+    let fixture = UndoTestFixture::new().await?;
+    let session_id = fixture.create_session().await?;
+    let journal = fixture.storage.event_journal();
+
+    let accounting = SessionAccounting::hydrate(&session_id, journal.clone()).await?;
+    let stream =
+        SessionEventStream::new(&session_id, journal.clone(), Arc::new(EventFanout::new()));
+    let recorder = AttemptRecorder::with_projection(stream.clone(), accounting.clone());
+
+    // Turn 1, then turn 2 which is generated (and charged) and then undone.
+    let msg1 = fixture.add_user_message(&session_id, "first").await?;
+    stream
+        .emit_persisted(AgentEventKind::PromptReceived {
+            content: "first".into(),
+            message_id: Some(msg1),
+        })
+        .await?;
+    let msg2 = fixture.add_user_message(&session_id, "second").await?;
+    let prompt2 = stream
+        .emit_persisted(AgentEventKind::PromptReceived {
+            content: "second".into(),
+            message_id: Some(msg2.clone()),
+        })
+        .await?;
+    let mut start = sample_start();
+    start.attempt.session_id = session_id.clone();
+    let handle = recorder
+        .begin(start)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut settled = sample_settlement();
+    settled.attempt.session_id = session_id.clone();
+    recorder
+        .settle(handle, settled)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let charged = accounting.read(|r| r.session().clone());
+    assert!(charged.complete_total_usd().is_some());
+
+    fixture.undo(&session_id, &msg2).await?;
+    crate::agent::undo::cleanup_revert_on_prompt(
+        &fixture.handle.config.provider,
+        &*journal,
+        &session_id,
+    )
+    .await
+    .expect("cleanup should succeed");
+
+    let after = journal.load_session_stream(&session_id, None, None).await?;
+    assert!(
+        !after.iter().any(|e| e.session_seq == prompt2.session_seq),
+        "the undone turn's prompt is pruned"
+    );
+    let ledger: Vec<_> = after
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                AgentEventKind::LlmAttemptStarted { .. } | AgentEventKind::LlmAttemptSettled { .. }
+            )
+        })
+        .collect();
+    assert_eq!(ledger.len(), 2, "both ledger records survive the rewind");
+    assert!(ledger.iter().all(|e| e.session_seq > prompt2.session_seq));
+
+    // Reopening reproduces the same incurred totals from the journal alone.
+    let reopened = SessionAccounting::hydrate(&session_id, journal.clone()).await?;
+    assert_eq!(reopened.read(|r| r.session().clone()), charged);
     Ok(())
 }
 
@@ -736,6 +911,317 @@ async fn test_cleanup_revert_removes_undone_messages_from_history() -> Result<()
     assert!(
         !user_msgs.contains(&"Hello again!"),
         "undone assistant message must NOT survive"
+    );
+
+    Ok(())
+}
+
+// ==================== Test Suite: Inherited fork snapshots ====================
+//
+// Messages copied into a fork from a parent operating in a different
+// workspace are context-only: their snapshot ids belong to the parent's
+// snapshot repository and must never restore into the fork's checkout.
+// Turns made inside the fork itself stay fully undoable.
+
+#[tokio::test]
+async fn test_fork_undo_treats_inherited_foreign_snapshots_as_context_only() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    let fork_workspace = TempDir::new()?;
+
+    fixture.write_file("a.txt", "a-original")?;
+
+    let parent_id = fixture.create_session().await?;
+    fixture.add_user_message(&parent_id, "Turn one").await?;
+    let (turn_id, pre_snapshot) = fixture.take_pre_snapshot(&parent_id).await?;
+    fixture.write_file("a.txt", "a-turn-one")?;
+    fixture
+        .take_post_snapshot(&parent_id, &turn_id, &pre_snapshot)
+        .await?;
+
+    // Fork at the parent's last message so the copied prefix contains the
+    // snapshot parts, then bind the fork to its own workspace the way
+    // isolated forks do.
+    let parent_history = fixture
+        .storage
+        .session_store()
+        .get_history(&parent_id)
+        .await?;
+    let fork_target = parent_history.last().map(|m| m.id.clone()).unwrap();
+    let child_id = fixture
+        .storage
+        .session_store()
+        .fork_session(&parent_id, &fork_target, ForkOrigin::User)
+        .await?;
+
+    {
+        let conn = fixture.storage.conn();
+        let conn = conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET cwd = ? WHERE public_id = ?",
+            rusqlite::params![
+                fork_workspace.path().to_string_lossy().to_string(),
+                child_id
+            ],
+        )?;
+    }
+    fixture
+        .register_session_actor_with_cwd(&child_id, fork_workspace.path())
+        .await;
+
+    // Undo of the inherited parent turn inside the fork: context-only. No
+    // files change anywhere and no error is reported.
+    let child_history = fixture
+        .storage
+        .session_store()
+        .get_history(&child_id)
+        .await?;
+    let inherited_target = child_history
+        .iter()
+        .find(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, MessagePart::TurnSnapshotPatch { .. }))
+        })
+        .map(|m| m.id.clone())
+        .expect("fork copied the parent's patch message");
+
+    let err = fixture
+        .undo(&child_id, &inherited_target)
+        .await
+        .expect_err("a directly selected foreign snapshot must be rejected");
+    assert!(
+        err.to_string().contains("workspace") || format!("{err:?}").contains("WorkspaceMismatch"),
+        "expected an explicit provenance error, got: {err:?}"
+    );
+    assert_eq!(fixture.read_file("a.txt")?, "a-turn-one");
+    assert_eq!(
+        fixture.read_file_in(fork_workspace.path(), "a.txt").ok(),
+        None,
+        "nothing was restored into the fork workspace"
+    );
+
+    // A new turn made inside the fork remains fully undoable.
+    fixture.write_file_in(fork_workspace.path(), "b.txt", "b-original")?;
+    let child_user_msg = fixture.add_user_message(&child_id, "Child turn").await?;
+    let (child_turn, child_pre) = fixture
+        .take_pre_snapshot_with_cwd(&child_id, fork_workspace.path())
+        .await?;
+    fixture.write_file_in(fork_workspace.path(), "b.txt", "b-child")?;
+    fixture
+        .take_post_snapshot_with_cwd(&child_id, &child_turn, &child_pre, fork_workspace.path())
+        .await?;
+
+    let child_undo = fixture.undo(&child_id, &child_user_msg).await?;
+    assert_eq!(child_undo.reverted_files, vec!["b.txt".to_string()]);
+    assert_eq!(
+        fixture.read_file_in(fork_workspace.path(), "b.txt")?,
+        "b-original"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fork_undo_from_subdirectory_cwd_is_context_only() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    let sub = fixture.worktree.path().join("sub");
+    std::fs::create_dir_all(&sub)?;
+    let fork_workspace = TempDir::new()?;
+
+    // Parent session bound to a repository subdirectory.
+    let parent_id = fixture.create_session_with_cwd(&sub).await?;
+    fixture.write_file_in(&sub, "nested.txt", "original")?;
+    fixture.add_user_message(&parent_id, "Edit nested").await?;
+    let (turn_id, pre_snapshot) = fixture.take_pre_snapshot_with_cwd(&parent_id, &sub).await?;
+    fixture.write_file_in(&sub, "nested.txt", "edited")?;
+    fixture
+        .take_post_snapshot_with_cwd(&parent_id, &turn_id, &pre_snapshot, &sub)
+        .await?;
+
+    let parent_history = fixture
+        .storage
+        .session_store()
+        .get_history(&parent_id)
+        .await?;
+    let fork_target = parent_history.last().map(|m| m.id.clone()).unwrap();
+    let child_id = fixture
+        .storage
+        .session_store()
+        .fork_session(&parent_id, &fork_target, ForkOrigin::User)
+        .await?;
+
+    {
+        let conn = fixture.storage.conn();
+        let conn = conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET cwd = ? WHERE public_id = ?",
+            rusqlite::params![
+                fork_workspace.path().to_string_lossy().to_string(),
+                child_id
+            ],
+        )?;
+    }
+    fixture
+        .register_session_actor_with_cwd(&child_id, fork_workspace.path())
+        .await;
+
+    let child_history = fixture
+        .storage
+        .session_store()
+        .get_history(&child_id)
+        .await?;
+    let inherited_target = child_history
+        .iter()
+        .find(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, MessagePart::TurnSnapshotPatch { .. }))
+        })
+        .map(|m| m.id.clone())
+        .expect("fork copied the parent's patch message");
+
+    // The subdirectory cwd differs from the fork workspace root, so the
+    // inherited snapshot is foreign here too and is rejected, unrestored.
+    fixture
+        .undo(&child_id, &inherited_target)
+        .await
+        .expect_err("a directly selected foreign snapshot must be rejected");
+    assert_eq!(fixture.read_file_in(&sub, "nested.txt")?, "edited");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_legacy_local_fork_undo_still_restores_inherited_history() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file("a.txt", "a-original")?;
+
+    let parent_id = fixture.create_session().await?;
+    fixture.add_user_message(&parent_id, "Turn one").await?;
+    let (turn_id, pre_snapshot) = fixture.take_pre_snapshot(&parent_id).await?;
+    fixture.write_file("a.txt", "a-turn-one")?;
+    fixture
+        .take_post_snapshot(&parent_id, &turn_id, &pre_snapshot)
+        .await?;
+
+    let parent_history = fixture
+        .storage
+        .session_store()
+        .get_history(&parent_id)
+        .await?;
+    let fork_target = parent_history.last().map(|m| m.id.clone()).unwrap();
+
+    // Legacy local fork: the child inherits the parent's cwd, so undo keeps
+    // its existing behavior in the shared checkout.
+    let child_id = fixture
+        .storage
+        .session_store()
+        .fork_session(&parent_id, &fork_target, ForkOrigin::User)
+        .await?;
+    fixture
+        .register_session_actor_with_cwd(&child_id, fixture.worktree.path())
+        .await;
+
+    let child_history = fixture
+        .storage
+        .session_store()
+        .get_history(&child_id)
+        .await?;
+    // Undo the first copied user message: the patch scan aggregates the
+    // following copied start/patch pair and restores the pre-turn snapshot
+    // exactly as a legacy same-checkout fork always did.
+    let inherited_target = child_history.first().map(|m| m.id.clone()).unwrap();
+
+    let result = fixture.undo(&child_id, &inherited_target).await?;
+    assert_eq!(result.reverted_files, vec!["a.txt".to_string()]);
+    assert_eq!(fixture.read_file("a.txt")?, "a-original");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_undo_without_snapshot_backend_reports_unavailable_backend() -> Result<()> {
+    use crate::agent::LocalAgentHandle;
+    use crate::agent::agent_config_builder::AgentConfigBuilder;
+    use crate::agent::core::{McpToolState, SessionRuntime};
+    use crate::agent::session_actor::SessionActor;
+    use kameo::actor::Spawn;
+    use querymt::LLMParams;
+    use std::sync::Arc;
+
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file("a.txt", "a-original")?;
+
+    let parent_id = fixture.create_session().await?;
+    fixture.add_user_message(&parent_id, "Turn one").await?;
+    let (turn_id, pre_snapshot) = fixture.take_pre_snapshot(&parent_id).await?;
+    fixture.write_file("a.txt", "a-turn-one")?;
+    fixture
+        .take_post_snapshot(&parent_id, &turn_id, &pre_snapshot)
+        .await?;
+
+    let parent_history = fixture
+        .storage
+        .session_store()
+        .get_history(&parent_id)
+        .await?;
+    let fork_target = parent_history.last().map(|m| m.id.clone()).unwrap();
+
+    // Same-workspace legacy fork with snapshots disabled: undo must keep
+    // reporting the existing unavailable-backend behavior instead of
+    // substituting any inherited Git snapshot data.
+    let child_id = fixture
+        .storage
+        .session_store()
+        .fork_session(&parent_id, &fork_target, ForkOrigin::User)
+        .await?;
+
+    let (registry, _registry_dir) = crate::test_utils::empty_plugin_registry()?;
+    let llm = LLMParams::new().provider("mock").model("mock");
+    let config =
+        Arc::new(AgentConfigBuilder::new(Arc::new(registry), fixture.storage.clone(), llm).build());
+    let handle = LocalAgentHandle::from_config(config);
+
+    let runtime = SessionRuntime::new(
+        Some(fixture.worktree.path().to_path_buf()),
+        std::collections::HashMap::new(),
+        McpToolState::empty(),
+    );
+    let actor = SessionActor::new(handle.config.clone(), child_id.clone(), runtime);
+    let actor_ref = SessionActor::spawn(actor);
+    handle
+        .registry
+        .lock()
+        .await
+        .insert(child_id.clone(), actor_ref);
+
+    let child_history = fixture
+        .storage
+        .session_store()
+        .get_history(&child_id)
+        .await?;
+    let inherited_target = child_history
+        .iter()
+        .find(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, MessagePart::TurnSnapshotPatch { .. }))
+        })
+        .map(|m| m.id.clone())
+        .expect("fork copied the parent's patch message");
+
+    let err = handle
+        .undo(&child_id, &inherited_target)
+        .await
+        .expect_err("undo must fail without a snapshot backend");
+    // The no-backend guard is enforced at the session actor: the error may
+    // surface directly or wrapped by the actor transport, but undo must keep
+    // reporting the unavailable backend instead of substituting inherited
+    // Git snapshot data.
+    assert!(
+        matches!(err, UndoError::NoSnapshotBackend)
+            || matches!(err, UndoError::ActorSend(ref m) if m.contains("No snapshot backend")),
+        "unexpected undo error without snapshot backend: {err:?}"
     );
 
     Ok(())

@@ -8,12 +8,17 @@ use crate::config::SlashCommandsConfig;
 use crate::events::{AgentEventKind, EventOrigin, ExecutionMetrics};
 use crate::model::AgentMessage;
 use crate::profiles::{LocalProfileCatalog, ProfileCatalog};
+use crate::send_agent::SendAgent;
 use crate::session::backend::StorageBackend;
-use crate::session::projection::{EventJournal, NewDurableEvent};
+use crate::session::lifecycle::{
+    ArchiveFilter, ResolutionFilter, SessionLifecycleFilter, SessionLifecyclePatch,
+};
+use crate::session::projection::{EventJournal, NewDurableEvent, SessionScope, ViewStore};
 #[cfg(feature = "remote")]
 use crate::session::store::RemoteSessionBookmark;
 use crate::test_utils::helpers::empty_plugin_registry;
 use anyhow::Result;
+use async_trait::async_trait;
 use querymt::chat::{ChatRole, FinishReason};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,13 +30,17 @@ async fn test_agent() -> Result<Agent> {
 async fn test_agent_with_storage(
     storage: Option<Arc<crate::session::sqlite_storage::SqliteStorage>>,
 ) -> Result<Agent> {
-    let (registry, _temp_dir) = empty_plugin_registry()?;
     let storage = match storage {
         Some(storage) => storage,
         None => Arc::new(
             crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
         ),
     };
+    test_agent_with_backend(storage).await
+}
+
+async fn test_agent_with_backend(storage: Arc<dyn StorageBackend>) -> Result<Agent> {
+    let (registry, _temp_dir) = empty_plugin_registry()?;
     Agent::single()
         .provider("openai", "gpt-4o-mini")
         .infra(AgentInfra {
@@ -42,6 +51,155 @@ async fn test_agent_with_storage(
         })
         .build()
         .await
+}
+
+struct DefaultLifecycleViewStore(Arc<crate::session::sqlite_storage::SqliteStorage>);
+
+#[async_trait]
+impl ViewStore for DefaultLifecycleViewStore {
+    async fn get_audit_view(
+        &self,
+        session_id: &str,
+        include_children: bool,
+    ) -> crate::session::error::SessionResult<crate::session::projection::AuditView> {
+        self.0.get_audit_view(session_id, include_children).await
+    }
+
+    async fn get_redacted_view(
+        &self,
+        session_id: &str,
+        policy: crate::session::projection::RedactionPolicy,
+    ) -> crate::session::error::SessionResult<crate::session::projection::RedactedView> {
+        self.0.get_redacted_view(session_id, policy).await
+    }
+
+    async fn get_summary_view(
+        &self,
+        session_id: &str,
+    ) -> crate::session::error::SessionResult<crate::session::projection::SummaryView> {
+        self.0.get_summary_view(session_id).await
+    }
+
+    async fn get_session_list_view(
+        &self,
+        filter: Option<crate::session::projection::SessionListFilter>,
+    ) -> crate::session::error::SessionResult<crate::session::projection::SessionListView> {
+        self.0.get_session_list_view(filter).await
+    }
+
+    async fn browse_session_groups(
+        &self,
+        cursor: Option<String>,
+        group_limit: usize,
+        session_limit_per_group: usize,
+        session_scope: crate::session::projection::SessionScope,
+    ) -> crate::session::error::SessionResult<(
+        Vec<crate::session::projection::SessionGroup>,
+        Option<String>,
+        usize,
+    )> {
+        self.0
+            .browse_session_groups(cursor, group_limit, session_limit_per_group, session_scope)
+            .await
+    }
+
+    async fn list_group_sessions(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: crate::session::projection::SessionScope,
+    ) -> crate::session::error::SessionResult<(crate::session::projection::SessionGroup, usize)>
+    {
+        self.0
+            .list_group_sessions(cwd, cursor, limit, session_scope)
+            .await
+    }
+
+    async fn list_session_items(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: crate::session::projection::SessionScope,
+    ) -> crate::session::error::SessionResult<(
+        Vec<crate::session::projection::SessionListItem>,
+        Option<String>,
+        usize,
+    )> {
+        self.0
+            .list_session_items(cwd, cursor, limit, session_scope)
+            .await
+    }
+
+    async fn get_session_list_meta_stats(
+        &self,
+        session_ids: &[String],
+    ) -> crate::session::error::SessionResult<
+        std::collections::HashMap<String, crate::session::projection::SessionListMetaStats>,
+    > {
+        self.0.get_session_list_meta_stats(session_ids).await
+    }
+
+    async fn search_sessions(
+        &self,
+        query: String,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: crate::session::projection::SessionScope,
+    ) -> crate::session::error::SessionResult<(
+        Vec<crate::session::projection::SessionGroup>,
+        Option<String>,
+        usize,
+    )> {
+        self.0
+            .search_sessions(query, cursor, limit, session_scope)
+            .await
+    }
+
+    async fn list_session_children(
+        &self,
+        parent_session_id: String,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> crate::session::error::SessionResult<(crate::session::projection::SessionGroup, usize)>
+    {
+        self.0
+            .list_session_children(parent_session_id, cursor, limit)
+            .await
+    }
+
+    async fn get_atif(
+        &self,
+        session_id: &str,
+        options: &crate::export::AtifExportOptions,
+    ) -> crate::session::error::SessionResult<crate::export::ATIF> {
+        self.0.get_atif(session_id, options).await
+    }
+
+    async fn get_recent_models_view(
+        &self,
+        limit_per_workspace: usize,
+    ) -> crate::session::error::SessionResult<crate::session::projection::RecentModelsView> {
+        self.0.get_recent_models_view(limit_per_workspace).await
+    }
+}
+
+struct SplitLifecycleBackend(Arc<crate::session::sqlite_storage::SqliteStorage>);
+
+#[async_trait]
+impl StorageBackend for SplitLifecycleBackend {
+    fn session_store(&self) -> Arc<dyn crate::session::store::SessionStore> {
+        Arc::new(self.0.as_ref().clone())
+    }
+
+    fn event_journal(&self) -> Arc<dyn EventJournal> {
+        Arc::new(self.0.as_ref().clone())
+    }
+
+    fn view_store(&self) -> Option<Arc<dyn ViewStore>> {
+        Some(Arc::new(DefaultLifecycleViewStore(self.0.clone())))
+    }
 }
 
 async fn agent_with_slash_config(config: SlashCommandsConfig) -> Result<Agent> {
@@ -124,6 +282,67 @@ async fn with_profiles_reuses_root_agent_for_active_profile() -> Result<()> {
         .await?;
 
     assert!(Arc::ptr_eq(&root_handle, &runtime.agent().handle()));
+    Ok(())
+}
+
+async fn agent_with_middleware_entries(
+    entries: Vec<crate::config::MiddlewareEntry>,
+) -> Result<Agent> {
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    Agent::single()
+        .provider("openai", "gpt-4o-mini")
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .middleware_from_config(entries)
+        .build()
+        .await
+}
+
+fn guard_entry(config: serde_json::Value) -> crate::config::MiddlewareEntry {
+    crate::config::MiddlewareEntry {
+        middleware_type: "parallel_edit_guard".to_string(),
+        config,
+    }
+}
+
+fn guard_count(agent: &Agent) -> usize {
+    agent
+        .handle()
+        .config
+        .middleware_drivers
+        .iter()
+        .filter(|d| d.name() == "ParallelEditGuard")
+        .count()
+}
+
+#[tokio::test]
+async fn default_agent_has_parallel_edit_guard() -> Result<()> {
+    let agent = test_agent().await?;
+    assert_eq!(guard_count(&agent), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_deny_guard_config_yields_single_instance() -> Result<()> {
+    let agent =
+        agent_with_middleware_entries(vec![guard_entry(serde_json::json!({"mode": "deny"}))])
+            .await?;
+    assert_eq!(guard_count(&agent), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabled_guard_config_yields_no_guard() -> Result<()> {
+    let agent =
+        agent_with_middleware_entries(vec![guard_entry(serde_json::json!({"enabled": false}))])
+            .await?;
+    assert_eq!(guard_count(&agent), 0);
     Ok(())
 }
 
@@ -439,6 +658,23 @@ async fn delete_session_clears_delegate_model_overrides() -> Result<()> {
             .get(&session_id, "coder")
             .await
             .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_loaded_idle_session_does_not_wait_for_stop_grace() -> Result<()> {
+    let agent = test_agent().await?;
+    let session_id = agent.create_session().await?;
+
+    let started = std::time::Instant::now();
+    agent.sessions().delete(&session_id).await?;
+
+    // Stop escalation allows 3s; deleting an idle session must not pay it.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "delete took {:?}",
+        started.elapsed()
     );
     Ok(())
 }
@@ -825,6 +1061,7 @@ async fn acp_session_list_includes_relationship_and_operational_meta() -> Result
         .await?;
     storage
         .append_durable(&NewDurableEvent {
+            session_seq: None,
             session_id: child.public_id.clone(),
             origin: EventOrigin::Local,
             source_node: None,
@@ -838,6 +1075,7 @@ async fn acp_session_list_includes_relationship_and_operational_meta() -> Result
                 cumulative_cost_usd: None,
                 context_tokens: 0,
                 metrics: ExecutionMetrics::default(),
+                accounting: None,
             },
         })
         .await?;
@@ -897,7 +1135,11 @@ async fn acp_session_list_includes_relationship_and_operational_meta() -> Result
         child_meta
             .get("runtimeStatus")
             .and_then(|status| status.get("phase")),
-        Some(&serde_json::json!("idle"))
+        Some(&serde_json::json!("unknown"))
+    );
+    assert_eq!(
+        child_meta["runtimeStatus"]["observation"]["availability"], "unavailable",
+        "unmaterialized in-memory storage has no owner or run-lease evidence"
     );
     assert_eq!(
         child_meta
@@ -1000,15 +1242,6 @@ async fn acp_list_sessions_opt_in_selected_peer_pages_offline_bookmarks() -> Res
         .await?;
     assert_eq!(first.sessions.len(), 10);
     assert_eq!(first.next_cursor.as_deref(), Some("remote:0:10:bookmarks"));
-    for session in &first.sessions {
-        let fields = session.meta.as_ref().expect("remote metadata");
-        assert_eq!(fields.get("location"), Some(&serde_json::json!("remote")));
-        assert_eq!(fields.get("nodeId"), Some(&serde_json::json!("peer-a")));
-        assert_eq!(
-            fields.get("connectionState"),
-            Some(&serde_json::json!("disconnected"))
-        );
-    }
     let second = agent
         .sessions()
         .list_for_acp(
@@ -1020,6 +1253,26 @@ async fn acp_list_sessions_opt_in_selected_peer_pages_offline_bookmarks() -> Res
         .await?;
     assert_eq!(second.sessions.len(), 2);
     assert_eq!(second.next_cursor, None);
+    for session in first.sessions.iter().chain(&second.sessions) {
+        let fields = session.meta.as_ref().expect("remote metadata");
+        assert_eq!(fields["location"], "remote");
+        assert_eq!(fields["nodeId"], "peer-a");
+        assert_eq!(fields["nodeLabel"], "Remote A");
+        assert_eq!(fields["connectionState"], "disconnected");
+        assert_eq!(session.cwd, PathBuf::from("/remote/work"));
+        assert!(session.title.as_deref().unwrap().starts_with("Remote "));
+        assert_eq!(fields["runtimeStatus"]["phase"], "unknown");
+        assert_eq!(
+            fields["runtimeStatus"]["observation"]["availability"],
+            "unavailable"
+        );
+        for field in ["messageCount", "userMessageCount", "hasErrors"] {
+            assert!(
+                !fields.contains_key(field),
+                "offline bookmark fabricated {field}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1464,4 +1717,917 @@ global_enabled = false
 
     agent.shutdown().await;
     Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_api_filters_before_paging_and_acp_returns_metadata() -> Result<()> {
+    let agent = test_agent().await?;
+    let store = agent.storage_backend().session_store();
+    let open = store.create_session(None, None, None, None).await?;
+    let resolved = store.create_session(None, None, None, None).await?;
+    agent
+        .sessions()
+        .set_session_lifecycle(
+            &resolved.public_id,
+            crate::session::lifecycle::SessionLifecyclePatch {
+                resolved: Some(true),
+                archived: None,
+            },
+        )
+        .await?;
+
+    let page = agent
+        .sessions()
+        .list_with_lifecycle(
+            ListSessionsOptions {
+                limit: Some(1),
+                ..ListSessionsOptions::default()
+            },
+            crate::session::lifecycle::SessionLifecycleFilter {
+                resolution: crate::session::lifecycle::ResolutionFilter::Open,
+                archive: crate::session::lifecycle::ArchiveFilter::Any,
+            },
+        )
+        .await?;
+    assert_eq!(page.total_count, 1);
+    let row = page
+        .groups
+        .iter()
+        .flat_map(|group| &group.sessions)
+        .next()
+        .expect("open session in filtered page");
+    assert_eq!(row.summary.session_id, open.public_id);
+    assert_eq!(
+        row.lifecycle.as_ref().map(|state| state.resolved),
+        Some(false)
+    );
+
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "querymt".into(),
+        serde_json::json!({ "sessionFilters": { "resolution": "resolved" } }),
+    );
+    let acp_page = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new().meta(meta))
+        .await?;
+    assert_eq!(acp_page.sessions.len(), 1);
+    let acp_row = &acp_page.sessions[0];
+    assert_eq!(acp_row.session_id.to_string(), resolved.public_id);
+    assert_eq!(
+        acp_row
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("querymt"))
+            .and_then(|meta| meta.get("lifecycle"))
+            .and_then(|lifecycle| lifecycle.get("resolved"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+
+    let mut invalid_meta = serde_json::Map::new();
+    invalid_meta.insert(
+        "querymt".into(),
+        serde_json::json!({ "sessionFilters": { "resolution": null } }),
+    );
+    assert!(
+        agent
+            .sessions()
+            .list_for_acp(AcpListSessionsRequest::new().meta(invalid_meta))
+            .await
+            .is_err()
+    );
+
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_query_modes_preserve_filters_pages_and_metadata() -> Result<()> {
+    let sqlite =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = test_agent_with_storage(Some(sqlite.clone())).await?;
+    let store = agent.storage_backend().session_store();
+    let mut ids = Vec::new();
+    for (name, cwd, updated_at, resolved, archived) in [
+        (
+            "needle first",
+            Some("/work"),
+            "2025-02-01T00:00:00Z",
+            false,
+            true,
+        ),
+        (
+            "needle second",
+            Some("/work"),
+            "2025-01-01T00:00:00Z",
+            false,
+            true,
+        ),
+        (
+            "needle hidden",
+            Some("/work"),
+            "2025-03-01T00:00:00Z",
+            true,
+            true,
+        ),
+        (
+            "unrelated",
+            Some("/elsewhere"),
+            "2024-12-01T00:00:00Z",
+            false,
+            true,
+        ),
+        ("ungrouped", None, "2024-11-01T00:00:00Z", false, true),
+        (
+            "needle unarchived",
+            Some("/work"),
+            "2025-04-01T00:00:00Z",
+            false,
+            false,
+        ),
+    ] {
+        let session = store
+            .create_session(Some(name.into()), cwd.map(PathBuf::from), None, None)
+            .await?;
+        store
+            .patch_session_lifecycle(
+                &session.public_id,
+                &SessionLifecyclePatch {
+                    resolved: Some(resolved),
+                    archived: Some(archived),
+                },
+            )
+            .await?;
+        sqlite.conn_for_test().lock().unwrap().execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE public_id = ?2",
+            rusqlite::params![updated_at, session.public_id],
+        )?;
+        ids.push(session.public_id);
+    }
+    let child = store
+        .create_session(
+            Some("needle child".into()),
+            Some("/work".into()),
+            Some(ids[2].clone()),
+            Some(crate::session::domain::ForkOrigin::User),
+        )
+        .await?;
+    store
+        .patch_session_lifecycle(
+            &child.public_id,
+            &SessionLifecyclePatch {
+                archived: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let filter = SessionLifecycleFilter {
+        resolution: ResolutionFilter::Open,
+        archive: ArchiveFilter::Only,
+    };
+    let options = ListSessionsOptions {
+        // Convenience methods must replace the caller's mode, cwd and query.
+        mode: SessionListMode::Search,
+        cwd: Some("/wrong".into()),
+        query: Some("not-found".into()),
+        limit: Some(1),
+        session_scope: Some(SessionScope::Root),
+        ..Default::default()
+    };
+    let sessions = agent.sessions();
+    let first = sessions
+        .list_group_with_lifecycle(Some("/work/".into()), options.clone(), filter)
+        .await?;
+    assert_eq!(first.total_count, 2);
+    assert_eq!(first.next_cursor.as_deref(), Some("1"));
+    let group = &first.groups[0];
+    assert_eq!(group.cwd.as_deref(), Some("/work"));
+    assert_eq!(group.total_count, Some(2));
+    assert_eq!(group.next_cursor, first.next_cursor);
+    assert_eq!(
+        group.latest_activity.as_deref(),
+        Some("2025-02-01T00:00:00Z")
+    );
+    assert_eq!(group.sessions.len(), 1);
+    assert_eq!(group.sessions[0].summary.session_id, ids[0]);
+    assert_eq!(group.sessions[0].summary.cwd, group.cwd);
+    assert_eq!(
+        group.sessions[0].lifecycle,
+        Some(sessions.get_session_lifecycle(&ids[0]).await?)
+    );
+    let second = sessions
+        .list_group_with_lifecycle(
+            Some("/work".into()),
+            ListSessionsOptions {
+                cursor: first.next_cursor,
+                ..options.clone()
+            },
+            filter,
+        )
+        .await?;
+    assert_eq!(second.total_count, 2);
+    assert_eq!(second.groups[0].sessions[0].summary.session_id, ids[1]);
+    assert_eq!(second.next_cursor, None);
+    assert_eq!(second.groups[0].next_cursor, None);
+
+    let ungrouped = sessions
+        .list_group_with_lifecycle(Some("__none__".into()), options.clone(), filter)
+        .await?;
+    assert_eq!(ungrouped.total_count, 1);
+    assert_eq!(ungrouped.groups[0].cwd, None);
+    assert_eq!(ungrouped.groups[0].sessions[0].summary.session_id, ids[4]);
+
+    let browse = sessions
+        .browse_with_lifecycle(options.clone(), filter)
+        .await?;
+    assert_eq!(browse.total_count, 4);
+    assert_eq!(browse.groups.len(), 1);
+    assert_eq!(browse.groups[0].cwd, None);
+    assert_eq!(browse.next_cursor.as_deref(), Some("1"));
+    let browse = sessions
+        .browse_with_lifecycle(
+            ListSessionsOptions {
+                cursor: browse.next_cursor,
+                ..options.clone()
+            },
+            filter,
+        )
+        .await?;
+    assert_eq!(browse.total_count, 4);
+    assert_eq!(browse.groups[0].cwd.as_deref(), Some("/work"));
+    assert_eq!(browse.groups[0].total_count, Some(2));
+    assert_eq!(browse.groups[0].sessions.len(), 2);
+    assert_eq!(browse.groups[0].latest_activity, group.latest_activity);
+    assert_eq!(browse.next_cursor.as_deref(), Some("2"));
+
+    let search = sessions
+        .search_with_lifecycle(
+            "needle",
+            ListSessionsOptions {
+                mode: SessionListMode::Browse,
+                ..options.clone()
+            },
+            filter,
+        )
+        .await?;
+    assert_eq!(search.total_count, 2);
+    assert_eq!(search.groups.len(), 1);
+    assert_eq!(search.groups[0].cwd.as_deref(), Some("/work"));
+    assert_eq!(search.groups[0].total_count, Some(2));
+    assert_eq!(search.groups[0].latest_activity, group.latest_activity);
+    assert_eq!(search.groups[0].sessions[0].summary.session_id, ids[0]);
+    assert_eq!(
+        search.groups[0].sessions[0].lifecycle,
+        group.sessions[0].lifecycle
+    );
+    assert_eq!(search.next_cursor.as_deref(), Some("1"));
+    let search = sessions
+        .search_with_lifecycle(
+            "needle",
+            ListSessionsOptions {
+                cursor: search.next_cursor,
+                ..options
+            },
+            filter,
+        )
+        .await?;
+    assert_eq!(search.total_count, 2);
+    assert_eq!(search.groups[0].sessions[0].summary.session_id, ids[1]);
+    assert_eq!(search.next_cursor, None);
+
+    let empty = sessions
+        .list_with_lifecycle(
+            ListSessionsOptions {
+                mode: SessionListMode::Search,
+                ..Default::default()
+            },
+            filter,
+        )
+        .await?;
+    assert_eq!(empty.total_count, 0);
+    assert!(empty.groups.is_empty());
+    assert_eq!(empty.next_cursor, None);
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_query_children_keep_parent_and_authoritative_state() -> Result<()> {
+    let agent = test_agent().await?;
+    let store = agent.storage_backend().session_store();
+    let parent = store
+        .create_session(None, Some("/parent".into()), None, None)
+        .await?;
+    let mut children = Vec::new();
+    for archived in [false, true, false] {
+        let child = store
+            .create_session(
+                None,
+                Some("/children".into()),
+                Some(parent.public_id.clone()),
+                Some(crate::session::domain::ForkOrigin::User),
+            )
+            .await?;
+        store
+            .patch_session_lifecycle(
+                &child.public_id,
+                &SessionLifecyclePatch {
+                    resolved: Some(true),
+                    archived: Some(archived),
+                },
+            )
+            .await?;
+        children.push(child.public_id);
+    }
+    // An open user fork must not leak through the resolution filter.
+    store
+        .create_session(
+            None,
+            Some("/children".into()),
+            Some(parent.public_id.clone()),
+            Some(crate::session::domain::ForkOrigin::User),
+        )
+        .await?;
+    // The children endpoint retains its existing user-fork semantics, not delegates.
+    store
+        .create_session(
+            None,
+            Some("/children".into()),
+            Some(parent.public_id.clone()),
+            Some(crate::session::domain::ForkOrigin::Delegation),
+        )
+        .await?;
+    let sessions = agent.sessions();
+    let filter = SessionLifecycleFilter {
+        resolution: ResolutionFilter::Resolved,
+        archive: ArchiveFilter::Excluded,
+    };
+    let first = sessions
+        .children_with_lifecycle(&parent.public_id, None, Some(0), filter)
+        .await?;
+    assert_eq!(first.parent_session_id, parent.public_id);
+    assert_eq!(first.total_count, 2);
+    assert_eq!(first.sessions.len(), 1, "zero limit is clamped to one");
+    assert_eq!(first.next_cursor.as_deref(), Some("1"));
+    let second = sessions
+        .children_with_lifecycle(&parent.public_id, first.next_cursor, Some(1), filter)
+        .await?;
+    assert_eq!(second.total_count, 2);
+    assert_eq!(second.next_cursor, None);
+    let mut listed = Vec::new();
+    for row in first.sessions.iter().chain(&second.sessions) {
+        assert_eq!(
+            row.summary.parent_session_id.as_deref(),
+            Some(parent.public_id.as_str())
+        );
+        assert_eq!(row.summary.fork_origin.as_deref(), Some("user"));
+        assert_eq!(row.summary.cwd.as_deref(), Some("/children"));
+        assert_eq!(
+            row.lifecycle,
+            Some(
+                sessions
+                    .get_session_lifecycle(&row.summary.session_id)
+                    .await?
+            )
+        );
+        listed.push(row.summary.session_id.clone());
+    }
+    listed.sort();
+    let mut expected = vec![children[0].clone(), children[2].clone()];
+    expected.sort();
+    assert_eq!(listed, expected);
+    let all = sessions
+        .children_with_lifecycle(
+            &parent.public_id,
+            None,
+            None,
+            SessionLifecycleFilter::default(),
+        )
+        .await?;
+    assert_eq!(all.total_count, 4);
+    let archived = all
+        .sessions
+        .iter()
+        .find(|row| row.summary.session_id == children[1])
+        .unwrap();
+    assert_eq!(
+        archived.lifecycle,
+        Some(sessions.get_session_lifecycle(&children[1]).await?)
+    );
+    assert!(archived.lifecycle.as_ref().unwrap().archived);
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_query_metadata_errors_fail_instead_of_fabricating_open_state() -> Result<()> {
+    let sqlite =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = test_agent_with_storage(Some(sqlite.clone())).await?;
+    let store = agent.storage_backend().session_store();
+    store.create_session(None, None, None, None).await?;
+    // Leave listing intact but make authoritative lifecycle hydration unavailable.
+    sqlite
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .execute("DROP TABLE session_lifecycle", [])?;
+    let error = agent
+        .sessions()
+        .list_with_lifecycle(
+            ListSessionsOptions::default(),
+            SessionLifecycleFilter::default(),
+        )
+        .await
+        .expect_err("metadata backend failures must not become known-open rows");
+    assert!(error.to_string().contains("session_lifecycle"));
+    let error = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new())
+        .await
+        .expect_err("ACP must propagate metadata backend failures too");
+    assert!(error.to_string().contains("session_lifecycle"));
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_query_unsupported_store_and_invalid_filters_fail_closed() -> Result<()> {
+    let sqlite =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = test_agent_with_backend(Arc::new(SplitLifecycleBackend(sqlite))).await?;
+    let parent = agent
+        .storage_backend()
+        .session_store()
+        .create_session(None, None, None, None)
+        .await?;
+    let filter = SessionLifecycleFilter {
+        resolution: ResolutionFilter::Open,
+        archive: ArchiveFilter::Any,
+    };
+    let error = agent
+        .sessions()
+        .children_with_lifecycle(&parent.public_id, None, None, filter)
+        .await
+        .expect_err("unsupported child filters must not silently list all children");
+    assert!(
+        error
+            .to_string()
+            .contains("lifecycle filtering is unsupported")
+    );
+    let all = agent
+        .sessions()
+        .list_with_lifecycle(
+            ListSessionsOptions::default(),
+            SessionLifecycleFilter::default(),
+        )
+        .await?;
+    assert_eq!(all.total_count, 1);
+    assert_eq!(
+        all.groups[0].sessions[0].summary.session_id,
+        parent.public_id
+    );
+    assert_eq!(all.groups[0].sessions[0].lifecycle, None);
+    let acp = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new())
+        .await?;
+    assert_eq!(acp.sessions.len(), 1);
+    assert!(
+        acp.sessions[0]
+            .meta
+            .as_ref()
+            .unwrap()
+            .get("querymt")
+            .and_then(|value| value.get("lifecycle"))
+            .is_none()
+    );
+    for (querymt, expected_error) in [
+        (serde_json::json!(false), "_meta.querymt must be an object"),
+        (
+            serde_json::json!({ "sessionFilters": { "archive": "invalid" } }),
+            "invalid _meta.querymt.sessionFilters",
+        ),
+        (
+            serde_json::json!({ "sessionFilters": { "resolved": true } }),
+            "invalid _meta.querymt.sessionFilters",
+        ),
+        (
+            serde_json::json!({ "sessionFilters": { "resolution": "open" } }),
+            "lifecycle filtering is unsupported",
+        ),
+    ] {
+        let mut meta = serde_json::Map::new();
+        meta.insert("querymt".into(), querymt);
+        let error = agent
+            .sessions()
+            .list_for_acp(AcpListSessionsRequest::new().meta(meta))
+            .await
+            .expect_err("malformed or unsupported filters must not be ignored");
+        assert!(error.to_string().contains(expected_error), "{error}");
+    }
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn lifecycle_query_offline_bookmark_metadata_is_unknown_and_filters_reject_merges()
+-> Result<()> {
+    let agent = test_agent().await?;
+    agent
+        .storage_backend()
+        .session_store()
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: "offline-owner-session".into(),
+            node_id: "offline-node".into(),
+            peer_label: "offline-owner".into(),
+            cwd: Some("/remote".into()),
+            created_at: 1,
+            title: None,
+        })
+        .await?;
+    let all = agent
+        .sessions()
+        .list_with_lifecycle(
+            ListSessionsOptions {
+                remote: RemoteSessionMode::Bookmarks,
+                ..Default::default()
+            },
+            SessionLifecycleFilter::default(),
+        )
+        .await?;
+    let row = &all.groups[0].sessions[0];
+    assert_eq!(row.summary.session_id, "offline-owner-session");
+    assert_eq!(row.summary.node_id.as_deref(), Some("offline-node"));
+    assert_eq!(
+        row.lifecycle, None,
+        "an offline bookmark is not a known-open session"
+    );
+    for remote in [RemoteSessionMode::Bookmarks, RemoteSessionMode::Live] {
+        let error = agent
+            .sessions()
+            .list_with_lifecycle(
+                ListSessionsOptions {
+                    remote,
+                    ..Default::default()
+                },
+                SessionLifecycleFilter {
+                    resolution: ResolutionFilter::Open,
+                    archive: ArchiveFilter::Any,
+                },
+            )
+            .await
+            .expect_err("merging remote rows cannot implement complete lifecycle filtering");
+        assert!(
+            error
+                .to_string()
+                .contains("remote bookmark/live merge is unsupported")
+        );
+    }
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_capabilities_require_session_store_and_view_filter_support() -> Result<()> {
+    let sqlite =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let backend: Arc<dyn StorageBackend> = Arc::new(SplitLifecycleBackend(sqlite));
+    let agent = test_agent_with_backend(backend).await?;
+
+    let store = agent.storage_backend().session_store();
+    assert!(store.supports_session_lifecycle());
+    let view_store = agent
+        .storage_backend()
+        .view_store()
+        .expect("split backend view store");
+    assert!(!view_store.supports_session_lifecycle());
+    assert!(!view_store.supports_session_lifecycle_filtering());
+
+    let handle = agent.handle();
+    let capabilities = crate::control::capabilities::get_capabilities(&handle);
+    assert!(
+        !capabilities
+            .methods
+            .iter()
+            .any(|method| method == "querymt/session/getLifecycle")
+    );
+    assert!(
+        !capabilities
+            .methods
+            .iter()
+            .any(|method| method == "querymt/session/setLifecycle")
+    );
+
+    let response = handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/capabilities",
+            Arc::from(serde_json::value::RawValue::from_string("{}".into())?),
+        ))
+        .await?;
+    let extension_capabilities: serde_json::Value = serde_json::from_str(response.0.get())?;
+    assert_eq!(
+        extension_capabilities["features"]["session_lifecycle"],
+        false
+    );
+    assert!(
+        !extension_capabilities["methods"]
+            .as_array()
+            .expect("methods")
+            .iter()
+            .any(|method| method == "querymt/session/getLifecycle")
+    );
+
+    let filter_error = agent
+        .sessions()
+        .list_with_lifecycle(
+            ListSessionsOptions::default(),
+            crate::session::lifecycle::SessionLifecycleFilter {
+                resolution: crate::session::lifecycle::ResolutionFilter::Open,
+                archive: crate::session::lifecycle::ArchiveFilter::Any,
+            },
+        )
+        .await
+        .expect_err("unsupported view lifecycle filters must fail");
+    assert!(
+        filter_error
+            .to_string()
+            .contains("lifecycle filtering is unsupported")
+    );
+
+    agent.shutdown().await;
+    Ok(())
+}
+
+// ── Managed worktree workspaces (simple API) ─────────────────────────────────
+
+mod workspace_api {
+    use super::*;
+    use crate::api::SessionOptions;
+    use crate::config::WorkspaceSettings;
+    use crate::worktree::WorkspaceTarget;
+    use crate::worktree::test_support::{commit_files, init_repo, materialize};
+
+    struct Fixture {
+        agent: Agent,
+        repo: tempfile::TempDir,
+        storage_root: tempfile::TempDir,
+        _plugins: tempfile::TempDir,
+    }
+
+    async fn fixture(workspace: Option<WorkspaceSettings>) -> Fixture {
+        let repo = init_repo();
+        commit_files(repo.path(), "initial", &[("README.md", "hello\n")]);
+        materialize(repo.path(), &[("README.md", "hello\n")]);
+        let storage_root = tempfile::TempDir::new().unwrap();
+        let (registry, plugins) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let mut builder = Agent::single()
+            .provider("openai", "gpt-4o-mini")
+            .cwd(repo.path())
+            .infra(AgentInfra {
+                plugin_registry: Arc::new(registry),
+                storage: Some(storage),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            });
+        if let Some(mut settings) = workspace {
+            settings.storage_root = Some(storage_root.path().to_path_buf());
+            builder = builder.workspace(settings);
+        }
+        Fixture {
+            agent: builder.build().await.unwrap(),
+            repo,
+            storage_root,
+            _plugins: plugins,
+        }
+    }
+
+    /// 21.7: no settings -> no service, no facade, no `/worktree`.
+    #[tokio::test]
+    async fn agent_without_workspace_settings_has_no_service() {
+        let f = fixture(None).await;
+        assert!(f.agent.worktrees().is_none());
+        assert!(f.agent.handle().config.workspace_service().is_none());
+        let err = f
+            .agent
+            .chat_session_with(SessionOptions::worktree())
+            .await
+            .err()
+            .expect("requested isolation fails closed without a service");
+        assert_eq!(err.code(), "workspace_service_unavailable", "{err}");
+    }
+
+    /// 21.4: with the service enabled, option-less sessions stay local.
+    #[tokio::test]
+    async fn option_less_chat_session_stays_local_with_the_service_enabled() {
+        let f = fixture(Some(WorkspaceSettings::enabled())).await;
+        let worktrees = f.agent.worktrees().expect("service enabled");
+
+        for session in [
+            f.agent.chat_session().await.unwrap(),
+            f.agent
+                .chat_session_with(SessionOptions::default())
+                .await
+                .unwrap(),
+        ] {
+            assert!(session.workspace().is_none());
+        }
+        assert!(worktrees.list().await.unwrap().workspaces.is_empty());
+        assert!(
+            std::fs::read_dir(f.storage_root.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "no checkout directory is created for local sessions"
+        );
+    }
+
+    /// 21.9: explicit isolation binds the session to its own checkout and the
+    /// management facade operates on it with stable error codes.
+    #[tokio::test]
+    async fn explicit_worktree_session_and_management_facade() {
+        let f = fixture(Some(WorkspaceSettings::enabled())).await;
+        let worktrees = f.agent.worktrees().unwrap();
+
+        let session = f
+            .agent
+            .chat_session_with(SessionOptions::worktree().name("iso"))
+            .await
+            .unwrap();
+        let binding = session.workspace().expect("disclosed binding");
+        let workspace_id = binding["workspaceId"].as_str().unwrap().to_string();
+        let cwd = std::path::PathBuf::from(binding["sessionCwd"].as_str().unwrap());
+        assert_ne!(cwd, f.repo.path());
+        assert!(cwd.starts_with(f.storage_root.path()));
+        assert_eq!(binding["baseline"], "commit");
+
+        let listed = worktrees.list().await.unwrap();
+        assert_eq!(listed.workspaces.len(), 1);
+        assert_eq!(
+            listed.workspaces[0].owner_session_id.as_deref(),
+            Some(session.id())
+        );
+        assert_eq!(
+            worktrees
+                .status(&workspace_id)
+                .await
+                .unwrap()
+                .summary
+                .workspace_id,
+            workspace_id
+        );
+
+        // Removal of an actively owned workspace is refused with a stable code.
+        let err = worktrees
+            .remove(WorkspaceTarget::Workspace(workspace_id.clone()), false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "workspace_not_archived");
+        let err = worktrees.status("ws-unknown").await.unwrap_err();
+        assert_eq!(err.code(), "workspace_not_found");
+        assert_eq!(
+            worktrees.list().await.unwrap().workspaces.len(),
+            1,
+            "a refused removal loses nothing"
+        );
+
+        // The typed `create` operation reuses the agent's cwd by default.
+        let created = worktrees
+            .create(crate::worktree::WorktreeCreateRequest::default())
+            .await
+            .unwrap();
+        assert_ne!(created.workspace_id, workspace_id);
+        assert_eq!(created.baseline_mode, "commit");
+    }
+
+    /// A loaded isolated session reports its durable binding; a loaded local
+    /// session still reports none.
+    #[tokio::test]
+    async fn loaded_sessions_report_their_durable_workspace_binding() {
+        let f = fixture(Some(WorkspaceSettings::enabled())).await;
+        let isolated = f
+            .agent
+            .chat_session_with(SessionOptions::worktree())
+            .await
+            .unwrap();
+        let local = f.agent.chat_session().await.unwrap();
+
+        let loaded = f.agent.load_session(isolated.id()).await.unwrap();
+        let created = isolated.workspace().expect("disclosed at creation");
+        let reloaded = loaded.workspace().expect("disclosed on load");
+        assert_eq!(reloaded["workspaceId"], created["workspaceId"]);
+        assert_eq!(reloaded["sessionCwd"], created["sessionCwd"]);
+        assert_eq!(reloaded["baseline"], created["baseline"]);
+
+        let loaded_local = f.agent.load_session(local.id()).await.unwrap();
+        assert!(loaded_local.workspace().is_none());
+
+        let with_snapshot = f
+            .agent
+            .sessions()
+            .load_with_snapshot(isolated.id())
+            .await
+            .unwrap();
+        assert_eq!(
+            with_snapshot.session.workspace().expect("binding")["workspaceId"],
+            created["workspaceId"]
+        );
+    }
+
+    #[tokio::test]
+    async fn contradictory_session_options_are_rejected_before_creation() {
+        let f = fixture(Some(WorkspaceSettings::enabled())).await;
+        let err = f
+            .agent
+            .chat_session_with(SessionOptions::local().base_ref("main"))
+            .await
+            .err()
+            .expect("invalid options");
+        assert_eq!(err.code(), "invalid_options", "{err}");
+        assert!(
+            f.agent
+                .worktrees()
+                .unwrap()
+                .list()
+                .await
+                .unwrap()
+                .workspaces
+                .is_empty()
+        );
+    }
+
+    /// 21.2 at build time: an unusable storage root fails `build()`.
+    #[tokio::test]
+    async fn unusable_storage_root_fails_the_agent_build() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (registry, _plugins) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let err = Agent::single()
+            .provider("openai", "gpt-4o-mini")
+            .workspace(WorkspaceSettings {
+                storage_root: Some(file.path().join("nested")),
+                ..WorkspaceSettings::enabled()
+            })
+            .infra(AgentInfra {
+                plugin_registry: Arc::new(registry),
+                storage: Some(storage),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            })
+            .build()
+            .await
+            .err()
+            .expect("build must fail");
+        assert!(
+            err.to_string().contains("invalid workspace configuration"),
+            "{err}"
+        );
+    }
+
+    /// 21.7: TOML translation threads the section through to the builder.
+    #[tokio::test]
+    async fn toml_workspace_section_enables_the_service() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let toml = format!(
+            "[agent]\nprovider = \"openai\"\nmodel = \"gpt-4o-mini\"\n\n[agent.workspace]\nenabled = true\nstorage_root = {:?}\n",
+            dir.path().join("wt")
+        );
+        let crate::config::Config::Single(config) =
+            crate::config::load_config(crate::config::ConfigSource::Toml(toml))
+                .await
+                .unwrap()
+        else {
+            panic!("single config");
+        };
+        let (registry, _plugins) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let agent = Agent::from_config(
+            *config,
+            AgentInfra {
+                plugin_registry: Arc::new(registry),
+                storage: Some(storage),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(agent.worktrees().is_some());
+        assert!(dir.path().join("wt").is_dir());
+    }
 }

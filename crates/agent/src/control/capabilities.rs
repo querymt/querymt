@@ -27,6 +27,10 @@ pub struct ControlFeatureInfo {
     pub mesh: bool,
     pub mesh_invites: bool,
     pub remote_sessions: bool,
+    #[serde(default)]
+    pub session_lifecycle: bool,
+    #[serde(default)]
+    pub session_pins: bool,
     pub schedules: bool,
     pub remote_schedules: bool,
     pub profiles: bool,
@@ -107,11 +111,34 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_ATTACH_METHOD.to_string(),
     ];
 
+    if agent.supports_session_lifecycle_contract() {
+        methods.extend([
+            "querymt/session/getLifecycle".to_string(),
+            "querymt/session/setLifecycle".to_string(),
+        ]);
+    }
+    let session_pins = agent
+        .config
+        .provider
+        .history_store()
+        .supports_session_pins();
+    if session_pins {
+        methods.push("querymt/session/setPinned".to_string());
+    }
+
+    if agent.config.workspace_service().is_some() {
+        methods.push("querymt/worktree/handoff".to_string());
+    }
+
     if agent.profiles().is_some() {
         methods.extend([
-            "querymt/profiles".to_string(),
             "querymt/profile/agents".to_string(),
             "querymt/profile/setActive".to_string(),
+        ]);
+    }
+    if agent.profiles().is_some() || mesh_enabled {
+        methods.extend([
+            "querymt/profiles".to_string(),
             "querymt/session/setDelegateModel".to_string(),
             "querymt/session/delegateModels".to_string(),
         ]);
@@ -141,6 +168,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/schedules/changed".to_string(),
         crate::acp::shared::QMT_NOTIFICATION_DELEGATION_UPDATE.to_string(),
         crate::acp::shared::QMT_NOTIFICATION_INPUT_STATE.to_string(),
+        crate::acp::shared::QMT_NOTIFICATION_RUNTIME_CHANGED.to_string(),
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_AUTHORITY_NOTIFICATION
             .to_string(),
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_VALIDATION_FAILED_NOTIFICATION
@@ -148,9 +176,12 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_COMPLETED_NOTIFICATION
             .to_string(),
     ];
-    if agent.profiles().is_some() {
+    if agent.profiles().is_some() || mesh_enabled {
         notifications
             .push(crate::acp::shared::QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED.to_string());
+    }
+    if session_pins {
+        notifications.push(crate::acp::shared::QMT_NOTIFICATION_SESSION_PINS_CHANGED.to_string());
     }
 
     CapabilitiesInfo {
@@ -176,6 +207,8 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
             mesh: cfg!(feature = "remote") && mesh_enabled,
             mesh_invites,
             remote_sessions: cfg!(feature = "remote"),
+            session_lifecycle: agent.supports_session_lifecycle_contract(),
+            session_pins,
             schedules: true,
             remote_schedules: cfg!(feature = "remote") && mesh_enabled,
             profiles: agent.profiles().is_some(),

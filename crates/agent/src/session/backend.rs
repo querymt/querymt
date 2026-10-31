@@ -100,6 +100,19 @@ pub trait StorageBackend: Send + Sync {
     fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
         None
     }
+
+    /// Managed worktree workspace registry (isolated Git execution workspaces).
+    /// Returns None if the backend cannot persist workspace records.
+    fn workspace_repository(&self) -> Option<Arc<dyn crate::worktree::WorkspaceRepository>> {
+        None
+    }
+
+    /// Directory of per-session run leases guarding this backend's journal.
+    /// Returns None when the backend has no local, machine-scoped location;
+    /// run leasing and orphaned-run reconciliation are then disabled.
+    fn run_lease_root(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// SQLite implementation of StorageBackend.
@@ -145,6 +158,16 @@ impl StorageBackend for SqliteStorage {
             crate::knowledge::sqlite::SqliteKnowledgeStore::new(self.conn()),
         ))
     }
+
+    fn workspace_repository(&self) -> Option<Arc<dyn crate::worktree::WorkspaceRepository>> {
+        Some(Arc::new(crate::worktree::SqliteWorkspaceRepository::new(
+            self.conn(),
+        )))
+    }
+
+    fn run_lease_root(&self) -> Option<PathBuf> {
+        SqliteStorage::run_lease_root(self)
+    }
 }
 
 impl SqliteStorage {
@@ -187,6 +210,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_backend_exposes_run_lease_root_beside_database() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = SqliteStorage::connect(dir.path().join("sessions.db"))
+            .await
+            .unwrap();
+        assert_eq!(
+            StorageBackend::run_lease_root(&storage),
+            Some(dir.path().join("sessions.run-leases"))
+        );
+
+        let memory = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        assert_eq!(StorageBackend::run_lease_root(&memory), None);
+
+        let explicit = memory.with_run_lease_root(dir.path().join("leases"));
+        assert_eq!(
+            StorageBackend::run_lease_root(&explicit),
+            Some(dir.path().join("leases"))
+        );
     }
 
     #[test]

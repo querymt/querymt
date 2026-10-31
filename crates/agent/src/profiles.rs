@@ -832,9 +832,8 @@ pub fn ensure_unique_profile_ids(profiles: &[ProfileMetadata]) -> Result<()> {
 
 /// Lazily builds and caches profile runtimes keyed by profile id.
 ///
-/// Session/profile bindings are advisory: they are kept in memory and, when
-/// shared storage is available, persisted to the sessions DB `profile_bindings`
-/// side table. Missing or unavailable persisted profiles fall back to active.
+/// Session/profile bindings are cached in memory after successful persistence
+/// to shared storage. Without shared storage they are memory-only.
 pub struct ProfileRuntimeManager<C = Arc<dyn ProfileCatalog>> {
     catalog: C,
     shared_infra: AgentInfra,
@@ -1054,7 +1053,8 @@ where
         runtime: &ProfileRuntime,
     ) -> Result<SessionProfileBinding> {
         let binding = runtime.session_binding();
-        self.set_session_binding(session_id, binding.clone()).await;
+        self.set_session_binding(session_id, binding.clone())
+            .await?;
         Ok(binding)
     }
 
@@ -1062,30 +1062,31 @@ where
         &self,
         session_id: impl Into<String>,
         binding: SessionProfileBinding,
-    ) {
+    ) -> Result<()> {
         let session_id = session_id.into();
-        self.session_bindings
-            .lock()
-            .await
-            .insert(session_id.clone(), binding.clone());
-        let Some(storage) = &self.shared_infra.storage else {
+        // Serialize persistence and cache publication so a failed write cannot
+        // install a memory-only binding or race a successful write in this manager.
+        let mut bindings = self.session_bindings.lock().await;
+        if let Some(storage) = &self.shared_infra.storage {
+            storage
+                .session_store()
+                .set_session_runtime_binding(
+                    &session_id,
+                    &binding.profile_id,
+                    binding.agent_id.as_deref(),
+                    binding.profile_fingerprint.as_deref(),
+                    binding.provider_lock_digest.as_deref(),
+                    binding.provider_locks_json.as_deref(),
+                )
+                .await
+                .with_context(|| {
+                    format!("Failed to persist profile binding for session '{session_id}'")
+                })?;
+        } else {
             warn!(session_id, profile_id = %binding.profile_id, "session profile binding is memory-only because shared storage is unavailable");
-            return;
-        };
-        let store = storage.session_store();
-        if let Err(err) = store
-            .set_session_runtime_binding(
-                &session_id,
-                &binding.profile_id,
-                binding.agent_id.as_deref(),
-                binding.profile_fingerprint.as_deref(),
-                binding.provider_lock_digest.as_deref(),
-                binding.provider_locks_json.as_deref(),
-            )
-            .await
-        {
-            warn!(session_id, profile_id = %binding.profile_id, error = %err, "failed to persist session profile binding");
         }
+        bindings.insert(session_id, binding);
+        Ok(())
     }
 
     pub async fn session_binding(&self, session_id: &str) -> Option<SessionProfileBinding> {
@@ -1568,8 +1569,6 @@ mod tests {
     use crate::agent::remote::test_helpers::fixtures::{get_test_mesh, random_node_id};
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::test_utils::empty_plugin_registry;
-    #[cfg(feature = "remote")]
-    use querymt::error::LLMError;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::Notify;
@@ -1625,13 +1624,11 @@ mod tests {
             .await
             .expect("set provider_node_id");
 
-        let provider = provider
-            .build_provider_for_session(&session_id)
-            .await
-            .expect("mesh-backed provider should build");
-        match provider.chat_with_tools(&[], None).await {
-            Err(LLMError::ProviderError(message)) => message,
-            other => panic!("expected provider error from mesh lookup; got: {other:?}"),
+        // Remote providers negotiate their contract while being built, so an
+        // unknown peer fails here rather than on the first chat call.
+        match provider.build_provider_for_session(&session_id).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected mesh negotiation to fail for an unknown peer"),
         }
     }
 
@@ -2813,6 +2810,122 @@ system = "inline"
             "expected mesh lookup error after propagation; got: {message}"
         );
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_binding_persistence_never_changes_cached_or_durable_owner() {
+        use crate::session::store::SessionStore;
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let (mut infra, _dir) = test_infra().await;
+        infra.storage = Some(storage.clone());
+        let catalog = LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .build();
+        let manager = ProfileRuntimeManager::with_infra(catalog.clone(), "alpha", infra.clone());
+        let binding = |profile_id: &str| SessionProfileBinding {
+            profile_id: profile_id.into(),
+            agent_id: None,
+            profile_fingerprint: None,
+            profile_source: None,
+            profile_config_kind: None,
+            provider_lock_digest: None,
+            provider_locks_json: None,
+        };
+        manager
+            .set_session_binding("existing", binding("alpha"))
+            .await
+            .unwrap();
+        storage
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_binding BEFORE INSERT ON profile_bindings
+             BEGIN SELECT RAISE(ABORT, 'binding rejected'); END;",
+            )
+            .unwrap();
+        for id in ["existing", "new"] {
+            let error = manager
+                .set_session_binding(id, binding("beta"))
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("binding rejected"));
+        }
+        assert_eq!(
+            manager
+                .session_binding("existing")
+                .await
+                .unwrap()
+                .profile_id,
+            "alpha"
+        );
+        assert!(manager.session_binding("new").await.is_none());
+        assert_eq!(
+            storage
+                .get_session_runtime_binding("existing")
+                .await
+                .unwrap()
+                .unwrap()
+                .profile_id,
+            "alpha"
+        );
+        assert!(
+            storage
+                .get_session_runtime_binding("new")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        storage
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_binding")
+            .unwrap();
+        manager
+            .set_session_binding("existing", binding("beta"))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .session_binding("existing")
+                .await
+                .unwrap()
+                .profile_id,
+            "beta"
+        );
+        let fresh = ProfileRuntimeManager::with_infra(catalog, "alpha", infra);
+        assert_eq!(
+            fresh
+                .shared_infra
+                .storage
+                .as_ref()
+                .unwrap()
+                .session_store()
+                .get_session_runtime_binding("existing")
+                .await
+                .unwrap()
+                .unwrap()
+                .profile_id,
+            "beta"
+        );
+        let (mut memory_infra, _memory_dir) = test_infra().await;
+        memory_infra.storage = None;
+        let memory = ProfileRuntimeManager::with_infra(
+            LocalProfileCatalog::builder()
+                .include_embedded_default(false)
+                .build(),
+            "alpha",
+            memory_infra,
+        );
+        memory
+            .set_session_binding("memory", binding("alpha"))
+            .await
+            .unwrap();
+        assert_eq!(
+            memory.session_binding("memory").await.unwrap().profile_id,
+            "alpha"
+        );
     }
 
     #[tokio::test]

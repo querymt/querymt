@@ -138,6 +138,31 @@ impl LocalAgentHandle {
         self.config.build_delegation_meta()
     }
 
+    /// Refuse undo/redo for a read-only session (previous owner or archived
+    /// workspace): its snapshots are context-only and must never touch a
+    /// checkout it no longer owns.
+    async fn refuse_if_read_only(
+        &self,
+        session_id: &str,
+    ) -> Result<(), crate::agent::undo::UndoError> {
+        self.session_materializer
+            .ensure_writable(session_id)
+            .await
+            .map_err(|err| {
+                let field = |key: &str| {
+                    err.data
+                        .as_ref()
+                        .and_then(|d| d.get(key))
+                        .and_then(|v| v.as_str())
+                };
+                crate::agent::undo::UndoError::Other(format!(
+                    "{}: {}",
+                    field("code").unwrap_or("read_only"),
+                    field("message").unwrap_or("session is read-only")
+                ))
+            })
+    }
+
     /// Undo: revert filesystem to state at the given message_id.
     ///
     /// Routes through the kameo session actor via `SessionActorRef`.
@@ -146,6 +171,7 @@ impl LocalAgentHandle {
         session_id: &str,
         message_id: &str,
     ) -> Result<crate::agent::undo::UndoResult, crate::agent::undo::UndoError> {
+        self.refuse_if_read_only(session_id).await?;
         let session_ref = {
             let registry = self.registry.lock().await;
             registry.get(session_id).cloned().ok_or_else(|| {
@@ -163,6 +189,7 @@ impl LocalAgentHandle {
         &self,
         session_id: &str,
     ) -> Result<crate::agent::undo::RedoResult, crate::agent::undo::UndoError> {
+        self.refuse_if_read_only(session_id).await?;
         let session_ref = {
             let registry = self.registry.lock().await;
             registry.get(session_id).cloned().ok_or_else(|| {

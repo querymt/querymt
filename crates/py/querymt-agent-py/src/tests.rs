@@ -33,6 +33,7 @@ mod tests {
                         attached: None,
                         connection_state: None,
                         runtime_state: None,
+                        workspace: None,
                     }],
                     latest_activity: Some("2026-01-02T00:00:00Z".to_string()),
                     total_count: Some(1),

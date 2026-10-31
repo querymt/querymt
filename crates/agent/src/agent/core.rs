@@ -198,9 +198,39 @@ pub struct SessionRuntime {
     /// emits final events, etc.). This ensures the next queued prompt doesn't race
     /// with cancellation cleanup.
     pub execution_permit: Arc<tokio::sync::Semaphore>,
+    /// Checkout-scoped cooperative mutation gate for worktree-aware
+    /// sessions. Undo/redo (and baseline capture) hold it while writing
+    /// files so a concurrent capture never observes partial restoration.
+    /// Set for Git sessions when the workspace service is configured.
+    pub mutation_gate: Arc<OnceCell<Arc<crate::worktree::gate::CheckoutMutationGate>>>,
+    /// Session-scoped slash-command registry resolved from the session's
+    /// bound workspace checkout at materialization. Unset for legacy local
+    /// sessions, which keep the agent-level registry.
+    pub slash_registry: OnceCell<Arc<crate::slash_commands::SlashCommandRegistry>>,
+    /// Managed checkout context is independent of cooperative locking.
+    pub managed_checkout: OnceCell<bool>,
+    pub(crate) workspace_activity: OnceCell<crate::worktree::gate::CheckoutActivityLease>,
+    /// Rebuildable accounting projection, hydrated from the journal on first
+    /// use and released with the runtime.
+    accounting: OnceCell<Arc<crate::accounting::SessionAccounting>>,
 }
 
 impl SessionRuntime {
+    /// The session's accounting projection, hydrated once per runtime.
+    ///
+    /// The projection is the sink's shared one for the session, so work that
+    /// records outside this runtime (delegation summaries) is visible here.
+    pub async fn accounting(
+        &self,
+        session_id: &str,
+        sink: &crate::event_sink::EventSink,
+    ) -> Result<Arc<crate::accounting::SessionAccounting>, crate::accounting::AccountingError> {
+        self.accounting
+            .get_or_try_init(|| sink.session_accounting(session_id))
+            .await
+            .cloned()
+    }
+
     /// Construct a new `SessionRuntime`, filling all bookkeeping fields with
     /// their default initial values.
     pub fn new(
@@ -222,6 +252,11 @@ impl SessionRuntime {
             pre_turn_snapshot_task: ParkingMutex::new(None),
             turn_diffs: ParkingMutex::new(Default::default()),
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            mutation_gate: Arc::new(OnceCell::new()),
+            slash_registry: OnceCell::new(),
+            managed_checkout: OnceCell::new(),
+            workspace_activity: OnceCell::new(),
+            accounting: OnceCell::new(),
         })
     }
 }

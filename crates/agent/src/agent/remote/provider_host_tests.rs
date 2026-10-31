@@ -121,6 +121,7 @@ mod provider_host_tests {
             tools: None,
             params: None,
             item_aware_contract_version: None,
+            options: None,
         };
 
         let result = actor_ref.ask(req).await;
@@ -347,6 +348,7 @@ mod provider_host_tests {
             tools: None,
             params: None,
             item_aware_contract_version: None,
+            options: None,
         };
         let result = f.actor_ref.ask(req).await;
         // The ask returns Result<Result<ProviderChatResponse, AgentError>, SendError>
@@ -385,6 +387,7 @@ mod provider_host_tests {
             tools: None,
             params: None,
             item_aware_contract_version: None,
+            options: None,
         };
 
         // Both calls fail for the same reason (provider not found).
@@ -677,6 +680,7 @@ mod provider_host_tests {
                 "n_ctx": 32768
             })),
             item_aware_contract_version: None,
+            options: None,
         };
 
         let json = serde_json::to_string(&req).expect("serialize");
@@ -756,6 +760,7 @@ mod provider_host_tests {
             tools: None,
             params: None,
             item_aware_contract_version: None,
+            options: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(
@@ -1177,6 +1182,157 @@ mod provider_host_tests {
         assert!(
             tell_result.is_err(),
             "actor should be killed after terminal message"
+        );
+    }
+
+    // ── Ordered relay: host numbering end-to-end ─────────────────────────────
+
+    struct MockStreamBackend;
+
+    #[async_trait::async_trait]
+    impl querymt_remote::RemoteProviderBackend for MockStreamBackend {
+        type Error = querymt_remote::RemoteProviderHostError;
+
+        async fn build_provider(
+            &self,
+            _request: querymt_remote::ProviderBuildRequest,
+        ) -> Result<std::sync::Arc<dyn querymt::LLMProvider>, Self::Error> {
+            Ok(std::sync::Arc::new(
+                crate::agent::remote::test_helpers::fixtures::MockLLMProvider::new("hello"),
+            ))
+        }
+    }
+
+    /// A real host streams to a real router through the mesh. If the host
+    /// numbered messages from anything but 0, or left gaps, the router would
+    /// hold them and fail after the gap timeout (15 s); completing well inside
+    /// that proves contiguous numbering from 0 and in-order terminal release.
+    #[tokio::test]
+    async fn test_host_numbers_stream_messages_contiguously_from_zero() {
+        use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
+        use querymt_remote::{AttachStreamConsumer, ProviderStreamRouterActor, RegisterRequest};
+
+        let _mesh = get_test_mesh().await;
+        let router_ref =
+            ProviderStreamRouterActor::spawn(ProviderStreamRouterActor::new(None, None));
+        router_ref
+            .ask(RegisterRequest {
+                request_id: "req-seq".into(),
+            })
+            .await
+            .expect("register");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        router_ref
+            .ask(AttachStreamConsumer {
+                request_id: "req-seq".into(),
+                consumer_tx: tx,
+            })
+            .await
+            .expect("attach");
+        let remote_router = router_ref.clone().into_remote_ref().await;
+
+        let host = querymt_remote::ProviderHostActor::spawn(
+            querymt_remote::ProviderHostActor::new(std::sync::Arc::new(MockStreamBackend)),
+        );
+        host.ask(crate::agent::remote::ProviderStreamRequest {
+            provider: "mock".into(),
+            model: "mock".into(),
+            messages: Vec::new(),
+            tools: None,
+            session_id: "sess".into(),
+            request_id: "req-seq".into(),
+            stream_router_ref: remote_router,
+            reconnect_grace_secs: 5,
+            heartbeat_interval_secs: 1,
+            lease_ttl_secs: 60,
+            params: None,
+            item_aware_contract_version: None,
+            options: None,
+        })
+        .await
+        .expect("stream request accepted");
+
+        let mut saw_terminal = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !saw_terminal {
+            let msg = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("stream must complete well before the gap timeout")
+                .expect("consumer channel closed early");
+            saw_terminal = relay_message_is_terminal(&msg);
+        }
+    }
+
+    struct FailingBackend;
+
+    #[async_trait::async_trait]
+    impl querymt_remote::RemoteProviderBackend for FailingBackend {
+        type Error = querymt_remote::RemoteProviderHostError;
+
+        async fn build_provider(
+            &self,
+            _request: querymt_remote::ProviderBuildRequest,
+        ) -> Result<std::sync::Arc<dyn querymt::LLMProvider>, Self::Error> {
+            Err(querymt_remote::RemoteProviderHostError::Internal(
+                "no such provider".into(),
+            ))
+        }
+    }
+
+    /// Setup failures are sent as `seq: Some(0)`; the router must still
+    /// release them to the consumer immediately.
+    #[tokio::test]
+    async fn test_host_setup_failure_reaches_consumer_as_sequenced_provider_error() {
+        use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
+        use querymt_remote::{AttachStreamConsumer, ProviderStreamRouterActor, RegisterRequest};
+
+        let _mesh = get_test_mesh().await;
+        let router_ref =
+            ProviderStreamRouterActor::spawn(ProviderStreamRouterActor::new(None, None));
+        router_ref
+            .ask(RegisterRequest {
+                request_id: "req-fail".into(),
+            })
+            .await
+            .expect("register");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        router_ref
+            .ask(AttachStreamConsumer {
+                request_id: "req-fail".into(),
+                consumer_tx: tx,
+            })
+            .await
+            .expect("attach");
+        let remote_router = router_ref.clone().into_remote_ref().await;
+
+        let host = querymt_remote::ProviderHostActor::spawn(
+            querymt_remote::ProviderHostActor::new(std::sync::Arc::new(FailingBackend)),
+        );
+        host.ask(crate::agent::remote::ProviderStreamRequest {
+            provider: "mock".into(),
+            model: "mock".into(),
+            messages: Vec::new(),
+            tools: None,
+            session_id: "sess".into(),
+            request_id: "req-fail".into(),
+            stream_router_ref: remote_router,
+            reconnect_grace_secs: 5,
+            heartbeat_interval_secs: 1,
+            lease_ttl_secs: 60,
+            params: None,
+            item_aware_contract_version: None,
+            options: None,
+        })
+        .await
+        .expect("request accepted; failure is relayed");
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("provider error must arrive promptly")
+            .expect("channel open");
+        assert!(
+            matches!(msg, StreamRelayMessage::ProviderError { .. }),
+            "got {msg:?}"
         );
     }
 }

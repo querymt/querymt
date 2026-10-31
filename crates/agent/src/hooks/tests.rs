@@ -14,6 +14,104 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 
+#[tokio::test]
+async fn delegation_hooks_disclose_parent_and_execute_in_allocated_child() {
+    use super::engine::{DelegationStartRequest, PostDelegationRequest, PreDelegationRequest};
+    let parent = TempDir::new().unwrap();
+    let child = TempDir::new().unwrap();
+    let group = MatcherGroupConfig {
+        matcher: None,
+        hooks: vec![command_hook(
+            "cat > hook-input.json; pwd > hook-cwd; printf '{}'".into(),
+        )],
+    };
+    let hooks = Hooks::new(HooksConfig {
+        enabled: true,
+        pre_delegation: vec![group.clone()],
+        delegation_start: vec![group.clone()],
+        post_delegation: vec![group],
+        ..HooksConfig::default()
+    })
+    .unwrap();
+    hooks
+        .run_pre_delegation(PreDelegationRequest {
+            session_id: "parent".into(),
+            turn_id: "turn".into(),
+            cwd: Some(parent.path().into()),
+            model: "mock".into(),
+            permission_mode: "default".into(),
+            tool_use_id: "tool".into(),
+            target_agent_id: "delegate".into(),
+            objective: "edit".into(),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            isolation: crate::worktree::DelegationIsolation::Isolated,
+        })
+        .await
+        .unwrap();
+    let pre: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(parent.path().join("hook-input.json")).unwrap())
+            .unwrap();
+    assert_eq!(pre["parent_session_id"], "parent");
+    assert_eq!(pre["parent_cwd"], pre["cwd"]);
+    assert!(!child.path().join("hook-input.json").exists());
+    hooks
+        .run_delegation_start(DelegationStartRequest {
+            session_id: "parent".into(),
+            parent_cwd: Some(parent.path().into()),
+            turn_id: "turn".into(),
+            cwd: Some(child.path().into()),
+            model: "mock".into(),
+            permission_mode: "default".into(),
+            delegation_id: "delegation".into(),
+            target_agent_id: "delegate".into(),
+            objective: "edit".into(),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            status: "requested".into(),
+        })
+        .await
+        .unwrap();
+    let start: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(child.path().join("hook-input.json")).unwrap())
+            .unwrap();
+    assert_eq!(start["parent_cwd"], parent.path().display().to_string());
+    assert_eq!(start["cwd"], child.path().display().to_string());
+    hooks
+        .run_post_delegation(PostDelegationRequest {
+            session_id: "parent".into(),
+            parent_cwd: Some(parent.path().into()),
+            turn_id: "turn".into(),
+            cwd: Some(child.path().into()),
+            model: "mock".into(),
+            permission_mode: "default".into(),
+            delegation_id: "delegation".into(),
+            target_agent_id: "delegate".into(),
+            child_session_id: "child".into(),
+            objective: "edit".into(),
+            status: "complete".into(),
+            summary: "done".into(),
+            verification_passed: true,
+        })
+        .await
+        .unwrap();
+    let post: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(child.path().join("hook-input.json")).unwrap())
+            .unwrap();
+    assert_eq!(post["child_session_id"], "child");
+    assert_eq!(post["parent_session_id"], "parent");
+    assert_eq!(post["parent_cwd"], parent.path().display().to_string());
+    assert_eq!(post["cwd"], child.path().display().to_string());
+    assert_eq!(
+        std::fs::read_to_string(child.path().join("hook-cwd"))
+            .unwrap()
+            .trim(),
+        child.path().canonicalize().unwrap().display().to_string()
+    );
+}
+
 #[test]
 fn generated_hook_schemas_match_expected_fixtures() {
     let dir = TempDir::new().expect("tempdir");

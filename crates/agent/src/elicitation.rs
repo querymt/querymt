@@ -48,13 +48,13 @@ impl From<rmcp::model::ElicitationAction> for ElicitationAction {
 }
 
 /// Response to an elicitation request from the UI/ACP client
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElicitationResponse {
     pub action: ElicitationAction,
     pub content: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingElicitationForm {
     pub message: String,
     pub requested_schema: serde_json::Value,
@@ -74,6 +74,46 @@ impl Default for PendingElicitationForm {
     }
 }
 
+/// What a pending interaction asks the user.
+///
+/// Both kinds share the session-owned pending map, claim/generation protocol,
+/// single-winner resolution and cancel/tool-exit cleanup. Answers travel as an
+/// [`ElicitationResponse`]: a permission answer is `Accept` with
+/// `{"option_id": "<selected option>"}`; `Decline`/`Cancel` reject the call.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InteractionKind {
+    #[default]
+    Elicitation,
+    Permission {
+        request: Box<crate::acp::protocol::RequestPermissionRequest>,
+    },
+}
+
+/// Content key carrying the selected option of a permission answer.
+pub const PERMISSION_OPTION_KEY: &str = "option_id";
+
+impl ElicitationResponse {
+    /// Permission answer selecting `option_id`.
+    pub fn permission_selected(option_id: impl Into<String>) -> Self {
+        Self {
+            action: ElicitationAction::Accept,
+            content: Some(serde_json::json!({ PERMISSION_OPTION_KEY: option_id.into() })),
+        }
+    }
+
+    /// Option selected by a permission answer, if any.
+    pub fn selected_permission_option(&self) -> Option<&str> {
+        if self.action != ElicitationAction::Accept {
+            return None;
+        }
+        self.content
+            .as_ref()
+            .and_then(|content| content.get(PERMISSION_OPTION_KEY))
+            .and_then(|value| value.as_str())
+    }
+}
+
 pub struct PendingElicitationRegistration {
     pub session_id: String,
     pub form: PendingElicitationForm,
@@ -88,6 +128,7 @@ pub struct PendingElicitationRegistration {
 pub struct PendingElicitation {
     pub session_id: String,
     pub form: PendingElicitationForm,
+    pub kind: InteractionKind,
     pub owner_authority: Option<String>,
     pub run_id: Option<String>,
     pub tool_call_id: Option<String>,
@@ -107,6 +148,7 @@ impl PendingElicitation {
         Self {
             session_id: session_id.into(),
             form: PendingElicitationForm::default(),
+            kind: InteractionKind::Elicitation,
             owner_authority: None,
             run_id: None,
             tool_call_id: None,
@@ -117,11 +159,13 @@ impl PendingElicitation {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingElicitationSnapshot {
     pub elicitation_id: String,
     pub session_id: String,
     pub form: PendingElicitationForm,
+    #[serde(default)]
+    pub kind: InteractionKind,
     pub owner_authority: Option<String>,
     pub run_id: Option<String>,
     pub tool_call_id: Option<String>,
@@ -291,9 +335,42 @@ pub async fn register_pending_elicitation(
         PendingElicitation {
             session_id: registration.session_id,
             form: registration.form,
+            kind: InteractionKind::Elicitation,
             owner_authority: registration.owner_authority,
             run_id: registration.run_id,
             tool_call_id: registration.tool_call_id,
+            delivery_generation: 0,
+            delivery_connection: None,
+            sender,
+        },
+    );
+}
+
+/// Register a pending tool-permission interaction.
+///
+/// Shares the pending map, claim/generation protocol and cleanup with form
+/// elicitations; only answer validation differs (see
+/// [`validate_elicitation_response`]).
+pub async fn register_pending_permission(
+    pending_map: &PendingElicitationMap,
+    interaction_id: String,
+    session_id: String,
+    request: crate::acp::protocol::RequestPermissionRequest,
+    run_id: Option<String>,
+    tool_call_id: Option<String>,
+    sender: oneshot::Sender<ElicitationResponse>,
+) {
+    pending_map.lock().await.insert(
+        interaction_id,
+        PendingElicitation {
+            session_id,
+            form: PendingElicitationForm::default(),
+            kind: InteractionKind::Permission {
+                request: Box::new(request),
+            },
+            owner_authority: None,
+            run_id,
+            tool_call_id,
             delivery_generation: 0,
             delivery_connection: None,
             sender,
@@ -311,6 +388,7 @@ pub async fn snapshot_pending_elicitations(
             elicitation_id: elicitation_id.clone(),
             session_id: entry.session_id.clone(),
             form: entry.form.clone(),
+            kind: entry.kind.clone(),
             owner_authority: entry.owner_authority.clone(),
             run_id: entry.run_id.clone(),
             tool_call_id: entry.tool_call_id.clone(),
@@ -322,15 +400,17 @@ pub async fn snapshot_pending_elicitations(
     snapshot
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaimedElicitationDelivery {
     pub elicitation_id: String,
     pub session_id: String,
     pub form: PendingElicitationForm,
+    #[serde(default)]
+    pub kind: InteractionKind,
     pub delivery_generation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ElicitationResolution {
     Resolved,
     StaleDelivery,
@@ -364,6 +444,89 @@ fn push_agent_pending_maps(
     }
 }
 
+type SharedRegistry = Arc<Mutex<crate::agent::SessionRegistry>>;
+
+fn push_agent_registries(
+    agent: &crate::agent::LocalAgentHandle,
+    registries: &mut Vec<SharedRegistry>,
+    seen: &mut HashSet<usize>,
+) {
+    if seen.insert(Arc::as_ptr(&agent.registry) as usize) {
+        registries.push(agent.registry.clone());
+    }
+    let registry = agent.agent_registry();
+    for info in registry.list_agents() {
+        let Some(handle) = registry.get_handle(&info.id) else {
+            continue;
+        };
+        let Some(delegate) = handle
+            .as_any()
+            .downcast_ref::<crate::agent::LocalAgentHandle>()
+        else {
+            continue;
+        };
+        if seen.insert(Arc::as_ptr(&delegate.registry) as usize) {
+            registries.push(delegate.registry.clone());
+        }
+    }
+}
+
+/// Session registries of the agent, its materialized profile runtimes and its
+/// delegates: every place a session (local, or remote attached locally) lives.
+async fn all_registries(agent: &crate::agent::LocalAgentHandle) -> Vec<SharedRegistry> {
+    let mut registries = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(profiles) = agent.profiles().as_ref() {
+        for runtime in profiles.materialized_runtimes().await {
+            push_agent_registries(
+                runtime.agent().handle().as_ref(),
+                &mut registries,
+                &mut seen,
+            );
+        }
+    }
+    push_agent_registries(agent, &mut registries, &mut seen);
+    registries
+}
+
+/// The `SessionActorRef` that owns `session_id`, wherever the session runs.
+async fn find_session_ref(
+    agent: &crate::agent::LocalAgentHandle,
+    session_id: &str,
+) -> Option<crate::agent::SessionActorRef> {
+    for registry in all_registries(agent).await {
+        if let Some(session_ref) = registry.lock().await.get(session_id) {
+            return Some(session_ref.clone());
+        }
+    }
+    None
+}
+
+/// Every remote-hosted session ref known to this agent. Local sessions share
+/// the host maps, which are read directly where a whole-agent scan is needed.
+async fn remote_session_refs(
+    agent: &crate::agent::LocalAgentHandle,
+) -> Vec<(String, crate::agent::SessionActorRef)> {
+    let mut seen = HashSet::new();
+    let mut refs = Vec::new();
+    for registry in all_registries(agent).await {
+        let registry = registry.lock().await;
+        for session_id in registry.session_ids() {
+            if let Some(session_ref) = registry.get(&session_id)
+                && session_ref.is_remote()
+                && seen.insert(session_id.clone())
+            {
+                refs.push((session_id, session_ref.clone()));
+            }
+        }
+    }
+    refs
+}
+
+fn warn_interaction_call(what: &str, session_id: &str, error: &crate::error::AgentError) {
+    log::warn!("Session interaction call failed: op={what} session_id={session_id} error={error}");
+}
+
 async fn all_pending_maps(agent: &crate::agent::LocalAgentHandle) -> Vec<PendingElicitationMap> {
     let mut maps = Vec::new();
     let mut seen = HashSet::new();
@@ -376,23 +539,151 @@ async fn all_pending_maps(agent: &crate::agent::LocalAgentHandle) -> Vec<Pending
     maps
 }
 
+/// Adopt `authority_verifier` for unowned entries of `session_id` in one map.
+/// Returns whether at least one entry is owned by that authority after assignment.
+pub async fn assign_authority_in_map(
+    map: &PendingElicitationMap,
+    session_id: &str,
+    authority_verifier: &str,
+) -> bool {
+    let mut assigned = false;
+    let mut entries = map.lock().await;
+    for entry in entries
+        .values_mut()
+        .filter(|entry| entry.session_id == session_id)
+    {
+        if entry.owner_authority.is_none() {
+            entry.owner_authority = Some(authority_verifier.to_string());
+        }
+        assigned |= entry.owner_authority.as_deref() == Some(authority_verifier);
+    }
+    assigned
+}
+
+/// Claim delivery of matching entries of `session_id` in one map.
+///
+/// With `authority_verifier` the entry's owner authority must match (recovery
+/// claim). Without it, `elicitation_id` selects a single live entry.
+pub async fn claim_deliveries_in_map(
+    map: &PendingElicitationMap,
+    session_id: &str,
+    elicitation_id: Option<&str>,
+    authority_verifier: Option<&str>,
+    connection_id: &str,
+) -> Vec<ClaimedElicitationDelivery> {
+    let mut claims = Vec::new();
+    let mut entries = map.lock().await;
+    for (entry_id, entry) in entries.iter_mut().filter(|(entry_id, entry)| {
+        entry.session_id == session_id
+            && elicitation_id.is_none_or(|expected| entry_id.as_str() == expected)
+            && authority_verifier
+                .is_none_or(|verifier| entry.owner_authority.as_deref() == Some(verifier))
+    }) {
+        entry.delivery_generation = entry.delivery_generation.saturating_add(1);
+        entry.delivery_connection = Some(connection_id.to_string());
+        claims.push(ClaimedElicitationDelivery {
+            elicitation_id: entry_id.clone(),
+            session_id: entry.session_id.clone(),
+            form: entry.form.clone(),
+            kind: entry.kind.clone(),
+            delivery_generation: entry.delivery_generation,
+        });
+    }
+    claims.sort_by(|left, right| left.elicitation_id.cmp(&right.elicitation_id));
+    claims
+}
+
+/// Entries of `session_id` currently claimed by `connection_id`.
+pub async fn claimed_deliveries_in_map(
+    map: &PendingElicitationMap,
+    session_id: &str,
+    connection_id: &str,
+) -> Vec<ClaimedElicitationDelivery> {
+    let entries = map.lock().await;
+    let mut claims = entries
+        .iter()
+        .filter(|(_, entry)| {
+            entry.session_id == session_id
+                && entry.delivery_connection.as_deref() == Some(connection_id)
+        })
+        .map(|(elicitation_id, entry)| ClaimedElicitationDelivery {
+            elicitation_id: elicitation_id.clone(),
+            session_id: entry.session_id.clone(),
+            form: entry.form.clone(),
+            kind: entry.kind.clone(),
+            delivery_generation: entry.delivery_generation,
+        })
+        .collect::<Vec<_>>();
+    claims.sort_by(|left, right| left.elicitation_id.cmp(&right.elicitation_id));
+    claims
+}
+
+/// Validate and resolve one interaction in one map.
+///
+/// `delivery_generation: Some(g)` requires the exact claimed delivery.
+/// `None` is the unclaimed path: allowed only for entries that were never
+/// claimed and have no owner authority, or for the claiming connection.
+/// Check, validate and remove happen under a single hold of the map lock.
+/// `session_id: None` matches an entry of any session (legacy callers that
+/// do not name the session). Returns `NotFound` when the entry is absent or
+/// belongs to another session.
+pub async fn resolve_in_map(
+    map: &PendingElicitationMap,
+    session_id: Option<&str>,
+    elicitation_id: &str,
+    connection_id: &str,
+    delivery_generation: Option<u64>,
+    response: ElicitationResponse,
+) -> Result<ElicitationResolution, agent_client_protocol::Error> {
+    let mut entries = map.lock().await;
+    let Some(entry) = entries.get(elicitation_id) else {
+        return Ok(ElicitationResolution::NotFound);
+    };
+    if session_id.is_some_and(|session_id| entry.session_id != session_id) {
+        return Ok(ElicitationResolution::NotFound);
+    }
+    let allowed = match delivery_generation {
+        Some(generation) => {
+            entry.delivery_generation == generation
+                && entry.delivery_connection.as_deref() == Some(connection_id)
+        }
+        None if entry.delivery_generation == 0 => entry.owner_authority.is_none(),
+        None => entry.delivery_connection.as_deref() == Some(connection_id),
+    };
+    if !allowed {
+        return Ok(ElicitationResolution::StaleDelivery);
+    }
+    validate_elicitation_response(entry, &response)?;
+    let entry = entries
+        .remove(elicitation_id)
+        .expect("pending entry exists while registry lock is held");
+    drop(entries);
+    let _ = entry.sender.send(response);
+    Ok(ElicitationResolution::Resolved)
+}
+
 pub async fn assign_pending_elicitation_authority(
     agent: &crate::agent::LocalAgentHandle,
     session_id: &str,
     authority_verifier: &str,
 ) -> bool {
+    if let Some(session_ref) = find_session_ref(agent, session_id).await {
+        return match session_ref
+            .list_pending_interactions(Some(authority_verifier.to_string()))
+            .await
+        {
+            Ok(pending) => pending
+                .iter()
+                .any(|entry| entry.owner_authority.as_deref() == Some(authority_verifier)),
+            Err(error) => {
+                warn_interaction_call("assign_authority", session_id, &error);
+                false
+            }
+        };
+    }
     let mut assigned = false;
     for map in all_pending_maps(agent).await {
-        let mut entries = map.lock().await;
-        for entry in entries
-            .values_mut()
-            .filter(|entry| entry.session_id == session_id)
-        {
-            if entry.owner_authority.is_none() {
-                entry.owner_authority = Some(authority_verifier.to_string());
-            }
-            assigned = true;
-        }
+        assigned |= assign_authority_in_map(&map, session_id, authority_verifier).await;
     }
     assigned
 }
@@ -411,6 +702,27 @@ pub async fn pending_sessions_for_authority(
                 .map(|entry| entry.session_id.clone()),
         );
     }
+    let remote_results =
+        futures_util::future::join_all(remote_session_refs(agent).await.into_iter().map(
+            |(session_id, session_ref)| async move {
+                let result = session_ref.list_pending_interactions(None).await;
+                (session_id, result)
+            },
+        ))
+        .await;
+    for (session_id, result) in remote_results {
+        match result {
+            Ok(pending) => {
+                if pending
+                    .iter()
+                    .any(|entry| entry.owner_authority.as_deref() == Some(authority_verifier))
+                {
+                    session_ids.push(session_id);
+                }
+            }
+            Err(error) => warn_interaction_call("list_pending", &session_id, &error),
+        }
+    }
     session_ids.sort();
     session_ids.dedup();
     session_ids
@@ -420,17 +732,93 @@ pub async fn has_pending_elicitation_for_agent_session(
     agent: &crate::agent::LocalAgentHandle,
     session_id: &str,
 ) -> bool {
+    if let Some(session_ref) = find_session_ref(agent, session_id).await {
+        return match session_ref.list_pending_interactions(None).await {
+            Ok(pending) => !pending.is_empty(),
+            Err(error) => {
+                warn_interaction_call("has_pending", session_id, &error);
+                // Unknown is treated as still pending: authority must not be
+                // retired because the owner was momentarily unreachable.
+                true
+            }
+        };
+    }
     for map in all_pending_maps(agent).await {
-        if map
-            .lock()
-            .await
-            .values()
-            .any(|entry| entry.session_id == session_id)
-        {
+        if has_pending_elicitation_for_session(&map, session_id).await {
             return true;
         }
     }
     false
+}
+
+/// IDs of the pending permission interactions of `session_id` that
+/// `connection_id` does not already hold, wherever the session runs. Used to
+/// re-deliver permission requests to a client that attaches after the request
+/// was raised.
+/// True when `session_id` has pending interactions and every one of them is a
+/// permission request. Such a session needs no form-question support from the
+/// client, so recovery does not have to require it.
+pub async fn session_pending_is_permission_only(
+    agent: &crate::agent::LocalAgentHandle,
+    session_id: &str,
+) -> bool {
+    let pending = if let Some(session_ref) = find_session_ref(agent, session_id).await {
+        session_ref
+            .list_pending_interactions(None)
+            .await
+            .unwrap_or_else(|error| {
+                warn_interaction_call("permission_only", session_id, &error);
+                Vec::new()
+            })
+    } else {
+        let mut snapshots = Vec::new();
+        for map in all_pending_maps(agent).await {
+            snapshots.extend(snapshot_pending_elicitations(&map).await);
+        }
+        snapshots
+            .into_iter()
+            .filter(|entry| entry.session_id == session_id)
+            .collect()
+    };
+    !pending.is_empty()
+        && pending
+            .iter()
+            .all(|entry| matches!(entry.kind, InteractionKind::Permission { .. }))
+}
+
+pub async fn undelivered_permission_ids_for_session(
+    agent: &crate::agent::LocalAgentHandle,
+    session_id: &str,
+    connection_id: &str,
+) -> Vec<String> {
+    let pending = if let Some(session_ref) = find_session_ref(agent, session_id).await {
+        session_ref
+            .list_pending_interactions(None)
+            .await
+            .unwrap_or_else(|error| {
+                warn_interaction_call("pending_permissions", session_id, &error);
+                Vec::new()
+            })
+    } else {
+        let mut snapshots = Vec::new();
+        for map in all_pending_maps(agent).await {
+            snapshots.extend(snapshot_pending_elicitations(&map).await);
+        }
+        snapshots
+            .into_iter()
+            .filter(|entry| entry.session_id == session_id)
+            .collect()
+    };
+    let mut ids = pending
+        .into_iter()
+        .filter(|entry| {
+            matches!(entry.kind, InteractionKind::Permission { .. })
+                && entry.delivery_connection.as_deref() != Some(connection_id)
+        })
+        .map(|entry| entry.elicitation_id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
 }
 
 pub async fn claim_pending_elicitation_deliveries(
@@ -440,23 +828,31 @@ pub async fn claim_pending_elicitation_deliveries(
     authority_verifier: &str,
     connection_id: &str,
 ) -> Vec<ClaimedElicitationDelivery> {
+    if let Some(session_ref) = find_session_ref(agent, session_id).await {
+        return session_ref
+            .claim_interaction_delivery(
+                elicitation_id.map(str::to_string),
+                connection_id.to_string(),
+                Some(authority_verifier.to_string()),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                warn_interaction_call("claim", session_id, &error);
+                Vec::new()
+            });
+    }
     let mut claims = Vec::new();
     for map in all_pending_maps(agent).await {
-        let mut entries = map.lock().await;
-        for (entry_id, entry) in entries.iter_mut().filter(|(entry_id, entry)| {
-            entry.session_id == session_id
-                && elicitation_id.is_none_or(|expected| entry_id.as_str() == expected)
-                && entry.owner_authority.as_deref() == Some(authority_verifier)
-        }) {
-            entry.delivery_generation = entry.delivery_generation.saturating_add(1);
-            entry.delivery_connection = Some(connection_id.to_string());
-            claims.push(ClaimedElicitationDelivery {
-                elicitation_id: entry_id.clone(),
-                session_id: entry.session_id.clone(),
-                form: entry.form.clone(),
-                delivery_generation: entry.delivery_generation,
-            });
-        }
+        claims.extend(
+            claim_deliveries_in_map(
+                &map,
+                session_id,
+                elicitation_id,
+                Some(authority_verifier),
+                connection_id,
+            )
+            .await,
+        );
     }
     claims.sort_by(|left, right| left.elicitation_id.cmp(&right.elicitation_id));
     claims
@@ -468,22 +864,30 @@ pub async fn claim_live_elicitation_delivery(
     elicitation_id: &str,
     connection_id: &str,
 ) -> Option<ClaimedElicitationDelivery> {
+    if let Some(session_ref) = find_session_ref(agent, session_id).await {
+        return session_ref
+            .claim_interaction_delivery(
+                Some(elicitation_id.to_string()),
+                connection_id.to_string(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                warn_interaction_call("claim_live", session_id, &error);
+                Vec::new()
+            })
+            .into_iter()
+            .next();
+    }
     for map in all_pending_maps(agent).await {
-        let mut entries = map.lock().await;
-        let Some(entry) = entries.get_mut(elicitation_id) else {
-            continue;
-        };
-        if entry.session_id != session_id {
-            continue;
+        if let Some(claim) =
+            claim_deliveries_in_map(&map, session_id, Some(elicitation_id), None, connection_id)
+                .await
+                .into_iter()
+                .next()
+        {
+            return Some(claim);
         }
-        entry.delivery_generation = entry.delivery_generation.saturating_add(1);
-        entry.delivery_connection = Some(connection_id.to_string());
-        return Some(ClaimedElicitationDelivery {
-            elicitation_id: elicitation_id.to_string(),
-            session_id: entry.session_id.clone(),
-            form: entry.form.clone(),
-            delivery_generation: entry.delivery_generation,
-        });
     }
     None
 }
@@ -493,28 +897,39 @@ pub async fn claimed_elicitation_deliveries(
     session_id: &str,
     connection_id: &str,
 ) -> Vec<ClaimedElicitationDelivery> {
+    if let Some(session_ref) = find_session_ref(agent, session_id).await {
+        let pending = session_ref
+            .list_pending_interactions(None)
+            .await
+            .unwrap_or_else(|error| {
+                warn_interaction_call("claimed", session_id, &error);
+                Vec::new()
+            });
+        return pending
+            .into_iter()
+            .filter(|entry| entry.delivery_connection.as_deref() == Some(connection_id))
+            .map(|entry| ClaimedElicitationDelivery {
+                elicitation_id: entry.elicitation_id,
+                session_id: entry.session_id,
+                form: entry.form,
+                kind: entry.kind,
+                delivery_generation: entry.delivery_generation,
+            })
+            .collect();
+    }
     let mut claims = Vec::new();
     for map in all_pending_maps(agent).await {
-        let entries = map.lock().await;
-        claims.extend(
-            entries
-                .iter()
-                .filter(|(_, entry)| {
-                    entry.session_id == session_id
-                        && entry.delivery_connection.as_deref() == Some(connection_id)
-                })
-                .map(|(elicitation_id, entry)| ClaimedElicitationDelivery {
-                    elicitation_id: elicitation_id.clone(),
-                    session_id: entry.session_id.clone(),
-                    form: entry.form.clone(),
-                    delivery_generation: entry.delivery_generation,
-                }),
-        );
+        claims.extend(claimed_deliveries_in_map(&map, session_id, connection_id).await);
     }
     claims.sort_by(|left, right| left.elicitation_id.cmp(&right.elicitation_id));
     claims
 }
 
+/// Resolve `elicitation_id` for a connection.
+///
+/// Routed through the owning session actor (local or remote). When no session
+/// is named, every local pending map and then every remote-hosted session is
+/// searched; a session without a registered actor falls back to the local maps.
 pub async fn resolve_elicitation_from_connection(
     agent: &crate::agent::LocalAgentHandle,
     session_id: Option<&str>,
@@ -522,54 +937,176 @@ pub async fn resolve_elicitation_from_connection(
     connection_id: &str,
     response: ElicitationResponse,
 ) -> Result<ElicitationResolution, agent_client_protocol::Error> {
+    resolve_interaction_routed(
+        agent,
+        session_id,
+        elicitation_id,
+        connection_id,
+        None,
+        response,
+    )
+    .await
+}
+
+async fn resolve_interaction_routed(
+    agent: &crate::agent::LocalAgentHandle,
+    session_id: Option<&str>,
+    elicitation_id: &str,
+    connection_id: &str,
+    delivery_generation: Option<u64>,
+    response: ElicitationResponse,
+) -> Result<ElicitationResolution, agent_client_protocol::Error> {
+    if let Some(session_id) = session_id
+        && let Some(session_ref) = find_session_ref(agent, session_id).await
+    {
+        return session_ref
+            .resolve_interaction(
+                elicitation_id.to_string(),
+                connection_id.to_string(),
+                delivery_generation,
+                response,
+            )
+            .await
+            .map_err(agent_client_protocol::Error::from);
+    }
     for map in all_pending_maps(agent).await {
-        let delivery = {
-            let entries = map.lock().await;
-            let Some(entry) = entries.get(elicitation_id) else {
-                continue;
-            };
-            if session_id.is_some_and(|session_id| entry.session_id != session_id) {
-                continue;
-            }
-            if entry.delivery_generation == 0 {
-                if entry.owner_authority.is_some() {
-                    return Ok(ElicitationResolution::StaleDelivery);
-                }
-                (entry.session_id.clone(), 0)
-            } else if entry.delivery_connection.as_deref() == Some(connection_id) {
-                (entry.session_id.clone(), entry.delivery_generation)
-            } else {
-                return Ok(ElicitationResolution::StaleDelivery);
-            }
-        };
-        if delivery.1 == 0 {
-            let mut entries = map.lock().await;
-            let Some(entry) = entries.get(elicitation_id) else {
-                return Ok(ElicitationResolution::NotFound);
-            };
-            validate_elicitation_response(entry, &response)?;
-            let entry = entries.remove(elicitation_id).expect("entry checked above");
-            drop(entries);
-            let _ = entry.sender.send(response);
-            return Ok(ElicitationResolution::Resolved);
-        }
-        return resolve_claimed_elicitation(
-            agent,
-            &delivery.0,
+        match resolve_in_map(
+            &map,
+            session_id,
             elicitation_id,
             connection_id,
-            delivery.1,
-            response,
+            delivery_generation,
+            response.clone(),
         )
-        .await;
+        .await?
+        {
+            ElicitationResolution::NotFound => continue,
+            resolved => return Ok(resolved),
+        }
+    }
+    if session_id.is_none() {
+        let mut last_error = None;
+        for (remote_session_id, session_ref) in remote_session_refs(agent).await {
+            match session_ref
+                .resolve_interaction(
+                    elicitation_id.to_string(),
+                    connection_id.to_string(),
+                    delivery_generation,
+                    response.clone(),
+                )
+                .await
+            {
+                Ok(ElicitationResolution::NotFound) => continue,
+                Ok(resolved) => return Ok(resolved),
+                Err(error)
+                    if error.transport_failure().is_some()
+                        || matches!(
+                            error,
+                            crate::error::AgentError::RemoteNodeUpgradeRequired { .. }
+                        ) =>
+                {
+                    // One unreachable or outdated node must not hide the
+                    // interaction when another node owns it.
+                    warn_interaction_call("resolve", &remote_session_id, &error);
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(error.into());
+        }
     }
     Ok(ElicitationResolution::NotFound)
+}
+
+/// Serialize a form's requested schema, carrying request-level `_meta` (if any)
+/// under the `"_meta"` key so `form_allows_custom` can see it. Forms without
+/// metadata serialize exactly as before.
+fn form_schema_with_meta<S: Serialize, M: Serialize>(
+    requested_schema: &S,
+    meta: Option<&M>,
+) -> serde_json::Value {
+    let mut schema = serde_json::to_value(requested_schema).unwrap_or(serde_json::Value::Null);
+    if let Some(meta) = meta
+        && let Ok(meta_value) = serde_json::to_value(meta)
+        && !meta_value.is_null()
+        && meta_value.as_object().is_none_or(|obj| !obj.is_empty())
+        && let Some(obj) = schema.as_object_mut()
+    {
+        obj.insert("_meta".to_string(), meta_value);
+    }
+    schema
+}
+
+/// Whether the form advertises free-form ("custom") answers in addition to its
+/// listed options. Mirrors the client-side rule used to render the custom field.
+fn form_allows_custom(form: &PendingElicitationForm) -> bool {
+    if form.source == "builtin:question" {
+        return true;
+    }
+    let Some(meta) = form
+        .requested_schema
+        .get("_meta")
+        .and_then(|m| m.get("querymt"))
+    else {
+        return false;
+    };
+    meta.get("allow_custom").and_then(|v| v.as_bool()) == Some(true)
+        || meta.get("allowCustom").and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// Copy of `schema` with per-property option constraints (`oneOf`, `anyOf`,
+/// `enum`, `const`, and the same on array `items`) removed. Types, `required`
+/// and object structure are preserved so malformed payloads are still rejected.
+fn relax_schema_for_custom(schema: &serde_json::Value) -> serde_json::Value {
+    fn strip_options(property: &mut serde_json::Value) {
+        let Some(obj) = property.as_object_mut() else {
+            return;
+        };
+        for key in ["oneOf", "anyOf", "enum", "const"] {
+            obj.remove(key);
+        }
+        if let Some(items) = obj.get_mut("items") {
+            strip_options(items);
+        }
+    }
+
+    let mut relaxed = schema.clone();
+    if let Some(properties) = relaxed
+        .get_mut("properties")
+        .and_then(|p| p.as_object_mut())
+    {
+        for property in properties.values_mut() {
+            strip_options(property);
+        }
+    }
+    relaxed
 }
 
 fn validate_elicitation_response(
     entry: &PendingElicitation,
     response: &ElicitationResponse,
 ) -> Result<(), agent_client_protocol::Error> {
+    if let InteractionKind::Permission { request } = &entry.kind {
+        if response.action != ElicitationAction::Accept {
+            return Ok(());
+        }
+        let option_id = response.selected_permission_option().ok_or_else(|| {
+            agent_client_protocol::Error::invalid_params()
+                .data("Accepted permission response requires an option_id")
+        })?;
+        return if request
+            .options
+            .iter()
+            .any(|option| option.option_id.0.as_ref() == option_id)
+        {
+            Ok(())
+        } else {
+            Err(agent_client_protocol::Error::invalid_params()
+                .data(format!("Unknown permission option: {option_id}")))
+        };
+    }
     if response.action != ElicitationAction::Accept {
         return Ok(());
     }
@@ -577,7 +1114,14 @@ fn validate_elicitation_response(
         agent_client_protocol::Error::invalid_params()
             .data("Accepted elicitation response requires content")
     })?;
-    let validator = jsonschema::validator_for(&entry.form.requested_schema).map_err(|err| {
+    let relaxed;
+    let schema = if form_allows_custom(&entry.form) {
+        relaxed = relax_schema_for_custom(&entry.form.requested_schema);
+        &relaxed
+    } else {
+        &entry.form.requested_schema
+    };
+    let validator = jsonschema::validator_for(schema).map_err(|err| {
         agent_client_protocol::Error::invalid_params()
             .data(format!("Invalid elicitation schema: {err}"))
     })?;
@@ -595,28 +1139,53 @@ pub async fn resolve_claimed_elicitation(
     delivery_generation: u64,
     response: ElicitationResponse,
 ) -> Result<ElicitationResolution, agent_client_protocol::Error> {
-    for map in all_pending_maps(agent).await {
-        let mut entries = map.lock().await;
-        let Some(entry) = entries.get(elicitation_id) else {
-            continue;
-        };
-        if entry.session_id != session_id {
-            continue;
-        }
-        if entry.delivery_generation != delivery_generation
-            || entry.delivery_connection.as_deref() != Some(connection_id)
-        {
-            return Ok(ElicitationResolution::StaleDelivery);
-        }
-        validate_elicitation_response(entry, &response)?;
-        let entry = entries
-            .remove(elicitation_id)
-            .expect("pending entry exists while registry lock is held");
-        drop(entries);
-        let _ = entry.sender.send(response);
-        return Ok(ElicitationResolution::Resolved);
-    }
-    Ok(ElicitationResolution::NotFound)
+    resolve_interaction_routed(
+        agent,
+        Some(session_id),
+        elicitation_id,
+        connection_id,
+        Some(delivery_generation),
+        response,
+    )
+    .await
+}
+
+/// Cancel a claimed delivery that can no longer make progress (for example when
+/// validation retries are exhausted).
+///
+/// The generation/connection check and the removal happen under a single hold
+/// of the map lock, so a delivery re-claimed by another connection in the
+/// meantime is never cancelled. The waiter is notified after the lock is
+/// released.
+pub async fn cancel_claimed_elicitation(
+    agent: &crate::agent::LocalAgentHandle,
+    session_id: &str,
+    elicitation_id: &str,
+    connection_id: &str,
+    delivery_generation: u64,
+) -> ElicitationResolution {
+    // A cancel answer always validates, and the generation/connection check
+    // plus removal happen atomically on the owning session, so a delivery
+    // re-claimed by another connection is never cancelled.
+    resolve_claimed_elicitation(
+        agent,
+        session_id,
+        elicitation_id,
+        connection_id,
+        delivery_generation,
+        ElicitationResponse {
+            action: ElicitationAction::Cancel,
+            content: None,
+        },
+    )
+    .await
+    .unwrap_or_else(|error| {
+        log::warn!(
+            "Failed to cancel claimed elicitation: session_id={session_id} elicitation_id={elicitation_id} error={}",
+            error.message
+        );
+        ElicitationResolution::NotFound
+    })
 }
 
 pub async fn has_pending_elicitation_for_session(
@@ -740,12 +1309,12 @@ impl ClientHandler for McpClientHandler {
             // Extract message and schema from the enum variant.
             let (message, schema_json) = match &request {
                 CreateElicitationRequestParams::FormElicitationParams {
+                    meta,
                     message,
                     requested_schema,
-                    ..
                 } => (
                     message.clone(),
-                    serde_json::to_value(requested_schema).unwrap_or(serde_json::Value::Null),
+                    form_schema_with_meta(requested_schema, meta.as_ref()),
                 ),
                 CreateElicitationRequestParams::UrlElicitationParams { message, url, .. } => {
                     (message.clone(), serde_json::json!({ "url": url }))
@@ -1098,6 +1667,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assigning_a_conflicting_authority_does_not_report_success() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let map = fixture.handle.pending_elicitations();
+        let materialized = fixture
+            .handle
+            .new_session(crate::acp::protocol::NewSessionRequest::new(
+                fixture._tempdir.path(),
+            ))
+            .await
+            .unwrap()
+            .session_id
+            .to_string();
+        for (id, session_id) in [
+            ("fallback-question", "unmaterialized"),
+            ("actor-question", materialized.as_str()),
+        ] {
+            let (sender, _receiver) = oneshot::channel();
+            insert_pending_elicitation(&map, id.into(), session_id.into(), sender).await;
+            assert!(
+                assign_pending_elicitation_authority(&fixture.handle, session_id, "first").await
+            );
+            assert!(
+                !assign_pending_elicitation_authority(&fixture.handle, session_id, "second").await
+            );
+            assert_eq!(
+                map.lock().await[id].owner_authority.as_deref(),
+                Some("first")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn recovery_generation_allows_one_valid_winner() {
         let fixture = crate::test_utils::TestAgent::new().await;
         let map = fixture.handle.pending_elicitations();
@@ -1343,6 +1944,120 @@ mod tests {
         assert!(!has_pending_elicitation_for_session(&map, "other-session").await);
     }
 
+    async fn register_test_permission(
+        map: &PendingElicitationMap,
+        id: &str,
+        session_id: &str,
+        run_id: Option<&str>,
+        tool_call_id: Option<&str>,
+    ) -> oneshot::Receiver<ElicitationResponse> {
+        use crate::acp::protocol::{
+            PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionRequest,
+            ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let (tx, rx) = oneshot::channel();
+        let request = RequestPermissionRequest::new(
+            session_id.to_string(),
+            ToolCallUpdate::new(
+                ToolCallId::from(id.to_string()),
+                ToolCallUpdateFields::new(),
+            ),
+            vec![PermissionOption::new(
+                PermissionOptionId::from("allow_once"),
+                "Allow once",
+                PermissionOptionKind::AllowOnce,
+            )],
+        );
+        register_pending_permission(
+            map,
+            id.to_string(),
+            session_id.to_string(),
+            request,
+            run_id.map(str::to_string),
+            tool_call_id.map(str::to_string),
+            tx,
+        )
+        .await;
+        rx
+    }
+
+    #[tokio::test]
+    async fn session_cancel_and_tool_exit_retire_both_interaction_kinds() {
+        let map: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // Session cancel: a permission and an elicitation of the session are
+        // both cancelled; another session's permission is untouched.
+        let permission_rx = register_test_permission(&map, "perm", "session-a", None, None).await;
+        let (form_tx, form_rx) = oneshot::channel();
+        insert_pending_elicitation(&map, "form".into(), "session-a".into(), form_tx).await;
+        let _other_rx = register_test_permission(&map, "other", "session-b", None, None).await;
+        assert_eq!(
+            cancel_pending_elicitations_for_session(&map, "session-a").await,
+            2
+        );
+        for response in [permission_rx.await.unwrap(), form_rx.await.unwrap()] {
+            assert_eq!(response.action, ElicitationAction::Cancel);
+            // A cancelled permission selects no option, so it can never grant.
+            assert_eq!(response.selected_permission_option(), None);
+        }
+        let remaining = snapshot_pending_elicitations(&map).await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].elicitation_id, "other");
+
+        // Tool exit: only the exiting invocation's permission is removed.
+        let exiting_rx =
+            register_test_permission(&map, "exiting", "session-c", Some("run-1"), Some("tool-1"))
+                .await;
+        let _kept_rx =
+            register_test_permission(&map, "kept", "session-c", Some("run-1"), Some("tool-2"))
+                .await;
+        assert_eq!(
+            remove_pending_elicitations_for_tool(&map, "session-c", "run-1", "tool-1").await,
+            1
+        );
+        assert!(exiting_rx.await.is_err());
+        let ids: Vec<_> = snapshot_pending_elicitations(&map)
+            .await
+            .into_iter()
+            .map(|entry| entry.elicitation_id)
+            .collect();
+        assert_eq!(ids, vec!["kept", "other"]);
+    }
+
+    #[tokio::test]
+    async fn permission_answers_must_select_a_listed_option() {
+        let map: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let mut rx = register_test_permission(&map, "perm", "session-a", None, None).await;
+
+        for bad in [
+            ElicitationResponse::permission_selected("not_an_option"),
+            ElicitationResponse {
+                action: ElicitationAction::Accept,
+                content: None,
+            },
+        ] {
+            let result = resolve_in_map(&map, Some("session-a"), "perm", "conn", None, bad).await;
+            assert!(result.is_err(), "malformed answer must be rejected");
+            assert!(rx.try_recv().is_err(), "request stays pending");
+        }
+
+        let resolved = resolve_in_map(
+            &map,
+            Some("session-a"),
+            "perm",
+            "conn",
+            None,
+            ElicitationResponse::permission_selected("allow_once"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, ElicitationResolution::Resolved);
+        assert_eq!(
+            rx.await.unwrap().selected_permission_option(),
+            Some("allow_once")
+        );
+    }
+
     #[tokio::test]
     async fn cancelling_session_resolves_only_its_pending_elicitations() {
         let map: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
@@ -1389,6 +2104,331 @@ mod tests {
         assert_eq!(
             response.content,
             Some(serde_json::json!({"selection": "allow_once"}))
+        );
+    }
+
+    fn question_entry(schema: serde_json::Value, source: &str) -> PendingElicitation {
+        let (tx, _rx) = oneshot::channel();
+        let mut entry = PendingElicitation::for_test("s", tx);
+        entry.form = PendingElicitationForm {
+            message: "q".to_string(),
+            requested_schema: schema,
+            source: source.to_string(),
+        };
+        entry
+    }
+
+    fn accept(content: serde_json::Value) -> ElicitationResponse {
+        ElicitationResponse {
+            action: ElicitationAction::Accept,
+            content: Some(content),
+        }
+    }
+
+    fn single_choice_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"selection": {
+                "type": "string",
+                "oneOf": [{"const": "A", "title": "A"}, {"const": "B", "title": "B"}]
+            }},
+            "required": ["selection"]
+        })
+    }
+
+    fn multi_choice_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"selection": {
+                "type": "array",
+                "items": {"anyOf": [{"const": "A", "title": "A"}, {"const": "B", "title": "B"}]}
+            }},
+            "required": ["selection"]
+        })
+    }
+
+    #[test]
+    fn builtin_question_accepts_custom_single_answer() {
+        let entry = question_entry(single_choice_schema(), "builtin:question");
+        assert!(
+            validate_elicitation_response(&entry, &accept(serde_json::json!({"selection": "A"})))
+                .is_ok()
+        );
+        assert!(
+            validate_elicitation_response(
+                &entry,
+                &accept(serde_json::json!({"selection": "something else entirely"}))
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn builtin_question_accepts_custom_multi_answer() {
+        let entry = question_entry(multi_choice_schema(), "builtin:question");
+        assert!(
+            validate_elicitation_response(
+                &entry,
+                &accept(serde_json::json!({"selection": ["custom"]}))
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn custom_forms_still_reject_missing_required_and_wrong_types() {
+        let entry = question_entry(single_choice_schema(), "builtin:question");
+        assert!(validate_elicitation_response(&entry, &accept(serde_json::json!({}))).is_err());
+        assert!(
+            validate_elicitation_response(&entry, &accept(serde_json::json!({"selection": 42})))
+                .is_err()
+        );
+        let multi = question_entry(multi_choice_schema(), "builtin:question");
+        assert!(
+            validate_elicitation_response(&multi, &accept(serde_json::json!({"selection": "A"})))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn non_custom_forms_keep_strict_option_validation() {
+        let entry = question_entry(single_choice_schema(), "mcp:server");
+        assert!(
+            validate_elicitation_response(
+                &entry,
+                &accept(serde_json::json!({"selection": "free"}))
+            )
+            .is_err()
+        );
+        assert!(
+            validate_elicitation_response(&entry, &accept(serde_json::json!({"selection": "A"})))
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_question_answer_resolves_the_waiting_tool() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let map = fixture.handle.pending_elicitations();
+        let (tx, rx) = oneshot::channel();
+        register_pending_elicitation(
+            &map,
+            "question-custom".to_string(),
+            PendingElicitationRegistration {
+                session_id: "s1".to_string(),
+                form: PendingElicitationForm {
+                    message: "Pick".to_string(),
+                    requested_schema: single_choice_schema(),
+                    source: "builtin:question".to_string(),
+                },
+                owner_authority: None,
+                run_id: None,
+                tool_call_id: None,
+            },
+            tx,
+        )
+        .await;
+        let claim = claim_live_elicitation_delivery(
+            fixture.handle.as_ref(),
+            "s1",
+            "question-custom",
+            "conn",
+        )
+        .await
+        .expect("claim");
+
+        let resolution = resolve_claimed_elicitation(
+            fixture.handle.as_ref(),
+            "s1",
+            "question-custom",
+            "conn",
+            claim.delivery_generation,
+            accept(serde_json::json!({"selection": "my own words"})),
+        )
+        .await
+        .expect("custom answer must not be rejected");
+        assert_eq!(resolution, ElicitationResolution::Resolved);
+        assert_eq!(
+            rx.await.expect("tool is released").content,
+            Some(serde_json::json!({"selection": "my own words"}))
+        );
+        assert!(map.lock().await.is_empty());
+    }
+
+    #[test]
+    fn form_meta_is_merged_into_schema_and_enables_custom() {
+        let meta = serde_json::json!({"querymt": {"allow_custom": true}});
+        let schema = form_schema_with_meta(&single_choice_schema(), Some(&meta));
+        assert_eq!(schema["_meta"], meta);
+        assert!(form_allows_custom(&PendingElicitationForm {
+            message: String::new(),
+            requested_schema: schema,
+            source: "mcp:server".to_string(),
+        }));
+    }
+
+    #[test]
+    fn form_without_meta_is_unchanged() {
+        let base = single_choice_schema();
+        assert_eq!(
+            form_schema_with_meta(&base, None::<&serde_json::Value>),
+            base
+        );
+        let empty = serde_json::json!({});
+        assert_eq!(form_schema_with_meta(&base, Some(&empty)), base);
+        assert!(!form_allows_custom(&PendingElicitationForm {
+            message: String::new(),
+            requested_schema: base,
+            source: "mcp:server".to_string(),
+        }));
+    }
+
+    async fn register_claimed(
+        fixture: &crate::test_utils::TestAgent,
+        id: &str,
+        connection: &str,
+    ) -> (
+        ClaimedElicitationDelivery,
+        oneshot::Receiver<ElicitationResponse>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        register_pending_elicitation(
+            &fixture.handle.pending_elicitations(),
+            id.to_string(),
+            PendingElicitationRegistration {
+                session_id: "s1".to_string(),
+                form: PendingElicitationForm {
+                    message: "Pick".to_string(),
+                    requested_schema: single_choice_schema(),
+                    source: "mcp:server".to_string(),
+                },
+                owner_authority: None,
+                run_id: None,
+                tool_call_id: None,
+            },
+            tx,
+        )
+        .await;
+        let claim = claim_live_elicitation_delivery(fixture.handle.as_ref(), "s1", id, connection)
+            .await
+            .expect("claim");
+        (claim, rx)
+    }
+
+    #[tokio::test]
+    async fn cancel_claimed_elicitation_releases_waiter_and_removes_entry() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let (claim, rx) = register_claimed(&fixture, "q-cancel", "conn").await;
+
+        let resolution = cancel_claimed_elicitation(
+            fixture.handle.as_ref(),
+            "s1",
+            "q-cancel",
+            "conn",
+            claim.delivery_generation,
+        )
+        .await;
+        assert_eq!(resolution, ElicitationResolution::Resolved);
+        assert_eq!(rx.await.unwrap().action, ElicitationAction::Cancel);
+        assert!(
+            fixture
+                .handle
+                .pending_elicitations()
+                .lock()
+                .await
+                .is_empty()
+        );
+
+        let again = cancel_claimed_elicitation(
+            fixture.handle.as_ref(),
+            "s1",
+            "q-cancel",
+            "conn",
+            claim.delivery_generation,
+        )
+        .await;
+        assert_eq!(again, ElicitationResolution::NotFound);
+    }
+
+    #[tokio::test]
+    async fn cancel_claimed_elicitation_ignores_stale_or_reclaimed_delivery() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let (claim, mut rx) = register_claimed(&fixture, "q-stale", "conn-a").await;
+        // Another connection re-claims the question.
+        let newer =
+            claim_live_elicitation_delivery(fixture.handle.as_ref(), "s1", "q-stale", "conn-b")
+                .await
+                .expect("reclaim");
+        assert!(newer.delivery_generation > claim.delivery_generation);
+
+        let resolution = cancel_claimed_elicitation(
+            fixture.handle.as_ref(),
+            "s1",
+            "q-stale",
+            "conn-a",
+            claim.delivery_generation,
+        )
+        .await;
+        assert_eq!(resolution, ElicitationResolution::StaleDelivery);
+        assert!(rx.try_recv().is_err());
+        assert!(
+            has_pending_elicitation_for_session(&fixture.handle.pending_elicitations(), "s1").await
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_cancel_and_resolve_settle_exactly_once() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let (claim, rx) = register_claimed(&fixture, "q-race", "conn").await;
+        let handle = fixture.handle.clone();
+        let generation = claim.delivery_generation;
+
+        let cancel = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                cancel_claimed_elicitation(handle.as_ref(), "s1", "q-race", "conn", generation)
+                    .await
+            })
+        };
+        let resolve = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                resolve_claimed_elicitation(
+                    handle.as_ref(),
+                    "s1",
+                    "q-race",
+                    "conn",
+                    generation,
+                    accept(serde_json::json!({"selection": "A"})),
+                )
+                .await
+                .expect("valid answer")
+            })
+        };
+        let (cancel, resolve) = (cancel.await.unwrap(), resolve.await.unwrap());
+        let resolved = [cancel, resolve]
+            .iter()
+            .filter(|r| **r == ElicitationResolution::Resolved)
+            .count();
+        assert_eq!(
+            resolved, 1,
+            "exactly one side may win: {cancel:?} {resolve:?}"
+        );
+        assert!(rx.await.is_ok());
+        assert!(handle.pending_elicitations().lock().await.is_empty());
+    }
+
+    #[test]
+    fn explicit_allow_custom_meta_relaxes_validation() {
+        let mut schema = single_choice_schema();
+        schema["_meta"] = serde_json::json!({"querymt": {"allow_custom": true}});
+        let entry = question_entry(schema, "mcp:server");
+        assert!(
+            validate_elicitation_response(
+                &entry,
+                &accept(serde_json::json!({"selection": "free"}))
+            )
+            .is_ok()
         );
     }
 }

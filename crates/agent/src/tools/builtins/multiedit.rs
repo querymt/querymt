@@ -7,15 +7,45 @@ use serde_json::{Value, json};
 
 use super::edit::EditTool;
 use crate::tools::builtins::edit_output;
-use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
+use crate::tools::{
+    AliasScope, ArgAlias, CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError,
+    WrapRule, single_path_write_access,
+};
+
+const fn item_alias(from: &'static str, to: &'static str) -> ArgAlias {
+    ArgAlias {
+        scope: AliasScope::ArrayItems("edits"),
+        from,
+        to,
+    }
+}
+
+/// Compatibility spellings accepted for `multiedit`: top-level `filePath` and the
+/// per-item edit names (never advertised).
+const MULTIEDIT_ARG_ALIASES: &[ArgAlias] = &[
+    ArgAlias {
+        scope: AliasScope::TopLevel,
+        from: "filePath",
+        to: "file_path",
+    },
+    item_alias("oldString", "old_string"),
+    item_alias("old_str", "old_string"),
+    item_alias("newString", "new_string"),
+    item_alias("new_str", "new_string"),
+    item_alias("replaceAll", "replace_all"),
+];
+
+/// A single edit may be sent flat, without the `edits` array.
+const MULTIEDIT_WRAP: WrapRule = WrapRule {
+    array: "edits",
+    fields: &["old_string", "new_string", "replace_all"],
+    required: &["old_string", "new_string"],
+};
 
 #[derive(Deserialize)]
 struct EditOperation {
-    #[serde(rename = "oldString")]
     old_string: String,
-    #[serde(rename = "newString")]
     new_string: String,
-    #[serde(rename = "replaceAll")]
     #[serde(default)]
     replace_all: bool,
 }
@@ -51,7 +81,7 @@ impl Tool for MultiEditTool {
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "filePath": {
+                        "file_path": {
                             "type": "string",
                             "description": "The absolute path to the file to modify"
                         },
@@ -61,25 +91,27 @@ impl Tool for MultiEditTool {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "oldString": {
+                                    "old_string": {
                                         "type": "string",
                                         "description": "The text to replace"
                                     },
-                                    "newString": {
+                                    "new_string": {
                                         "type": "string",
                                         "description": "The text to replace it with"
                                     },
-                                    "replaceAll": {
+                                    "replace_all": {
                                         "type": "boolean",
                                         "description": "Replace all occurrences (default false)",
                                         "default": false
                                     }
                                 },
-                                "required": ["oldString", "newString"]
+                                "required": ["old_string", "new_string"],
+                                "additionalProperties": false
                             }
                         }
                     },
-                    "required": ["filePath", "edits"]
+                    "required": ["file_path", "edits"],
+                    "additionalProperties": false
                 }),
                 strict: None,
             },
@@ -90,15 +122,27 @@ impl Tool for MultiEditTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn arg_aliases(&self) -> &'static [ArgAlias] {
+        MULTIEDIT_ARG_ALIASES
+    }
+
+    fn wrap_single_item(&self) -> Option<WrapRule> {
+        Some(MULTIEDIT_WRAP)
+    }
+
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        single_path_write_access(args, "file_path", cwd)
+    }
+
     async fn call(
         &self,
         args: Value,
         context: &dyn ToolContext,
     ) -> Result<Vec<ToolResultPart>, ToolError> {
         let file_path_str = args
-            .get("filePath")
+            .get("file_path")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidRequest("filePath is required".to_string()))?;
+            .ok_or_else(|| ToolError::InvalidRequest("file_path is required".to_string()))?;
 
         let edits_val = args
             .get("edits")
@@ -120,13 +164,13 @@ impl Tool for MultiEditTool {
         for (index, edit) in edits.iter().enumerate() {
             if edit.old_string.is_empty() {
                 return Err(ToolError::InvalidRequest(format!(
-                    "edit {} has empty oldString",
+                    "edit {} has empty old_string",
                     index + 1
                 )));
             }
             if edit.old_string == edit.new_string {
                 return Err(ToolError::InvalidRequest(format!(
-                    "edit {} has identical oldString and newString",
+                    "edit {} has identical old_string and new_string",
                     index + 1
                 )));
             }
@@ -134,40 +178,45 @@ impl Tool for MultiEditTool {
 
         let file_path = context.resolve_path(file_path_str)?;
 
-        // Apply all edits in memory first so the file is only written once.
-        let original_content = tokio::fs::read_to_string(&file_path)
-            .await
-            .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {}", e)))?;
-        let mut content = original_content.clone();
+        // Mutating phase runs under the checkout mutation gate when the
+        // session has one (see `run_under_mutation_gate`).
+        crate::tools::run_under_mutation_gate(context, async {
+            // Apply all edits in memory first so the file is only written once.
+            let original_content = tokio::fs::read_to_string(&file_path)
+                .await
+                .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {}", e)))?;
+            let mut content = original_content.clone();
 
-        for (index, edit) in edits.iter().enumerate() {
-            content = EditTool::replace(
-                &content,
-                &edit.old_string,
-                &edit.new_string,
-                edit.replace_all,
-            )
-            .map_err(|e| {
-                ToolError::ProviderError(format!(
-                    "multiedit failed at edit {} of {}: {}; no changes written",
-                    index + 1,
-                    edits.len(),
-                    e
-                ))
-            })?;
-        }
+            for (index, edit) in edits.iter().enumerate() {
+                content = EditTool::replace(
+                    &content,
+                    &edit.old_string,
+                    &edit.new_string,
+                    edit.replace_all,
+                )
+                .map_err(|e| {
+                    ToolError::ProviderError(format!(
+                        "multiedit failed at edit {} of {}: {}; no changes written",
+                        index + 1,
+                        edits.len(),
+                        e
+                    ))
+                })?;
+            }
 
-        // Write final content
-        tokio::fs::write(&file_path, &content)
-            .await
-            .map_err(|e| ToolError::ProviderError(format!("Failed to write file: {}", e)))?;
+            // Write final content
+            tokio::fs::write(&file_path, &content)
+                .await
+                .map_err(|e| ToolError::ProviderError(format!("Failed to write file: {}", e)))?;
 
-        // Build compact line-numbered hunk output from the actual file diff so
-        // sequential edits produce precise hunks instead of whole-file replacements.
-        let file_output =
-            edit_output::build_file_output_from_diff(&file_path, &original_content, &content);
-        let output_text = edit_output::format_compact_receipt(&[file_output]);
-        Ok(vec![ToolResultPart::text(output_text)])
+            // Build compact line-numbered hunk output from the actual file diff so
+            // sequential edits produce precise hunks instead of whole-file replacements.
+            let file_output =
+                edit_output::build_file_output_from_diff(&file_path, &original_content, &content);
+            let output_text = edit_output::format_compact_receipt(&[file_output]);
+            Ok(vec![ToolResultPart::text(output_text)])
+        })
+        .await
     }
 }
 
@@ -188,6 +237,29 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[test]
+    fn file_access_writes_normalised_file_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = dunce::canonicalize(temp_dir.path()).unwrap();
+        let tool = MultiEditTool::new();
+
+        let access = tool.file_access(&json!({"file_path": "docs/../a.md"}), Some(&root));
+
+        assert_eq!(access, FileAccess::writes([root.join("a.md")]));
+    }
+
+    #[test]
+    fn file_access_is_none_for_invalid_args() {
+        let tool = MultiEditTool::new();
+        let cwd = std::env::temp_dir();
+
+        assert_eq!(tool.file_access(&json!({}), Some(&cwd)), FileAccess::None);
+        assert_eq!(
+            tool.file_access(&json!({"file_path": null}), Some(&cwd)),
+            FileAccess::None
+        );
+    }
+
     #[tokio::test]
     async fn test_multiedit() {
         let temp_dir = TempDir::new().unwrap();
@@ -199,16 +271,16 @@ mod tests {
         let tool = MultiEditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
+            "file_path": file_path.display().to_string(),
             "edits": [
                 {
-                    "oldString": "hello",
-                    "newString": "hi"
+                    "old_string": "hello",
+                    "new_string": "hi"
                 },
                 {
-                    "oldString": "rust",
-                    "newString": "Rust",
-                    "replaceAll": true
+                    "old_string": "rust",
+                    "new_string": "Rust",
+                    "replace_all": true
                 }
             ]
         });
@@ -243,15 +315,15 @@ mod tests {
         let tool = MultiEditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
+            "file_path": file_path.display().to_string(),
             "edits": [
                 {
-                    "oldString": "hello",
-                    "newString": "hi"
+                    "old_string": "hello",
+                    "new_string": "hi"
                 },
                 {
-                    "oldString": "missing",
-                    "newString": "x"
+                    "old_string": "missing",
+                    "new_string": "x"
                 }
             ]
         });
@@ -273,15 +345,15 @@ mod tests {
         let tool = MultiEditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
+            "file_path": file_path.display().to_string(),
             "edits": [
                 {
-                    "oldString": "alpha",
-                    "newString": "beta"
+                    "old_string": "alpha",
+                    "new_string": "beta"
                 },
                 {
-                    "oldString": "beta",
-                    "newString": "gamma"
+                    "old_string": "beta",
+                    "new_string": "gamma"
                 }
             ]
         });
@@ -301,7 +373,7 @@ mod tests {
         let tool = MultiEditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
+            "file_path": file_path.display().to_string(),
             "edits": []
         });
 
@@ -320,17 +392,17 @@ mod tests {
         let tool = MultiEditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
+            "file_path": file_path.display().to_string(),
             "edits": [
                 {
-                    "oldString": "",
-                    "newString": "x"
+                    "old_string": "",
+                    "new_string": "x"
                 }
             ]
         });
 
         let err = tool.call(args, &context).await.unwrap_err().to_string();
-        assert!(err.contains("edit 1 has empty oldString"));
+        assert!(err.contains("edit 1 has empty old_string"));
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "hello");
     }
 
@@ -345,17 +417,17 @@ mod tests {
         let tool = MultiEditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
+            "file_path": file_path.display().to_string(),
             "edits": [
                 {
-                    "oldString": "hello",
-                    "newString": "hello"
+                    "old_string": "hello",
+                    "new_string": "hello"
                 }
             ]
         });
 
         let err = tool.call(args, &context).await.unwrap_err().to_string();
-        assert!(err.contains("edit 1 has identical oldString and newString"));
+        assert!(err.contains("edit 1 has identical old_string and new_string"));
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "hello");
     }
 
@@ -370,15 +442,15 @@ mod tests {
         let tool = MultiEditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
+            "file_path": file_path.display().to_string(),
             "edits": [
                 {
-                    "oldString": "b",
-                    "newString": "B"
+                    "old_string": "b",
+                    "new_string": "B"
                 },
                 {
-                    "oldString": "j",
-                    "newString": "J"
+                    "old_string": "j",
+                    "new_string": "J"
                 }
             ]
         });

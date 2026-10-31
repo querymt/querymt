@@ -13,7 +13,10 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, ReadFilter, Tool as ToolTrait, ToolContext, ToolError,
+    path_or_cwd_filtered_read_access,
+};
 
 /// Maximum bytes for a single matched line's text.
 /// Lines longer than this are truncated to prevent binary blobs or extremely
@@ -108,6 +111,23 @@ impl<'a> Sink for ContextSink<'a> {
         ctx: &SinkContext<'_>,
     ) -> Result<bool, Self::Error> {
         Ok(self.add_line(ctx.line_number().unwrap_or(0), ctx.bytes(), true))
+    }
+}
+
+/// Read `exclude` as either one glob string or an array of glob strings.
+///
+/// A single string behaves like a one-element array. Shared by execution and the
+/// scheduling access filter so both see the same patterns.
+fn exclude_patterns(args: &Value) -> Option<Vec<String>> {
+    match args.get("exclude")? {
+        Value::String(pattern) => Some(vec![pattern.clone()]),
+        Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        ),
+        _ => None,
     }
 }
 
@@ -386,6 +406,7 @@ impl ToolTrait for SearchTextTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "pattern": {
                             "type": "string",
@@ -400,9 +421,11 @@ impl ToolTrait for SearchTextTool {
                             "description": "File pattern to include in the search (e.g. \"*.js\", \"*.{ts,tsx}\")"
                         },
                         "exclude": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "File patterns to exclude from the search"
+                            "anyOf": [
+                                { "type": "string" },
+                                { "type": "array", "items": { "type": "string" } }
+                            ],
+                            "description": "File pattern or array of patterns to exclude from the search"
                         },
                         "max_results": {
                             "type": "integer",
@@ -453,6 +476,23 @@ impl ToolTrait for SearchTextTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        // Reads the files under `path` (default: the working directory) that
+        // pass the same include/exclude/file-type filter the search applies,
+        // so it is only ordered against writes it could actually observe.
+        let mut filter = ReadFilter::new();
+        if let Some(include) = args.get("include").and_then(Value::as_str) {
+            filter = filter.include(include);
+        }
+        if let Some(exclude) = exclude_patterns(args) {
+            filter = filter.exclude_all(exclude.iter().map(String::as_str));
+        }
+        if let Some(file_type) = args.get("file_type").and_then(Value::as_str) {
+            filter = filter.file_type(file_type);
+        }
+        path_or_cwd_filtered_read_access(args, "path", cwd, filter)
+    }
+
     fn truncation_hint(&self) -> Option<&'static str> {
         Some(
             "TIP: Many matches found and truncated. Refine your search pattern, \
@@ -484,11 +524,7 @@ impl ToolTrait for SearchTextTool {
             .and_then(Value::as_str)
             .map(|s| s.to_string());
 
-        let exclude = args.get("exclude").and_then(Value::as_array).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        });
+        let exclude = exclude_patterns(&args);
 
         let max_results = args
             .get("max_results")
@@ -572,6 +608,53 @@ impl ToolTrait for SearchTextTool {
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::FileAccess as Access;
+
+    #[test]
+    fn file_access_reads_path_or_cwd() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let tool = SearchTextTool::new();
+        assert_eq!(
+            tool.file_access(&serde_json::json!({"pattern": "x"}), Some(&root)),
+            Access::reads([root.clone()])
+        );
+        assert_eq!(
+            tool.file_access(
+                &serde_json::json!({"pattern": "x", "path": "src"}),
+                Some(&root)
+            ),
+            Access::reads([root.join("src")])
+        );
+        assert_eq!(
+            tool.file_access(&serde_json::json!({"pattern": "x"}), None),
+            Access::None
+        );
+    }
+
+    #[test]
+    fn file_access_carries_the_search_filter() {
+        use std::path::Path;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let access = SearchTextTool::new().file_access(
+            &serde_json::json!({
+                "pattern": "x",
+                "include": "*.rs",
+                "exclude": ["gen/**"],
+            }),
+            Some(&root),
+        );
+        let [scope] = access.read_scopes_slice() else {
+            panic!("expected one scope: {access:?}");
+        };
+        assert_eq!(scope.path, root);
+        assert!(scope.observes_write(&root.join("src/lib.rs")));
+        assert!(!scope.observes_write(&root.join("README.md")));
+        assert!(!scope.observes_write(&root.join("gen/out.rs")));
+        assert!(!scope.observes_write(Path::new("/elsewhere/a.rs")));
+    }
+
     use super::*;
 
     fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
@@ -947,6 +1030,63 @@ match again",
         // Should return no matches because file is excluded
         assert_eq!(file_count(&result), 0);
         assert_eq!(match_count(&result), 0);
+    }
+
+    #[tokio::test]
+    async fn scalar_and_array_exclude_give_identical_results() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = SearchTextTool::new();
+        fs::create_dir_all(temp_dir.path().join("tests")).unwrap();
+        fs::write(temp_dir.path().join("tests/a.rs"), "@@marker in tests\n").unwrap();
+        fs::write(temp_dir.path().join("b.rs"), "@@marker in src\n").unwrap();
+
+        let array = first_text_block(
+            tool.call(json!({"pattern": "@@", "exclude": ["tests/**"]}), &context)
+                .await
+                .unwrap(),
+        );
+        let scalar = first_text_block(
+            tool.call(json!({"pattern": "@@", "exclude": "tests/**"}), &context)
+                .await
+                .unwrap(),
+        );
+        let unfiltered =
+            first_text_block(tool.call(json!({"pattern": "@@"}), &context).await.unwrap());
+
+        assert_eq!(scalar, array);
+        assert_eq!(file_count(&scalar), 1, "{scalar}");
+        assert!(
+            scalar.contains("b.rs") && !scalar.contains("a.rs"),
+            "{scalar}"
+        );
+        assert_eq!(file_count(&unfiltered), 2, "exclude must actually filter");
+    }
+
+    #[test]
+    fn scalar_and_array_exclude_give_identical_scheduling_filters() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let tool = SearchTextTool::new();
+        let scalar = tool.file_access(&json!({"pattern": "x", "exclude": "gen/**"}), Some(&root));
+        let array = tool.file_access(&json!({"pattern": "x", "exclude": ["gen/**"]}), Some(&root));
+        assert_eq!(scalar, array);
+        let [scope] = scalar.read_scopes_slice() else {
+            panic!("expected one scope: {scalar:?}");
+        };
+        assert!(scope.observes_write(&root.join("src/lib.rs")));
+        assert!(!scope.observes_write(&root.join("gen/out.rs")));
+    }
+
+    #[test]
+    fn exclude_schema_accepts_string_or_array() {
+        let schema = SearchTextTool::new().definition().function.parameters;
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&json!({"pattern": "x", "exclude": "a/**"})));
+        assert!(validator.is_valid(&json!({"pattern": "x", "exclude": ["a/**"]})));
+        assert!(!validator.is_valid(&json!({"pattern": "x", "exclude": 5})));
+        assert!(!validator.is_valid(&json!({"pattern": "x", "exclude": [5]})));
     }
 
     #[tokio::test]

@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use querymt::LLMParams;
 use querymt::chat::ChatRole;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, params, params_from_iter};
+use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -14,6 +15,7 @@ use crate::session::domain::{
     ProgressKind, RevertState, Task, TaskKind, TaskStatus,
 };
 use crate::session::error::{SessionError, SessionResult};
+use crate::session::lifecycle::{SessionLifecycle, SessionLifecyclePatch};
 use crate::session::repo_artifact::SqliteArtifactRepository;
 use crate::session::repo_decision::SqliteDecisionRepository;
 use crate::session::repo_delegation::SqliteDelegationRepository;
@@ -29,7 +31,7 @@ use crate::session::store::{
     CustomModel, DelegateAssignmentWrite, DelegateAssignments, LLMConfig, RemoteSessionBookmark,
     Session, SessionExecutionConfig, SessionStore, TaskPatch, extract_llm_config_values,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::SqliteStorage;
 use super::row_parsers::{parse_llm_config_row, parse_llm_params};
@@ -219,6 +221,241 @@ impl SessionStore for SqliteStorage {
         repo.get_session(session_id).await
     }
 
+    fn supports_session_lifecycle(&self) -> bool {
+        true
+    }
+
+    async fn get_session_lifecycle(&self, session_id: &str) -> SessionResult<SessionLifecycle> {
+        let mut lifecycles = self
+            .get_session_lifecycles(&[session_id.to_owned()])
+            .await?;
+        lifecycles
+            .remove(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.to_owned()))
+    }
+
+    async fn patch_session_lifecycle(
+        &self,
+        session_id: &str,
+        patch: &SessionLifecyclePatch,
+    ) -> SessionResult<SessionLifecycle> {
+        patch.validate()?;
+        let session_id = session_id.to_owned();
+        let patch = patch.clone();
+        self.run_blocking_session(move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let internal_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM sessions WHERE public_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(internal_id) = internal_id else {
+                return Err(SessionError::SessionNotFound(session_id));
+            };
+
+            let now = if patch.resolved == Some(true) || patch.archived == Some(true) {
+                Some(
+                    OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .map_err(|error| SessionError::SerializationError(error.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let resolved = patch
+                .resolved
+                .map(|value| if value { 1_i64 } else { 0_i64 });
+            let archived = patch
+                .archived
+                .map(|value| if value { 1_i64 } else { 0_i64 });
+            tx.execute(
+                "INSERT INTO session_lifecycle (session_id, resolved_at, archived_at)
+                 VALUES (?1, CASE WHEN ?2 = 1 THEN ?3 ELSE NULL END,
+                         CASE WHEN ?4 = 1 THEN ?5 ELSE NULL END)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     resolved_at = CASE
+                         WHEN ?2 IS NULL THEN session_lifecycle.resolved_at
+                         WHEN ?2 = 0 THEN NULL
+                         WHEN session_lifecycle.resolved_at IS NULL THEN ?3
+                         ELSE session_lifecycle.resolved_at
+                     END,
+                     archived_at = CASE
+                         WHEN ?4 IS NULL THEN session_lifecycle.archived_at
+                         WHEN ?4 = 0 THEN NULL
+                         WHEN session_lifecycle.archived_at IS NULL THEN ?5
+                         ELSE session_lifecycle.archived_at
+                     END",
+                params![internal_id, resolved, now, archived, now],
+            )?;
+
+            let lifecycle = tx.query_row(
+                "SELECT s.public_id, l.resolved_at, l.archived_at
+                 FROM sessions s JOIN session_lifecycle l ON l.session_id = s.id
+                 WHERE s.id = ?1",
+                params![internal_id],
+                |row| {
+                    let session_id: String = row.get(0)?;
+                    let resolved_at: Option<String> = row.get(1)?;
+                    let archived_at: Option<String> = row.get(2)?;
+                    Ok(SessionLifecycle {
+                        session_id,
+                        resolved: resolved_at.is_some(),
+                        archived: archived_at.is_some(),
+                        resolved_at,
+                        archived_at,
+                    })
+                },
+            )?;
+            tx.commit()?;
+            Ok(lifecycle)
+        })
+        .await
+    }
+
+    async fn get_session_lifecycles(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, SessionLifecycle>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let session_ids = session_ids.to_vec();
+        self.run_blocking_session(move |conn| {
+            let mut lifecycles = HashMap::with_capacity(session_ids.len());
+            for chunk in session_ids.chunks(500) {
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT s.public_id, l.resolved_at, l.archived_at
+                     FROM sessions s LEFT JOIN session_lifecycle l ON l.session_id = s.id
+                     WHERE s.public_id IN ({placeholders})"
+                ))?;
+                let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+                    let session_id: String = row.get(0)?;
+                    let resolved_at: Option<String> = row.get(1)?;
+                    let archived_at: Option<String> = row.get(2)?;
+                    Ok(SessionLifecycle {
+                        session_id,
+                        resolved: resolved_at.is_some(),
+                        archived: archived_at.is_some(),
+                        resolved_at,
+                        archived_at,
+                    })
+                })?;
+                for row in rows {
+                    let lifecycle = row?;
+                    lifecycles.insert(lifecycle.session_id.clone(), lifecycle);
+                }
+            }
+            if let Some(missing_id) = session_ids.iter().find(|id| !lifecycles.contains_key(*id)) {
+                return Err(SessionError::SessionNotFound(missing_id.clone()));
+            }
+            Ok(lifecycles)
+        })
+        .await
+    }
+
+    fn supports_session_pins(&self) -> bool {
+        true
+    }
+
+    async fn set_session_pinned(
+        &self,
+        session_id: &str,
+        pinned: bool,
+    ) -> SessionResult<(crate::session::store::SessionPin, bool)> {
+        let session_id = session_id.to_owned();
+        self.run_blocking_session(move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let internal_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM sessions WHERE public_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(internal_id) = internal_id else {
+                return Err(SessionError::SessionNotFound(session_id));
+            };
+
+            let changed = if pinned {
+                let pinned_at = OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .map_err(|error| SessionError::SerializationError(error.to_string()))?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO session_pins (session_id, pinned_at) VALUES (?1, ?2)",
+                    params![internal_id, pinned_at],
+                )?
+            } else {
+                tx.execute(
+                    "DELETE FROM session_pins WHERE session_id = ?1",
+                    params![internal_id],
+                )?
+            } > 0;
+            let pinned_at = tx
+                .query_row(
+                    "SELECT pinned_at FROM session_pins WHERE session_id = ?1",
+                    params![internal_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            tx.commit()?;
+            Ok((
+                crate::session::store::SessionPin {
+                    session_id,
+                    pinned,
+                    pinned_at,
+                },
+                changed,
+            ))
+        })
+        .await
+    }
+
+    async fn get_session_pins(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, crate::session::store::SessionPin>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let session_ids = session_ids.to_vec();
+        self.run_blocking_session(move |conn| {
+            let mut pins = HashMap::with_capacity(session_ids.len());
+            for chunk in session_ids.chunks(500) {
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT s.public_id, p.pinned_at
+                     FROM sessions s LEFT JOIN session_pins p ON p.session_id = s.id
+                     WHERE s.public_id IN ({placeholders})"
+                ))?;
+                let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+                    let session_id: String = row.get(0)?;
+                    let pinned_at: Option<String> = row.get(1)?;
+                    Ok(crate::session::store::SessionPin {
+                        session_id,
+                        pinned: pinned_at.is_some(),
+                        pinned_at,
+                    })
+                })?;
+                for row in rows {
+                    let pin = row?;
+                    pins.insert(pin.session_id.clone(), pin);
+                }
+            }
+            if let Some(missing_id) = session_ids.iter().find(|id| !pins.contains_key(*id)) {
+                return Err(SessionError::SessionNotFound(missing_id.clone()));
+            }
+            Ok(pins)
+        })
+        .await
+    }
+
     async fn set_session_name(
         &self,
         session_id: &str,
@@ -226,6 +463,15 @@ impl SessionStore for SqliteStorage {
     ) -> SessionResult<String> {
         let repo = SqliteSessionRepository::new(self.conn.clone());
         repo.set_session_name(session_id, name).await
+    }
+
+    async fn set_session_cwd(
+        &self,
+        session_id: &str,
+        cwd: Option<std::path::PathBuf>,
+    ) -> SessionResult<()> {
+        let repo = SqliteSessionRepository::new(self.conn.clone());
+        repo.set_session_cwd(session_id, cwd).await
     }
 
     async fn list_sessions(&self) -> SessionResult<Vec<Session>> {
@@ -418,12 +664,96 @@ impl SessionStore for SqliteStorage {
         .await
     }
 
+    async fn create_session_with_isolation_intent(
+        &self,
+        name: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+        parent_session_id: Option<String>,
+        fork_origin: Option<ForkOrigin>,
+        intent: Option<crate::session::store::PendingForkIsolation>,
+    ) -> SessionResult<Session> {
+        let repo = SqliteSessionRepository::new(self.conn.clone());
+        repo.create_session_with_isolation_intent(name, cwd, parent_session_id, fork_origin, intent)
+            .await
+    }
+
     async fn fork_session(
         &self,
         source_session_id: &str,
         target_message_id: &str,
         fork_origin: ForkOrigin,
     ) -> SessionResult<String> {
+        self.fork_session_with_isolation_intent(
+            source_session_id,
+            target_message_id,
+            fork_origin,
+            None,
+        )
+        .await
+    }
+
+    async fn get_pending_fork_isolation(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<crate::session::store::PendingForkIsolation>> {
+        let session_id = session_id.to_string();
+        let json: Option<String> = self
+            .run_blocking(move |conn| {
+                conn.query_row(
+                    "SELECT intent_json FROM session_fork_isolation_intents i
+                 JOIN sessions s ON s.id = i.session_id WHERE s.public_id = ?",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+            })
+            .await?;
+        json.map(|json| {
+            serde_json::from_str(&json).map_err(|err| {
+                SessionError::InvalidOperation(format!(
+                    "invalid pending fork isolation intent: {err}"
+                ))
+            })
+        })
+        .transpose()
+    }
+
+    async fn complete_fork_isolation(&self, session_id: &str) -> SessionResult<()> {
+        let session_id = session_id.to_string();
+        self.run_blocking(move |conn| {
+            let tx = conn.transaction()?;
+            let (cwd, checkout, relative): (String, String, String) = tx.query_row(
+                "SELECT s.cwd, w.checkout_path, w.relative_cwd FROM sessions s
+                 JOIN workspaces w ON w.owner_session_id = s.public_id
+                 WHERE s.public_id = ? AND w.lifecycle = 'ready'",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if Path::new(&cwd) != Path::new(&checkout).join(relative) {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            tx.execute(
+                "DELETE FROM session_fork_isolation_intents
+                 WHERE session_id = (SELECT id FROM sessions WHERE public_id = ?)",
+                params![session_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn fork_session_with_isolation_intent(
+        &self,
+        source_session_id: &str,
+        target_message_id: &str,
+        fork_origin: ForkOrigin,
+        intent: Option<crate::session::store::PendingForkIsolation>,
+    ) -> SessionResult<String> {
+        let intent_json = intent
+            .map(|intent| serde_json::to_string(&intent))
+            .transpose()
+            .map_err(|err| SessionError::InvalidOperation(err.to_string()))?;
         // Resolve source session public_id → internal i64
         let source_session_internal_id =
             self.resolve_session_internal_id(source_session_id).await?;
@@ -468,6 +798,14 @@ impl SessionStore for SqliteStorage {
 
             // Get new session internal ID
             let new_session_internal_id: i64 = tx.last_insert_rowid();
+            // The copied conversation and its startup barrier commit together:
+            // interruption cannot leave an isolated fork looking legacy-local.
+            if let Some(intent_json) = intent_json {
+                tx.execute(
+                    "INSERT INTO session_fork_isolation_intents (session_id, intent_json) VALUES (?, ?)",
+                    params![new_session_internal_id, intent_json],
+                )?;
+            }
 
             // 2. Identify messages to copy (up to target_message_id internal ID).
             // Use deterministic internal-id ordering so same-second timestamps don't truncate
@@ -601,7 +939,19 @@ impl SessionStore for SqliteStorage {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                     })?.collect::<Result<Vec<_>, _>>()?;
 
-                    for (ptype, content, order) in parts {
+                    for (ptype, mut content, order) in parts {
+                        if ptype == "turn_snapshot_start" || ptype == "turn_snapshot_patch" {
+                            let mut part: crate::model::MessagePart = serde_json::from_str(&content).map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+                            match &mut part {
+                                crate::model::MessagePart::TurnSnapshotStart { inherited, workspace_root, .. } |
+                                crate::model::MessagePart::TurnSnapshotPatch { inherited, workspace_root, .. } => {
+                                    *inherited = true;
+                                    if workspace_root.is_none() { *workspace_root = parent_cwd.as_ref().map(PathBuf::from); }
+                                }
+                                _ => {}
+                            }
+                            content = serde_json::to_string(&part).map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+                        }
                         tx.execute(
                             "INSERT INTO message_parts (message_id, part_type, content_json, sort_order) VALUES (?, ?, ?, ?)",
                             params![new_msg_internal_id, ptype, content, order],
@@ -610,12 +960,22 @@ impl SessionStore for SqliteStorage {
                 }
             }
 
+            // Accounting ownership is never inherited: `llm_attempt_started` /
+            // `llm_attempt_settled` stay with the session that dispatched the
+            // attempt, so a fork starts its own spend scope and copied
+            // assistant messages (and their usage) create no fork charges.
+            // The filter above is an allowlist; do not widen it to accounting.
             // Copy only conversational durable events into the fork timeline.
             // Risk/tradeoff: operational events (tool calls, llm lifecycle, provider/task/progress/
             // delegation telemetry) are intentionally excluded because replaying them in a fork can
             // create contradictory state and duplicate execution traces. The downside is inherited
             // UI telemetry before the fork point is intentionally partial.
-            for (_event_id, timestamp, origin, source_node, kind, payload_json) in conversational_events_to_copy {
+            for (index, (_event_id, timestamp, origin, source_node, kind, payload_json)) in
+                conversational_events_to_copy.into_iter().enumerate()
+            {
+                // Copied events are numbered 1..n so the fork's own sequencer
+                // continues after them.
+                let session_seq = index as i64 + 1;
                 let new_event_id = Uuid::now_v7().to_string();
                 let stream_seq: i64 = tx.query_row(
                     "UPDATE event_journal_seq SET next_seq = next_seq + 1 WHERE id = 1 RETURNING next_seq - 1",
@@ -624,7 +984,7 @@ impl SessionStore for SqliteStorage {
                 )?;
 
                 tx.execute(
-                    "INSERT INTO event_journal (event_id, stream_seq, session_id, timestamp, origin, source_node, kind, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO event_journal (event_id, stream_seq, session_id, timestamp, origin, source_node, kind, payload_json, session_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         new_event_id,
                         stream_seq,
@@ -634,6 +994,7 @@ impl SessionStore for SqliteStorage {
                         source_node,
                         kind,
                         payload_json,
+                        session_seq,
                     ],
                 )?;
             }
@@ -1458,6 +1819,15 @@ impl SessionStore for SqliteStorage {
         repo.get_session_fork_info(session_id).await
     }
 
+    async fn get_session_ref_by_internal_id(
+        &self,
+        session_internal_id: i64,
+    ) -> SessionResult<Option<(String, Option<std::path::PathBuf>)>> {
+        let repo = SqliteSessionRepository::new(self.conn.clone());
+        repo.get_session_ref_by_internal_id(session_internal_id)
+            .await
+    }
+
     async fn list_child_sessions(&self, parent_id: &str) -> SessionResult<Vec<String>> {
         let repo = SqliteSessionRepository::new(self.conn.clone());
         repo.list_child_sessions(parent_id).await
@@ -1917,14 +2287,15 @@ impl SessionStore for SqliteStorage {
 
         self.run_blocking(move |conn| {
             conn.query_row(
-                "SELECT public_id, message_id, snapshot_id, backend_id, created_at FROM revert_states WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                "SELECT public_id, message_id, snapshot_id, backend_id, workspace_root, created_at FROM revert_states WHERE session_id = ? ORDER BY id DESC LIMIT 1",
                 params![session_internal_id],
                 |row| {
                     let public_id: String = row.get(0)?;
                     let message_id: String = row.get(1)?;
                     let snapshot_id: String = row.get(2)?;
                     let backend_id: String = row.get(3)?;
-                    let created_at_str: String = row.get(4)?;
+                    let workspace_root: Option<String> = row.get(4)?;
+                    let created_at_str: String = row.get(5)?;
                     let created_at = OffsetDateTime::parse(
                         &created_at_str,
                         &time::format_description::well_known::Rfc3339,
@@ -1937,6 +2308,7 @@ impl SessionStore for SqliteStorage {
                         message_id,
                         snapshot_id,
                         backend_id,
+                        workspace_root: workspace_root.map(PathBuf::from),
                         created_at,
                     })
                 },
@@ -1954,13 +2326,14 @@ impl SessionStore for SqliteStorage {
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default();
             conn.execute(
-                "INSERT INTO revert_states (public_id, session_id, message_id, snapshot_id, backend_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO revert_states (public_id, session_id, message_id, snapshot_id, backend_id, workspace_root, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 params![
                     state.public_id,
                     session_internal_id,
                     state.message_id,
                     state.snapshot_id,
                     state.backend_id,
+                    state.workspace_root.as_ref().map(|p| p.to_string_lossy().into_owned()),
                     now,
                 ],
             )?;
@@ -1977,7 +2350,7 @@ impl SessionStore for SqliteStorage {
             let tx = conn.transaction()?;
             let state = tx
                 .query_row(
-                    "SELECT id, public_id, message_id, snapshot_id, backend_id, created_at FROM revert_states WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                    "SELECT id, public_id, message_id, snapshot_id, backend_id, workspace_root, created_at FROM revert_states WHERE session_id = ? ORDER BY id DESC LIMIT 1",
                     params![session_internal_id],
                     |row| {
                         let id: i64 = row.get(0)?;
@@ -1985,7 +2358,8 @@ impl SessionStore for SqliteStorage {
                         let message_id: String = row.get(2)?;
                         let snapshot_id: String = row.get(3)?;
                         let backend_id: String = row.get(4)?;
-                        let created_at_str: String = row.get(5)?;
+                        let workspace_root: Option<String> = row.get(5)?;
+                        let created_at_str: String = row.get(6)?;
                         let created_at = OffsetDateTime::parse(
                             &created_at_str,
                             &time::format_description::well_known::Rfc3339,
@@ -2000,6 +2374,7 @@ impl SessionStore for SqliteStorage {
                                 message_id,
                                 snapshot_id,
                                 backend_id,
+                                workspace_root: workspace_root.map(PathBuf::from),
                                 created_at,
                             },
                         ))
@@ -2025,14 +2400,15 @@ impl SessionStore for SqliteStorage {
 
         self.run_blocking(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT public_id, message_id, snapshot_id, backend_id, created_at FROM revert_states WHERE session_id = ? ORDER BY id ASC",
+                "SELECT public_id, message_id, snapshot_id, backend_id, workspace_root, created_at FROM revert_states WHERE session_id = ? ORDER BY id ASC",
             )?;
             let rows = stmt.query_map(params![session_internal_id], |row| {
                 let public_id: String = row.get(0)?;
                 let message_id: String = row.get(1)?;
                 let snapshot_id: String = row.get(2)?;
                 let backend_id: String = row.get(3)?;
-                let created_at_str: String = row.get(4)?;
+                let workspace_root: Option<String> = row.get(4)?;
+                let created_at_str: String = row.get(5)?;
                 let created_at = OffsetDateTime::parse(
                     &created_at_str,
                     &time::format_description::well_known::Rfc3339,
@@ -2045,6 +2421,7 @@ impl SessionStore for SqliteStorage {
                     message_id,
                     snapshot_id,
                     backend_id,
+                    workspace_root: workspace_root.map(PathBuf::from),
                     created_at,
                 })
             })?;
@@ -2216,6 +2593,69 @@ impl SessionStore for SqliteStorage {
                 ],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn resolve_session_locations(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, crate::session::location::SessionLocation>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let session_ids = session_ids.to_vec();
+        self.run_blocking_session(move |conn| {
+            let mut locations = HashMap::with_capacity(session_ids.len());
+            for chunk in session_ids.chunks(400) {
+                let placeholders = vec!["?"; chunk.len()].join(", ");
+                let tx = conn.transaction()?;
+                let local_ids = {
+                    let sql = format!(
+                        "SELECT public_id FROM sessions WHERE public_id IN ({placeholders})"
+                    );
+                    let mut stmt = tx.prepare(&sql)?;
+                    stmt.query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<HashSet<_>, _>>()?
+                };
+                let bookmarks = {
+                    let sql = format!(
+                        "SELECT session_id, node_id, peer_label, cwd, created_at, title
+                         FROM remote_session_bookmarks WHERE session_id IN ({placeholders})"
+                    );
+                    let mut stmt = tx.prepare(&sql)?;
+                    let rows = stmt.query_map(
+                        params_from_iter(chunk.iter().map(String::as_str)),
+                        |row| {
+                            Ok(RemoteSessionBookmark {
+                                session_id: row.get(0)?,
+                                node_id: row.get(1)?,
+                                peer_label: row.get(2)?,
+                                cwd: row.get(3)?,
+                                created_at: row.get(4)?,
+                                title: row.get(5)?,
+                            })
+                        },
+                    )?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .map(|bookmark| (bookmark.session_id.clone(), bookmark))
+                        .collect::<HashMap<_, _>>()
+                };
+
+                for session_id in chunk {
+                    let location = crate::session::location::classify_session_location(
+                        local_ids.contains(session_id),
+                        bookmarks.get(session_id).cloned(),
+                    );
+                    locations.insert(session_id.clone(), location);
+                }
+                tx.commit()?;
+            }
+            Ok(locations)
         })
         .await
     }

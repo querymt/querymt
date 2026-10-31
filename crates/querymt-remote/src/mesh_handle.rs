@@ -4,7 +4,8 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 
@@ -17,6 +18,19 @@ use crate::{
 };
 
 pub type ReRegisterFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+#[derive(Default)]
+struct RegistrationState {
+    generation: AtomicU64,
+    operation: tokio::sync::Mutex<()>,
+    last_warning: parking_lot::Mutex<Option<std::time::Instant>>,
+}
+
+async fn withdraw_registration(name: &str) {
+    if let Err(error) = remote::unregister(name.to_owned()).await {
+        log::debug!("MeshHandle: failed to withdraw '{name}' from DHT: {error}");
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteLookupError {
@@ -37,6 +51,7 @@ pub struct MeshHandle {
     routes: Arc<RouteTable>,
     local_hostname: Arc<String>,
     pub(crate) re_register_fns: Arc<RwLock<HashMap<String, ReRegisterFn>>>,
+    registration_states: Arc<parking_lot::Mutex<HashMap<String, Weak<RegistrationState>>>>,
     keypair: Arc<libp2p::identity::Keypair>,
     invite_store: Option<Arc<RwLock<InviteStore>>>,
     mesh_state_store: Option<Arc<RwLock<MeshStateStore>>>,
@@ -45,7 +60,9 @@ pub struct MeshHandle {
     shutdown_lock: Arc<tokio::sync::Mutex<()>>,
     stream_reconnect_grace: std::time::Duration,
     config_scopes: Arc<RwLock<Vec<MeshScopeId>>>,
+    pub(crate) catalog_refresh_generation: Arc<std::sync::atomic::AtomicU64>,
     peer_node_resolver: Option<PeerNodeResolver>,
+    pub(crate) iroh_diagnostics: crate::iroh_diagnostics::IrohDiagnostics,
 }
 
 impl std::fmt::Debug for MeshHandle {
@@ -82,6 +99,7 @@ impl MeshHandle {
             routes,
             local_hostname: Arc::new(local_hostname),
             re_register_fns,
+            registration_states: Default::default(),
             keypair: Arc::new(keypair),
             invite_store,
             mesh_state_store,
@@ -90,13 +108,20 @@ impl MeshHandle {
             shutdown_lock: Arc::new(tokio::sync::Mutex::new(())),
             stream_reconnect_grace,
             config_scopes: Arc::new(RwLock::new(Vec::new())),
+            catalog_refresh_generation: Default::default(),
             peer_node_resolver: None,
+            iroh_diagnostics: Default::default(),
         }
     }
 
     pub fn with_peer_node_resolver(mut self, resolver: PeerNodeResolver) -> Self {
         self.peer_node_resolver = Some(resolver);
         self
+    }
+
+    /// Relay health is independent of peer liveness and mesh authorization.
+    pub fn iroh_diagnostics(&self) -> Option<crate::IrohTransportDiagnostics> {
+        self.iroh_diagnostics.snapshot()
     }
 
     pub fn peer_id(&self) -> &PeerId {
@@ -138,28 +163,62 @@ impl MeshHandle {
         A: kameo::Actor + kameo::remote::RemoteActor,
     {
         let name = name.into();
-        actor_ref.into_remote_ref().await;
-        if let Err(e) = actor_ref.register(name.clone()).await {
-            log::warn!("MeshHandle: failed to register '{}' in DHT: {}", name, e);
-        }
-
-        let name_clone = name.clone();
-        let actor_ref_clone = actor_ref.clone();
-        let re_register: ReRegisterFn = Arc::new(move || {
-            let name = name_clone.clone();
-            let actor_ref = actor_ref_clone.clone();
-            Box::pin(async move {
-                actor_ref.into_remote_ref().await;
-                if let Err(e) = actor_ref.register(name.clone()).await {
-                    log::warn!(
-                        "MeshHandle: re-registration of '{}' after peer discovery failed: {}",
-                        name,
-                        e
-                    );
-                }
-            })
-        });
-        self.re_register_fns.write().insert(name, re_register);
+        let re_register = {
+            let mut states = self.registration_states.lock();
+            states.retain(|_, state| state.strong_count() > 0);
+            let state = states
+                .get(&name)
+                .and_then(Weak::upgrade)
+                .unwrap_or_default();
+            states.insert(name.clone(), Arc::downgrade(&state));
+            let mut callbacks = self.re_register_fns.write();
+            let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let weak_actor = actor_ref.downgrade();
+            let weak_callbacks = Arc::downgrade(&self.re_register_fns);
+            let callback_name = name.clone();
+            let register: ReRegisterFn = Arc::new(move || {
+                let state = state.clone();
+                let weak_actor = weak_actor.clone();
+                let callbacks = weak_callbacks.clone();
+                let name = callback_name.clone();
+                Box::pin(async move {
+                    // A replacement and withdrawal share this gate, including
+                    // operations that were already in flight when superseded.
+                    let _operation = state.operation.lock().await;
+                    if state.generation.load(Ordering::SeqCst) != generation {
+                        return;
+                    }
+                    let Some(actor) = weak_actor.upgrade().filter(|actor| actor.is_alive()) else {
+                        if let Some(callbacks) = callbacks.upgrade() {
+                            let mut callbacks = callbacks.write();
+                            if state.generation.load(Ordering::SeqCst) == generation {
+                                callbacks.remove(&name);
+                            }
+                        }
+                        withdraw_registration(&name).await;
+                        return;
+                    };
+                    actor.into_remote_ref().await;
+                    if let Err(error) = actor.register(name.clone()).await {
+                        let mut last = state.last_warning.lock();
+                        if last.is_none_or(|last| last.elapsed() >= Duration::from_secs(60)) {
+                            log::warn!("MeshHandle: failed to register '{name}' in DHT: {error}");
+                            *last = Some(std::time::Instant::now());
+                        } else {
+                            log::debug!("MeshHandle: failed to register '{name}' in DHT: {error}");
+                        }
+                    }
+                    if state.generation.load(Ordering::SeqCst) != generation || !actor.is_alive() {
+                        withdraw_registration(&name).await;
+                    }
+                })
+            });
+            callbacks.insert(name, register.clone());
+            register
+        };
+        // Let publication finish its compensating withdrawal even if an
+        // attachment deadline cancels the caller while Kameo is publishing.
+        let _ = tokio::spawn(re_register()).await;
     }
 
     pub async fn lookup_actor<A>(
@@ -238,7 +297,20 @@ impl MeshHandle {
     }
 
     pub fn deregister_actor(&self, name: &str) {
-        self.re_register_fns.write().remove(name);
+        let states = self.registration_states.lock();
+        let state = states.get(name).and_then(Weak::upgrade);
+        let mut callbacks = self.re_register_fns.write();
+        callbacks.remove(name);
+        if let Some(state) = state {
+            let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let name = name.to_owned();
+            tokio::spawn(async move {
+                let _operation = state.operation.lock().await;
+                if state.generation.load(Ordering::SeqCst) == generation {
+                    withdraw_registration(&name).await;
+                }
+            });
+        }
     }
 
     pub fn re_register_fns_count(&self) -> usize {

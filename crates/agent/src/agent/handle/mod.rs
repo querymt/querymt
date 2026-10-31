@@ -16,18 +16,21 @@ mod ext_profiles;
 mod ext_remote;
 mod ext_schedules;
 mod ext_session_ops;
+mod ext_worktree_ops;
 mod model_registry;
 #[cfg(feature = "remote")]
 pub(crate) mod remote_connect;
 mod remote_mesh;
 mod remote_nodes;
 mod remote_sessions;
+mod runtime_observation;
 mod scheduler;
 mod send_agent_config;
 mod send_agent_impl;
 mod send_agent_lifecycle;
 mod session_config;
 mod session_control;
+pub(crate) mod session_lifecycle;
 #[cfg(feature = "remote")]
 pub(crate) mod session_operation;
 mod utils;
@@ -109,6 +112,31 @@ pub trait AgentHandle: Send + Sync {
         cwd: Option<String>,
         parent_session_id: String,
     ) -> std::result::Result<(String, SessionActorRef), Error>;
+
+    /// Set persisted lifecycle state without loading the session actor.
+    async fn set_session_lifecycle(
+        &self,
+        session_id: &str,
+        patch: crate::session::lifecycle::SessionLifecyclePatch,
+    ) -> crate::session::error::SessionResult<crate::session::lifecycle::SessionLifecycle> {
+        let _ = (session_id, patch);
+        Err(crate::session::error::SessionError::InvalidOperation(
+            "Session lifecycle updates are unsupported by this agent handle".into(),
+        ))
+    }
+
+    /// Whether this handle can execute tools in a node-local managed workspace.
+    fn supports_local_workspaces(&self) -> bool {
+        false
+    }
+
+    async fn create_isolated_delegation_session(
+        &self,
+        _workspace: crate::worktree::WorkspaceBinding,
+        _parent_session_id: String,
+    ) -> std::result::Result<(String, SessionActorRef), Error> {
+        Err(Error::invalid_request().data("isolated delegation requires local workspace execution"))
+    }
 
     // --- Event system ---
 
@@ -223,6 +251,8 @@ pub struct LocalAgentHandle {
     /// never holds registry state across network work (plan §2).
     #[cfg(feature = "remote")]
     pub(crate) remote_connect_gates: remote_connect::RemoteConnectGateMap,
+    #[cfg(feature = "remote")]
+    pub(crate) remote_connect_cooldowns: remote_connect::RemoteConnectCooldownMap,
 
     /// Non-blocking model inventory with snapshot-based reads and background refresh.
     /// This is the canonical public API for model listing and cache management.
@@ -243,7 +273,7 @@ pub struct LocalAgentHandle {
 }
 
 type SharedProfileCatalog = Arc<dyn ProfileCatalog>;
-type ProfileRuntime = Arc<ProfileRuntimeManager<SharedProfileCatalog>>;
+pub(crate) type ProfileRuntime = Arc<ProfileRuntimeManager<SharedProfileCatalog>>;
 pub(crate) type ProfileRuntimeSlot = Arc<ArcSwap<Option<ProfileRuntime>>>;
 pub(crate) type SchedulerHandleSlot = Arc<ParkingMutex<Option<crate::scheduler::SchedulerHandle>>>;
 

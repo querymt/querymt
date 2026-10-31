@@ -80,6 +80,20 @@ jobs:
             cuda_version: "12.8"
             extra_env: '{"CMAKE_POSITION_INDEPENDENT_CODE":"ON"}'
 
+          # Linux ROCm: match llama.cpp's Linux Docker SDK and fat-build targets.
+          # https://github.com/ggml-org/llama.cpp/blob/59d5fad7c111d30a547d690b69235ed9e05c035d/.devops/rocm.Dockerfile
+          - os: linux
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            features: rocm
+            feature_tag: rocm7.2
+            needs_cuda: "false"
+            rocm_version: "7.2.1"
+            extra_env: >-
+              {"CMAKE_HIP_ARCHITECTURES":"gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1150;gfx1200;gfx1201",
+               "CMAKE_POSITION_INDEPENDENT_CODE":"ON","CMAKE_BUILD_PARALLEL_LEVEL":"2"}
+
           # ── macOS ───────────────────────────────────────────────────────
           - os: darwin
             arch: amd64
@@ -136,6 +150,15 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Free disk space for ROCm SDK and fat build
+        if: runner.os == 'Linux' && contains(matrix.features, 'rocm')
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          large-packages: false
+          docker-images: false
+          tool-cache: false
+          swap-storage: false
+
       - name: Setup
         uses: ./.github/actions/native-setup
         with:
@@ -156,6 +179,36 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev
+
+      - name: Install ROCm SDK (Linux)
+        if: runner.os == 'Linux' && contains(matrix.features, 'rocm')
+        env:
+          ROCM_VERSION: ${{ matrix.rocm_version }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | \
+            gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main" | \
+            sudo tee /etc/apt/sources.list.d/rocm.list
+          printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' | \
+            sudo tee /etc/apt/preferences.d/rocm-pin-600
+          sudo apt-get update
+          # Compiler, device libraries, and BLAS only; no GPU driver is needed to build.
+          sudo apt-get install -y --no-install-recommends hip-dev rocm-device-libs hipblas-dev rocblas-dev
+          sudo apt-get clean
+
+          rocm_path="/opt/rocm-${ROCM_VERSION}"
+          {
+            echo "ROCM_PATH=$rocm_path"
+            echo "HIP_PATH=$rocm_path"
+            echo "CMAKE_HIP_COMPILER=$rocm_path/llvm/bin/clang"
+            echo "CMAKE_PREFIX_PATH=$rocm_path"
+          } >> "$GITHUB_ENV"
+          echo "$rocm_path/bin" >> "$GITHUB_PATH"
+          printf '%s/lib\n%s/lib64\n' "$rocm_path" "$rocm_path" | \
+            sudo tee /etc/ld.so.conf.d/querymt-rocm.conf
+          sudo ldconfig
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'

@@ -33,6 +33,7 @@ impl ToolTrait for KnowledgeStatsTool {
                 description: "Get statistics about the knowledge store for a given scope. Returns counts of entries, consolidations, and timestamps.".to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "scope": {
                             "type": "string",

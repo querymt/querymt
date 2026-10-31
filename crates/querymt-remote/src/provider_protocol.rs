@@ -1,13 +1,22 @@
 use querymt::ToolCall;
 use querymt::Usage;
-use querymt::chat::{ChatMessage, ChatOutput, FinishReason, StreamChunk, Tool};
+use querymt::chat::{
+    ChatCapabilities, ChatMessage, ChatOutput, FinishReason, GenerationOptions, StreamChunk, Tool,
+};
 pub use querymt::chat::{ITEM_AWARE_CHAT_CONTRACT_VERSION, messages_require_item_aware_contract};
 use querymt::error::LLMErrorPayload;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub struct GetProviderContractInfo;
+/// Asks a provider host for its contract and the capabilities of the provider
+/// it would build for this `(provider, model, params)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetProviderContractInfo {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
 
 /// Wire-protocol generation advertised by mesh provider hosts.
 ///
@@ -16,7 +25,15 @@ pub struct GetProviderContractInfo;
 /// via [`GetProviderContractInfo`] before the first provider call and fail
 /// fast with an actionable message on mismatch instead of surfacing opaque
 /// MessagePack decoding complaints.
-pub const MESH_PROTOCOL_VERSION: u32 = 2;
+pub const MESH_PROTOCOL_VERSION: u32 = 4;
+
+/// Host-resolved generation settings used to plan output-limit recovery.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderGenerationProfile {
+    pub initial_max_tokens: Option<u32>,
+    pub output_ceiling: Option<u32>,
+    pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderContractInfo {
@@ -26,6 +43,12 @@ pub struct ProviderContractInfo {
     /// before protocol versioning; the client treats that as a mismatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<u32>,
+    /// Chat capabilities of the provider the peer builds for the request,
+    /// including which per-request options it honours.
+    #[serde(default)]
+    pub capabilities: ChatCapabilities,
+    #[serde(default)]
+    pub generation: ProviderGenerationProfile,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +191,10 @@ pub struct ProviderChatRequest {
     pub params: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_aware_contract_version: Option<u32>,
+    /// Per-request generation overrides. Omitted from the wire when unset, and
+    /// ignored by peers that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<GenerationOptions>,
 }
 
 pub type GenericProviderStreamRequest<TRouterRef> = ProviderStreamRequest<TRouterRef>;
@@ -190,6 +217,10 @@ pub struct ProviderStreamRequest<TRouterRef> {
     pub params: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_aware_contract_version: Option<u32>,
+    /// Per-request generation overrides. Omitted from the wire when unset, and
+    /// ignored by peers that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<GenerationOptions>,
 }
 
 pub fn default_stream_heartbeat_secs() -> u64 {
@@ -303,7 +334,7 @@ pub fn should_ack_relay_message(
 mod item_aware_tests {
     use super::*;
     use querymt::chat::{
-        ChatFunctionCallItem, ChatMessage, ChatOutput, ChatOutputItem, ChatOutputStatus,
+        ChatCall, ChatFunctionCallItem, ChatMessage, ChatOutput, ChatOutputItem, ChatOutputStatus,
         ChatStreamAccumulator, StructuredStreamEvent,
     };
     use serde_json::json;
@@ -437,13 +468,76 @@ mod item_aware_tests {
         assert_eq!(streamed.items, output.items);
     }
 
+    /// The Anthropic parser's structured output (metadata, signed reasoning,
+    /// text, an opaque server block, two local calls, a terminal) crosses the
+    /// relay encoding, is recognised as terminal only at `ResponseTerminal`, and
+    /// accumulates without any flat `Done` chunk. The fixture is asserted against
+    /// the parser in `qmt-anthropic`.
+    #[test]
+    fn anthropic_shaped_structured_stream_terminates_on_response_terminal() {
+        let path = format!(
+            "{}/../providers/anthropic/tests/fixtures/structured_tool_turn.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let events: Vec<StreamChunk> =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture"))
+                .expect("fixture chunks");
+        assert!(
+            events
+                .iter()
+                .all(|c| matches!(c, StreamChunk::Structured(_)))
+        );
+        let last = events.len() - 1;
+
+        let mut accumulator = ChatStreamAccumulator::new();
+        let expected = {
+            let mut accumulator = ChatStreamAccumulator::new();
+            for chunk in &events {
+                accumulator.push(chunk).expect("accumulate locally");
+            }
+            accumulator.finish_success().expect("complete locally")
+        };
+        for (position, chunk) in events.into_iter().enumerate() {
+            let relay = StreamRelayMessage::Chunk(chunk);
+            let decoded: StreamRelayMessage =
+                serde_json::from_slice(&serde_json::to_vec(&relay).expect("serialize"))
+                    .expect("deserialize");
+            assert_eq!(
+                relay_message_is_terminal(&decoded),
+                position == last,
+                "only the ResponseTerminal event closes the relay (event {position})"
+            );
+            let StreamRelayMessage::Chunk(chunk) = decoded else {
+                panic!("expected relayed chunk")
+            };
+            accumulator.push(&chunk).expect("accumulate chunk");
+        }
+
+        let output = accumulator.finish_success().expect("complete stream");
+        assert_eq!(output.items, expected.items, "relay preserves every item");
+        assert_eq!(output.items.len(), 5);
+        assert_eq!(output.finish_reason, Some(FinishReason::ToolCalls));
+
+        // A batched delivery containing the terminal is also recognised.
+        let batch = StreamRelayMessage::ChunkBatch(vec![StreamChunk::Structured(
+            StructuredStreamEvent::ResponseTerminal {
+                status: ChatOutputStatus::Completed,
+                usage: None,
+                finish_reason: Some(FinishReason::Stop),
+                detail: None,
+            },
+        )]);
+        assert!(relay_message_is_terminal(&batch));
+    }
+
     #[test]
     fn requests_advertise_item_aware_contract_only_when_needed() {
         let config = crate::RemoteProviderClientConfig::new("peer", "demo", "m1");
-        let legacy = config.build_chat_request(&[ChatMessage::user().text("hi").build()], None);
+        let legacy =
+            config.build_chat_request(&ChatCall::new(&[ChatMessage::user().text("hi").build()]));
         assert_eq!(legacy.item_aware_contract_version, None);
 
-        let structured = config.build_chat_request(&[structured_message()], None);
+        let structured = config.build_chat_request(&ChatCall::new(&[structured_message()]));
         assert_eq!(
             structured.item_aware_contract_version,
             Some(ITEM_AWARE_CHAT_CONTRACT_VERSION)
@@ -518,14 +612,11 @@ mod item_aware_tests {
             .push(ToolResultPart::text("result payload"));
         let result = ChatMessage::from_user_parts(vec![ChatInputPart::tool_result(tool_result)]);
 
-        let request = config.build_chat_request(
-            &[
-                ChatMessage::from_user_parts(vec![ChatInputPart::text("look it up")]),
-                assistant,
-                result,
-            ],
-            None,
-        );
+        let request = config.build_chat_request(&ChatCall::new(&[
+            ChatMessage::from_user_parts(vec![ChatInputPart::text("look it up")]),
+            assistant,
+            result,
+        ]));
         assert_eq!(
             request.item_aware_contract_version,
             Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
@@ -588,6 +679,7 @@ mod item_aware_tests {
 mod rmp_wire_tests {
     use super::*;
     use querymt::chat::{CacheHint, ChatInputPart};
+    use serde_json::json;
 
     fn assert_rmp_round_trip_equal<T>(value: &T)
     where
@@ -608,6 +700,7 @@ mod rmp_wire_tests {
             tools: None,
             params: None,
             item_aware_contract_version: None,
+            options: None,
         }
     }
 
@@ -694,6 +787,7 @@ mod rmp_wire_tests {
             lease_ttl_secs: 60,
             params: None,
             item_aware_contract_version: None,
+            options: None,
         };
         assert_rmp_round_trip_equal(&request);
     }
@@ -703,6 +797,12 @@ mod rmp_wire_tests {
         let current = ProviderContractInfo {
             item_aware_chat_version: Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
             protocol_version: Some(MESH_PROTOCOL_VERSION),
+            capabilities: Default::default(),
+            generation: ProviderGenerationProfile {
+                initial_max_tokens: Some(32_000),
+                output_ceiling: Some(128_000),
+                reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
+            },
         };
         assert_rmp_round_trip_equal(&current);
 
@@ -711,6 +811,39 @@ mod rmp_wire_tests {
         }))
         .expect("legacy contract info");
         assert_eq!(legacy.protocol_version, None);
+    }
+
+    #[test]
+    fn requests_without_options_decode_and_omit_options_on_the_wire() {
+        // A peer that predates per-request options sends no `options` field.
+        let legacy: ProviderChatRequest = serde_json::from_value(serde_json::json!({
+            "provider": "demo",
+            "model": "m1",
+            "messages": [],
+            "tools": null
+        }))
+        .expect("legacy chat request");
+        assert_eq!(legacy.options, None);
+
+        // And unset options are never sent to older peers.
+        let encoded = serde_json::to_value(chat_request(Vec::new())).unwrap();
+        assert!(encoded.get("options").is_none());
+    }
+
+    #[test]
+    fn requests_with_options_round_trip_over_rmp() {
+        let mut request = chat_request(Vec::new());
+        request.options = Some(GenerationOptions::default().with_max_tokens(64_000));
+        assert_rmp_round_trip_equal(&request);
+    }
+
+    #[test]
+    fn contract_info_without_capabilities_reports_none() {
+        let legacy: ProviderContractInfo = serde_json::from_value(serde_json::json!({
+            "protocol_version": MESH_PROTOCOL_VERSION
+        }))
+        .expect("legacy contract info");
+        assert_eq!(legacy.capabilities, ChatCapabilities::NONE);
     }
 
     #[test]
@@ -729,6 +862,78 @@ mod rmp_wire_tests {
             decoded
         };
         assert_eq!(decoded.output.text().as_deref(), Some("hello"));
+    }
+
+    fn usage_with_tiers(tiers: Option<querymt::CacheWriteTiers>) -> Usage {
+        Usage {
+            input_tokens: 12,
+            output_tokens: 3,
+            reasoning_tokens: 5,
+            cache_read: 30,
+            cache_write: 300,
+            cache_write_tiers: tiers,
+        }
+    }
+
+    #[test]
+    fn cache_write_tiers_survive_remote_response_and_stream_transport() {
+        let cases = [
+            // Breakdown absent: must not turn into zeros.
+            None,
+            // Explicit zero one-hour count stays distinct from absent.
+            Some(querymt::CacheWriteTiers {
+                five_minute: Some(300),
+                one_hour: Some(0),
+            }),
+            // Only one side reported.
+            Some(querymt::CacheWriteTiers {
+                five_minute: None,
+                one_hour: Some(100),
+            }),
+            Some(querymt::CacheWriteTiers {
+                five_minute: Some(200),
+                one_hour: Some(100),
+            }),
+        ];
+        for tiers in cases {
+            let usage = usage_with_tiers(tiers);
+
+            let response = ProviderChatResponse::from(ChatOutput::from_projections(
+                None,
+                Some("hi".to_string()),
+                None,
+                Some(usage.clone()),
+                None,
+            ));
+            let rmp = rmp_serde::to_vec_named(&response).expect("encode response");
+            let decoded: ProviderChatResponse = rmp_serde::decode::from_slice(&rmp).unwrap();
+            assert_eq!(decoded.output.usage, Some(usage.clone()), "rmp {tiers:?}");
+            let json = serde_json::to_vec(&response).expect("json response");
+            let decoded: ProviderChatResponse = serde_json::from_slice(&json).unwrap();
+            assert_eq!(decoded.output.usage, Some(usage.clone()), "json {tiers:?}");
+
+            let relay = StreamRelayMessage::Chunk(StreamChunk::Usage(usage.clone()));
+            let rmp = rmp_serde::to_vec_named(&relay).expect("encode chunk");
+            let decoded: StreamRelayMessage = rmp_serde::decode::from_slice(&rmp).unwrap();
+            let StreamRelayMessage::Chunk(StreamChunk::Usage(decoded)) = decoded else {
+                panic!("expected usage chunk")
+            };
+            assert_eq!(decoded, usage, "stream {tiers:?}");
+            assert_eq!(decoded.cache_write_tiers, tiers);
+        }
+    }
+
+    #[test]
+    fn legacy_usage_without_tiers_decodes_as_absent_over_the_remote_wire() {
+        let response: ProviderChatResponse = serde_json::from_value(json!({
+            "text": "legacy",
+            "usage": {"input_tokens": 1, "output_tokens": 2, "cache_write": 7},
+            "finish_reason": "Stop"
+        }))
+        .expect("usage without tiers");
+        let usage = response.output.usage.expect("usage");
+        assert_eq!(usage.cache_write, 7);
+        assert_eq!(usage.cache_write_tiers, None);
     }
 
     #[test]

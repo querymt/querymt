@@ -97,6 +97,7 @@ mod event_relay_mesh_tests {
 
         // Publish a durable event to the source fanout
         source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
+            session_seq: 0,
             event_id: "e-f1".into(),
             stream_seq: 1,
             session_id: "s-f1".into(),
@@ -143,6 +144,7 @@ mod event_relay_mesh_tests {
         relay_ref.kill();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
+            session_seq: 0,
             event_id: "e-f1-dead".into(),
             stream_seq: 1,
             session_id: "s-f1-dead".into(),
@@ -190,6 +192,7 @@ mod event_relay_mesh_tests {
 
         for i in 1i64..=5 {
             source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
+                session_seq: 0,
                 event_id: format!("e-f2-{}", i),
                 stream_seq: i,
                 session_id: "s-f2".into(),
@@ -223,6 +226,100 @@ mod event_relay_mesh_tests {
         assert_eq!(received_seqs.len(), 5);
     }
 
+    /// ordered-session-events 1.3: one `EventForwarder` → one
+    /// `EventRelayActor` over the mesh preserves `tell` order for a burst of
+    /// 1,000 numbered events (durable and ephemeral interleaved).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_event_forwarding_preserves_order_for_1000_events() {
+        const COUNT: usize = 1000;
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+        let (relay_ref, event_sink, dht_name) = setup_relay("f2-1000", &test_id, "s-f2-1000").await;
+        let _ = relay_ref;
+
+        let remote_relay = mesh
+            .lookup_actor::<EventRelayActor>(&dht_name)
+            .await
+            .expect("lookup")
+            .expect("not found");
+
+        let source_fanout = Arc::new(EventFanout::new());
+        let mut rx = event_sink.fanout().subscribe();
+        let collector = tokio::spawn(async move {
+            let mut order = Vec::with_capacity(COUNT);
+            while order.len() < COUNT {
+                match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {
+                    Ok(Ok(envelope)) => {
+                        let id = match envelope.kind() {
+                            AgentEventKind::AssistantContentDelta { message_id, .. } => {
+                                message_id.clone()
+                            }
+                            AgentEventKind::AssistantMessageStored {
+                                message_id: Some(message_id),
+                                ..
+                            } => message_id.clone(),
+                            _ => continue,
+                        };
+                        order.push(id.parse::<usize>().expect("numbered event"));
+                    }
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                        panic!("collector lagged by {n}")
+                    }
+                    other => panic!("relay stream ended early: {other:?}"),
+                }
+            }
+            order
+        });
+
+        let _handle = EventForwarder::start(
+            source_fanout.clone(),
+            remote_relay,
+            "source-f2-1000".to_string(),
+            "s-f2-1000".to_string(),
+        );
+
+        for i in 0..COUNT {
+            let envelope = if i % 5 == 4 {
+                EventEnvelope::Durable(crate::events::DurableEvent {
+                    session_seq: 0,
+                    event_id: format!("e-{i}"),
+                    stream_seq: i as i64 + 1,
+                    session_id: "s-f2-1000".into(),
+                    timestamp: 0,
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::AssistantMessageStored {
+                        content: "x".into(),
+                        thinking: None,
+                        reasoning_parts: Vec::new(),
+                        message_id: Some(i.to_string()),
+                    },
+                })
+            } else {
+                EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+                    session_seq: 0,
+                    session_id: "s-f2-1000".into(),
+                    timestamp: 0,
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::AssistantContentDelta {
+                        content: "tok".into(),
+                        message_id: i.to_string(),
+                    },
+                })
+            };
+            source_fanout.publish(envelope);
+            // Keep the source fanout (1024 slots) from lagging the forwarder.
+            if i % 64 == 63 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let order = collector.await.expect("collector");
+        let expected: Vec<usize> = (0..COUNT).collect();
+        assert_eq!(order, expected, "relay must preserve forwarder tell order");
+    }
+
     // ── F.3 ──────────────────────────────────────────────────────────────────
     //
     // The `received` counter on `EventRelayActor` is private.  We verify it
@@ -241,6 +338,7 @@ mod event_relay_mesh_tests {
             _relay_ref
                 .tell(RelayedEvent {
                     event: AgentEvent {
+                        session_seq: 0,
                         seq: i,
                         timestamp: 0,
                         session_id: "s-f3".to_string(),
@@ -322,6 +420,7 @@ mod event_relay_mesh_tests {
 
             f.config.event_sink.fanout().publish(EventEnvelope::Durable(
                 crate::events::DurableEvent {
+                    session_seq: 0,
                     event_id: format!("e-f4-{attempt}"),
                     stream_seq: attempt as i64,
                     session_id: session_id.clone(),
@@ -506,6 +605,7 @@ mod event_relay_mesh_tests {
 
         // Publish event for a DIFFERENT session — must be dropped by forwarder
         source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
+            session_seq: 0,
             event_id: "e-other".into(),
             stream_seq: 1,
             session_id: "other-session".into(),
@@ -517,6 +617,7 @@ mod event_relay_mesh_tests {
 
         // Publish event for the TARGET session — must be forwarded
         source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
+            session_seq: 0,
             event_id: "e-target".into(),
             stream_seq: 2,
             session_id: "target-session".into(),
@@ -608,6 +709,7 @@ mod event_relay_mesh_tests {
 
         // Publish event for session-a only
         source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
+            session_seq: 0,
             event_id: "e-a".into(),
             stream_seq: 1,
             session_id: "session-a".into(),
@@ -857,6 +959,7 @@ mod event_relay_mesh_tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             f.config.event_sink.fanout().publish(EventEnvelope::Durable(
                 crate::events::DurableEvent {
+                    session_seq: 0,
                     event_id: "e-f7-pre".into(),
                     stream_seq: 1,
                     session_id: session_id.clone(),
@@ -923,6 +1026,7 @@ mod event_relay_mesh_tests {
             .event_sink
             .fanout()
             .publish(EventEnvelope::Durable(crate::events::DurableEvent {
+                session_seq: 0,
                 event_id: post_detach_event_id.into(),
                 stream_seq: 99,
                 session_id: session_id.clone(),

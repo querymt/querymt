@@ -12,13 +12,12 @@ use crate::tools::{
     generate_with_tools, parse_tool_response,
 };
 use async_trait::async_trait;
-use futures::Stream;
 use futures::channel::mpsc;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, Tool};
+use querymt::chat::{ChatCall, ChatCapabilities, ChatOutput, ChatProvider, ChatStream};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
@@ -326,15 +325,12 @@ impl LlamaCppProvider {
 
 #[async_trait]
 impl ChatProvider for LlamaCppProvider {
-    fn supports_streaming(&self) -> bool {
-        true
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE.with_streaming(true)
     }
 
-    async fn chat_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<ChatOutput, LLMError> {
+    async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+        let (messages, tools) = (call.messages, call.tools);
         let max_tokens = self.cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
         // Extract media from messages (empty vec if none)
@@ -350,10 +346,11 @@ impl ChatProvider for LlamaCppProvider {
         }
 
         // Convert media to bitmaps (if multimodal context available)
-        let bitmaps = if let Some(ref mm_ctx) = self.multimodal {
+        let bitmaps = if let Some(mm_ctx) = self.multimodal.as_ref().filter(|_| !media.is_empty()) {
+            let ctx = mm_ctx.lock()?;
             media
                 .iter()
-                .map(|m| m.to_bitmap(&mm_ctx.ctx))
+                .map(|m| m.to_bitmap(&ctx))
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             vec![]
@@ -499,14 +496,8 @@ impl ChatProvider for LlamaCppProvider {
         .into())
     }
 
-    async fn chat_stream_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<
-        std::pin::Pin<Box<dyn Stream<Item = Result<querymt::chat::StreamChunk, LLMError>> + Send>>,
-        LLMError,
-    > {
+    async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
+        let (messages, tools) = (call.messages, call.tools);
         let max_tokens = self.cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
         let (tx, rx) = mpsc::unbounded();
 
@@ -521,10 +512,11 @@ impl ChatProvider for LlamaCppProvider {
         }
 
         // Convert media to bitmaps
-        let bitmaps = if let Some(ref mm_ctx) = self.multimodal {
+        let bitmaps = if let Some(mm_ctx) = self.multimodal.as_ref().filter(|_| !media.is_empty()) {
+            let ctx = mm_ctx.lock()?;
             media
                 .iter()
-                .map(|m| m.to_bitmap(&mm_ctx.ctx))
+                .map(|m| m.to_bitmap(&ctx))
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             vec![]

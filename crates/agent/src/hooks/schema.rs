@@ -116,6 +116,32 @@ pub struct UpdatedDelegationWire {
     pub constraints: Option<String>,
     #[serde(default)]
     pub expected_output: Option<String>,
+    /// Execution isolation requested for this delegate. Absent keeps the
+    /// caller's resolution from the delegate tool request.
+    #[serde(default)]
+    pub isolation: Option<DelegationIsolationWire>,
+}
+
+/// Wire representation of the delegate execution isolation policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationIsolationWire {
+    /// Resolve from the parent's execution mode.
+    Inherit,
+    /// Explicitly share the parent's checkout (disclosed as shared).
+    Shared,
+    /// Explicitly request a private worktree checkout for this delegate.
+    Isolated,
+}
+
+impl From<DelegationIsolationWire> for crate::worktree::DelegationIsolation {
+    fn from(wire: DelegationIsolationWire) -> Self {
+        match wire {
+            DelegationIsolationWire::Inherit => crate::worktree::DelegationIsolation::Inherit,
+            DelegationIsolationWire::Shared => crate::worktree::DelegationIsolation::Shared,
+            DelegationIsolationWire::Isolated => crate::worktree::DelegationIsolation::Isolated,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -591,6 +617,10 @@ pub struct PostCompactionCommandInput {
 #[schemars(rename = "pre-delegation.command.input")]
 pub struct PreDelegationCommandInput {
     pub session_id: String,
+    #[serde(default)]
+    pub parent_session_id: String,
+    #[serde(default)]
+    pub parent_cwd: String,
     pub turn_id: String,
     pub transcript_path: NullableString,
     pub cwd: String,
@@ -612,6 +642,10 @@ pub struct PreDelegationCommandInput {
 #[schemars(rename = "delegation-start.command.input")]
 pub struct DelegationStartCommandInput {
     pub session_id: String,
+    #[serde(default)]
+    pub parent_session_id: String,
+    #[serde(default)]
+    pub parent_cwd: String,
     pub turn_id: String,
     pub transcript_path: NullableString,
     pub cwd: String,
@@ -634,6 +668,10 @@ pub struct DelegationStartCommandInput {
 #[schemars(rename = "post-delegation.command.input")]
 pub struct PostDelegationCommandInput {
     pub session_id: String,
+    #[serde(default)]
+    pub parent_session_id: String,
+    #[serde(default)]
+    pub parent_cwd: String,
     pub turn_id: String,
     pub transcript_path: NullableString,
     pub cwd: String,

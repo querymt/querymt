@@ -81,6 +81,9 @@ pub struct AgentToolContext {
     scope_policy: Arc<dyn ScopePolicy>,
     event_sink: Option<Arc<EventSink>>,
     task_service: Option<crate::session::TaskService>,
+    mutation_gate: Option<Arc<crate::worktree::gate::CheckoutMutationGate>>,
+    workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    session_store: Option<Arc<dyn crate::session::store::SessionStore>>,
 }
 
 impl AgentToolContext {
@@ -101,7 +104,28 @@ impl AgentToolContext {
             scope_policy: Arc::new(crate::knowledge::PermissiveScopePolicy),
             event_sink: None,
             task_service: None,
+            mutation_gate: None,
+            workspace_service: None,
+            session_store: None,
         }
+    }
+
+    /// Attach the managed worktree workspace service (when configured).
+    pub fn with_workspace_service(
+        mut self,
+        service: Option<Arc<crate::worktree::WorkspaceService>>,
+    ) -> Self {
+        self.workspace_service = service;
+        self
+    }
+
+    /// Attach the durable session store.
+    pub fn with_session_store(
+        mut self,
+        store: Arc<dyn crate::session::store::SessionStore>,
+    ) -> Self {
+        self.session_store = Some(store);
+        self
     }
 
     /// Create a context with an explicit cancellation token.
@@ -139,6 +163,17 @@ impl AgentToolContext {
 
     pub fn with_task_service(mut self, service: crate::session::TaskService) -> Self {
         self.task_service = Some(service);
+        self
+    }
+
+    /// Attach the checkout-scoped cooperative mutation gate for this
+    /// session's workspace. Mutating built-ins then serialize their file
+    /// writes with baseline capture and undo/redo.
+    pub fn with_mutation_gate(
+        mut self,
+        gate: Arc<crate::worktree::gate::CheckoutMutationGate>,
+    ) -> Self {
+        self.mutation_gate = Some(gate);
         self
     }
 
@@ -180,24 +215,7 @@ impl ToolContext for AgentToolContext {
 
     fn emit_event(&self, kind: crate::events::AgentEventKind) {
         if let Some(ref sink) = self.event_sink {
-            use crate::events::{Durability, classify_durability};
-
-            let session_id = self.session_id.clone();
-
-            if classify_durability(&kind) == Durability::Ephemeral {
-                sink.emit_ephemeral(&session_id, kind);
-            } else {
-                let sink = sink.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = sink.emit_durable(&session_id, kind).await {
-                        log::warn!(
-                            "failed to emit durable event for session {}: {}",
-                            session_id,
-                            err
-                        );
-                    }
-                });
-            }
+            sink.session_stream(&self.session_id).emit(kind);
         }
     }
 
@@ -280,6 +298,18 @@ impl ToolContext for AgentToolContext {
 
     fn cancellation_token(&self) -> CancellationToken {
         self.cancellation_token.clone()
+    }
+
+    fn checkout_mutation_gate(&self) -> Option<Arc<crate::worktree::gate::CheckoutMutationGate>> {
+        self.mutation_gate.clone()
+    }
+
+    fn workspace_service(&self) -> Option<Arc<crate::worktree::WorkspaceService>> {
+        self.workspace_service.clone()
+    }
+
+    fn session_store(&self) -> Option<Arc<dyn crate::session::store::SessionStore>> {
+        self.session_store.clone()
     }
 
     fn as_any(&self) -> &dyn Any {

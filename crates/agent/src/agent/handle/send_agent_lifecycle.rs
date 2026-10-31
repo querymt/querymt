@@ -42,9 +42,17 @@ impl LocalAgentHandle {
                     .delete(SessionDeleteCapabilities::new()),
             );
 
-        // Add delegation metadata if agent registry is available
-        if let Some(delegation_meta) = self.build_delegation_meta() {
-            capabilities = capabilities.meta(delegation_meta);
+        // Additive `_meta`: delegation targets, and workspace support when (and
+        // only when) a workspace service is configured.
+        let mut meta = self.build_delegation_meta().unwrap_or_default();
+        if let Some(service) = self.config.workspace_service() {
+            meta.insert(
+                crate::acp::shared::QUERYMT_META_NAMESPACE.to_string(),
+                serde_json::json!({ "workspace": service.capability_meta() }),
+            );
+        }
+        if !meta.is_empty() {
+            capabilities = capabilities.meta(meta);
         }
 
         Ok(InitializeResponse::new(protocol_version)
@@ -103,6 +111,9 @@ impl LocalAgentHandle {
         &self,
         req: ForkSessionRequest,
     ) -> Result<ForkSessionResponse, Error> {
+        self.session_materializer
+            .ensure_writable(req.session_id.0.as_ref())
+            .await?;
         // Phase 1: Prepare fork (heavy DB work, NO registry lock held)
         let response = self.session_materializer.prepare_fork_session(req).await?;
 
@@ -117,77 +128,120 @@ impl LocalAgentHandle {
     ) -> Result<ResumeSessionResponse, Error> {
         let session_id = req.session_id.to_string();
 
-        // Single-flight check: Check if session is already materialized
-        // Clone the actor_ref out of the registry to avoid holding the lock
-        // during the async ask(GetMode) call.
-        let existing_actor_ref = {
-            let registry = self.registry_lock().await;
-            registry.local_actor_ref(&session_id).cloned()
-        };
-
-        if let Some(existing_ref) = existing_actor_ref {
-            // Registry lock is now dropped, safe to make async actor calls.
-            let current_mode = existing_ref
-                .ask(crate::agent::messages::GetMode)
-                .mailbox_timeout(std::time::Duration::from_secs(10))
-                .reply_timeout(std::time::Duration::from_secs(10))
-                .send()
+        // Resolve durable ownership before touching a local actor registry, just
+        // as load does. A second runtime would own a competing event counter.
+        #[cfg(feature = "remote")]
+        if let Some(bookmark) = self
+            .config
+            .provider
+            .history_store()
+            .get_remote_session_bookmark(&session_id)
+            .await
+            .map_err(|error| Error::internal_error().data(error.to_string()))?
+        {
+            if self
+                .config
+                .provider
+                .history_store()
+                .get_session(&session_id)
                 .await
-                .map_err(|e| Error::internal_error().data(e.to_string()))?;
-            let session_ref = SessionActorRef::from(existing_ref);
-            let reasoning_effort = self
-                .session_reasoning_effort(&session_ref, &session_id)
-                .await;
-
-            let config_options = self
-                .session_config_options(Some(&session_id), current_mode, reasoning_effort)
-                .await?;
+                .map_err(|error| Error::internal_error().data(error.to_string()))?
+                .is_some()
+            {
+                return Err(Error::invalid_params().data(serde_json::json!({
+                    "message": "Session ID exists both locally and remotely",
+                    "sessionId": session_id,
+                })));
+            }
+            self.ensure_remote_session_connected(
+                &session_id,
+                Some(&bookmark.node_id),
+                crate::agent::handle::remote_connect::RemoteConnectReason::Open,
+            )
+            .await
+            .map_err(|error| error.to_acp_error())?;
+            let session_ref = self
+                .registry
+                .lock()
+                .await
+                .get(&session_id)
+                .cloned()
+                .ok_or_else(|| Error::internal_error().data("remote session was not attached"))?;
+            let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
             return Ok(ResumeSessionResponse::new()
                 .modes(crate::agent::session_registry::mode_state(current_mode))
-                .config_options(config_options));
+                .config_options(self.remote_session_config_options(&session_id).await?));
         }
 
-        // Phase 1: Prepare session (heavy work, NO registry lock held)
-        // The session_materializer's internal single-flight lock prevents
-        // duplicate materialization of the same session ID.
-        // Pass registry so it can re-check after acquiring the lock.
-        let (prepared, session_ref) = match self
+        let session_ref =
+            if let Some((owner, binding)) = self.bound_session_handle(&session_id).await? {
+                let owner = owner
+                    .as_any()
+                    .downcast_ref::<LocalAgentHandle>()
+                    .ok_or_else(|| {
+                        Error::internal_error().data(serde_json::json!({
+                            "message": "bound session runtime is not local",
+                            "sessionId": session_id,
+                            "profileId": binding.profile_id,
+                            "agentId": binding.agent_id,
+                        }))
+                    })?;
+                let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
+                if let Some(bridge) = bridge {
+                    owner.set_bridge(bridge).await;
+                }
+                owner.resume_session_in_runtime(req).await?
+            } else {
+                if self.profiles().is_some() {
+                    return Err(Error::invalid_params().data(serde_json::json!({
+                        "message": "Session has no profile binding",
+                        "sessionId": session_id,
+                    })));
+                }
+                self.resume_session_in_runtime(req).await?
+            };
+        let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+        let reasoning_effort = self
+            .session_reasoning_effort(&session_ref, &session_id)
+            .await;
+        let config_options = self
+            .session_config_options(Some(&session_id), current_mode, reasoning_effort)
+            .await?;
+        Ok(ResumeSessionResponse::new()
+            .modes(crate::agent::session_registry::mode_state(current_mode))
+            .config_options(config_options))
+    }
+
+    async fn resume_session_in_runtime(
+        &self,
+        req: ResumeSessionRequest,
+    ) -> Result<SessionActorRef, Error> {
+        let session_id = req.session_id.to_string();
+        if let Some(session_ref) =
+            crate::agent::session_registry::live_session(&self.registry, &session_id).await
+        {
+            return Ok(session_ref);
+        }
+        // Keep the owning materializer's single-flight guard through registration
+        // and finalization, including concurrent load/resume requests.
+        match self
             .session_materializer
             .prepare_resume_session(req, Some(&self.registry))
             .await?
         {
             PreparedSessionResult::Prepared(prepared) => {
-                let session_ref = {
-                    let mut registry = self.registry_lock().await;
-                    registry.register_prepared_session(&prepared).await
-                };
-                (Some(prepared), session_ref)
+                let session_ref = crate::agent::session_registry::register_prepared_session(
+                    &self.registry,
+                    &prepared,
+                )
+                .await;
+                self.session_materializer
+                    .finalize_session(&prepared)
+                    .await?;
+                Ok(session_ref)
             }
-            PreparedSessionResult::AlreadyRegistered(session_ref) => (None, session_ref),
-        };
-
-        // Phase 3: Finalize session (post-registration work, NO registry lock held)
-        // Pass the bridge for setup outside the lock
-        if let Some(prepared) = prepared.as_ref() {
-            let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
-            self.session_materializer
-                .finalize_session(prepared, bridge)
-                .await?;
+            PreparedSessionResult::AlreadyRegistered(session_ref) => Ok(session_ref),
         }
-
-        // Get current per-session settings for the response.
-        let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
-        let reasoning_effort = self
-            .session_reasoning_effort(&session_ref, &session_id)
-            .await;
-
-        let config_options = self
-            .session_config_options(Some(&session_id), current_mode, reasoning_effort)
-            .await?;
-
-        Ok(ResumeSessionResponse::new()
-            .modes(crate::agent::session_registry::mode_state(current_mode))
-            .config_options(config_options))
     }
 
     async fn run_session_end_hook(&self, session_id: &str, reason: &str) -> Result<(), Error> {
@@ -245,15 +299,18 @@ impl LocalAgentHandle {
 
         // Closing is best-effort: deleting persisted history is the primary intent.
         // Route through the session binding so delegated runtimes are released too.
-        let _ = self.stop_session(&session_id).await;
+        //
+        // The hook runs before the per-session guard is taken so a slow hook
+        // cannot hold up loads of this session. The guard then spans teardown
+        // through the row delete, so a concurrent load cannot register an
+        // actor for a session that is being deleted.
         if let Err(error) = self.run_session_end_hook(&session_id, "delete").await {
             tracing::warn!(session_id, %error, "session_end hook failed during delete");
         }
+        let delete_guard = self.terminate_for_delete(&session_id).await;
 
-        let exists = self
-            .config
-            .provider
-            .history_store()
+        let store = self.config.provider.history_store();
+        let exists = store
             .get_session(&session_id)
             .await
             .map_err(|e| Error::internal_error().data(serde_json::json!({"error": e.to_string()})))?
@@ -266,14 +323,18 @@ impl LocalAgentHandle {
             return Ok(DeleteSessionResponse::new());
         }
 
-        self.config
-            .provider
-            .history_store()
-            .delete_session(&session_id)
-            .await
-            .map_err(|e| {
-                Error::internal_error().data(serde_json::json!({"error": e.to_string()}))
-            })?;
+        store.delete_session(&session_id).await.map_err(|e| {
+            Error::internal_error().data(serde_json::json!({"error": e.to_string()}))
+        })?;
+        self.config.remove_run_lease_file(&session_id);
+        drop(delete_guard);
+        if store.supports_session_pins() {
+            crate::control::notifications::emit_session_pins_changed_notification(
+                self,
+                &session_id,
+            )
+            .await;
+        }
         self.clear_delegate_model_overrides(&session_id).await;
         if let Some(profiles) = self.profiles() {
             profiles.forget_session_binding(&session_id).await;

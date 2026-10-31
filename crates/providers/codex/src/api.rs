@@ -346,6 +346,7 @@ impl CodexRawUsage {
             reasoning_tokens: reasoning,
             cache_read,
             cache_write,
+            cache_write_tiers: None,
         }
     }
 }
@@ -1932,7 +1933,7 @@ mod tests {
         let mut cfg = test_codex("test-token");
         cfg.system = vec!["stable".into(), "dynamic".into()];
         assert_eq!(
-            super::CodexProviderConfig::system(&cfg).unwrap().as_ref(),
+            &*super::CodexProviderConfig::system(&cfg).unwrap(),
             "stable\n\ndynamic"
         );
         let mut messages = basic_user_messages();

@@ -10,6 +10,22 @@ use crate::{FunctionCall, ToolCall, Usage};
 /// Provider-specific fields retained by the structured chat contract.
 pub type Extensions = Map<String, Value>;
 
+/// Extension key a provider sets (to `true`) on a function-call item whose
+/// arguments must not execute even if they parse: for example a tool block
+/// that a token limit interrupted. Executors read it from the canonical item
+/// before the lossy projection to `ToolCall`.
+pub const INVALID_INPUT_EXTENSION: &str = "anthropic.invalid_input";
+
+impl ChatFunctionCallItem {
+    /// Whether the provider marked this call's input invalid.
+    pub fn is_marked_invalid(&self) -> bool {
+        self.extensions
+            .get(INVALID_INPUT_EXTENSION)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+}
+
 /// A validated concrete MIME type used by structured media.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct MediaType(mime::Mime);
@@ -1250,7 +1266,7 @@ impl ChatMessagePayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::{ChatMessage, ChatProvider, Tool};
+    use crate::chat::ChatProvider;
     use crate::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
     use crate::embedding::EmbeddingProvider;
     use crate::error::LLMError;
@@ -1601,11 +1617,7 @@ mod tests {
 
     #[async_trait]
     impl ChatProvider for LimitedProvider {
-        async fn chat_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<ChatOutput, LLMError> {
+        async fn chat(&self, _call: &crate::chat::ChatCall<'_>) -> Result<ChatOutput, LLMError> {
             Ok(ChatOutput::from_projections(
                 None,
                 Some("legacy text".into()),
@@ -1644,7 +1656,10 @@ mod tests {
     #[tokio::test]
     async fn legacy_provider_remains_usable_through_dyn_llm_provider() {
         let provider: &dyn crate::LLMProvider = &LimitedProvider;
-        let output = provider.chat(&[]).await.unwrap();
+        let output = provider
+            .chat(&crate::chat::ChatCall::new(&[]))
+            .await
+            .unwrap();
 
         assert!(!output.requires_item_aware_fidelity());
         assert_eq!(output.text().as_deref(), Some("legacy text"));

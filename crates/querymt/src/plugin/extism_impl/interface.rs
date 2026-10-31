@@ -1,10 +1,10 @@
 pub use crate::chat::{ITEM_AWARE_CHAT_CONTRACT_VERSION, messages_require_item_aware_contract};
 use crate::{
     ToolCall, Usage,
-    chat::{ChatMessage, ChatOutput, FinishReason, Tool},
+    chat::{ChatMessage, ChatOutput, FinishReason, GenerationOptions, Tool},
     completion::CompletionRequest,
     error::{LLMError, LLMErrorPayload},
-    plugin::extism_impl::SerializableHttpResponse,
+    plugin::extism_impl::{SerializableHttpRequest, SerializableHttpResponse},
     stt, tts,
 };
 use serde::{Deserialize, Serialize};
@@ -163,12 +163,43 @@ pub struct ExtismChatRequest<C> {
     pub tools: Option<Vec<Tool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_aware_contract_version: Option<u32>,
+    /// Per-request generation overrides. Omitted from the wire when unset, so
+    /// older plugins never see the field; older hosts simply never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<GenerationOptions>,
 }
 
 #[derive(Deserialize, Serialize)]
 pub struct ExtismChatParseRequest<C> {
     pub cfg: C,
     pub resp: SerializableHttpResponse,
+    #[serde(default)]
+    pub context: serde_json::Value,
+}
+
+/// Versioned prepared-chat contract shared by host and plugin.
+///
+/// Version 2 replaces the per-direction `chat_request` / `chat_stream_request`
+/// exports and `supported_generation_options` / `supports_streaming` with
+/// `prepare_chat_request(call, stream)` and `capabilities`.
+pub const PREPARED_CHAT_CONTRACT_VERSION: u32 = 2;
+
+#[derive(Deserialize, Serialize)]
+pub struct ExtismPreparedChatRequest {
+    pub request: SerializableHttpRequest,
+    pub context: serde_json::Value,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ExtismChatPrepareRequest<C> {
+    pub chat: ExtismChatRequest<C>,
+    pub stream: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ExtismChatStreamParserRequest<C> {
+    pub cfg: C,
+    pub context: serde_json::Value,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -466,6 +497,78 @@ mod item_aware_tests {
     use serde_json::json;
 
     #[test]
+    fn prepared_chat_context_roundtrips_separately_from_http() {
+        let private = json!({"tool_names": {"mcp_GetWeather": "GetWeather"}});
+        let prepared = ExtismPreparedChatRequest {
+            request: SerializableHttpRequest {
+                req: http::Request::builder()
+                    .uri("https://example.invalid/chat")
+                    .body(b"request body".to_vec())
+                    .unwrap(),
+            },
+            context: private.clone(),
+        };
+        let decoded: ExtismPreparedChatRequest =
+            serde_json::from_slice(&serde_json::to_vec(&prepared).unwrap()).unwrap();
+        assert_eq!(decoded.context, private);
+        assert_eq!(decoded.request.req.body(), b"request body");
+        assert!(decoded.request.req.headers().is_empty());
+        let parser = ExtismChatStreamParserRequest {
+            cfg: json!({}),
+            context: decoded.context,
+        };
+        let decoded: ExtismChatStreamParserRequest<serde_json::Value> =
+            serde_json::from_slice(&serde_json::to_vec(&parser).unwrap()).unwrap();
+        assert_eq!(decoded.context, private);
+    }
+
+    #[test]
+    fn cache_write_tiers_round_trip_through_plugin_response_and_chunk() {
+        use crate::{CacheWriteTiers, Usage, chat::StreamChunk};
+        for tiers in [
+            None,
+            Some(CacheWriteTiers {
+                five_minute: Some(300),
+                one_hour: Some(0),
+            }),
+            Some(CacheWriteTiers {
+                five_minute: Some(200),
+                one_hour: Some(100),
+            }),
+        ] {
+            let usage = Usage {
+                input_tokens: 12,
+                cache_read: 30,
+                cache_write: 300,
+                cache_write_tiers: tiers,
+                ..Usage::default()
+            };
+            let response = ExtismChatResponse {
+                output: ChatOutput::from_projections(
+                    None,
+                    Some("hi".into()),
+                    None,
+                    Some(usage.clone()),
+                    None,
+                ),
+            };
+            let decoded: ExtismChatResponse =
+                serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+            assert_eq!(decoded.output.usage, Some(usage.clone()), "{tiers:?}");
+
+            let chunk = ExtismChatChunk {
+                chunk: StreamChunk::Usage(usage.clone()),
+            };
+            let decoded: ExtismChatChunk =
+                serde_json::from_slice(&serde_json::to_vec(&chunk).unwrap()).unwrap();
+            let StreamChunk::Usage(decoded) = decoded.chunk else {
+                panic!("expected usage chunk")
+            };
+            assert_eq!(decoded, usage, "{tiers:?}");
+        }
+    }
+
+    #[test]
     fn legacy_extism_payloads_default_item_aware_fields() {
         let request: ExtismChatRequest<serde_json::Value> = serde_json::from_value(json!({
             "cfg": {},
@@ -474,6 +577,7 @@ mod item_aware_tests {
         }))
         .expect("legacy request");
         assert_eq!(request.item_aware_contract_version, None);
+        assert_eq!(request.options, None);
 
         let response: ExtismChatResponse = serde_json::from_value(json!({
             "text": "legacy",
@@ -499,6 +603,67 @@ mod item_aware_tests {
         assert!(message.get("content").is_none());
         assert_eq!(message["input"][0]["type"], "text");
         assert_eq!(message["input"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn extism_chat_request_options_round_trip() {
+        use crate::chat::ReasoningEffort;
+
+        let options = GenerationOptions::default()
+            .with_max_tokens(128_000)
+            .with_reasoning_effort(ReasoningEffort::Low);
+        let request = ExtismChatRequest {
+            cfg: json!({}),
+            messages: Vec::new(),
+            tools: None,
+            item_aware_contract_version: None,
+            options: Some(options),
+        };
+
+        let encoded = serde_json::to_vec(&request).expect("serialize request");
+        let decoded: ExtismChatRequest<serde_json::Value> =
+            serde_json::from_slice(&encoded).expect("deserialize request");
+
+        assert_eq!(decoded.options, Some(options));
+    }
+
+    #[test]
+    fn extism_chat_request_omits_unset_options_from_wire() {
+        let request = ExtismChatRequest {
+            cfg: json!({}),
+            messages: Vec::new(),
+            tools: None,
+            item_aware_contract_version: None,
+            options: None,
+        };
+
+        let value = serde_json::to_value(&request).expect("serialize request");
+
+        // Older plugins must see byte-identical requests when no override is set.
+        assert!(value.get("options").is_none());
+    }
+
+    #[test]
+    fn extism_prepare_request_carries_options_to_plugin() {
+        let prepare = ExtismChatPrepareRequest {
+            chat: ExtismChatRequest {
+                cfg: json!({}),
+                messages: Vec::new(),
+                tools: None,
+                item_aware_contract_version: None,
+                options: Some(GenerationOptions::default().with_max_tokens(64_000)),
+            },
+            stream: true,
+        };
+
+        let decoded: ExtismChatPrepareRequest<serde_json::Value> =
+            serde_json::from_slice(&serde_json::to_vec(&prepare).unwrap()).unwrap();
+
+        assert!(decoded.stream);
+        assert_eq!(
+            decoded.chat.options.and_then(|o| o.max_tokens),
+            Some(64_000)
+        );
     }
 
     #[test]
@@ -611,6 +776,7 @@ mod item_aware_tests {
             ],
             tools: None,
             item_aware_contract_version: None,
+            options: None,
         };
         assert!(
             messages_require_item_aware_contract(&request.messages),

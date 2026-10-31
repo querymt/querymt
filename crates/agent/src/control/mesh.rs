@@ -15,11 +15,15 @@ pub struct MeshScopeInfo {
 pub struct MeshStatusInfo {
     pub enabled: bool,
     pub peer_id: Option<String>,
+    #[serde(default)]
+    pub hostname: Option<String>,
     pub transport: Option<String>,
     pub known_peer_count: u32,
     pub has_invite_store: bool,
     pub has_mesh_state_store: bool,
     pub scopes: Vec<MeshScopeInfo>,
+    #[serde(default)]
+    pub iroh: Option<querymt_remote::IrohTransportDiagnostics>,
 }
 
 #[typeshare]
@@ -152,6 +156,7 @@ pub async fn status(agent: &LocalAgentHandle) -> MeshStatusInfo {
             return MeshStatusInfo {
                 enabled: true,
                 peer_id: Some(mesh.peer_id().to_string()),
+                hostname: Some(mesh.local_hostname().to_string()),
                 transport: Some(transport.to_string()),
                 known_peer_count: crate::agent::utils::u32_from_usize(
                     mesh.known_peer_ids().len(),
@@ -161,6 +166,7 @@ pub async fn status(agent: &LocalAgentHandle) -> MeshStatusInfo {
                 has_invite_store: mesh.invite_store().is_some(),
                 has_mesh_state_store: mesh.mesh_state_store().is_some(),
                 scopes,
+                iroh: runtime.iroh_diagnostics(),
             };
         }
     }
@@ -168,11 +174,13 @@ pub async fn status(agent: &LocalAgentHandle) -> MeshStatusInfo {
     MeshStatusInfo {
         enabled: false,
         peer_id: None,
+        hostname: None,
         transport: None,
         known_peer_count: 0,
         has_invite_store: false,
         has_mesh_state_store: false,
         scopes: Vec::new(),
+        iroh: None,
     }
 }
 

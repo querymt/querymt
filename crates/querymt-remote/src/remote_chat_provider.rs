@@ -1,11 +1,10 @@
 use crate::{RemoteProviderClientCore, RemoteProviderClientTransport, RemoteProviderStreamState};
 use futures_util::StreamExt;
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool};
+use querymt::chat::{ChatCall, ChatCapabilities, ChatOutput, ChatProvider, ChatStream};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
-use std::pin::Pin;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -60,21 +59,17 @@ impl<TTransport> ChatProvider for RemoteChatProvider<TTransport>
 where
     TTransport: RemoteProviderClientTransport + 'static,
 {
-    fn supports_streaming(&self) -> bool {
-        true
+    fn capabilities(&self) -> ChatCapabilities {
+        self.core.capabilities()
     }
 
-    async fn chat_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<ChatOutput, LLMError> {
+    async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
         let provider_name = self.core.config().provider_name.clone();
         let model_name = self.core.config().model.clone();
         let target_locator = self.core.config().target_locator.clone();
         let result = self
             .core
-            .chat_with_tools(messages, tools, |error| {
+            .chat(call, |error| {
                 matches!(
                     error,
                     LLMError::Transport {
@@ -105,14 +100,7 @@ where
         Ok(chat_response.into_canonical_output())
     }
 
-    async fn chat_stream_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<
-        Pin<Box<dyn futures_util::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
-        LLMError,
-    > {
+    async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
         let request_id = Uuid::now_v7().to_string();
         let session_id = self
             .remote_session_id()
@@ -128,8 +116,8 @@ where
             provider = %provider_name,
             model = %model_name,
             target_locator = %target_locator,
-            message_count = messages.len(),
-            tool_count = tools.map(|t| t.len()).unwrap_or(0),
+            message_count = call.messages.len(),
+            tool_count = call.tools.map(|t| t.len()).unwrap_or(0),
             first_chunk_ms = tracing::field::Empty,
         );
         let _setup_guard = setup_span.enter();
@@ -158,12 +146,11 @@ where
             "remote provider host lookup completed"
         );
 
-        let (tx, rx) = mpsc::channel::<crate::StreamRelayMessage>(64);
+        let (tx, rx) = mpsc::unbounded_channel::<crate::StreamRelayMessage>();
         tracing::debug!(
             target: "querymt_remote::provider::stream",
             session_id = %session_id,
             request_id = %request_id,
-            channel_capacity = 64,
             "registering and attaching stream router consumer"
         );
         let (_router_ref, remote_router_ref) = self
@@ -178,8 +165,7 @@ where
         );
 
         let stream_request = self.core.build_stream_request(
-            messages,
-            tools,
+            call,
             session_id.clone(),
             request_id.clone(),
             remote_router_ref,
@@ -233,7 +219,7 @@ where
             "remote provider stream request acknowledged"
         );
 
-        let raw_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let raw_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
         let session_id_for_stream = session_id.clone();
         let request_id_for_stream = request_id.clone();
         let provider_for_stream = provider_name.clone();

@@ -15,6 +15,7 @@ common = ["llama-cpp-2/common", "llama-cpp-2/mtmd", "llama-cpp-2/llguidance", "d
 llguidance = ["common"]
 cuda = ["api", "common", "llama-cpp-2/cuda"]
 metal = ["api", "common", "llama-cpp-2/metal"]
+rocm = ["api", "common", "llama-cpp-2/rocm"]
 openmp = ["llama-cpp-2/openmp"]
 vulkan = ["api", "common", "llama-cpp-2/vulkan"]
 
@@ -26,15 +27,15 @@ async-trait.workspace = true
 encoding_rs = "0.8"
 futures.workspace = true
 infer = { version = "0.22", default-features = false }
-llama-cpp-2 = { version = "0.1.157", default-features = false }
+llama-cpp-2 = { version = "0.1.160", default-features = false }
 llguidance = { version = "1.7", optional = true }
 toktrie = { version = "1.7", optional = true }
 querymt-provider-common = { path = "../../provider-common" }
 querymt-utils = { path = "../../querymt-utils" }
 log.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-minijinja = { version = "2", default-features = false, features = ["adjacent_loop_items", "builtins", "json", "loop_controls", "macros", "serde"] }
-minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
+minijinja = { version = "3", default-features = false, features = ["adjacent_loop_items", "builtins", "json", "loop_controls", "macros", "serde"] }
+minijinja-contrib = { version = "3", default-features = false, features = ["pycompat"] }
 querymt = { path = "../../querymt", default-features = false, optional = true }
 regex = "1"
 schemars.workspace = true

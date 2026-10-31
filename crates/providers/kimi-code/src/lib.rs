@@ -11,8 +11,9 @@ use querymt::{
     HTTPLLMProvider,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
-        http::{ChatStreamParser, HTTPChatProvider},
+        ChatCall, ChatCapabilities, ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat,
+        Tool, ToolChoice,
+        http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -147,45 +148,40 @@ impl HTTPChatProvider for KimiCode {
         classify_openai_http_error(response)
     }
 
-    fn supports_streaming(&self) -> bool {
-        self.stream.unwrap_or(false)
-    }
-
-    fn chat_request(
+    fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
+        call: &ChatCall<'_>,
+        stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
         let mut resolved = self.clone();
         resolved.api_key = self.resolved_api_key();
+        if stream {
+            resolved.stream = Some(true);
+        }
         let profile = self.profile();
-        let normalized_messages = KimiCode::normalize_messages(messages);
-        let mut request = openai_chat_request(&resolved, &normalized_messages, tools)?;
+        let normalized_messages = KimiCode::normalize_messages(call.messages);
+        let mut request = openai_chat_request(&resolved, &normalized_messages, call.tools)?;
         KimiCode::apply_kimi_agent_headers(&mut request, &profile)?;
-        Ok(request)
+        Ok(PreparedChatRequest::stateless(request))
     }
 
-    fn chat_stream_request(
+    fn parse_chat(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        let mut resolved = self.clone();
-        resolved.api_key = self.resolved_api_key();
-        resolved.stream = Some(true);
-        let profile = self.profile();
-        let normalized_messages = KimiCode::normalize_messages(messages);
-        let mut request = openai_chat_request(&resolved, &normalized_messages, tools)?;
-        KimiCode::apply_kimi_agent_headers(&mut request, &profile)?;
-        Ok(request)
-    }
-
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        response: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         openai_parse_chat(self, response)
     }
 
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+    fn chat_stream_parser(
+        &self,
+        _context: serde_json::Value,
+    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
         Ok(Box::new(KimiCodeStreamParser::default()))
+    }
+
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE.with_streaming(self.stream.unwrap_or(false))
     }
 }
 
@@ -436,7 +432,7 @@ impl HTTPLLMProviderFactory for KimiCodeFactory {
 #[cfg(test)]
 mod tests {
     use super::KimiCode;
-    use querymt::chat::{ChatMessage, http::HTTPChatProvider};
+    use querymt::chat::{ChatCall, ChatMessage, http::HTTPChatProvider};
     use serde_json::Value;
 
     fn test_provider() -> KimiCode {
@@ -451,11 +447,14 @@ mod tests {
     fn chat_request_includes_kimi_agent_headers() {
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
 
         let messages = vec![ChatMessage::user().text("hello").build()];
-        let request = provider.chat_request(&messages, None).unwrap();
+        let request = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
+            .unwrap();
 
         for header_name in [
             "user-agent",
@@ -494,7 +493,10 @@ mod tests {
                 .build(),
         ];
 
-        let request = provider.chat_stream_request(&messages, None).unwrap();
+        let request = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), true)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         let api_messages = body["messages"].as_array().unwrap();
 
@@ -531,7 +533,10 @@ mod tests {
                 .build(),
         ];
 
-        let request = provider.chat_request(&messages, None).unwrap();
+        let request = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         let api_messages = body["messages"].as_array().unwrap();
 
@@ -552,7 +557,7 @@ mod tests {
     fn chat_request_injects_reasoning_content_for_assistant_tool_calls() {
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
         let messages = vec![
             ChatMessage::user().text("run tool").build(),
@@ -562,7 +567,10 @@ mod tests {
                 .build(),
         ];
 
-        let request = provider.chat_request(&messages, None).unwrap();
+        let request = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         let api_messages = body
             .get("messages")
@@ -589,7 +597,7 @@ mod tests {
     fn chat_request_omits_reasoning_content_when_no_thinking() {
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
         let messages = vec![
             ChatMessage::user().text("run tool").build(),
@@ -598,7 +606,10 @@ mod tests {
                 .build(),
         ];
 
-        let request = provider.chat_request(&messages, None).unwrap();
+        let request = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         let api_messages = body
             .get("messages")
@@ -627,7 +638,7 @@ mod tests {
     fn reasoning_content_matches_by_tool_call_id_not_position() {
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
         let messages = vec![
             ChatMessage::user().text("first").build(),
@@ -642,7 +653,10 @@ mod tests {
                 .build(),
         ];
 
-        let request = provider.chat_request(&messages, None).unwrap();
+        let request = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         let api_messages = body["messages"].as_array().unwrap();
 
@@ -670,9 +684,9 @@ mod tests {
         // Default (stream: None) → no streaming
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
-        assert!(!provider.supports_streaming());
+        assert!(!provider.capabilities().streaming);
 
         // Explicit stream: true → streaming enabled
         let provider: KimiCode = serde_json::from_value(serde_json::json!({
@@ -681,7 +695,7 @@ mod tests {
             "stream": true
         }))
         .unwrap();
-        assert!(provider.supports_streaming());
+        assert!(provider.capabilities().streaming);
 
         // Explicit stream: false → streaming disabled
         let provider: KimiCode = serde_json::from_value(serde_json::json!({
@@ -690,7 +704,7 @@ mod tests {
             "stream": false
         }))
         .unwrap();
-        assert!(!provider.supports_streaming());
+        assert!(!provider.capabilities().streaming);
     }
 
     #[test]
@@ -698,10 +712,13 @@ mod tests {
         // When stream is omitted, the request body should have stream: false
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
         let messages = vec![ChatMessage::user().text("hi").build()];
-        let request = provider.chat_request(&messages, None).unwrap();
+        let request = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         assert_eq!(body.get("stream").and_then(Value::as_bool), Some(false));
     }
@@ -710,7 +727,10 @@ mod tests {
     fn chat_stream_request_forces_stream_true() {
         let provider = test_provider();
         let messages = vec![ChatMessage::user().text("hi").build()];
-        let request = provider.chat_stream_request(&messages, None).unwrap();
+        let request = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), true)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         assert_eq!(body.get("stream").and_then(Value::as_bool), Some(true));
     }
@@ -719,7 +739,7 @@ mod tests {
     fn parse_chat_stream_chunk_emits_text_delta() {
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
         let chunk =
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello world\"}}]}\n\n";
@@ -735,7 +755,7 @@ mod tests {
     fn parse_chat_stream_chunk_emits_reasoning_content_as_thinking() {
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
         // Kimi uses `reasoning_content` for thinking deltas in SSE responses
         let chunk = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"let me think...\"}}]}\n\n";
@@ -751,7 +771,7 @@ mod tests {
     fn parse_chat_stream_chunk_handles_tool_call_sequence() {
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
 
         // First chunk: tool call start with id and function name
@@ -818,7 +838,9 @@ mod tests {
             )
             .unwrap();
 
-        let response = provider.parse_chat(response).unwrap();
+        let response = provider
+            .parse_chat(response, serde_json::Value::Null)
+            .unwrap();
         let tool_calls = response.tool_calls().expect("tool calls should be present");
 
         assert_eq!(tool_calls[0].id, "tool_LUbH2dHPwNU9pt1GrIYrywKV");
@@ -830,7 +852,7 @@ mod tests {
 
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
 
         let start = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"tool_LUbH2dHPwNU9pt1GrIYrywKV","type":"function","function":{"name":"ls","arguments":"{\"path\":\".\"}"}}]}}]}
@@ -874,7 +896,10 @@ mod tests {
                 )
                 .build(),
         ];
-        let request = provider.chat_stream_request(&messages, None).unwrap();
+        let request = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), true)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         let api_messages = body["messages"].as_array().unwrap();
 
@@ -895,7 +920,7 @@ mod tests {
 
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
 
         let start = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"ls","arguments":"{\"path\":\".\"}"}}]}}]}
@@ -939,7 +964,10 @@ mod tests {
                 )
                 .build(),
         ];
-        let request = provider.chat_stream_request(&messages, None).unwrap();
+        let request = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), true)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         let api_messages = body["messages"].as_array().unwrap();
 
@@ -968,7 +996,10 @@ mod tests {
                 .build(),
         ];
 
-        let request = provider.chat_stream_request(&messages, None).unwrap();
+        let request = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), true)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         let api_messages = body["messages"].as_array().unwrap();
 
@@ -1009,7 +1040,10 @@ mod tests {
                 .build(),
         ];
 
-        let request = provider.chat_stream_request(&messages, None).unwrap();
+        let request = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), true)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         let api_messages = body["messages"].as_array().unwrap();
 
@@ -1026,7 +1060,7 @@ mod tests {
     fn parse_chat_stream_chunk_handles_done_sentinel() {
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
         let chunk = b"data: [DONE]\n\n";
         let events = parser.parse_chunk(chunk).unwrap();
@@ -1043,7 +1077,7 @@ mod tests {
     fn parse_chat_stream_chunk_emits_usage() {
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
         let chunk =
             b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\n";
@@ -1066,7 +1100,7 @@ mod tests {
         // Kimi may send `data:{...}` instead of `data: {...}`
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
         let chunk = b"data:{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n";
         let events = parser.parse_chunk(chunk).unwrap();
@@ -1085,7 +1119,7 @@ mod tests {
     fn parse_chat_stream_chunk_handles_done_without_space() {
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
         let chunk = b"data:[DONE]\n";
         let events = parser.parse_chunk(chunk).unwrap();

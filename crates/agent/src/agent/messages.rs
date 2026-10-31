@@ -7,10 +7,9 @@
 //!
 //! Public messages that may be sent across the kameo mesh (when the `remote`
 //! feature is enabled) derive `Serialize + Deserialize`. Internal-only messages
-//! (`PromptFinished`, `SetBridge`, `Shutdown`) do NOT — they are local-only and
+//! (`PromptFinished`, `Shutdown`) do NOT — they are local-only and
 //! contain non-serializable types.
 
-use crate::acp::client_bridge::ClientBridgeSender;
 use crate::acp::protocol::{ExtNotification as AcpExtNotification, ExtRequest, PromptRequest};
 use crate::agent::core::AgentMode;
 use crate::agent::session_control::{
@@ -20,7 +19,6 @@ pub use crate::agent::turn_control::{InputDelivery, SubmitInput, SubmitInputResu
 use querymt::LLMParams;
 use querymt::chat::ReasoningEffort;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use typeshare::typeshare;
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -34,8 +32,6 @@ use typeshare::typeshare;
 #[derive(Serialize, Deserialize)]
 pub struct Prompt {
     pub req: PromptRequest,
-    #[serde(skip)]
-    pub bridge: Option<ClientBridgeSender>,
 }
 
 /// Submit explicitly steered or queued input.
@@ -73,12 +69,48 @@ pub struct SessionRuntimeStatus {
     pub queued_input_count: u32,
     #[typeshare(serialized_as = "Option<number>")]
     pub run_started_at_ms: Option<u64>,
+    pub observation: RuntimeObservation,
+    #[serde(default)]
+    pub delegation_activity:
+        Vec<crate::control::delegation_notifications::DelegationUpdateNotification>,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeObservation {
+    pub availability: RuntimeAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
+    #[typeshare(serialized_as = "Option<number>")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeAvailability {
+    Live,
+    Inactive,
+    Unavailable,
+}
+
+impl RuntimeObservation {
+    pub const INACTIVE: Self = Self {
+        availability: RuntimeAvailability::Inactive,
+        epoch: None,
+        revision: None,
+        reason: None,
+    };
 }
 
 #[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRuntimePhase {
+    Unknown,
     Idle,
     Starting,
     Model,
@@ -89,6 +121,18 @@ pub enum SessionRuntimePhase {
 }
 
 impl SessionRuntimeStatus {
+    pub fn unavailable(reason: &str) -> Self {
+        Self {
+            phase: SessionRuntimePhase::Unknown,
+            observation: RuntimeObservation {
+                availability: RuntimeAvailability::Unavailable,
+                reason: Some(reason.to_string()),
+                ..RuntimeObservation::INACTIVE
+            },
+            ..Self::Idle
+        }
+    }
+
     #[allow(non_upper_case_globals)]
     pub const Idle: Self = Self {
         phase: SessionRuntimePhase::Idle,
@@ -97,6 +141,8 @@ impl SessionRuntimeStatus {
         pending_steering_count: 0,
         queued_input_count: 0,
         run_started_at_ms: None,
+        observation: RuntimeObservation::INACTIVE,
+        delegation_activity: Vec::new(),
     };
 
     #[allow(non_upper_case_globals)]
@@ -107,6 +153,8 @@ impl SessionRuntimeStatus {
         pending_steering_count: 0,
         queued_input_count: 0,
         run_started_at_ms: None,
+        observation: RuntimeObservation::INACTIVE,
+        delegation_activity: Vec::new(),
     };
 
     #[allow(non_upper_case_globals)]
@@ -117,6 +165,8 @@ impl SessionRuntimeStatus {
         pending_steering_count: 0,
         queued_input_count: 0,
         run_started_at_ms: None,
+        observation: RuntimeObservation::INACTIVE,
+        delegation_activity: Vec::new(),
     };
 
     #[allow(non_upper_case_globals)]
@@ -127,6 +177,8 @@ impl SessionRuntimeStatus {
         pending_steering_count: 0,
         queued_input_count: 0,
         run_started_at_ms: None,
+        observation: RuntimeObservation::INACTIVE,
+        delegation_activity: Vec::new(),
     };
 }
 
@@ -136,11 +188,16 @@ impl SessionRuntimeStatus {
 /// completions from older queued tasks.
 ///
 /// NOT serializable — only sent by spawned task within the same actor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RunCompletionDisposition {
     Completed,
     Failed,
     Cancelled,
+    /// The run ended on a middleware stop (e.g. the model's output limit).
+    Stopped {
+        stop_type: crate::events::StopType,
+        reason: String,
+    },
 }
 
 pub(crate) struct PromptFinished {
@@ -152,7 +209,7 @@ pub(crate) struct PromptFinished {
 pub(crate) struct RunPhaseChanged {
     pub generation: u64,
     pub run_id: String,
-    pub phase: crate::agent::turn_control::RunPhase,
+    pub phase: Option<crate::agent::turn_control::RunPhase>,
 }
 
 /// Run a scheduled prompt on this session.
@@ -272,6 +329,12 @@ pub struct GetRuntimeStatus;
 #[derive(Serialize, Deserialize)]
 pub struct GetLlmConfig;
 
+/// Local-only query: the slash-command registry this session actually
+/// expands prompts with (set at materialization for managed-checkout
+/// sessions). Lets the advertised catalog and invocation share one
+/// authority. Not serializable: it never crosses the mesh.
+pub struct GetSessionSlashRegistry;
+
 // ══════════════════════════════════════════════════════════════════════════
 //  Undo / Redo
 // ══════════════════════════════════════════════════════════════════════════
@@ -311,21 +374,6 @@ pub struct ExtNotification {
 // ══════════════════════════════════════════════════════════════════════════
 //  Lifecycle (local-only, NOT serializable)
 // ══════════════════════════════════════════════════════════════════════════
-
-/// Set the client bridge for SessionUpdate notifications.
-///
-/// NOT serializable — contains `ClientBridgeSender` (mpsc channel).
-pub struct SetBridge {
-    pub bridge: ClientBridgeSender,
-}
-
-#[cfg(test)]
-pub struct GetBridge;
-
-/// Clear a connection-local bridge only if it still belongs to that connection.
-pub struct ClearBridge {
-    pub connection_id: Arc<str>,
-}
 
 /// Stop this session actor gracefully.
 ///
@@ -441,6 +489,53 @@ pub struct SetPlanningContext {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+//  Session-owned interactions (elicitation / permission)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Snapshot the pending interactions owned by this session.
+///
+/// Reply: `Result<Vec<PendingElicitationSnapshot>, AgentError>`
+///
+/// When `assign_authority` is set, entries without an owner authority adopt it
+/// before the snapshot is taken (recovery authority issue).
+#[derive(Serialize, Deserialize)]
+pub struct ListPendingInteractions {
+    #[serde(default)]
+    pub assign_authority: Option<String>,
+}
+
+/// Claim delivery of pending interactions for a connection, bumping the
+/// delivery generation.
+///
+/// Reply: `Result<Vec<ClaimedElicitationDelivery>, AgentError>`
+///
+/// With `authority` the entry's owner authority must match; without it
+/// `interaction_id` is required (live claim by the connection that is
+/// receiving the request event).
+#[derive(Serialize, Deserialize)]
+pub struct ClaimInteractionDelivery {
+    pub interaction_id: Option<String>,
+    pub connection_id: String,
+    pub authority: Option<String>,
+}
+
+/// Resolve a pending interaction with a user answer.
+///
+/// Reply: `Result<ElicitationResolution, AgentError>`
+///
+/// `delivery_generation: Some(_)` requires the exact claimed delivery;
+/// `None` is the unclaimed path for connections without recovery authority.
+/// Invalid answers return `AgentError::InvalidInteractionResponse` and leave
+/// the interaction pending.
+#[derive(Serialize, Deserialize)]
+pub struct ResolveInteraction {
+    pub interaction_id: String,
+    pub connection_id: String,
+    pub delivery_generation: Option<u64>,
+    pub response: crate::elicitation::ElicitationResponse,
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 //  File Proxy (remote file index / file reads)
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -483,7 +578,7 @@ mod tests {
         // and the content field is called "prompt" in the protocol schema.
         let json = r#"{"req":{"sessionId":"sess-1","prompt":[]}}"#;
         let rt: Prompt = serde_json::from_str(json).unwrap();
-        assert!(rt.bridge.is_none());
+        assert_eq!(rt.req.session_id.to_string(), "sess-1");
         let back = serde_json::to_string(&rt).unwrap();
         assert!(back.contains("sess-1"));
     }

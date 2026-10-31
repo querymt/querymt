@@ -24,7 +24,7 @@
 
 use qmt_llama_cpp::{LlamaCppConfig, create_provider};
 use querymt::chat::{
-    ChatInputPart, ChatMessage, FunctionTool, MediaKind, MediaPart, MediaSource, Tool,
+    ChatCall, ChatInputPart, ChatMessage, FunctionTool, MediaKind, MediaPart, MediaSource, Tool,
 };
 use querymt_utils::str_utils::truncate_str;
 use serde_json::json;
@@ -129,7 +129,10 @@ async fn test_vision_chat_basic() {
         ChatInputPart::text("What's in this image?"),
     ])];
 
-    let response = provider.chat(&messages).await.expect("Chat failed");
+    let response = provider
+        .chat(&ChatCall::new(&messages))
+        .await
+        .expect("Chat failed");
     let text = response.text().unwrap_or_default();
     let usage = response.usage.clone().unwrap_or_default();
 
@@ -161,7 +164,7 @@ async fn test_vision_streaming() {
     ])];
 
     let mut stream = provider
-        .chat_stream(&messages)
+        .chat_stream(&ChatCall::new(&messages))
         .await
         .expect("stream failed");
 
@@ -212,7 +215,7 @@ async fn test_vision_chat_with_tools() {
     ])];
 
     let response = provider
-        .chat_with_tools(&messages, Some(&tools))
+        .chat(&ChatCall::new(&messages).tools(&tools))
         .await
         .expect("Chat with tools failed");
 
@@ -243,7 +246,7 @@ async fn test_vision_streaming_with_tools() {
     ])];
 
     let mut stream = provider
-        .chat_stream_with_tools(&messages, Some(&tools))
+        .chat_stream(&ChatCall::new(&messages).tools(&tools))
         .await
         .expect("stream with tools failed");
 
@@ -289,7 +292,10 @@ async fn test_text_only_with_vision_model() {
         "What is 2+2?",
     )])];
 
-    let response = provider.chat(&messages).await.expect("Chat failed");
+    let response = provider
+        .chat(&ChatCall::new(&messages))
+        .await
+        .expect("Chat failed");
     let text = response.text().unwrap_or_default();
 
     assert!(!text.is_empty(), "Should get text response");

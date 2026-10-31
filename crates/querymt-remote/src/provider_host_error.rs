@@ -60,8 +60,7 @@ mod tests {
                 .with_code(Some("server_is_overloaded".into()))
                 .with_request_id(Some("req-42".into())),
         );
-        let host_error =
-            RemoteProviderHostError::provider_chat("chat_stream_with_tools", &original);
+        let host_error = RemoteProviderHostError::provider_chat("chat_stream", &original);
 
         let recovered = LLMError::from_payload(host_error.to_payload());
         match recovered {
@@ -94,7 +93,7 @@ mod tests {
     #[test]
     fn payload_survives_the_mesh_wire_round_trip() {
         let original = LLMError::ProviderError("boom".to_string());
-        let host_error = RemoteProviderHostError::provider_chat("chat_with_tools", &original);
+        let host_error = RemoteProviderHostError::provider_chat("chat", &original);
 
         // Mirror kameo's handler-error codec exactly.
         let encoded = rmp_serde::to_vec_named(&host_error).expect("host error serializes");

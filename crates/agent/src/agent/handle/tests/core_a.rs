@@ -1,5 +1,336 @@
 use super::*;
 
+#[tokio::test]
+async fn status_consistency_idle_actor_does_not_mask_external_lease() {
+    let f = RealStorageHandleFixture::new().await;
+    let sid = seed_session_with_reasoning(&f, None).await;
+    f.handle
+        .load_session(LoadSessionRequest::new(
+            sid.clone(),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .unwrap();
+    let before = f
+        .handle
+        .observe_session_runtimes(std::slice::from_ref(&sid))
+        .await
+        .remove(&sid)
+        .unwrap();
+    assert_eq!(
+        before.phase,
+        crate::agent::messages::SessionRuntimePhase::Idle
+    );
+    let root = crate::session::run_lease::RunLeaseRoot::new(
+        f.handle.config.storage.run_lease_root().unwrap(),
+    );
+    let lease = root.acquire(&sid).await.unwrap().unwrap();
+    let state = f
+        .handle
+        .observe_session_runtimes(std::slice::from_ref(&sid))
+        .await
+        .remove(&sid)
+        .unwrap();
+    assert_eq!(
+        state.phase,
+        crate::agent::messages::SessionRuntimePhase::Unknown
+    );
+    assert_eq!(
+        state.observation.reason.as_deref(),
+        Some("live_owner_elsewhere")
+    );
+    let response = f
+        .handle
+        .handle_ext_session_runtime_state(ExtRequest::new(
+            "querymt/session/runtimeState",
+            Arc::from(
+                serde_json::value::to_raw_value(&serde_json::json!({"session_id": sid})).unwrap(),
+            ),
+        ))
+        .await
+        .unwrap();
+    let direct: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+    assert_eq!(direct, serde_json::to_value(&state).unwrap());
+    let listing = f
+        .handle
+        .list_sessions(ListSessionsRequest::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        listing
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id.to_string() == sid)
+            .unwrap()
+            .meta
+            .as_ref()
+            .unwrap()["runtimeStatus"],
+        direct
+    );
+    let snapshot = crate::session::load_snapshot::load_session_snapshot(
+        &f.handle,
+        f.storage.view_store().unwrap(),
+        &sid,
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot.runtime_status, state);
+    let sdk_session = crate::api::AgentSession::new(Arc::new(f.handle), sid);
+    assert_eq!(sdk_session.runtime_state().await.unwrap(), state);
+    drop(lease);
+}
+
+#[tokio::test]
+async fn status_observer_probes_do_not_report_each_other_as_execution() {
+    for materialized in [false, true] {
+        let f = RealStorageHandleFixture::new().await;
+        let sid = seed_session_with_reasoning(&f, None).await;
+        if materialized {
+            f.handle
+                .load_session(LoadSessionRequest::new(
+                    sid.clone(),
+                    std::path::PathBuf::new(),
+                ))
+                .await
+                .unwrap();
+        }
+        let root = f.storage.run_lease_root().unwrap();
+        let pause = crate::agent::handle::runtime_observation::pause_next_probe(&root, &sid);
+        let ids = [sid.clone()];
+        let first = f.handle.observe_session_runtimes(&ids);
+        tokio::pin!(first);
+        tokio::select! { _ = pause.entered.notified() => {}, _ = &mut first => panic!("probe did not pause") }
+        let (listed, direct, snapshot) = tokio::join!(
+            f.handle.list_sessions(ListSessionsRequest::new()),
+            f.handle.observe_session_runtimes(&ids),
+            crate::session::load_snapshot::load_session_snapshot(
+                &f.handle,
+                f.storage.view_store().unwrap(),
+                &sid
+            ),
+        );
+        pause.release.notify_one();
+        let first = first.await;
+        assert_eq!(
+            first[&sid].phase,
+            crate::agent::messages::SessionRuntimePhase::Idle
+        );
+        assert_eq!(
+            direct[&sid].phase,
+            crate::agent::messages::SessionRuntimePhase::Idle,
+            "observer's completed probe must not masquerade as a live run"
+        );
+        assert_eq!(
+            snapshot.unwrap().runtime_status.phase,
+            crate::agent::messages::SessionRuntimePhase::Idle
+        );
+        let row = listed
+            .unwrap()
+            .sessions
+            .into_iter()
+            .find(|row| row.session_id.to_string() == sid)
+            .unwrap();
+        assert_eq!(row.meta.unwrap()["runtimeStatus"]["phase"], "idle");
+        let lease = crate::session::run_lease::RunLeaseRoot::new(root)
+            .acquire(&sid)
+            .await
+            .unwrap()
+            .unwrap();
+        let external = f.handle.observe_session_runtimes(&ids).await;
+        assert_eq!(
+            external[&sid].observation.reason.as_deref(),
+            Some("live_owner_elsewhere")
+        );
+        drop(lease);
+    }
+}
+
+#[tokio::test]
+async fn status_observation_page_uses_one_deadline_including_owner_locks() {
+    let f = RealStorageHandleFixture::new().await;
+    let ids: Vec<_> = (0..100).map(|id| format!("blocked-page-{id}")).collect();
+    let _registry = f.handle.registry.lock().await;
+    let observed = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        f.handle.observe_session_runtimes(&ids),
+    )
+    .await
+    .expect("page must not spend a fresh timeout on every row");
+    assert_eq!(observed.len(), ids.len());
+    assert!(observed.values().all(|runtime| runtime.phase
+        == crate::agent::messages::SessionRuntimePhase::Unknown
+        && runtime.observation.reason.as_deref() == Some("observation_timeout")));
+}
+
+#[tokio::test]
+async fn status_observation_does_not_materialize_persisted_profile() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountingCatalog(Arc<AtomicUsize>);
+    #[async_trait]
+    impl ProfileCatalog for CountingCatalog {
+        async fn list_profiles(&self) -> anyhow::Result<Vec<crate::profiles::ProfileMetadata>> {
+            Ok(vec![])
+        }
+        async fn load_profile(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<crate::profiles::ProfileDocument> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("observation must not build this historical profile")
+        }
+    }
+    let f = RealStorageHandleFixture::new().await;
+    let session_id = seed_session_with_reasoning(&f, None).await;
+    f.storage
+        .session_store()
+        .set_profile_binding(&session_id, "unmaterialized")
+        .await
+        .unwrap();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(CountingCatalog(builds.clone()));
+    let (plugins, _dir) = empty_plugin_registry().unwrap();
+    let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        catalog,
+        "unmaterialized",
+        AgentInfra {
+            plugin_registry: Arc::new(plugins),
+            storage: Some(f.storage.clone()),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        },
+    ));
+    f.handle.set_profiles(profiles.clone());
+    let listing = f
+        .handle
+        .list_sessions(ListSessionsRequest::new())
+        .await
+        .unwrap();
+    let listed = listing
+        .sessions
+        .iter()
+        .find(|s| s.session_id.to_string() == session_id)
+        .unwrap();
+    let direct = f
+        .handle
+        .observe_session_runtimes(std::slice::from_ref(&session_id))
+        .await
+        .remove(&session_id)
+        .unwrap();
+    assert_eq!(
+        listed.meta.as_ref().unwrap()["runtimeStatus"],
+        serde_json::to_value(&direct).unwrap()
+    );
+    assert_eq!(builds.load(Ordering::SeqCst), 0);
+    assert!(profiles.materialized_runtimes().await.is_empty());
+    assert!(f.handle.registry.lock().await.is_empty());
+    let lease = crate::session::run_lease::RunLeaseRoot::new(
+        f.handle.config.storage.run_lease_root().unwrap(),
+    )
+    .acquire(&session_id)
+    .await
+    .unwrap()
+    .unwrap();
+    let other_owner = f
+        .handle
+        .observe_session_runtimes(std::slice::from_ref(&session_id))
+        .await
+        .remove(&session_id)
+        .unwrap();
+    assert_eq!(
+        other_owner.phase,
+        crate::agent::messages::SessionRuntimePhase::Unknown
+    );
+    assert_eq!(
+        other_owner.observation.reason.as_deref(),
+        Some("live_owner_elsewhere")
+    );
+    drop(lease);
+}
+
+#[tokio::test]
+async fn local_load_and_resume_replace_stopped_actors() {
+    for resume in [false, true] {
+        let f = RealStorageHandleFixture::new().await;
+        let session_id = seed_session_with_reasoning(&f, None).await;
+        f.handle
+            .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                SessionId::from(session_id.clone()),
+                std::path::PathBuf::new(),
+            ))
+            .await
+            .unwrap();
+        let dead = f
+            .handle
+            .registry
+            .lock()
+            .await
+            .local_actor_ref(&session_id)
+            .cloned()
+            .unwrap();
+        let old_id = dead.id();
+        dead.kill();
+        dead.wait_for_shutdown().await;
+        if resume {
+            f.handle
+                .resume_session(crate::acp::protocol::ResumeSessionRequest::new(
+                    SessionId::from(session_id.clone()),
+                    std::path::PathBuf::new(),
+                ))
+                .await
+                .expect("local resume rematerializes");
+        } else {
+            f.handle
+                .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                    SessionId::from(session_id.clone()),
+                    std::path::PathBuf::new(),
+                ))
+                .await
+                .expect("local load rematerializes");
+        }
+        let fresh = f
+            .handle
+            .registry
+            .lock()
+            .await
+            .local_actor_ref(&session_id)
+            .cloned()
+            .unwrap();
+        assert!(fresh.is_alive());
+        assert_ne!(fresh.id(), old_id);
+        fresh.kill();
+    }
+}
+
+#[tokio::test]
+async fn stopped_actor_is_evicted_without_another_load() {
+    let f = RealStorageHandleFixture::new().await;
+    let session_id = seed_session_with_reasoning(&f, None).await;
+    f.handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            SessionId::from(session_id.clone()),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .unwrap();
+    let actor = f
+        .handle
+        .registry
+        .lock()
+        .await
+        .local_actor_ref(&session_id)
+        .cloned()
+        .unwrap();
+    actor.kill();
+    actor.wait_for_shutdown().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while f.handle.registry.lock().await.get(&session_id).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shared registration installs a stop watcher");
+}
+
 #[test]
 fn test_should_return_without_force_stop_only_for_idle() {
     assert!(LocalAgentHandle::should_return_without_force_stop(
@@ -554,13 +885,270 @@ async fn test_new_session_binds_requested_profile_from_querymt_meta() {
         .expect("session binding");
 
     assert_eq!(binding.profile_id, "beta");
+    let options = response.config_options.expect("config options");
+    assert_eq!(options[0].id.0.as_ref(), "profile");
+    let model = options
+        .iter()
+        .find(|option| option.id.0.as_ref() == "model")
+        .expect("profile creation includes the effective model");
+    let loaded = f
+        .handle
+        .load_session(LoadSessionRequest::new(
+            session_id,
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .expect("reload profile session");
+    let loaded_options = loaded.config_options.expect("loaded config options");
+    let loaded_model = loaded_options
+        .iter()
+        .find(|option| option.id.0.as_ref() == "model")
+        .expect("profile reload includes model");
     assert_eq!(
-        response.config_options.expect("config options")[0]
-            .id
-            .0
-            .as_ref(),
-        "profile"
+        serde_json::to_value(model).unwrap(),
+        serde_json::to_value(loaded_model).unwrap()
     );
+}
+
+#[tokio::test]
+async fn profile_reopen_preserves_the_owning_actor_and_event_sequence() {
+    use crate::session::projection::EventJournal;
+
+    for (profile_id, agent_id) in [("alpha", None), ("quorum", Some("coder"))] {
+        let f = RealStorageHandleFixture::new().await;
+        let profile_dir = tempfile::tempdir().unwrap();
+        write_profile(profile_dir.path(), "alpha.toml", ALPHA_PROFILE_TOML);
+        write_profile(profile_dir.path(), "quorum.toml", QUORUM_PROFILE_TOML);
+        let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+            crate::profiles::LocalProfileCatalog::builder()
+                .include_embedded_default(false)
+                .include_default_user_dir(false)
+                .local_dir(profile_dir.path())
+                .build(),
+        );
+        let (registry, _registry_dir) = empty_plugin_registry().unwrap();
+        let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+            catalog,
+            "alpha",
+            AgentInfra {
+                plugin_registry: Arc::new(registry),
+                storage: Some(f.storage.clone()),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            },
+        ));
+        f.handle.set_profiles(profiles.clone());
+        let runtime = profiles.runtime_for_profile(profile_id).await.unwrap();
+        let owner = runtime.session_handle(agent_id).unwrap();
+        let owner = owner.as_any().downcast_ref::<LocalAgentHandle>().unwrap();
+        let created = owner
+            .new_session(NewSessionRequest::new(std::path::PathBuf::new()))
+            .await
+            .unwrap();
+        let session_id = created.session_id.to_string();
+        let mut binding = runtime.session_binding();
+        binding.agent_id = agent_id.map(str::to_string);
+        profiles
+            .set_session_binding(&session_id, binding)
+            .await
+            .unwrap();
+        let direct = owner
+            .registry
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .unwrap()
+            .get_runtime_status()
+            .await
+            .unwrap();
+        assert!(
+            owner.profiles().is_none(),
+            "direct bound owner must not need a profiles manager"
+        );
+        let own_observation = owner
+            .observe_session_runtimes(std::slice::from_ref(&session_id))
+            .await
+            .remove(&session_id)
+            .unwrap();
+        assert_eq!(
+            own_observation, direct,
+            "direct bound-owner observation must use its own registered actor"
+        );
+        let own_response = owner
+            .handle_ext_session_runtime_state(ExtRequest::new(
+                "querymt/session/runtimeState",
+                Arc::from(
+                    serde_json::value::to_raw_value(&serde_json::json!({"session_id": session_id}))
+                        .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(own_response.0.get()).unwrap(),
+            serde_json::to_value(&direct).unwrap()
+        );
+        if agent_id.is_none() {
+            let sdk = runtime
+                .agent()
+                .sessions()
+                .load(session_id.clone())
+                .await
+                .unwrap();
+            assert_eq!(sdk.runtime_state().await.unwrap(), direct);
+        }
+        let observed = f
+            .handle
+            .observe_session_runtimes(std::slice::from_ref(&session_id))
+            .await
+            .remove(&session_id)
+            .unwrap();
+        assert_eq!(
+            observed, direct,
+            "bound profile/delegate lookup must use its real actor"
+        );
+        assert_eq!(
+            observed.observation.availability,
+            crate::agent::messages::RuntimeAvailability::Live
+        );
+        let listed = f
+            .handle
+            .list_sessions(ListSessionsRequest::new())
+            .await
+            .unwrap();
+        let entry = listed
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id.to_string() == session_id)
+            .unwrap();
+        assert_eq!(
+            entry.meta.as_ref().unwrap()["runtimeStatus"],
+            serde_json::to_value(&direct).unwrap()
+        );
+        let stream = owner.config.event_sink.session_stream(&session_id);
+        stream.flush().await;
+        let tip = stream.tip();
+        f.handle
+            .load_session(LoadSessionRequest::new(
+                session_id.clone(),
+                std::path::PathBuf::new(),
+            ))
+            .await
+            .unwrap();
+        let resumed = SendAgent::resume_session(
+            &f.handle,
+            crate::acp::protocol::ResumeSessionRequest::new(
+                session_id.clone(),
+                std::path::PathBuf::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            resumed
+                .config_options
+                .unwrap()
+                .iter()
+                .any(|option| option.id.0.as_ref() == "profile")
+        );
+        assert!(
+            f.handle.registry.lock().await.get(&session_id).is_none(),
+            "reopening must not create an actor outside the owning profile"
+        );
+        assert_eq!(
+            stream.tip(),
+            tip,
+            "warm reopen must not write duplicate setup events"
+        );
+        owner
+            .config
+            .emit_event_persisted(&session_id, crate::events::AgentEventKind::SessionCreated)
+            .await
+            .expect("owning profile keeps its authoritative event sequence");
+        if agent_id.is_none() {
+            // The server's active profile can itself be the root handle.
+            owner.set_profiles(profiles.clone());
+            SendAgent::resume_session(
+                owner,
+                crate::acp::protocol::ResumeSessionRequest::new(
+                    session_id.clone(),
+                    std::path::PathBuf::new(),
+                ),
+            )
+            .await
+            .expect("same-runtime ownership must not recurse");
+        }
+        // Cold reopen still materializes in the bound owner, not the server root.
+        let stopped = owner
+            .registry
+            .lock()
+            .await
+            .local_actor_ref(&session_id)
+            .cloned()
+            .unwrap();
+        stopped.kill();
+        stopped.wait_for_shutdown().await;
+        stream.flush().await;
+        let count_materializations = |events: Vec<crate::events::DurableEvent>| {
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, crate::events::AgentEventKind::SessionCreated))
+                .count()
+        };
+        let before = count_materializations(
+            f.storage
+                .load_session_stream(&session_id, None, None)
+                .await
+                .unwrap(),
+        );
+        let (loaded, resumed, resumed_again) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(
+                    f.handle.load_session(LoadSessionRequest::new(
+                        session_id.clone(),
+                        std::path::PathBuf::new(),
+                    )),
+                    SendAgent::resume_session(
+                        &f.handle,
+                        crate::acp::protocol::ResumeSessionRequest::new(
+                            session_id.clone(),
+                            std::path::PathBuf::new(),
+                        ),
+                    ),
+                    SendAgent::resume_session(
+                        &f.handle,
+                        crate::acp::protocol::ResumeSessionRequest::new(
+                            session_id.clone(),
+                            std::path::PathBuf::new(),
+                        ),
+                    ),
+                )
+            })
+            .await
+            .expect("concurrent owner reopen must finish");
+        loaded.unwrap();
+        resumed.unwrap();
+        resumed_again.unwrap();
+        stream.flush().await;
+        assert_eq!(
+            count_materializations(
+                f.storage
+                    .load_session_stream(&session_id, None, None)
+                    .await
+                    .unwrap(),
+            ),
+            before + 1,
+            "concurrent cold reopen must materialize exactly one actor"
+        );
+        assert!(f.handle.registry.lock().await.get(&session_id).is_none());
+        owner
+            .config
+            .emit_event_persisted(&session_id, crate::events::AgentEventKind::SessionCreated)
+            .await
+            .unwrap();
+        f.handle.shutdown().await;
+    }
 }
 
 #[tokio::test]
@@ -630,7 +1218,8 @@ async fn register_profile_bound_delegate_session(
         .profiles()
         .expect("profiles configured")
         .set_session_binding(session_id, binding)
-        .await;
+        .await
+        .expect("bind delegate session");
     (delegate_handle, actor_ref)
 }
 
@@ -793,7 +1382,7 @@ async fn test_delete_profile_bound_delegate_session_releases_runtime() {
 }
 
 #[tokio::test]
-async fn test_profile_handle_rejects_unbound_session_load() {
+async fn test_profile_handle_rejects_unbound_session_load_and_resume() {
     let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
     let session = f
         .handle
@@ -804,7 +1393,7 @@ async fn test_profile_handle_rejects_unbound_session_load() {
         .await
         .expect("create unbound session");
     let req = crate::acp::protocol::LoadSessionRequest::new(
-        SessionId::from(session.public_id),
+        SessionId::from(session.public_id.clone()),
         std::path::PathBuf::new(),
     );
 
@@ -814,6 +1403,24 @@ async fn test_profile_handle_rejects_unbound_session_load() {
         .await
         .expect_err("unbound load must fail");
     assert!(err.to_string().contains("profile binding"));
+    let err = SendAgent::resume_session(
+        &f.handle,
+        crate::acp::protocol::ResumeSessionRequest::new(
+            SessionId::from(session.public_id.clone()),
+            std::path::PathBuf::new(),
+        ),
+    )
+    .await
+    .expect_err("unbound resume must fail");
+    assert!(err.to_string().contains("profile binding"));
+    assert!(
+        f.handle
+            .registry
+            .lock()
+            .await
+            .get(&session.public_id)
+            .is_none()
+    );
 }
 
 #[cfg(feature = "remote")]
@@ -857,7 +1464,7 @@ async fn test_load_session_resolves_remote_bookmark_before_local_or_profile_load
 
 #[cfg(feature = "remote")]
 #[tokio::test]
-async fn test_load_session_rejects_conflicting_remote_and_local_identity() {
+async fn test_load_and_resume_reject_conflicting_remote_and_local_identity() {
     use crate::session::store::RemoteSessionBookmark;
 
     let f = HandleFixture::new().await;
@@ -878,7 +1485,7 @@ async fn test_load_session_rejects_conflicting_remote_and_local_identity() {
         .await
         .expect("conflicting bookmark");
     let request = crate::acp::protocol::LoadSessionRequest::new(
-        SessionId::from(local.public_id),
+        SessionId::from(local.public_id.clone()),
         std::path::PathBuf::new(),
     );
     let error = f
@@ -887,6 +1494,24 @@ async fn test_load_session_rejects_conflicting_remote_and_local_identity() {
         .await
         .expect_err("location conflict");
     assert!(error.to_string().contains("both locally and remotely"));
+    let error = SendAgent::resume_session(
+        &f.handle,
+        crate::acp::protocol::ResumeSessionRequest::new(
+            SessionId::from(local.public_id.clone()),
+            std::path::PathBuf::new(),
+        ),
+    )
+    .await
+    .expect_err("resume location conflict");
+    assert!(error.to_string().contains("both locally and remotely"));
+    assert!(
+        f.handle
+            .registry
+            .lock()
+            .await
+            .get(&local.public_id)
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1109,7 +1734,8 @@ paths = ["{}"]
             "ghost",
             test_profile_metadata("ghost", "ghost", None).session_binding(),
         )
-        .await;
+        .await
+        .expect("bind missing profile");
     assert!(
         fixture
             .handle

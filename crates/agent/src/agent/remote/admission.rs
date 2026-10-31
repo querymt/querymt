@@ -79,6 +79,9 @@ pub(crate) enum AdmissionError {
 
     #[error("admission transport error: {0}")]
     Transport(String),
+
+    #[error("failed to persist mesh admission: {0}")]
+    Persistence(String),
 }
 
 impl AdmissionError {
@@ -232,6 +235,32 @@ where
             delay = std::cmp::min(delay.saturating_mul(2), self.policy.max_delay);
         }
     }
+}
+
+/// Persist admission on the runtime-owned store without reloading or replacing its path.
+pub(crate) async fn persist_admission(
+    store: std::sync::Arc<parking_lot::RwLock<querymt_remote::MeshStateStore>>,
+    mesh_id: String,
+    token: Option<querymt_remote::MembershipToken>,
+    peers: Vec<PeerEntry>,
+) -> Result<(), AdmissionError> {
+    tokio::task::spawn_blocking(move || {
+        let mut store = store.write();
+        if let Some(token) = token {
+            store.upsert_joined_mesh(token, peers)
+        } else {
+            let mut merged: std::collections::HashMap<_, _> = store
+                .known_peers_for_mesh(&mesh_id)
+                .into_iter()
+                .map(|peer| (peer.peer_id.clone(), peer))
+                .collect();
+            merged.extend(peers.into_iter().map(|peer| (peer.peer_id.clone(), peer)));
+            store.update_known_peers(&mesh_id, merged.into_values().collect())
+        }
+        .map_err(|error| AdmissionError::Persistence(error.to_string()))
+    })
+    .await
+    .map_err(|error| AdmissionError::Persistence(error.to_string()))?
 }
 
 pub(crate) fn admission_candidates(
@@ -495,6 +524,72 @@ mod tests {
         assert!(text.contains(&inviter.to_string()));
         assert!(text.contains("mesh-a"));
         assert!(text.contains("attempts="));
+    }
+
+    #[tokio::test]
+    async fn admission_and_readmission_keep_identity_selected_store_on_restart() {
+        use querymt_remote::{InvitePermissions, MembershipToken, MeshStateStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom.key.mesh_state.json");
+        let unrelated_path = dir.path().join("mesh_state.json");
+        let mut unrelated = MeshStateStore::load_or_create(&unrelated_path).unwrap();
+        unrelated
+            .upsert_hosted_mesh("unrelated".into(), None, None)
+            .unwrap();
+        let original = std::fs::read(&unrelated_path).unwrap();
+        let store = Arc::new(parking_lot::RwLock::new(
+            MeshStateStore::load_or_create(&path).unwrap(),
+        ));
+        let same_store = store.clone();
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let subject = peer();
+        let token = MembershipToken::issue(
+            "joined".into(),
+            &subject.to_string(),
+            &keypair,
+            "invite".into(),
+            InvitePermissions::default(),
+            0,
+        )
+        .unwrap();
+        let a = peer().to_string();
+        let b = peer().to_string();
+        persist_admission(
+            store.clone(),
+            "joined".into(),
+            Some(token.clone()),
+            vec![PeerEntry {
+                peer_id: a.clone(),
+                addrs: vec![],
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(same_store.read().get("joined").is_some());
+        persist_admission(
+            store,
+            "joined".into(),
+            None,
+            vec![PeerEntry {
+                peer_id: b.clone(),
+                addrs: vec![],
+            }],
+        )
+        .await
+        .unwrap();
+        let reloaded = MeshStateStore::load_or_create(&path).unwrap();
+        assert_eq!(
+            reloaded.get("joined").unwrap().membership_token,
+            Some(token)
+        );
+        let saved: HashSet<_> = reloaded
+            .known_peers_for_mesh("joined")
+            .into_iter()
+            .map(|peer| peer.peer_id)
+            .collect();
+        assert_eq!(saved, HashSet::from([a, b]));
+        assert!(reloaded.get("unrelated").is_none());
+        assert_eq!(std::fs::read(&unrelated_path).unwrap(), original);
     }
 
     #[test]

@@ -164,6 +164,7 @@ Each native provider is published with multiple OCI tags corresponding to differ
 | `latest-accelerate` | macOS Accelerate framework | macOS (x86_64, arm64) — izwi, mrs only |
 | `latest-vulkan` | Vulkan GPU | Linux (x86_64, arm64), Windows (x86_64) — llama-cpp only |
 | `latest-cuda12.8` | NVIDIA CUDA 12.8 | Linux (x86_64, arm64), Windows (x86_64) — llama-cpp only |
+| `latest-rocm7.2` | AMD ROCm 7.2 | Linux x86_64 only - llama-cpp only; GPU runtime validation pending |
 | `latest-cuda12.8-sm80` | NVIDIA CUDA SM 80 | Linux x86_64 — izwi, mrs only |
 | `latest-cuda12.8-sm86` | NVIDIA CUDA SM 86 | Linux x86_64 — izwi, mrs only |
 | `latest-cuda12.8-sm87` | NVIDIA CUDA SM 87 (Jetson Orin) | Linux arm64 — izwi, mrs only |
@@ -195,6 +196,25 @@ Use this table to find the correct `cuda12.8-smXX` suffix for your GPU.
 !!! tip "Not sure which SM your GPU is?"
     Run `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` to print your GPU's compute capability (e.g. `8.9` = SM 89).
 
+### AMD ROCm compatibility
+
+The `llama-cpp` `latest-rocm7.2` variant is built on Ubuntu 24.04 with **ROCm 7.2.1**, matching [llama.cpp's Linux ROCm Docker build](https://github.com/ggml-org/llama.cpp/blob/59d5fad7c111d30a547d690b69235ed9e05c035d/.devops/rocm.Dockerfile). One binary contains all of the upstream build's GPU targets; no per-GPU tag is needed:
+
+| GPU family | Compiled targets |
+|---|---|
+| Instinct (CDNA) | `gfx908`, `gfx90a`, `gfx942` |
+| RDNA 2 | `gfx1030` |
+| RDNA 3 | `gfx1100`, `gfx1101`, `gfx1102` |
+| Ryzen APUs (RDNA 3.5) | `gfx1150`, `gfx1151` |
+| RDNA 4 | `gfx1200`, `gfx1201` |
+
+!!! warning "Initial ROCm release: GPU runtime validation pending"
+    CI compiles the provider and checks ROCm linkage without an AMD GPU. Actual inference, performance, and model/backend combinations have not yet been validated on AMD hardware. The targets listed here describe compiled coverage, not a tested hardware support guarantee.
+
+The OCI artifact contains the provider library only, **not** ROCm or GPU drivers. Use Ubuntu 24.04 or a compatible environment with the ROCm 7.2.1 HIP runtime, hipBLAS, and rocBLAS (including its GPU kernel data) installed. Follow [AMD's ROCm 7.2.1 installation instructions](https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.2.1/install/install-methods/package-manager/package-manager-ubuntu.html) and check the GPU/driver requirements for your hardware. The dynamic linker must be able to resolve `libamdhip64.so`, `libhipblas.so`, `librocblas.so`, and their dependencies. Nonstandard installations, including NixOS, require an environment providing those libraries; the downloaded artifact is not self-contained.
+
+The process also needs permission to access the AMD GPU (`/dev/kfd` and the appropriate `/dev/dri` render node). GPUs outside the compiled list can use `latest-vulkan` or a source build with a custom target list. This initial ROCm variant is not published for Windows or Linux arm64.
+
 ### Choosing a feature tag
 
 ```
@@ -207,7 +227,8 @@ What OS are you on?
 │   ├── NVIDIA GPU
 │   │   ├── llama-cpp                  → latest-cuda12.8
 │   │   └── izwi / mrs                 → latest-cuda12.8-sm{XX}  (see table above)
-│   ├── AMD / Intel GPU                → latest-vulkan  (llama-cpp only)
+│   ├── AMD GPU + ROCm 7.2 (x86_64)     → latest-rocm7.2 (llama-cpp; validation pending)
+│   ├── Other AMD / Intel GPU          → latest-vulkan  (llama-cpp only)
 │   └── CPU only                       → latest  (or latest-default)
 └── Windows
     ├── NVIDIA GPU                     → latest-cuda12.8  (llama-cpp only)
@@ -218,19 +239,112 @@ What OS are you on?
 
 ## Provider reference
 
+### anthropic
+
+Claude models through the Anthropic Messages API. Requests are shaped per model, so the same session settings are valid on every Claude generation.
+
+#### Model classes and "auto" effort
+
+The model ID (including Bedrock, Vertex and router forms such as `us.anthropic.claude-opus-4-7-v1:0`, `claude-sonnet-4-6@20260101` or `anthropic/claude-sonnet-5-5`) is parsed into family and version and falls into one class:
+
+| Class | Models | "auto" (no effort set) | Explicit effort (`low`, `medium`, `high`, `max`) |
+|---|---|---|---|
+| Default-on adaptive | Claude 5 or later, Fable, Mythos (including Mythos Preview) | No `thinking`, no effort: the API defaults apply | `thinking: {type: "adaptive"}` + `output_config.effort` |
+| Opt-in adaptive | Opus and Sonnet 4.6 to 4.8 | `thinking: {type: "adaptive"}` | `thinking: {type: "adaptive"}` + `output_config.effort` |
+| Budget | Everything older, and IDs that can't be parsed | No `thinking` | `thinking: {type: "enabled", budget_tokens}` |
+
+!!! warning "Behaviour change for Opus 4.6-4.8 and Sonnet 4.6"
+    "auto" now turns adaptive thinking **on** for these models. This raises cost and latency, and responses may contain thinking blocks. There is no "off" reasoning level yet.
+
+!!! note "\"auto\" on Claude 5.x does not bound thinking"
+    Default-on models keep their API default effort (`high` on most models), and nothing in the request limits how much they think. The documented controls are `max_tokens` and `effort`. Thinking spend is reported as `reasoning_tokens` in usage so it is visible, but it is not capped by this provider.
+
+#### Effort and budget fitting
+
+On adaptive models the effort is sent unchanged as `output_config.effort`. On budget models the budget is `reasoning_budget_tokens` when configured, otherwise a default per effort (low 1,024, medium 8,000, high 16,000, max 31,999). It is then fitted to the request: at least 1,024 and at most half of `max_tokens`. When `max_tokens` is below 2,048 thinking is omitted. Budget models never receive `output_config`.
+
+#### Sampling parameters
+
+- On Opus 4.7 or later and on every Claude 5 or later, Fable or Mythos model, `temperature`, `top_p` and `top_k` are **never sent**.
+- On other models, whenever thinking is sent, `temperature` and `top_k` are omitted and `top_p` is sent only if it is between 0.95 and 1.
+- Otherwise the configured values are sent.
+
+Each dropped value is logged at debug level.
+
+#### Forced tool choice
+
+A forced `tool_choice` is `any` or a named tool.
+
+- Budget models: thinking is dropped from that request.
+- Opus 5.5 or later, Sonnet 5.5 or later, Fable 5.1 or later, Mythos 5.1 or later: the API rejects forced tool choice, so the request fails locally with an invalid-request error.
+- Other adaptive models: sent unchanged.
+
+#### Thinking replay, usage and stop reasons
+
+Each thinking block becomes its own reasoning item with its own signature. Signed blocks are replayed unchanged, even when their text is empty (the default `display: "omitted"` on Opus 4.7+ and Claude 5). `redacted_thinking` blocks are kept and replayed with their opaque data. `output_tokens_details.thinking_tokens` is reported as `reasoning_tokens` and subtracted from the inclusive `output_tokens`, so ordinary output and reasoning never overlap. Streaming usage ends with the final `message_delta` values: the provisional output count in `message_start` is not emitted as ordinary output, fields a later event omits (input, cache) keep their earlier values, and an explicit zero replaces them. Cache writes keep the returned `cache_creation` five-minute and one-hour counts as a breakdown of the aggregate `cache_creation_input_tokens` (never added on top); with no breakdown the tiers stay absent rather than assumed. Stop reasons map as: `end_turn`/`stop_sequence` to stop, `tool_use` to tool calls, `max_tokens`/`model_context_window_exceeded` to length, `refusal` to content filter, `pause_turn` to other.
+
+#### `adaptive_thinking` override
+
+An optional provider config field overrides the class derived from the model ID:
+
+```toml
+[providers.anthropic]
+adaptive_thinking = true   # force opt-in adaptive thinking
+```
+
+- `true` sends adaptive thinking explicitly. This is the right choice for a proxy or custom model ID that can't be parsed but fronts an adaptive model.
+- `false` forces budget thinking. The API **rejects** budget thinking on Opus 4.7+ and every Claude 5 or later model.
+
+The sampling and forced-tool-choice rules always use the parsed model ID and ignore this override.
+
+#### Strict tool use (`strict_tools`)
+
+Strict tool use makes the API enforce a tool's input schema during sampling. One optional provider setting controls it:
+
+```toml
+[providers.anthropic]
+strict_tools = ["edit", "multiedit", "replace_symbol"]
+```
+
+A tool is eligible when its definition sets `strict: true` or its unprefixed name is in `strict_tools` (names are matched before the OAuth `mcp_` prefix is applied). The provider itself has no default list: when `strict_tools` is unset or empty, no tool is selected by name, but tools whose definitions explicitly set `strict: true` stay eligible. The QueryMT agent fills in `["edit", "multiedit", "replace_symbol"]` for Anthropic when you have not set `strict_tools`; set `strict_tools = []` to turn that off. Builtin tool definitions never set `strict`, so OpenAI Responses behaviour is unchanged.
+
+Eligible tools are sent with `"strict": true` only when every check passes:
+
+- **Model.** Opus and Sonnet 4.5 or later, Haiku 4.5 or later, and all Fable and Mythos models. Older or unrecognised model IDs send no `strict` field and the original schemas (logged at debug level).
+- **Schema.** Strict mode accepts a subset of JSON Schema, so the provider converts a *copy* of each schema: fixed-property objects are closed (`additionalProperties: false`), and numeric limits, string-length limits, `maxItems` and `minItems` above 1 move into the property description, for example `(minimum: 0)`. Required and optional properties are unchanged. The agent still validates calls against the original schema. A tool whose schema cannot be converted safely (external or recursive references, dictionaries or open objects, `pattern`, unsupported formats, `oneOf`/`allOf`/`not` and other unknown keywords) is sent non-strict with its original schema and a warning naming the tool and the unsupported feature. Other eligible tools stay strict. This applies to explicit and name-selected strictness alike.
+- **Budgets.** Counted over the successfully converted tools only: at most 20 strict tools, 24 optional properties and 16 union properties (`anyOf` or type arrays). If any limit is exceeded, *every* tool in that request is sent non-strict with its original schema and a warning names the limit.
+
+Strict tools work the same over API key and OAuth: OAuth strict requests were verified against the live API on `claude-sonnet-4-5` and `claude-sonnet-5-5` (see `scripts/verify-anthropic-strict.sh`).
+
+### Usage normalization across API providers
+
+Every provider adapter reports usage in the same exclusive categories: uncached input, ordinary output, reasoning, cache reads and cache writes. Each token appears in one category, so totals and cost estimates never count it twice. What each wire format needs to get there:
+
+| Provider | Wire shape | Normalization | Limitations |
+| --- | --- | --- | --- |
+| OpenAI Chat, OpenRouter, xAI, Mistral, Alibaba | `prompt_tokens` includes `prompt_tokens_details.cached_tokens` and `cache_write_tokens`; `completion_tokens` includes `reasoning_tokens` | Cache reads and writes are subtracted from the prompt; reasoning is subtracted from the completion | A missing detail object means zero, not unknown |
+| DeepSeek | Flat `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` | An explicit miss count, including `0`, is used as uncached input instead of a derived value | Cache writes are not reported (they are billed as ordinary input) |
+| OpenAI Responses, Codex | `input_tokens` includes `input_tokens_details.cached_tokens` and `cache_write_tokens`; `output_tokens` includes `reasoning_tokens` | Same subtraction as Chat | Only terminal usage is authoritative; each attempt carries its own usage |
+| Google Gemini | `promptTokenCount` includes `cachedContentTokenCount`; `candidatesTokenCount` excludes `thoughtsTokenCount`; `toolUsePromptTokenCount` is separate | Cached tokens are subtracted from the prompt, thoughts become reasoning, tool-use prompt tokens count as input | Gemini reports no cache-write counter (implicit cache writes and cache storage time are not metered here) |
+| Anthropic | See [Thinking replay, usage and stop reasons](#thinking-replay-usage-and-stop-reasons) | `input_tokens` is already uncached; thinking is subtracted from `output_tokens` | Catalog prices cover base-duration cache writes; one-hour writes need an explicit one-hour rate |
+
+These adapters only report what the response states. They never infer a cache counter from the requested cache settings or the provider name.
+
 ### llama-cpp
 
 Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models, vision/multimodal models, and streaming. Broadest hardware support of the three native providers.
 
 **Supported platforms:**
 
-| OS | Architecture | CPU | Metal | Accelerate | Vulkan | CUDA 12.8 |
-|---|---|:---:|:---:|:---:|:---:|:---:|
-| Linux | x86_64 | ✓ | — | — | ✓ | ✓ |
-| Linux | arm64 | ✓ | — | — | ✓ | ✓ |
-| macOS | x86_64 | — | ✓ | — | — | — |
-| macOS | arm64 | — | ✓ | — | — | — |
-| Windows | x86_64 | ✓ | — | — | — | ✓ |
+| OS | Architecture | CPU | Metal | Accelerate | Vulkan | CUDA 12.8 | ROCm 7.2 |
+|---|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| Linux | x86_64 | ✓ | — | — | ✓ | ✓ | Build only* |
+| Linux | arm64 | ✓ | — | — | ✓ | ✓ | — |
+| macOS | x86_64 | — | ✓ | — | — | — | — |
+| macOS | arm64 | — | ✓ | — | — | — | — |
+| Windows | x86_64 | ✓ | — | — | — | ✓ | — |
+
+*ROCm is published with compiled target coverage; GPU runtime validation is pending. See [AMD ROCm compatibility](#amd-rocm-compatibility).
 
 **Configuration:**
 
@@ -269,6 +383,18 @@ Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models,
     n_ctx = 4096
     n_gpu_layers = 99
     flash_attention = "enabled"
+    ```
+
+=== "Linux (ROCm, x86_64)"
+    ```toml
+    [[providers]]
+    name = "llama-cpp"
+    path = "oci://ghcr.io/querymt/llama-cpp:latest-rocm7.2"
+
+    [providers.config]
+    model = "/path/to/model.gguf"
+    n_ctx = 4096
+    n_gpu_layers = 99
     ```
 
 === "Linux (Vulkan)"

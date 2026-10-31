@@ -27,7 +27,7 @@ pub(crate) async fn start_shared_runtime(spec: MeshSpec) -> Result<MeshRuntime> 
         ));
     }
 
-    let requested_cfg = runtime_config_from_spec(spec.clone())?;
+    let requested_cfg = runtime_config_from_spec(spec)?;
     let state = SHARED_MESH.get_or_init(OnceCell::new);
     let existing = state
         .get_or_try_init(|| {
@@ -65,6 +65,7 @@ fn runtime_configs_compatible(existing: &MeshRuntimeConfig, requested: &MeshRunt
                 .map(|lan| (&lan.listen, lan.discovery, lan.directory))
         && existing.iroh_enabled == requested.iroh_enabled
         && existing.iroh_gso == requested.iroh_gso
+        && existing.iroh_dns == requested.iroh_dns
         && existing.identity_file == requested.identity_file
         && existing.request_timeout == requested.request_timeout
         && existing.stream_reconnect_grace == requested.stream_reconnect_grace
@@ -89,12 +90,13 @@ fn runtime_config_label(config: &MeshRuntimeConfig) -> String {
         (false, false) => "disabled",
     };
     format!(
-        "{transports} mesh (identity={:?}, node_name={:?}, peers={}, iroh_scopes={}, iroh_gso={})",
+        "{transports} mesh (identity={:?}, node_name={:?}, peers={}, iroh_scopes={}, iroh_gso={}, iroh_dns={:?})",
         config.identity_file,
         config.node_name,
         config.peers.len(),
         config.iroh_scopes.len(),
-        config.iroh_gso
+        config.iroh_gso,
+        config.iroh_dns
     )
 }
 
@@ -115,6 +117,7 @@ fn runtime_config_from_spec(spec: MeshSpec) -> Result<MeshRuntimeConfig> {
         cfg.lan,
         cfg.iroh,
         cfg.iroh_gso,
+        cfg.iroh_dns,
     )
 }
 
@@ -141,11 +144,36 @@ mod tests {
                     "enabled = true\niroh_gso = {enabled}\n{transport}"
                 ))
                 .unwrap();
-                let runtime = runtime_config_from_spec(MeshSpec::Toml(cfg)).unwrap();
+                let runtime = runtime_config_from_spec(MeshSpec::Toml(Box::new(cfg))).unwrap();
                 assert!(runtime.iroh_enabled);
                 assert_eq!(runtime.iroh_gso, enabled);
             }
         }
+    }
+
+    #[test]
+    fn dns_policy_is_preserved_and_checked_for_shared_runtime_compatibility() {
+        for transport in [
+            "transport = 'iroh'",
+            "[lan]\nenabled = true\n[[iroh]]\nenabled = true\nname = 'test'",
+        ] {
+            let cfg: MeshTomlConfig = toml::from_str(&format!(
+                "enabled = true\n{transport}\n[iroh_dns]\nfallback = 'never'\n"
+            ))
+            .unwrap();
+            let runtime = runtime_config_from_spec(MeshSpec::Toml(Box::new(cfg))).unwrap();
+            assert_eq!(
+                runtime.iroh_dns.as_ref().unwrap().fallback,
+                querymt_remote::IrohDnsFallback::Never
+            );
+            let mut requested = runtime.clone();
+            assert!(runtime_configs_compatible(&runtime, &requested));
+            requested.iroh_dns = None;
+            assert!(!runtime_configs_compatible(&runtime, &requested));
+            assert!(runtime_config_label(&runtime).contains("iroh_dns=Some"));
+        }
+        let cfg: MeshTomlConfig = toml::from_str("enabled = true\ntransport = 'iroh'\n[iroh_dns]\nsystem_defaults = false\nfallback = 'never'").unwrap();
+        assert!(runtime_config_from_spec(MeshSpec::Toml(Box::new(cfg))).is_err());
     }
 
     #[test]

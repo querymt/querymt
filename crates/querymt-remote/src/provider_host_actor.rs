@@ -12,7 +12,7 @@ use kameo::Actor;
 use kameo::message::{Context, Message};
 use kameo::remote::_internal;
 use parking_lot::Mutex;
-use querymt::chat::StreamChunk;
+use querymt::chat::{ChatCall, StreamChunk};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -173,13 +173,18 @@ impl Message<GetProviderContractInfo> for ProviderHostActor {
 
     async fn handle(
         &mut self,
-        _msg: GetProviderContractInfo,
+        msg: GetProviderContractInfo,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        Ok(ProviderContractInfo {
-            item_aware_chat_version: Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
-            protocol_version: Some(crate::provider_protocol::MESH_PROTOCOL_VERSION),
-        })
+        let host_defaults = self.backend.host_default_params(&msg.provider, &msg.model);
+        let params =
+            crate::merge_remote_provider_params(msg.params.as_ref(), host_defaults.as_ref());
+        self.backend
+            .contract_info(
+                crate::ProviderBuildRequest::new(&msg.provider, &msg.model).with_params(params),
+            )
+            .await
+            .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))
     }
 }
 
@@ -218,11 +223,13 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
             .await
             .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
 
-            let tools_slice = msg.tools.as_deref();
+            let call = ChatCall::new(&msg.messages)
+                .maybe_tools(msg.tools.as_deref())
+                .options(msg.options.unwrap_or_default());
             let response = provider
-                .chat_with_tools(&msg.messages, tools_slice)
+                .chat(&call)
                 .await
-                .map_err(|e| RemoteProviderHostError::provider_chat("chat_with_tools", &e))?;
+                .map_err(|e| RemoteProviderHostError::provider_chat("chat", &e))?;
 
             let tool_calls = response.tool_calls().unwrap_or_default();
             let finish_reason = response.finish_reason.map(|r| format!("{:?}", r));
@@ -319,13 +326,13 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                 .await
                 .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
 
-                let tools_slice = msg.tools.as_deref();
+                let call = ChatCall::new(&msg.messages)
+                    .maybe_tools(msg.tools.as_deref())
+                    .options(msg.options.unwrap_or_default());
                 let stream = provider
-                    .chat_stream_with_tools(&msg.messages, tools_slice)
+                    .chat_stream(&call)
                     .await
-                    .map_err(|e| {
-                        RemoteProviderHostError::provider_chat("chat_stream_with_tools", &e)
-                    })?;
+                    .map_err(|e| RemoteProviderHostError::provider_chat("chat_stream", &e))?;
 
                 Ok::<_, RemoteProviderHostError>((provider, stream))
             }
@@ -340,6 +347,7 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                             message: StreamRelayMessage::ProviderError {
                                 error: e.to_payload(),
                             },
+                            seq: Some(0),
                         })
                         .send();
                     remove_active_stream(&cleanup_streams, &cleanup_session_id, &cleanup_request_id);
@@ -364,7 +372,7 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                     let mut batch_count = 0usize;
                     let mut max_batch_size = 0usize;
                     let relay_start = started_at;
-                    let mut buffered: VecDeque<StreamRelayMessage> = VecDeque::new();
+                    let mut buffered = RelayQueue::default();
                     let mut pending_batch: Vec<StreamChunk> = Vec::new();
                     let mut disconnected_since: Option<tokio::time::Instant> = None;
                     let mut upstream_done = false;
@@ -378,7 +386,7 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                         stream.phase = ProviderStreamPhase::WaitingFirstChunk;
                     });
 
-                    let flush_batch = |buffered: &mut VecDeque<StreamRelayMessage>,
+                    let flush_batch = |buffered: &mut RelayQueue,
                                        pending_batch: &mut Vec<StreamChunk>,
                                        batch_count: &mut usize,
                                        max_batch_size: &mut usize| {
@@ -392,7 +400,7 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                         } else {
                             StreamRelayMessage::ChunkBatch(std::mem::take(pending_batch))
                         };
-                        buffered.push_back(message);
+                        buffered.push_sequenced(message);
                     };
 
                     'outer: loop {
@@ -430,7 +438,7 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                                     continue;
                                 }
                                 if let Some(status) = status {
-                                    buffered.push_back(StreamRelayMessage::Heartbeat {
+                                    buffered.push_unsequenced(StreamRelayMessage::Heartbeat {
                                         phase: status.phase,
                                         elapsed_ms: status.elapsed_ms,
                                         idle_ms: status.idle_ms,
@@ -507,17 +515,18 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                         }
 
                         if let Some(message) = terminal_message.take() {
-                            buffered.push_back(message);
+                            buffered.push_sequenced(message);
                         }
 
                         loop {
                             if disconnected_since.is_some() {
-                                let replay_count = buffered.iter().filter(|msg| keep_stream_message_buffered(msg)).count();
+                                let replay_count = buffered.replayable_count();
                                 let reconnect_result = stream_router_ref.tell(&RoutedStreamRelayMessage {
                                     request_id: request_id.clone(),
                                     message: StreamRelayMessage::TransportReconnected {
                                         buffered_chunks: replay_count,
                                     },
+                                    seq: None,
                                 }).send_ack().await;
                                 if reconnect_result.is_ok() {
                                     let _disconnected_duration = disconnected_since.take().map(|s| s.elapsed());
@@ -538,7 +547,7 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                                         stream.receiver_connected = false;
                                     });
                                     if since.elapsed() >= reconnect_grace {
-                                        buffered.push_back(StreamRelayMessage::TransportFailed {
+                                        buffered.push_sequenced(StreamRelayMessage::TransportFailed {
                                             error: querymt::error::LLMError::Transport {
                                                 kind: querymt::error::TransportErrorKind::Timeout,
                                                 message: format!("reconnect grace expired after {:?}", reconnect_grace),
@@ -558,12 +567,13 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                                 }
                             }
 
-                            let Some(front) = buffered.front().cloned() else {
+                            let Some((front_seq, front)) = buffered.front_cloned() else {
                                 break;
                             };
                             let relay = RoutedStreamRelayMessage {
                                 request_id: request_id.clone(),
                                 message: front,
+                                seq: front_seq,
                             };
                             let is_terminal = relay_message_is_terminal(&relay.message);
                             let is_chunk_batch = matches!(
@@ -615,6 +625,7 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                                         message: StreamRelayMessage::TransportDisconnected {
                                             reason: e.to_string(),
                                         },
+                                        seq: None,
                                     }).send();
                                     update_active_stream(&active_streams, &session_id, &request_id, |stream| {
                                         stream.phase = ProviderStreamPhase::ReceiverDisconnected;
@@ -692,6 +703,50 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
 
             Ok(())
         })
+    }
+}
+
+/// Outgoing relay queue for one stream. Data, terminal and failure messages
+/// get contiguous per-request sequence numbers starting at 0 when queued;
+/// heartbeats and connection notices stay unnumbered. A message keeps its
+/// number until it is popped, so resends after a send error reuse it.
+#[derive(Debug, Default)]
+pub(crate) struct RelayQueue {
+    queue: VecDeque<(Option<u64>, StreamRelayMessage)>,
+    next_seq: u64,
+}
+
+impl RelayQueue {
+    pub(crate) fn push_sequenced(&mut self, message: StreamRelayMessage) {
+        self.queue.push_back((Some(self.next_seq), message));
+        self.next_seq += 1;
+    }
+
+    pub(crate) fn push_unsequenced(&mut self, message: StreamRelayMessage) {
+        self.queue.push_back((None, message));
+    }
+
+    pub(crate) fn front_cloned(&self) -> Option<(Option<u64>, StreamRelayMessage)> {
+        self.queue.front().cloned()
+    }
+
+    pub(crate) fn pop_front(&mut self) {
+        self.queue.pop_front();
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub(crate) fn replayable_count(&self) -> usize {
+        self.queue
+            .iter()
+            .filter(|(_, msg)| keep_stream_message_buffered(msg))
+            .count()
     }
 }
 
@@ -847,3 +902,227 @@ remote_provider_msg_impl!(
     "querymt::GetProviderStreamStatus",
     REG_GET_PROVIDER_STREAM_STATUS
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use kameo::actor::Spawn;
+    use querymt::LLMProvider;
+    use querymt::chat::{
+        ChatCall, ChatCapabilities, ChatOutput, ChatProvider, GenerationOptionSupport,
+        GenerationOptions,
+    };
+    use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
+    use querymt::embedding::EmbeddingProvider;
+    use querymt::error::LLMError;
+
+    use crate::{ProviderBuildRequest, RemoteProviderBackend};
+
+    /// Provider that records the per-request options it receives.
+    #[derive(Default)]
+    struct RecordingProvider {
+        seen: Arc<Mutex<Vec<GenerationOptions>>>,
+    }
+
+    #[async_trait]
+    impl ChatProvider for RecordingProvider {
+        async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+            self.seen.lock().push(call.options);
+            Ok(ChatOutput::default())
+        }
+
+        fn capabilities(&self) -> ChatCapabilities {
+            ChatCapabilities::NONE.with_options(GenerationOptionSupport::ALL)
+        }
+    }
+
+    #[async_trait]
+    impl CompletionProvider for RecordingProvider {
+        async fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
+            Err(LLMError::NotImplemented("unused".into()))
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for RecordingProvider {
+        async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+            Err(LLMError::NotImplemented("unused".into()))
+        }
+    }
+
+    impl LLMProvider for RecordingProvider {}
+
+    struct RecordingBackend {
+        seen: Arc<Mutex<Vec<GenerationOptions>>>,
+    }
+
+    #[async_trait]
+    impl RemoteProviderBackend for RecordingBackend {
+        type Error = RemoteProviderHostError;
+
+        async fn build_provider(
+            &self,
+            _request: ProviderBuildRequest,
+        ) -> Result<Arc<dyn LLMProvider>, Self::Error> {
+            Ok(Arc::new(RecordingProvider {
+                seen: Arc::clone(&self.seen),
+            }))
+        }
+    }
+
+    fn chat_request(options: Option<GenerationOptions>) -> ProviderChatRequest {
+        ProviderChatRequest {
+            provider: "demo".into(),
+            model: "m1".into(),
+            messages: Vec::new(),
+            tools: None,
+            params: None,
+            item_aware_contract_version: None,
+            options,
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_request_options_reach_the_backend_provider() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let actor = ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend {
+            seen: Arc::clone(&seen),
+        })));
+        let options = GenerationOptions::default().with_max_tokens(64_000);
+
+        actor
+            .ask(chat_request(Some(options)))
+            .await
+            .expect("chat with options");
+
+        assert_eq!(*seen.lock(), [options]);
+    }
+
+    #[tokio::test]
+    async fn chat_request_without_options_keeps_configured_values() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let actor = ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend {
+            seen: Arc::clone(&seen),
+        })));
+
+        actor
+            .ask(chat_request(None))
+            .await
+            .expect("chat without options");
+
+        assert_eq!(*seen.lock(), [GenerationOptions::NONE]);
+    }
+
+    #[tokio::test]
+    async fn contract_info_reports_the_built_providers_capabilities() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let actor =
+            ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend { seen })));
+
+        let info = actor
+            .ask(GetProviderContractInfo {
+                provider: "demo".into(),
+                model: "m1".into(),
+                params: None,
+            })
+            .await
+            .expect("contract info");
+
+        assert_eq!(info.capabilities.options, GenerationOptionSupport::ALL);
+    }
+
+    fn heartbeat() -> StreamRelayMessage {
+        StreamRelayMessage::Heartbeat {
+            phase: ProviderStreamPhase::Streaming,
+            elapsed_ms: 0,
+            idle_ms: 0,
+            chunk_count: 0,
+        }
+    }
+
+    fn text(s: &str) -> StreamRelayMessage {
+        StreamRelayMessage::Chunk(StreamChunk::Text(s.into()))
+    }
+
+    #[test]
+    fn relay_queue_numbers_data_and_terminals_contiguously_and_skips_heartbeats() {
+        let mut queue = RelayQueue::default();
+        queue.push_sequenced(text("a"));
+        queue.push_unsequenced(heartbeat());
+        queue.push_sequenced(text("b"));
+        queue.push_unsequenced(StreamRelayMessage::TransportDisconnected { reason: "x".into() });
+        queue.push_sequenced(StreamRelayMessage::TransportFailed {
+            error: querymt::error::LLMError::Transport {
+                kind: querymt::error::TransportErrorKind::Timeout,
+                message: "grace".into(),
+            }
+            .to_payload(),
+        });
+
+        let mut seqs = Vec::new();
+        while let Some((seq, _)) = queue.front_cloned() {
+            seqs.push(seq);
+            queue.pop_front();
+        }
+        assert_eq!(seqs, vec![Some(0), None, Some(1), None, Some(2)]);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn relay_queue_resend_after_send_error_reuses_the_same_number() {
+        let mut queue = RelayQueue::default();
+        queue.push_sequenced(text("a"));
+        queue.push_sequenced(text("b"));
+
+        // A failed send does not pop; the host re-reads the front.
+        let first = queue.front_cloned().expect("front");
+        let resent = queue.front_cloned().expect("front again");
+        assert_eq!(first.0, Some(0));
+        assert_eq!(resent.0, Some(0));
+        // Messages queued meanwhile keep counting up.
+        queue.push_sequenced(text("c"));
+        queue.pop_front();
+        assert_eq!(queue.front_cloned().expect("front").0, Some(1));
+    }
+
+    /// A resent message (same `seq`) reaches the consumer once.
+    #[tokio::test]
+    async fn router_delivers_resent_message_once() {
+        use crate::provider_stream_router::ProviderStreamRouterActor;
+        use crate::stream_router_protocol::RoutedStreamRelayMessage;
+
+        let router_ref =
+            ProviderStreamRouterActor::spawn(ProviderStreamRouterActor::new(None, None));
+        router_ref
+            .ask(crate::provider_stream_router::RegisterRequest {
+                request_id: "r".into(),
+            })
+            .await
+            .expect("register");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        router_ref
+            .ask(crate::provider_stream_router::AttachStreamConsumer {
+                request_id: "r".into(),
+                consumer_tx: tx,
+            })
+            .await
+            .expect("attach");
+
+        let mut queue = RelayQueue::default();
+        queue.push_sequenced(text("a"));
+        let (seq, message) = queue.front_cloned().expect("front");
+        for _ in 0..2 {
+            router_ref
+                .ask(RoutedStreamRelayMessage {
+                    request_id: "r".into(),
+                    message: message.clone(),
+                    seq,
+                })
+                .await
+                .expect("route");
+        }
+        assert!(matches!(rx.try_recv(), Ok(StreamRelayMessage::Chunk(_))));
+        assert!(rx.try_recv().is_err(), "duplicate must not be delivered");
+    }
+}

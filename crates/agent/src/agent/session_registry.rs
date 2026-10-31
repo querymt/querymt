@@ -131,6 +131,74 @@ pub fn config_options_with_profiles(
     options
 }
 
+/// The selected model's identity, independent of discovery/catalog availability.
+pub(crate) fn model_config_option(
+    provider: &str,
+    model: &str,
+    provider_node_id: Option<&str>,
+) -> SessionConfigOption {
+    let id = format!("{provider}/{model}");
+    SessionConfigOption::select(
+        "model",
+        "Model",
+        id.clone(),
+        vec![SessionConfigSelectOption::new(id.clone(), model)],
+    )
+    .meta(serde_json::Map::from_iter([(
+        "querymt".into(),
+        serde_json::json!({ "modelEntry": {
+            "id": id, "provider": provider, "model": model, "node_id": provider_node_id,
+        }}),
+    )]))
+}
+
+/// Register through the shared boundary so local, profile and remote sessions
+/// all evict stopped actors without keeping either actor or registry alive.
+pub(crate) async fn register_prepared_session(
+    registry: &Arc<tokio::sync::Mutex<SessionRegistry>>,
+    prepared: &crate::agent::session_materializer::PreparedSession,
+) -> SessionActorRef {
+    let session_ref = registry
+        .lock()
+        .await
+        .register_prepared_session(prepared)
+        .await;
+    let registry = Arc::downgrade(registry);
+    let actor = prepared.actor_ref.downgrade();
+    let id = prepared.actor_ref.id();
+    let session_id = prepared.session_id.clone();
+    tokio::spawn(async move {
+        actor.wait_for_shutdown().await;
+        if let Some(registry) = registry.upgrade() {
+            registry
+                .lock()
+                .await
+                .remove_local_if_same_actor(&session_id, id);
+        }
+    });
+    session_ref
+}
+
+/// Wait out graceful draining outside the registry lock before replacing an actor.
+pub(crate) async fn live_session(
+    registry: &tokio::sync::Mutex<SessionRegistry>,
+    session_id: &str,
+) -> Option<SessionActorRef> {
+    loop {
+        let session = registry.lock().await.get(session_id).cloned()?;
+        match session {
+            SessionActorRef::Local(ref actor) if !actor.is_alive() => {
+                actor.wait_for_shutdown().await;
+                registry
+                    .lock()
+                    .await
+                    .remove_local_if_same_actor(session_id, actor.id());
+            }
+            _ => return Some(session),
+        }
+    }
+}
+
 /// Controls how a materialized session actor is integrated with remote infra.
 pub struct SessionMaterializationOptions {
     pub attach_mesh_handle: bool,
@@ -228,10 +296,6 @@ pub struct SessionRegistry {
     mesh: Option<crate::agent::remote::MeshHandle>,
     #[cfg(feature = "remote")]
     remote_disconnect_tx: Option<mpsc::UnboundedSender<RemoteSessionDisconnect>>,
-    /// Client bridge for workspace queries and notifications. Set once the ACP
-    /// connection is established. Propagated to new session actors via `SetBridge`
-    /// so that tools like `language_query` can access the client's language server.
-    bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
 }
 
 impl SessionRegistry {
@@ -246,17 +310,7 @@ impl SessionRegistry {
             mesh: None,
             #[cfg(feature = "remote")]
             remote_disconnect_tx: None,
-            bridge: None,
         }
-    }
-
-    /// Set the client bridge for ACP communication.
-    ///
-    /// When set, newly created sessions will receive the bridge via `SetBridge`
-    /// so that session actors can send notifications and tools like
-    /// `language_query` can access the client's language server.
-    pub fn set_bridge(&mut self, bridge: crate::acp::client_bridge::ClientBridgeSender) {
-        self.bridge = Some(bridge);
     }
 
     #[cfg(feature = "remote")]
@@ -404,6 +458,21 @@ impl SessionRegistry {
         self.local_actor_refs.get(session_id)
     }
 
+    pub(crate) fn remove_local_if_same_actor(
+        &mut self,
+        session_id: &str,
+        id: kameo::actor::ActorId,
+    ) -> bool {
+        let same = matches!(
+            self.sessions.get(session_id),
+            Some(SessionActorRef::Local(actor)) if actor.id() == id
+        );
+        if same {
+            self.remove(session_id);
+        }
+        same
+    }
+
     pub async fn materialize_session_actor(
         &mut self,
         session_id: String,
@@ -421,6 +490,7 @@ impl SessionRegistry {
             session_id.clone(),
             &crate::agent::mcp::agent_implementation(),
             tool_state.clone(),
+            cwd.as_deref(),
         )
         .await?;
 
@@ -445,16 +515,6 @@ impl SessionRegistry {
         let actor = { SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone()) };
         let actor_ref = SessionActor::spawn(actor);
         let session_ref = SessionActorRef::from(actor_ref.clone());
-
-        if let Some(ref bridge) = self.bridge
-            && let Err(e) = session_ref.set_bridge(bridge.clone()).await
-        {
-            log::warn!(
-                "Session {}: failed to set bridge on session actor: {}",
-                session_id,
-                e
-            );
-        }
 
         self.sessions
             .insert(session_id.clone(), session_ref.clone());
@@ -897,13 +957,16 @@ pub(crate) async fn prepare_remote_attachment(
         peer_label: peer_label.clone(),
         remote_node_id: remote_node_id.clone(),
     };
-    let relay_ref = EventRelayActor::spawn(EventRelayActor::new(
-        context.event_sink,
-        session_id.clone(),
-        peer_label,
-        remote_node_id,
-        context.disconnect_tx,
-    ));
+    let relay_ref = EventRelayActor::spawn(
+        EventRelayActor::new(
+            context.event_sink,
+            session_id.clone(),
+            peer_label,
+            remote_node_id,
+            context.disconnect_tx,
+        )
+        .with_gap_source(session_ref.clone()),
+    );
     let relay_actor_id = relay_ref.id().sequence_id();
     let mut candidate = PreparedRemoteAttachment {
         armed: true,
@@ -939,10 +1002,7 @@ pub(crate) async fn prepare_remote_attachment(
                 scoped_event_relay(scope, &candidate.session_id, mesh.peer_id()),
                 candidate.relay_actor_id
             );
-            candidate.registered_relay_names.push(name.clone());
-            runtime
-                .register_actor(candidate.relay_ref.clone(), name)
-                .await;
+            candidate.registered_relay_names.push(name);
         }
     } else {
         candidate.relay_dht_name = format!(
@@ -950,14 +1010,6 @@ pub(crate) async fn prepare_remote_attachment(
             candidate.session_id, candidate.relay_actor_id
         );
     }
-
-    if let Err(error) = candidate.relay_ref.link_remote(&remote_ref).await {
-        abort_prepared_remote_attachment(candidate).await;
-        return Err(AgentError::RemoteActor(format!(
-            "failed to link event relay to remote session: {error}"
-        )));
-    }
-    candidate.linked = true;
 
     let relay_remote_ref = candidate.relay_ref.into_remote_ref().await;
     if let Err(error) = candidate
@@ -975,12 +1027,35 @@ pub(crate) async fn prepare_remote_attachment(
             candidate.relay_actor_id,
             error
         );
-        abort_prepared_remote_attachment(candidate).await;
+        let unavailable = error.data.as_ref().is_some_and(|data| {
+            data.get("category").and_then(serde_json::Value::as_str) == Some("remote_transport")
+                && data.get("kind").and_then(serde_json::Value::as_str) == Some("actor_unavailable")
+        });
+        cleanup_attachment_parts(candidate.cleanup_parts(), !unavailable).await;
+        candidate.armed = false;
         return Err(AgentError::RemoteActor(format!(
             "failed to subscribe remote session events: {error}"
         )));
     }
 
+    // Register the observer before linking: a disconnect must be recognizable
+    // by the owner even if it happens while the attachment is being installed.
+    if let Err(error) = candidate.relay_ref.link_remote(&remote_ref).await {
+        abort_prepared_remote_attachment(candidate).await;
+        return Err(AgentError::RemoteActor(format!(
+            "failed to link event relay to remote session: {error}"
+        )));
+    }
+    candidate.linked = true;
+    // Direct subscription and linking must succeed before this candidate is discoverable.
+    if let Some(mesh) = candidate.mesh.clone() {
+        let runtime = MeshRuntimeHandle::from(mesh);
+        for name in &candidate.registered_relay_names {
+            runtime
+                .register_actor(candidate.relay_ref.clone(), name.clone())
+                .await;
+        }
+    }
     Ok(candidate)
 }
 
@@ -1067,23 +1142,28 @@ async fn cleanup_attachment_parts(parts: RemoteAttachmentCleanupParts<'_>, notif
         mesh,
     } = parts;
     if notify_remote {
-        if let Err(error) = session_ref
-            .unsubscribe_events(attachment_id, relay_dht_name.to_string())
-            .await
+        let mut may_unsubscribe = true;
+        if linked
+            && let SessionActorRef::Remote { actor_ref, .. } = session_ref
+            && let Err(error) = relay_ref.unlink_remote(actor_ref).await
         {
+            // Keep the owner's observer marker until the still-linked relay
+            // dies; unsubscribing now would misclassify it as an unrelated failure.
+            may_unsubscribe = false;
             log::warn!(
-                "remote attachment cleanup: unsubscribe failed for {} (attachment_id={}): {}",
+                "remote attachment cleanup: unlink failed for {} (attachment_id={}): {}",
                 session_id,
                 attachment_id,
                 error
             );
         }
-        if linked
-            && let SessionActorRef::Remote { actor_ref, .. } = session_ref
-            && let Err(error) = relay_ref.unlink_remote(actor_ref).await
+        if may_unsubscribe
+            && let Err(error) = session_ref
+                .unsubscribe_events(attachment_id, relay_dht_name.to_string())
+                .await
         {
             log::warn!(
-                "remote attachment cleanup: unlink failed for {} (attachment_id={}): {}",
+                "remote attachment cleanup: unsubscribe failed for {} (attachment_id={}): {}",
                 session_id,
                 attachment_id,
                 error
@@ -1214,6 +1294,74 @@ mod tests {
     }
 
     // ── Unit tests ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stopped_actor_cleanup_does_not_evict_replacement() {
+        let mut f = RegistryFixture::new().await;
+        let old = f.spawn_actor();
+        let fresh = f.spawn_actor();
+        f.registry
+            .sessions
+            .insert("test-session".into(), fresh.clone().into());
+        f.registry
+            .local_actor_refs
+            .insert("test-session".into(), fresh.clone());
+        assert!(
+            !f.registry
+                .remove_local_if_same_actor("test-session", old.id())
+        );
+        assert_eq!(
+            f.registry.local_actor_ref("test-session").unwrap().id(),
+            fresh.id()
+        );
+        assert!(
+            f.registry
+                .remove_local_if_same_actor("test-session", fresh.id())
+        );
+        old.kill();
+        fresh.kill();
+    }
+
+    #[tokio::test]
+    async fn stopped_actor_inserted_without_side_index_is_removed() {
+        let mut f = RegistryFixture::new().await;
+        let actor = f.spawn_actor();
+        f.registry.insert("test-session".into(), actor.clone());
+        assert!(f.registry.local_actor_ref("test-session").is_none());
+        actor.kill();
+        actor.wait_for_shutdown().await;
+        let registry = Mutex::new(f.registry);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            live_session(&registry, "test-session"),
+        )
+        .await
+        .expect("stopped actor cleanup must terminate");
+        assert!(result.is_none());
+        assert!(registry.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unindexed_actor_cleanup_does_not_evict_replacement() {
+        let mut f = RegistryFixture::new().await;
+        let old = f.spawn_actor();
+        let fresh = f.spawn_actor();
+        f.registry.insert("test-session".into(), fresh.clone());
+        assert!(
+            !f.registry
+                .remove_local_if_same_actor("test-session", old.id())
+        );
+        assert!(
+            matches!(f.registry.get("test-session"), Some(SessionActorRef::Local(actor)) if actor.id() == fresh.id())
+        );
+        assert!(
+            f.registry
+                .remove_local_if_same_actor("test-session", fresh.id())
+        );
+        assert!(f.registry.is_empty());
+        old.kill();
+        fresh.kill();
+    }
 
     #[tokio::test]
     async fn test_new_registry_is_empty() {

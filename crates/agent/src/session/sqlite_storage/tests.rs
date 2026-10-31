@@ -7,9 +7,13 @@ use rusqlite::Connection;
 use crate::acp::protocol::{ContentBlock, ImageContent, TextContent};
 use crate::agent::core::AgentMode;
 use crate::agent::session_control::{SessionControlState, SessionModelBinding};
-use crate::events::{AgentEventKind, EventOrigin};
+use crate::events::{AgentEventKind, DurableEvent, EventOrigin};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::ForkOrigin;
+use crate::session::error::SessionResult;
+use crate::session::lifecycle::{
+    ArchiveFilter, ResolutionFilter, SessionLifecycleFilter, SessionLifecyclePatch,
+};
 use crate::session::projection::{
     EventJournal, NewDurableEvent, RecentModelEntry, SessionScope, ViewStore,
 };
@@ -17,6 +21,96 @@ use crate::session::store::{RemoteSessionBookmark, SessionStore};
 
 use super::SqliteStorage;
 use super::migrations::{MIGRATIONS, apply_migrations};
+
+#[tokio::test]
+async fn fork_isolation_intent_is_atomic_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sessions.db");
+    let storage = SqliteStorage::connect(db.clone()).await.unwrap();
+    let source = storage
+        .create_session(None, None, None, None)
+        .await
+        .unwrap();
+    let message = AgentMessage {
+        id: "fork-intent-message".into(),
+        session_id: source.public_id.clone(),
+        role: ChatRole::User,
+        parts: vec![],
+        created_at: 1,
+        parent_message_id: None,
+        source_provider: None,
+        source_model: None,
+    };
+    storage
+        .add_message(&source.public_id, message)
+        .await
+        .unwrap();
+    let intent = crate::session::store::PendingForkIsolation {
+        source_session_id: source.public_id.clone(),
+        source_cwd: dir.path().to_path_buf(),
+        options: crate::worktree::SessionCreationOptions::isolated_worktree(
+            crate::worktree::BaselineMode::CurrentWorkingTree,
+        )
+        .to_workspace_options(),
+        handoff_workspace_id: None,
+    };
+    storage
+        .run_blocking(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER reject_fork_intent BEFORE INSERT ON session_fork_isolation_intents
+             BEGIN SELECT RAISE(ABORT, 'injected intent failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(
+        storage
+            .fork_session_with_isolation_intent(
+                &source.public_id,
+                "fork-intent-message",
+                ForkOrigin::User,
+                Some(intent.clone()),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(storage.list_sessions().await.unwrap().len(), 1);
+    assert_eq!(
+        storage.get_history(&source.public_id).await.unwrap().len(),
+        1
+    );
+    storage
+        .run_blocking(|conn| {
+            conn.execute_batch("DROP TRIGGER reject_fork_intent;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let fork_id = storage
+        .fork_session_with_isolation_intent(
+            &source.public_id,
+            "fork-intent-message",
+            ForkOrigin::User,
+            Some(intent.clone()),
+        )
+        .await
+        .unwrap();
+    drop(storage);
+    let reopened = SqliteStorage::connect(db).await.unwrap();
+    assert_eq!(
+        reopened.get_pending_fork_isolation(&fork_id).await.unwrap(),
+        Some(intent)
+    );
+    assert_eq!(reopened.get_history(&fork_id).await.unwrap().len(), 1);
+    assert!(
+        reopened
+            .get_pending_fork_isolation(&source.public_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
 
 #[tokio::test]
 async fn prompt_blocks_round_trip_through_persistence_and_fork() {
@@ -1169,6 +1263,38 @@ fn migration_0001_is_recorded() {
 }
 
 #[test]
+fn migration_0023_persists_revert_workspace_provenance() {
+    let mut conn = Connection::open_in_memory().expect("in-memory db");
+    apply_migrations(&mut conn).expect("apply migrations");
+
+    conn.execute(
+        "INSERT INTO sessions (public_id, name, created_at, updated_at) \
+         VALUES ('sess-1', 'session', '2026-01-15T00:00:00Z', '2026-01-15T00:00:00Z')",
+        [],
+    )
+    .expect("insert session");
+    conn.execute(
+        "INSERT INTO revert_states (public_id, session_id, message_id, snapshot_id, \
+         backend_id, workspace_root, created_at) \
+         VALUES ('rev-1', (SELECT id FROM sessions WHERE public_id = 'sess-1'), \
+         'msg-1', 'snap-1', 'git', '/tmp/workspaces/ws-1', '2026-01-15T00:00:01Z')",
+        [],
+    )
+    .expect("insert revert frame with provenance");
+
+    // Provenance survives the round trip so a same-workspace restart or
+    // resume retains working undo history.
+    let root: Option<String> = conn
+        .query_row(
+            "SELECT workspace_root FROM revert_states WHERE public_id = 'rev-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query provenance");
+    assert_eq!(root.as_deref(), Some("/tmp/workspaces/ws-1"));
+}
+
+#[test]
 fn migration_0002_drops_legacy_events_table() {
     let mut conn = Connection::open_in_memory().expect("in-memory db");
     apply_migrations(&mut conn).expect("apply migrations");
@@ -2141,6 +2267,552 @@ fn migrations_are_idempotent() {
     assert_eq!(count_after_first, count_after_second);
 }
 
+/// `apply_migrations` keys on the full version string and records it with
+/// `INSERT OR IGNORE`. Two entries sharing a string would both run on a fresh
+/// database, but the second would be silently skipped on any database that
+/// already applied the first. Numeric prefixes may repeat across branches
+/// (different full names are fine); full strings must not.
+#[test]
+fn migration_versions_are_unique_and_well_formed() {
+    let mut seen = std::collections::HashSet::new();
+    for migration in MIGRATIONS {
+        let version = migration.version;
+        assert!(
+            seen.insert(version),
+            "duplicate migration version `{version}`: a duplicate is silently skipped on \
+             databases that already applied it"
+        );
+
+        let (number, name) = version
+            .split_once('_')
+            .unwrap_or_else(|| panic!("migration version `{version}` must be `NNNN_name`"));
+        assert!(
+            number.len() == 4 && number.bytes().all(|b| b.is_ascii_digit()),
+            "migration version `{version}` must start with a four-digit number"
+        );
+        assert!(
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "migration version `{version}` name must be non-empty lowercase snake_case"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_lifecycle_migration_upgrades_legacy_database_without_backfill() {
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let mut conn = Connection::open(db.path()).unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE schema_migrations (
+             version TEXT PRIMARY KEY,
+             applied_at INTEGER NOT NULL
+         );",
+    )
+    .unwrap();
+
+    // Model the previous schema by applying and recording every migration except lifecycle.
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version != "0022_session_lifecycle")
+    {
+        (migration.apply)(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, 0)",
+            [migration.version],
+        )
+        .unwrap();
+    }
+
+    let lifecycle_table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_lifecycle')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        lifecycle_table_exists,
+        "migration 0001 initializes the current schema"
+    );
+    conn.execute_batch("DROP TABLE session_lifecycle;").unwrap();
+    let lifecycle_table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_lifecycle')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !lifecycle_table_exists,
+        "fixture must predate lifecycle support"
+    );
+
+    conn.execute(
+        "INSERT INTO sessions (public_id, name, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            "pre-lifecycle-session",
+            "Legacy session",
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z"
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let storage = SqliteStorage::connect(db.path().to_path_buf())
+        .await
+        .unwrap();
+    {
+        let conn = storage.conn_for_test();
+        let conn = conn.lock().unwrap();
+        let lifecycle_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_lifecycle')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(lifecycle_table_exists, "connection applies migration 0022");
+        let lifecycle_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_lifecycle", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lifecycle_rows, 0, "legacy sessions are not backfilled");
+        let legacy_row: (String, String, String, String) = conn
+            .query_row(
+                "SELECT public_id, name, created_at, updated_at FROM sessions WHERE public_id = ?1",
+                ["pre-lifecycle-session"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_row,
+            (
+                "pre-lifecycle-session".into(),
+                "Legacy session".into(),
+                "2026-01-01T00:00:00Z".into(),
+                "2026-01-02T00:00:00Z".into(),
+            )
+        );
+    }
+
+    let session = storage
+        .get_session("pre-lifecycle-session")
+        .await
+        .unwrap()
+        .expect("pre-existing session survives the lifecycle migration");
+    assert_eq!(session.public_id, "pre-lifecycle-session");
+    assert_eq!(session.name.as_deref(), Some("Legacy session"));
+
+    let lifecycle = storage
+        .get_session_lifecycle(&session.public_id)
+        .await
+        .unwrap();
+    assert!(!lifecycle.resolved);
+    assert!(!lifecycle.archived);
+    assert_eq!(lifecycle.resolved_at, None);
+    assert_eq!(lifecycle.archived_at, None);
+}
+
+#[test]
+fn workspace_archival_migration_preserves_bindings_and_results() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    apply_migrations(&mut conn).unwrap();
+    conn.execute_batch("DROP TABLE workspace_results; DROP TABLE workspaces;")
+        .unwrap();
+    let old = crate::session::schema::WORKSPACE_TABLES_DDL
+        .replace("'missing', 'archived',", "'missing',");
+    conn.execute_batch(&old).unwrap();
+    conn.execute_batch("INSERT INTO sessions(public_id, created_at, updated_at) VALUES('owner', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        INSERT INTO workspaces(public_id, common_dir, origin_path, project_name, checkout_path, branch, execution, baseline_mode, lifecycle, owner_session_id, created_at, updated_at)
+        VALUES('parent', '/repo/.git', '/repo', 'repo', '/wt/parent', 'qmt/parent', 'worktree', 'commit', 'ready', 'owner', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        INSERT INTO workspaces(public_id, common_dir, origin_path, project_name, checkout_path, branch, execution, baseline_mode, lifecycle, parent_workspace_id, created_at, updated_at)
+        VALUES('child', '/repo/.git', '/repo', 'repo', '/wt/child', 'qmt/child', 'worktree', 'commit', 'ready', 'parent', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        INSERT INTO workspace_results(workspace_public_id, baseline_commit, result_ref, captured_at) VALUES('child', 'base', 'refs/qmt/results/child/test', '2026-01-01T00:00:00Z');").unwrap();
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0025_workspace_archival")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    conn.execute(
+        "UPDATE workspaces SET lifecycle = 'archived' WHERE public_id = 'parent'",
+        [],
+    )
+    .unwrap();
+    let preserved: (String, String, i64) = conn.query_row("SELECT owner_session_id, (SELECT parent_workspace_id FROM workspaces WHERE public_id = 'child'), (SELECT count(*) FROM workspace_results) FROM workspaces WHERE public_id = 'parent'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+    assert_eq!(preserved, ("owner".into(), "parent".into(), 1));
+    let violations: i64 = conn
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
+    assert!(
+        conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+            .unwrap()
+    );
+}
+
+/// The archival rebuild copies by column name, so an old table carrying an
+/// additive column (added later by an `ALTER TABLE` helper, hence last in
+/// the old table but absent from the rebuild statement) keeps that column's
+/// data instead of misaligning or dropping it.
+#[test]
+fn workspace_archival_migration_preserves_additive_columns() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    apply_migrations(&mut conn).unwrap();
+    conn.execute_batch("DROP TABLE workspace_results; DROP TABLE workspaces;")
+        .unwrap();
+    let old = crate::session::schema::WORKSPACE_TABLES_DDL
+        .replace("'missing', 'archived',", "'missing',");
+    conn.execute_batch(&old).unwrap();
+    crate::session::schema::ensure_workspace_provisioning_columns(&mut conn).unwrap();
+    conn.execute_batch(
+        "INSERT INTO workspaces(public_id, common_dir, origin_path, project_name, checkout_path, branch, execution, baseline_mode, lifecycle, requested_base_ref, operation_id, provisioning_phase, created_at, updated_at)
+         VALUES('w', '/repo/.git', '/repo', 'repo', '/wt/w', 'qmt/w', 'worktree', 'commit', 'ready', 'v1.2', 'op-1', 'intent_persisted', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+    )
+    .unwrap();
+
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0025_workspace_archival")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+
+    let row: (String, String, String, String) = conn
+        .query_row(
+            "SELECT branch, requested_base_ref, operation_id, provisioning_phase FROM workspaces WHERE public_id = 'w'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            "qmt/w".into(),
+            "v1.2".into(),
+            "op-1".into(),
+            "intent_persisted".into()
+        )
+    );
+    // The rebuilt table now accepts the new lifecycle value.
+    conn.execute(
+        "UPDATE workspaces SET lifecycle = 'archived' WHERE public_id = 'w'",
+        [],
+    )
+    .unwrap();
+}
+
+#[test]
+fn workspace_source_cwd_migration_backfills_existing_rows() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    apply_migrations(&mut conn).unwrap();
+    // Model a database from before the column existed.
+    conn.execute_batch("ALTER TABLE workspaces DROP COLUMN source_cwd;")
+        .unwrap();
+    conn.execute_batch(
+        "INSERT INTO workspaces(public_id, common_dir, origin_path, project_name, checkout_path, branch, relative_cwd, execution, baseline_mode, lifecycle, created_at, updated_at)
+         VALUES('w-sub', '/repo/.git', '/repo/', 'repo', '/wt/w-sub', 'qmt/w-sub', 'crates/agent', 'worktree', 'commit', 'archived', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                ('w-root', '/repo/.git', '/repo', 'repo', '/wt/w-root', 'qmt/w-root', '', 'worktree', 'commit', 'removed', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+    )
+    .unwrap();
+
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0029_workspace_source_cwd")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+
+    fn source_cwd(conn: &Connection, id: &str) -> String {
+        conn.query_row(
+            "SELECT source_cwd FROM workspaces WHERE public_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+    assert_eq!(source_cwd(&conn, "w-sub"), "/repo/crates/agent");
+    assert_eq!(source_cwd(&conn, "w-root"), "/repo");
+
+    // Re-running never overwrites a stored value.
+    conn.execute(
+        "UPDATE workspaces SET source_cwd = '/elsewhere' WHERE public_id = 'w-root'",
+        [],
+    )
+    .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    assert_eq!(source_cwd(&conn, "w-root"), "/elsewhere");
+}
+
+#[test]
+fn workspace_handoff_migration_upgrades_existing_database() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    apply_migrations(&mut conn).unwrap();
+    // Model a database from before handoff existed.
+    conn.execute_batch(
+        "DROP TABLE workspace_handoffs; ALTER TABLE workspaces DROP COLUMN handed_off_to;
+         INSERT INTO workspaces(public_id, common_dir, origin_path, project_name, checkout_path, branch, relative_cwd, execution, baseline_mode, lifecycle, created_at, updated_at, source_cwd)
+         VALUES('w-1', '/repo/.git', '/repo', 'repo', '/wt/w-1', 'qmt/w-1', '', 'worktree', 'commit', 'ready', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '/repo');",
+    )
+    .unwrap();
+
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0030_workspace_handoff")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    // Idempotent for fresh installs and reruns.
+    (migration.apply)(&mut conn).unwrap();
+
+    let handed_off: Option<String> = conn
+        .query_row(
+            "SELECT handed_off_to FROM workspaces WHERE public_id = 'w-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(handed_off, None, "existing rows keep no handoff target");
+    let markers: i64 = conn
+        .query_row("SELECT count(*) FROM workspace_handoffs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(markers, 0);
+}
+
+#[test]
+fn worktree_workspace_migration_upgrades_existing_database() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    // Model an upgrade from the pre-worktree schema: everything except 0022.
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|m| m.version != "0022_worktree_workspaces")
+    {
+        (migration.apply)(&mut conn).unwrap();
+    }
+
+    // Existing local session with no workspace association.
+    conn.execute(
+        "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at) \
+         VALUES ('legacy-sess', 'Keep me', '/repo', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        [],
+    )
+    .unwrap();
+
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0022_worktree_workspaces")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    // Idempotent on re-run.
+    (migration.apply)(&mut conn).unwrap();
+    // The tables were recreated above, so re-apply the later column too.
+    schema_ensure_source_cwd(&mut conn);
+
+    // Registry and result tables exist with the expected columns.
+    for (table, expected_columns) in [
+        (
+            "workspaces",
+            vec![
+                "id",
+                "public_id",
+                "common_dir",
+                "origin_path",
+                "project_name",
+                "checkout_path",
+                "branch",
+                "relative_cwd",
+                "execution",
+                "baseline_mode",
+                "source_head",
+                "baseline_commit",
+                "lifecycle",
+                "owner_session_id",
+                "parent_workspace_id",
+                "parent_session_id",
+                "delegation_id",
+                "delegation_batch_id",
+                "last_error",
+                "created_at",
+                "updated_at",
+                "requested_base_ref",
+                "operation_id",
+                "provisioning_phase",
+                "source_cwd",
+                "handed_off_to",
+            ],
+        ),
+        (
+            "workspace_results",
+            vec![
+                "id",
+                "workspace_public_id",
+                "baseline_commit",
+                "result_commit",
+                "result_ref",
+                "verification",
+                "captured_at",
+                "captured_head",
+            ],
+        ),
+    ] {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(columns, expected_columns, "unexpected schema for {table}");
+    }
+
+    // Legacy sessions are untouched and unassociated.
+    let (name, count): (String, i64) = conn
+        .query_row(
+            "SELECT s.name, (SELECT COUNT(*) FROM workspaces) FROM sessions s \
+             WHERE s.public_id = 'legacy-sess'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(name, "Keep me");
+    assert_eq!(count, 0, "no workspaces exist after upgrade");
+
+    // Owner uniqueness is enforced by the partial unique index.
+    conn.execute(
+        "INSERT INTO workspaces (public_id, common_dir, origin_path, project_name, \
+         checkout_path, branch, relative_cwd, execution, baseline_mode, lifecycle, \
+         owner_session_id, created_at, updated_at) \
+         VALUES ('ws-1', '/r/.git', '/r', 'r', '/wt/1', 'qmt/workspace/ws-1', '', \
+         'worktree', 'commit', 'ready', 'legacy-sess', \
+         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        [],
+    )
+    .unwrap();
+    let dup_owner = conn.execute(
+        "INSERT INTO workspaces (public_id, common_dir, origin_path, project_name, \
+         checkout_path, branch, relative_cwd, execution, baseline_mode, lifecycle, \
+         owner_session_id, created_at, updated_at) \
+         VALUES ('ws-2', '/r/.git', '/r', 'r', '/wt/2', 'qmt/workspace/ws-2', '', \
+         'worktree', 'commit', 'ready', 'legacy-sess', \
+         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        [],
+    );
+    assert!(dup_owner.is_err(), "a session may own only one workspace");
+
+    // Checkout paths are never reused.
+    let dup_checkout = conn.execute(
+        "INSERT INTO workspaces (public_id, common_dir, origin_path, project_name, \
+         checkout_path, branch, relative_cwd, execution, baseline_mode, lifecycle, \
+         created_at, updated_at) \
+         VALUES ('ws-3', '/r/.git', '/r', 'r', '/wt/1', 'qmt/workspace/ws-3', '', \
+         'worktree', 'commit', 'provisioning', \
+         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        [],
+    );
+    assert!(dup_checkout.is_err(), "checkout paths are never reused");
+}
+
+/// The 0027 provisioning-intent migration upgrades an existing database:
+/// the replayable provisioning inputs (requested ref, operation id, phase)
+/// are added idempotently, pre-existing rows are preserved, and a true
+/// first intent (no baseline) round-trips through the repository without a
+/// fabricated capture.
+#[tokio::test]
+async fn provisioning_intent_migration_upgrades_existing_database() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    // Model an upgrade from the pre-0027 schema: run every migration, then
+    // recreate the workspace tables in their pre-0027 shape (the shared DDL
+    // predates the new columns), so only 0027 has to add them.
+    for migration in MIGRATIONS.iter().filter(|m| {
+        m.version != "0027_workspace_provisioning_intent" && m.version != "0022_worktree_workspaces"
+    }) {
+        (migration.apply)(&mut conn).unwrap();
+    }
+    conn.execute_batch("DROP TABLE workspace_results; DROP TABLE workspaces;")
+        .unwrap();
+    conn.execute_batch(crate::session::schema::WORKSPACE_TABLES_DDL)
+        .unwrap();
+
+    // A workspace provisioned by the older binary: no replay inputs.
+    conn.execute_batch(
+        "INSERT INTO workspaces(public_id, common_dir, origin_path, project_name, \
+         checkout_path, branch, relative_cwd, execution, baseline_mode, lifecycle, \
+         created_at, updated_at) \
+         VALUES('pre-27', '/repo/.git', '/repo', 'repo', '/wt/pre-27', 'qmt/pre-27', '', \
+         'worktree', 'current_working_tree', 'provisioning', \
+         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+    )
+    .unwrap();
+
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0027_workspace_provisioning_intent")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    // Idempotent on re-run.
+    (migration.apply)(&mut conn).unwrap();
+    // The tables were recreated from the shared DDL above, so bring in the
+    // later `source_cwd` column the repository now reads.
+    schema_ensure_source_cwd(&mut conn);
+
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(workspaces)").unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for expected in ["requested_base_ref", "operation_id", "provisioning_phase"] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "missing column {expected} after upgrade"
+            );
+        }
+    }
+
+    // The pre-migration row survives with NULL replay inputs.
+    use crate::worktree::repo_workspace::WorkspaceRepository as _;
+    let store = crate::worktree::SqliteWorkspaceRepository::new(std::sync::Arc::new(
+        std::sync::Mutex::new(conn),
+    ));
+    let id = crate::worktree::WorkspaceId::from_raw("pre-27");
+    let record = store.get_workspace(&id).await.unwrap().unwrap();
+    assert_eq!(
+        record.lifecycle,
+        crate::worktree::WorkspaceLifecycle::Provisioning
+    );
+    assert!(record.baseline.is_none(), "no fabricated baseline");
+    assert_eq!(
+        record.requested_baseline_mode,
+        crate::worktree::BaselineMode::CurrentWorkingTree
+    );
+    assert_eq!(record.requested_base_ref, None);
+    assert_eq!(record.operation_id, "");
+    assert_eq!(record.provisioning_phase, None);
+
+    // The true first persisted intent round-trips once the replay inputs
+    // are recorded.
+    let mut intent = record.clone();
+    intent.requested_base_ref = Some("refs/heads/main".into());
+    intent.operation_id = "op-first".into();
+    intent.provisioning_phase = Some(crate::worktree::ProvisioningPhase::IntentPersisted);
+    store.update_workspace(intent.clone()).await.unwrap();
+    let loaded = store.get_workspace(&id).await.unwrap().unwrap();
+    assert_eq!(loaded, intent);
+}
+
 #[tokio::test]
 async fn task_lifecycle_is_atomic_revisioned_and_explicit() {
     use crate::session::domain::{TaskKind, TaskStatus};
@@ -2564,6 +3236,7 @@ async fn custom_model_crud_round_trip() {
 
 fn new_durable(session_id: &str, kind: AgentEventKind) -> NewDurableEvent {
     NewDurableEvent {
+        session_seq: None,
         session_id: session_id.to_string(),
         origin: EventOrigin::Local,
         source_node: None,
@@ -2810,6 +3483,195 @@ async fn journal_legacy_rows_without_source_cursor_remain_readable() {
     assert_eq!(stream[0].source_node, None);
 }
 
+/// Journal that only forwards `load_session_stream`, so
+/// `last_unfinished_run` exercises the trait's default implementation.
+struct StreamOnlyJournal(SqliteStorage);
+
+#[async_trait::async_trait]
+impl EventJournal for StreamOnlyJournal {
+    async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent> {
+        self.0.append_durable(event).await
+    }
+    async fn load_session_stream(
+        &self,
+        session_id: &str,
+        after_seq: Option<i64>,
+        limit: Option<usize>,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        self.0
+            .load_session_stream(session_id, after_seq, limit)
+            .await
+    }
+    async fn load_global_stream(
+        &self,
+        after_seq: Option<i64>,
+        limit: Option<usize>,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        self.0.load_global_stream(after_seq, limit).await
+    }
+    async fn delete_session_events_from(
+        &self,
+        session_id: &str,
+        from_seq: i64,
+    ) -> SessionResult<usize> {
+        self.0
+            .delete_session_events_from(session_id, from_seq)
+            .await
+    }
+    async fn append_durable_from_source(
+        &self,
+        event: &NewDurableEvent,
+    ) -> SessionResult<Option<DurableEvent>> {
+        self.0.append_durable_from_source(event).await
+    }
+    async fn latest_source_seq(&self, s: &str, n: &str) -> SessionResult<Option<i64>> {
+        self.0.latest_source_seq(s, n).await
+    }
+    async fn remote_sync_cursor(&self, s: &str, n: &str) -> SessionResult<Option<i64>> {
+        self.0.remote_sync_cursor(s, n).await
+    }
+    async fn advance_remote_sync_cursor(
+        &self,
+        s: &str,
+        n: &str,
+        seq: i64,
+        complete: bool,
+    ) -> SessionResult<()> {
+        self.0.advance_remote_sync_cursor(s, n, seq, complete).await
+    }
+    async fn load_remote_session_stream(
+        &self,
+        s: &str,
+        n: &str,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        self.0.load_remote_session_stream(s, n).await
+    }
+    async fn max_stream_seq(&self, session_id: &str) -> SessionResult<i64> {
+        self.0.max_stream_seq(session_id).await
+    }
+}
+
+async fn assert_last_unfinished_run_semantics(journal: &dyn EventJournal) {
+    let started = |id: &str| AgentEventKind::RunStarted {
+        run_id: id.to_string(),
+        origin: "interactive".to_string(),
+    };
+    let completed = |id: &str| AgentEventKind::RunCompleted {
+        run_id: id.to_string(),
+        outcome: "completed".to_string(),
+        stop_type: None,
+        reason: None,
+    };
+    let append = |session: &'static str, kind: AgentEventKind| async move {
+        journal
+            .append_durable(&new_durable(session, kind))
+            .await
+            .unwrap();
+    };
+
+    // No runs.
+    append("none", AgentEventKind::SessionCreated).await;
+    assert_eq!(journal.last_unfinished_run("none").await.unwrap(), None);
+
+    // Matched run.
+    append("matched", started("a")).await;
+    append("matched", completed("a")).await;
+    assert_eq!(journal.last_unfinished_run("matched").await.unwrap(), None);
+
+    // Unmatched last run, after a matched one.
+    append("last", started("a")).await;
+    append("last", completed("a")).await;
+    append("last", started("b")).await;
+    assert_eq!(
+        journal
+            .last_unfinished_run("last")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("b")
+    );
+
+    // Unmatched earlier run followed by a matched later run: the earlier one
+    // is still the last unfinished run.
+    append("earlier", started("a")).await;
+    append("earlier", started("b")).await;
+    append("earlier", completed("b")).await;
+    assert_eq!(
+        journal
+            .last_unfinished_run("earlier")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("a")
+    );
+
+    // Other sessions are never consulted.
+    assert_eq!(journal.last_unfinished_run("unknown").await.unwrap(), None);
+
+    // Events mirrored from a remote host describe runs that host owns and
+    // closes; they are never orphans of this node.
+    let remote_started = NewDurableEvent {
+        origin: EventOrigin::Remote,
+        source_node: Some("peer".to_string()),
+        source_node_id: Some("node-a".to_string()),
+        source_seq: Some(1),
+        ..new_durable("mirrored", started("remote-run"))
+    };
+    journal
+        .append_durable_from_source(&remote_started)
+        .await
+        .unwrap();
+    assert_eq!(journal.last_unfinished_run("mirrored").await.unwrap(), None);
+    // A local unfinished run in the same session is still found.
+    append("mirrored", started("local-run")).await;
+    assert_eq!(
+        journal
+            .last_unfinished_run("mirrored")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("local-run")
+    );
+}
+
+#[tokio::test]
+async fn last_unfinished_run_query_uses_run_lifecycle_index() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let conn = storage.conn_for_test();
+    let conn = conn.lock().unwrap();
+    let plan: Vec<String> = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN \
+             SELECT kind, json_extract(payload_json, '$.data.run_id') \
+             FROM event_journal \
+             WHERE session_id = ? AND kind IN ('run_started', 'run_completed') \
+             AND origin = 'local' \
+             ORDER BY stream_seq ASC",
+        )
+        .unwrap()
+        .query_map(["s"], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("idx_event_journal_run_lifecycle")),
+        "query must use the partial index, plan: {plan:?}"
+    );
+}
+
+#[tokio::test]
+async fn journal_last_unfinished_run_sqlite_override() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    assert_last_unfinished_run_semantics(&storage).await;
+}
+
+#[tokio::test]
+async fn journal_last_unfinished_run_default_impl() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    assert_last_unfinished_run_semantics(&StreamOnlyJournal(storage)).await;
+}
+
 #[tokio::test]
 async fn journal_append_durable_assigns_monotonic_seq() {
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
@@ -2838,6 +3700,7 @@ async fn journal_append_durable_returns_correct_fields() {
 
     let evt = journal
         .append_durable(&NewDurableEvent {
+            session_seq: None,
             session_id: "sess-x".to_string(),
             origin: EventOrigin::Remote,
             source_node: Some("node-a".to_string()),
@@ -3067,6 +3930,281 @@ async fn journal_ordering_is_monotonic_per_stream() {
             "stream_seq must be strictly increasing"
         );
     }
+}
+
+#[tokio::test]
+async fn journal_replay_orders_by_producer_session_seq() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    // Persisted in the opposite order from production (as racing writers did).
+    for (seq, kind) in [
+        (2, AgentEventKind::Cancelled),
+        (1, AgentEventKind::SessionCreated),
+    ] {
+        let mut event = new_durable("s1", kind);
+        event.session_seq = Some(seq);
+        journal.append_durable(&event).await.unwrap();
+    }
+
+    let events = journal.load_session_stream("s1", None, None).await.unwrap();
+    let seqs: Vec<i64> = events.iter().map(|e| e.session_seq).collect();
+    assert_eq!(seqs, vec![1, 2], "replay follows production order");
+    assert!(matches!(events[0].kind, AgentEventKind::SessionCreated));
+    assert_eq!(journal.max_session_seq_blocking("s1"), 2);
+    assert_eq!(journal.max_session_seq_blocking("other"), 0);
+}
+
+#[tokio::test]
+async fn journal_rejects_duplicate_session_seq_but_allows_unsequenced_rows() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    let mut sequenced = new_durable("s1", AgentEventKind::SessionCreated);
+    sequenced.session_seq = Some(1);
+    journal.append_durable(&sequenced).await.unwrap();
+    assert!(
+        journal.append_durable(&sequenced).await.is_err(),
+        "(session_id, session_seq) is unique"
+    );
+
+    // Unsequenced rows (annotations) store NULL and never collide.
+    for _ in 0..2 {
+        let stored = journal
+            .append_durable(&new_durable("s1", AgentEventKind::Cancelled))
+            .await
+            .unwrap();
+        assert_eq!(stored.session_seq, 0);
+    }
+}
+
+#[tokio::test]
+async fn journal_batch_append_keeps_order_and_isolates_failures() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    let batch: Vec<NewDurableEvent> = (1..=3)
+        .map(|seq| {
+            let mut event = new_durable("s1", AgentEventKind::Cancelled);
+            event.session_seq = Some(seq);
+            event
+        })
+        .collect();
+    let results = journal.append_durable_batch(&batch).await;
+    let stored: Vec<i64> = results
+        .iter()
+        .map(|r| r.as_ref().unwrap().session_seq)
+        .collect();
+    assert_eq!(stored, vec![1, 2, 3]);
+
+    // One colliding event fails alone; its neighbours still persist.
+    let mut next = batch.clone();
+    next[1].session_seq = Some(2); // duplicate of the stored row
+    next[0].session_seq = Some(4);
+    next[2].session_seq = Some(5);
+    let results = journal.append_durable_batch(&next).await;
+    assert!(results[0].is_ok() && results[1].is_err() && results[2].is_ok());
+    assert_eq!(journal.max_session_seq_blocking("s1"), 5);
+}
+
+#[tokio::test]
+async fn journal_relayed_events_keep_host_session_seq_and_dedup() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    let mut event = new_durable("s1", AgentEventKind::SessionCreated);
+    event.origin = EventOrigin::Remote;
+    event.source_node_id = Some("node-a".to_string());
+    event.source_seq = Some(40);
+    event.session_seq = Some(7);
+
+    let stored = journal
+        .append_durable_from_source(&event)
+        .await
+        .unwrap()
+        .expect("first relay persists");
+    assert_eq!(stored.session_seq, 7, "host sequence is kept as-is");
+    assert!(
+        journal
+            .append_durable_from_source(&event)
+            .await
+            .unwrap()
+            .is_none(),
+        "replayed relay is a no-op"
+    );
+
+    let replay = journal.load_session_stream("s1", None, None).await.unwrap();
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].session_seq, 7);
+}
+
+/// The host's numbering is a separate sequence: a relayed row may carry the
+/// same `session_seq` as a local row without being rejected, and the local
+/// counter ignores relayed numbers.
+#[tokio::test]
+async fn journal_relayed_session_seq_does_not_collide_with_local_numbering() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    let mut local = new_durable("s1", AgentEventKind::SessionCreated);
+    local.session_seq = Some(1);
+    journal.append_durable(&local).await.unwrap();
+
+    let mut relayed = new_durable("s1", AgentEventKind::Cancelled);
+    relayed.origin = EventOrigin::Remote;
+    relayed.source_node_id = Some("node-a".to_string());
+    relayed.source_seq = Some(90);
+    relayed.session_seq = Some(1);
+    assert!(
+        journal
+            .append_durable_from_source(&relayed)
+            .await
+            .unwrap()
+            .is_some(),
+        "relayed row with the same number as a local row is stored"
+    );
+
+    let mut high = relayed.clone();
+    high.source_seq = Some(91);
+    high.session_seq = Some(500);
+    journal.append_durable_from_source(&high).await.unwrap();
+    assert_eq!(
+        journal.max_session_seq_blocking("s1"),
+        1,
+        "local counter ignores relayed numbers"
+    );
+
+    // Local numbers stay unique.
+    assert!(journal.append_durable(&local).await.is_err());
+}
+
+/// Pages served to other nodes are strictly increasing in `stream_seq` even
+/// when the rows were stored out of production order.
+#[tokio::test]
+async fn journal_page_is_raw_stream_seq_order_while_replay_restores_production_order() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    for seq in [3, 1, 2] {
+        let mut event = new_durable("s1", AgentEventKind::Cancelled);
+        event.session_seq = Some(seq);
+        journal.append_durable(&event).await.unwrap();
+    }
+
+    let page = journal.load_session_page("s1", None, None).await.unwrap();
+    let stream: Vec<i64> = page.iter().map(|e| e.stream_seq).collect();
+    assert!(stream.windows(2).all(|w| w[0] < w[1]), "{stream:?}");
+    let session: Vec<i64> = page.iter().map(|e| e.session_seq).collect();
+    assert_eq!(session, vec![3, 1, 2], "raw insert order");
+
+    let replay = journal.load_session_stream("s1", None, None).await.unwrap();
+    let session: Vec<i64> = replay.iter().map(|e| e.session_seq).collect();
+    assert_eq!(session, vec![1, 2, 3], "replay follows production order");
+
+    let tail = journal
+        .load_session_page("s1", Some(page[0].stream_seq), Some(1))
+        .await
+        .unwrap();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].stream_seq, page[1].stream_seq);
+}
+
+/// Unsequenced rows keep their insert slot instead of jumping to the front.
+#[tokio::test]
+async fn journal_replay_keeps_unsequenced_rows_in_their_slot() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    let mut a = new_durable("s1", AgentEventKind::SessionCreated);
+    a.session_seq = Some(2);
+    journal.append_durable(&a).await.unwrap();
+    journal
+        .append_durable(&new_durable("s1", AgentEventKind::Cancelled))
+        .await
+        .unwrap();
+    let mut b = new_durable("s1", AgentEventKind::SessionCreated);
+    b.session_seq = Some(1);
+    journal.append_durable(&b).await.unwrap();
+
+    let replay = journal.load_session_stream("s1", None, None).await.unwrap();
+    let session: Vec<i64> = replay.iter().map(|e| e.session_seq).collect();
+    assert_eq!(session, vec![1, 0, 2]);
+}
+
+#[test]
+fn migration_0024_backfills_local_rows_from_stream_order_and_leaves_relayed_null() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|m| m.version != "0024_event_journal_session_seq")
+    {
+        (migration.apply)(&mut conn).unwrap();
+    }
+
+    let insert = |id: &str, stream_seq: i64, session: &str, origin: &str, node_id: Option<&str>| {
+        conn.execute(
+            "INSERT INTO event_journal \
+             (event_id, stream_seq, session_id, timestamp, origin, source_node, source_node_id, source_seq, kind, payload_json) \
+             VALUES (?1, ?2, ?3, 1, ?4, NULL, ?5, ?6, 'cancelled', '{\"type\":\"cancelled\"}')",
+            rusqlite::params![id, stream_seq, session, origin, node_id, node_id.map(|_| stream_seq)],
+        )
+        .unwrap();
+    };
+    insert("a1", 1, "s1", "local", None);
+    insert("b1", 2, "s2", "local", None);
+    insert("a2", 3, "s1", "local", None);
+    insert("r1", 4, "s1", "remote", Some("node-a"));
+    insert("a3", 5, "s1", "local", None);
+
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0024_event_journal_session_seq")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    // Idempotent.
+    (migration.apply)(&mut conn).unwrap();
+
+    let seq_of = |id: &str| -> Option<i64> {
+        conn.query_row(
+            "SELECT session_seq FROM event_journal WHERE event_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(seq_of("a1"), Some(1));
+    assert_eq!(seq_of("a2"), Some(2));
+    assert_eq!(seq_of("a3"), Some(3));
+    assert_eq!(seq_of("b1"), Some(1), "numbering is per session");
+    assert_eq!(seq_of("r1"), None, "relayed legacy rows stay unnumbered");
+
+    let index_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_event_journal_session_order'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index_exists, 1);
+}
+
+#[tokio::test]
+async fn file_databases_use_wal_with_normal_synchronous() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = SqliteStorage::connect(dir.path().join("journal.db"))
+        .await
+        .unwrap();
+    let conn = storage.conn_for_test();
+    let conn = conn.lock().unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    let synchronous: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode.to_ascii_lowercase(), "wal");
+    assert_eq!(synchronous, 1, "NORMAL");
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -3458,6 +4596,564 @@ async fn search_sessions_filters_by_scope() {
 // ViewStore — get_recent_models_view tests
 // ══════════════════════════════════════════════════════════════════════
 
+fn set_session_updated_at(storage: &SqliteStorage, session_id: &str, updated_at: &str) {
+    let conn = storage.conn_for_test();
+    conn.lock()
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE public_id = ?2",
+            rusqlite::params![updated_at, session_id],
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn session_lifecycle_storage_defaults_patches_and_cascades() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(Some("lifecycle".into()), None, None, None)
+        .await
+        .unwrap();
+    let sibling = storage
+        .create_session(Some("sibling".into()), None, None, None)
+        .await
+        .unwrap();
+    let store: &dyn SessionStore = &storage;
+    assert!(store.supports_session_lifecycle());
+
+    let before_activity = store
+        .get_session(&session.public_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .updated_at;
+    let lifecycle_rows: i64 = storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM session_lifecycle", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(lifecycle_rows, 0, "new sessions are not backfilled");
+
+    let initial = store
+        .get_session_lifecycle(&session.public_id)
+        .await
+        .unwrap();
+    assert!(!initial.resolved);
+    assert!(!initial.archived);
+    assert_eq!(initial.resolved_at, None);
+    assert_eq!(initial.archived_at, None);
+
+    let empty_patch = SessionLifecyclePatch::default();
+    assert!(
+        store
+            .patch_session_lifecycle(&session.public_id, &empty_patch)
+            .await
+            .is_err()
+    );
+    let resolved_patch = SessionLifecyclePatch {
+        resolved: Some(true),
+        archived: None,
+    };
+    let resolved = store
+        .patch_session_lifecycle(&session.public_id, &resolved_patch)
+        .await
+        .unwrap();
+    let repeated = store
+        .patch_session_lifecycle(&session.public_id, &resolved_patch)
+        .await
+        .unwrap();
+    assert!(resolved.resolved);
+    assert_eq!(resolved.resolved_at, repeated.resolved_at);
+
+    let archived = store
+        .patch_session_lifecycle(
+            &session.public_id,
+            &SessionLifecyclePatch {
+                resolved: None,
+                archived: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+    let reopened = store
+        .patch_session_lifecycle(
+            &session.public_id,
+            &SessionLifecyclePatch {
+                resolved: Some(false),
+                archived: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!reopened.resolved);
+    assert_eq!(reopened.resolved_at, None);
+    assert!(reopened.archived);
+    assert_eq!(reopened.archived_at, archived.archived_at);
+    assert_eq!(
+        store
+            .get_session(&session.public_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        before_activity
+    );
+
+    let ids = vec![session.public_id.clone(), sibling.public_id.clone()];
+    let batch = store.get_session_lifecycles(&ids).await.unwrap();
+    assert!(batch[&session.public_id].archived);
+    assert!(!batch[&sibling.public_id].resolved);
+    assert_eq!(batch[&sibling.public_id].resolved_at, None);
+
+    let views: &dyn ViewStore = &storage;
+    assert!(views.supports_session_lifecycle());
+    let listed = views.get_session_list_lifecycles(&ids).await.unwrap();
+    assert_eq!(listed, batch);
+    assert!(matches!(
+        store.get_session_lifecycle("missing-session").await,
+        Err(crate::session::error::SessionError::SessionNotFound(_))
+    ));
+    assert!(
+        store
+            .patch_session_lifecycle("missing-session", &resolved_patch)
+            .await
+            .is_err()
+    );
+
+    let internal_id: i64 = storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM sessions WHERE public_id = ?1",
+            rusqlite::params![session.public_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    store.delete_session(&session.public_id).await.unwrap();
+    let remaining_lifecycle_rows: i64 = storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_lifecycle WHERE session_id = ?1",
+            rusqlite::params![internal_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_lifecycle_rows, 0, "session deletion cascades");
+}
+
+#[tokio::test]
+async fn session_pins_are_idempotent_and_cascade_without_activity_writes() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(Some("pinned".into()), None, None, None)
+        .await
+        .unwrap();
+    let store: &dyn SessionStore = &storage;
+    assert!(store.supports_session_pins());
+    let before_activity = store
+        .get_session(&session.public_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .updated_at;
+
+    let (pinned, changed) = store
+        .set_session_pinned(&session.public_id, true)
+        .await
+        .unwrap();
+    assert!(changed);
+    assert!(pinned.pinned);
+    let pinned_at = pinned.pinned_at.expect("pin timestamp");
+    let (repeated, changed) = store
+        .set_session_pinned(&session.public_id, true)
+        .await
+        .unwrap();
+    assert!(!changed);
+    assert_eq!(repeated.pinned_at.as_deref(), Some(pinned_at.as_str()));
+
+    assert_eq!(
+        store
+            .get_session(&session.public_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        before_activity
+    );
+    let (unpinned, changed) = store
+        .set_session_pinned(&session.public_id, false)
+        .await
+        .unwrap();
+    assert!(changed);
+    assert!(!unpinned.pinned);
+    assert_eq!(unpinned.pinned_at, None);
+    let (_, changed) = store
+        .set_session_pinned(&session.public_id, false)
+        .await
+        .unwrap();
+    assert!(!changed);
+
+    store
+        .set_session_pinned(&session.public_id, true)
+        .await
+        .unwrap();
+    let internal_id: i64 = storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM sessions WHERE public_id = ?1",
+            rusqlite::params![session.public_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    store.delete_session(&session.public_id).await.unwrap();
+    let remaining_pin_rows: i64 = storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_pins WHERE session_id = ?1",
+            rusqlite::params![internal_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_pin_rows, 0, "session deletion cascades pins");
+}
+
+#[tokio::test]
+async fn session_lifecycle_state_survives_reopening_storage() {
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let db_path = db.path().to_path_buf();
+    let session_id;
+    let expected;
+    {
+        let storage = SqliteStorage::connect(db_path.clone()).await.unwrap();
+        let session = storage
+            .create_session(Some("persist lifecycle".into()), None, None, None)
+            .await
+            .unwrap();
+        session_id = session.public_id;
+        expected = storage
+            .patch_session_lifecycle(
+                &session_id,
+                &SessionLifecyclePatch {
+                    resolved: Some(true),
+                    archived: Some(true),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let reopened = SqliteStorage::connect(db_path).await.unwrap();
+    let actual = reopened.get_session_lifecycle(&session_id).await.unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn lifecycle_filters_apply_before_pages_counts_and_activity() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let newest_open = storage
+        .create_session(
+            Some("lifecycleprobe newest open".into()),
+            Some("/lifecycle".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let newest_archived = storage
+        .create_session(
+            Some("lifecycleprobe newest archived".into()),
+            Some("/lifecycle".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let resolved = storage
+        .create_session(
+            Some("lifecycleprobe resolved".into()),
+            Some("/lifecycle".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let older_open = storage
+        .create_session(
+            Some("lifecycleprobe older open".into()),
+            Some("/lifecycle".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let parent = storage
+        .create_session(
+            Some("lifecycleprobe parent".into()),
+            Some("/children".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let open_child = storage
+        .create_session(
+            Some("lifecycleprobe open child".into()),
+            Some("/children".into()),
+            Some(parent.public_id.clone()),
+            Some(ForkOrigin::User),
+        )
+        .await
+        .unwrap();
+    let archived_child = storage
+        .create_session(
+            Some("lifecycleprobe archived child".into()),
+            Some("/children".into()),
+            Some(parent.public_id.clone()),
+            Some(ForkOrigin::User),
+        )
+        .await
+        .unwrap();
+
+    set_session_updated_at(&storage, &newest_archived.public_id, "2025-04-01T00:00:00Z");
+    set_session_updated_at(&storage, &resolved.public_id, "2025-03-01T00:00:00Z");
+    set_session_updated_at(&storage, &newest_open.public_id, "2025-02-01T00:00:00Z");
+    set_session_updated_at(&storage, &older_open.public_id, "2025-01-01T00:00:00Z");
+    set_session_updated_at(&storage, &parent.public_id, "2024-12-01T00:00:00Z");
+    set_session_updated_at(&storage, &open_child.public_id, "2024-11-01T00:00:00Z");
+    set_session_updated_at(&storage, &archived_child.public_id, "2024-10-01T00:00:00Z");
+
+    let store: &dyn SessionStore = &storage;
+    store
+        .patch_session_lifecycle(
+            &newest_archived.public_id,
+            &SessionLifecyclePatch {
+                resolved: None,
+                archived: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .patch_session_lifecycle(
+            &resolved.public_id,
+            &SessionLifecyclePatch {
+                resolved: Some(true),
+                archived: None,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .patch_session_lifecycle(
+            &archived_child.public_id,
+            &SessionLifecyclePatch {
+                resolved: None,
+                archived: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .patch_session_lifecycle(
+            &parent.public_id,
+            &SessionLifecyclePatch {
+                resolved: Some(true),
+                archived: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let filter = SessionLifecycleFilter {
+        resolution: ResolutionFilter::Open,
+        archive: ArchiveFilter::Excluded,
+    };
+    let views: &dyn ViewStore = &storage;
+
+    let (items, next_cursor, total) = views
+        .list_session_items_with_lifecycle(
+            Some("/lifecycle".into()),
+            None,
+            1,
+            SessionScope::All,
+            filter,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(items[0].session_id, newest_open.public_id);
+    assert_eq!(next_cursor.as_deref(), Some("1"));
+    let (items, next_cursor, total) = views
+        .list_session_items_with_lifecycle(
+            Some("/lifecycle".into()),
+            next_cursor,
+            1,
+            SessionScope::All,
+            filter,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(items[0].session_id, older_open.public_id);
+    assert!(next_cursor.is_none());
+
+    let (archived_items, _, archived_total) = views
+        .list_session_items_with_lifecycle(
+            Some("/lifecycle".into()),
+            None,
+            10,
+            SessionScope::All,
+            SessionLifecycleFilter {
+                resolution: ResolutionFilter::Any,
+                archive: ArchiveFilter::Only,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived_total, 1);
+    assert_eq!(archived_items[0].session_id, newest_archived.public_id);
+
+    let (resolved_items, _, resolved_total) = views
+        .list_session_items_with_lifecycle(
+            Some("/lifecycle".into()),
+            None,
+            10,
+            SessionScope::All,
+            SessionLifecycleFilter {
+                resolution: ResolutionFilter::Resolved,
+                archive: ArchiveFilter::Any,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolved_total, 1);
+    assert_eq!(resolved_items[0].session_id, resolved.public_id);
+
+    let (group, total) = views
+        .list_group_sessions_with_lifecycle(
+            Some("/lifecycle".into()),
+            None,
+            1,
+            SessionScope::All,
+            filter,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(group.total_count, Some(2));
+    assert_eq!(group.sessions[0].session_id, newest_open.public_id);
+    assert_eq!(
+        group.latest_activity.unwrap(),
+        time::OffsetDateTime::parse(
+            "2025-02-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+    );
+
+    let (groups, _, total) = views
+        .browse_session_groups_with_lifecycle(None, 10, 1, SessionScope::Root, filter)
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    let workspace_group = groups
+        .iter()
+        .find(|group| group.cwd.as_deref() == Some("/lifecycle"))
+        .unwrap();
+    assert_eq!(workspace_group.total_count, Some(2));
+    assert_eq!(
+        workspace_group.sessions[0].session_id,
+        newest_open.public_id
+    );
+
+    let (groups, _, total) = views
+        .search_sessions_with_lifecycle(
+            "lifecycleprobe".into(),
+            None,
+            1,
+            SessionScope::Root,
+            filter,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    let first_page_ids = session_ids(&groups);
+    assert_eq!(first_page_ids.len(), 1);
+    assert!(!first_page_ids.contains(&newest_archived.public_id));
+    assert!(!first_page_ids.contains(&resolved.public_id));
+
+    let (groups, _, _) = views
+        .search_sessions_with_lifecycle(
+            "lifecycleprobe".into(),
+            None,
+            10,
+            SessionScope::Root,
+            filter,
+        )
+        .await
+        .unwrap();
+    let search_workspace = groups
+        .iter()
+        .find(|group| group.cwd.as_deref() == Some("/lifecycle"))
+        .unwrap();
+    assert_eq!(search_workspace.total_count, Some(2));
+    assert_eq!(
+        search_workspace.latest_activity.unwrap(),
+        time::OffsetDateTime::parse(
+            "2025-02-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+    );
+
+    let (group, total) = views
+        .list_session_children_with_lifecycle(parent.public_id.clone(), None, 10, filter)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(group.sessions[0].session_id, open_child.public_id);
+
+    let list_view = views
+        .get_session_list_view_with_lifecycle(None, filter)
+        .await
+        .unwrap();
+    assert_eq!(list_view.total_count, 3);
+    assert_eq!(
+        list_view
+            .groups
+            .iter()
+            .map(|group| group.sessions.len())
+            .sum::<usize>(),
+        3
+    );
+    let listed_child = list_view
+        .groups
+        .iter()
+        .flat_map(|group| group.sessions.iter())
+        .find(|session| session.session_id == open_child.public_id)
+        .expect("open child remains listed when its parent is filtered out");
+    assert_eq!(
+        listed_child.parent_session_id.as_deref(),
+        Some(parent.public_id.as_str())
+    );
+
+    let (_, _, unfiltered_total) = views
+        .search_sessions("lifecycleprobe".into(), None, 20, SessionScope::Root)
+        .await
+        .unwrap();
+    assert_eq!(unfiltered_total, 5);
+}
+
 #[tokio::test]
 async fn recent_models_view_reads_from_event_journal() {
     // This test verifies that get_recent_models_view reads from
@@ -3480,6 +5176,7 @@ async fn recent_models_view_reads_from_event_journal() {
     let journal: &dyn EventJournal = &storage;
     journal
         .append_durable(&NewDurableEvent {
+            session_seq: None,
             session_id: session_id.clone(),
             origin: EventOrigin::Local,
             source_node: None,
@@ -3548,6 +5245,7 @@ async fn recent_models_view_respects_limit_per_workspace() {
     ] {
         journal
             .append_durable(&NewDurableEvent {
+                session_seq: None,
                 session_id: session_id.clone(),
                 origin: EventOrigin::Local,
                 source_node: None,
@@ -3585,6 +5283,7 @@ async fn journal_preserves_remote_origin_and_source_node() {
 
     journal
         .append_durable(&NewDurableEvent {
+            session_seq: None,
             session_id: "s1".to_string(),
             origin: EventOrigin::Remote,
             source_node: Some("peer-42".to_string()),
@@ -3630,4 +5329,9 @@ async fn remote_bookmark_point_lookup_missing_returns_none() {
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
     let got = storage.get_remote_session_bookmark("absent").await.unwrap();
     assert_eq!(got, None);
+}
+
+fn schema_ensure_source_cwd(conn: &mut Connection) {
+    crate::session::schema::ensure_workspace_source_cwd(conn).unwrap();
+    crate::session::schema::ensure_workspace_handoff(conn).unwrap();
 }

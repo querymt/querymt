@@ -142,6 +142,11 @@ max_retries = 3
 initial_backoff_ms = 1000
 backoff_multiplier = 2.0
 
+# Compaction is a paid request. Every attempt (including a retry after a
+# rejected or empty summary) is recorded in the session's cost accounting
+# under the "compaction" purpose, charged to the cycle that triggered it.
+# See "Cost accounting" in api_reference.md.
+
 # Snapshot backend (undo/redo support)
 [agent.execution.snapshot]
 backend = "git"           # "git" or "none"
@@ -207,6 +212,25 @@ timeout_sec = 5
 ```
 
 Hook commands receive JSON on stdin and return JSON on stdout. Supported events now include compaction hooks and delegation hooks in addition to tool, prompt, session, permission, and stop hooks. See the [Hooks Guide](hooks.md) for the full event list, schema files, and `stop` continuation behavior.
+
+### Workspace (Git worktree) Configuration
+
+Managed Git worktree isolation is disabled by default. Enabling it only makes
+isolation *available*; sessions still run locally unless they explicitly ask
+for a worktree.
+
+```toml
+[agent.workspace]          # [quorum.workspace] for a quorum
+enabled = true             # default false
+storage_root = "~/.qmt/worktrees"   # default; relative paths resolve against this file
+baseline = "commit"        # "commit" (default) | "current_working_tree"
+```
+
+`baseline` is a default for explicitly requested top-level isolation that does
+not choose its own baseline. Invalid settings (unusable `storage_root`, a
+backend without a workspace repository) fail when the agent is built. See
+[Git Worktree Workspaces](worktrees.md) for requesting isolation, the error
+codes, and the Rust/Python APIs.
 
 ## MCP Servers
 
@@ -277,6 +301,11 @@ type = "dedup_check"
 threshold = 0.85
 min_lines = 10
 
+# Parallel edit guard (on in "warn" mode by default; "deny" rejects redundant same-file edits)
+[[middleware]]
+type = "parallel_edit_guard"
+mode = "deny"
+
 # Custom middleware (if registered)
 [[middleware]]
 type = "custom_middleware"
@@ -328,6 +357,28 @@ Database path precedence:
 3. Default `<QMT_CONFIG_DIR or QMT_HOME or ~/.qmt>/sessions.db`
 
 Programmatic builders may still call `.db(...)` as an explicit runtime override.
+
+### Run leases
+
+While a local session run is in progress, the process holds an exclusive OS file lock (a *run lease*) on
+`<db-dir>/<db-stem>.run-leases/<session-id>.lock`, e.g. `~/.qmt/sessions.run-leases/`. The directory sits next to the
+sessions database, so a separate `--db` gets separate leases.
+
+- The operating system releases the lease when the process exits, including a crash or kill. This works the same on
+  Linux, macOS and Windows.
+- If a process dies mid-run, the session journal keeps a `run_started` without a `run_completed`. The next process that
+  loads, cancels or stops that session sees the free lease and records `run_completed` with outcome `interrupted`, so the
+  session no longer shows as running.
+- A prompt sent to a session whose lease is held by another process fails with `session is running in another process`.
+  A lease held only for a moment (while another process reconciles or deletes the session) delays the prompt briefly
+  instead. Queued prompts of one process keep the lease between turns.
+- Processes that take no lease (QueryMT versions before run leases, or a run that could not take one) are not
+  visible to others: loading such a session elsewhere marks its live run `interrupted`. Restart running instances when
+  upgrading.
+- The lock files are empty and are kept after a run. Deleting a session removes its file when it is free.
+- Leases are per machine. They are not reliable on network filesystems (NFS/SMB); keep the sessions database on a local
+  disk. If the lease cannot be taken for any other I/O reason, the run proceeds without one.
+- Sessions hosted on a remote node are not reconciled locally; the host closes its own runs.
 
 ## Multi-Agent (Quorum) Configuration
 
@@ -382,6 +433,11 @@ capabilities = ["coding", "filesystem"]
 tools = ["edit", "write_file", "shell", "read_tool"]
 
 system = "You are a coder agent. Implement the requested changes."
+
+# Workspace isolation for tasks delegated to this agent (default "inherit").
+# isolation = "inherit"   # isolated parents isolate delegates; local parents share
+# isolation = "isolated"  # always a private worktree (needs [quorum.workspace])
+# isolation = "shared"    # share the parent's checkout (disclosed as shared)
 
 [delegates.execution]
 # Same execution policy structure
@@ -554,6 +610,116 @@ QueryMT includes several built-in commands:
 
 For complete slash commands documentation, see [Slash Commands Guide](slash-commands.md).
 
+## Tool Argument Handling
+
+Builtin tool parameters use `snake_case` names everywhere. The edit tools were the
+only exception and were renamed in a single release:
+
+| Tool | Canonical parameters |
+|---|---|
+| `edit` | `file_path`, `old_string`, `new_string`, `replace_all` |
+| `multiedit` | `file_path`, `edits[]` of `old_string`, `new_string`, `replace_all` |
+| `replace_symbol` | `replacements[]` of `path`, `symbol`, `kind`, `occurrence`, `expected_hash`, `new_text`; `root` |
+
+**Permanent aliases.** The previous camelCase names (`filePath`, `oldString`,
+`newString`, `replaceAll`, `newText`, `expectedHash`) and the short forms `old_str` /
+`new_str` are still accepted, at the top level and inside `edits` / `replacements`
+items, and are renamed to the canonical names before the call is processed. Aliases
+are never advertised to the model and exist only for builtin tools: MCP and provider
+tools receive their keys unchanged. Sending two spellings of one parameter (for
+example `new_string` and `newString`) is rejected, even when the values are equal.
+
+**Closed schemas.** Every builtin object schema sets `additionalProperties: false`, so
+an unknown key fails validation instead of being ignored.
+
+**Unambiguous shape repairs.** Before validation the schema is used to repair
+mistakes that have one reading: a JSON string where an array or object is expected, an
+integer sent as a string (`"466, "`), a single string where an array of strings is
+expected, and a single edit or replacement sent without its `edits` / `replacements`
+array. Broken JSON, string-typed content (such as edit text that happens to contain
+JSON) and union-typed values are never modified.
+
+`search_text.exclude` accepts either one glob string or an array of globs. A
+`question` header longer than 12 characters is accepted and shortened to its first 12
+Unicode scalar values before it is shown.
+
+### Raw and effective arguments
+
+Every tool call has two argument representations with separate owners:
+
+| Representation | What it is | Consumed by |
+|---|---|---|
+| **Raw** | The argument text exactly as the model emitted it (aliases, stringified containers, odd whitespace). Never rewritten. | Stored assistant output/history, provider replay on the next request, diagnostics. |
+| **Effective** | Normalised, hook-adjusted and validated arguments of the prepared call. | `pre_tool_use` hooks (the normalised input), validation, file-access scheduling, middleware review (`ParallelEditGuard`), permission checks, tool invocation, snapshots, `ToolCallStart` events, progress records, `post_tool_use` hooks, and the `tool_arguments` stored on tool results. |
+
+A repair therefore never rewrites history: the assistant message keeps what the model
+sent, while the matching tool result records what actually ran, including a target
+changed by a hook.
+
+### Preparation order
+
+Each call is prepared once, in model order, and the prepared call (not the raw
+text) is what gets scheduled and executed:
+
+0. Reject invalid outer input (see [Invalid outer input](#invalid-outer-input)). No
+   hook, permission check or tool sees such a call.
+1. Normalise the raw arguments (aliases, shape repairs). Conflicting spellings reject
+   the call before any hook runs.
+2. Run `pre_tool_use` hooks once on the normalised input. A hook `updated_input` is
+   normalised the same way; a hook block wins over a conflict inside its replacement.
+3. Validate the effective arguments against the tool schema.
+4. Declare the call's file access from the effective arguments.
+5. Middleware reviews the prepared batch (`on_prepared_tool_calls`) and may reject
+   calls, for example `ParallelEditGuard` in `deny` mode.
+6. Conflict-aware waves are planned from the declared accesses and executed.
+
+Preparation happens one execution segment at a time. A segment is a run of
+parallel-safe calls, or a single stateful/clarification barrier call. Calls after a
+barrier are prepared only after it finished, so their hooks see its effects (for
+example an updated task state). Calls skipped by cancellation or by a clarification
+answer are never prepared: their hooks do not run and they receive a synthetic result
+in model order. Every call ends with exactly one result.
+
+### Invalid outer input
+
+For every provider, a call whose raw arguments are malformed JSON, are not a JSON
+object, or were marked invalid by the provider is **never executed**. It is rejected
+before hooks, permission checks and invocation, and receives exactly one error result
+whose text is `{"INVALID_JSON": "<raw input>"}`. The raw input is cut to 2,000 Unicode
+scalar values. Invalid input never becomes an executable `{}`.
+
+The Anthropic provider marks a streamed tool call invalid when its completed buffer is
+not a JSON object, and when `max_tokens` interrupts the block, even if the partial
+buffer happens to parse. Each interrupted block completes exactly once, before the
+response terminates. A block that finished normally before the limit is not
+invalidated, and a block with no input deltas is the valid zero-argument call `{}`. The
+marker travels on the canonical function-call item and is carried onto the prepared
+call; it is not inferred from the argument text.
+
+This is different from an unrepaired value *inside* a valid object:
+
+```jsonc
+// Invalid outer input: rejected as INVALID_JSON, hooks and tool never run.
+{"edits": [
+
+// Valid outer object, unrepairable nested string: reaches schema validation, so hooks
+// run once and the error lists the violation with a hint.
+// /edits: expected array, got string: "[{\"old_string\": ..."; hint: `edits` must be
+// a JSON array of objects, not a string containing JSON
+{"file_path": "a.rs", "edits": "[{\"old_string\": \"x\", "}
+```
+
+The rejected call keeps its raw arguments in stored assistant history, and the tool
+result records them as emitted (there are no effective arguments to record).
+
+### Anthropic history replay
+
+Anthropic requires `tool_use.input` to be an object. When an assistant tool call whose
+stored arguments are not a JSON object is replayed, the provider sends `input: {}` and
+logs a warning containing the call ID (never the argument text). That `{}` is a protocol
+placeholder only: stored history keeps the raw arguments, the matching error result
+stays in place, and the placeholder is never executed.
+
 ## New Tools Reference
 
 QueryMT includes several new code intelligence tools:
@@ -613,7 +779,7 @@ Replace entire symbol bodies using AST byte ranges:
 replace_symbol(replacements=[{
     path: "src/lib.rs",
     symbol: "my_function",
-    newText: "fn my_function() -> i32 { 42 }"
+    new_text: "fn my_function() -> i32 { 42 }"
 }])
 ```
 
@@ -676,6 +842,8 @@ Configure which tools are mutating:
 assume_mutating = false
 mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
 ```
+
+A permission-required tool call that no cached choice, tool policy or hook decides waits for an explicit user answer, delivered as an ACP `session/request_permission` request. It is never auto-granted, including when no client is attached. Unattended runs (schedules, headless) must restrict `tools` / `mutating_tools` or add `permission_request` hooks, or they pause at the first unanswered permission. See [Session Interactions](mesh.md#session-interactions) for the full lifecycle and the all-nodes-upgrade requirement (`RemoteNodeUpgradeRequired`).
 
 ## Scheduled Tasks Configuration
 

@@ -5,8 +5,8 @@ use querymt::{
     HTTPLLMProvider,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatOutput, StreamChunk, Tool, ToolChoice,
-        http::{ChatStreamParser, HTTPChatProvider},
+        ChatCall, ChatCapabilities, ChatOutput, StreamChunk, Tool, ToolChoice,
+        http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -156,33 +156,32 @@ impl HTTPChatProvider for Codex {
         api::classify_codex_http_error(response)
     }
 
-    fn chat_request(
+    fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        api::codex_chat_request(self, messages, tools)
+        call: &ChatCall<'_>,
+        _stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
+        api::codex_chat_request(self, call.messages, call.tools).map(PreparedChatRequest::stateless)
     }
 
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+    fn parse_chat(
+        &self,
+        response: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         let tool_state_buffer = Arc::new(Mutex::new(HashMap::new()));
         api::codex_parse_chat_with_state(response, &tool_state_buffer)
     }
 
-    fn chat_stream_request(
+    fn chat_stream_parser(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        api::codex_chat_request(self, messages, tools)
-    }
-
-    fn supports_streaming(&self) -> bool {
-        true
-    }
-
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        _context: serde_json::Value,
+    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
         Ok(Box::new(CodexStreamParser::default()))
+    }
+
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE.with_streaming(true)
     }
 }
 

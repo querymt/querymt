@@ -1,5 +1,6 @@
 use super::utils::{ext_json_response, format_prefixed_error_chain};
 use super::*;
+use serde::Deserialize;
 use typeshare::typeshare;
 
 #[derive(Debug, serde::Deserialize)]
@@ -11,6 +12,35 @@ struct UndoSessionRequest {
 #[derive(Debug, serde::Deserialize)]
 struct SessionIdRequest {
     session_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetSessionLifecycleRequest {
+    session_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSessionLifecycleRequest {
+    session_id: String,
+    #[serde(default, deserialize_with = "deserialize_patch_bool")]
+    resolved: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_patch_bool")]
+    archived: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetSessionPinnedRequest {
+    session_id: String,
+    pinned: bool,
+}
+
+fn deserialize_patch_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    bool::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -61,12 +91,79 @@ struct UndoStackResponse {
 }
 
 impl LocalAgentHandle {
+    pub(super) async fn handle_ext_session_get_lifecycle(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        let parsed: GetSessionLifecycleRequest = parse_session_op_request(req)?;
+        let lifecycle = self
+            .get_session_lifecycle_unloaded(&parsed.session_id)
+            .await
+            .map_err(|error| Error::internal_error().data(error.to_string()))?;
+        ext_json_response(&lifecycle)
+    }
+
+    pub(super) async fn handle_ext_session_set_lifecycle(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        let parsed: SetSessionLifecycleRequest = parse_session_op_request(req)?;
+        let patch = crate::session::lifecycle::SessionLifecyclePatch {
+            resolved: parsed.resolved,
+            archived: parsed.archived,
+        };
+        patch
+            .validate()
+            .map_err(|error| Error::invalid_params().data(error.to_string()))?;
+        let lifecycle = self
+            .patch_session_lifecycle_unloaded(&parsed.session_id, &patch)
+            .await
+            .map_err(|error| Error::internal_error().data(error.to_string()))?;
+        ext_json_response(&lifecycle)
+    }
+
+    pub(super) async fn handle_ext_session_set_pinned(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        let parsed: SetSessionPinnedRequest = parse_session_op_request(req)?;
+        let store = self.config.provider.history_store();
+        if !store.supports_session_pins() {
+            return Err(Error::method_not_found());
+        }
+        let (pin, changed) = store
+            .set_session_pinned(&parsed.session_id, parsed.pinned)
+            .await
+            .map_err(|error| match error {
+                crate::session::error::SessionError::SessionNotFound(_) => {
+                    Error::invalid_params().data(error.to_string())
+                }
+                other => Error::internal_error().data(other.to_string()),
+            })?;
+        if changed {
+            crate::control::notifications::emit_session_pins_changed_notification(
+                self,
+                &parsed.session_id,
+            )
+            .await;
+        }
+        ext_json_response(&pin)
+    }
+
     pub(super) async fn handle_ext_session_submit_input(
         &self,
         req: ExtRequest,
         delivery: crate::agent::messages::InputDelivery,
     ) -> Result<ExtResponse, Error> {
         let parsed: SubmitInputRequest = parse_session_op_request(req)?;
+        self.session_materializer
+            .ensure_writable(&parsed.session_id)
+            .await?;
+        if super::ext_worktree_ops::native_worktree_command(&parsed.prompt)?.is_some() {
+            return Err(Error::invalid_request().data(
+                "native /worktree administration uses session/prompt, not queued or steering input",
+            ));
+        }
         let session_id = parsed.session_id.clone();
         #[cfg(feature = "remote")]
         let operation = session_operation::SessionOperation::SubmitInput {
@@ -127,22 +224,15 @@ impl LocalAgentHandle {
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
         let parsed: SessionIdRequest = parse_session_op_request(req)?;
-        #[cfg(feature = "remote")]
-        let state = self
-            .execute_session_operation(
-                &parsed.session_id,
-                session_operation::SessionOperation::RuntimeState,
-                |session_ref| Box::pin(session_ref.get_runtime_status()),
-            )
-            .await
-            .map_err(session_operation::SessionOperationError::into_acp_error)?;
-        #[cfg(not(feature = "remote"))]
-        let state = self
-            .session_ref_for_agent_session(&parsed.session_id)
-            .await?
-            .get_runtime_status()
-            .await
-            .map_err(Error::from)?;
+        let mut observations = self
+            .observe_session_runtimes(std::slice::from_ref(&parsed.session_id))
+            .await;
+        let state = observations.remove(&parsed.session_id).unwrap_or_else(|| {
+            crate::agent::messages::SessionRuntimeStatus::unavailable("observation_unavailable")
+        });
+        if state.observation.reason.as_deref() == Some("session_not_found") {
+            return Err(Error::invalid_params().data("unknown session"));
+        }
         ext_json_response(&state)
     }
 
@@ -151,6 +241,9 @@ impl LocalAgentHandle {
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
         let parsed: UndoSessionRequest = parse_session_op_request(req)?;
+        self.session_materializer
+            .ensure_writable(&parsed.session_id)
+            .await?;
         let profile_handle = self.profile_session_op_handle(&parsed.session_id).await?;
         let session_handle = profile_handle.as_deref().unwrap_or(self);
         let result = session_handle
@@ -181,6 +274,9 @@ impl LocalAgentHandle {
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
         let parsed: SessionIdRequest = parse_session_op_request(req)?;
+        self.session_materializer
+            .ensure_writable(&parsed.session_id)
+            .await?;
         let profile_handle = self.profile_session_op_handle(&parsed.session_id).await?;
         let session_handle = profile_handle.as_deref().unwrap_or(self);
         let result = session_handle.redo(&parsed.session_id).await;

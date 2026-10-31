@@ -19,9 +19,25 @@ delegation_wait_timeout_secs = 2400
 delegation_cancel_grace_secs = 5
 max_parallel_delegations = 5
 
+# -----------------------------------------------------------------------------
+# Optional: managed Git worktree workspaces (disabled by default).
+# One workspace service is shared by the planner and every delegate.
+#
+# [quorum.workspace]
+# enabled = true
+# storage_root = "~/.qmt/worktrees"   # relative paths resolve against this file
+# baseline = "commit"                 # or "current_working_tree"
+#
+# Per-delegate isolation (see [[delegates]] below):
+#   isolation = "inherit"   # default: isolated parents isolate delegates
+#   isolation = "isolated"  # always a private checkout (needs the service)
+#   isolation = "shared"    # share the parent's checkout (disclosed as shared)
+# A non-"inherit" value on the `delegate` tool call overrides this setting.
+# -----------------------------------------------------------------------------
+
 [planner]
 provider = "codex"
-model = "gpt-5.5"
+model = "gpt-6.1-sol"
 tools = [
   # File operations
   "read_tool",
@@ -35,6 +51,9 @@ tools = [
   "create_task", "read_task", "update_task", "complete_task", "todowrite", "todoread",
   # Sub-agent delegation
   "delegate",
+  # Deterministic integration of a reviewed isolated result (one commit on the
+  # current branch; repository hooks run). Not a free-form edit tool.
+  "accept_delegation_result",
   # User interaction
   "question",
   # Web browsing
@@ -84,7 +103,15 @@ must supply all required context to agent to execute task.
    task to the `coder` agent with a clear objective, context, and expected output.
    Do NOT attempt to do the implementation yourself. Do NOT stop at just having a plan.
 4. **Verify & iterate** — After a delegate completes, review the results and delegate
-   follow-up work if needed.
+   follow-up work if needed. "Completed" only means the run ended: check that the
+   result actually contains the changes the objective required.
+5. **Integrate accepted work** — Isolated delegates work in a private checkout and
+   nothing reaches this checkout until you accept it. When a reviewed result is
+   correct, call `accept_delegation_result` with the delegation id and the result
+   commit from the delegation summary. QueryMT then applies exactly that change as
+   one commit on the current branch (repository hooks run). If it reports a
+   conflict or a refusal, nothing was changed: do NOT delegate "apply this patch" or
+   "merge this branch" work; report it, or delegate the underlying change again.
 
 ## What You MUST NOT Do
 
@@ -113,12 +140,13 @@ Don't make large assumptions about user intent.
 
 [quorum.delegation_summary]
 provider = "codex"
-model = "gpt-5.4"
+model = "gpt-6.1-sol"
 
 [[delegates]]
+# isolation = "inherit"   # "inherit" | "isolated" | "shared" (see [quorum.workspace])
 id = "coder"
 provider = "codex"
-model = "gpt-5.4"
+model = "gpt-6.1-sol"
 description = "Specialized in implementation and code writing"
 capabilities = ["rust", "python"]
 mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
