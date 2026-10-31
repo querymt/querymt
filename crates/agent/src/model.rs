@@ -423,11 +423,27 @@ fn project_output_for_target(
     target: Option<&OutputTarget>,
     source_provider: Option<&str>,
     source_model: Option<&str>,
+    summary: Option<&str>,
 ) -> querymt::chat::ChatOutput {
     if native_replay_allowed(output, target, source_provider, source_model) {
         output.clone()
     } else {
-        output.clone().into_portable()
+        use crate::session::compaction::codex;
+
+        if let Some(target) = target
+            && (output.items.iter().any(|item| {
+                matches!(item,
+                    ChatOutputItem::Reasoning(item) if item.encrypted_content.is_some()
+                )
+            }) || codex::has_compaction(output))
+        {
+            log::info!(
+                "Encrypted context dropped from request to {}/{}; stored context is retained for compatible replay",
+                target.provider,
+                target.model,
+            );
+        }
+        codex::portable_output(output, summary).unwrap_or_else(|| output.clone().into_portable())
     }
 }
 
@@ -761,9 +777,9 @@ impl AgentMessage {
     ) -> Result<ChatMessage, PromptContentError> {
         let mut input_parts = Vec::new();
         let mut output_items = Vec::new();
-        // A canonical `Output` part, when present, is the assistant turn's sole
-        // generated-content authority. Any legacy generated parts are ignored so
-        // the authoritative output is never merged with a stale projection.
+        // Canonical Output owns native generated content. Legacy projections
+        // remain ignored, except an explicitly paired compaction summary used
+        // by the provider adapter for an incompatible target.
         let mut canonical_output: Option<ChatOutput> = None;
 
         for part in &self.parts {
@@ -826,6 +842,10 @@ impl AgentMessage {
                             target,
                             self.source_provider.as_deref(),
                             self.source_model.as_deref(),
+                            self.parts.iter().find_map(|part| match part {
+                                MessagePart::Compaction { summary, .. } => Some(summary.as_str()),
+                                _ => None,
+                            }),
                         ));
                     }
                 }
@@ -895,6 +915,26 @@ impl AgentMessage {
         }
 
         if self.role == ChatRole::Assistant {
+            // Older native checkpoints may lack a paired plaintext summary.
+            // Keep an honest notice without mutating their stored state.
+            if let Some(output) = &mut canonical_output
+                && output.items.is_empty()
+                && let Some(summary) = self.parts.iter().find_map(|part| match part {
+                    MessagePart::Compaction { summary, .. } => Some(summary),
+                    _ => None,
+                })
+            {
+                output.items = ChatOutput::from_projections(
+                    None,
+                    Some(format!(
+                        "{summary}\nEncrypted context is unavailable for this provider."
+                    )),
+                    None,
+                    None,
+                    None,
+                )
+                .items;
+            }
             let output = canonical_output.unwrap_or_else(|| ChatOutput {
                 items: output_items,
                 status: Some(querymt::chat::ChatOutputStatus::Completed),
