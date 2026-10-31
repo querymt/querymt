@@ -6,6 +6,6 @@ pub fn setup_logging() {
     querymt_utils::telemetry::setup_telemetry(
         env!("CARGO_PKG_NAME"),
         env!("QMT_BUILD_VERSION"),
-        false,
+        cfg!(target_os = "linux"),
     );
 }

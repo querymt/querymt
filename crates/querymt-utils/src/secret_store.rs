@@ -36,12 +36,17 @@ use std::time::SystemTime;
 ///
 /// On first call this sets the platform-native credential store as the default
 /// used by `keyring_core::Entry`. Subsequent calls are no-ops.
-static STORE_INIT: OnceLock<()> = OnceLock::new();
+static STORE_INIT: OnceLock<io::Result<()>> = OnceLock::new();
 
-fn ensure_store_initialized() {
-    STORE_INIT.get_or_init(|| {
-        init_native_store();
-    });
+#[cfg(target_os = "linux")]
+mod linux;
+
+fn ensure_store_initialized() -> io::Result<()> {
+    STORE_INIT
+        .get_or_init(init_native_store)
+        .as_ref()
+        .copied()
+        .map_err(|error| io::Error::new(error.kind(), error.to_string()))
 }
 
 /// Platform-aware store initialization.
@@ -51,8 +56,8 @@ fn ensure_store_initialized() {
 ///
 /// # Panics
 ///
-/// Panics if the platform store cannot be created (e.g. keychain access failure).
-fn init_native_store() {
+/// On macOS and Windows, panics if the native store cannot be created.
+fn init_native_store() -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let store = apple_native_keyring_store::keychain::Store::new()
@@ -67,21 +72,10 @@ fn init_native_store() {
         keyring_core::set_default_store(store);
     }
 
-    // On Linux: use DBus Secret Service when the feature is enabled,
-    // otherwise fall back to kernel keyutils.
-    #[cfg(all(target_os = "linux", feature = "dbus-secret-service"))]
-    {
-        let store = dbus_secret_service_keyring_store::Store::new()
-            .expect("Failed to create DBus Secret Service store");
-        keyring_core::set_default_store(store);
-    }
+    #[cfg(target_os = "linux")]
+    linux::init()?;
 
-    #[cfg(all(target_os = "linux", not(feature = "dbus-secret-service")))]
-    {
-        let store = linux_keyutils_keyring_store::Store::new()
-            .expect("Failed to create Linux keyutils store");
-        keyring_core::set_default_store(store);
-    }
+    Ok(())
 }
 
 /// Install the Android host-backed keyring store before any secret operations.
@@ -108,7 +102,7 @@ const DEFAULT_PROVIDER_KEY: &str = "default";
 const SERVICE_NAME: &str = "querymt";
 
 /// A secure storage for API keys and other sensitive information using system keyring
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SecretStore {
     // Stateless - all operations go directly to keyring
 }
@@ -120,7 +114,7 @@ impl SecretStore {
     ///
     /// * `io::Result<Self>` - A new SecretStore instance or an IO error
     pub fn new() -> io::Result<Self> {
-        ensure_store_initialized();
+        ensure_store_initialized()?;
         #[cfg(target_os = "android")]
         if keyring_core::get_default_store().is_none() {
             return Err(io::Error::new(
@@ -129,6 +123,28 @@ impl SecretStore {
             ));
         }
         Ok(SecretStore {})
+    }
+
+    /// Opens the store without blocking an async executor thread.
+    pub async fn new_async() -> io::Result<Self> {
+        tokio::task::spawn_blocking(Self::new)
+            .await
+            .map_err(|error| io::Error::other(format!("secret store task failed: {error}")))?
+    }
+
+    /// Runs synchronous credential operations off the async executor.
+    ///
+    /// A started operation continues if its awaiting task is cancelled. Move any
+    /// synchronization guard into the closure when it must protect the full write.
+    pub async fn run<T, F>(&self, operation: F) -> io::Result<T>
+    where
+        F: FnOnce(&mut Self) -> io::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let mut store = self.clone();
+        tokio::task::spawn_blocking(move || operation(&mut store))
+            .await
+            .map_err(|error| io::Error::other(format!("secret store task failed: {error}")))?
     }
 
     /// Sets a secret value for the given key
@@ -390,5 +406,91 @@ pub fn format_timestamp(timestamp: u64) -> String {
             format!("in {}h {}m", hours, minutes)
         }
         Err(_) => "expired".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn blocking_operation_keeps_its_guard_after_caller_cancellation() {
+        let store = SecretStore {};
+        let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let guard = lock.clone().lock_owned().await;
+        let executor_thread = std::thread::current().id();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let caller = tokio::spawn(async move {
+            store
+                .run(move |_| {
+                    let _guard = guard;
+                    assert_ne!(std::thread::current().id(), executor_thread);
+                    let _ = started_tx.send(());
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        caller.abort();
+        let _ = caller.await;
+        assert!(lock.try_lock().is_err());
+        release_tx.send(()).unwrap();
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), lock.lock())
+                .await
+                .unwrap(),
+        );
+
+        let error = SecretStore {}
+            .run(|_| Err::<(), _>(io::ErrorKind::PermissionDenied.into()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    #[ignore = "requires a real credential backend; writes and deletes only a unique test-owned key"]
+    fn native_store_sync_and_tokio_roundtrip() {
+        let name = format!(
+            "qmt-store-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut store = SecretStore::new().unwrap();
+        assert!(store.try_get(&name).unwrap().is_none());
+        store.set(&name, "test-only").unwrap();
+        let result = store.try_get(&name);
+        store.delete(&name).unwrap();
+        assert_eq!(result.unwrap().as_deref(), Some("test-only"));
+        for multithread in [false, true] {
+            let mut builder = if multithread {
+                tokio::runtime::Builder::new_multi_thread()
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+            };
+            let name = name.clone();
+            builder.enable_all().build().unwrap().block_on(async move {
+                let store = SecretStore::new_async().await.unwrap();
+                store
+                    .run(move |store| {
+                        store.set(&name, "test-only")?;
+                        let result = store.try_get(&name);
+                        store.delete(&name)?;
+                        assert_eq!(result?.as_deref(), Some("test-only"));
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            });
+        }
     }
 }

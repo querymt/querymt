@@ -727,7 +727,8 @@ pub async fn refresh_service_tokens_if_needed(
     store: &mut impl ServiceAuthStore,
 ) -> Result<ServiceTokenSet> {
     let tokens = store
-        .get_tokens()?
+        .get_tokens_async()
+        .await?
         .ok_or(ServiceClientError::ServiceAuthRequired)?;
 
     if tokens.has_valid_access_token() {
@@ -748,7 +749,7 @@ pub async fn refresh_service_tokens_if_needed(
                 refreshed_tokens
             })?;
 
-    store.set_tokens(&refreshed_tokens)?;
+    store.set_tokens_async(&refreshed_tokens).await?;
     Ok(refreshed_tokens)
 }
 
@@ -935,6 +936,28 @@ pub trait ServiceAuthStore {
     fn get_tokens(&self) -> Result<Option<ServiceTokenSet>>;
     fn delete_tokens(&mut self) -> Result<()>;
 
+    /// Async token access. Blocking stores should override these defaults.
+    fn get_tokens_async(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<ServiceTokenSet>>> + Send
+    where
+        Self: Sized,
+    {
+        let result = self.get_tokens();
+        async move { result }
+    }
+
+    fn set_tokens_async(
+        &mut self,
+        tokens: &ServiceTokenSet,
+    ) -> impl std::future::Future<Output = Result<()>> + Send
+    where
+        Self: Sized,
+    {
+        let result = self.set_tokens(tokens);
+        async move { result }
+    }
+
     fn auth_status(&self) -> Result<ServiceAuthStatus> {
         Ok(match self.get_tokens()? {
             Some(tokens) if tokens.has_valid_access_token() => ServiceAuthStatus::AccessTokenValid,
@@ -966,6 +989,22 @@ impl SecretStoreServiceAuthStore {
 }
 
 impl ServiceAuthStore for SecretStoreServiceAuthStore {
+    async fn get_tokens_async(&self) -> Result<Option<ServiceTokenSet>> {
+        self.store
+            .run(|store| store.try_get(SERVICE_OAUTH_TOKENS_SECRET_KEY))
+            .await?
+            .map(|tokens| serde_json::from_str(&tokens).map_err(ServiceClientError::Json))
+            .transpose()
+    }
+
+    async fn set_tokens_async(&mut self, tokens: &ServiceTokenSet) -> Result<()> {
+        let tokens = serde_json::to_string(tokens)?;
+        self.store
+            .run(move |store| store.set(SERVICE_OAUTH_TOKENS_SECRET_KEY, tokens))
+            .await?;
+        Ok(())
+    }
+
     fn set_endpoint(&mut self, endpoint: &Url) -> Result<()> {
         self.store
             .set(SERVICE_ENDPOINT_SECRET_KEY, endpoint.as_str())?;

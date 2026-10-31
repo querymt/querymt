@@ -12,7 +12,8 @@ homepage = "https://query.mt"
 
 [features]
 default = []
-dbus-secret-service = ["querymt-utils/dbus-secret-service", "querymt-service-client?/dbus-secret-service"]
+zbus-secret-service = ["querymt-utils/zbus-secret-service", "querymt-service-client?/zbus-secret-service"]
+systemd-credentials = ["querymt-utils/systemd-credentials", "querymt-service-client?/systemd-credentials"]
 service = ["dep:querymt-service-client"]
 
 [dependencies]
@@ -38,6 +39,9 @@ async-trait = "0.1"
 open = "5"
 
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 name = "qmt"
