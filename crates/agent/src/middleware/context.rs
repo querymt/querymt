@@ -101,6 +101,10 @@ impl ContextMiddleware {
         }
     }
 
+    fn threshold(&self, max_tokens: usize) -> usize {
+        (max_tokens as f64 * (self.config.compact_at_percent.min(100) as f64 / 100.0)) as usize
+    }
+
     /// Get max tokens for this context, fetching dynamically if needed
     fn get_max_tokens(&self, context: &ConversationContext) -> usize {
         match &self.config.context_source {
@@ -196,9 +200,7 @@ impl MiddlewareDriver for ContextMiddleware {
 
                 let current_tokens = context.stats.context_tokens;
 
-                let compact_threshold = (max_tokens as f64
-                    * (self.config.compact_at_percent.min(100) as f64 / 100.0))
-                    as usize;
+                let compact_threshold = self.threshold(max_tokens);
 
                 if self.config.auto_compact && current_tokens >= compact_threshold {
                     debug!(
@@ -248,6 +250,11 @@ impl MiddlewareDriver for ContextMiddleware {
 
     fn name(&self) -> &'static str {
         "ContextMiddleware"
+    }
+
+    fn compaction_threshold(&self, context: &ConversationContext) -> Option<usize> {
+        let max_tokens = self.get_max_tokens(context);
+        (self.config.auto_compact && max_tokens > 0).then(|| self.threshold(max_tokens))
     }
 }
 

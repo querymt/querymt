@@ -135,13 +135,29 @@ impl SessionCompaction {
         max_prompt_bytes: Option<usize>,
         ledger: &DispatchLedger,
     ) -> Result<CompactionResult> {
-        // Estimate original token count
+        self.process_for_target(
+            messages,
+            provider,
+            (model, None),
+            retry_config,
+            max_prompt_bytes,
+            ledger,
+        )
+        .await
+    }
+
+    pub(crate) async fn process_for_target(
+        &self,
+        messages: &[AgentMessage],
+        provider: Arc<dyn querymt::chat::ChatProvider>,
+        request_context: (&str, Option<&crate::model::OutputTarget>),
+        retry_config: &RetryConfig,
+        max_prompt_bytes: Option<usize>,
+        ledger: &DispatchLedger,
+    ) -> Result<CompactionResult> {
+        let (model, target) = request_context;
         let original_token_count = self.estimate_messages_tokens(messages, max_prompt_bytes);
-
-        // Build the compaction request
-        let chat_messages = self.build_compaction_messages(messages, max_prompt_bytes)?;
-
-        // Call LLM with retry logic
+        let chat_messages = self.build_compaction_messages(messages, max_prompt_bytes, target)?;
         let output = self
             .call_with_retry(
                 &ChatCall::new(&chat_messages),
@@ -155,10 +171,8 @@ impl SessionCompaction {
                 ledger,
             )
             .await?;
-
         let summary = Self::summary_from_output(&output)?;
         let summary_token_count = self.estimator.estimate(&summary);
-
         Ok(CompactionResult {
             summary,
             original_token_count,
@@ -171,10 +185,11 @@ impl SessionCompaction {
         &self,
         messages: &[AgentMessage],
         max_prompt_bytes: Option<usize>,
+        target: Option<&crate::model::OutputTarget>,
     ) -> Result<Vec<querymt::chat::ChatMessage>> {
         let mut chat_messages: Vec<querymt::chat::ChatMessage> = messages
             .iter()
-            .map(|message| message.to_chat_message_with_max_prompt_bytes(max_prompt_bytes))
+            .map(|message| message.to_chat_message_with_output_target(target, max_prompt_bytes))
             .collect::<std::result::Result<_, _>>()?;
 
         // Add the compaction prompt as a user message
@@ -1296,6 +1311,31 @@ mod tests {
         chunks
     }
 
+    #[test]
+    fn handoff_projection_preserves_only_compatible_checkpoint_state() {
+        let mut message = AgentMessage::new("handoff".into(), ChatRole::Assistant);
+        message.parts.push(MessagePart::Output {
+            output: codex_compaction_output("handoff-secret"),
+        });
+        let target = codex_target();
+        let compaction = SessionCompaction::new();
+        let native = compaction
+            .build_compaction_messages(&[message.clone()], None, Some(&target))
+            .unwrap();
+        assert!(
+            serde_json::to_string(&native)
+                .unwrap()
+                .contains("handoff-secret")
+        );
+        let other = OutputTarget::new("xai", "grok");
+        let portable = compaction
+            .build_compaction_messages(&[message], None, Some(&other))
+            .unwrap();
+        let text = serde_json::to_string(&portable).unwrap();
+        assert!(!text.contains("handoff-secret"));
+        assert!(text.contains("visible reasoning summary"));
+    }
+
     fn codex_target() -> OutputTarget {
         OutputTarget::new("codex", "codex-mini-latest")
             .with_protocol("responses")
@@ -1408,7 +1448,11 @@ mod tests {
                 .process_codex(
                     &history,
                     provider.clone(),
-                    (&target, &tools),
+                    codex::CompactionContext {
+                        target: &target,
+                        tools: &tools,
+                        threshold: None,
+                    },
                     &retry_config(0),
                     None,
                     &test_ledger().await,
@@ -1532,7 +1576,11 @@ mod tests {
             .process_codex(
                 &effective,
                 provider,
-                (&target, &[]),
+                codex::CompactionContext {
+                    target: &target,
+                    tools: &[],
+                    threshold: None,
+                },
                 &retry_config(0),
                 None,
                 &test_ledger().await,
@@ -1629,7 +1677,11 @@ mod tests {
                     .process_codex(
                         &[],
                         provider,
-                        (&codex_target(), &[]),
+                        codex::CompactionContext {
+                            target: &codex_target(),
+                            tools: &[],
+                            threshold: None
+                        },
                         &retry_config(0),
                         None,
                         &test_ledger().await,
@@ -2495,7 +2547,7 @@ mod tests {
 
         let chat_messages = fixture
             .service
-            .build_compaction_messages(&messages, None)
+            .build_compaction_messages(&messages, None, None)
             .unwrap();
 
         // Should have all original messages + compaction prompt
@@ -2523,7 +2575,7 @@ mod tests {
 
         let chat_messages = fixture
             .service
-            .build_compaction_messages(&messages, None)
+            .build_compaction_messages(&messages, None, None)
             .unwrap();
 
         // Check that roles are preserved (excluding the appended prompt)
@@ -2563,7 +2615,7 @@ mod tests {
 
         let chat_messages = fixture
             .service
-            .build_compaction_messages(&[message], None)
+            .build_compaction_messages(&[message], None, None)
             .unwrap();
         assert!(matches!(
             &chat_messages[0].portable_input_parts()[0],
@@ -2808,7 +2860,7 @@ mod tests {
 
         let chat_messages = fixture
             .service
-            .build_compaction_messages(&messages, None)
+            .build_compaction_messages(&messages, None, None)
             .unwrap();
 
         // Verify first message is the user message from conversation

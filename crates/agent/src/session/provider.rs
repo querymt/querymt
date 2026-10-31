@@ -996,37 +996,73 @@ impl SessionHandle {
     /// Get the session history converted to standard ChatMessages for the LLM.
     pub async fn history(&self) -> SessionResult<Vec<ChatMessage>> {
         let agent_msgs = self.get_effective_agent_history().await?;
-        self.project_history(&agent_msgs)
+        self.project_history(&agent_msgs).await
     }
 
     pub(crate) async fn history_with_compaction(
         &self,
     ) -> SessionResult<(Vec<ChatMessage>, Vec<ChatMessage>)> {
         let agent_msgs = self.get_effective_agent_history().await?;
-        let messages = self.project_history(&agent_msgs)?;
+        let messages = self.project_history(&agent_msgs).await?;
         let summaries = crate::agent::utils::genai::compaction_summaries(&agent_msgs, &messages);
         Ok((messages, summaries))
     }
 
-    pub(crate) fn output_target(&self) -> Option<OutputTarget> {
+    pub(crate) async fn output_target(&self) -> Option<OutputTarget> {
         let cfg = self.llm_config.as_ref()?;
         let mut target = OutputTarget::new(cfg.provider.clone(), cfg.model.clone())
             .with_protocol(cfg.protocol.clone())
             .with_endpoint(cfg.endpoint.clone());
-        crate::session::compaction::codex::resolve_target(
-            &mut target,
-            cfg.params.as_ref(),
-            &self.provider.initial_config,
-        );
+        if crate::session::compaction::codex::needs_target_resolution(&target) {
+            #[cfg(feature = "remote")]
+            let binding_is_local = self.provider_node_id.as_deref().is_none_or(|node| {
+                node == "local"
+                    || self
+                        .provider
+                        .mesh
+                        .load()
+                        .as_deref()
+                        .is_some_and(|mesh| mesh.peer_id().to_string() == node)
+            });
+            #[cfg(not(feature = "remote"))]
+            let binding_is_local = true;
+            // A viewer's binding is not authoritative for an explicitly remote provider.
+            let binding = if binding_is_local {
+                self.provider
+                    .provider_resolver
+                    .resolve(&cfg.provider)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            let resolved = binding.as_ref().map(|binding| {
+                crate::session::provider_config::runtime_config_builder(
+                    binding,
+                    &cfg.model,
+                    cfg.params.as_ref(),
+                )
+            });
+            crate::session::compaction::codex::resolve_target(
+                &mut target,
+                resolved
+                    .as_ref()
+                    .map(|builder| builder.value())
+                    .or(cfg.params.as_ref()),
+            );
+        }
         Some(target)
     }
 
-    fn project_history(&self, agent_msgs: &[AgentMessage]) -> SessionResult<Vec<ChatMessage>> {
+    async fn project_history(
+        &self,
+        agent_msgs: &[AgentMessage],
+    ) -> SessionResult<Vec<ChatMessage>> {
         // Build the full target identity so native provider state (encrypted
         // reasoning, opaque items) may only replay to the exact same
         // provider/protocol/model/endpoint; any other target gets the portable
         // projection.
-        let target = self.output_target();
+        let target = self.output_target().await;
         let max_prompt_bytes = self
             .execution_config
             .as_ref()
@@ -1703,6 +1739,50 @@ pub mod tests {
         ) -> querymt::plugin::Fut<'a, Result<Vec<String>, LLMError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
+    }
+
+    #[tokio::test]
+    async fn codex_replay_target_uses_binding_config_and_session_override_precedence() {
+        use crate::test_utils::helpers::mock_plugin_registry;
+        use crate::test_utils::mocks::{MockLlmProvider, SharedLlmProvider, TestProviderFactory};
+        let factory = Arc::new(TestProviderFactory::new(SharedLlmProvider::new(
+            MockLlmProvider::new(),
+            vec![],
+        )));
+        let (mut registry, _dir) = mock_plugin_registry(factory).unwrap();
+        registry.config.providers[0].name = "codex".into();
+        registry.config.providers[0].config = Some(HashMap::from([(
+            "base_url".into(),
+            toml::Value::String("https://example.com/binding/".into()),
+        )]));
+        let provider = Arc::new(SessionProvider::new(
+            Arc::new(registry),
+            Arc::new(MockSessionStore::new()),
+            LLMParams::new()
+                .provider("codex")
+                .base_url("https://example.com/initial/"),
+        ));
+        let mut config = crate::test_utils::mock_llm_config();
+        config.provider = "codex".into();
+        config.params = None;
+        let mut handle = SessionHandle {
+            provider,
+            session: mock_session("replay-target"),
+            llm_config: Some(config),
+            provider_node_id: None,
+            execution_config: None,
+            cached_llm_provider: Arc::new(tokio::sync::OnceCell::new()),
+        };
+        let target = handle.output_target().await.unwrap();
+        assert_eq!(target.endpoint, "https://example.com/binding/responses");
+        assert_eq!(target.protocol, "responses");
+        handle.llm_config.as_mut().unwrap().params = Some(serde_json::json!({
+            "base_url":"https://example.com/session/"
+        }));
+        assert_eq!(
+            handle.output_target().await.unwrap().endpoint,
+            "https://example.com/session/responses"
+        );
     }
 
     #[tokio::test]

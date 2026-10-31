@@ -257,6 +257,7 @@ pub(super) async fn run_ai_compaction(
     let target = exec_ctx
         .session_handle
         .output_target()
+        .await
         .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
     let native_codex = codex::supports_compaction(&target);
     let strategy = if pre_hook.custom_summary.is_some() {
@@ -322,7 +323,17 @@ pub(super) async fn run_ai_compaction(
                 .process_codex(
                     &messages,
                     llm_provider,
-                    (&target, &tools),
+                    codex::CompactionContext {
+                        target: &target,
+                        tools: &tools,
+                        threshold: current_state.context().and_then(|context| {
+                            config
+                                .middleware_drivers
+                                .iter()
+                                .filter_map(|driver| driver.compaction_threshold(context))
+                                .min()
+                        }),
+                    },
                     &retry_config,
                     prompt_limit,
                     &ledger,
@@ -865,6 +876,51 @@ mod tests {
             AgentEventKind::CompactionEnd { .. }
         ));
         assert_compaction_journal_matches(&config, &exec_ctx.session_id, &events).await;
+    }
+
+    #[tokio::test]
+    async fn codex_retention_fits_the_active_manual_context_threshold() {
+        use crate::middleware::{ContextConfig, ContextMiddleware, MiddlewareDriver};
+        use querymt::chat::{ChatOpaqueItem, ChatOutputItem, ChatOutputProvenance};
+        let output = ChatOutput {
+            status: Some(querymt::chat::ChatOutputStatus::Completed),
+            finish_reason: Some(FinishReason::Stop),
+            provenance: Some(ChatOutputProvenance {
+                provider: "codex".into(),
+                model: "mock".into(),
+                protocol: "responses".into(),
+                endpoint: "https://chatgpt.com/backend-api/codex/responses".into(),
+            }),
+            items: vec![ChatOutputItem::Opaque(ChatOpaqueItem {
+                original_type: "compaction".into(),
+                payload: serde_json::json!({"type":"compaction", "encrypted_content":"checkpoint"}),
+            })],
+            ..Default::default()
+        };
+        let (mut config, mut exec_ctx, state, _dir) =
+            fixture_with_provider(Hooks::disabled(), Some(output), "codex").await;
+        let context_driver = Arc::new(ContextMiddleware::new(ContextConfig::with_manual_limit(
+            32_000,
+        )));
+        assert_eq!(
+            context_driver.compaction_threshold(state.context().unwrap()),
+            Some(27_200)
+        );
+        config.middleware_drivers = vec![context_driver.clone()];
+        let mut user = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+        user.parts.push(MessagePart::Text {
+            content: "large ".repeat(20_000),
+        });
+        exec_ctx.add_message(user).await.unwrap();
+        let resumed = run_ai_compaction(&config, &mut exec_ctx, &state)
+            .await
+            .unwrap();
+        assert!(resumed.context().unwrap().stats.context_tokens < 27_200);
+        let next = context_driver.on_step_start(resumed, None).await.unwrap();
+        assert!(
+            matches!(next, ExecutionState::BeforeLlmCall { .. }),
+            "a successful checkpoint must not immediately request compaction again"
+        );
     }
 
     #[tokio::test]

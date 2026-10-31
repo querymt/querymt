@@ -17,15 +17,21 @@ const RETAINED_MESSAGES: &str = "querymt_codex_retained_messages";
 const COMPACTION_NOTICE: &str = "Earlier context was compacted into encrypted Codex state.";
 pub(crate) const COMPACTION_STRATEGY: &str = "codex_native";
 
+pub(crate) struct CompactionContext<'a> {
+    pub target: &'a OutputTarget,
+    pub tools: &'a [Tool],
+    pub threshold: Option<usize>,
+}
+
+pub(crate) fn needs_target_resolution(target: &OutputTarget) -> bool {
+    target.provider == "codex" && (target.protocol.is_empty() || target.endpoint.is_empty())
+}
+
 pub(crate) fn supports_compaction(target: &OutputTarget) -> bool {
     target.provider == "codex" && target.protocol == "responses" && !target.endpoint.is_empty()
 }
 
-pub(crate) fn resolve_target(
-    target: &mut OutputTarget,
-    params: Option<&serde_json::Value>,
-    initial_config: &querymt::LLMParams,
-) {
+pub(crate) fn resolve_target(target: &mut OutputTarget, params: Option<&serde_json::Value>) {
     if target.provider != "codex" {
         return;
     }
@@ -38,12 +44,6 @@ pub(crate) fn resolve_target(
         let base_url = params
             .and_then(|params| params.get("base_url"))
             .and_then(serde_json::Value::as_str)
-            .or_else(|| {
-                initial_config
-                    .base_url
-                    .as_deref()
-                    .filter(|_| initial_config.provider.as_deref() == Some("codex"))
-            })
             .unwrap_or("https://chatgpt.com/backend-api/codex/");
         target.endpoint = reqwest::Url::parse(base_url)
             .ok()
@@ -93,12 +93,16 @@ impl SessionCompaction {
         &self,
         messages: &[AgentMessage],
         provider: Arc<dyn querymt::chat::ChatProvider>,
-        request_context: (&OutputTarget, &[Tool]),
+        request_context: CompactionContext<'_>,
         retry_config: &RetryConfig,
         max_prompt_bytes: Option<usize>,
         ledger: &DispatchLedger,
     ) -> Result<CompactionResult> {
-        let (target, tools) = request_context;
+        let CompactionContext {
+            target,
+            tools,
+            threshold,
+        } = request_context;
         let mut chat_messages = messages
             .iter()
             .map(|message| {
@@ -137,7 +141,18 @@ impl SessionCompaction {
             ChatOutputItem::Opaque(opaque) => opaque.original_type == "compaction",
             _ => false,
         });
-        let retained = retained_user_messages(messages);
+        let checkpoint_tokens = self.estimator.estimate(&output.estimate_text());
+        // Leave room for the checkpoint and request instructions/tools rather
+        // than retaining a prefix that immediately crosses the same threshold.
+        let retained_budget = threshold
+            .map(|threshold| {
+                threshold
+                    .saturating_sub(checkpoint_tokens)
+                    .saturating_sub((threshold / 10).max(1024))
+            })
+            .unwrap_or(64_000)
+            .min(64_000);
+        let retained = retained_user_messages(messages, retained_budget);
         output
             .extensions
             .insert(RETAINED_MESSAGES.into(), serde_json::to_value(&retained)?);
@@ -147,7 +162,7 @@ impl SessionCompaction {
             // Output usage is not a measured replacement-window size. Use the visible
             // retained context estimate until the next normal response reports usage.
             summary_token_count: self.estimate_messages_tokens(&retained, max_prompt_bytes)
-                + self.estimator.estimate(&output.estimate_text()),
+                + checkpoint_tokens,
             native_output: Some(output),
         })
     }
@@ -247,10 +262,8 @@ fn user_message(message: &AgentMessage) -> Option<AgentMessage> {
     (!retained.parts.is_empty()).then_some(retained)
 }
 
-fn retained_user_messages(messages: &[AgentMessage]) -> Vec<AgentMessage> {
+fn retained_user_messages(messages: &[AgentMessage], mut budget: usize) -> Vec<AgentMessage> {
     let estimator = SessionCompaction::new();
-    // Match Codex V2's retained user-context budget.
-    let mut budget = 64_000usize;
     let mut retained = Vec::new();
     for message in messages.iter().rev().filter_map(user_message) {
         let tokens = estimator.estimate_messages_tokens(std::slice::from_ref(&message), None);
@@ -271,10 +284,7 @@ mod tests {
     #[test]
     fn other_providers_keep_their_identity_and_portable_path() {
         let mut target = OutputTarget::new("xai", "grok");
-        let initial = querymt::LLMParams::new()
-            .provider("codex")
-            .base_url("https://example.com/codex/");
-        resolve_target(&mut target, None, &initial);
+        resolve_target(&mut target, None);
         assert_eq!(target.provider, "xai");
         assert!(target.protocol.is_empty());
         assert!(target.endpoint.is_empty());
@@ -295,9 +305,8 @@ mod tests {
     #[test]
     fn codex_identity_and_visible_reasoning_are_resolved_without_mutating_output() {
         let mut target = OutputTarget::new("codex", "model");
-        let initial = querymt::LLMParams::new().provider("codex");
         let params = serde_json::json!({"base_url":"https://example.com/codex/"});
-        resolve_target(&mut target, Some(&params), &initial);
+        resolve_target(&mut target, Some(&params));
         assert_eq!(target.protocol, "responses");
         assert_eq!(target.endpoint, "https://example.com/codex/responses");
         assert!(supports_compaction(&target));
