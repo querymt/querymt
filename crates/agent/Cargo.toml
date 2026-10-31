@@ -146,7 +146,7 @@ tree-sitter-php = "0.25"
 # crates.io tree-sitter-kotlin 0.3.x pins tree-sitter 0.20, whose C runtime
 # (linked globally via build-script flags) breaks the tree-sitter 0.26 runtime
 # already in the graph. Master binds via tree-sitter-language only.
-tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", rev = "5fd3624ac85221ab21fbfb0924a28bc70a3fd794" }
+tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", rev = "d6af96d2e23ef0a8ff5ab512864378cf08fba311" }
 tree-sitter-swift = "0.7"
 tree-sitter-json = "0.24"
 tree-sitter-yaml = "0.7"
