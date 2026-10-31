@@ -5,6 +5,9 @@ on:
     branches: [main, master]
     paths:
       - 'crates/agent/**'
+      - 'crates/querymt-utils/**'
+      - 'crates/cli/**'
+      - 'crates/service-client/**'
       - 'crates/querymt/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -12,6 +15,9 @@ on:
   pull_request:
     paths:
       - 'crates/agent/**'
+      - 'crates/querymt-utils/**'
+      - 'crates/cli/**'
+      - 'crates/service-client/**'
       - 'crates/querymt/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -21,7 +27,7 @@ permissions:
   contents: read
 
 env:
-  features: 'dashboard,oauth,zbus-secret-service,remote'
+  features: 'dashboard,oauth,zbus-secret-service,systemd-credentials,remote'
 
 jobs:
   # Job 1: Check formatting (fast, fails first)
@@ -93,6 +99,12 @@ jobs:
           printf '{"revision":"ci","target":"embedded","acpWebSocketPath":"/acp/ws"}\n' > "$RUNNER_TEMP/dashboard-ui/querymt-ui.json"
           echo "QMT_UI_DIST=$RUNNER_TEMP/dashboard-ui" >> "$GITHUB_ENV"
       
+      - name: Test credential backends
+        run: |
+          cargo test --locked -p querymt-utils --features oauth,systemd-credentials --lib
+          cargo test --locked -p querymt-cli --features service,systemd-credentials --test secret_store
+          cargo test --locked -p querymt-service-client --features systemd-credentials --lib
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 

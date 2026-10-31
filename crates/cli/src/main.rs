@@ -285,7 +285,9 @@ async fn run(
     }
 
     #[cfg(target_os = "linux")]
-    SecretStore::new_async().await?;
+    if let Err(error) = SecretStore::new_async().await {
+        log::warn!("Credential storage unavailable: {error}");
+    }
 
     #[cfg(feature = "service")]
     if let Some(Commands::Service { command }) = &args.command {

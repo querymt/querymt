@@ -122,7 +122,7 @@
                 "--example"
                 "qmtcode"
                 "--features"
-                "dashboard,oauth,zbus-secret-service,remote"
+                "dashboard,oauth,zbus-secret-service,systemd-credentials,remote"
               ];
               nativeBuildInputs = [
                 pkgs.pkg-config
@@ -164,7 +164,7 @@
                 "--bin"
                 "qmt"
                 "--features"
-                "zbus-secret-service"
+                "zbus-secret-service,systemd-credentials"
               ];
               nativeBuildInputs = [
                 pkgs.pkg-config
