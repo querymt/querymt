@@ -282,7 +282,6 @@ impl HTTPLLMProvider for Codex {
 
 fn codex_models() -> Vec<String> {
     vec![
-        "gpt-5.5".to_string(),
         "gpt-5.6-luna".to_string(),
         "gpt-5.6-terra".to_string(),
         "gpt-5.6-sol".to_string(),
@@ -290,6 +289,7 @@ fn codex_models() -> Vec<String> {
         "gpt-6-sol".to_string(),
         "gpt-6-astra".to_string(),
         "gpt-6.1-sol".to_string(),
+        "gpt-6.1-terra".to_string(),
     ]
 }
 
