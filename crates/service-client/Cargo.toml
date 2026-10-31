@@ -8,6 +8,7 @@ description = "Isolated QueryMT service OAuth and API client primitives"
 [features]
 default = []
 zbus-secret-service = ["querymt-utils/zbus-secret-service"]
+systemd-credentials = ["querymt-utils/systemd-credentials"]
 
 [dependencies]
 oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "rustls-tls"] }

@@ -4,13 +4,14 @@ use std::{io, path::PathBuf, sync::Arc};
 
 use keyring_core::{CredentialStore, api::CredentialStoreApi};
 
-#[cfg(feature = "tpm")]
-mod tpm;
+mod secret_service;
+#[cfg(feature = "systemd-credentials")]
+mod systemd;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
     SecretService,
-    Tpm,
+    Systemd,
     Keyutils,
 }
 
@@ -18,11 +19,11 @@ fn parse_preference(value: &str) -> io::Result<Option<Backend>> {
     match value.trim() {
         "auto" => Ok(None),
         "secret-service" => Ok(Some(Backend::SecretService)),
-        "tpm" => Ok(Some(Backend::Tpm)),
+        "systemd" => Ok(Some(Backend::Systemd)),
         "keyutils" => Ok(Some(Backend::Keyutils)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "expected auto, secret-service, tpm, or keyutils",
+            "expected auto, secret-service, systemd, or keyutils",
         )),
     }
 }
@@ -80,14 +81,14 @@ fn select<T>(
         return probe(backend).map(|store| (backend, store));
     }
     let mut failures = Vec::new();
-    for backend in [Backend::SecretService, Backend::Tpm, Backend::Keyutils] {
+    for backend in [Backend::SecretService, Backend::Systemd, Backend::Keyutils] {
         match probe(backend) {
             Ok(store) => return Ok((backend, store)),
             // Damaged persistent storage must not be mistaken for an empty store.
             Err(error) if error.kind() == io::ErrorKind::InvalidData => return Err(error),
             Err(error) => {
-                if backend == Backend::Tpm {
-                    log::warn!("TPM credential storage is unavailable: {error}");
+                if backend == Backend::Systemd {
+                    log::warn!("systemd credential storage is unavailable: {error}");
                 } else {
                     log::debug!("{backend:?} credential storage unavailable: {error}");
                 }
@@ -104,29 +105,19 @@ fn select<T>(
 fn probe(backend: Backend) -> io::Result<Arc<CredentialStore>> {
     match backend {
         Backend::SecretService => {
-            // Verify the default collection exists without prompting or writing.
-            // Keep locked wallets on this backend; credential calls can unlock
-            // them on a blocking worker instead of hiding their existing keys.
-            let service = secret_service::blocking::SecretService::connect(
-                secret_service::EncryptionType::Dh,
-            )
-            .map_err(io::Error::other)?;
-            service.get_default_collection().map_err(io::Error::other)?;
-            zbus_secret_service_keyring_store::Store::new()
-                .map(|store| store as Arc<CredentialStore>)
-                .map_err(super::map_keyring_error)
+            secret_service::Store::new().map(|store| store as Arc<CredentialStore>)
         }
-        Backend::Tpm => {
-            #[cfg(feature = "tpm")]
+        Backend::Systemd => {
+            #[cfg(feature = "systemd-credentials")]
             {
-                tpm::Store::new(config_dir()?.join("tpm-secrets"))
+                systemd::Store::new(config_dir()?.join("credentials"))
                     .map(|store| store as Arc<CredentialStore>)
             }
-            #[cfg(not(feature = "tpm"))]
+            #[cfg(not(feature = "systemd-credentials"))]
             {
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "TPM support was disabled at build time",
+                    "systemd Credentials support was disabled at build time",
                 ))
             }
         }
@@ -167,7 +158,7 @@ pub(super) fn init() -> io::Result<()> {
         Backend::SecretService => {
             log::info!("Using D-Bus Secret Service for credential storage (zbus)")
         }
-        Backend::Tpm => log::info!("Using TPM 2.0 sealed storage for credentials"),
+        Backend::Systemd => log::info!("Using systemd encrypted user credentials"),
         Backend::Keyutils => log::warn!(
             "Using temporary kernel keyutils credential storage; secrets will be lost on reboot and may be lost earlier if the keyring expires or is cleared"
         ),
@@ -181,7 +172,7 @@ mod tests {
 
     #[test]
     fn probes_in_priority_order_and_stops_at_success() {
-        for available in [Backend::SecretService, Backend::Tpm, Backend::Keyutils] {
+        for available in [Backend::SecretService, Backend::Systemd, Backend::Keyutils] {
             let mut attempted = Vec::new();
             let (chosen, ()) = select(None, |backend| {
                 attempted.push(backend);
@@ -195,7 +186,7 @@ mod tests {
             assert_eq!(chosen, available);
             assert_eq!(
                 attempted,
-                [Backend::SecretService, Backend::Tpm, Backend::Keyutils]
+                [Backend::SecretService, Backend::Systemd, Backend::Keyutils]
                     .into_iter()
                     .take(attempted.len())
                     .collect::<Vec<_>>()
@@ -206,12 +197,12 @@ mod tests {
     #[test]
     fn explicit_backend_does_not_fall_back() {
         let mut attempted = Vec::new();
-        let error = select(Some(Backend::Tpm), |backend| -> io::Result<()> {
+        let error = select(Some(Backend::Systemd), |backend| -> io::Result<()> {
             attempted.push(backend);
             Err(io::ErrorKind::PermissionDenied.into())
         })
         .unwrap_err();
-        assert_eq!(attempted, [Backend::Tpm]);
+        assert_eq!(attempted, [Backend::Systemd]);
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -220,7 +211,7 @@ mod tests {
         let mut attempted = Vec::new();
         let error = select(None, |backend| -> io::Result<()> {
             attempted.push(backend);
-            Err(if backend == Backend::Tpm {
+            Err(if backend == Backend::Systemd {
                 io::ErrorKind::InvalidData
             } else {
                 io::ErrorKind::NotFound
@@ -229,7 +220,7 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(attempted, [Backend::SecretService, Backend::Tpm]);
+        assert_eq!(attempted, [Backend::SecretService, Backend::Systemd]);
         assert!(
             select(None, |_| -> io::Result<()> {
                 Err(io::ErrorKind::PermissionDenied.into())
@@ -245,7 +236,7 @@ mod tests {
             parse_preference("secret-service").unwrap(),
             Some(Backend::SecretService)
         );
-        assert_eq!(parse_preference("tpm").unwrap(), Some(Backend::Tpm));
+        assert_eq!(parse_preference("systemd").unwrap(), Some(Backend::Systemd));
         assert_eq!(
             parse_preference("keyutils").unwrap(),
             Some(Backend::Keyutils)

@@ -77,7 +77,6 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
- "zeroize",
 ]
 
 [[package]]
@@ -11378,21 +11377,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d8f70e07b9c3962945a74e59ca1c511bba65b6419468acc217c457d93f3c740"
 
 [[package]]
-name = "purecrypto"
-version = "0.6.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f39562bd8eaad7acdf4469e572786a4dfa00abed352aa890a63f7b2940e2174b"
-
-[[package]]
-name = "purecrypto-tpm"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf4430e3a25016b906697d1fbbf2ecb2451e7bcad6af2c3ee7f5ad6159a40cf4"
-dependencies = [
- "purecrypto",
-]
-
-[[package]]
 name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11978,6 +11962,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spinners",
+ "tempfile",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
@@ -12107,13 +12092,14 @@ dependencies = [
 name = "querymt-utils"
 version = "0.6.0"
 dependencies = [
- "aes-gcm",
  "anthropic-auth",
  "anyhow",
  "apple-native-keyring-store",
+ "async-io",
  "async-trait",
  "base64 0.23.1",
  "dirs 7.0.0",
+ "futures-lite",
  "getrandom 0.4.3",
  "keyring-core",
  "kimi-auth",
@@ -12127,12 +12113,13 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
- "purecrypto-tpm",
  "reqwest 0.13.5",
+ "rustix",
  "secret-service",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "socket2 0.6.5",
  "tempfile",
  "tokio",
  "tonic",
@@ -12142,8 +12129,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "windows-native-keyring-store",
- "zbus-secret-service-keyring-store",
- "zeroize",
+ "zbus",
 ]
 
 [[package]]
@@ -18620,17 +18606,6 @@ dependencies = [
  "zbus_macros",
  "zbus_names",
  "zvariant",
-]
-
-[[package]]
-name = "zbus-secret-service-keyring-store"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74801d001b9e7729adb4f1825b67b398185fed424749aa3d8bacf70417137d9a"
-dependencies = [
- "keyring-core",
- "secret-service",
- "zbus",
 ]
 
 [[package]]
