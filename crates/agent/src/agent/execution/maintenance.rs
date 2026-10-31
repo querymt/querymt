@@ -10,7 +10,7 @@ use crate::events::{AgentEventKind, StopType};
 use crate::hooks::{PostCompactionRequest, PreCompactionRequest};
 use crate::middleware::ExecutionState;
 use crate::model::MessagePart;
-use crate::session::compaction::SessionCompaction;
+use crate::session::compaction::{SessionCompaction, codex};
 use log::{debug, info, warn};
 use std::sync::Arc;
 
@@ -254,18 +254,35 @@ pub(super) async fn run_ai_compaction(
         .llm_config()
         .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
 
-    let model = config
-        .execution_policy
-        .compaction
-        .model
-        .as_ref()
-        .unwrap_or(&llm_config.model);
+    let target = exec_ctx
+        .session_handle
+        .output_target()
+        .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
+    let native_codex = codex::supports_compaction(&target);
+    let strategy = if pre_hook.custom_summary.is_some() {
+        "hook_summary"
+    } else if native_codex {
+        codex::COMPACTION_STRATEGY
+    } else {
+        "llm_summary"
+    };
+    let model = if native_codex {
+        &llm_config.model
+    } else {
+        config
+            .execution_policy
+            .compaction
+            .model
+            .as_ref()
+            .unwrap_or(&llm_config.model)
+    };
 
     let mut result = if let Some(summary) = pre_hook.custom_summary {
         crate::session::compaction::CompactionResult {
             summary_token_count: summary.len() / 4,
             summary,
             original_token_count: token_estimate,
+            native_output: None,
         }
     } else {
         let llm_provider = match exec_ctx
@@ -294,20 +311,37 @@ pub(super) async fn run_ai_compaction(
             initial_backoff_ms: config.execution_policy.compaction.retry.initial_backoff_ms,
             backoff_multiplier: config.execution_policy.compaction.retry.backoff_multiplier,
         };
-        match config
-            .compaction
-            .process(
-                &messages,
-                llm_provider,
-                model,
-                &retry_config,
-                exec_ctx
-                    .execution_config()
-                    .and_then(|cfg| cfg.max_prompt_bytes),
-                &ledger,
-            )
-            .await
-        {
+        let result = if native_codex {
+            let tools = config.collect_tools(
+                llm_provider.clone(),
+                Some(exec_ctx.runtime.as_ref()),
+                Some(&exec_ctx.tool_config),
+            );
+            config
+                .compaction
+                .process_codex(
+                    &messages,
+                    llm_provider,
+                    (&target, &tools),
+                    &retry_config,
+                    prompt_limit,
+                    &ledger,
+                )
+                .await
+        } else {
+            config
+                .compaction
+                .process(
+                    &messages,
+                    llm_provider,
+                    model,
+                    &retry_config,
+                    prompt_limit,
+                    &ledger,
+                )
+                .await
+        };
+        match result {
             Ok(result) => result,
             Err(error) => {
                 // The cycle budget gate refused a paid compaction dispatch:
@@ -380,6 +414,18 @@ pub(super) async fn run_ai_compaction(
         );
     }
     if !post_hook.additional_contexts.is_empty() {
+        if let Some(output) = &mut result.native_output {
+            output.items.extend(
+                querymt::chat::ChatOutput::from_projections(
+                    None,
+                    Some(post_hook.additional_contexts.join("\n\n")),
+                    None,
+                    None,
+                    None,
+                )
+                .items,
+            );
+        }
         result.summary = format!(
             "{}\n\n{}",
             result.summary,
@@ -394,26 +440,20 @@ pub(super) async fn run_ai_compaction(
         return Err(error);
     }
 
-    info!(
-        "Compaction generated summary: {} tokens -> {} tokens",
-        result.original_token_count, result.summary_token_count
+    tracing::info!(
+        strategy,
+        native_checkpoint = result.native_output.is_some(),
+        original_tokens = result.original_token_count,
+        result_tokens = result.summary_token_count,
+        "Compaction generated result"
     );
 
-    let (request_msg, summary_msg) = SessionCompaction::create_compaction_messages(
-        session_id,
-        &result.summary,
-        result.original_token_count,
-    );
-
-    if let Err(error) = exec_ctx.add_message(request_msg).await {
-        let error = anyhow::anyhow!("Failed to store compaction request: {}", error);
-        emit_compaction_failure(config, session_id, &compaction_id, &error).await;
-        return Err(error);
-    }
-    if let Err(error) = exec_ctx.add_message(summary_msg).await {
-        let error = anyhow::anyhow!("Failed to store compaction summary: {}", error);
-        emit_compaction_failure(config, session_id, &compaction_id, &error).await;
-        return Err(error);
+    for message in result.take_messages(session_id) {
+        if let Err(error) = exec_ctx.add_message(message).await {
+            let error = anyhow::anyhow!("Failed to store compaction checkpoint: {}", error);
+            emit_compaction_failure(config, session_id, &compaction_id, &error).await;
+            return Err(error);
+        }
     }
 
     let filtered_messages = match exec_ctx.session_handle.get_effective_agent_history().await {
@@ -427,7 +467,8 @@ pub(super) async fn run_ai_compaction(
 
     let new_context_tokens = config
         .compaction
-        .estimate_messages_tokens(&filtered_messages, prompt_limit);
+        .estimate_messages_tokens(&filtered_messages, prompt_limit)
+        .max(result.summary_token_count);
 
     // One validated text summary chunk after the start and before the terminal update.
     emit_compaction_event(
@@ -461,7 +502,7 @@ pub(super) async fn run_ai_compaction(
     // Convert AgentMessages to ChatMessages for the ConversationContext
     let chat_messages: Vec<querymt::chat::ChatMessage> = filtered_messages
         .iter()
-        .map(|message| message.to_chat_message_with_max_prompt_bytes(prompt_limit))
+        .map(|message| message.to_chat_message_with_output_target(Some(&target), prompt_limit))
         .collect::<Result<_, _>>()
         .map_err(|error| anyhow::anyhow!("Invalid prompt content after compaction: {error}"))?;
 
@@ -553,12 +594,34 @@ mod tests {
         ExecutionState,
         tempfile::TempDir,
     ) {
+        fixture_with_provider(hooks, output, "mock").await
+    }
+
+    async fn fixture_with_provider(
+        hooks: Hooks,
+        output: Option<ChatOutput>,
+        provider_name: &str,
+    ) -> (
+        AgentConfig,
+        ExecutionContext,
+        ExecutionState,
+        tempfile::TempDir,
+    ) {
         let mut mock = MockLlmProvider::new();
         if let Some(output) = output {
             // The configured single retry may call the provider at most twice.
-            mock.expect_chat()
-                .times(1..=2)
-                .returning(move |_| Ok(output.clone()));
+            if provider_name == "codex" {
+                mock.expect_chat_with_tools()
+                    .times(1..=2)
+                    .returning(move |_, tools| {
+                        assert!(tools.is_some_and(|tools| !tools.is_empty()));
+                        Ok(output.clone())
+                    });
+            } else {
+                mock.expect_chat()
+                    .times(1..=2)
+                    .returning(move |_| Ok(output.clone()));
+            }
         } else {
             mock.expect_chat().times(0);
         }
@@ -566,15 +629,13 @@ mod tests {
             mock,
             vec![],
         )));
-        let (registry, tempdir) = mock_plugin_registry(factory).unwrap();
+        let (mut registry, tempdir) = mock_plugin_registry(factory).unwrap();
+        registry.config.providers[0].name = provider_name.into();
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
-        let mut config = AgentConfigBuilder::new(
-            Arc::new(registry),
-            storage,
-            LLMParams::new().provider("mock").model("mock"),
-        )
-        .with_hooks(hooks)
-        .build();
+        let params = LLMParams::new().provider(provider_name).model("mock");
+        let mut config = AgentConfigBuilder::new(Arc::new(registry), storage, params)
+            .with_hooks(hooks)
+            .build();
         config.execution_policy.compaction.retry.max_retries = 1;
         config.execution_policy.compaction.retry.initial_backoff_ms = 0;
         let session_handle = config
@@ -730,6 +791,80 @@ mod tests {
         assert!(!cancelled);
         assert_compaction_journal_matches(&config, &exec_ctx.session_id, &compaction_events).await;
         assert!(!crate::session::compaction::has_compaction(&after));
+    }
+
+    #[tokio::test]
+    async fn codex_native_compaction_resumes_with_reasoning_and_a_single_durable_checkpoint() {
+        use querymt::chat::{ChatOpaqueItem, ChatOutputItem, ChatOutputProvenance};
+        let mut output = ChatOutput::from_projections(
+            Some("visible reasoning summary".into()),
+            None,
+            None,
+            None,
+            Some(FinishReason::Stop),
+        );
+        output.provenance = Some(ChatOutputProvenance {
+            provider: "codex".into(),
+            model: "mock".into(),
+            protocol: "responses".into(),
+            endpoint: "https://chatgpt.com/backend-api/codex/responses".into(),
+        });
+        if let ChatOutputItem::Reasoning(reasoning) = &mut output.items[0] {
+            reasoning.encrypted_content = Some("encrypted-reasoning".into());
+        }
+        output.items.push(ChatOutputItem::Opaque(ChatOpaqueItem {
+            original_type: "compaction".into(),
+            payload: serde_json::json!({"type":"compaction", "encrypted_content":"encrypted-checkpoint"}),
+        }));
+        let hooks = Hooks::new(HooksConfig {
+            enabled: true,
+            post_compaction: hook_group(serde_json::json!({"hook_specific_output": {
+                "hook_event_name":"post_compaction", "additional_context":"keep the hook note"
+            }})),
+            ..Default::default()
+        })
+        .unwrap();
+        let (config, mut exec_ctx, state, _dir) =
+            fixture_with_provider(hooks, Some(output), "codex").await;
+        // Real SQLite configs have empty protocol/endpoint fields. Native compaction
+        // and normal history replay must both resolve the Codex target correctly.
+        assert!(exec_ctx.llm_config().unwrap().protocol.is_empty());
+        let mut events = config.subscribe_events();
+        let resumed = run_ai_compaction(&config, &mut exec_ctx, &state)
+            .await
+            .unwrap();
+        assert!(matches!(resumed, ExecutionState::BeforeLlmCall { .. }));
+        let history = config
+            .provider
+            .history_store()
+            .get_history(&exec_ctx.session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            history.len(),
+            2,
+            "one original user and one atomic checkpoint"
+        );
+        assert!(!history.iter().any(|message| {
+            message
+                .parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::CompactionRequest { .. }))
+        }));
+        let encoded =
+            serde_json::to_string(&exec_ctx.session_handle.history().await.unwrap()).unwrap();
+        assert!(encoded.contains("visible reasoning summary"));
+        assert!(encoded.contains("encrypted-reasoning"));
+        assert!(encoded.contains("encrypted-checkpoint"));
+        assert!(encoded.contains("keep the hook note"));
+        let encoded = serde_json::to_string(&resumed.context().unwrap().messages).unwrap();
+        assert!(encoded.contains("encrypted-checkpoint"));
+        let events = take_compaction_events(&mut events);
+        assert!(matches!(
+            &events.last().unwrap().kind,
+            AgentEventKind::CompactionEnd { .. }
+        ));
+        assert_compaction_journal_matches(&config, &exec_ctx.session_id, &events).await;
     }
 
     #[tokio::test]

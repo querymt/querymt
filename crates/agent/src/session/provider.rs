@@ -1008,17 +1008,25 @@ impl SessionHandle {
         Ok((messages, summaries))
     }
 
+    pub(crate) fn output_target(&self) -> Option<OutputTarget> {
+        let cfg = self.llm_config.as_ref()?;
+        let mut target = OutputTarget::new(cfg.provider.clone(), cfg.model.clone())
+            .with_protocol(cfg.protocol.clone())
+            .with_endpoint(cfg.endpoint.clone());
+        crate::session::compaction::codex::resolve_target(
+            &mut target,
+            cfg.params.as_ref(),
+            &self.provider.initial_config,
+        );
+        Some(target)
+    }
+
     fn project_history(&self, agent_msgs: &[AgentMessage]) -> SessionResult<Vec<ChatMessage>> {
         // Build the full target identity so native provider state (encrypted
         // reasoning, opaque items) may only replay to the exact same
         // provider/protocol/model/endpoint; any other target gets the portable
         // projection.
-        let target = self.llm_config.as_ref().map(|cfg| {
-            let mut target = OutputTarget::new(cfg.provider.clone(), cfg.model.clone());
-            target.protocol = cfg.protocol.clone();
-            target.endpoint = cfg.endpoint.clone();
-            target
-        });
+        let target = self.output_target();
         let max_prompt_bytes = self
             .execution_config
             .as_ref()

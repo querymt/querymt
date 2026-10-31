@@ -427,7 +427,22 @@ fn project_output_for_target(
     if native_replay_allowed(output, target, source_provider, source_model) {
         output.clone()
     } else {
-        output.clone().into_portable()
+        use crate::session::compaction::codex;
+
+        if let Some(target) = target
+            && (output.items.iter().any(|item| {
+                matches!(item,
+                    ChatOutputItem::Reasoning(item) if item.encrypted_content.is_some()
+                )
+            }) || codex::has_compaction(output))
+        {
+            log::info!(
+                "Encrypted context dropped from request to {}/{}; stored context is retained for compatible replay",
+                target.provider,
+                target.model,
+            );
+        }
+        codex::portable_output(output).unwrap_or_else(|| output.clone().into_portable())
     }
 }
 
@@ -895,6 +910,26 @@ impl AgentMessage {
         }
 
         if self.role == ChatRole::Assistant {
+            // A native checkpoint has no portable summary. Keep an honest notice
+            // (and post-hook notes) when switching away, without mutating storage.
+            if let Some(output) = &mut canonical_output
+                && output.items.is_empty()
+                && let Some(summary) = self.parts.iter().find_map(|part| match part {
+                    MessagePart::Compaction { summary, .. } => Some(summary),
+                    _ => None,
+                })
+            {
+                output.items = ChatOutput::from_projections(
+                    None,
+                    Some(format!(
+                        "{summary}\nEncrypted context is unavailable for this provider."
+                    )),
+                    None,
+                    None,
+                    None,
+                )
+                .items;
+            }
             let output = canonical_output.unwrap_or_else(|| ChatOutput {
                 items: output_items,
                 status: Some(querymt::chat::ChatOutputStatus::Completed),

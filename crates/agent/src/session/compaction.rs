@@ -27,6 +27,8 @@ pub const COMPACTION_PROMPT: &str = r#"Provide a detailed prompt for continuing 
 
 Be comprehensive but concise. This summary will replace the conversation history."#;
 
+pub(crate) mod codex;
+
 /// Configuration for retry behavior
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -51,12 +53,36 @@ impl Default for RetryConfig {
 /// Result of a compaction operation
 #[derive(Debug, Clone)]
 pub struct CompactionResult {
-    /// The generated summary
+    /// The generated summary, or a notice when the native checkpoint is opaque.
     pub summary: String,
     /// Original token count before compaction
     pub original_token_count: usize,
-    /// Estimated token count of the summary
+    /// Estimated visible size of the replacement context.
     pub summary_token_count: usize,
+    /// Canonical provider-native checkpoint, when available.
+    pub native_output: Option<ChatOutput>,
+}
+
+impl CompactionResult {
+    pub(crate) fn take_messages(&mut self, session_id: &str) -> Vec<AgentMessage> {
+        let (request, mut summary) = SessionCompaction::create_compaction_messages(
+            session_id,
+            &self.summary,
+            self.original_token_count,
+        );
+        if let Some(output) = self.native_output.take() {
+            if let Some(origin) = &output.provenance {
+                summary.source_provider = Some(origin.provider.clone());
+                summary.source_model = Some(origin.model.clone());
+            }
+            // The boundary and encrypted state are committed in one message write.
+            summary.parent_message_id = None;
+            summary.parts.push(MessagePart::Output { output });
+            vec![summary]
+        } else {
+            vec![request, summary]
+        }
+    }
 }
 
 /// Service for generating AI-powered conversation summaries
@@ -116,9 +142,9 @@ impl SessionCompaction {
         let chat_messages = self.build_compaction_messages(messages, max_prompt_bytes)?;
 
         // Call LLM with retry logic
-        let summary = self
+        let output = self
             .call_with_retry(
-                &chat_messages,
+                &ChatCall::new(&chat_messages),
                 provider,
                 model,
                 retry_config,
@@ -130,16 +156,17 @@ impl SessionCompaction {
             )
             .await?;
 
+        let summary = Self::summary_from_output(&output)?;
         let summary_token_count = self.estimator.estimate(&summary);
 
         Ok(CompactionResult {
             summary,
             original_token_count,
             summary_token_count,
+            native_output: None,
         })
     }
 
-    /// Build chat messages for compaction request
     fn build_compaction_messages(
         &self,
         messages: &[AgentMessage],
@@ -183,17 +210,20 @@ impl SessionCompaction {
             session.id = session_id,
             gen_ai.request.stream = provider.capabilities().streaming,
             querymt.compaction = true,
+            querymt.compaction.strategy = codex::request_strategy(call).unwrap_or("llm_summary"),
+            querymt.compaction.native_trigger_sent = false,
+            querymt.compaction.native_checkpoint_received = false,
         )
     )]
     async fn call_with_retry(
         &self,
-        messages: &[querymt::chat::ChatMessage],
+        call: &ChatCall<'_>,
         provider: Arc<dyn querymt::chat::ChatProvider>,
         model: &str,
         retry_config: &RetryConfig,
         session_id: Option<&str>,
         ledger: &DispatchLedger,
-    ) -> Result<String> {
+    ) -> Result<ChatOutput> {
         // Provider identity is unavailable on ChatProvider; canonical provenance can supply it.
         genai::finish_reason("error");
         let chat_span = tracing::Span::current();
@@ -232,31 +262,42 @@ impl SessionCompaction {
                 .await
                 .map_err(accounting_failure)?;
 
+            if codex::request_strategy(call).is_some() {
+                chat_span.record("querymt.compaction.native_trigger_sent", true);
+            }
             let raw = if streaming {
-                Self::call_streaming(messages, &provider, &mut timing, &chat_span).await
+                Self::call_streaming(call, &provider, &mut timing, &chat_span).await
             } else {
-                provider
-                    .chat(&ChatCall::new(messages))
-                    .await
-                    .map_err(|error| StreamFailure {
-                        error,
-                        response_started: false,
-                        usage: None,
-                        output: None,
-                    })
+                provider.chat(call).await.map_err(|error| StreamFailure {
+                    error,
+                    response_started: false,
+                    usage: None,
+                    output: None,
+                })
             };
 
             // Settle before validation: a refused, empty or incomplete summary
             // still incurred whatever usage it reported.
             let result = match raw {
                 Ok(output) => {
-                    let validated = Self::summary_from_output(&output);
+                    let native_validation = codex::validate_compaction(call, &output);
+                    if native_validation
+                        .as_ref()
+                        .is_some_and(|validation| validation.is_ok())
+                    {
+                        chat_span.record("querymt.compaction.native_checkpoint_received", true);
+                    }
+                    let validated = native_validation
+                        .unwrap_or_else(|| Self::summary_from_output(&output).map(|_| ()));
                     match &validated {
                         Ok(_) => attempt_record.settle_output(&output).await,
                         Err(_) => attempt_record.settle_rejected_output(&output, false).await,
                     }
                     .map_err(accounting_failure)?;
-                    validated.inspect(|_| genai::output(&output))
+                    validated.map(|()| {
+                        genai::output(&output);
+                        output
+                    })
                 }
                 Err(failure) => {
                     match &failure.output {
@@ -314,14 +355,14 @@ impl SessionCompaction {
     /// Failures keep what accounting needs: whether any response bytes were
     /// seen, the usage observed so far, and any partial output.
     async fn call_streaming(
-        messages: &[querymt::chat::ChatMessage],
+        call: &ChatCall<'_>,
         provider: &Arc<dyn querymt::chat::ChatProvider>,
         timing: &mut genai::StreamTiming,
         chat_span: &tracing::Span,
     ) -> std::result::Result<ChatOutput, StreamFailure> {
         timing.start();
         let mut stream = provider
-            .chat_stream(&ChatCall::new(messages))
+            .chat_stream(call)
             .await
             .map_err(|error| StreamFailure {
                 error,
@@ -468,10 +509,14 @@ impl SessionCompaction {
                 m.parts
                     .iter()
                     .map(|p| match p {
-                        MessagePart::Text { content } => self.estimator.estimate(content),
-                        MessagePart::Prompt { blocks } => self
-                            .estimator
-                            .estimate(&render_prompt_for_llm(blocks, max_prompt_bytes)),
+                        MessagePart::Text { content }
+                        | MessagePart::HookContext { content, .. } => {
+                            self.estimator.estimate(content)
+                        }
+                        MessagePart::Prompt { blocks } | MessagePart::Steering { blocks, .. } => {
+                            self.estimator
+                                .estimate(&render_prompt_for_llm(blocks, max_prompt_bytes))
+                        }
                         MessagePart::ToolResult { content, .. } => {
                             let text: String = content
                                 .iter()
@@ -578,8 +623,8 @@ fn is_mesh_timeout_error(e: &querymt::error::LLMError) -> bool {
 
 /// Filter messages to return only the "effective" history after the last compaction.
 ///
-/// This function finds the most recent compaction message and returns only
-/// messages from that point forward (including the compaction itself).
+/// Text compaction keeps its request/summary pair and subsequent messages.
+/// Native Codex checkpoints prepend their retained user context to that suffix.
 ///
 /// # Arguments
 ///
@@ -587,21 +632,27 @@ fn is_mesh_timeout_error(e: &querymt::error::LLMError) -> bool {
 ///
 /// # Returns
 ///
-/// A subset of messages starting from (and including) the last compaction,
+/// The latest checkpoint's replacement history plus subsequent messages,
 /// or all messages if no compaction exists.
-pub fn filter_to_effective_history(messages: Vec<AgentMessage>) -> Vec<AgentMessage> {
-    // Find the index of the last compaction request (user message).
-    // This anchors on the user side of the compaction pair so that the
-    // effective history starts with the user→assistant compaction exchange.
-    let last_compaction_idx = messages.iter().rposition(|m| {
-        m.parts
+pub fn filter_to_effective_history(mut messages: Vec<AgentMessage>) -> Vec<AgentMessage> {
+    let last_compaction_idx = messages.iter().rposition(|message| {
+        message
+            .parts
             .iter()
-            .any(|p| matches!(p, MessagePart::CompactionRequest { .. }))
+            .any(|part| matches!(part, MessagePart::CompactionRequest { .. }))
+            || codex::retained_messages(message).is_some()
     });
 
     let filtered: Vec<AgentMessage> = match last_compaction_idx {
-        Some(idx) => messages.into_iter().skip(idx).collect(),
-        None => messages, // No compaction found, return all messages
+        Some(idx) => {
+            let mut retained = codex::retained_messages(&messages[idx]).unwrap_or_default();
+            for message in &mut retained {
+                message.session_id.clone_from(&messages[idx].session_id);
+            }
+            retained.extend(messages.split_off(idx));
+            retained
+        }
+        None => messages,
     };
 
     // Filter out messages that only contain snapshot metadata parts
@@ -690,10 +741,11 @@ pub fn get_last_compaction(messages: &[AgentMessage]) -> Option<&MessagePart> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::OutputTarget;
     use crate::test_utils::mocks::MockCompactionProvider;
     use querymt::chat::{
-        ChatMessageItem, ChatMessagePart, ChatMessagePartDelta, ChatOutputItem, StreamChunk,
-        StructuredStreamEvent,
+        ChatMessageItem, ChatMessagePart, ChatMessagePartDelta, ChatOpaqueItem, ChatOutputItem,
+        ChatOutputProvenance, StreamChunk, StructuredStreamEvent,
     };
     use querymt::error::LLMError;
     use std::collections::VecDeque;
@@ -821,6 +873,18 @@ mod tests {
             );
             let chat = spans.iter().find(|span| span.name == "chat model").unwrap();
             assert_eq!(chat.name, "chat model");
+            assert_eq!(
+                attr(chat, "querymt.compaction.strategy"),
+                Some(&Value::from("llm_summary"))
+            );
+            assert_eq!(
+                attr(chat, "querymt.compaction.native_trigger_sent"),
+                Some(&Value::Bool(false))
+            );
+            assert_eq!(
+                attr(chat, "querymt.compaction.native_checkpoint_received"),
+                Some(&Value::Bool(false))
+            );
             assert_eq!(
                 attr(chat, "gen_ai.request.model"),
                 Some(&Value::from("model"))
@@ -1063,6 +1127,8 @@ mod tests {
     struct ScriptedProvider {
         streaming: bool,
         attempts: tokio::sync::Mutex<VecDeque<Attempt>>,
+        requests: std::sync::Mutex<Vec<Vec<querymt::chat::ChatMessage>>>,
+        offered_tools: std::sync::Mutex<Vec<Vec<querymt::chat::Tool>>>,
         calls: AtomicUsize,
         delay: Duration,
         clock: Arc<std::sync::Mutex<(Option<std::time::Instant>, Option<f64>)>>,
@@ -1073,6 +1139,8 @@ mod tests {
             Arc::new(Self {
                 streaming,
                 attempts: tokio::sync::Mutex::new(attempts.into()),
+                requests: Default::default(),
+                offered_tools: Default::default(),
                 calls: AtomicUsize::new(0),
                 delay: Duration::ZERO,
                 clock: Default::default(),
@@ -1095,7 +1163,12 @@ mod tests {
             querymt::chat::ChatCapabilities::NONE.with_streaming(self.streaming)
         }
 
-        async fn chat(&self, _: &ChatCall<'_>) -> std::result::Result<ChatOutput, LLMError> {
+        async fn chat(&self, call: &ChatCall<'_>) -> std::result::Result<ChatOutput, LLMError> {
+            self.requests.lock().unwrap().push(call.messages.to_vec());
+            self.offered_tools
+                .lock()
+                .unwrap()
+                .push(call.tools.unwrap_or_default().to_vec());
             let Attempt::Output(output) = self.next().await else {
                 panic!("expected non-streaming call")
             };
@@ -1104,8 +1177,13 @@ mod tests {
 
         async fn chat_stream(
             &self,
-            _: &ChatCall<'_>,
+            call: &ChatCall<'_>,
         ) -> std::result::Result<querymt::chat::ChatStream, LLMError> {
+            self.requests.lock().unwrap().push(call.messages.to_vec());
+            self.offered_tools
+                .lock()
+                .unwrap()
+                .push(call.tools.unwrap_or_default().to_vec());
             self.clock
                 .lock()
                 .unwrap()
@@ -1216,6 +1294,350 @@ mod tests {
             },
         ));
         chunks
+    }
+
+    fn codex_target() -> OutputTarget {
+        OutputTarget::new("codex", "codex-mini-latest")
+            .with_protocol("responses")
+            .with_endpoint("https://chatgpt.com/backend-api/codex/responses")
+    }
+
+    fn codex_compaction_output(state: &str) -> ChatOutput {
+        use querymt::chat::{ChatReasoningItem, ChatReasoningPart};
+        let target = codex_target();
+        ChatOutput {
+            status: Some(ChatOutputStatus::Completed),
+            finish_reason: Some(FinishReason::Stop),
+            provenance: Some(ChatOutputProvenance {
+                provider: target.provider,
+                protocol: target.protocol,
+                model: target.model,
+                endpoint: target.endpoint,
+            }),
+            items: vec![
+                ChatOutputItem::Reasoning(ChatReasoningItem {
+                    id: Some("reasoning-1".into()),
+                    summary: vec![ChatReasoningPart::text("visible reasoning summary")],
+                    encrypted_content: Some("reasoning-state".into()),
+                    content: Vec::new(),
+                    signature: None,
+                    status: None,
+                    extensions: Default::default(),
+                }),
+                ChatOutputItem::Opaque(ChatOpaqueItem {
+                    original_type: "compaction".into(),
+                    payload: serde_json::json!({"type":"compaction", "encrypted_content":state}),
+                }),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_native_checkpoint_survives_reload_switch_back_and_fork_until_out_of_range() {
+        use crate::session::{sqlite_storage::SqliteStorage, store::SessionStore};
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        let session = storage
+            .create_session(None, None, None, None)
+            .await
+            .unwrap();
+        let target = codex_target();
+        let user = MessageFixture::user_message("user-1", &session.public_id, "keep my request");
+        let mut reasoning = MessageFixture::assistant_message(
+            "reasoning-1",
+            &session.public_id,
+            "ignored projection",
+        );
+        reasoning.parts = vec![MessagePart::Output {
+            output: codex_compaction_output("prior-state"),
+        }];
+        let mut mixed =
+            MessageFixture::user_message("mixed-1", &session.public_id, "retain steering too");
+        mixed.parts.push(MessagePart::ToolResult {
+            call_id: "old-call".into(),
+            tool_name: None,
+            tool_arguments: None,
+            content: vec![querymt::chat::ToolResultPart::text("old tool result")],
+            is_error: false,
+            compacted_at: None,
+        });
+        let history = vec![user, reasoning, mixed];
+        for message in &history {
+            storage
+                .add_message(&session.public_id, message.clone())
+                .await
+                .unwrap();
+        }
+        let output = codex_compaction_output("checkpoint-state");
+        let mut chunks = vec![Ok(StreamChunk::Structured(
+            StructuredStreamEvent::ResponseMetadata {
+                response_id: Some("compact-1".into()),
+                status: Some(ChatOutputStatus::InProgress),
+                usage: None,
+                finish_reason: None,
+                provenance: output.provenance.clone(),
+            },
+        ))];
+        for (output_index, item) in output.items.iter().cloned().enumerate() {
+            chunks.push(Ok(StreamChunk::Structured(
+                StructuredStreamEvent::ItemCompleted { output_index, item },
+            )));
+        }
+        chunks.push(Ok(StreamChunk::Structured(
+            StructuredStreamEvent::ResponseTerminal {
+                status: ChatOutputStatus::Completed,
+                usage: None,
+                finish_reason: Some(FinishReason::Stop),
+                detail: None,
+            },
+        )));
+        let provider = ScriptedProvider::new(true, vec![Attempt::Stream(chunks)]);
+        let tools = [querymt::chat::Tool {
+            tool_type: "function".into(),
+            function: querymt::chat::FunctionTool {
+                name: "read_tool".into(),
+                description: "Read a file".into(),
+                parameters: serde_json::json!({"type":"object", "properties":{}}),
+                strict: None,
+            },
+        }];
+        use crate::test_utils::helpers::genai_trace::{attr, capture};
+        use opentelemetry::Value;
+        let (result, spans) = capture(async {
+            SessionCompaction::new()
+                .process_codex(
+                    &history,
+                    provider.clone(),
+                    (&target, &tools),
+                    &retry_config(0),
+                    None,
+                    &test_ledger().await,
+                )
+                .await
+        })
+        .await;
+        let mut result = result.unwrap();
+        let chat = spans
+            .iter()
+            .find(|span| span.name == "chat codex-mini-latest")
+            .unwrap();
+        assert_eq!(
+            attr(chat, "querymt.compaction.strategy"),
+            Some(&Value::from("codex_native"))
+        );
+        assert_eq!(
+            attr(chat, "querymt.compaction.native_trigger_sent"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            attr(chat, "querymt.compaction.native_checkpoint_received"),
+            Some(&Value::Bool(true))
+        );
+        {
+            assert_eq!(
+                provider.offered_tools.lock().unwrap()[0][0].function.name,
+                "read_tool"
+            );
+            let requests = provider.requests.lock().unwrap();
+            let request = &requests[0];
+            let encoded = serde_json::to_string(request).unwrap();
+            assert!(encoded.contains("visible reasoning summary"));
+            assert!(encoded.contains("reasoning-state"));
+            assert!(!encoded.contains(COMPACTION_PROMPT));
+            assert!(
+                matches!(&request.last().unwrap().output().unwrap().items[0],
+                ChatOutputItem::Opaque(item) if item.original_type == "compaction_trigger")
+            );
+        }
+        let checkpoint = result.take_messages(&session.public_id);
+        assert_eq!(
+            checkpoint.len(),
+            1,
+            "native boundary and payload use one atomic message write"
+        );
+        let checkpoint_id = checkpoint[0].id.clone();
+        storage
+            .add_message(&session.public_id, checkpoint.into_iter().next().unwrap())
+            .await
+            .unwrap();
+        let reloaded = storage.get_history(&session.public_id).await.unwrap();
+        let effective = filter_to_effective_history(reloaded);
+        assert_eq!(
+            effective.len(),
+            3,
+            "two retained user contexts plus the checkpoint"
+        );
+        assert!(effective[..2].iter().all(|message| {
+            message.role == ChatRole::User
+                && !message
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, MessagePart::ToolResult { .. }))
+        }));
+        let checkpoint = effective.last().unwrap();
+        let before = serde_json::to_value(checkpoint).unwrap();
+        for other in [
+            OutputTarget::new("anthropic", "claude"),
+            OutputTarget::new("openai", "codex-mini-latest")
+                .with_protocol("responses")
+                .with_endpoint(&target.endpoint),
+            OutputTarget::new("codex", "different-model")
+                .with_protocol("responses")
+                .with_endpoint(&target.endpoint),
+            target.clone().with_endpoint("different-endpoint"),
+        ] {
+            let portable = checkpoint
+                .to_chat_message_with_output_target(Some(&other), None)
+                .unwrap();
+            let encoded = serde_json::to_string(&portable).unwrap();
+            assert!(!encoded.contains("checkpoint-state"));
+            assert!(!encoded.contains("reasoning-state"));
+            assert!(encoded.contains("visible reasoning summary"));
+            assert!(
+                portable.portable_input_parts().iter().any(|part| part
+                    .as_text()
+                    .is_some_and(|text| text.contains("visible reasoning summary"))),
+                "providers that ignore unsigned reasoning must still receive the summary as text"
+            );
+        }
+        let back = checkpoint
+            .to_chat_message_with_output_target(Some(&target), None)
+            .unwrap();
+        let encoded = serde_json::to_string(&back).unwrap();
+        assert!(encoded.contains("checkpoint-state"));
+        assert!(encoded.contains("reasoning-state"));
+        assert!(encoded.contains("visible reasoning summary"));
+        assert_eq!(serde_json::to_value(checkpoint).unwrap(), before);
+
+        let fork = storage
+            .fork_session(
+                &session.public_id,
+                &checkpoint_id,
+                crate::session::domain::ForkOrigin::User,
+            )
+            .await
+            .unwrap();
+        let fork_history = filter_to_effective_history(storage.get_history(&fork).await.unwrap());
+        assert_eq!(fork_history.len(), 3);
+        assert!(
+            fork_history
+                .iter()
+                .all(|message| message.session_id == fork)
+        );
+
+        let mut compact_only = codex_compaction_output("new-checkpoint");
+        compact_only.items.remove(0);
+        let provider = ScriptedProvider::new(false, vec![Attempt::output(compact_only)]);
+        let mut next = SessionCompaction::new()
+            .process_codex(
+                &effective,
+                provider,
+                (&target, &[]),
+                &retry_config(0),
+                None,
+                &test_ledger().await,
+            )
+            .await
+            .unwrap();
+        for message in next.take_messages(&session.public_id) {
+            storage
+                .add_message(&session.public_id, message)
+                .await
+                .unwrap();
+        }
+        let effective =
+            filter_to_effective_history(storage.get_history(&session.public_id).await.unwrap());
+        assert_eq!(
+            effective.len(),
+            3,
+            "repeated compaction does not duplicate retained users"
+        );
+        let encoded = serde_json::to_string(&effective).unwrap();
+        assert!(encoded.contains("new-checkpoint"));
+        assert!(!encoded.contains("checkpoint-state"));
+        let portable = effective
+            .last()
+            .unwrap()
+            .to_chat_message_with_output_target(
+                Some(&OutputTarget::new("anthropic", "claude")),
+                None,
+            )
+            .unwrap();
+        assert!(
+            portable
+                .output()
+                .unwrap()
+                .text()
+                .unwrap()
+                .contains("unavailable for this provider")
+        );
+        assert!(
+            !serde_json::to_string(&portable)
+                .unwrap()
+                .contains("new-checkpoint")
+        );
+        let back = effective
+            .last()
+            .unwrap()
+            .to_chat_message_with_output_target(Some(&target), None)
+            .unwrap();
+        assert!(
+            serde_json::to_string(&back)
+                .unwrap()
+                .contains("new-checkpoint")
+        );
+        let (request, summary) = SessionCompaction::create_compaction_messages(
+            &session.public_id,
+            "portable summary",
+            100,
+        );
+        for message in [request, summary] {
+            storage
+                .add_message(&session.public_id, message)
+                .await
+                .unwrap();
+        }
+        let effective =
+            filter_to_effective_history(storage.get_history(&session.public_id).await.unwrap());
+        assert_eq!(effective.len(), 2);
+        assert!(
+            !serde_json::to_string(&effective)
+                .unwrap()
+                .contains("new-checkpoint")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_native_compaction_rejects_missing_duplicate_incomplete_or_foreign_state() {
+        let valid = codex_compaction_output("checkpoint-state");
+        let mut missing = valid.clone();
+        missing.items.pop();
+        let mut duplicate = valid.clone();
+        duplicate.items.push(valid.items.last().unwrap().clone());
+        let mut blank = valid.clone();
+        if let ChatOutputItem::Opaque(item) = blank.items.last_mut().unwrap() {
+            item.payload["encrypted_content"] = serde_json::json!("");
+        }
+        let mut incomplete = valid.clone();
+        incomplete.status = Some(ChatOutputStatus::Incomplete);
+        let mut foreign = valid.clone();
+        foreign.provenance.as_mut().unwrap().provider = "openai".into();
+        for output in [missing, duplicate, blank, incomplete, foreign] {
+            let provider = ScriptedProvider::new(false, vec![Attempt::output(output)]);
+            assert!(
+                SessionCompaction::new()
+                    .process_codex(
+                        &[],
+                        provider,
+                        (&codex_target(), &[]),
+                        &retry_config(0),
+                        None,
+                        &test_ledger().await,
+                    )
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     async fn process_script(

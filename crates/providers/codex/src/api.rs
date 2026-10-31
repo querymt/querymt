@@ -163,6 +163,14 @@ enum CodexInputItem<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<Cow<'a, str>>,
     },
+    #[serde(rename = "compaction_trigger")]
+    CompactionTrigger {},
+    #[serde(rename = "compaction")]
+    Compaction {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<Cow<'a, str>>,
+        encrypted_content: Cow<'a, str>,
+    },
     #[serde(rename = "function_call")]
     FunctionCall {
         call_id: Cow<'a, str>,
@@ -668,6 +676,10 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
         })?;
     }
     let instructions = resolve_instructions(cfg.model(), cfg.instructions())?;
+    let endpoint = cfg
+        .base_url()
+        .join("responses")
+        .map_err(|error| LLMError::HttpError(error.to_string()))?;
     let mut inputs = Vec::with_capacity(messages.len() + 1);
     let system_parts = cfg.system_parts();
     let system = system_parts
@@ -701,7 +713,7 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
                 origin.provider == "codex"
                     && origin.protocol == "responses"
                     && origin.model == cfg.model()
-                    && origin.endpoint == codex_responses_endpoint()
+                    && origin.endpoint == endpoint.as_str()
             });
             convert_structured_output_to_codex(output, &mut inputs, native_replay)?;
             ranges.push(start..inputs.len());
@@ -913,6 +925,8 @@ pub fn codex_chat_request<C: CodexProviderConfig>(
         .header(AUTHORIZATION, format!("Bearer {}", api_key))
         .header("ChatGPT-Account-ID", account_id)
         .header("OpenAI-Beta", "responses=experimental")
+        // Codex advertises this on both compaction and continuation requests.
+        .header("x-codex-beta-features", "remote_compaction_v2")
         .header("originator", "codex_cli_rs")
         .header(CONTENT_TYPE, "application/json")
         .body(json_body)?)
@@ -950,6 +964,11 @@ fn convert_structured_output_to_codex<'a>(
                 // payload. Legacy plaintext thinking has no provenance or
                 // encrypted state, so flatten it to assistant output_text.
                 if !native_replay {
+                    if reasoning.encrypted_content.is_some() {
+                        log::info!(
+                            "Encrypted reasoning dropped from incompatible Codex request; visible reasoning is preserved"
+                        );
+                    }
                     let visible = reasoning.visible_text();
                     if !visible.is_empty() {
                         out.push(CodexInputItem::Message {
@@ -1021,6 +1040,47 @@ fn convert_structured_output_to_codex<'a>(
                     // Exact provider argument text is replayed byte-exact.
                     arguments: Cow::Borrowed(call.arguments.as_str()),
                 });
+            }
+            ChatOutputItem::Opaque(opaque)
+                if native_replay
+                    && opaque.original_type == "compaction_trigger"
+                    && opaque.payload == serde_json::json!({"type": "compaction_trigger"}) =>
+            {
+                out.push(CodexInputItem::CompactionTrigger {});
+            }
+            ChatOutputItem::Opaque(opaque)
+                if native_replay && opaque.original_type == "compaction" =>
+            {
+                let encrypted_content = opaque
+                    .payload
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .filter(|content| !content.is_empty())
+                    .ok_or_else(|| {
+                        LLMError::InvalidRequest(
+                            "Codex compaction item is missing encrypted_content".into(),
+                        )
+                    })?;
+                if opaque.payload.get("type").and_then(Value::as_str) != Some("compaction") {
+                    return Err(LLMError::InvalidRequest(
+                        "invalid Codex compaction item type".into(),
+                    ));
+                }
+                out.push(CodexInputItem::Compaction {
+                    id: opaque
+                        .payload
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(Cow::Borrowed),
+                    encrypted_content: Cow::Borrowed(encrypted_content),
+                });
+            }
+            ChatOutputItem::Opaque(opaque)
+                if !native_replay && opaque.original_type == "compaction" =>
+            {
+                log::info!(
+                    "Encrypted compaction context dropped from incompatible Codex request; stored context is unchanged"
+                );
             }
             ChatOutputItem::Opaque(opaque) => {
                 return Err(LLMError::InvalidRequest(format!(
@@ -2003,6 +2063,121 @@ mod tests {
     }
 
     #[test]
+    fn codex_compaction_trigger_stream_and_replay_use_existing_transport() {
+        use querymt::chat::http::HTTPChatProvider;
+        use querymt::chat::{ChatCall, ChatOpaqueItem, ChatStreamAccumulator, ChatStreamFinish};
+
+        let cfg = test_codex(&test_oauth_token("test-account"));
+        let trigger = structured_assistant_turn(vec![ChatOutputItem::Opaque(ChatOpaqueItem {
+            original_type: "compaction_trigger".into(),
+            payload: serde_json::json!({"type": "compaction_trigger"}),
+        })]);
+        let messages = [
+            ChatMessage::user().text("keep this request").build(),
+            trigger,
+        ];
+        let prepared = cfg
+            .prepare_chat_request(&ChatCall::new(&messages), true)
+            .unwrap();
+        assert!(prepared.request.uri().path().ends_with("/responses"));
+        assert_eq!(
+            prepared.request.headers()["chatgpt-account-id"],
+            "test-account"
+        );
+        assert_eq!(
+            prepared.request.headers()["x-codex-beta-features"],
+            "remote_compaction_v2"
+        );
+        let body: Value = serde_json::from_slice(prepared.request.body()).unwrap();
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert_eq!(
+            body["input"][1],
+            serde_json::json!({"type": "compaction_trigger"})
+        );
+
+        let compaction = serde_json::json!({
+            "type": "compaction", "id": "cmp_1", "encrypted_content": "opaque-state"
+        });
+        let mut parser = cfg.chat_stream_parser(prepared.context).unwrap();
+        let mut accumulator = ChatStreamAccumulator::new();
+        for event in [
+            serde_json::json!({"type":"response.created", "response":{"id":"resp_cmp", "model":cfg.model}}),
+            serde_json::json!({"type":"response.output_item.added", "output_index":0, "item":compaction}),
+            serde_json::json!({"type":"response.output_item.done", "output_index":0, "item":compaction}),
+            serde_json::json!({"type":"response.completed", "response":{"id":"resp_cmp", "end_turn":true}}),
+        ] {
+            for chunk in parser
+                .parse_chunk(format!("data: {event}\n\n").as_bytes())
+                .unwrap()
+            {
+                accumulator.push(&chunk).unwrap();
+            }
+        }
+        parser.finish().unwrap();
+        let ChatStreamFinish::Completed(output) = accumulator.finish() else {
+            panic!("expected completed native compaction");
+        };
+        assert!(output.text().is_none());
+        let encoded = serde_json::to_vec(&output).unwrap();
+        let restored: ChatOutput = serde_json::from_slice(&encoded).unwrap();
+        let messages = [
+            ChatMessage::user().text("keep this request").build(),
+            ChatMessage::from_assistant_output(restored),
+            ChatMessage::user().text("continue").build(),
+        ];
+        let request = cfg
+            .prepare_chat_request(&ChatCall::new(&messages), true)
+            .unwrap();
+        assert_eq!(
+            request.request.headers()["x-codex-beta-features"],
+            "remote_compaction_v2"
+        );
+        let body: Value = serde_json::from_slice(request.request.body()).unwrap();
+        assert_eq!(body["input"][1], compaction);
+        assert_eq!(body["input"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn codex_compaction_replay_rejects_invalid_items_but_drops_foreign_state() {
+        use querymt::chat::ChatOpaqueItem;
+        for payload in [
+            serde_json::json!({"type": "compaction"}),
+            serde_json::json!({"type": "compaction", "encrypted_content": ""}),
+            serde_json::json!({"type": "other", "encrypted_content": "opaque-state"}),
+        ] {
+            let item = ChatOutputItem::Opaque(ChatOpaqueItem {
+                original_type: "compaction".into(),
+                payload,
+            });
+            assert!(
+                convert_structured_output_to_codex(
+                    &ChatOutput {
+                        items: vec![item],
+                        ..Default::default()
+                    },
+                    &mut Vec::new(),
+                    true,
+                )
+                .is_err()
+            );
+        }
+        let item = ChatOutputItem::Opaque(ChatOpaqueItem {
+            original_type: "compaction".into(),
+            payload: serde_json::json!({"type":"compaction", "encrypted_content":"opaque-state"}),
+        });
+        let output = ChatOutput {
+            items: vec![item],
+            ..Default::default()
+        };
+        let before = output.clone();
+        let mut inputs = Vec::new();
+        convert_structured_output_to_codex(&output, &mut inputs, false).unwrap();
+        assert!(inputs.is_empty());
+        assert_eq!(output, before);
+    }
+
+    #[test]
     fn structured_message_with_unsupported_part_fails_replay() {
         let output = ChatOutput {
             items: vec![ChatOutputItem::Message(ChatMessageItem {
@@ -2274,8 +2449,13 @@ mod tests {
             status: None,
             extensions: Extensions::new(),
         })]);
-
-        let messages = vec![ChatMessage::user().text("continue").build(), turn];
+        let trigger = structured_assistant_turn(vec![ChatOutputItem::Opaque(
+            querymt::chat::ChatOpaqueItem {
+                original_type: "compaction_trigger".into(),
+                payload: serde_json::json!({"type":"compaction_trigger"}),
+            },
+        )]);
+        let messages = vec![ChatMessage::user().text("continue").build(), turn, trigger];
         let body: Value =
             serde_json::from_slice(&codex_chat_body_json(&cfg, &messages, None).unwrap()).unwrap();
         let reasoning = &body["input"][1];
