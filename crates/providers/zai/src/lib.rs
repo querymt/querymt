@@ -2,7 +2,7 @@ use http::{Request, Response};
 use qmt_openai::api::{
     OpenAIErrorClassification, OpenAIProviderConfig, OpenAIToolUseState,
     classify_openai_http_error_with, openai_chat_request, openai_embed_request,
-    openai_list_models_request, openai_parse_chat_with, openai_parse_embed,
+    openai_list_models_request, openai_parse_chat_with, openai_parse_embed_with,
     openai_parse_list_models, parse_openai_sse_chunk_with, url_schema,
 };
 use querymt::error::ProviderErrorKind;
@@ -203,12 +203,16 @@ impl ChatStreamParser for ZaiStreamParser {
 }
 
 impl HTTPEmbeddingProvider for Zai {
+    fn classify_embed_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+        classify_openai_http_error_with(response, Some(classify_zai_error))
+    }
+
     fn embed_request(&self, inputs: &[String]) -> Result<Request<Vec<u8>>, LLMError> {
         openai_embed_request(self, inputs)
     }
 
     fn parse_embed(&self, resp: Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
-        openai_parse_embed(self, resp)
+        openai_parse_embed_with(self, resp, Some(classify_zai_error))
     }
 }
 
@@ -326,10 +330,27 @@ mod tests {
             let http_error = provider.classify_chat_error(&error_response(429, code.clone()));
             assert_error_kind(&http_error, ProviderErrorKind::QuotaExceeded, false);
 
+            let embedding_http_error =
+                provider.classify_embed_error(&error_response(429, code.clone()));
+            assert_error_kind(
+                &embedding_http_error,
+                ProviderErrorKind::QuotaExceeded,
+                false,
+            );
+
             let body_error = provider
                 .parse_chat(error_response(200, code.clone()), serde_json::Value::Null)
                 .unwrap_err();
             assert_error_kind(&body_error, ProviderErrorKind::QuotaExceeded, false);
+
+            let embedding_body_error = provider
+                .parse_embed(error_response(200, code.clone()))
+                .unwrap_err();
+            assert_error_kind(
+                &embedding_body_error,
+                ProviderErrorKind::QuotaExceeded,
+                false,
+            );
 
             let event = json!({
                 "error": {
@@ -367,7 +388,9 @@ mod tests {
         let http_error = provider.classify_chat_error(&response(429));
         assert_error_kind(&http_error, ProviderErrorKind::RateLimited, true);
 
-        let body_error = provider.parse_chat(response(200), serde_json::Value::Null).unwrap_err();
+        let body_error = provider
+            .parse_chat(response(200), serde_json::Value::Null)
+            .unwrap_err();
         assert_error_kind(&body_error, ProviderErrorKind::RateLimited, true);
 
         let chunk = format!(
