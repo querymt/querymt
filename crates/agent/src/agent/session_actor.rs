@@ -2956,12 +2956,24 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         return Err(AgentError::Internal(reason));
     }
 
+    // Native orientation runs after hooks accepted the prompt and before the
+    // message is stored, so the first model request already carries the cards.
+    // It is additive and fail-open; it never blocks or alters the prompt.
+    let mut context_contributions = hook_result.context_contributions;
+    let orientation = crate::agent::repository_delivery::orientation_contexts(
+        &config,
+        &exec_ctx,
+        &user_text,
+        &context_contributions,
+    )
+    .await;
+    context_contributions.extend(orientation);
+
     let mut parts = vec![MessagePart::Prompt {
         blocks: req.prompt.clone(),
     }];
     parts.extend(
-        hook_result
-            .context_contributions
+        context_contributions
             .into_iter()
             .map(|context| MessagePart::HookContext {
                 event_name: context.event_name,

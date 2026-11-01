@@ -1761,3 +1761,43 @@ async fn repository_knowledge_root_is_anchored_to_config_file_directory() {
         Some(dir.path().join("repo").as_path())
     );
 }
+
+/// 7.3: the opt-in repository-knowledge example loads, lists the repository
+/// tools its documented configuration relies on, enables both delivery stages,
+/// and rolls back completely by disabling the feature.
+#[tokio::test]
+async fn repository_knowledge_coder_example_loads_and_rolls_back_by_disabling() {
+    use crate::tools::builtins::REPOSITORY_TOOL_NAMES;
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/confs/repository_knowledge_coder.toml");
+    let Config::Single(config) = load_config(ConfigSource::Path(path.clone())).await.unwrap()
+    else {
+        panic!("single config");
+    };
+
+    let rk = &config.agent.repository_knowledge;
+    assert!(rk.enabled && rk.orientation_active() && rk.index_context_active());
+    assert_eq!(rk.delivery.max_cards, 2);
+    assert_eq!(rk.delivery.max_tokens, 600);
+    assert_eq!(rk.delivery.max_bytes, 4096);
+
+    // The allowlist is authoritative: every repository tool is listed explicitly.
+    let tools = config.agent.tools.clone();
+    assert!(!tools.is_empty(), "explicit allowlist");
+    for name in REPOSITORY_TOOL_NAMES {
+        assert!(tools.iter().any(|t| t == name), "{name} listed");
+    }
+    // Legacy session-memory tools are not pulled in.
+    assert!(!tools.iter().any(|t| t.starts_with("knowledge_")));
+
+    // Rollback: disabling the feature turns off reads and both delivery stages
+    // even though the delivery flags remain set.
+    let mut off = (*config).clone();
+    off.agent.repository_knowledge.enabled = false;
+    let rk = &off.agent.repository_knowledge;
+    assert!(rk.if_enabled().is_none());
+    assert!(!rk.orientation_active() && !rk.index_context_active());
+    let builder = crate::api::Agent::builder_from_config(off, None).unwrap();
+    assert!(builder.configured_repository_knowledge().is_none());
+}

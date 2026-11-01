@@ -739,6 +739,20 @@ async fn execute_prepared_inner(
             tool_use_id: call.id.clone(),
         })
         .await?;
+    // A blocked or suppressed result must not regain information through
+    // enrichment; decided before the hook result is consumed.
+    // Redaction (a rewritten output or error flag) counts the same as a block:
+    // the model-visible result is no longer the tool's own output.
+    // The engine reports the (possibly unchanged) final content and flag
+    // whenever hooks ran, so only a difference from the tool's own output
+    // counts as redaction.
+    let output_suppressed = post_hook.should_block
+        || post_hook.stop_reason.is_some()
+        || post_hook
+            .content
+            .as_ref()
+            .is_some_and(|content| *content != result_blocks)
+        || post_hook.is_error.is_some_and(|flag| flag != is_error);
     for notice in post_hook.notices {
         config.emit_event(
             &exec_ctx.session_id,
@@ -828,6 +842,26 @@ async fn execute_prepared_inner(
 
     let mut hook_contexts = hook_contexts;
     hook_contexts.extend(post_hook.context_contributions);
+    // Native index enrichment: after execution, post-tool hooks and output
+    // truncation. Purely additive context; the result blocks and error flag
+    // above are never touched. Contributions already present (for example from
+    // a command-hook wrapper) are not delivered again.
+    let enrichment = crate::agent::repository_delivery::index_contexts(
+        config,
+        exec_ctx,
+        &crate::agent::repository_delivery::FinishedCall {
+            tool_name: &call.function.name,
+            tool_source,
+            execution_is_error,
+            result_is_error: is_error,
+            output_suppressed,
+            tool_use_id: &call.id,
+            args: &args,
+        },
+        &hook_contexts,
+    )
+    .await;
+    hook_contexts.extend(enrichment);
     let mut tool_result = ToolResult::new(
         call.id.clone(),
         result_blocks,
@@ -1589,6 +1623,7 @@ pub(super) async fn store_all_tool_results(
     // persisting the combined tool_result message so hook-driven rewrites are
     // visible to the model in the stored transcript.
     let batch_id = Uuid::new_v4().to_string();
+    crate::agent::repository_delivery::restore_state(config, exec_ctx).await;
     let mut adjusted_results = Vec::with_capacity(ordered_results.len());
     for mut result in ordered_results.iter().cloned() {
         if let Some(wait_condition) =
@@ -1596,6 +1631,12 @@ pub(super) async fn store_all_tool_results(
         {
             wait_conditions.push(wait_condition);
         }
+        // Native repository cards draw from the turn's shared budget in
+        // stable tool-call order (not completion order). Cards that do not
+        // fit are dropped whole, so they are never recorded as delivered.
+        let contexts = std::mem::take(&mut result.hook_contexts);
+        result.hook_contexts =
+            crate::agent::repository_delivery::allocate(config, exec_ctx, contexts);
         adjusted_results.push(result);
     }
 

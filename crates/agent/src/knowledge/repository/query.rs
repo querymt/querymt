@@ -36,9 +36,15 @@
 //! unchanged corpus reads no content), then revalidates every source it is
 //! about to emit, retrying a bounded number of times if one changed in between.
 
+use super::purpose::PurposeRow;
 use super::reconcile::ReconcileStatus;
 use super::service::{RepositoryService, ServiceError, SourceCheck};
-use super::store::{FileRecord, IndexDiagnostic, SearchPlan, SearchSnapshot, SectionMatch};
+use super::store::{
+    FileRecord, IndexDiagnostic, PurposeMatch, SearchPlan, SearchSnapshot, SectionMatch,
+    SymbolMatch,
+};
+use crate::index::symbol_index::SymbolKind;
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::str::FromStr;
 use thiserror::Error;
@@ -55,6 +61,33 @@ const EXCERPT_BYTES: usize = 240;
 const MIN_NAVIGATION_SCORE: u32 = 2;
 const FILENAME_WEIGHT: u32 = 3;
 const DIRECTORY_WEIGHT: u32 = 1;
+
+/// Words that name an identifier exactly, for the symbol lookup. Whole words
+/// and `a::b` paths only: never fuzzy and never camelCase fragments.
+fn symbol_terms(question: &str) -> Vec<String> {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    let mut push = |term: String| {
+        if seen.insert(term.clone()) {
+            out.push(term);
+        }
+    };
+    for raw in question.split_whitespace() {
+        let trimmed = raw.trim_matches(|c: char| !is_ident(c));
+        if trimmed.contains("::") {
+            push(trimmed.to_lowercase());
+        }
+        for word in trimmed.split(|c: char| !is_ident(c)) {
+            let lower = word.to_lowercase();
+            if lower.chars().count() >= 3 && !STOPWORDS.contains(&lower.as_str()) {
+                push(lower);
+            }
+        }
+    }
+    out.truncate(MAX_TOKENS);
+    out
+}
 
 /// Function words that would match nearly every section. Dropped from the
 /// search unless that would leave nothing to search for.
@@ -116,6 +149,10 @@ pub enum HitKind {
     Section,
     /// A path-level record of a selected code file.
     File,
+    /// A declaration extracted from a selected code file.
+    Symbol,
+    /// An authored File/Purpose row.
+    Purpose,
 }
 
 /// Where a hit's content comes from. Kept visibly distinct in results.
@@ -130,16 +167,19 @@ pub enum Provenance {
 /// One retrieved record with its citation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryHit {
-    /// Retrievable ID: a section key, or `file:<path>`.
+    /// Retrievable ID: a section key, `file:<path>`, `symbol:<path>#<kind>:<name>`
+    /// or `purpose:<document>#<target>`.
     pub id: String,
     pub kind: HitKind,
     pub provenance: Provenance,
     /// Repository-relative source path.
     pub path: String,
-    /// 1-based inclusive lines in the original file (sections only).
+    /// 1-based inclusive lines in the original file (everything but a file).
+    /// For a purpose row this is the row's line in its document.
     pub start_line: Option<usize>,
     pub end_line: Option<usize>,
-    /// Heading breadcrumb (`A > B`); `None` for a preamble or a file.
+    /// Heading breadcrumb (`A > B`) of a section, the qualified name of a
+    /// symbol, or the described path of a purpose row.
     pub selector: Option<String>,
     pub title: String,
     /// Bounded excerpt of the record's own content.
@@ -215,10 +255,10 @@ pub fn normalize_relative_path(raw: &str) -> Result<String, &'static str> {
         return Err("path must be relative to the repository root");
     }
     let mut chars = path.chars();
-    if let (Some(first), Some(':')) = (chars.next(), chars.next()) {
-        if first.is_ascii_alphabetic() {
-            return Err("path must be relative to the repository root");
-        }
+    if let (Some(first), Some(':')) = (chars.next(), chars.next())
+        && first.is_ascii_alphabetic()
+    {
+        return Err("path must be relative to the repository root");
     }
     let mut segments = Vec::new();
     for segment in path.split('/') {
@@ -236,7 +276,7 @@ pub fn normalize_relative_path(raw: &str) -> Result<String, &'static str> {
 }
 
 /// Split `word` at camelCase boundaries (`HTTPServer` -> `HTTP`, `Server`).
-fn split_camel(word: &str) -> Vec<String> {
+pub(super) fn split_camel(word: &str) -> Vec<String> {
     let chars: Vec<char> = word.chars().collect();
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -295,7 +335,7 @@ fn question_tokens(question: &str) -> Option<Vec<String>> {
 
 /// An FTS5 expression of quoted words only. Tokens are alphanumeric, so the
 /// quoting cannot be escaped from; doubling quotes is belt and braces.
-fn fts_expression(tokens: &[String]) -> String {
+pub(super) fn fts_expression(tokens: &[String]) -> String {
     tokens
         .iter()
         .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
@@ -304,7 +344,7 @@ fn fts_expression(tokens: &[String]) -> String {
 }
 
 /// Repository-relative paths the question names verbatim.
-fn path_candidates(question: &str) -> Vec<String> {
+pub(super) fn path_candidates(question: &str) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for raw in question.split_whitespace() {
@@ -341,12 +381,12 @@ fn path_candidates(question: &str) -> Vec<String> {
             }
             _ => trimmed,
         };
-        if let Ok(path) = normalize_relative_path(candidate) {
-            if seen.insert(path.clone()) {
-                out.push(path);
-                if out.len() == MAX_PATH_CANDIDATES {
-                    break;
-                }
+        if let Ok(path) = normalize_relative_path(candidate)
+            && seen.insert(path.clone())
+        {
+            out.push(path);
+            if out.len() == MAX_PATH_CANDIDATES {
+                break;
             }
         }
     }
@@ -383,7 +423,7 @@ fn navigation_score(path: &str, tokens: &[String]) -> u32 {
 }
 
 /// A bounded, whitespace-collapsed excerpt cut on a character boundary.
-fn excerpt(body: &str) -> String {
+pub(super) fn excerpt(body: &str) -> String {
     let mut collapsed = String::new();
     for word in body.split_whitespace() {
         if !collapsed.is_empty() {
@@ -443,6 +483,12 @@ impl Prepared {
             // Headroom so de-duplication cannot starve the limit.
             fts_limit: (limit * 4).clamp(20, 200),
             include_files: request.lane != Lane::Documentation,
+            symbol_terms: if request.lane == Lane::Documentation {
+                Vec::new()
+            } else {
+                symbol_terms(&request.question)
+            },
+            include_purposes: request.lane != Lane::Documentation,
         };
         Ok(Self {
             lane: request.lane,
@@ -471,6 +517,74 @@ impl Prepared {
             excerpt: format!("source file, {} bytes", file.size),
             status: None,
             exact,
+        }
+    }
+
+    fn symbol_hit(found: &SymbolMatch) -> QueryHit {
+        let record = &found.record;
+        QueryHit {
+            id: record.key.clone(),
+            kind: HitKind::Symbol,
+            provenance: Provenance::SourceDerived,
+            path: found.path.clone(),
+            start_line: Some(record.start_line),
+            end_line: Some(record.end_line),
+            selector: Some(record.qualified_name.clone()),
+            title: format!("{} {}", record.kind.as_str(), record.qualified_name),
+            excerpt: excerpt(&record.signature),
+            status: None,
+            exact: false,
+        }
+    }
+
+    fn purpose_hit(found: &PurposeMatch, exact: bool) -> QueryHit {
+        let PurposeRow {
+            doc_path,
+            target_path,
+            purpose,
+            line,
+            ..
+        } = &found.row;
+        QueryHit {
+            id: found.row.key(),
+            kind: HitKind::Purpose,
+            provenance: Provenance::Authored,
+            path: doc_path.clone(),
+            start_line: Some(*line),
+            end_line: Some(*line),
+            selector: Some(target_path.clone()),
+            title: target_path.clone(),
+            excerpt: if purpose.is_empty() {
+                "(no purpose written)".to_string()
+            } else {
+                excerpt(purpose)
+            },
+            status: found.doc_status.clone(),
+            exact,
+        }
+    }
+
+    /// Exact qualified names first, then declarations, then members.
+    fn symbol_rank(&self, found: &SymbolMatch) -> u8 {
+        let record = &found.record;
+        if self
+            .plan
+            .symbol_terms
+            .contains(&record.qualified_name.to_lowercase())
+            && record.qualified_name.contains("::")
+        {
+            0
+        } else if matches!(
+            record.kind,
+            SymbolKind::Field
+                | SymbolKind::EnumVariant
+                | SymbolKind::Impl
+                | SymbolKind::Test
+                | SymbolKind::Unknown
+        ) {
+            2
+        } else {
+            1
         }
     }
 
@@ -512,7 +626,7 @@ impl Prepared {
 
         // Navigation candidates.
         let mut exact_files: Vec<&FileRecord> = Vec::new();
-        let mut navigation: Vec<(u32, &FileRecord)> = Vec::new();
+        let mut navigation: Vec<(u32, QueryHit)> = Vec::new();
         for candidate in &self.candidates {
             if let Some(file) = snapshot.files.iter().find(|file| &file.path == candidate) {
                 exact_files.push(file);
@@ -524,10 +638,36 @@ impl Prepared {
             }
             let score = navigation_score(&file.path, &self.tokens);
             if score >= MIN_NAVIGATION_SCORE {
-                navigation.push((score, file));
+                navigation.push((score, Self::file_hit(file, false)));
             }
         }
-        navigation.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
+        // Authored purpose rows: the described path and the author's words both
+        // count; a row whose path the question names outranks everything.
+        let mut exact_purposes: Vec<&PurposeMatch> = Vec::new();
+        for found in &snapshot.purposes {
+            if self.candidates.contains(&found.row.target_path) {
+                exact_purposes.push(found);
+                continue;
+            }
+            let said = words(&found.row.purpose);
+            let score = navigation_score(&found.row.target_path, &self.tokens)
+                + self
+                    .tokens
+                    .iter()
+                    .filter(|token| said.contains(*token))
+                    .count() as u32;
+            if score >= MIN_NAVIGATION_SCORE {
+                navigation.push((score, Self::purpose_hit(found, false)));
+            }
+        }
+        navigation.sort_by(|a, b| {
+            Reverse(a.0)
+                .cmp(&Reverse(b.0))
+                .then_with(|| a.1.path.cmp(&b.1.path))
+                .then_with(|| a.1.id.cmp(&b.1.id))
+        });
+        let mut symbols: Vec<&SymbolMatch> = snapshot.symbols.iter().collect();
+        symbols.sort_by_key(|found| self.symbol_rank(found));
 
         // Documentation candidates.
         let (exact_sections, ranked): (Vec<&SectionMatch>, Vec<&SectionMatch>) =
@@ -536,8 +676,14 @@ impl Prepared {
         for file in exact_files {
             push(Self::file_hit(file, true));
         }
+        for found in exact_purposes {
+            push(Self::purpose_hit(found, true));
+        }
         for found in exact_sections {
             push(Self::section_hit(found));
+        }
+        for found in symbols {
+            push(Self::symbol_hit(found));
         }
         let mut docs = ranked.into_iter();
         let mut files = navigation.into_iter();
@@ -550,14 +696,15 @@ impl Prepared {
             if let Some(found) = doc {
                 push(Self::section_hit(found));
             }
-            if let Some((_, file)) = file {
-                push(Self::file_hit(file, false));
+            if let Some((_, hit)) = file {
+                push(hit);
             }
         }
 
         let total_matches = hits.len();
         hits.truncate(self.limit);
-        let truncated = total_matches > hits.len() || snapshot.fts_saturated;
+        let truncated =
+            total_matches > hits.len() || snapshot.fts_saturated || snapshot.symbols_saturated;
         QueryResponse {
             generation: snapshot.generation,
             status,
@@ -753,6 +900,134 @@ mod tests {
             .unwrap();
         // `session` is a file name once and a directory twice.
         assert_eq!(ids(&response), vec!["file:src/tools/session.rs"]);
+    }
+
+    const QUEUE: &str = "pub struct Queue { items: Vec<u32> }\nimpl Queue {\n    pub fn push(&mut self, item: u32) {}\n}\npub fn helper() {}\n";
+
+    #[test]
+    fn an_exact_identifier_finds_its_declaration_with_a_range() {
+        let fx = Fx::new();
+        fx.put("src/queue.rs", QUEUE);
+        fx.put("src/other.rs", "pub fn unrelated() {}\n");
+        let response = fx.ask("where is Queue::push defined?");
+        let first = &response.hits[0];
+        assert_eq!(first.kind, HitKind::Symbol);
+        assert_eq!(first.provenance, Provenance::SourceDerived);
+        assert_eq!(first.id, "symbol:src/queue.rs#method:Queue::push");
+        assert_eq!(first.path, "src/queue.rs");
+        assert_eq!((first.start_line, first.end_line), (Some(3), Some(3)));
+        assert_eq!(first.selector.as_deref(), Some("Queue::push"));
+        assert!(first.excerpt.contains("fn push"));
+        assert!(!first.exact, "only a named path is an exact-path hit");
+    }
+
+    #[test]
+    fn identifier_lookup_is_exact_and_case_insensitive_never_fuzzy() {
+        let fx = Fx::new();
+        fx.put("src/queue.rs", QUEUE);
+        let hit = |question: &str| {
+            fx.ask_with(QueryRequest {
+                question: question.into(),
+                lane: Lane::Navigation,
+                ..Default::default()
+            })
+            .unwrap()
+            .hits
+            .into_iter()
+            .filter(|hit| hit.kind == HitKind::Symbol)
+            .map(|hit| hit.id)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(hit("helper"), ["symbol:src/queue.rs#function:helper"]);
+        assert_eq!(hit("HELPER"), ["symbol:src/queue.rs#function:helper"]);
+        assert!(hit("helpe").is_empty());
+        assert!(hit("helpers").is_empty());
+    }
+
+    #[test]
+    fn symbols_are_navigation_records_not_documentation() {
+        let fx = Fx::new();
+        fx.put("src/queue.rs", QUEUE);
+        let docs = fx.ask_with(QueryRequest {
+            question: "helper".into(),
+            lane: Lane::Documentation,
+            ..Default::default()
+        });
+        assert!(
+            docs.unwrap()
+                .hits
+                .iter()
+                .all(|h| h.kind == HitKind::Section)
+        );
+        // Path scope confines symbol hits like every other record.
+        let scoped = fx
+            .ask_with(QueryRequest {
+                question: "helper".into(),
+                path: Some("docs".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(scoped.hits.is_empty());
+    }
+
+    #[test]
+    fn declarations_outrank_fields_and_a_symbol_never_shadows_its_import() {
+        let fx = Fx::new();
+        fx.put(
+            "src/a.rs",
+            "use std::fmt::Display;\npub struct Display2 { display: u8 }\npub fn display() {}\n",
+        );
+        let response = fx.ask("display");
+        let symbols: Vec<_> = response
+            .hits
+            .iter()
+            .filter(|h| h.kind == HitKind::Symbol)
+            .map(|h| h.id.as_str())
+            .collect();
+        assert_eq!(
+            symbols,
+            [
+                "symbol:src/a.rs#function:display",
+                "symbol:src/a.rs#field:Display2::display"
+            ]
+        );
+        assert!(response.hits.iter().all(|h| !h.id.contains("import")));
+    }
+
+    #[test]
+    fn purpose_rows_are_authored_navigation_hits() {
+        let fx = Fx::new();
+        fx.put("src/queue.rs", QUEUE);
+        fx.put(
+            "docs/map.md",
+            "# Map\n\n| File | Purpose |\n|--|--|\n| `../src/queue.rs` | Holds pending work for the scheduler. |\n",
+        );
+        let response = fx.ask_with(QueryRequest {
+            question: "pending work scheduler".into(),
+            lane: Lane::Navigation,
+            ..Default::default()
+        });
+        let hit = response
+            .unwrap()
+            .hits
+            .into_iter()
+            .find(|h| h.kind == HitKind::Purpose)
+            .expect("purpose hit");
+        assert_eq!(hit.provenance, Provenance::Authored);
+        assert_eq!(hit.path, "docs/map.md");
+        assert_eq!(hit.selector.as_deref(), Some("src/queue.rs"));
+        assert_eq!(hit.start_line, Some(5));
+        assert!(hit.excerpt.contains("pending work"));
+
+        // Naming the described path outranks everything.
+        let by_path = fx.ask("src/queue.rs");
+        assert_eq!(by_path.hits[0].id, "file:src/queue.rs");
+        assert!(
+            by_path
+                .hits
+                .iter()
+                .any(|h| h.kind == HitKind::Purpose && h.exact)
+        );
     }
 
     #[test]

@@ -83,6 +83,11 @@ pub(crate) struct ExecutionContext {
     pub repository_knowledge:
         Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
 
+    /// Shared per-turn budget for native repository-knowledge delivery,
+    /// created on first use from the host's delivery settings.
+    pub delivery_budget:
+        std::sync::Mutex<Option<crate::knowledge::repository::budget::DeliveryBudget>>,
+
     /// Optional event sink, propagated into tool contexts so tools can emit agent events.
     pub event_sink: Option<Arc<crate::event_sink::EventSink>>,
 
@@ -132,6 +137,7 @@ impl ExecutionContext {
             execution_origin: ExecutionOrigin::Interactive,
             knowledge_store: None,
             repository_knowledge: None,
+            delivery_budget: std::sync::Mutex::new(None),
             event_sink: None,
             workspace_query_bridge: None,
             turn_id: None,

@@ -24,13 +24,16 @@
 //! the response says so ([`ListResponse::generation_changed`],
 //! [`GetError::GenerationChanged`]) instead of mixing pages of two corpora.
 
+use super::code::{CodeStatus, SYMBOL_PREFIX, SourceDoc, SymbolRecord, symbol_key_path};
 use super::identity::{DocumentId, SectionKey};
+use super::purpose::{PURPOSE_PREFIX, PurposeRow, purpose_key_path};
 use super::query::normalize_relative_path;
 use super::reconcile::ReconcileStatus;
-use super::service::{RepositoryService, ServiceError};
+use super::service::{RepositoryService, ServiceError, SourceCheck};
 use super::store::{
     IndexDiagnostic, SCHEMA_VERSION, StoreError, StoredDocument, StoredSection, path_in_scope,
 };
+use rusqlite::Connection;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use thiserror::Error;
@@ -40,7 +43,7 @@ pub const DEFAULT_PAGE: usize = 20;
 pub const MAX_PAGE: usize = 50;
 /// Bytes of a preamble shown inline in a document catalog.
 const PREAMBLE_BYTES: usize = 1024;
-const FILE_PREFIX: &str = "file:";
+pub(super) const FILE_PREFIX: &str = "file:";
 
 // ─── Fetch ───────────────────────────────────────────────────────────────────
 
@@ -120,12 +123,38 @@ pub struct DocumentCatalog {
     pub sections: Vec<SectionRef>,
 }
 
-/// A path-level record of a selected code file.
+/// A selected code file: its path-level record plus whatever could be
+/// extracted from it. All of it is source-derived.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileInfo {
     pub generation: u64,
     pub path: String,
     pub size: u64,
+    pub language: Option<String>,
+    pub status: CodeStatus,
+    /// Declarations in source order.
+    pub symbols: Vec<SymbolRecord>,
+    /// Documentation copied verbatim from the file.
+    pub docs: Vec<SourceDoc>,
+}
+
+/// One declaration, with the verbatim documentation written above it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolInfo {
+    pub generation: u64,
+    pub path: String,
+    pub symbol: SymbolRecord,
+    pub doc: Option<SourceDoc>,
+    /// Direct members, in source order.
+    pub members: Vec<SymbolRecord>,
+}
+
+/// An authored File/Purpose row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurposeInfo {
+    pub generation: u64,
+    pub row: PurposeRow,
+    pub doc_status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +162,8 @@ pub enum Fetched {
     Section(SectionContent),
     Catalog(DocumentCatalog),
     File(FileInfo),
+    Symbol(SymbolInfo),
+    Purpose(PurposeInfo),
 }
 
 /// Why a fetch failed. Never carries content from outside the checkout.
@@ -182,18 +213,18 @@ impl From<StoreError> for GetError {
     }
 }
 
-fn invalid(message: impl Into<String>) -> GetError {
+pub(super) fn invalid(message: impl Into<String>) -> GetError {
     GetError::Invalid(message.into())
 }
 
 /// Parse `"{generation}:{offset}"`.
-fn parse_cursor(raw: &str) -> Result<(u64, usize), GetError> {
+pub(super) fn parse_cursor(raw: &str) -> Result<(u64, usize), GetError> {
     raw.split_once(':')
         .and_then(|(generation, offset)| Some((generation.parse().ok()?, offset.parse().ok()?)))
         .ok_or_else(|| invalid("malformed cursor; use the cursor from a previous response"))
 }
 
-fn floor_boundary(text: &str, mut index: usize) -> usize {
+pub(super) fn floor_boundary(text: &str, mut index: usize) -> usize {
     index = index.min(text.len());
     while !text.is_char_boundary(index) {
         index -= 1;
@@ -210,7 +241,7 @@ fn ceil_boundary(text: &str, mut index: usize) -> usize {
 }
 
 /// A section matched by a `path` + `section` selector.
-fn select_section<'a>(
+pub(super) fn select_section<'a>(
     document: &'a StoredDocument,
     selector: &str,
 ) -> Result<&'a StoredSection, GetError> {
@@ -308,6 +339,12 @@ pub struct StatsReport {
     pub documents: usize,
     pub sections: usize,
     pub code_files: usize,
+    /// Declarations extracted from code files (source-derived).
+    pub symbols: usize,
+    /// Authored File/Purpose rows.
+    pub purposes: usize,
+    /// Code files kept as path-level records only (unsupported or failed).
+    pub partial_code_files: usize,
     /// Selected documents that are unusable (malformed, disabled, duplicate ID).
     pub excluded_sources: usize,
     /// False when selected files were skipped or the manifest is unusable.
@@ -340,6 +377,12 @@ impl RepositoryService {
         if let Some(id) = &request.id {
             if let Some(path) = id.strip_prefix(FILE_PREFIX) {
                 return self.fetch_file(path, cursor);
+            }
+            if id.starts_with(SYMBOL_PREFIX) {
+                return self.fetch_symbol(id, cursor);
+            }
+            if id.starts_with(PURPOSE_PREFIX) {
+                return self.fetch_purpose(id, cursor);
             }
             if id.contains('#') {
                 return self.fetch_section_id(id, cursor, request.max_bytes);
@@ -383,15 +426,129 @@ impl RepositoryService {
         }
         let path = normalize_relative_path(raw)
             .map_err(|reason| invalid(format!("invalid path `{raw}`: {reason}")))?;
-        let (generation, source) = self.store().source(&path)?;
-        match source {
-            Some(source) if source.is_code => Ok(Fetched::File(FileInfo {
-                generation,
-                path,
-                size: source.stamp.size,
-            })),
-            _ => Err(GetError::NotFound { what: path }),
+        self.fresh_code(&path).map(Fetched::File)
+    }
+
+    /// The current record of a selected code file, revalidated against the file
+    /// on disk. Refreshes and retries (bounded) if it changed, so a returned
+    /// declaration range is never one known to be outdated.
+    fn fresh_code(&self, path: &str) -> Result<FileInfo, GetError> {
+        let limit = self.attempts();
+        let mut changes = 0;
+        let mut refreshed = false;
+        loop {
+            match self.check_source(path)? {
+                SourceCheck::Current => {
+                    let (generation, found) = self.store().code_record(path)?;
+                    return found
+                        .map(|(size, record)| FileInfo {
+                            generation,
+                            path: path.to_string(),
+                            size,
+                            language: record.language,
+                            status: record.status,
+                            symbols: record.symbols,
+                            docs: record.docs,
+                        })
+                        .ok_or_else(|| GetError::NotFound {
+                            what: path.to_string(),
+                        });
+                }
+                SourceCheck::Absent if refreshed => {
+                    return Err(GetError::NotFound {
+                        what: path.to_string(),
+                    });
+                }
+                SourceCheck::Absent => {}
+                SourceCheck::Changed => {
+                    changes += 1;
+                    if changes >= limit {
+                        return Err(ServiceError::Updating {
+                            path: path.to_string(),
+                        }
+                        .into());
+                    }
+                }
+            }
+            self.refresh()?;
+            refreshed = true;
         }
+    }
+
+    /// A symbol ID names a path, a kind and a qualified name. If the declaration
+    /// was renamed or removed the ID is simply not found: it never resolves to a
+    /// different symbol.
+    fn fetch_symbol(&self, id: &str, cursor: Option<(u64, usize)>) -> Result<Fetched, GetError> {
+        if cursor.is_some() {
+            return Err(invalid("a symbol record has no continuation"));
+        }
+        let not_found = || GetError::NotFound {
+            what: id.to_string(),
+        };
+        let raw = symbol_key_path(id).ok_or_else(|| {
+            invalid("unrecognized symbol id; use an id returned by repo_knowledge_*")
+        })?;
+        let path = normalize_relative_path(raw).map_err(|_| not_found())?;
+        let file = self.fresh_code(&path).map_err(|error| match error {
+            GetError::NotFound { .. } => not_found(),
+            other => other,
+        })?;
+        let symbol = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.key == id)
+            .cloned()
+            .ok_or_else(not_found)?;
+        let doc = file
+            .docs
+            .iter()
+            .find(|doc| doc.symbol_key.as_deref() == Some(id))
+            .cloned();
+        let members = file
+            .symbols
+            .iter()
+            .filter(|member| {
+                member.ordinal > symbol.ordinal
+                    && member.depth == symbol.depth + 1
+                    && member.parent.as_deref() == Some(symbol.qualified_name.as_str())
+                    && member.start_line <= symbol.end_line
+            })
+            .cloned()
+            .collect();
+        Ok(Fetched::Symbol(SymbolInfo {
+            generation: file.generation,
+            path,
+            symbol,
+            doc,
+            members,
+        }))
+    }
+
+    /// A purpose row lives and dies with its document, so the document's source
+    /// is revalidated before the row is returned.
+    fn fetch_purpose(&self, id: &str, cursor: Option<(u64, usize)>) -> Result<Fetched, GetError> {
+        if cursor.is_some() {
+            return Err(invalid("a purpose row has no continuation"));
+        }
+        let not_found = || GetError::NotFound {
+            what: id.to_string(),
+        };
+        let raw = purpose_key_path(id).ok_or_else(|| {
+            invalid("unrecognized purpose id; use an id returned by repo_knowledge_*")
+        })?;
+        let path = normalize_relative_path(raw).map_err(|_| not_found())?;
+        match self.fresh_document(&path) {
+            Ok(_) => {}
+            Err(ServiceError::NotIndexed { .. }) => return Err(not_found()),
+            Err(other) => return Err(other.into()),
+        }
+        let (generation, found) = self.store().purpose(id)?;
+        let found = found.ok_or_else(not_found)?;
+        Ok(Fetched::Purpose(PurposeInfo {
+            generation,
+            row: found.row,
+            doc_status: found.doc_status,
+        }))
     }
 
     /// `selector` is a section key or a heading selector; `None` fetches the
@@ -407,32 +564,25 @@ impl RepositoryService {
             Ok(current) => current,
             Err(ServiceError::NotIndexed { .. }) => {
                 // A selected code file is a navigation record, not a document.
-                let (generation, source) = self.store().source(path)?;
-                return match source {
-                    Some(source) if source.is_code && selector.is_none() && cursor.is_none() => {
-                        Ok(Fetched::File(FileInfo {
-                            generation,
-                            path: path.to_string(),
-                            size: source.stamp.size,
-                        }))
-                    }
-                    _ => Err(GetError::NotFound {
+                if selector.is_some() || cursor.is_some() {
+                    return Err(GetError::NotFound {
                         what: path.to_string(),
-                    }),
-                };
+                    });
+                }
+                return self.fresh_code(path).map(Fetched::File);
             }
             Err(other) => return Err(other.into()),
         };
         let generation = current.generation;
         let document = current.document;
 
-        if let Some((issued, _)) = cursor {
-            if issued != generation {
-                return Err(GetError::GenerationChanged {
-                    cursor: issued,
-                    current: generation,
-                });
-            }
+        if let Some((issued, _)) = cursor
+            && issued != generation
+        {
+            return Err(GetError::GenerationChanged {
+                cursor: issued,
+                current: generation,
+            });
         }
 
         let section = match selector {
@@ -490,51 +640,7 @@ impl RepositoryService {
         let limit = request.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
 
         let report = self.refresh()?;
-        let (generation, mut entries) = self.store().read(|conn| {
-            let mut entries = Vec::new();
-            let mut statement = conn.prepare(
-                "SELECT d.path, d.doc_id, d.title, d.description, d.status, \
-                 (SELECT count(*) FROM sections s WHERE s.doc_path = d.path) \
-                 FROM documents d ORDER BY d.path",
-            )?;
-            let rows = statement.query_map([], |row| {
-                Ok(ListEntry {
-                    kind: EntryKind::Document,
-                    path: row.get(0)?,
-                    id: row.get(1)?,
-                    title: row.get(2)?,
-                    description: row.get(3)?,
-                    status: row.get(4)?,
-                    sections: usize::try_from(row.get::<_, i64>(5)?).unwrap_or_default(),
-                    size: None,
-                })
-            })?;
-            for row in rows {
-                entries.push(row?);
-            }
-            let mut statement =
-                conn.prepare("SELECT path, size FROM sources WHERE is_code = 1 ORDER BY path")?;
-            let rows = statement.query_map([], |row| {
-                let path: String = row.get(0)?;
-                Ok(ListEntry {
-                    kind: EntryKind::File,
-                    id: format!("{FILE_PREFIX}{path}"),
-                    title: path
-                        .rsplit_once('/')
-                        .map_or(path.as_str(), |(_, name)| name)
-                        .to_string(),
-                    path,
-                    description: None,
-                    status: None,
-                    sections: 0,
-                    size: Some(u64::try_from(row.get::<_, i64>(1)?).unwrap_or_default()),
-                })
-            })?;
-            for row in rows {
-                entries.push(row?);
-            }
-            Ok(entries)
-        })?;
+        let (generation, mut entries) = self.store().read(load_entries)?;
         entries.retain(|entry| path_in_scope(&entry.path, scope.as_deref()));
 
         let (offset, generation_changed) = match cursor {
@@ -585,12 +691,63 @@ impl RepositoryService {
             documents: counts.documents,
             sections: counts.sections,
             code_files,
+            symbols: counts.symbols,
+            purposes: counts.purposes,
+            partial_code_files: counts.partial_code_files,
             excluded_sources,
             coverage_complete: state.coverage.is_empty(),
             diagnostics,
             coverage: state.coverage,
         })
     }
+}
+
+/// Every active document (by path) followed by every selected code file (by
+/// path), read from one snapshot.
+pub(super) fn load_entries(conn: &Connection) -> Result<Vec<ListEntry>, StoreError> {
+    let mut entries = Vec::new();
+    let mut statement = conn.prepare(
+        "SELECT d.path, d.doc_id, d.title, d.description, d.status, \
+         (SELECT count(*) FROM sections s WHERE s.doc_path = d.path) \
+         FROM documents d ORDER BY d.path",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(ListEntry {
+            kind: EntryKind::Document,
+            path: row.get(0)?,
+            id: row.get(1)?,
+            title: row.get(2)?,
+            description: row.get(3)?,
+            status: row.get(4)?,
+            sections: usize::try_from(row.get::<_, i64>(5)?).unwrap_or_default(),
+            size: None,
+        })
+    })?;
+    for row in rows {
+        entries.push(row?);
+    }
+    let mut statement =
+        conn.prepare("SELECT path, size FROM sources WHERE is_code = 1 ORDER BY path")?;
+    let rows = statement.query_map([], |row| {
+        let path: String = row.get(0)?;
+        Ok(ListEntry {
+            kind: EntryKind::File,
+            id: format!("{FILE_PREFIX}{path}"),
+            title: path
+                .rsplit_once('/')
+                .map_or(path.as_str(), |(_, name)| name)
+                .to_string(),
+            path,
+            description: None,
+            status: None,
+            sections: 0,
+            size: Some(u64::try_from(row.get::<_, i64>(1)?).unwrap_or_default()),
+        })
+    })?;
+    for row in rows {
+        entries.push(row?);
+    }
+    Ok(entries)
 }
 
 fn catalog_of(generation: u64, document: &StoredDocument) -> DocumentCatalog {
@@ -620,7 +777,7 @@ fn catalog_of(generation: u64, document: &StoredDocument) -> DocumentCatalog {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::config::RepositoryKnowledgeSettings;
     use crate::knowledge::repository::reconcile::ReconcileOptions;
@@ -633,14 +790,14 @@ mod tests {
     const MANIFEST: &str = "version = 1\n[documents]\ninclude = [\"docs/**/*.md\"]\n[code]\ninclude = [\"src/**/*.rs\"]\n";
     const ARCH: &str = "Intro text before any heading.\n# Architecture\n## Scheduling\nThe scheduler dispatches tasks.\n## Storage\nRows live in SQLite.\n";
 
-    struct Fx {
+    pub(in crate::knowledge::repository) struct Fx {
         _tmp: tempfile::TempDir,
-        repo: PathBuf,
-        service: RepositoryService,
+        pub(in crate::knowledge::repository) repo: PathBuf,
+        pub(in crate::knowledge::repository) service: RepositoryService,
     }
 
     impl Fx {
-        fn new() -> Self {
+        pub(in crate::knowledge::repository) fn new() -> Self {
             let tmp = tempfile::tempdir().unwrap();
             let repo = tmp.path().join("repo");
             fs::create_dir_all(repo.join(".git")).unwrap();
@@ -669,7 +826,7 @@ mod tests {
             fx
         }
 
-        fn put(&self, rel: &str, content: &str) {
+        pub(in crate::knowledge::repository) fn put(&self, rel: &str, content: &str) {
             let path = self.repo.join(rel);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, content).unwrap();

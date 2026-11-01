@@ -2377,6 +2377,44 @@ model = "gpt-4"
         assert!(registry_of(&disabled, Some("coder")).is_none());
     }
 
+    /// 5.12: the retrieval policy applies to quorum members exactly as to a
+    /// standalone agent: only when enabled and query/get are usable.
+    #[tokio::test]
+    async fn quorum_members_get_the_retrieval_policy_only_when_enabled() {
+        let root = tempfile::TempDir::new().unwrap();
+        let applies = |agent: &crate::api::agent::Agent, id: Option<&str>| {
+            let handle = match id {
+                None => agent.planner().expect("planner"),
+                Some(id) => agent.delegate(id).expect("delegate"),
+            };
+            let local = handle
+                .as_any()
+                .downcast_ref::<AgentHandle>()
+                .expect("local handle");
+            crate::agent::repository_delivery::policy_applies(&local.config)
+        };
+        for enabled in [true, false] {
+            let (infra, _dir) = quorum_infra().await;
+            let mut builder = crate::api::agent::Agent::builder_from_quorum_config(
+                workspace_quorum_config(root.path(), ""),
+                None,
+            )
+            .expect("builder")
+            .infra(infra);
+            if enabled {
+                builder = builder
+                    .repository_knowledge(crate::config::RepositoryKnowledgeSettings::enabled());
+            }
+            let agent = builder.build().await.expect("quorum builds");
+            // The planner's explicit `tools = ["delegate"]` allowlist stays
+            // authoritative: it never gets retrieval guidance for tools it
+            // cannot call. Unrestricted delegates follow the host setting.
+            assert!(!applies(&agent, None));
+            assert_eq!(applies(&agent, Some("coder")), enabled);
+            assert_eq!(applies(&agent, Some("reviewer")), enabled);
+        }
+    }
+
     /// 21.6/21.8: a quorum without workspace settings builds without a
     /// service, and an `isolated` delegate then fails the build.
     #[tokio::test]

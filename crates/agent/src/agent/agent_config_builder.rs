@@ -549,6 +549,16 @@ impl AgentConfigBuilder {
         mut self,
         registry: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
     ) -> Self {
+        // The repository tools exist only while the feature is enabled, so a
+        // disabled configuration advertises nothing new to the model.
+        if registry.is_some() {
+            self.tool_registry
+                .extend(crate::tools::builtins::repository_knowledge_tools());
+        } else {
+            for name in crate::tools::builtins::REPOSITORY_TOOL_NAMES {
+                self.tool_registry.remove(name);
+            }
+        }
         self.repository_knowledge = registry;
         self
     }
@@ -793,6 +803,44 @@ mod tests {
             .map(|t| t.function.name.clone())
             .collect();
         assert!(!names.is_empty(), "default tool registry should have tools");
+    }
+
+    #[tokio::test]
+    async fn repository_tools_are_registered_only_when_the_feature_is_enabled() {
+        use crate::config::RepositoryKnowledgeSettings;
+        use crate::knowledge::repository::RepositoryKnowledgeRegistry;
+        use crate::tools::builtins::REPOSITORY_TOOL_NAMES;
+
+        let names_of =
+            |config: &crate::agent::agent_config::AgentConfig| config.tool_registry.names();
+
+        let (builder, _td) = make_builder().await;
+        let default_names = names_of(&builder.build());
+        for name in REPOSITORY_TOOL_NAMES {
+            assert!(!default_names.contains(&name.to_string()), "{name}");
+        }
+
+        let registry =
+            RepositoryKnowledgeRegistry::from_settings(&RepositoryKnowledgeSettings::enabled());
+        assert!(registry.is_some());
+        let (builder, _td) = make_builder().await;
+        let enabled = builder.with_repository_knowledge(registry);
+        let enabled_names = names_of(&enabled.build());
+        for name in REPOSITORY_TOOL_NAMES {
+            assert!(enabled_names.contains(&name.to_string()), "{name}");
+        }
+
+        // Disabling again removes them; disabled settings yield no registry.
+        let (builder, _td) = make_builder().await;
+        let registry =
+            RepositoryKnowledgeRegistry::from_settings(&RepositoryKnowledgeSettings::enabled());
+        let off = builder
+            .with_repository_knowledge(registry)
+            .with_repository_knowledge(None);
+        let off_names = names_of(&off.build());
+        for name in REPOSITORY_TOOL_NAMES {
+            assert!(!off_names.contains(&name.to_string()), "{name}");
+        }
     }
 
     // ── Builder setters ─────────────────────────────────────────────────────
