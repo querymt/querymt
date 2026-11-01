@@ -1228,6 +1228,17 @@ mod tests {
             tool_arguments: Some(r#"{"path":"src/queue.rs"}"#.into()),
             compacted_at: None,
         });
+        // The live stage enriched this call, which is what makes it eligible
+        // for re-evaluation after compaction. The text is stale on purpose:
+        // re-selection must come from current sources, never from this card.
+        indexed.parts.push(MessagePart::HookContext {
+            event_name: "post_tool_use".into(),
+            handler_id: "qmt.repository_knowledge.index_context".into(),
+            tool_use_id: Some("c1".into()),
+            content:
+                "[repository-knowledge version=old epoch=0 card=src/queue.rs#old]\nSTALE-INDEX"
+                    .into(),
+        });
         exec_ctx.session_handle.add_message(indexed).await.unwrap();
         (config, exec_ctx, state, tempdir)
     }
@@ -1321,6 +1332,108 @@ mod tests {
         assert!(
             again.iter().all(|c| !first.contains(&c.content)),
             "a retained card version is not delivered twice: {again:?}"
+        );
+    }
+
+    fn index_call_result(call_id: &str) -> AgentMessage {
+        let mut m = AgentMessage::new("s".to_string(), ChatRole::User);
+        m.parts.push(MessagePart::ToolResult {
+            call_id: call_id.into(),
+            content: vec![querymt::chat::ToolResultPart::text("outline")],
+            is_error: false,
+            tool_name: Some("index".into()),
+            tool_arguments: Some(r#"{"path":"src/queue.rs"}"#.into()),
+            compacted_at: None,
+        });
+        m
+    }
+
+    #[tokio::test]
+    async fn only_index_calls_that_received_a_native_card_are_re_evaluated() {
+        let repo = repo();
+        let (config, exec_ctx, _state, _td) = knowledge_fixture(&repo).await;
+
+        // No persisted index-context card names this call (a foreign `index`
+        // tool, or a result a hook suppressed): nothing is recovered for it.
+        let unenriched = vec![index_call_result("foreign")];
+        let none = crate::agent::repository_delivery::post_compaction_contexts(
+            &config,
+            &exec_ctx,
+            &unenriched,
+        )
+        .await;
+        assert!(none.is_empty(), "{none:?}");
+
+        // The same call, once the live stage enriched it, is re-evaluated.
+        let mut enriched = index_call_result("c1");
+        enriched.parts.push(MessagePart::HookContext {
+            event_name: "post_tool_use".into(),
+            handler_id: "qmt.repository_knowledge.index_context".into(),
+            tool_use_id: Some("c1".into()),
+            content: "[repository-knowledge version=old epoch=0 card=x]\nold".into(),
+        });
+        let some = crate::agent::repository_delivery::post_compaction_contexts(
+            &config,
+            &exec_ctx,
+            &[enriched],
+        )
+        .await;
+        assert!(!some.is_empty(), "an enriched call is re-evaluated");
+    }
+
+    #[tokio::test]
+    async fn restore_counts_only_native_cards_and_reads_history_once() {
+        use crate::knowledge::repository::budget::Refusal;
+        let repo = repo();
+        let (config, exec_ctx, _state, _td) = knowledge_fixture(&repo).await;
+        let card = |handler: &str, id: &str| crate::hooks::HookContextContribution {
+            event_name: "post_tool_use".into(),
+            handler_id: handler.into(),
+            tool_use_id: None,
+            content: format!("[repository-knowledge version=v1 card={id}]\nbody"),
+        };
+        let stored = |handler: &str, id: &str| {
+            let c = card(handler, id);
+            let mut m = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+            m.parts.push(MessagePart::HookContext {
+                event_name: c.event_name,
+                handler_id: c.handler_id,
+                tool_use_id: c.tool_use_id,
+                content: c.content,
+            });
+            m
+        };
+        // A foreign hook imitating a marker, and a genuine native card.
+        for m in [
+            stored("user-hook", "imitated"),
+            stored("qmt.repository_knowledge.orientation", "native"),
+        ] {
+            exec_ctx.session_handle.add_message(m).await.unwrap();
+        }
+
+        crate::agent::repository_delivery::restore_state(&config, &exec_ctx).await;
+        // History added after the first restore is not re-read.
+        exec_ctx
+            .session_handle
+            .add_message(stored("qmt.repository_knowledge.orientation", "late"))
+            .await
+            .unwrap();
+        crate::agent::repository_delivery::restore_state(&config, &exec_ctx).await;
+
+        let mut guard = exec_ctx.delivery_budget.lock().unwrap();
+        let budget = guard.as_mut().expect("restored");
+        let native = "qmt.repository_knowledge.orientation";
+        assert!(
+            budget.admit(&card(native, "imitated")).is_ok(),
+            "a foreign hook must not suppress a real card"
+        );
+        assert_eq!(
+            budget.admit(&card(native, "native")),
+            Err(Refusal::AlreadyDelivered)
+        );
+        assert!(
+            budget.admit(&card(native, "late")).is_ok(),
+            "restore reads history once per budget"
         );
     }
 

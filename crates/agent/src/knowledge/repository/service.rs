@@ -215,6 +215,15 @@ impl RepositoryService {
         }
     }
 
+    /// Whether a refresh is running right now. Best-effort: callers that must
+    /// not wait (automatic delivery) skip instead of queueing behind it.
+    pub fn is_refreshing(&self) -> bool {
+        matches!(
+            self.refresh_lock.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+
     /// Attempts bounding refresh, revalidation and retrieval retries.
     pub(super) fn attempts(&self) -> u32 {
         self.policy.max_attempts.max(1)
@@ -356,13 +365,22 @@ impl RepositoryService {
             return Ok(SourceCheck::Changed);
         }
         // Content is unchanged; remember the new stamp. Bookkeeping only, so a
-        // failure here must not fail the read.
-        let _ = self.store.touch_sources(&[SourceTouch {
-            path: path.to_string(),
-            stamp: read.stamp,
-            content_hash: Some(read.hash),
-            indexed_at_ns: self.options.now_ns.unwrap_or_else(system_now_ns),
-        }]);
+        // failure here must not fail the read. It is skipped while a refresh
+        // runs: that refresh holds an earlier snapshot of this row and would
+        // race the touch, and the next check simply hashes again.
+        let guard = match self.refresh_lock.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if guard.is_some() {
+            let _ = self.store.touch_sources(&[SourceTouch {
+                path: path.to_string(),
+                stamp: read.stamp,
+                content_hash: Some(read.hash),
+                indexed_at_ns: self.options.now_ns.unwrap_or_else(system_now_ns),
+            }]);
+        }
         Ok(SourceCheck::Current)
     }
 }
@@ -880,5 +898,53 @@ mod tests {
 
         let current = fx.service.fresh_document("docs/a.md").unwrap();
         assert!(current.document.sections[0].body.contains("edited"));
+    }
+
+    #[test]
+    fn is_refreshing_reports_a_running_refresh_without_waiting() {
+        let fx = Fx::new();
+        fx.put_old("docs/a.md", "# A\nalpha\n");
+        assert!(!fx.service.is_refreshing());
+        let mut seen = None;
+        fx.service
+            .refresh_with(&mut || {
+                seen = Some(fx.service.is_refreshing());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(seen, Some(true), "visible from inside a refresh");
+        assert!(!fx.service.is_refreshing(), "released afterwards");
+    }
+
+    #[test]
+    fn a_stamp_touch_is_skipped_while_a_refresh_runs_but_the_read_still_succeeds() {
+        let fx = Fx::new();
+        fx.put_old("docs/a.md", "# A\nalpha\n");
+        fx.service.refresh().unwrap();
+        // Same bytes, new mtime: the stamp no longer matches, so the content
+        // is re-hashed and a touch would normally record the new stamp.
+        fx.put("docs/a.md", "# A\nalpha\n");
+        let guard = fx.service.refresh_lock.lock().unwrap();
+        let during = fx.service.check_source("docs/a.md").unwrap();
+        drop(guard);
+        assert!(matches!(during, SourceCheck::Current));
+        let (_, stored) = fx.service.store().source("docs/a.md").unwrap();
+        let stored = stored.unwrap();
+        let on_disk = FileStamp::from_metadata(&fs::metadata(fx.repo.join("docs/a.md")).unwrap());
+        assert_ne!(
+            stored.stamp, on_disk,
+            "no touch while a refresh holds the lock"
+        );
+
+        assert!(matches!(
+            fx.service.check_source("docs/a.md").unwrap(),
+            SourceCheck::Current
+        ));
+        let (_, stored) = fx.service.store().source("docs/a.md").unwrap();
+        assert_eq!(
+            stored.unwrap().stamp,
+            on_disk,
+            "touched once the lock is free"
+        );
     }
 }

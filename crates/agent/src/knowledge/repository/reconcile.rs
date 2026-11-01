@@ -204,7 +204,7 @@ pub(crate) fn reconcile_with(
     let mut coverage: Vec<IndexDiagnostic> = Vec::new();
     let (manifest, fingerprint, override_status) = match load_manifest(root.root()) {
         Ok(ManifestOutcome::Loaded(manifest)) => {
-            let fingerprint = fingerprint("manifest", Some(&manifest));
+            let fingerprint = fingerprint("manifest", Some(&manifest), &options.discovery);
             (Some(manifest), fingerprint, None)
         }
         Ok(ManifestOutcome::NotConfigured) => {
@@ -216,7 +216,7 @@ pub(crate) fn reconcile_with(
             ));
             (
                 None,
-                fingerprint("not-configured", None),
+                fingerprint("not-configured", None, &options.discovery),
                 Some(ReconcileStatus::NotConfigured),
             )
         }
@@ -229,7 +229,7 @@ pub(crate) fn reconcile_with(
             ));
             (
                 None,
-                fingerprint(error.code(), None),
+                fingerprint(error.code(), None, &options.discovery),
                 Some(ReconcileStatus::ManifestInvalid),
             )
         }
@@ -608,13 +608,23 @@ fn collect_ids(batch: &ParsedBatch, ids: &mut BTreeMap<String, String>) {
 /// records mean: the parsing pipeline, the store layout and the manifest's
 /// selection patterns. Host limits are deliberately excluded; they change which
 /// files are selected, which reconciliation already diffs.
-fn fingerprint(tag: &str, manifest: Option<&KnowledgeManifest>) -> String {
+fn fingerprint(
+    tag: &str,
+    manifest: Option<&KnowledgeManifest>,
+    discovery: &DiscoveryOptions,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"qmt-repository-reconcile\0");
     hasher.update(EXTRACTOR_VERSION.to_le_bytes());
     hasher.update(SCHEMA_VERSION.to_le_bytes());
     hasher.update(tag.as_bytes());
     hasher.update([0u8]);
+    // Host settings that change which files are selected: a different budget
+    // or ignore policy is a different configuration, not the same index.
+    hasher.update((discovery.max_files as u64).to_le_bytes());
+    hasher.update(discovery.max_file_bytes.to_le_bytes());
+    hasher.update(discovery.max_total_bytes.to_le_bytes());
+    hasher.update([u8::from(discovery.allow_ignored)]);
     if let Some(manifest) = manifest {
         for (label, selection) in [("documents", &manifest.documents), ("code", &manifest.code)] {
             hasher.update(label.as_bytes());
@@ -658,6 +668,38 @@ mod tests {
 
     fn opts() -> ReconcileOptions {
         ReconcileOptions::from(&RepositoryKnowledgeSettings::default())
+    }
+
+    #[test]
+    fn the_config_fingerprint_covers_host_selection_settings() {
+        let base = DiscoveryOptions::from(&RepositoryKnowledgeSettings::default());
+        let reference = fingerprint("manifest", None, &base);
+        assert_eq!(reference, fingerprint("manifest", None, &base));
+        let variants = [
+            DiscoveryOptions {
+                max_files: base.max_files + 1,
+                ..base.clone()
+            },
+            DiscoveryOptions {
+                max_file_bytes: base.max_file_bytes + 1,
+                ..base.clone()
+            },
+            DiscoveryOptions {
+                max_total_bytes: base.max_total_bytes + 1,
+                ..base.clone()
+            },
+            DiscoveryOptions {
+                allow_ignored: !base.allow_ignored,
+                ..base.clone()
+            },
+        ];
+        for variant in &variants {
+            assert_ne!(
+                reference,
+                fingerprint("manifest", None, variant),
+                "{variant:?}"
+            );
+        }
     }
 
     fn ago(secs: u64) -> SystemTime {

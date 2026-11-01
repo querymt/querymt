@@ -1628,9 +1628,12 @@ fn repository_knowledge_limits_are_capped_at_implementation_maxima() {
 
     let zero = RepositoryKnowledgeSettings {
         default_result_limit: 0,
+        max_response_bytes: 10,
         ..RepositoryKnowledgeSettings::enabled()
     };
     assert_eq!(zero.effective_default_result_limit(), 1);
+    // Room for the truncation disclosure is always kept.
+    assert_eq!(zero.effective_max_response_bytes(), 512);
 }
 
 #[test]

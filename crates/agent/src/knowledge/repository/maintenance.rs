@@ -178,7 +178,7 @@ pub(super) fn apply_writes(
     }
     let mut written = Vec::with_capacity(pending.len());
     for (relative, absolute, write) in pending {
-        write_atomic(&absolute, write.content.as_bytes())
+        write_atomic(root, &absolute, write.content.as_bytes())
             .map_err(|error| ExportError::io(&relative, &error))?;
         written.push(relative);
     }
