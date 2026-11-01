@@ -17,6 +17,7 @@ mod ext_remote;
 mod ext_schedules;
 mod ext_session_history;
 mod ext_session_ops;
+mod ext_speech;
 mod ext_worktree_ops;
 pub(crate) mod model_registry;
 #[cfg(feature = "remote")]

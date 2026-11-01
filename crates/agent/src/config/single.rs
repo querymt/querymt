@@ -64,6 +64,10 @@ pub struct SingleAgentConfig {
     /// Optional `.agents` Protocol loading settings (disabled by default).
     #[serde(default)]
     pub dotagents: crate::dotagents::DotagentsSettings,
+
+    /// Session-independent speech. Absent or empty disables ACP methods.
+    #[serde(default)]
+    pub speech: SpeechConfig,
 }
 
 /// A middleware entry in the agent's processing stack.

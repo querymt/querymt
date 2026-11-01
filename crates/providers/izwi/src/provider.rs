@@ -252,9 +252,10 @@ impl LLMProvider for IzwiProvider {
                 .asr_transcribe(&audio_base64, Some(model.as_str()), language.as_deref())
                 .await
                 .map_err(map_izwi_error)?;
-            Ok(stt::SttResponse {
-                text: transcription.text,
-            })
+            Ok(stt_response_from_asr(
+                transcription.text,
+                transcription.language,
+            ))
         })
         .await
     }
@@ -385,9 +386,128 @@ fn map_izwi_error(err: IzwiError) -> LLMError {
     }
 }
 
+fn stt_response_from_asr(raw_text: String, detected_language: Option<String>) -> stt::SttResponse {
+    let (text, parsed_language) = split_asr_language_prefix(&raw_text);
+    stt::SttResponse {
+        text,
+        language: nonempty_language(detected_language).or(parsed_language),
+    }
+}
+
+fn nonempty_language(language: Option<String>) -> Option<String> {
+    language.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(normalize_language_name(trimmed))
+        }
+    })
+}
+
+/// Split Qwen3-ASR `language {Lang}<asr_text>{transcript}` (and leftover glued
+/// forms like `language RussianОкей`) into transcript text and detected language.
+fn split_asr_language_prefix(raw: &str) -> (String, Option<String>) {
+    let trimmed = raw.trim();
+    let Some(rest) = strip_language_keyword(trimmed) else {
+        return (trimmed.to_string(), None);
+    };
+
+    if let Some((meta, text)) = rest.split_once("<asr_text>") {
+        return (text.trim().to_string(), parse_language_name(meta.trim()));
+    }
+    if rest.eq_ignore_ascii_case("none") {
+        return (String::new(), None);
+    }
+    match split_language_and_text(rest) {
+        Some((language, text)) => (text, Some(language)),
+        None => (trimmed.to_string(), None),
+    }
+}
+
+fn strip_language_keyword(value: &str) -> Option<&str> {
+    const PREFIX: &str = "language ";
+    if value.len() >= PREFIX.len() && value[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        Some(&value[PREFIX.len()..])
+    } else {
+        None
+    }
+}
+
+fn parse_language_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphabetic() || ch == '-')
+    {
+        return None;
+    }
+    Some(normalize_language_name(value))
+}
+
+fn split_language_and_text(rest: &str) -> Option<(String, String)> {
+    if let Some((lang, text)) = rest.split_once(char::is_whitespace)
+        && !has_lower_to_upper_transition(lang)
+        && let Some(language) = parse_language_name(lang)
+    {
+        return Some((language, text.trim().to_string()));
+    }
+
+    let ascii_end = rest
+        .char_indices()
+        .find(|(_, ch)| !ch.is_ascii_alphabetic() && *ch != '-')
+        .map(|(idx, _)| idx)
+        .unwrap_or(rest.len());
+    if ascii_end == 0 {
+        return None;
+    }
+    let ascii = &rest[..ascii_end];
+    if let Some(idx) = camel_case_split(ascii) {
+        let language = parse_language_name(&ascii[..idx])?;
+        return Some((language, rest[idx..].trim().to_string()));
+    }
+    if ascii_end < rest.len() {
+        let language = parse_language_name(ascii)?;
+        return Some((language, rest[ascii_end..].trim().to_string()));
+    }
+    None
+}
+
+fn camel_case_split(value: &str) -> Option<usize> {
+    let mut prev_lower = false;
+    for (idx, ch) in value.char_indices() {
+        if prev_lower && ch.is_ascii_uppercase() {
+            return Some(idx);
+        }
+        prev_lower = ch.is_ascii_lowercase();
+    }
+    None
+}
+
+fn has_lower_to_upper_transition(value: &str) -> bool {
+    camel_case_split(value).is_some()
+}
+
+fn normalize_language_name(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut out = first.to_uppercase().collect::<String>();
+            out.extend(chars.flat_map(char::to_lowercase));
+            out
+        }
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{IzwiProvider, parse_audio_format};
+    use super::{
+        IzwiProvider, parse_audio_format, split_asr_language_prefix, stt_response_from_asr,
+    };
     use izwi_core::ModelVariant;
     use izwi_core::audio::AudioFormat;
 
@@ -458,5 +578,44 @@ mod tests {
                 "disabled variant '{model}' should not appear"
             );
         }
+    }
+
+    #[test]
+    fn split_asr_language_prefix_strips_asr_text_token() {
+        let (text, language) =
+            split_asr_language_prefix("language Chinese<asr_text>甚至出现交易几乎停滞的情况。");
+        assert_eq!(language.as_deref(), Some("Chinese"));
+        assert_eq!(text, "甚至出现交易几乎停滞的情况。");
+    }
+
+    #[test]
+    fn split_asr_language_prefix_strips_glued_cyrillic() {
+        let (text, language) = split_asr_language_prefix("language RussianОкей, понял тогда.");
+        assert_eq!(language.as_deref(), Some("Russian"));
+        assert_eq!(text, "Окей, понял тогда.");
+    }
+
+    #[test]
+    fn split_asr_language_prefix_strips_glued_english() {
+        let (text, language) = split_asr_language_prefix("language EnglishThe quick brown fox");
+        assert_eq!(language.as_deref(), Some("English"));
+        assert_eq!(text, "The quick brown fox");
+    }
+
+    #[test]
+    fn split_asr_language_prefix_leaves_plain_transcript() {
+        let (text, language) = split_asr_language_prefix("hello world");
+        assert_eq!(language, None);
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn stt_response_prefers_runtime_language_and_still_strips_prefix() {
+        let response = stt_response_from_asr(
+            "language RussianОкей, понял тогда.".into(),
+            Some("russian".into()),
+        );
+        assert_eq!(response.language.as_deref(), Some("Russian"));
+        assert_eq!(response.text, "Окей, понял тогда.");
     }
 }

@@ -19,7 +19,7 @@ use crate::agent::core::{SnapshotPolicy, ToolPolicy};
 use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{
     ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, SingleAgentConfig,
-    SkillsConfig, SlashCommandsConfig, ToolSpec,
+    SkillsConfig, SlashCommandsConfig, SpeechConfig, ToolSpec,
 };
 use crate::event_fanout::EventFanout;
 use crate::middleware::MiddlewareDriver;
@@ -125,6 +125,8 @@ pub struct AgentBuilder {
     workspace: Option<crate::config::WorkspaceSettings>,
     /// Prebuilt workspace service; wins over `workspace`.
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    /// Speech settings from the builder or TOML; service built at `build()`.
+    speech: Option<SpeechConfig>,
     /// MCP servers from TOML `[[mcp]]` config, attached to every new session.
     mcp_servers: Vec<McpServerConfig>,
     /// Runtime MCP attachment source (e.g., mobile in-process MCP peers).
@@ -171,6 +173,7 @@ impl AgentBuilder {
             dotagents_task_approver: None,
             workspace: None,
             workspace_service: None,
+            speech: None,
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: None,
             agent_registry: None,
@@ -321,6 +324,12 @@ impl AgentBuilder {
     /// Inject a prebuilt workspace service (wins over [`workspace`](Self::workspace)).
     pub fn workspace_service(mut self, service: Arc<crate::worktree::WorkspaceService>) -> Self {
         self.workspace_service = Some(service);
+        self
+    }
+
+    /// Configure session-independent speech-to-text.
+    pub fn speech(mut self, config: SpeechConfig) -> Self {
+        self.speech = Some(config);
         self
     }
 
@@ -622,6 +631,17 @@ impl AgentBuilder {
         };
         if let Some(service) = workspace_service {
             builder = builder.with_workspace_service(service);
+        }
+
+        let speech_service = match self.speech.take() {
+            Some(config) if config.is_configured() => Some(
+                crate::speech::SpeechService::new(config, plugin_registry.clone())
+                    .map_err(|err| anyhow!("invalid speech configuration: {err}"))?,
+            ),
+            _ => None,
+        };
+        if let Some(service) = speech_service {
+            builder = builder.with_speech_service(service);
         }
 
         // Wire schedule repository and knowledge store from the storage backend.
@@ -1582,6 +1602,9 @@ impl Agent {
         builder.hooks_config = Some(config.agent.hooks);
         if config.agent.workspace.enabled {
             builder.workspace = Some(config.agent.workspace);
+        }
+        if config.speech.is_configured() {
+            builder.speech = Some(config.speech);
         }
 
         // Wire MCP servers from TOML `[[mcp]]` config.

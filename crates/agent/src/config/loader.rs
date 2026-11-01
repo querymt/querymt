@@ -96,6 +96,10 @@ async fn build_config_from_toml_value(
             &config.agent.permissions,
             &config.mcp.iter().collect::<Vec<_>>(),
         )?;
+        config
+            .speech
+            .validate()
+            .map_err(|err| anyhow!("invalid speech configuration: {err}"))?;
 
         // Step 5: Resolve system prompt file references
         match &resolution {
@@ -142,6 +146,10 @@ async fn build_config_from_toml_value(
                 &config.mcp.iter().chain(&delegate.mcp).collect::<Vec<_>>(),
             )?;
         }
+        config
+            .speech
+            .validate()
+            .map_err(|err| anyhow!("invalid speech configuration: {err}"))?;
 
         // Step 5: Resolve system prompt file references
         match &resolution {
