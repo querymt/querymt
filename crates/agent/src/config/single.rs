@@ -201,6 +201,10 @@ pub struct AgentSettings {
     /// default; enabling never isolates an option-less session.
     #[serde(default)]
     pub workspace: WorkspaceSettings,
+
+    /// Experimental tree memory (`[agent.memory]`), disabled by default.
+    #[serde(default)]
+    pub memory: crate::optchat::MemorySettings,
 }
 
 #[allow(dead_code)]

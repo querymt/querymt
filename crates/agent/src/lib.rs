@@ -39,6 +39,7 @@ pub mod model_heuristics;
 pub mod model_info;
 pub mod model_inventory;
 pub mod model_registry;
+pub mod optchat;
 #[cfg(feature = "plugin-loaders")]
 pub mod plugin_update;
 pub mod profiles;
