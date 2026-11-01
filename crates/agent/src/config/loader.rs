@@ -90,6 +90,10 @@ async fn build_config_from_toml_value(
 
         // Step 4: Validate
         validate_mcp_servers(&config.mcp)?;
+        config
+            .speech
+            .validate()
+            .map_err(|err| anyhow!("invalid speech configuration: {err}"))?;
 
         // Step 5: Resolve system prompt file references
         match &resolution {
@@ -121,6 +125,10 @@ async fn build_config_from_toml_value(
             validate_mcp_servers(&delegate.mcp)?;
         }
         validate_peer_delegates(&config.delegates, &config.mesh)?;
+        config
+            .speech
+            .validate()
+            .map_err(|err| anyhow!("invalid speech configuration: {err}"))?;
 
         // Step 5: Resolve system prompt file references
         match &resolution {

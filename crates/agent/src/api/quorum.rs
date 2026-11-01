@@ -11,7 +11,7 @@ use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::SnapshotPolicy;
 use crate::agent::core::ToolPolicy;
-use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
+use crate::config::{MiddlewareEntry, QuorumConfig, SpeechConfig, resolve_tools};
 use crate::delegation::AgentInfo;
 
 use crate::acp::protocol::{ContentBlock, PromptRequest, TextContent};
@@ -58,6 +58,8 @@ pub struct QuorumBuilder {
     workspace: Option<crate::config::WorkspaceSettings>,
     /// Prebuilt workspace service; wins over `workspace`.
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    /// Speech settings; one service is built and attached to the planner only.
+    speech: Option<SpeechConfig>,
     /// Pre-built registry entries to merge before building (Phase 7: remote agents).
     ///
     /// When `Some`, the entries in this registry are merged with the local delegate agents
@@ -115,6 +117,7 @@ impl QuorumBuilder {
             dotagents_task_approver: None,
             workspace: None,
             workspace_service: None,
+            speech: None,
             initial_registry: None,
             #[cfg(feature = "remote")]
             mesh: None,
@@ -194,6 +197,12 @@ impl QuorumBuilder {
     /// Inject a prebuilt workspace service (wins over [`workspace`](Self::workspace)).
     pub fn workspace_service(mut self, service: Arc<crate::worktree::WorkspaceService>) -> Self {
         self.workspace_service = Some(service);
+        self
+    }
+
+    /// Configure session-independent speech-to-text on the planner.
+    pub fn speech(mut self, config: SpeechConfig) -> Self {
+        self.speech = Some(config);
         self
     }
 
@@ -462,6 +471,13 @@ impl QuorumBuilder {
                 }
                 None => None,
             },
+        };
+        let speech_service = match self.speech.take() {
+            Some(config) if config.is_configured() => Some(
+                crate::speech::SpeechService::new(config, registry.clone())
+                    .map_err(|err| anyhow!("invalid speech configuration: {err}"))?,
+            ),
+            _ => None,
         };
         if workspace_service.is_none()
             && let Some(delegate) = self
@@ -787,6 +803,7 @@ impl QuorumBuilder {
         let delegation_wait_timeout_for_planner = self.delegation_wait_timeout_secs;
         let delegation_cancel_grace_for_planner = self.delegation_cancel_grace_secs;
         let workspace_for_planner = workspace_service.clone();
+        let speech_for_planner = speech_service;
         builder = builder.with_planner(move |storage, agent_registry, event_fanout| {
             let mut b = AgentConfigBuilder::new(
                 registry_for_planner.clone(),
@@ -862,6 +879,9 @@ impl QuorumBuilder {
 
             if let Some(service) = workspace_for_planner.clone() {
                 b = b.with_workspace_service(service);
+            }
+            if let Some(service) = speech_for_planner.clone() {
+                b = b.with_speech_service(service);
             }
 
             // Wire schedule repository and knowledge store into the planner config.
@@ -1231,6 +1251,9 @@ impl super::agent::Agent {
 
         if config.quorum.workspace.enabled {
             builder.workspace = Some(config.quorum.workspace);
+        }
+        if config.speech.is_configured() {
+            builder.speech = Some(config.speech);
         }
         builder.snapshot_policy = snapshot_policy;
         builder.initial_registry = initial_registry;
