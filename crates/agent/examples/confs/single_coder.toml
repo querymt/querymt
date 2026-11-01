@@ -133,10 +133,10 @@ and suggest concrete fixes. Prioritize findings by severity. Focus on:
 </system-reminder>"""
 
 # Execution limits
-[[middleware]]
-type = "limits"
-max_steps = 200
-max_turns = 50
+# [[middleware]]
+# type = "limits"
+# max_steps = 200
+# max_turns = 50
 
 # Context management with auto-compaction
 # Note: auto_compact is controlled by [agent.execution.compaction].auto
