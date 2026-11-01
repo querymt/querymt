@@ -42,6 +42,7 @@ use super::reconcile::{
 use super::root::ResolvedRoot;
 use super::store::{RepositoryStore, SourceTouch, StoreError, StoredDocument, StoredSource};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 use thiserror::Error;
@@ -130,6 +131,11 @@ pub struct RepositoryService {
     options: ReconcileOptions,
     policy: RefreshPolicy,
     refresh_lock: Mutex<()>,
+    /// A workspace change was reported since the last hinted refresh began.
+    hinted: AtomicBool,
+    /// A hinted refresh is scheduled or running; further hints only set
+    /// `hinted`, so bursts of events coalesce into few refreshes.
+    hint_active: AtomicBool,
 }
 
 fn retryable(error: &StoreError) -> bool {
@@ -169,7 +175,44 @@ impl RepositoryService {
             options,
             policy,
             refresh_lock: Mutex::new(()),
+            hinted: AtomicBool::new(false),
+            hint_active: AtomicBool::new(false),
         })
+    }
+
+    /// Record that the workspace reported a change. Returns `true` when the
+    /// caller should schedule [`run_hinted_refresh`](Self::run_hinted_refresh)
+    /// (no hinted refresh is already pending).
+    ///
+    /// A hint is only an acceleration: it reads nothing itself, and retrieval
+    /// reconciles with the files regardless of whether any hint arrived, so a
+    /// missed event, an external write or a branch switch is still observed.
+    pub fn hint_changed(&self) -> bool {
+        self.hinted.store(true, Ordering::SeqCst);
+        !self.hint_active.swap(true, Ordering::SeqCst)
+    }
+
+    /// Refresh for every hint recorded so far, coalescing hints that arrive
+    /// meanwhile. Call only after [`hint_changed`](Self::hint_changed) returned
+    /// `true`. Returns the number of refreshes performed. A failed refresh is
+    /// not retried here: the next retrieval reports it.
+    pub fn run_hinted_refresh(&self) -> u32 {
+        let mut refreshes = 0;
+        loop {
+            while self.hinted.swap(false, Ordering::SeqCst) {
+                refreshes += 1;
+                if self.refresh().is_err() {
+                    break;
+                }
+            }
+            self.hint_active.store(false, Ordering::SeqCst);
+            // A hint that landed between the last check and releasing the
+            // slot must not be lost; take the slot back if nobody else did.
+            if !self.hinted.load(Ordering::SeqCst) || self.hint_active.swap(true, Ordering::SeqCst)
+            {
+                return refreshes;
+            }
+        }
     }
 
     /// Attempts bounding refresh, revalidation and retrieval retries.
@@ -449,6 +492,36 @@ mod tests {
         assert_eq!(fx.service.store().counts().unwrap().documents, DOCS);
         let again = fx.service.refresh().unwrap();
         assert_eq!(again.generation, first.generation);
+    }
+
+    #[test]
+    fn change_hints_coalesce_and_prewarm_the_index() {
+        let fx = Fx::new();
+        fx.write_all(0);
+        assert!(fx.service.hint_changed(), "first hint schedules a refresh");
+        assert!(
+            !fx.service.hint_changed(),
+            "hints while one is pending coalesce into it"
+        );
+        assert_eq!(fx.service.run_hinted_refresh(), 1);
+        assert_eq!(fx.service.store().counts().unwrap().documents, DOCS);
+        // The slot is released, so later changes schedule again.
+        assert!(fx.service.hint_changed());
+        assert_eq!(fx.service.run_hinted_refresh(), 1);
+    }
+
+    #[test]
+    fn writes_without_any_hint_are_still_reconciled_on_retrieval() {
+        let fx = Fx::new();
+        fx.write_all(0);
+        fx.service.refresh().unwrap();
+        // An external edit and an addition that no watcher reported.
+        fx.put("docs/d00.md", "# Doc 00\nversion 999\n");
+        fx.put("docs/new.md", "# New\nversion 999\n");
+        let current = fx.service.fresh_document("docs/d00.md").unwrap();
+        assert!(current.document.sections[0].body.contains("version 999"));
+        fx.service.refresh().unwrap();
+        assert_eq!(fx.service.store().counts().unwrap().documents, DOCS + 1);
     }
 
     #[test]

@@ -12011,6 +12011,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "typeshare",
+ "unicode-normalization",
  "ureq 3.5.1",
  "url",
  "uuid 1.29.0",

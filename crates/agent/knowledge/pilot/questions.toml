@@ -1,0 +1,292 @@
+# Frozen M5 pilot question set (format version 1).
+#
+# Sanitized: every item is a short task or question written for this fixture.
+# None derives from a session transcript, a session database, a credential or
+# a developer's absolute path (the loader rejects such fragments).
+#
+# `dev` items may be used to inspect results and tune the corpus. `held_out`
+# items must not influence corpus authoring or the relevance gate: they were
+# written before any replay was run, and held-out replay refuses to run when
+# the compiled gate differs from the one recorded below.
+#
+# Expectations are repository-relative paths; a result counts when it cites any
+# of them (a concept note or the source file it explains).
+
+version = 1
+revision = "42823824+worktree"          # HEAD plus the uncommitted pilot corpus; the corpus fingerprints below are the real pin
+gate_version = 1
+gate_fingerprint = "985e6fcb143a079c9aea1a8fe6ef8e00"
+
+[frozen_corpus]
+curated = "b7c75bf6ae632fa484e8c5add77ff80f"
+baseline = "354b3ec283921d37d4440b343e86c542"
+
+[[arm]]
+name = "baseline"                        # no repository knowledge
+
+[[arm]]
+name = "curated"                         # reviewed concept notes + source maps
+manifest = ".qmt/knowledge.toml"
+
+# The exhaustive per-file purpose arm is intentionally NOT defined: its
+# descriptions must be written and reviewed by a person, and scaffolding only
+# creates empty rows. See crates/agent/knowledge/pilot/README.md.
+
+# --- dev: navigation ------------------------------------------------------
+
+[[question]]
+id = "dev-nav-waves"
+split = "dev"
+class = "navigation"
+text = "where is plan_waves defined"
+expect = ["crates/agent/src/agent/execution/wave_plan.rs", "crates/agent/knowledge/execution.md"]
+
+[[question]]
+id = "dev-nav-lease"
+split = "dev"
+class = "navigation"
+text = "which file implements the per-session run lease"
+expect = ["crates/agent/src/session/run_lease.rs", "crates/agent/knowledge/sessions.md"]
+
+[[question]]
+id = "dev-nav-normalize"
+split = "dev"
+class = "navigation"
+text = "find normalize_arguments"
+expect = ["crates/agent/src/tools/args.rs", "crates/agent/knowledge/tools.md"]
+
+# --- dev: conceptual ------------------------------------------------------
+
+[[question]]
+id = "dev-con-retry"
+split = "dev"
+class = "conceptual"
+text = "how does the execution loop retry transient provider errors"
+expect = ["crates/agent/knowledge/execution.md"]
+
+[[question]]
+id = "dev-con-prune"
+split = "dev"
+class = "conceptual"
+text = "how does pruning decide which tool outputs to drop from history"
+expect = ["crates/agent/knowledge/sessions.md"]
+
+[[question]]
+id = "dev-con-gate"
+split = "dev"
+class = "conceptual"
+text = "what does the orientation relevance gate require before a card is delivered"
+expect = ["crates/agent/knowledge/repository-knowledge.md"]
+
+# --- dev: path-free feature requests --------------------------------------
+
+[[question]]
+id = "dev-free-parallel"
+split = "dev"
+class = "path_free"
+text = "make independent tool calls from one model response run at the same time but keep conflicting file writes ordered"
+expect = ["crates/agent/knowledge/execution.md", "crates/agent/src/agent/execution/wave_plan.rs"]
+
+[[question]]
+id = "dev-free-args"
+split = "dev"
+class = "path_free"
+text = "the model sometimes sends a json string where the tool schema declares an array, accept it safely"
+expect = ["crates/agent/knowledge/tools.md", "crates/agent/src/tools/args.rs"]
+
+# --- dev: negatives -------------------------------------------------------
+
+[[question]]
+id = "dev-neg-typo"
+split = "dev"
+class = "negative"
+text = "fix the typo in the changelog"
+
+[[question]]
+id = "dev-neg-recipe"
+split = "dev"
+class = "negative"
+text = "write a short poem about autumn leaves"
+
+[[question]]
+id = "dev-neg-generic"
+split = "dev"
+class = "negative"
+text = "please update the code and make it work better"
+
+[[question]]
+id = "dev-neg-outside"
+split = "dev"
+class = "negative"
+text = "rename the button label on the settings dialog of the desktop application"
+
+[[question]]
+id = "dev-nonen-de"
+split = "dev"
+class = "non_english"
+text = "Wie werden fehlgeschlagene Anfragen an den Modellanbieter wiederholt"
+
+# --- held-out: navigation -------------------------------------------------
+
+[[question]]
+id = "ho-nav-location"
+split = "held_out"
+class = "navigation"
+text = "which module resolves a session id to a local row or a remote bookmark"
+expect = ["crates/agent/src/session/location.rs", "crates/agent/knowledge/sessions.md"]
+
+[[question]]
+id = "ho-nav-validation"
+split = "held_out"
+class = "navigation"
+text = "where are tool argument violations rendered with did you mean hints"
+expect = ["crates/agent/src/tools/validation.rs", "crates/agent/knowledge/tools.md"]
+
+[[question]]
+id = "ho-nav-budget"
+split = "held_out"
+class = "navigation"
+text = "where does the per-turn delivery budget for repository cards live"
+expect = ["crates/agent/src/knowledge/repository/budget.rs", "crates/agent/knowledge/repository-knowledge.md"]
+
+[[question]]
+id = "ho-nav-compaction-boundary"
+split = "held_out"
+class = "navigation"
+text = "find filter_to_effective_history"
+expect = ["crates/agent/src/session/compaction.rs", "crates/agent/knowledge/sessions.md"]
+
+# --- held-out: conceptual -------------------------------------------------
+
+[[question]]
+id = "ho-con-permission"
+split = "held_out"
+class = "conceptual"
+text = "in what order do hooks, validation and permission checks run for a tool call"
+expect = ["crates/agent/knowledge/execution.md"]
+
+[[question]]
+id = "ho-con-lease-death"
+split = "held_out"
+class = "conceptual"
+text = "what happens to a run whose process died without completing"
+expect = ["crates/agent/knowledge/sessions.md"]
+
+[[question]]
+id = "ho-con-freshness"
+split = "held_out"
+class = "conceptual"
+text = "how does repository knowledge notice that a selected file changed without reading every file"
+expect = ["crates/agent/knowledge/repository-knowledge.md"]
+
+[[question]]
+id = "ho-con-scope"
+split = "held_out"
+class = "conceptual"
+text = "why does a directory search wait only for some writes in the tool scheduler"
+expect = ["crates/agent/knowledge/tools.md", "crates/agent/knowledge/execution.md"]
+
+# --- held-out: path-free --------------------------------------------------
+
+[[question]]
+id = "ho-free-compaction"
+split = "held_out"
+class = "path_free"
+text = "when the context window fills up, summarize the conversation but never loop forever without progress"
+expect = ["crates/agent/knowledge/execution.md", "crates/agent/knowledge/sessions.md"]
+
+[[question]]
+id = "ho-free-lock"
+split = "held_out"
+class = "path_free"
+text = "stop two processes from running the same session at once"
+expect = ["crates/agent/knowledge/sessions.md", "crates/agent/src/session/run_lease.rs"]
+
+[[question]]
+id = "ho-free-cards"
+split = "held_out"
+class = "path_free"
+text = "avoid sending the same repository documentation card to the model twice after a resume"
+expect = ["crates/agent/knowledge/repository-knowledge.md"]
+
+# --- held-out: negatives --------------------------------------------------
+
+[[question]]
+id = "ho-neg-weather"
+split = "held_out"
+class = "negative"
+text = "what is the capital of australia"
+
+[[question]]
+id = "ho-neg-generic"
+split = "held_out"
+class = "negative"
+text = "implement the function and fix the failing thing in the file"
+
+[[question]]
+id = "ho-neg-css"
+split = "held_out"
+class = "negative"
+text = "adjust the padding of the sidebar so the logo is centered"
+
+[[question]]
+id = "ho-neg-external"
+split = "held_out"
+class = "negative"
+text = "summarize the quarterly sales spreadsheet and email it to finance"
+
+[[question]]
+id = "ho-nonen-es"
+split = "held_out"
+class = "non_english"
+text = "como se guardan y se podan los resultados antiguos de las herramientas"
+
+[[question]]
+id = "ho-nonen-fr"
+split = "held_out"
+class = "non_english"
+text = "comment le planificateur ordonne les appels d'outils en parallele"
+
+# --- scenarios ------------------------------------------------------------
+
+[[scenario]]
+id = "dev-parallel"
+split = "dev"
+kind = "parallel"
+prompt = "make independent tool calls from one model response run at the same time but keep conflicting file writes ordered"
+files = ["crates/agent/src/agent/execution/wave_plan.rs", "crates/agent/src/tools/args.rs", "crates/agent/src/session/run_lease.rs"]
+
+[[scenario]]
+id = "dev-repeat"
+split = "dev"
+kind = "repeat"
+prompt = "how does the execution loop retry transient provider errors"
+files = ["crates/agent/src/agent/execution/wave_plan.rs"]
+
+[[scenario]]
+id = "dev-compaction"
+split = "dev"
+kind = "compaction"
+prompt = "how does pruning decide which tool outputs to drop from history"
+files = ["crates/agent/src/session/run_lease.rs"]
+
+[[scenario]]
+id = "ho-parallel"
+split = "held_out"
+kind = "parallel"
+prompt = "stop two processes from running the same session at once"
+files = ["crates/agent/src/session/run_lease.rs", "crates/agent/src/tools/args.rs", "crates/agent/src/knowledge/repository/gate.rs"]
+
+[[scenario]]
+id = "ho-repeat"
+split = "held_out"
+kind = "repeat"
+prompt = "avoid sending the same repository documentation card to the model twice after a resume"
+files = ["crates/agent/src/knowledge/repository/gate.rs"]
+
+[[scenario]]
+id = "ho-compaction"
+split = "held_out"
+kind = "compaction"
+prompt = "what happens to a run whose process died without completing"
+files = ["crates/agent/src/agent/execution/wave_plan.rs"]

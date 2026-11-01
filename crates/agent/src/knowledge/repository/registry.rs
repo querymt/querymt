@@ -53,6 +53,8 @@ pub struct RepositoryKnowledgeRegistry {
     /// Serializes opening, so two sessions reaching a new checkout together
     /// do not race to create the same index file.
     open_lock: Mutex<()>,
+    /// Local, in-memory delivery counters for this registry only.
+    diagnostics: super::diagnostics::DeliveryDiagnostics,
 }
 
 impl RepositoryKnowledgeRegistry {
@@ -67,6 +69,7 @@ impl RepositoryKnowledgeRegistry {
                 policy: RefreshPolicy::default(),
                 services: Mutex::new(HashMap::new()),
                 open_lock: Mutex::new(()),
+                diagnostics: Default::default(),
             })
         })
     }
@@ -85,12 +88,18 @@ impl RepositoryKnowledgeRegistry {
                 policy: RefreshPolicy::default(),
                 services: Mutex::new(HashMap::new()),
                 open_lock: Mutex::new(()),
+                diagnostics: Default::default(),
             })
         })
     }
 
     pub fn settings(&self) -> &RepositoryKnowledgeSettings {
         &self.settings
+    }
+
+    /// Local matched/delivered/suppressed/fetched counters.
+    pub fn diagnostics(&self) -> &super::diagnostics::DeliveryDiagnostics {
+        &self.diagnostics
     }
 
     /// Resolve and authorize the knowledge root for a session working
@@ -137,6 +146,47 @@ impl RepositoryKnowledgeRegistry {
         Ok(opened)
     }
 
+    /// The already-open service for the checkout containing `cwd`. Never
+    /// opens, creates or reads anything: a checkout nobody has queried yet has
+    /// nothing to keep warm.
+    pub fn open_service_for(&self, cwd: &Path) -> Option<Arc<RepositoryService>> {
+        let key = self.resolve(Some(cwd)).ok()?.cache_key();
+        self.lock().get(&key).cloned()
+    }
+
+    /// Forward workspace change events for `cwd` as coalesced refresh hints.
+    ///
+    /// Hints only pre-warm the index of a checkout that is already open.
+    /// Retrieval still reconciles with the files itself, so events the watcher
+    /// missed, writes made outside the process and branch switches are
+    /// observed on the next explicit retrieval regardless of this task.
+    /// The task ends when the watcher's channel closes.
+    pub fn spawn_change_hints(
+        self: &Arc<Self>,
+        cwd: PathBuf,
+        mut changes: tokio::sync::broadcast::Receiver<crate::index::FileChangeSet>,
+    ) -> tokio::task::JoinHandle<()> {
+        let registry = Arc::clone(self);
+        tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match changes.recv().await {
+                    // A lagged receiver lost events, which is still a change.
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+                let Some(service) = registry.open_service_for(&cwd) else {
+                    continue;
+                };
+                if service.hint_changed() {
+                    tokio::task::spawn_blocking(move || {
+                        service.run_hinted_refresh();
+                    });
+                }
+            }
+        })
+    }
+
     /// Number of checkouts with an open service (diagnostics and tests).
     pub fn open_services(&self) -> usize {
         self.lock().len()
@@ -180,6 +230,50 @@ mod tests {
         fn config_exists(&self) -> bool {
             self.tmp.path().join("config").exists()
         }
+    }
+
+    async fn wait_for(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn workspace_changes_prewarm_only_checkouts_that_are_already_open() {
+        let fx = Fx::enabled();
+        let repo = fx.repo("repo");
+        fs::create_dir_all(repo.join(".qmt")).unwrap();
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(
+            repo.join(".qmt/knowledge.toml"),
+            "version = 1\n[documents]\ninclude = [\"docs/**/*.md\"]\n",
+        )
+        .unwrap();
+        fs::write(repo.join("docs/a.md"), "# A\nbody\n").unwrap();
+
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let task = fx.registry.spawn_change_hints(repo.clone(), rx);
+
+        // Nothing has queried this checkout: a hint must not open or create anything.
+        tx.send(crate::index::FileChangeSet::default()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(fx.registry.open_services(), 0);
+        assert!(!fx.config_exists());
+
+        // Once a session has opened the checkout, hints refresh it.
+        let service = fx.registry.service_for(Some(&repo)).unwrap();
+        assert_eq!(service.store().counts().unwrap().documents, 0);
+        tx.send(crate::index::FileChangeSet::default()).unwrap();
+        let svc = service.clone();
+        assert!(wait_for(move || svc.store().counts().unwrap().documents == 1).await);
+
+        // A lagged/closed channel never panics; closing ends the task.
+        drop(tx);
+        task.await.unwrap();
     }
 
     #[test]

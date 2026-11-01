@@ -47,6 +47,7 @@
 //! Serialized refresh, retries and pre-emission revalidation are layered on
 //! top of this by the service; this module is the pure reconciliation step.
 
+use super::code::{CODE_EXTRACTOR_VERSION, extract_code};
 use super::discovery::{
     DiscoveredFile, DiscoveryOptions, FileStamp, codes as discovery_codes, discover,
 };
@@ -55,6 +56,7 @@ use super::identity::{
     NormalizedBatch, NormalizedDocument, normalize_documents, normalize_explicit_id,
 };
 use super::manifest::{KnowledgeManifest, MANIFEST_RELATIVE_PATH, ManifestOutcome, load_manifest};
+use super::purpose::parse_purpose_rows;
 use super::root::ResolvedRoot;
 use super::store::{
     GenerationUpdate, IndexDiagnostic, RepositoryStore, SCHEMA_VERSION, SourceRecord, SourceState,
@@ -68,9 +70,10 @@ use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-/// Version of the parsing/normalization pipeline. Bumping it re-parses every
-/// source on the next refresh.
-const EXTRACTOR_VERSION: u32 = 1;
+/// Version of the document parsing/normalization pipeline. Bumping it
+/// re-parses every source on the next refresh. Code extraction has its own
+/// version ([`CODE_EXTRACTOR_VERSION`]) that invalidates only code records.
+const EXTRACTOR_VERSION: u32 = 2;
 
 /// Default racy-timestamp window. Two seconds covers the coarsest common
 /// filesystem timestamp granularity.
@@ -163,7 +166,7 @@ struct Fresh {
     is_code: bool,
     stamp: FileStamp,
     hash: String,
-    /// Document bytes awaiting parsing; empty for code-only sources.
+    /// Bytes awaiting parsing (documents) or symbol extraction (code).
     bytes: Vec<u8>,
 }
 
@@ -270,6 +273,9 @@ pub(crate) fn reconcile_with(
                 && source.is_document == file.is_document
                 && source.is_code == file.is_code
                 && source.content_hash.is_some()
+                // A code record built by another extractor format is never
+                // reused, even when its bytes are unchanged.
+                && (!file.is_code || source.code_version == Some(CODE_EXTRACTOR_VERSION))
         });
         if let Some(source) = reusable
             && !options.force_hash
@@ -307,11 +313,7 @@ pub(crate) fn reconcile_with(
                                 is_code: file.is_code,
                                 stamp: read.stamp,
                                 hash: read.hash,
-                                bytes: if file.is_document {
-                                    read.bytes
-                                } else {
-                                    Vec::new()
-                                },
+                                bytes: read.bytes,
                             },
                         );
                     }
@@ -430,6 +432,7 @@ pub(crate) fn reconcile_with(
     let mut upserts: Vec<SourceRecord> = Vec::with_capacity(fresh.len());
     for (path, source) in fresh {
         let diagnostics = by_path.remove(&path).unwrap_or_default();
+        let mut diagnostics = diagnostics;
         let (state, document, explicit_id) = if source.is_document {
             let explicit_id = ids.get(&path).cloned();
             match docs.remove(&path) {
@@ -439,6 +442,22 @@ pub(crate) fn reconcile_with(
         } else {
             (SourceState::Code, None, None)
         };
+        let purposes = document
+            .as_ref()
+            .filter(|document| !document.parsed.body_from_metadata)
+            .map(|document| {
+                parse_purpose_rows(
+                    &path,
+                    &document.parsed.body,
+                    document.parsed.body_start_line,
+                )
+            })
+            .unwrap_or_default();
+        let code = source.is_code.then(|| {
+            let extraction = extract_code(&path, &source.bytes);
+            diagnostics.extend(extraction.diagnostic);
+            extraction.record
+        });
         upserts.push(SourceRecord {
             path,
             is_document: source.is_document,
@@ -450,6 +469,8 @@ pub(crate) fn reconcile_with(
             state,
             explicit_id,
             diagnostics,
+            code,
+            purposes,
         });
     }
 
@@ -1117,5 +1138,155 @@ mod tests {
         fx.rec();
         fx.rec();
         assert_eq!(before, snapshot(&fx.repo));
+    }
+
+    // ── code extraction cache ────────────────────────────────────────────
+
+    fn symbols_of(fx: &Fx, path: &str) -> Vec<String> {
+        fx.store
+            .code_record(path)
+            .unwrap()
+            .1
+            .map(|(_, record)| {
+                record
+                    .symbols
+                    .into_iter()
+                    .map(|symbol| symbol.qualified_name)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn code_files_get_symbol_records_on_the_first_build() {
+        let fx = standard();
+        fx.rec();
+        assert_eq!(symbols_of(&fx, "src/lib.rs"), ["f"]);
+        let counts = fx.store.counts().unwrap();
+        assert_eq!((counts.symbols, counts.partial_code_files), (1, 0));
+        assert_eq!(
+            fx.source("src/lib.rs").unwrap().code_version,
+            Some(CODE_EXTRACTOR_VERSION)
+        );
+    }
+
+    #[test]
+    fn only_the_changed_file_is_re_extracted() {
+        let fx = standard();
+        fx.put_old("src/other.rs", "pub fn other() {}\n");
+        fx.rec();
+        let before = fx.source("src/other.rs").unwrap();
+
+        fx.put_old("src/lib.rs", "pub fn f() {}\npub fn g() {}\n");
+        let report = fx.rec();
+        assert_eq!(report.status, ReconcileStatus::Updated);
+        assert_eq!((report.changed, report.added), (1, 0));
+        assert_eq!(
+            report.reused, 3,
+            "unchanged files are trusted from metadata"
+        );
+        assert_eq!(symbols_of(&fx, "src/lib.rs"), ["f", "g"]);
+        assert_eq!(fx.source("src/other.rs").unwrap(), before);
+        assert_eq!(symbols_of(&fx, "src/other.rs"), ["other"]);
+    }
+
+    #[test]
+    fn removed_symbols_and_deleted_files_leave_active_navigation() {
+        let fx = standard();
+        fx.put_old("src/lib.rs", "pub fn f() {}\npub fn gone() {}\n");
+        fx.rec();
+        assert_eq!(symbols_of(&fx, "src/lib.rs"), ["f", "gone"]);
+
+        fx.put_old("src/lib.rs", "pub fn f() {}\n");
+        fx.rec();
+        assert_eq!(symbols_of(&fx, "src/lib.rs"), ["f"]);
+
+        fs::remove_file(fx.path("src/lib.rs")).unwrap();
+        let report = fx.rec();
+        assert_eq!(report.removed, 1);
+        assert!(fx.store.code_record("src/lib.rs").unwrap().1.is_none());
+        assert_eq!(fx.store.counts().unwrap().symbols, 0);
+    }
+
+    #[test]
+    fn a_new_extractor_format_re_extracts_code_but_not_documents() {
+        let fx = standard();
+        let first = fx.rec();
+        assert_eq!(fx.rec().status, ReconcileStatus::Unchanged);
+
+        fx.store.invalidate_code_versions();
+        let report = fx.rec();
+        assert_eq!(report.status, ReconcileStatus::Updated);
+        assert_eq!(report.changed, 1, "only the code file is rebuilt");
+        assert_eq!(report.reparsed, 0, "documents are not re-parsed");
+        assert!(report.generation > first.generation);
+        assert_eq!(
+            fx.source("src/lib.rs").unwrap().code_version,
+            Some(CODE_EXTRACTOR_VERSION)
+        );
+        assert_eq!(symbols_of(&fx, "src/lib.rs"), ["f"]);
+        assert_eq!(fx.rec().status, ReconcileStatus::Unchanged);
+    }
+
+    #[test]
+    fn unsupported_and_unparseable_sources_stay_visible_with_diagnostics() {
+        let fx = Fx::new();
+        fx.put(
+            ".qmt/knowledge.toml",
+            "version = 1\n[code]\ninclude = [\"src/**/*.rs\", \"data/*.xyz\"]\n",
+        );
+        fx.put_old("src/ok.rs", "pub fn ok() {}\n");
+        fx.put_old("data/blob.xyz", "opaque");
+        fs::write(fx.path("src/bad.rs"), [0xff, 0xfe, 0x00]).unwrap();
+        set_mtime(&fx.path("src/bad.rs"), ago(3600));
+
+        let report = fx.rec();
+        assert_eq!(report.selected, 3);
+        assert!(
+            report.is_complete(),
+            "coverage is about selection, not symbols"
+        );
+
+        let counts = fx.store.counts().unwrap();
+        assert_eq!(counts.partial_code_files, 2);
+        assert_eq!(symbols_of(&fx, "src/ok.rs"), ["ok"]);
+        assert!(symbols_of(&fx, "data/blob.xyz").is_empty());
+
+        let blob = fx.source("data/blob.xyz").unwrap();
+        assert_eq!(blob.diagnostics.len(), 1);
+        assert_eq!(blob.diagnostics[0].code, "code_unsupported_language");
+        let bad = fx.source("src/bad.rs").unwrap();
+        assert_eq!(bad.diagnostics[0].code, "code_not_utf8");
+        assert!(bad.is_code, "a failed file keeps its path-level record");
+
+        let (_, all) = fx.store.index_diagnostics().unwrap();
+        assert_eq!(all.len(), 2);
+        // Diagnostics are part of the cached record: a warm pass changes nothing.
+        assert_eq!(fx.rec().status, ReconcileStatus::Unchanged);
+    }
+
+    #[test]
+    fn purpose_rows_are_indexed_with_their_document_and_replaced_with_it() {
+        let fx = standard();
+        fx.put_old(
+            "docs/map.md",
+            "# Map\n\n| File | Purpose |\n|--|--|\n| `../src/lib.rs` | Crate root. |\n",
+        );
+        fx.rec();
+        let (_, found) = fx.store.purpose("purpose:docs/map.md#src/lib.rs").unwrap();
+        let found = found.unwrap();
+        assert_eq!(found.row.purpose, "Crate root.");
+        assert_eq!(found.row.line, 5);
+
+        fx.put_old("docs/map.md", "# Map\nno table any more\n");
+        fx.rec();
+        assert!(
+            fx.store
+                .purpose("purpose:docs/map.md#src/lib.rs")
+                .unwrap()
+                .1
+                .is_none()
+        );
+        assert_eq!(fx.store.counts().unwrap().purposes, 0);
     }
 }

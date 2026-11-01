@@ -171,18 +171,27 @@ pub struct ParsedDocument {
     pub diagnostics: Vec<DocumentDiagnostic>,
 }
 
+impl Lifecycle {
+    /// The lifecycle an author's `status` label means.
+    pub fn from_status(status: Option<&str>) -> Self {
+        match status.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("draft") => Self::Draft,
+            Some("deprecated") => Self::Deprecated,
+            _ => Self::Usable,
+        }
+    }
+
+    /// Whether a document in this lifecycle may become an automatic card.
+    /// Draft and deprecated documents stay explicitly retrievable but are
+    /// never delivered unasked.
+    pub fn allows_automatic_delivery(self) -> bool {
+        matches!(self, Self::Usable)
+    }
+}
+
 impl ParsedDocument {
     pub fn lifecycle(&self) -> Lifecycle {
-        match self
-            .status
-            .as_deref()
-            .map(|s| s.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("draft") => Lifecycle::Draft,
-            Some("deprecated") => Lifecycle::Deprecated,
-            _ => Lifecycle::Usable,
-        }
+        Lifecycle::from_status(self.status.as_deref())
     }
 }
 

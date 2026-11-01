@@ -91,6 +91,7 @@ nav:
     - Git Worktree Workspaces: agent/worktrees.md
     - '`.agents` Protocol': agent/dotagents.md
     - 'Protocol Support Matrix': agent/dotagents_support_matrix.md
+    - Repository Knowledge: agent/repository_knowledge.md
     - Mesh Networking: agent/mesh.md
     - Event Ordering: agent/event-ordering.md
     - Export & Fine-Tuning: agent/export.md
