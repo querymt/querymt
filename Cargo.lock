@@ -11941,6 +11941,7 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-yaml",
  "typeshare",
+ "unicode-normalization",
  "ureq 3.5.0",
  "uuid 1.29.0",
  "whatlang",

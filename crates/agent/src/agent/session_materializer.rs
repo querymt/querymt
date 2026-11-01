@@ -688,6 +688,10 @@ impl SessionMaterializer {
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
         let session_id = session_context.session().public_id.clone();
 
+        // One stable, capability-gated retrieval policy, attached once at
+        // creation (no-op unless repository knowledge and its tools are usable).
+        crate::agent::repository_delivery::attach_policy(&self.config, &session_id).await;
+
         // Persist the durable session-to-workspace association. The registry
         // enforces a single writable owner atomically, so a duplicate owner
         // attempt fails closed instead of sharing the checkout. A failed
@@ -1369,6 +1373,7 @@ impl SessionMaterializer {
             .await
             .map_err(|err| Error::internal_error().data(err.to_string()))?;
         let successor = context.session().public_id.clone();
+        crate::agent::repository_delivery::attach_policy(&self.config, &successor).await;
         if let Some(name) = name
             && let Err(err) = self
                 .config
@@ -1625,12 +1630,19 @@ impl SessionMaterializer {
                 let manager_actor = self.config.workspace_manager_actor.clone();
                 let runtime_clone = prepared.runtime.clone();
                 let cwd_owned = cwd_path.clone();
+                let repository_knowledge = self.config.repository_knowledge();
                 tokio::spawn(async move {
                     let root = crate::index::resolve_workspace_root(&cwd_owned);
                     match crate::index::get_or_create_workspace_with_timeout(&manager_actor, root)
                         .await
                     {
                         Ok(handle) => {
+                            if let Some(registry) = repository_knowledge {
+                                registry.spawn_change_hints(
+                                    cwd_owned.clone(),
+                                    handle.file_watcher.subscribe_changes(),
+                                );
+                            }
                             let _ = runtime_clone.workspace_handle.set(handle);
                         }
                         Err(e) => log::warn!("Failed to initialize workspace index: {}", e),

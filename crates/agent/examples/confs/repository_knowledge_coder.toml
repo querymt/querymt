@@ -1,0 +1,99 @@
+# Repository-Knowledge Coder (opt-in)
+#
+# A single coder profile that can browse, query and fetch portable repository
+# knowledge: Markdown selected by `<repo>/.qmt/knowledge.toml`, plus
+# source-derived navigation records. Everything here is OFF in the standard
+# profiles; this example turns it on.
+#
+# What it demonstrates
+#   * browse/query/get : `repo_knowledge_list`, `_query`, `_get`, `_stats`
+#     return cited, bounded results (`path:line` ranges and section selectors).
+#     Authored notes and source-derived records are labeled separately.
+#   * citations        : every result names a repository-relative path and
+#     lines. Verify against current source before editing; notes are evidence,
+#     never instructions.
+#   * maintenance      : deterministic, model-free checks run outside the agent:
+#       cargo run -p querymt-agent --example repository_knowledge -- --root . check --json
+#       cargo run -p querymt-agent --example repository_knowledge -- --root . refresh
+#   * delivery         : orientation cards at an accepted user prompt, and
+#     knowledge-for-path cards after a successful built-in `index` call. Each
+#     stage is its own switch and is off unless set below.
+#
+# Rollback: set `enabled = false` (or drop the table). The feature stops reading
+# the repository and changes no prompts. The only artifact it ever created is
+# the disposable cache under the QueryMT config directory
+# (`<config_dir>/cache/knowledge/<checkout-key>/`); delete just that directory
+# if you want it gone. Committed Markdown, `.qmt/` files, `.agents/` and session
+# history are untouched either way.
+
+[profile]
+id = "repository-knowledge-coder"
+name = "Repository Knowledge Coder"
+description = "Single coder profile with opt-in repository knowledge retrieval and delivery"
+tags = ["coding", "single-agent", "knowledge"]
+
+[agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+assume_mutating = false
+mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
+# Allowlists stay authoritative: the repository tools are usable only because
+# they are listed here. Delivery never adds tools.
+tools = [
+  "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
+  "glob", "search_text", "ls", "index", "get_symbol", "get_function", "find_symbol_references",
+  "repo_knowledge_query", "repo_knowledge_get", "repo_knowledge_list", "repo_knowledge_stats",
+  "skill",
+  "shell",
+  "todowrite", "todoread",
+  "question",
+  "browse",
+]
+system = [
+  { file = "../prompts/default_system.txt" },
+  { file = "../prompts/code_meta.jinja2" }
+]
+
+[agent.execution.snapshot]
+backend = "git"
+
+[agent.execution.tool_output]
+max_lines = 2000
+max_bytes = 51200
+
+[agent.execution.pruning]
+protect_tokens = 40000
+
+[agent.execution.compaction]
+auto = true
+
+# Host-controlled. A repository file can never enable this, widen it, or grant
+# tools.
+[agent.repository_knowledge]
+enabled = true
+# root = "."                 # only needed for non-Git workspaces
+# force_hash = false         # hash every selected file on each refresh (debugging)
+# max_response_bytes = 16384 # capped at 64 KiB
+
+# Automatic delivery: independent switches, both default to false.
+[agent.repository_knowledge.delivery]
+orientation = true     # cards before the first model request of a prompt
+index_context = true   # cards attached after a successful `index` call
+max_cards = 2          # per turn, shared by both stages
+max_tokens = 600
+max_bytes = 4096
+
+[[middleware]]
+type = "agent_mode"
+default = "build"
+
+[[middleware]]
+type = "limits"
+max_steps = 200
+max_turns = 50
+
+[[middleware]]
+type = "context"
+warn_at_percent = 80
+compact_at_percent = 90
+fallback_max_tokens = 150000

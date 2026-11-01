@@ -130,6 +130,10 @@ pub struct AgentConfig {
     /// sessions may request isolated worktree execution and existing sessions
     /// resolve their persisted workspace binding before startup.
     pub workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    /// Lazy per-checkout repository knowledge. `None` unless the host enabled
+    /// the feature; no root is resolved until a session uses it.
+    pub repository_knowledge:
+        Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
 }
 
 impl AgentConfig {
@@ -294,6 +298,13 @@ impl AgentConfig {
     /// Access the knowledge store, if configured.
     pub fn knowledge_store(&self) -> Option<Arc<dyn crate::knowledge::KnowledgeStore>> {
         self.knowledge_store.clone()
+    }
+
+    /// Repository knowledge registry, when the host enabled the feature.
+    pub fn repository_knowledge(
+        &self,
+    ) -> Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>> {
+        self.repository_knowledge.clone()
     }
 
     /// Managed worktree workspace service, when configured.

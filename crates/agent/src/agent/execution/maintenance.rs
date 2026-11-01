@@ -416,6 +416,28 @@ pub(super) async fn run_ai_compaction(
         return Err(error);
     }
 
+    // Re-establish a bounded set of recently relevant repository cards under
+    // the new compaction epoch. Additive and fail-open.
+    let restored =
+        crate::agent::repository_delivery::post_compaction_contexts(config, exec_ctx, &messages)
+            .await;
+    if !restored.is_empty() {
+        let mut message =
+            crate::model::AgentMessage::new(session_id.clone(), querymt::chat::ChatRole::User);
+        message.parts = restored
+            .into_iter()
+            .map(|context| MessagePart::HookContext {
+                event_name: context.event_name,
+                handler_id: context.handler_id,
+                tool_use_id: context.tool_use_id,
+                content: context.content,
+            })
+            .collect();
+        if let Err(error) = exec_ctx.add_message(message).await {
+            warn!("failed to store post-compaction repository context: {error}");
+        }
+    }
+
     let filtered_messages = match exec_ctx.session_handle.get_effective_agent_history().await {
         Ok(messages) => messages,
         Err(error) => {
@@ -1118,5 +1140,313 @@ mod tests {
             assert_eq!(t.priced_attempts, 0);
             assert_eq!(t.unresolved_attempts, 0);
         }
+    }
+
+    // ── Repository knowledge re-evaluation after compaction (5.10) ──────────
+
+    struct Repo {
+        dir: tempfile::TempDir,
+        cache: tempfile::TempDir,
+    }
+
+    fn repo() -> Repo {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        for (path, body) in [
+            (
+                ".qmt/knowledge.toml",
+                "version = 1\n[documents]\ninclude = [\"docs/**/*.md\", \"src/**/AGENTS.md\"]\n[code]\ninclude = [\"src/**/*.rs\"]\n",
+            ),
+            ("src/queue.rs", "pub fn push_task() {}\n"),
+            (
+                "src/AGENTS.md",
+                "# Source\n\n| File | Purpose |\n|---|---|\n| `queue.rs` | Priority queue. |\n",
+            ),
+            (
+                "docs/arch.md",
+                "# Architecture\n## Scheduling\nThe scheduler dispatches queued tasks to workers using a priority queue.\n",
+            ),
+        ] {
+            let target = root.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, body).unwrap();
+        }
+        Repo {
+            dir,
+            cache: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    async fn knowledge_fixture(
+        repo: &Repo,
+    ) -> (
+        AgentConfig,
+        ExecutionContext,
+        ExecutionState,
+        tempfile::TempDir,
+    ) {
+        let (mut config, mut exec_ctx, state, tempdir) = fixture(
+            custom_summary_hooks("Valid continuation summary", None),
+            None,
+        )
+        .await;
+        let settings = crate::config::RepositoryKnowledgeSettings {
+            delivery: crate::config::RepositoryKnowledgeDeliverySettings {
+                orientation: true,
+                index_context: true,
+                ..Default::default()
+            },
+            ..crate::config::RepositoryKnowledgeSettings::enabled()
+        };
+        config.repository_knowledge =
+            crate::knowledge::repository::RepositoryKnowledgeRegistry::from_settings_in(
+                &settings,
+                repo.cache.path().join("config"),
+            );
+        exec_ctx.runtime = SessionRuntime::new(
+            Some(repo.dir.path().to_path_buf()),
+            Default::default(),
+            McpToolState::empty(),
+        );
+        // The task in progress and a successful index call before compaction.
+        let mut task = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+        task.parts.push(MessagePart::Prompt {
+            blocks: vec![crate::acp::protocol::ContentBlock::Text(
+                crate::acp::protocol::TextContent::new(
+                    "the scheduler dispatches queued tasks to workers",
+                ),
+            )],
+        });
+        exec_ctx.session_handle.add_message(task).await.unwrap();
+        let mut indexed = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+        indexed.parts.push(MessagePart::ToolResult {
+            call_id: "c1".into(),
+            content: vec![querymt::chat::ToolResultPart::text("outline")],
+            is_error: false,
+            tool_name: Some("index".into()),
+            tool_arguments: Some(r#"{"path":"src/queue.rs"}"#.into()),
+            compacted_at: None,
+        });
+        // The live stage enriched this call, which is what makes it eligible
+        // for re-evaluation after compaction. The text is stale on purpose:
+        // re-selection must come from current sources, never from this card.
+        indexed.parts.push(MessagePart::HookContext {
+            event_name: "post_tool_use".into(),
+            handler_id: "qmt.repository_knowledge.index_context".into(),
+            tool_use_id: Some("c1".into()),
+            content:
+                "[repository-knowledge version=old epoch=0 card=src/queue.rs#old]\nSTALE-INDEX"
+                    .into(),
+        });
+        exec_ctx.session_handle.add_message(indexed).await.unwrap();
+        (config, exec_ctx, state, tempdir)
+    }
+
+    async fn stored_cards(exec_ctx: &ExecutionContext) -> Vec<String> {
+        exec_ctx
+            .session_handle
+            .get_effective_agent_history()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                MessagePart::HookContext { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn compaction_redelivers_recent_cards_under_the_new_epoch_from_current_sources() {
+        let repo = repo();
+        let (config, mut exec_ctx, state, _td) = knowledge_fixture(&repo).await;
+        run_ai_compaction(&config, &mut exec_ctx, &state)
+            .await
+            .unwrap();
+
+        let cards = stored_cards(&exec_ctx).await;
+        // Bounded by the shared per-turn budget (two cards by default).
+        assert!(!cards.is_empty() && cards.len() <= 2, "{cards:?}");
+        assert!(cards.iter().all(|c| c.contains("epoch=1")), "{cards:?}");
+        assert!(
+            cards
+                .iter()
+                .any(|c| c.contains("src/AGENTS.md") || c.contains("docs/arch.md"))
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_and_removed_documents_are_not_resurrected_from_old_payloads() {
+        let repo = repo();
+        let (config, mut exec_ctx, state, _td) = knowledge_fixture(&repo).await;
+        // An old card for the note sits in pre-compaction history.
+        let old = {
+            let mut m = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+            m.parts.push(MessagePart::HookContext {
+                event_name: "user_prompt_submit".into(),
+                handler_id: "qmt.repository_knowledge.orientation".into(),
+                tool_use_id: None,
+                content:
+                    "[repository-knowledge version=old epoch=0 card=docs/arch.md#x]\nSTALE-TEXT"
+                        .into(),
+            });
+            m
+        };
+        exec_ctx.session_handle.add_message(old).await.unwrap();
+        std::fs::write(
+            repo.dir.path().join("docs/arch.md"),
+            "# Architecture\n## Scheduling\nThe scheduler now uses a fair queue for dispatching tasks to workers.\n",
+        )
+        .unwrap();
+        std::fs::remove_file(repo.dir.path().join("src/AGENTS.md")).unwrap();
+
+        run_ai_compaction(&config, &mut exec_ctx, &state)
+            .await
+            .unwrap();
+        let cards = stored_cards(&exec_ctx).await;
+        assert!(cards.iter().all(|c| !c.contains("STALE-TEXT")), "{cards:?}");
+        assert!(cards.iter().any(|c| c.contains("fair queue")), "{cards:?}");
+        assert!(
+            cards.iter().all(|c| !c.contains("Priority queue.")),
+            "removed purpose row must not return: {cards:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_cards_are_not_duplicated_by_a_second_evaluation() {
+        let repo = repo();
+        let (config, mut exec_ctx, state, _td) = knowledge_fixture(&repo).await;
+        run_ai_compaction(&config, &mut exec_ctx, &state)
+            .await
+            .unwrap();
+        let first = stored_cards(&exec_ctx).await;
+        assert!(!first.is_empty());
+
+        let before = exec_ctx.session_handle.get_agent_history().await.unwrap();
+        let again = crate::agent::repository_delivery::post_compaction_contexts(
+            &config, &exec_ctx, &before,
+        )
+        .await;
+        assert!(
+            again.iter().all(|c| !first.contains(&c.content)),
+            "a retained card version is not delivered twice: {again:?}"
+        );
+    }
+
+    fn index_call_result(call_id: &str) -> AgentMessage {
+        let mut m = AgentMessage::new("s".to_string(), ChatRole::User);
+        m.parts.push(MessagePart::ToolResult {
+            call_id: call_id.into(),
+            content: vec![querymt::chat::ToolResultPart::text("outline")],
+            is_error: false,
+            tool_name: Some("index".into()),
+            tool_arguments: Some(r#"{"path":"src/queue.rs"}"#.into()),
+            compacted_at: None,
+        });
+        m
+    }
+
+    #[tokio::test]
+    async fn only_index_calls_that_received_a_native_card_are_re_evaluated() {
+        let repo = repo();
+        let (config, exec_ctx, _state, _td) = knowledge_fixture(&repo).await;
+
+        // No persisted index-context card names this call (a foreign `index`
+        // tool, or a result a hook suppressed): nothing is recovered for it.
+        let unenriched = vec![index_call_result("foreign")];
+        let none = crate::agent::repository_delivery::post_compaction_contexts(
+            &config,
+            &exec_ctx,
+            &unenriched,
+        )
+        .await;
+        assert!(none.is_empty(), "{none:?}");
+
+        // The same call, once the live stage enriched it, is re-evaluated.
+        let mut enriched = index_call_result("c1");
+        enriched.parts.push(MessagePart::HookContext {
+            event_name: "post_tool_use".into(),
+            handler_id: "qmt.repository_knowledge.index_context".into(),
+            tool_use_id: Some("c1".into()),
+            content: "[repository-knowledge version=old epoch=0 card=x]\nold".into(),
+        });
+        let some = crate::agent::repository_delivery::post_compaction_contexts(
+            &config,
+            &exec_ctx,
+            &[enriched],
+        )
+        .await;
+        assert!(!some.is_empty(), "an enriched call is re-evaluated");
+    }
+
+    #[tokio::test]
+    async fn restore_counts_only_native_cards_and_reads_history_once() {
+        use crate::knowledge::repository::budget::Refusal;
+        let repo = repo();
+        let (config, exec_ctx, _state, _td) = knowledge_fixture(&repo).await;
+        let card = |handler: &str, id: &str| crate::hooks::HookContextContribution {
+            event_name: "post_tool_use".into(),
+            handler_id: handler.into(),
+            tool_use_id: None,
+            content: format!("[repository-knowledge version=v1 card={id}]\nbody"),
+        };
+        let stored = |handler: &str, id: &str| {
+            let c = card(handler, id);
+            let mut m = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::User);
+            m.parts.push(MessagePart::HookContext {
+                event_name: c.event_name,
+                handler_id: c.handler_id,
+                tool_use_id: c.tool_use_id,
+                content: c.content,
+            });
+            m
+        };
+        // A foreign hook imitating a marker, and a genuine native card.
+        for m in [
+            stored("user-hook", "imitated"),
+            stored("qmt.repository_knowledge.orientation", "native"),
+        ] {
+            exec_ctx.session_handle.add_message(m).await.unwrap();
+        }
+
+        crate::agent::repository_delivery::restore_state(&config, &exec_ctx).await;
+        // History added after the first restore is not re-read.
+        exec_ctx
+            .session_handle
+            .add_message(stored("qmt.repository_knowledge.orientation", "late"))
+            .await
+            .unwrap();
+        crate::agent::repository_delivery::restore_state(&config, &exec_ctx).await;
+
+        let mut guard = exec_ctx.delivery_budget.lock().unwrap();
+        let budget = guard.as_mut().expect("restored");
+        let native = "qmt.repository_knowledge.orientation";
+        assert!(
+            budget.admit(&card(native, "imitated")).is_ok(),
+            "a foreign hook must not suppress a real card"
+        );
+        assert_eq!(
+            budget.admit(&card(native, "native")),
+            Err(Refusal::AlreadyDelivered)
+        );
+        assert!(
+            budget.admit(&card(native, "late")).is_ok(),
+            "restore reads history once per budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_repository_knowledge_compaction_adds_no_context() {
+        let (config, mut exec_ctx, state, _td) = fixture(
+            custom_summary_hooks("Valid continuation summary", None),
+            None,
+        )
+        .await;
+        run_ai_compaction(&config, &mut exec_ctx, &state)
+            .await
+            .unwrap();
+        assert!(stored_cards(&exec_ctx).await.is_empty());
     }
 }

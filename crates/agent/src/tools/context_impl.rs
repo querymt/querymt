@@ -84,6 +84,7 @@ pub struct AgentToolContext {
     mutation_gate: Option<Arc<crate::worktree::gate::CheckoutMutationGate>>,
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
     session_store: Option<Arc<dyn crate::session::store::SessionStore>>,
+    repository_knowledge: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
 }
 
 impl AgentToolContext {
@@ -107,7 +108,17 @@ impl AgentToolContext {
             mutation_gate: None,
             workspace_service: None,
             session_store: None,
+            repository_knowledge: None,
         }
+    }
+
+    /// Attach repository knowledge (only when the host enabled it).
+    pub fn with_repository_knowledge(
+        mut self,
+        registry: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
+    ) -> Self {
+        self.repository_knowledge = registry;
+        self
     }
 
     /// Attach the managed worktree workspace service (when configured).
@@ -310,6 +321,12 @@ impl ToolContext for AgentToolContext {
 
     fn session_store(&self) -> Option<Arc<dyn crate::session::store::SessionStore>> {
         self.session_store.clone()
+    }
+
+    fn repository_knowledge(
+        &self,
+    ) -> Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>> {
+        self.repository_knowledge.clone()
     }
 
     fn as_any(&self) -> &dyn Any {

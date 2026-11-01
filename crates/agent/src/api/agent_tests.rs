@@ -2361,6 +2361,70 @@ async fn lifecycle_capabilities_require_session_store_and_view_filter_support() 
     Ok(())
 }
 
+// ── Repository knowledge binding ─────────────────────────────────────────────
+
+mod repository_knowledge_binding {
+    use super::*;
+    use crate::config::RepositoryKnowledgeSettings;
+
+    async fn build(
+        settings: Option<RepositoryKnowledgeSettings>,
+        cwd: &std::path::Path,
+    ) -> (Agent, tempfile::TempDir) {
+        let (registry, plugins) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let mut builder = Agent::single()
+            .provider("openai", "gpt-4o-mini")
+            .cwd(cwd)
+            .infra(AgentInfra {
+                plugin_registry: Arc::new(registry),
+                storage: Some(storage),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            });
+        if let Some(settings) = settings {
+            builder = builder.repository_knowledge(settings);
+        }
+        (builder.build().await.unwrap(), plugins)
+    }
+
+    #[tokio::test]
+    async fn disabled_or_omitted_settings_bind_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (omitted, _p1) = build(None, tmp.path()).await;
+        assert!(omitted.handle().config.repository_knowledge().is_none());
+        let (disabled, _p2) = build(Some(RepositoryKnowledgeSettings::default()), tmp.path()).await;
+        assert!(disabled.handle().config.repository_knowledge().is_none());
+    }
+
+    #[tokio::test]
+    async fn enabled_settings_bind_a_lazy_registry_without_builder_time_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let config = tmp.path().join("config");
+
+        let (agent, _plugins) = build(Some(RepositoryKnowledgeSettings::enabled()), &repo).await;
+        let registry = agent
+            .handle()
+            .config
+            .repository_knowledge()
+            .expect("enabled settings bind a registry");
+        // Building resolved no root, opened no index, created nothing.
+        assert_eq!(registry.open_services(), 0);
+        assert!(!config.exists());
+        assert!(
+            std::fs::read_dir(&repo)
+                .unwrap()
+                .all(|e| e.unwrap().file_name() == ".git")
+        );
+    }
+}
+
 // ── Managed worktree workspaces (simple API) ─────────────────────────────────
 
 mod workspace_api {

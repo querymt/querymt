@@ -1532,3 +1532,275 @@ async fn example_profiles_keep_workspace_disabled_and_delegates_inheriting() {
         );
     }
 }
+
+// ── [agent.repository_knowledge] / [quorum.repository_knowledge] ─────────
+
+#[test]
+fn repository_knowledge_defaults_to_disabled_and_absent_section_is_unchanged() {
+    let single: SingleAgentConfig = toml::from_str(
+        r#"
+[agent]
+provider = "p"
+model = "m"
+"#,
+    )
+    .unwrap();
+    let rk = &single.agent.repository_knowledge;
+    assert_eq!(rk, &RepositoryKnowledgeSettings::default());
+    assert!(!rk.enabled);
+    assert!(rk.root.is_none());
+    assert!(!rk.force_hash);
+    assert!(!rk.allow_ignored);
+    assert!(!rk.delivery.orientation);
+    assert!(!rk.delivery.index_context);
+    assert!(rk.if_enabled().is_none());
+
+    let quorum: QuorumConfig =
+        toml::from_str("[quorum]\n[planner]\nprovider = \"p\"\nmodel = \"m\"\n").unwrap();
+    assert_eq!(
+        quorum.quorum.repository_knowledge,
+        RepositoryKnowledgeSettings::default()
+    );
+}
+
+#[test]
+fn repository_knowledge_settings_round_trip_and_reject_unknown_keys() {
+    let parsed: RepositoryKnowledgeSettings = toml::from_str(
+        r#"
+enabled = true
+root = "/repo"
+max_files = 10
+max_file_bytes = 1024
+max_total_bytes = 4096
+max_response_bytes = 2048
+default_result_limit = 5
+force_hash = true
+allow_ignored = true
+
+[delivery]
+orientation = true
+index_context = false
+max_cards = 1
+max_tokens = 100
+max_bytes = 512
+"#,
+    )
+    .unwrap();
+    assert!(parsed.enabled && parsed.force_hash && parsed.allow_ignored);
+    assert_eq!(parsed.root.as_deref(), Some(Path::new("/repo")));
+    assert_eq!(parsed.max_files, 10);
+    assert_eq!(parsed.max_file_bytes, 1024);
+    assert_eq!(parsed.max_total_bytes, 4096);
+    assert!(parsed.delivery.orientation && !parsed.delivery.index_context);
+    let back: RepositoryKnowledgeSettings =
+        toml::from_str(&toml::to_string(&parsed).unwrap()).unwrap();
+    assert_eq!(back, parsed);
+
+    for bad in [
+        "enabled = true\nmode = \"always\"\n",
+        "[delivery]\nauto = true\n",
+    ] {
+        let err = toml::from_str::<RepositoryKnowledgeSettings>(bad)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "{err}");
+    }
+}
+
+#[test]
+fn repository_knowledge_limits_are_capped_at_implementation_maxima() {
+    let s = RepositoryKnowledgeSettings {
+        max_response_bytes: usize::MAX,
+        default_result_limit: 10_000,
+        delivery: RepositoryKnowledgeDeliverySettings {
+            max_cards: 99,
+            max_tokens: 1_000_000,
+            max_bytes: usize::MAX,
+            ..Default::default()
+        },
+        ..RepositoryKnowledgeSettings::enabled()
+    };
+    assert_eq!(s.effective_max_response_bytes(), 64 * 1024);
+    assert_eq!(s.effective_default_result_limit(), 50);
+    assert_eq!(s.delivery.effective_max_cards(), 4);
+    assert_eq!(s.delivery.effective_max_tokens(), 2_000);
+    assert_eq!(s.delivery.effective_max_bytes(), 16 * 1024);
+
+    let zero = RepositoryKnowledgeSettings {
+        default_result_limit: 0,
+        max_response_bytes: 10,
+        ..RepositoryKnowledgeSettings::enabled()
+    };
+    assert_eq!(zero.effective_default_result_limit(), 1);
+    // Room for the truncation disclosure is always kept.
+    assert_eq!(zero.effective_max_response_bytes(), 512);
+}
+
+#[test]
+fn repository_knowledge_delivery_flags_never_enable_the_feature() {
+    let s = RepositoryKnowledgeSettings {
+        enabled: false,
+        delivery: RepositoryKnowledgeDeliverySettings {
+            orientation: true,
+            index_context: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(!s.orientation_active());
+    assert!(!s.index_context_active());
+
+    let only_orientation = RepositoryKnowledgeSettings {
+        delivery: RepositoryKnowledgeDeliverySettings {
+            orientation: true,
+            ..Default::default()
+        },
+        ..RepositoryKnowledgeSettings::enabled()
+    };
+    assert!(only_orientation.orientation_active());
+    assert!(!only_orientation.index_context_active());
+}
+
+#[test]
+fn repository_knowledge_root_resolves_against_config_dir() {
+    let rel = RepositoryKnowledgeSettings {
+        root: Some("repo".into()),
+        ..RepositoryKnowledgeSettings::enabled()
+    }
+    .anchored_at(Path::new("/etc/qmt"));
+    assert_eq!(rel.root.as_deref(), Some(Path::new("/etc/qmt/repo")));
+
+    let abs = RepositoryKnowledgeSettings {
+        root: Some("/abs/repo".into()),
+        allowed_roots: vec!["work".into(), "/srv/repos".into()],
+        ..RepositoryKnowledgeSettings::enabled()
+    }
+    .anchored_at(Path::new("/etc/qmt"));
+    assert_eq!(abs.root.as_deref(), Some(Path::new("/abs/repo")));
+    assert_eq!(
+        abs.allowed_roots,
+        vec![PathBuf::from("/etc/qmt/work"), PathBuf::from("/srv/repos")]
+    );
+}
+
+#[test]
+fn repository_knowledge_schema_is_generated_for_both_config_roots() {
+    for schema in [
+        serde_json::to_value(schemars::schema_for!(SingleAgentConfig)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(QuorumConfig)).unwrap(),
+    ] {
+        let props = schema
+            .pointer("/$defs/RepositoryKnowledgeSettings/properties")
+            .and_then(|v| v.as_object())
+            .expect("RepositoryKnowledgeSettings must be in the schema");
+        for key in ["enabled", "root", "max_files", "force_hash", "delivery"] {
+            assert!(props.contains_key(key), "missing {key}");
+        }
+    }
+}
+
+#[test]
+fn repository_knowledge_builders_carry_settings_only_when_enabled() {
+    use crate::api::{Agent, QuorumBuilder};
+
+    // Disabled single-agent config: builder holds no settings at all.
+    let disabled: SingleAgentConfig =
+        toml::from_str("[agent]\nprovider = \"p\"\nmodel = \"m\"\n").unwrap();
+    let b = Agent::builder_from_config(disabled, None).unwrap();
+    assert!(b.configured_repository_knowledge().is_none());
+
+    // Enabled: settings round-trip into the builder.
+    let enabled: SingleAgentConfig = toml::from_str(
+        "[agent]\nprovider = \"p\"\nmodel = \"m\"\n[agent.repository_knowledge]\nenabled = true\nforce_hash = true\n",
+    )
+    .unwrap();
+    let b = Agent::builder_from_config(enabled, None).unwrap();
+    let got = b
+        .configured_repository_knowledge()
+        .expect("enabled settings");
+    assert!(got.enabled && got.force_hash);
+
+    // Programmatic builders.
+    let b = crate::api::AgentBuilder::new()
+        .repository_knowledge(RepositoryKnowledgeSettings::enabled());
+    assert!(b.configured_repository_knowledge().unwrap().enabled);
+    let q = QuorumBuilder::new().repository_knowledge(RepositoryKnowledgeSettings::enabled());
+    assert!(q.configured_repository_knowledge().unwrap().enabled);
+    assert!(
+        QuorumBuilder::new()
+            .configured_repository_knowledge()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn repository_knowledge_root_is_anchored_to_config_file_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let single_path = dir.path().join("single.toml");
+    std::fs::write(
+        &single_path,
+        "[agent]\nprovider = \"p\"\nmodel = \"m\"\n[agent.repository_knowledge]\nenabled = true\nroot = \"repo\"\n",
+    )
+    .unwrap();
+    let Config::Single(single) = load_config(ConfigSource::Path(single_path)).await.unwrap() else {
+        panic!("expected single config");
+    };
+    assert_eq!(
+        single.agent.repository_knowledge.root.as_deref(),
+        Some(dir.path().join("repo").as_path())
+    );
+
+    let quorum_path = dir.path().join("quorum.toml");
+    std::fs::write(
+        &quorum_path,
+        "[quorum]\n[quorum.repository_knowledge]\nenabled = true\nroot = \"repo\"\n[planner]\nprovider = \"p\"\nmodel = \"m\"\n",
+    )
+    .unwrap();
+    let Config::Multi(quorum) = load_config(ConfigSource::Path(quorum_path)).await.unwrap() else {
+        panic!("expected quorum config");
+    };
+    assert_eq!(
+        quorum.quorum.repository_knowledge.root.as_deref(),
+        Some(dir.path().join("repo").as_path())
+    );
+}
+
+/// 7.3: the opt-in repository-knowledge example loads, lists the repository
+/// tools its documented configuration relies on, enables both delivery stages,
+/// and rolls back completely by disabling the feature.
+#[tokio::test]
+async fn repository_knowledge_coder_example_loads_and_rolls_back_by_disabling() {
+    use crate::tools::builtins::REPOSITORY_TOOL_NAMES;
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/confs/repository_knowledge_coder.toml");
+    let Config::Single(config) = load_config(ConfigSource::Path(path.clone())).await.unwrap()
+    else {
+        panic!("single config");
+    };
+
+    let rk = &config.agent.repository_knowledge;
+    assert!(rk.enabled && rk.orientation_active() && rk.index_context_active());
+    assert_eq!(rk.delivery.max_cards, 2);
+    assert_eq!(rk.delivery.max_tokens, 600);
+    assert_eq!(rk.delivery.max_bytes, 4096);
+
+    // The allowlist is authoritative: every repository tool is listed explicitly.
+    let tools = config.agent.tools.clone();
+    assert!(!tools.is_empty(), "explicit allowlist");
+    for name in REPOSITORY_TOOL_NAMES {
+        assert!(tools.iter().any(|t| t == name), "{name} listed");
+    }
+    // Legacy session-memory tools are not pulled in.
+    assert!(!tools.iter().any(|t| t.starts_with("knowledge_")));
+
+    // Rollback: disabling the feature turns off reads and both delivery stages
+    // even though the delivery flags remain set.
+    let mut off = (*config).clone();
+    off.agent.repository_knowledge.enabled = false;
+    let rk = &off.agent.repository_knowledge;
+    assert!(rk.if_enabled().is_none());
+    assert!(!rk.orientation_active() && !rk.index_context_active());
+    let builder = crate::api::Agent::builder_from_config(off, None).unwrap();
+    assert!(builder.configured_repository_knowledge().is_none());
+}

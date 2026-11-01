@@ -24,6 +24,7 @@ pub mod messages;
 pub(crate) mod objective;
 pub mod protocol;
 pub mod remote;
+pub(crate) mod repository_delivery;
 pub mod session_actor;
 pub mod session_control;
 pub mod session_materializer;
