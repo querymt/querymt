@@ -29,8 +29,15 @@ pub enum Refusal {
 /// Whether a contribution was produced by a native delivery adapter. Only
 /// those are subject to the budget; other hooks' context is never trimmed here.
 pub fn is_native(contribution: &HookContextContribution) -> bool {
+    is_native_handler(&contribution.handler_id)
+}
+
+/// Whether `handler_id` names a native delivery adapter. Persisted history is
+/// only trusted for duplicate suppression when it carries one of these ids, so
+/// a foreign hook that imitates a card marker cannot suppress real cards.
+pub fn is_native_handler(handler_id: &str) -> bool {
     matches!(
-        contribution.handler_id.as_str(),
+        handler_id,
         ORIENTATION_HANDLER_ID | INDEX_CONTEXT_HANDLER_ID
     )
 }
@@ -68,6 +75,9 @@ pub struct DeliveryBudget {
     /// rebuilt from persisted provenance at turn start.
     represented: BTreeSet<String>,
     epoch: u64,
+    /// Whether `restore` has run for this budget, so history is read once per
+    /// budget lifetime instead of once per tool batch.
+    restored: bool,
 }
 
 impl DeliveryBudget {
@@ -82,7 +92,13 @@ impl DeliveryBudget {
             admitted: BTreeSet::new(),
             represented: BTreeSet::new(),
             epoch: 0,
+            restored: false,
         }
+    }
+
+    /// Whether duplicate-suppression state was already rebuilt from history.
+    pub fn is_restored(&self) -> bool {
+        self.restored
     }
 
     /// Rebuild duplicate-suppression state from the effective history's
@@ -93,6 +109,7 @@ impl DeliveryBudget {
         epoch: u64,
     ) {
         self.epoch = epoch;
+        self.restored = true;
         self.represented.extend(
             represented_contents
                 .into_iter()

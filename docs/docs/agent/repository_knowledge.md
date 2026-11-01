@@ -301,6 +301,10 @@ Repository files cannot enable a stage, a handler, a command or a permission.
 
 **Retrieval policy.** When the feature is enabled and both `repo_knowledge_query` and `repo_knowledge_get` are usable under the agent's tool policy, a new session receives one fixed, compact system-prompt part (attached once, never per turn). It does not require a lookup before targeted reads. Allowlists stay authoritative: if the tools are excluded, no guidance is added and a warning is logged. Cards then carry relative citations only, with no instruction to call an unavailable tool. A quorum planner with an explicit `tools` list is treated the same way.
 
+The part is attached when a session is created or forked, using the agent's tool configuration, which is also what the new session starts with. Sessions that already exist when the feature is turned on keep their stored system prompt and do not receive it, so prompt prefixes and provider caches stay byte-stable; start a new session to get the guidance. Tool allow/deny changes made to a running session later do not rewrite the stored part.
+
+**Delivery never waits.** Automatic delivery skips (adds nothing) when the checkout's index is already being refreshed, instead of queueing behind it, and gives up after a short deadline. Retrieval tools, by contrast, wait for a fresh index. Only cards that the live stage itself attached are re-evaluated after compaction, and only native cards count toward duplicate suppression, so a foreign hook that imitates a card marker cannot hide real cards.
+
 **Local diagnostics.** Per process, in memory, the host counts cards matched, delivered and suppressed (with a reason such as `card_limit` or `already_delivered`), added tokens, selection latency, and `repo_knowledge_get` fetches. No prompt text, card text or statistics are written to the repository. Delivered and fetched are separate observations; nothing infers that advice was followed.
 
 Rollback: set the stage flags (or `enabled`) to `false`.

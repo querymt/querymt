@@ -120,6 +120,18 @@ pub(crate) async fn restore_state(config: &AgentConfig, exec_ctx: &ExecutionCont
     if !registry.settings().delivery.any_enabled() {
         return;
     }
+    // History is read once per budget lifetime. Cards admitted afterwards are
+    // tracked by the budget itself; compaction resets the budget, which
+    // makes the next call rebuild it from the surviving history.
+    if exec_ctx
+        .delivery_budget
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|budget| budget.is_restored())
+    {
+        return;
+    }
     let Ok(Ok(history)) = tokio::time::timeout(
         DELIVERY_TIMEOUT,
         exec_ctx.state.store.get_history(&exec_ctx.session_id),
@@ -138,7 +150,15 @@ pub(crate) async fn restore_state(config: &AgentConfig, exec_ctx: &ExecutionCont
         .iter()
         .flat_map(|m| m.parts.iter())
         .filter_map(|p| match p {
-            MessagePart::HookContext { content, .. } => Some(content.as_str()),
+            // Only native cards count as represented: a foreign hook that
+            // imitates a card marker must not suppress real cards.
+            MessagePart::HookContext {
+                handler_id,
+                content,
+                ..
+            } if crate::knowledge::repository::budget::is_native_handler(handler_id) => {
+                Some(content.as_str())
+            }
             _ => None,
         })
         .collect();
@@ -228,6 +248,9 @@ pub(crate) async fn orientation_contexts(
     let started = Instant::now();
     let selected = run_bounded(deadline, move || {
         let service = registry.service_for(cwd.as_deref()).ok()?;
+        if service.is_refreshing() {
+            return Some(Vec::new());
+        }
         Some(orientation_contributions(
             &service,
             PromptInput {
@@ -260,6 +283,34 @@ pub(crate) struct FinishedCall<'a> {
     pub args: &'a Value,
 }
 
+/// A finished call with owned fields, so it can move into blocking work and
+/// be viewed as an [`IndexCall`] on either side of that move.
+struct OwnedCall {
+    tool_name: String,
+    tool_source: String,
+    execution_is_error: bool,
+    result_is_error: bool,
+    output_suppressed: bool,
+    tool_use_id: String,
+    args: Value,
+    cwd: Option<std::path::PathBuf>,
+}
+
+impl OwnedCall {
+    fn borrow(&self) -> IndexCall<'_> {
+        IndexCall {
+            tool_name: &self.tool_name,
+            tool_source: &self.tool_source,
+            execution_is_error: self.execution_is_error,
+            result_is_error: self.result_is_error,
+            output_suppressed: self.output_suppressed,
+            tool_use_id: &self.tool_use_id,
+            args: &self.args,
+            cwd: self.cwd.as_deref(),
+        }
+    }
+}
+
 /// Knowledge-for-path context for a successful built-in `index` call, when the
 /// host enabled that stage.
 pub(crate) async fn index_contexts(
@@ -277,46 +328,34 @@ pub(crate) async fn index_contexts(
     let max_cards = registry.settings().delivery.effective_max_cards();
     let fetch = fetch_available(config, exec_ctx);
     let cwd = exec_ctx.cwd().map(|path| path.to_path_buf());
-    let tool_name = call.tool_name.to_string();
-    let tool_source = call.tool_source.to_string();
-    let tool_use_id = call.tool_use_id.to_string();
-    let args = call.args.clone();
-    let (execution_is_error, result_is_error, output_suppressed) = (
-        call.execution_is_error,
-        call.result_is_error,
-        call.output_suppressed,
-    );
+    let owned = OwnedCall {
+        tool_name: call.tool_name.to_string(),
+        tool_source: call.tool_source.to_string(),
+        execution_is_error: call.execution_is_error,
+        result_is_error: call.result_is_error,
+        output_suppressed: call.output_suppressed,
+        tool_use_id: call.tool_use_id.to_string(),
+        args: call.args.clone(),
+        cwd,
+    };
     let existing = existing.to_vec();
     // Ineligible calls are rejected before the checkout is touched.
-    let probe = IndexCall {
-        tool_name: &tool_name,
-        tool_source: &tool_source,
-        execution_is_error,
-        result_is_error,
-        output_suppressed,
-        tool_use_id: &tool_use_id,
-        args: &args,
-        cwd: cwd.as_deref(),
-    };
-    if !probe.eligible() {
+    if !owned.borrow().eligible() {
         return Vec::new();
     }
     let deadline = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
     let started = Instant::now();
     let selected = run_bounded(deadline, move || {
-        let service = registry.service_for(cwd.as_deref()).ok()?;
-        let call = IndexCall {
-            tool_name: &tool_name,
-            tool_source: &tool_source,
-            execution_is_error,
-            result_is_error,
-            output_suppressed,
-            tool_use_id: &tool_use_id,
-            args: &args,
-            cwd: cwd.as_deref(),
-        };
+        let service = registry.service_for(owned.cwd.as_deref()).ok()?;
+        if service.is_refreshing() {
+            return Some(Vec::new());
+        }
         Some(post_index_contributions(
-            &service, &call, max_cards, fetch, &existing,
+            &service,
+            &owned.borrow(),
+            max_cards,
+            fetch,
+            &existing,
         ))
     })
     .await;
@@ -364,14 +403,37 @@ pub(crate) async fn post_compaction_contexts(
         });
     let mut recent_args: Vec<Value> = Vec::new();
     if settings.index_context_active() {
+        // Only calls that the live stage itself enriched are re-evaluated:
+        // their persisted index-context cards name the call. That keeps the
+        // built-in-only and not-suppressed eligibility decided at delivery
+        // time, which raw tool results cannot show (a foreign `index` tool,
+        // or a result a hook redacted, never received a card).
+        let enriched_calls: std::collections::BTreeSet<&str> = before
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|part| match part {
+                MessagePart::HookContext {
+                    handler_id,
+                    tool_use_id: Some(tool_use_id),
+                    ..
+                } if handler_id
+                    == crate::knowledge::repository::adapters::INDEX_CONTEXT_HANDLER_ID =>
+                {
+                    Some(tool_use_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
         for part in before.iter().rev().flat_map(|m| m.parts.iter().rev()) {
             if let MessagePart::ToolResult {
+                call_id,
                 tool_name: Some(name),
                 tool_arguments: Some(arguments),
                 is_error: false,
                 ..
             } = part
                 && name == crate::knowledge::repository::adapters::INDEX_TOOL_NAME
+                && enriched_calls.contains(call_id.as_str())
                 && let Ok(args) = serde_json::from_str::<Value>(arguments)
             {
                 recent_args.push(args);
@@ -418,6 +480,9 @@ pub(crate) async fn post_compaction_contexts(
     let deadline = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
     let selected = run_bounded(deadline, move || {
         let service = registry.service_for(cwd.as_deref()).ok()?;
+        if service.is_refreshing() {
+            return Some(Vec::new());
+        }
         let mut out = Vec::new();
         if orientation && let Some(prompt) = prompt.as_deref() {
             out.extend(
@@ -446,7 +511,10 @@ pub(crate) async fn post_compaction_contexts(
     allocate(config, exec_ctx, selected)
 }
 
-/// Run selection off the executor and give up at `deadline`. Every failure
+/// Run selection off the executor and give up at `deadline`. A selection that
+/// finds a refresh already running (for example a cold index still being
+/// built by an earlier, abandoned pass) yields nothing instead of queueing
+/// behind it, so abandoned work cannot pile up. Every failure
 /// mode (unbound or unavailable checkout, selector error, panic, timeout)
 /// yields no contribution; none can fail the turn or the tool call.
 pub(crate) async fn run_bounded<F>(
