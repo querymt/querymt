@@ -76,8 +76,8 @@ fn bind(context: &dyn ToolContext) -> Result<Bound, ToolError> {
     let settings = registry.settings();
     Ok(Bound {
         service,
-        budget: settings.max_response_bytes.clamp(512, MAX_BUDGET),
-        default_limit: settings.default_result_limit.clamp(1, 50),
+        budget: settings.effective_max_response_bytes().min(MAX_BUDGET),
+        default_limit: settings.effective_default_result_limit(),
     })
 }
 

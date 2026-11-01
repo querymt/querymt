@@ -19,6 +19,9 @@ pub mod delivery;
 pub mod diagnostics;
 pub mod discovery;
 pub mod document;
+/// Offline pilot-evaluation harness for the `repository_knowledge` example.
+/// Public only so the example can use it; not part of the supported API.
+#[doc(hidden)]
 pub mod evaluation;
 pub mod evidence;
 pub mod export;

@@ -296,11 +296,22 @@ fn splice(existing: &str, map_text: &str, relative: &str) -> Result<String, Expo
 }
 
 /// Write `bytes` over `path` through a sibling temporary file and a rename.
-pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+///
+/// `root` is the canonical knowledge root. `confine_target` checked the path
+/// before any directory existed, so the parent is canonicalized again after
+/// it is created: a directory component swapped for a symlink in between
+/// cannot redirect the write outside the root.
+pub(super) fn write_atomic(root: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(io::Error::other("target has no file name"));
     };
     fs::create_dir_all(parent)?;
+    if !parent.canonicalize()?.starts_with(root.canonicalize()?) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "target directory resolves outside the knowledge root",
+        ));
+    }
     let temp = parent.join(format!(
         ".{}.qmt-{}-{}.tmp",
         name.to_string_lossy(),
@@ -389,7 +400,7 @@ impl RepositoryService {
                 bytes,
             });
         }
-        write_atomic(&absolute, plan.content.as_bytes())
+        write_atomic(self.root().root(), &absolute, plan.content.as_bytes())
             .map_err(|error| ExportError::io(&target, &error))?;
         Ok(ExportReceipt {
             target,
@@ -668,6 +679,31 @@ mod tests {
             "keep"
         );
         assert!(!outside.path().join("new.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_for_a_symlink_after_confinement_cannot_redirect_the_write() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        // `confine_target` saw no `gen` directory; one now points outside.
+        let (_, absolute) = confine_target(&root, "gen/map.md").unwrap();
+        symlink(outside.path(), root.join("gen")).unwrap();
+
+        let error = write_atomic(&root, &absolute, b"payload").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!outside.path().join("map.md").exists());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+
+        // A plain nested target still writes.
+        let (_, ok) = confine_target(&root, "docs/new/map.md").unwrap();
+        write_atomic(&root, &ok, b"fine").unwrap();
+        assert_eq!(fs::read_to_string(ok).unwrap(), "fine");
     }
 
     #[test]

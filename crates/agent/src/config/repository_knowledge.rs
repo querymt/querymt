@@ -3,6 +3,7 @@ use super::*;
 /// Hard implementation ceilings. Host settings can lower the defaults but can
 /// never raise them past these values.
 pub const REPOSITORY_KNOWLEDGE_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+pub const REPOSITORY_KNOWLEDGE_MIN_RESPONSE_BYTES: usize = 512;
 pub const REPOSITORY_KNOWLEDGE_MAX_RESULT_LIMIT: usize = 50;
 pub const REPOSITORY_KNOWLEDGE_MAX_DELIVERY_CARDS: usize = 4;
 pub const REPOSITORY_KNOWLEDGE_MAX_DELIVERY_TOKENS: usize = 2_000;
@@ -170,10 +171,13 @@ impl RepositoryKnowledgeSettings {
         self
     }
 
-    /// Effective serialized response budget, never above the 64 KiB ceiling.
+    /// Effective serialized response budget: within the 512 B floor (room for
+    /// the truncation disclosure) and the 64 KiB ceiling.
     pub fn effective_max_response_bytes(&self) -> usize {
-        self.max_response_bytes
-            .min(REPOSITORY_KNOWLEDGE_MAX_RESPONSE_BYTES)
+        self.max_response_bytes.clamp(
+            REPOSITORY_KNOWLEDGE_MIN_RESPONSE_BYTES,
+            REPOSITORY_KNOWLEDGE_MAX_RESPONSE_BYTES,
+        )
     }
 
     /// Effective default result limit, within `1..=50`.
