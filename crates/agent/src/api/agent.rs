@@ -111,6 +111,7 @@ pub struct AgentBuilder {
     middleware_factories: Vec<MiddlewareFactory>,
     middleware_entries: Vec<MiddlewareEntry>,
     execution: Option<ExecutionPolicy>,
+    memory: crate::optchat::MemorySettings,
     skills_config: Option<SkillsConfig>,
     slash_commands_config: Option<SlashCommandsConfig>,
     hooks_config: Option<HooksConfig>,
@@ -161,6 +162,7 @@ impl AgentBuilder {
             middleware_factories: Vec::new(),
             middleware_entries: Vec::new(),
             execution: None,
+            memory: Default::default(),
             skills_config: None,
             slash_commands_config: None,
             hooks_config: None,
@@ -282,6 +284,12 @@ impl AgentBuilder {
     /// Configure skills.
     pub fn skills(mut self, config: SkillsConfig) -> Self {
         self.skills_config = Some(config);
+        self
+    }
+
+    /// Configure experimental, session-local OptChat memory (disabled by default).
+    pub fn memory(mut self, settings: crate::optchat::MemorySettings) -> Self {
+        self.memory = settings;
         self
     }
 
@@ -827,7 +835,9 @@ impl AgentBuilder {
 
         // Build final AgentConfig with middleware swapped in
         let initial = Arc::try_unwrap(initial_config).unwrap_or_else(|arc| (*arc).clone());
-        let final_config = Arc::new(initial.with_middleware(middleware_drivers));
+        let mut final_config = initial.with_middleware(middleware_drivers);
+        crate::optchat::install(&mut final_config, self.memory)?;
+        let final_config = Arc::new(final_config);
 
         let handle = Arc::new(AgentHandle::from_config(final_config));
 
@@ -1589,6 +1599,7 @@ impl Agent {
 
         // Thread through config fields that were previously silently dropped
         builder.execution = Some(config.agent.execution);
+        builder.memory = config.agent.memory;
         builder.skills_config = Some(config.agent.skills);
         builder.slash_commands_config = Some(config.agent.slash_commands);
         builder.hooks_config = Some(config.agent.hooks);
