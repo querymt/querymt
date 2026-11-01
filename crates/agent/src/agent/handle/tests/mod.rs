@@ -500,5 +500,6 @@ mod schedule_get_remote;
 mod schedule_notifications;
 mod scheduler;
 mod session_ops_ext;
+mod speech;
 mod worktree_ops_ext;
 mod worktree_slash_commands;

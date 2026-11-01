@@ -52,6 +52,7 @@ pub mod session_event_stream;
 pub mod skills;
 pub mod slash_commands;
 pub mod snapshot;
+pub(crate) mod speech;
 pub mod tasks;
 pub mod tools;
 pub mod verification;

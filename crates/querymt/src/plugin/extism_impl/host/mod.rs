@@ -897,7 +897,10 @@ impl LLMProvider for ExtismProvider {
             })
             .await?;
 
-        Ok(stt::SttResponse { text: out.text })
+        Ok(stt::SttResponse {
+            text: out.text,
+            language: None,
+        })
     }
 
     async fn speech(&self, req: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {

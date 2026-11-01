@@ -303,6 +303,14 @@ mock! {
             name: &'b str,
             args: serde_json::Value,
         ) -> Result<Vec<querymt::chat::ToolResultPart>, LLMError>;
+        async fn transcribe<'a, 'b>(
+            &'a self,
+            req: &'b querymt::stt::SttRequest,
+        ) -> Result<querymt::stt::SttResponse, LLMError>;
+        async fn speech<'a, 'b>(
+            &'a self,
+            req: &'b querymt::tts::TtsRequest,
+        ) -> Result<querymt::tts::TtsResponse, LLMError>;
     }
 }
 
@@ -377,6 +385,22 @@ impl LLMProvider for SharedLlmProvider {
     ) -> Result<Vec<querymt::chat::ToolResultPart>, LLMError> {
         let provider = self.inner.lock().await;
         provider.call_tool(name, args).await
+    }
+
+    async fn transcribe(
+        &self,
+        req: &querymt::stt::SttRequest,
+    ) -> Result<querymt::stt::SttResponse, LLMError> {
+        let provider = self.inner.lock().await;
+        provider.transcribe(req).await
+    }
+
+    async fn speech(
+        &self,
+        req: &querymt::tts::TtsRequest,
+    ) -> Result<querymt::tts::TtsResponse, LLMError> {
+        let provider = self.inner.lock().await;
+        provider.speech(req).await
     }
 }
 

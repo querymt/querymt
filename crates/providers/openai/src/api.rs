@@ -969,11 +969,15 @@ pub fn openai_parse_stt<C: OpenAIProviderConfig>(
     if let Ok(json_resp) = serde_json::from_slice::<OpenAISttJsonResponse>(resp.body()) {
         return Ok(SttResponse {
             text: json_resp.text,
+            language: None,
         });
     }
 
     let text = String::from_utf8(resp.body().to_vec())?;
-    Ok(SttResponse { text })
+    Ok(SttResponse {
+        text,
+        language: None,
+    })
 }
 
 pub fn openai_tts_request<C: OpenAIProviderConfig>(
