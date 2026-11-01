@@ -37,13 +37,18 @@
 //! excluded from [`RepositoryStore::export_logical`], which is what clone/rebuild
 //! equivalence compares.
 
+use super::code::{CODE_EXTRACTOR_VERSION, CodeRecord, CodeStatus, SourceDoc, SymbolRecord};
 use super::discovery::FileStamp;
 use super::document::{DiagnosticSeverity, DocumentDiagnostic, DocumentKind};
 use super::identity::NormalizedDocument;
+use super::purpose::PurposeRow;
+use crate::index::symbol_index::SymbolKind;
+use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Duration;
 use thiserror::Error;
@@ -53,7 +58,7 @@ pub const STORE_FORMAT: &str = "qmt-repository-knowledge";
 
 /// Layout version. Any other value found on disk is rebuilt, never migrated:
 /// the file is a cache.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// How long a connection waits on another process's write lock.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -80,7 +85,9 @@ CREATE TABLE sources (
     -- row when its explicit ID is claimed by another source.
     state         TEXT NOT NULL,
     explicit_id   TEXT,
-    diagnostics_json TEXT NOT NULL
+    diagnostics_json TEXT NOT NULL,
+    -- Extractor format the source's code record was built with (code only).
+    code_version  INTEGER
 ) WITHOUT ROWID;
 
 CREATE TABLE documents (
@@ -137,6 +144,66 @@ CREATE TRIGGER sections_ad AFTER DELETE ON sections BEGIN
     INSERT INTO sections_fts (sections_fts, rowid, search_title, search_breadcrumb, search_tags, search_description, body)
     VALUES ('delete', old.id, old.search_title, old.search_breadcrumb, old.search_tags, old.search_description, old.body);
 END;
+
+-- Source-derived records. Everything below is syntax read from code files; no
+-- purposes or semantics are stored here.
+CREATE TABLE code_files (
+    path         TEXT PRIMARY KEY NOT NULL REFERENCES sources(path) ON DELETE CASCADE,
+    language     TEXT,
+    status       TEXT NOT NULL,
+    symbol_count INTEGER NOT NULL,
+    doc_count    INTEGER NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE symbols (
+    id             INTEGER PRIMARY KEY,
+    path           TEXT NOT NULL REFERENCES code_files(path) ON DELETE CASCADE,
+    ordinal        INTEGER NOT NULL,
+    symbol_key     TEXT NOT NULL UNIQUE,
+    kind           TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    name_lc        TEXT NOT NULL,
+    qualified_name TEXT NOT NULL,
+    qualified_lc   TEXT NOT NULL,
+    signature      TEXT NOT NULL,
+    parent         TEXT,
+    depth          INTEGER NOT NULL,
+    occurrence     INTEGER NOT NULL,
+    start_line     INTEGER NOT NULL,
+    end_line       INTEGER NOT NULL,
+    digest         TEXT NOT NULL,
+    byte_len       INTEGER NOT NULL,
+    line_count     INTEGER NOT NULL,
+    UNIQUE (path, ordinal)
+);
+CREATE INDEX symbols_name ON symbols(name_lc);
+CREATE INDEX symbols_qualified ON symbols(qualified_lc);
+
+-- Documentation copied verbatim from source files.
+CREATE TABLE source_docs (
+    path       TEXT NOT NULL REFERENCES code_files(path) ON DELETE CASCADE,
+    ordinal    INTEGER NOT NULL,
+    symbol_key TEXT,
+    start_line INTEGER NOT NULL,
+    end_line   INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    PRIMARY KEY (path, ordinal)
+) WITHOUT ROWID;
+
+-- File/Purpose rows an author wrote in documents.
+CREATE TABLE purposes (
+    id          INTEGER PRIMARY KEY,
+    doc_path    TEXT NOT NULL REFERENCES documents(path) ON DELETE CASCADE,
+    ordinal     INTEGER NOT NULL,
+    purpose_key TEXT NOT NULL UNIQUE,
+    target_path TEXT NOT NULL,
+    purpose     TEXT NOT NULL,
+    line        INTEGER NOT NULL,
+    occurrence  INTEGER NOT NULL,
+    managed     INTEGER NOT NULL,
+    UNIQUE (doc_path, ordinal)
+);
+CREATE INDEX purposes_target ON purposes(target_path);
 "#;
 
 /// Why the store could not be used.
@@ -342,10 +409,34 @@ pub struct SourceRecord {
     /// Normalized explicit document ID claimed by this source, if any.
     pub explicit_id: Option<String>,
     pub diagnostics: Vec<IndexDiagnostic>,
+    /// Extracted symbols and documentation of a code source.
+    pub code: Option<CodeRecord>,
+    /// File/Purpose rows found in a document source.
+    pub purposes: Vec<PurposeRow>,
 }
 
 impl SourceRecord {
     fn validate(&self) -> Result<(), StoreError> {
+        if self.code.is_some() && !self.is_code {
+            return Err(StoreError::InvalidRecord(format!(
+                "`{}` carries a code record but is not marked as code",
+                self.path
+            )));
+        }
+        if !self.purposes.is_empty() && self.document.is_none() {
+            return Err(StoreError::InvalidRecord(format!(
+                "`{}` carries purpose rows but no document",
+                self.path
+            )));
+        }
+        for row in &self.purposes {
+            if row.doc_path != self.path {
+                return Err(StoreError::InvalidRecord(format!(
+                    "purpose row of `{}` filed under `{}`",
+                    row.doc_path, self.path
+                )));
+            }
+        }
         if self.path.is_empty()
             || self.path.starts_with('/')
             || self.path.split('/').any(|segment| segment == "..")
@@ -412,6 +503,9 @@ pub struct StoredSource {
     pub diagnostics: Vec<IndexDiagnostic>,
     /// A stored document exists for this source.
     pub has_document: bool,
+    /// Extractor format of the stored code record; `None` for non-code or
+    /// unextracted sources.
+    pub code_version: Option<u32>,
 }
 
 /// Refreshed change-detection data for a source whose content did not change.
@@ -466,6 +560,12 @@ pub struct StoreCounts {
     pub sources: usize,
     pub documents: usize,
     pub sections: usize,
+    /// Extracted declarations across all code files.
+    pub symbols: usize,
+    /// Authored File/Purpose rows.
+    pub purposes: usize,
+    /// Code files kept as path-level records only (unsupported or failed).
+    pub partial_code_files: usize,
 }
 
 /// Everything reconciliation needs, read from one consistent snapshot.
@@ -689,22 +789,26 @@ impl RepositoryStore {
     }
 
     pub fn counts(&self) -> Result<StoreCounts, StoreError> {
-        let (generation, (sources, documents, sections)) = self.read(|conn| {
+        let (generation, counts) = self.read(|conn| {
             let count = |sql: &str| -> Result<usize, StoreError> {
                 let n: i64 = conn.query_row(sql, [], |row| row.get(0))?;
                 Ok(usize::try_from(n).unwrap_or_default())
             };
-            Ok((
-                count("SELECT count(*) FROM sources")?,
-                count("SELECT count(*) FROM documents")?,
-                count("SELECT count(*) FROM sections")?,
-            ))
+            Ok(StoreCounts {
+                generation: 0,
+                sources: count("SELECT count(*) FROM sources")?,
+                documents: count("SELECT count(*) FROM documents")?,
+                sections: count("SELECT count(*) FROM sections")?,
+                symbols: count("SELECT count(*) FROM symbols")?,
+                purposes: count("SELECT count(*) FROM purposes")?,
+                partial_code_files: count(
+                    "SELECT count(*) FROM code_files WHERE status != 'extracted'",
+                )?,
+            })
         })?;
         Ok(StoreCounts {
             generation,
-            sources,
-            documents,
-            sections,
+            ..counts
         })
     }
 
@@ -924,6 +1028,30 @@ impl RepositoryStore {
         })
     }
 
+    /// One document with its File/Purpose rows, from a single snapshot.
+    pub fn corpus_entry(&self, path: &str) -> Result<(u64, Option<CorpusEntry>), StoreError> {
+        self.read(|conn| load_corpus_entry(conn, path))
+    }
+
+    /// Every document with its File/Purpose rows, sorted by path, from a
+    /// single snapshot. Maintenance reads this so checks never mix
+    /// generations.
+    pub fn corpus(&self) -> Result<(u64, Vec<CorpusEntry>), StoreError> {
+        self.read(|conn| {
+            let paths: Vec<String> = {
+                let mut statement = conn.prepare("SELECT path FROM documents ORDER BY path")?;
+                statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<Result<_, _>>()?
+            };
+            let mut entries = Vec::with_capacity(paths.len());
+            for path in paths {
+                entries.extend(load_corpus_entry(conn, &path)?);
+            }
+            Ok(entries)
+        })
+    }
+
     /// Every document with its sections, sorted by path, with no machine-local
     /// data. Equal output means equal logical corpora.
     pub fn export_logical(&self) -> Result<(u64, Vec<StoredDocument>), StoreError> {
@@ -992,6 +1120,11 @@ pub struct SearchPlan {
     pub fts_limit: usize,
     /// Also list path-level code records in scope.
     pub include_files: bool,
+    /// Lowercased identifiers (names or qualified names) to look up exactly
+    /// among extracted symbols. Empty skips the symbol lookup.
+    pub symbol_terms: Vec<String>,
+    /// Also return the File/Purpose rows whose target is in scope.
+    pub include_purposes: bool,
 }
 
 /// A section that matched, with the document facts retrieval needs.
@@ -1001,9 +1134,29 @@ pub struct SectionMatch {
     pub doc_id: String,
     pub doc_title: String,
     pub doc_status: Option<String>,
+    pub doc_tags: Vec<String>,
+    pub doc_description: Option<String>,
     pub section: StoredSection,
     /// The section belongs to a document the question named by path.
     pub exact: bool,
+}
+
+/// Why a document is associated with a source file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AssociationKind {
+    /// A File/Purpose row names the file or one of its parent directories.
+    Purpose,
+    /// The document's `knowledge_sources` names the file (or a symbol in it).
+    Source,
+    /// A `knowledge_paths` glob of the document matches the file.
+    Applies,
+}
+
+/// A document directly associated with a file.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Association {
+    pub doc_path: String,
+    pub kind: AssociationKind,
 }
 
 /// A path-level code record.
@@ -1013,10 +1166,51 @@ pub struct FileRecord {
     pub size: u64,
 }
 
+/// An extracted declaration and the file it lives in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolMatch {
+    pub path: String,
+    pub record: SymbolRecord,
+}
+
+/// An authored File/Purpose row and the lifecycle of its document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurposeMatch {
+    pub row: PurposeRow,
+    pub doc_status: Option<String>,
+}
+
+/// A code file as the map renderer needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapFile {
+    pub path: String,
+    pub language: Option<String>,
+    pub status: CodeStatus,
+    /// Declarations in source order.
+    pub symbols: Vec<SymbolRecord>,
+}
+
+/// Everything a map of one scope is rendered from, read from one generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapData {
+    pub generation: u64,
+    /// Code files in scope, sorted by path.
+    pub files: Vec<MapFile>,
+    /// Purpose rows whose target is in scope, in document order.
+    pub purposes: Vec<PurposeMatch>,
+}
+
 /// Everything one [`RepositoryStore::search`] read, from one generation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchSnapshot {
     pub generation: u64,
+    /// Symbols whose name or qualified name equals a requested term, by path
+    /// then source order.
+    pub symbols: Vec<SymbolMatch>,
+    /// More symbols matched than were returned.
+    pub symbols_saturated: bool,
+    /// Purpose rows in scope, in document order.
+    pub purposes: Vec<PurposeMatch>,
     /// Exact-path sections (path, ordinal order) followed by ranked full-text
     /// sections (best first, ties by path then ordinal).
     pub sections: Vec<SectionMatch>,
@@ -1052,7 +1246,7 @@ fn escape_like(value: &str) -> String {
 
 const MATCH_COLUMNS: &str = "s.ordinal, s.section_key, s.level, s.title, s.breadcrumb_json, \
      s.occurrence, s.start_line, s.end_line, s.body, s.from_metadata, \
-     s.doc_path, d.doc_id, d.title, d.status";
+     s.doc_path, d.doc_id, d.title, d.status, d.tags_json, d.description";
 
 fn match_from_row(row: &rusqlite::Row<'_>, exact: bool) -> rusqlite::Result<SectionMatch> {
     Ok(SectionMatch {
@@ -1061,6 +1255,8 @@ fn match_from_row(row: &rusqlite::Row<'_>, exact: bool) -> rusqlite::Result<Sect
         doc_id: row.get(11)?,
         doc_title: row.get(12)?,
         doc_status: row.get(13)?,
+        doc_tags: parse_json(&row.get::<_, String>(14)?),
+        doc_description: row.get(15)?,
         exact,
     })
 }
@@ -1071,7 +1267,8 @@ impl RepositoryStore {
     pub fn search(&self, plan: &SearchPlan) -> Result<SearchSnapshot, StoreError> {
         let scope = plan.scope.as_deref();
         let like = scope.map(|scope| format!("{}/%", escape_like(scope)));
-        let (generation, (sections, fts_saturated, files)) = self.read(|conn| {
+        let (generation, (sections, fts_saturated, files, symbols, symbols_saturated, purposes)) =
+            self.read(|conn| {
             let mut sections: Vec<SectionMatch> = Vec::new();
             let mut seen = BTreeSet::new();
 
@@ -1135,15 +1332,355 @@ impl RepositoryStore {
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
             }
-            Ok((sections, saturated, files))
+            let (symbols, symbols_saturated) = if plan.symbol_terms.is_empty() {
+                (Vec::new(), false)
+            } else {
+                load_symbols(conn, &plan.symbol_terms, scope, like.as_deref())?
+            };
+            let purposes = if plan.include_purposes {
+                load_purposes(conn, scope, like.as_deref())?
+            } else {
+                Vec::new()
+            };
+            Ok((sections, saturated, files, symbols, symbols_saturated, purposes))
         })?;
         Ok(SearchSnapshot {
             generation,
+            symbols,
+            symbols_saturated,
+            purposes,
             sections,
             fts_saturated,
             files,
         })
     }
+
+    /// Which of `paths` are indexed sources (documents or code), from one
+    /// snapshot.
+    pub fn existing_sources(&self, paths: &[String]) -> Result<(u64, Vec<String>), StoreError> {
+        self.read(|conn| {
+            let mut statement = conn.prepare("SELECT 1 FROM sources WHERE path = ?1")?;
+            let mut found = Vec::new();
+            for path in paths {
+                if statement.exists([path])? {
+                    found.push(path.clone());
+                }
+            }
+            Ok(found)
+        })
+    }
+
+    /// Documents directly associated with the indexed file `file`, sorted and
+    /// de-duplicated, from one snapshot. Associations are exact: a purpose row
+    /// naming `file` or a parent directory, a `knowledge_sources` selector
+    /// naming `file`, or a `knowledge_paths` glob matching it. Never fuzzy.
+    pub fn associations(&self, file: &str) -> Result<(u64, Vec<Association>), StoreError> {
+        const OPTIONS: glob::MatchOptions = glob::MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: true,
+            require_literal_leading_dot: false,
+        };
+        self.read(|conn| {
+            let mut found: BTreeSet<Association> = BTreeSet::new();
+            let mut purposes = conn.prepare(
+                "SELECT DISTINCT doc_path FROM purposes \
+                 WHERE target_path = ?1 \
+                    OR substr(?1, 1, length(target_path) + 1) = target_path || '/'",
+            )?;
+            for doc_path in purposes.query_map([file], |row| row.get::<_, String>(0))? {
+                found.insert(Association {
+                    doc_path: doc_path?,
+                    kind: AssociationKind::Purpose,
+                });
+            }
+            let mut documents = conn.prepare(
+                "SELECT path, knowledge_sources_json, knowledge_paths_json FROM documents \
+                 WHERE knowledge_sources_json != '[]' OR knowledge_paths_json != '[]' \
+                 ORDER BY path",
+            )?;
+            let rows = documents
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (doc_path, sources, applies) in rows {
+                let sources: Vec<String> = parse_json(&sources);
+                if sources
+                    .iter()
+                    .any(|selector| selector.split('#').next().map(str::trim) == Some(file))
+                {
+                    found.insert(Association {
+                        doc_path: doc_path.clone(),
+                        kind: AssociationKind::Source,
+                    });
+                }
+                let applies: Vec<String> = parse_json(&applies);
+                if applies.iter().any(|pattern| {
+                    glob::Pattern::new(pattern.trim())
+                        .is_ok_and(|pattern| pattern.matches_with(file, OPTIONS))
+                }) {
+                    found.insert(Association {
+                        doc_path,
+                        kind: AssociationKind::Applies,
+                    });
+                }
+            }
+            Ok(found.into_iter().collect())
+        })
+    }
+
+    /// A code file's extracted record and size, from one snapshot. `None` when
+    /// the path is not an indexed code file.
+    pub fn code_record(&self, path: &str) -> Result<(u64, Option<(u64, CodeRecord)>), StoreError> {
+        self.read(|conn| {
+            let head = conn
+                .query_row(
+                    "SELECT s.size, c.language, c.status FROM code_files c \
+                     JOIN sources s ON s.path = c.path WHERE c.path = ?1",
+                    [path],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((size, language, status)) = head else {
+                return Ok(None);
+            };
+            let status = CodeStatus::parse(&status)
+                .ok_or_else(|| StoreError::Unreadable(format!("unknown code status `{status}`")))?;
+            let mut statement = conn.prepare(&format!(
+                "SELECT {SYMBOL_COLUMNS} FROM symbols WHERE path = ?1 ORDER BY ordinal"
+            ))?;
+            let symbols = statement
+                .query_map([path], symbol_from_row)?
+                .map(|row| row.map(|found| found.record))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut statement = conn.prepare(
+                "SELECT ordinal, symbol_key, start_line, end_line, text FROM source_docs \
+                 WHERE path = ?1 ORDER BY ordinal",
+            )?;
+            let docs = statement
+                .query_map([path], |row| {
+                    Ok(SourceDoc {
+                        ordinal: to_usize(row.get(0)?),
+                        symbol_key: row.get(1)?,
+                        start_line: to_usize(row.get(2)?),
+                        end_line: to_usize(row.get(3)?),
+                        text: row.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some((
+                u64::try_from(size).unwrap_or_default(),
+                CodeRecord {
+                    language,
+                    status,
+                    symbols,
+                    docs,
+                },
+            )))
+        })
+    }
+
+    /// A purpose row by its portable key.
+    pub fn purpose(&self, key: &str) -> Result<(u64, Option<PurposeMatch>), StoreError> {
+        self.read(|conn| {
+            Ok(conn
+                .query_row(
+                    &format!("{PURPOSE_SELECT} WHERE p.purpose_key = ?1"),
+                    [key],
+                    purpose_from_row,
+                )
+                .optional()?)
+        })
+    }
+
+    /// Code files, declarations and purpose rows under `scope`, from one
+    /// snapshot.
+    pub fn map_data(&self, scope: Option<&str>) -> Result<MapData, StoreError> {
+        let like = scope.map(|scope| format!("{}/%", escape_like(scope)));
+        let (generation, (files, purposes)) = self.read(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT path, language, status FROM code_files \
+                 WHERE (?1 IS NULL OR path = ?1 OR path LIKE ?2 ESCAPE '\\') ORDER BY path",
+            )?;
+            let mut files = statement
+                .query_map(params![scope, like], |row| {
+                    let status: String = row.get(2)?;
+                    Ok(MapFile {
+                        path: row.get(0)?,
+                        language: row.get(1)?,
+                        status: CodeStatus::parse(&status).unwrap_or(CodeStatus::Failed),
+                        symbols: Vec::new(),
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let positions: BTreeMap<String, usize> = files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| (file.path.clone(), index))
+                .collect();
+            let mut statement = conn.prepare(&format!(
+                "SELECT {SYMBOL_COLUMNS} FROM symbols \
+                 WHERE (?1 IS NULL OR path = ?1 OR path LIKE ?2 ESCAPE '\\') \
+                 ORDER BY path, ordinal"
+            ))?;
+            let rows = statement.query_map(params![scope, like], symbol_from_row)?;
+            for row in rows {
+                let found = row?;
+                if let Some(&index) = positions.get(&found.path) {
+                    files[index].symbols.push(found.record);
+                }
+            }
+            let purposes = load_purposes(conn, scope, like.as_deref())?;
+            Ok((files, purposes))
+        })?;
+        Ok(MapData {
+            generation,
+            files,
+            purposes,
+        })
+    }
+
+    /// Pretend the stored code records came from another extractor format.
+    #[cfg(test)]
+    pub(crate) fn invalidate_code_versions(&self) {
+        self.lock()
+            .unwrap()
+            .execute(
+                "UPDATE sources SET code_version = 0 WHERE code_version IS NOT NULL",
+                [],
+            )
+            .unwrap();
+    }
+}
+
+const SYMBOL_LIMIT: usize = 200;
+const PURPOSE_LIMIT: usize = 5000;
+
+const SYMBOL_COLUMNS: &str = "path, ordinal, symbol_key, kind, name, qualified_name, signature, \
+     parent, depth, occurrence, start_line, end_line, digest, byte_len, line_count";
+
+const PURPOSE_SELECT: &str = "SELECT p.doc_path, p.ordinal, p.target_path, p.purpose, p.line, \
+     p.occurrence, p.managed, d.status FROM purposes p JOIN documents d ON d.path = p.doc_path";
+
+fn to_usize(value: i64) -> usize {
+    usize::try_from(value).unwrap_or_default()
+}
+
+fn symbol_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolMatch> {
+    let kind: String = row.get(3)?;
+    Ok(SymbolMatch {
+        path: row.get(0)?,
+        record: SymbolRecord {
+            ordinal: to_usize(row.get(1)?),
+            key: row.get(2)?,
+            kind: SymbolKind::from_str(&kind).unwrap_or(SymbolKind::Unknown),
+            name: row.get(4)?,
+            qualified_name: row.get(5)?,
+            signature: row.get(6)?,
+            parent: row.get(7)?,
+            depth: u32::try_from(row.get::<_, i64>(8)?).unwrap_or_default(),
+            occurrence: u32::try_from(row.get::<_, i64>(9)?).unwrap_or_default(),
+            start_line: to_usize(row.get(10)?),
+            end_line: to_usize(row.get(11)?),
+            digest: row.get(12)?,
+            byte_len: to_usize(row.get(13)?),
+            line_count: to_usize(row.get(14)?),
+        },
+    })
+}
+
+/// A document and the File/Purpose rows it contains.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorpusEntry {
+    pub document: StoredDocument,
+    pub purposes: Vec<PurposeRow>,
+}
+
+fn load_corpus_entry(conn: &Connection, path: &str) -> Result<Option<CorpusEntry>, StoreError> {
+    let Some(document) = load_document(conn, "path", path)? else {
+        return Ok(None);
+    };
+    let mut statement = conn.prepare(&format!(
+        "{PURPOSE_SELECT} WHERE p.doc_path = ?1 ORDER BY p.ordinal"
+    ))?;
+    let purposes = statement
+        .query_map([path], purpose_from_row)?
+        .map(|row| row.map(|found| found.row))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(CorpusEntry { document, purposes }))
+}
+
+fn purpose_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PurposeMatch> {
+    Ok(PurposeMatch {
+        row: PurposeRow {
+            doc_path: row.get(0)?,
+            ordinal: to_usize(row.get(1)?),
+            target_path: row.get(2)?,
+            purpose: row.get(3)?,
+            line: to_usize(row.get(4)?),
+            occurrence: u32::try_from(row.get::<_, i64>(5)?).unwrap_or_default(),
+            managed: row.get(6)?,
+        },
+        doc_status: row.get(7)?,
+    })
+}
+
+/// Imports are never matched: they restate a name, they do not declare one.
+fn load_symbols(
+    conn: &Connection,
+    terms: &[String],
+    scope: Option<&str>,
+    like: Option<&str>,
+) -> Result<(Vec<SymbolMatch>, bool), StoreError> {
+    let placeholders = (0..terms.len())
+        .map(|index| format!("?{}", index + 3))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT {SYMBOL_COLUMNS} FROM symbols \
+         WHERE kind != 'import' \
+           AND (name_lc IN ({placeholders}) OR qualified_lc IN ({placeholders})) \
+           AND (?1 IS NULL OR path = ?1 OR path LIKE ?2 ESCAPE '\\') \
+         ORDER BY path, ordinal LIMIT {}",
+        SYMBOL_LIMIT + 1
+    );
+    let text =
+        |value: Option<&str>| value.map_or(SqlValue::Null, |v| SqlValue::Text(v.to_string()));
+    let mut bound = vec![text(scope), text(like)];
+    bound.extend(terms.iter().cloned().map(SqlValue::Text));
+    let mut statement = conn.prepare(&sql)?;
+    let mut found = statement
+        .query_map(rusqlite::params_from_iter(bound), symbol_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let saturated = found.len() > SYMBOL_LIMIT;
+    found.truncate(SYMBOL_LIMIT);
+    Ok((found, saturated))
+}
+
+fn load_purposes(
+    conn: &Connection,
+    scope: Option<&str>,
+    like: Option<&str>,
+) -> Result<Vec<PurposeMatch>, StoreError> {
+    let mut statement = conn.prepare(&format!(
+        "{PURPOSE_SELECT} \
+         WHERE (?1 IS NULL OR p.target_path = ?1 OR p.target_path LIKE ?2 ESCAPE '\\') \
+         ORDER BY p.doc_path, p.ordinal LIMIT {PURPOSE_LIMIT}"
+    ))?;
+    let rows = statement
+        .query_map(params![scope, like], purpose_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 // ─── Writes ──────────────────────────────────────────────────────────────────
@@ -1221,8 +1758,8 @@ fn insert_source(conn: &Connection, record: &SourceRecord) -> Result<(), StoreEr
     };
     conn.execute(
         "INSERT INTO sources (path, is_document, is_code, size, mtime_ns, file_dev, file_ino, \
-         content_hash, indexed_at_ns, state, explicit_id, diagnostics_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         content_hash, indexed_at_ns, state, explicit_id, diagnostics_json, code_version) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             record.path,
             record.is_document,
@@ -1236,10 +1773,91 @@ fn insert_source(conn: &Connection, record: &SourceRecord) -> Result<(), StoreEr
             record.state.as_str(),
             record.explicit_id,
             diagnostics_to_json(&record.diagnostics),
+            record.code.as_ref().map(|_| CODE_EXTRACTOR_VERSION),
         ],
     )?;
     if let Some(document) = &record.document {
         insert_document(conn, document)?;
+        for row in &record.purposes {
+            insert_purpose(conn, row)?;
+        }
+    }
+    if let Some(code) = &record.code {
+        insert_code(conn, &record.path, code)?;
+    }
+    Ok(())
+}
+
+fn insert_purpose(conn: &Connection, row: &PurposeRow) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO purposes (doc_path, ordinal, purpose_key, target_path, purpose, line, \
+         occurrence, managed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            row.doc_path,
+            to_i64(row.ordinal),
+            row.key(),
+            row.target_path,
+            row.purpose,
+            to_i64(row.line),
+            i64::from(row.occurrence),
+            row.managed,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_code(conn: &Connection, path: &str, code: &CodeRecord) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO code_files (path, language, status, symbol_count, doc_count) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            path,
+            code.language,
+            code.status.as_str(),
+            to_i64(code.symbols.len()),
+            to_i64(code.docs.len()),
+        ],
+    )?;
+    let mut symbol = conn.prepare_cached(
+        "INSERT INTO symbols (path, ordinal, symbol_key, kind, name, name_lc, qualified_name, \
+         qualified_lc, signature, parent, depth, occurrence, start_line, end_line, digest, \
+         byte_len, line_count) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+    )?;
+    for record in &code.symbols {
+        symbol.execute(params![
+            path,
+            to_i64(record.ordinal),
+            record.key,
+            record.kind.as_str(),
+            record.name,
+            record.name.to_lowercase(),
+            record.qualified_name,
+            record.qualified_name.to_lowercase(),
+            record.signature,
+            record.parent,
+            i64::from(record.depth),
+            i64::from(record.occurrence),
+            to_i64(record.start_line),
+            to_i64(record.end_line),
+            record.digest,
+            to_i64(record.byte_len),
+            to_i64(record.line_count),
+        ])?;
+    }
+    let mut doc = conn.prepare_cached(
+        "INSERT INTO source_docs (path, ordinal, symbol_key, start_line, end_line, text) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for record in &code.docs {
+        doc.execute(params![
+            path,
+            to_i64(record.ordinal),
+            record.symbol_key,
+            to_i64(record.start_line),
+            to_i64(record.end_line),
+            record.text,
+        ])?;
     }
     Ok(())
 }
@@ -1322,7 +1940,7 @@ fn insert_document(conn: &Connection, document: &NormalizedDocument) -> Result<(
 
 const SOURCE_SELECT: &str = "SELECT s.path, s.is_document, s.is_code, s.size, s.mtime_ns, \
      s.file_dev, s.file_ino, s.content_hash, s.indexed_at_ns, s.state, s.explicit_id, \
-     s.diagnostics_json, (d.path IS NOT NULL) \
+     s.diagnostics_json, (d.path IS NOT NULL), s.code_version \
      FROM sources s LEFT JOIN documents d ON d.path = s.path";
 
 fn source_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<StoredSource, StoreError>> {
@@ -1351,6 +1969,9 @@ fn source_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<StoredSou
         explicit_id: row.get(10)?,
         diagnostics: diagnostics_from_json(&diagnostics),
         has_document: row.get(12)?,
+        code_version: row
+            .get::<_, Option<i64>>(13)?
+            .and_then(|version| u32::try_from(version).ok()),
     }))
 }
 
@@ -1378,7 +1999,7 @@ fn parse_json<T: serde::de::DeserializeOwned + Default>(raw: &str) -> T {
 }
 
 /// `column` is a fixed identifier chosen by this module, never user input.
-fn load_document(
+pub(super) fn load_document(
     conn: &Connection,
     column: &'static str,
     value: &str,
@@ -1483,6 +2104,8 @@ mod tests {
             state: SourceState::Parsed,
             explicit_id: None,
             diagnostics: Vec::new(),
+            code: None,
+            purposes: Vec::new(),
         }
     }
 
@@ -1498,6 +2121,8 @@ mod tests {
             state: SourceState::Code,
             explicit_id: None,
             diagnostics: Vec::new(),
+            code: None,
+            purposes: Vec::new(),
         }
     }
 
@@ -1710,10 +2335,19 @@ mod tests {
             .unwrap();
         assert_eq!(
             tables,
-            ["documents", "meta", "sections", "sources"]
-                .into_iter()
-                .map(String::from)
-                .collect::<BTreeSet<_>>()
+            [
+                "code_files",
+                "documents",
+                "meta",
+                "purposes",
+                "sections",
+                "source_docs",
+                "sources",
+                "symbols",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<BTreeSet<_>>()
         );
     }
 
