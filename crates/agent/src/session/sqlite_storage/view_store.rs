@@ -1312,7 +1312,7 @@ impl ViewStore for SqliteStorage {
             .and_then(|cursor| cursor.parse::<i64>().ok())
             .filter(|offset| *offset >= 0)
             .unwrap_or(0);
-        let limit = limit.clamp(1, 200);
+        let limit = limit.clamp(1, crate::session::projection::MAX_SESSION_ITEMS_PAGE);
         let scope_where = format!(
             "{} AND {} AND {}",
             session_scope_where(session_scope, "s"),

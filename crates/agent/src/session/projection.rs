@@ -366,6 +366,9 @@ pub trait EventJournal: Send + Sync {
     async fn max_stream_seq(&self, session_id: &str) -> SessionResult<i64>;
 }
 
+/// Upper bound on one flat `list_session_items*` page; the ACP global page size must fit under it.
+pub const MAX_SESSION_ITEMS_PAGE: usize = 500;
+
 /// View generation (read-only projections)
 #[async_trait]
 pub trait ViewStore: Send + Sync {

@@ -923,8 +923,160 @@ async fn acp_list_sessions_pages_workspace_sessions_without_cross_workspace_leak
         AgentSessions::list_for_acp_from_view_store(view_store, AcpListSessionsRequest::new())
             .await?;
     assert_eq!(unfiltered.total_count, 102);
-    assert_eq!(unfiltered.sessions.len(), 100);
-    assert_eq!(unfiltered.next_cursor.as_deref(), Some("100"));
+    // The global page is larger than the 102 rows here, so everything fits in one page.
+    assert_eq!(unfiltered.sessions.len(), 102);
+    assert_eq!(unfiltered.next_cursor, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn acp_list_sessions_global_page_size_bounds_local_pages() -> Result<()> {
+    let agent = test_agent().await?;
+    let session_store = agent.storage_backend().session_store();
+    let total = crate::api::sessions::ACP_GLOBAL_PAGE_SIZE + 5;
+    for index in 0..total {
+        session_store
+            .create_session(Some(format!("Session {index}")), None, None, None)
+            .await?;
+    }
+    let view_store = agent.storage_backend().view_store().expect("view store");
+    let first = AgentSessions::list_for_acp_from_view_store(
+        view_store.clone(),
+        AcpListSessionsRequest::new(),
+    )
+    .await?;
+    assert_eq!(first.sessions.len(), crate::api::sessions::ACP_GLOBAL_PAGE_SIZE);
+    let cursor = first.next_cursor.expect("first page should continue");
+    let second = AgentSessions::list_for_acp_from_view_store(
+        view_store,
+        AcpListSessionsRequest::new().cursor(cursor),
+    )
+    .await?;
+    assert_eq!(second.sessions.len(), 5);
+    assert_eq!(second.next_cursor, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn acp_list_sessions_rejects_unknown_session_source() -> Result<()> {
+    let agent = test_agent().await?;
+    let mut meta = crate::acp::protocol::Meta::new();
+    meta.insert(
+        "querymt".into(),
+        serde_json::json!({ "sessionSource": "sideways" }),
+    );
+    let error = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new().meta(meta))
+        .await
+        .expect_err("unknown source must be rejected");
+    assert!(error.to_string().contains("sessionSource"));
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn acp_list_sessions_source_splits_local_and_remote_listings() -> Result<()> {
+    let agent = test_agent().await?;
+    let store = agent.storage_backend().session_store();
+    let local = store
+        .create_session(Some("Local".into()), None, None, None)
+        .await?;
+    for index in 0..3 {
+        store
+            .save_remote_session_bookmark(&RemoteSessionBookmark {
+                session_id: format!("remote-{index}"),
+                node_id: "peer-a".into(),
+                peer_label: "Remote A".into(),
+                cwd: Some("/remote/work".into()),
+                created_at: index,
+                title: Some(format!("Remote {index}")),
+            })
+            .await?;
+    }
+    let meta = |source: &str| {
+        let mut meta = crate::acp::protocol::Meta::new();
+        meta.insert("remoteNodeIds".into(), serde_json::json!(["peer-a"]));
+        meta.insert(
+            "querymt".into(),
+            serde_json::json!({ "sessionSource": source }),
+        );
+        meta
+    };
+
+    // Local-only: the local page ends with no chained `remote:` cursor and no remote rows.
+    let local_page = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new().meta(meta("local")))
+        .await?;
+    assert_eq!(
+        local_page
+            .sessions
+            .iter()
+            .map(|session| session.session_id.to_string())
+            .collect::<Vec<_>>(),
+        vec![local.public_id.clone()]
+    );
+    assert_eq!(local_page.next_cursor, None);
+
+    // Remote-only: starts at the first peer without walking any local page.
+    let remote_page = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new().meta(meta("remote")))
+        .await?;
+    assert_eq!(remote_page.sessions.len(), 3);
+    assert!(remote_page.sessions.iter().all(|session| {
+        session.meta.as_ref().is_some_and(|meta| meta["location"] == "remote")
+    }));
+    assert_eq!(remote_page.next_cursor, None);
+
+    // The legacy default still returns local then remote rows in one chain.
+    let legacy = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new().meta({
+            let mut meta = crate::acp::protocol::Meta::new();
+            meta.insert("remoteNodeIds".into(), serde_json::json!(["peer-a"]));
+            meta
+        }))
+        .await?;
+    assert_eq!(legacy.sessions.len(), 4);
+
+    // A remote cursor is invalid for a local-only listing, and a local cursor for a remote-only one.
+    assert!(
+        agent
+            .sessions()
+            .list_for_acp(
+                AcpListSessionsRequest::new()
+                    .meta(meta("local"))
+                    .cursor(Some("remote:0:0".to_string())),
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        agent
+            .sessions()
+            .list_for_acp(
+                AcpListSessionsRequest::new()
+                    .meta(meta("remote"))
+                    .cursor(Some("123".to_string())),
+            )
+            .await
+            .is_err()
+    );
+
+    // No selected peers: a remote-only listing is empty rather than falling back to local rows.
+    let mut no_peers = crate::acp::protocol::Meta::new();
+    no_peers.insert(
+        "querymt".into(),
+        serde_json::json!({ "sessionSource": "remote" }),
+    );
+    let empty = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new().meta(no_peers))
+        .await?;
+    assert!(empty.sessions.is_empty());
+    assert_eq!(empty.next_cursor, None);
     Ok(())
 }
 
