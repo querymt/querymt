@@ -90,12 +90,31 @@ fn missing_credentials_error(provider_name: &str, env_var_name: Option<&str>) ->
     SessionError::ProviderError(LLMError::AuthError(msg))
 }
 
+/// The same binding/session merge is used for construction and replay identity.
+pub(crate) fn runtime_config_builder(
+    binding: &ProviderBinding,
+    model: &str,
+    params: Option<&Value>,
+) -> ProviderConfigBuilder {
+    let mut builder = ProviderConfigBuilder::from_binding(binding);
+    builder.set("model", model.into());
+    if let Some(params) = params {
+        builder.merge_value(params, ConfigOverrideMode::Overwrite);
+    }
+    builder
+}
+
 pub(crate) async fn resolve_provider_config(
     binding: &ProviderBinding,
     initial_config: &LLMParams,
     mode: ProviderConfigMode<'_>,
 ) -> Result<ResolvedProviderConfig, SessionError> {
-    let mut builder = ProviderConfigBuilder::from_binding(binding);
+    let mut builder = match &mode {
+        ProviderConfigMode::Runtime { model, params, .. } => {
+            runtime_config_builder(binding, model, *params)
+        }
+        ProviderConfigMode::CatalogListing => ProviderConfigBuilder::from_binding(binding),
+    };
     let factory = &binding.factory;
     let provider_name = binding.logical_name.as_str();
     let mut use_oauth_resolver = false;
@@ -104,16 +123,10 @@ pub(crate) async fn resolve_provider_config(
     match mode {
         ProviderConfigMode::Runtime {
             model,
-            params,
             api_key_override,
             session_id,
+            ..
         } => {
-            builder.set("model", model.into());
-
-            if let Some(params_value) = params {
-                builder.merge_value(params_value, ConfigOverrideMode::Overwrite);
-            }
-
             // Only parse the models.dev cache when it can change the caps.
             let model_info = ModelDefaults::wants_model_info(provider_name, builder.value())
                 .then(|| crate::model_info::get_model_info(provider_name, model))

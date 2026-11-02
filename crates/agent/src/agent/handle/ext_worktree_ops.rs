@@ -584,10 +584,18 @@ impl LocalAgentHandle {
             ),
             basis: handle.billing_basis_for_model(&model),
         };
+        let target = handle.output_target().await;
         let result = self
             .config
             .compaction
-            .process(&messages, llm_provider, &model, &retry, None, &ledger)
+            .process_for_target(
+                &messages,
+                llm_provider,
+                (&model, target.as_ref()),
+                &retry,
+                None,
+                &ledger,
+            )
             .await
             .map_err(|err| failed(err.to_string()))
             .and_then(|result| {

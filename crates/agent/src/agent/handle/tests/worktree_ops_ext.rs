@@ -213,7 +213,7 @@ async fn worktree_fixture_with(
     configure_service: bool,
     default_baseline: crate::worktree::BaselineMode,
 ) -> WorktreeExtFixture {
-    worktree_fixture_inner(configure_service, default_baseline, false).await
+    worktree_fixture_inner(configure_service, default_baseline, false, "mock").await
 }
 
 /// Journal that delegates to the real one but rejects the handoff
@@ -334,6 +334,7 @@ async fn worktree_fixture_inner(
     configure_service: bool,
     default_baseline: crate::worktree::BaselineMode,
     reject_announcements: bool,
+    provider_name: &str,
 ) -> WorktreeExtFixture {
     let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
     let llm = provider.clone();
@@ -342,7 +343,8 @@ async fn worktree_fixture_inner(
         tools: vec![].into_boxed_slice(),
     };
     let factory = Arc::new(TestProviderFactory::new(shared));
-    let (plugin_registry, plugin_dir) = mock_plugin_registry(factory).expect("plugin registry");
+    let (mut plugin_registry, plugin_dir) = mock_plugin_registry(factory).expect("plugin registry");
+    plugin_registry.config.providers[0].name = provider_name.into();
 
     let storage = Arc::new(
         crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
@@ -357,7 +359,7 @@ async fn worktree_fixture_inner(
     let mut builder = AgentConfigBuilder::new(
         Arc::new(plugin_registry),
         builder_storage,
-        LLMParams::new().provider("mock").model("mock-model"),
+        LLMParams::new().provider(provider_name).model("mock-model"),
     )
     .with_tool_policy(ToolPolicy::ProviderOnly);
 
@@ -1828,6 +1830,79 @@ async fn handoff_summary_is_opt_in_and_seeds_the_successor() {
     );
 }
 
+#[tokio::test]
+async fn handoff_summary_replays_a_compatible_encrypted_checkpoint() {
+    use crate::session::store::SessionStore as _;
+    use crate::worktree::{HandoffOptions, WorkspaceTarget, WorktreeOps};
+    use querymt::chat::{ChatOpaqueItem, ChatOutput, ChatOutputItem, ChatOutputProvenance};
+    let f =
+        worktree_fixture_inner(true, crate::worktree::BaselineMode::Commit, false, "codex").await;
+    let owner = isolated_session(&f, f.repo.path()).await;
+    let mut output = ChatOutput {
+        provenance: Some(ChatOutputProvenance {
+            provider: "codex".into(),
+            model: "mock-model".into(),
+            protocol: "responses".into(),
+            endpoint: "https://chatgpt.com/backend-api/codex/responses".into(),
+        }),
+        items: vec![ChatOutputItem::Opaque(ChatOpaqueItem {
+            original_type: "compaction".into(),
+            payload: serde_json::json!({"type":"compaction", "encrypted_content":"encrypted-worktree-state"}),
+        })],
+        ..Default::default()
+    };
+    output.extensions.insert(
+        "querymt_codex_retained_messages".into(),
+        serde_json::json!([]),
+    );
+    let mut checkpoint = crate::session::compaction::CompactionResult {
+        summary: "Earlier context was compacted into encrypted Codex state.".into(),
+        original_token_count: 1000,
+        summary_token_count: 20,
+        native_output: Some(output),
+    };
+    for message in checkpoint.take_messages(&owner) {
+        f.storage
+            .session_store()
+            .add_message(&owner, message)
+            .await
+            .unwrap();
+    }
+    f.llm
+        .lock()
+        .await
+        .expect_chat()
+        .times(1)
+        .returning(|messages| {
+            assert!(
+                serde_json::to_string(messages)
+                    .unwrap()
+                    .contains("encrypted-worktree-state"),
+                "compatible handoff summarization must not silently strip the checkpoint"
+            );
+            Ok(
+                crate::test_utils::MockChatResponse::text_only("parser refactor in progress")
+                    .into(),
+            )
+        });
+    let successor = WorktreeOps::new(f.service.clone())
+        .handoff(
+            &f.handle,
+            &WorkspaceTarget::Session(owner),
+            HandoffOptions {
+                summary: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(successor.summary_seeded);
+    let history = f.storage.get_history(&successor.session_id).await.unwrap();
+    let text = serde_json::to_string(&history).unwrap();
+    assert!(text.contains("parser refactor in progress"));
+    assert!(!text.contains("encrypted-worktree-state"));
+}
+
 /// 24.4: a summarizer failure fails the handoff before the transfer.
 #[tokio::test]
 async fn handoff_summary_failure_creates_nothing_and_keeps_ownership() {
@@ -2330,7 +2405,7 @@ async fn handoff_announcement_reaches_every_attached_connection_before_the_respo
 async fn handoff_succeeds_when_the_announcement_cannot_be_recorded() {
     use crate::worktree::{WorkspaceTarget, WorktreeOps};
 
-    let f = worktree_fixture_inner(true, crate::worktree::BaselineMode::Commit, true).await;
+    let f = worktree_fixture_inner(true, crate::worktree::BaselineMode::Commit, true, "mock").await;
     let ops = WorktreeOps::new(f.service.clone());
     let previous = isolated_session(&f, f.repo.path()).await;
 
@@ -3023,7 +3098,7 @@ async fn session_archive_unloads_the_owner_without_archiving_the_workspace() {
 async fn archive_succeeds_when_the_announcement_cannot_be_recorded() {
     use crate::worktree::{WorkspaceLifecycle, WorkspaceTarget, WorktreeOps};
 
-    let f = worktree_fixture_inner(true, crate::worktree::BaselineMode::Commit, true).await;
+    let f = worktree_fixture_inner(true, crate::worktree::BaselineMode::Commit, true, "mock").await;
     let ops = WorktreeOps::new(f.service.clone());
     let owner = isolated_session(&f, f.repo.path()).await;
 
