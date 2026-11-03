@@ -2011,3 +2011,66 @@ async fn unreachable_owner_with_local_window_serves_stale_snapshot() {
     assert_eq!(snapshot["history"]["stale"], true);
     assert_eq!(snapshot["audit"]["events"].as_array().unwrap().len(), 4);
 }
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn load_session_with_unreachable_owner_serves_the_local_window_as_stale() {
+    // No mesh in this fixture: connecting to the owner fails outright.
+    let (viewer, _) = viewer_with_synced_history("rs-5", "node-v", 4).await;
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        crate::acp::shared::QUERYMT_META_NAMESPACE.into(),
+        serde_json::json!({ "loadWindow": {} }),
+    );
+    let request = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from("rs-5".to_string()),
+        std::path::PathBuf::new(),
+    )
+    .meta(meta);
+    let response = viewer.handle.load_session(request).await.unwrap();
+    let snapshot = &response.meta.unwrap()["querymt/sessionLoadSnapshot.v1"];
+    assert_eq!(snapshot["history"]["stale"], true);
+    assert_eq!(snapshot["audit"]["events"].as_array().unwrap().len(), 4);
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn load_session_with_unreachable_owner_and_no_local_window_keeps_the_connect_error() {
+    let viewer = RealStorageHandleFixture::new().await;
+    viewer
+        .storage
+        .session_store()
+        .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+            session_id: "rs-6".into(),
+            node_id: "node-u".into(),
+            peer_label: "owner".into(),
+            cwd: None,
+            created_at: 1_700_000_000,
+            title: None,
+        })
+        .await
+        .unwrap();
+    let request = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from("rs-6".to_string()),
+        std::path::PathBuf::new(),
+    );
+    let error = viewer.handle.load_session(request).await.unwrap_err();
+    assert_eq!(error.data.unwrap()["category"], "remote_session_connect");
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn exhausted_budget_still_serves_a_window_already_in_the_local_journal() {
+    let (viewer, _) = viewer_with_synced_history("rs-4", "node-w", 4).await;
+    let snapshot = viewer
+        .handle
+        .build_remote_attach_snapshot_with_budget(
+            "rs-4",
+            Some(crate::session::history_window::LoadWindow::default()),
+            Ok(()),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot["audit"]["events"].as_array().unwrap().len(), 4);
+}

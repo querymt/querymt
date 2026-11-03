@@ -37,6 +37,13 @@ type PreparedCandidateSlot = std::sync::Arc<
     std::sync::Mutex<Option<crate::agent::session_registry::PreparedRemoteAttachment>>,
 >;
 
+/// A session actor found on its owner, and how it was found.
+struct LocatedRemoteActor {
+    remote_ref: kameo::actor::RemoteActorRef<crate::agent::session_actor::SessionActor>,
+    preferred_scope: Option<crate::agent::remote::scope::MeshScopeId>,
+    outcome: RemoteConnectOutcome,
+}
+
 // ── Reason / outcome / result types ─────────────────────────────────────
 
 /// Why a connect attempt is running. Drives timeout budgets and default
@@ -237,6 +244,21 @@ impl RemoteSessionConnectError {
                 | Self::RecoveryFailed { .. }
                 | Self::TimedOut { .. }
                 | Self::HealthCheckFailed { .. }
+        )
+    }
+
+    /// Whether the failure means the owner could not be reached, as opposed
+    /// to the owner (or local state) giving a definite answer. A load may
+    /// still be served from a local copy in the former case.
+    pub(crate) fn owner_unreachable(&self) -> bool {
+        matches!(
+            self,
+            Self::MeshUnavailable { .. }
+                | Self::NodeUnavailable { .. }
+                | Self::RecoveryFailed { .. }
+                | Self::TimedOut { .. }
+                | Self::HealthCheckFailed { .. }
+                | Self::CoolingDown { .. }
         )
     }
 
@@ -857,10 +879,12 @@ impl LocalAgentHandle {
             return self
                 .attach_and_verify_remote(
                     session_id,
-                    remote_ref,
-                    options.preferred_scope,
+                    LocatedRemoteActor {
+                        remote_ref,
+                        preferred_scope: options.preferred_scope,
+                        outcome: RemoteConnectOutcome::Resumed,
+                    },
                     &merged,
-                    RemoteConnectOutcome::Resumed,
                     prepared_slot,
                     options.windowed,
                 )
@@ -884,10 +908,12 @@ impl LocalAgentHandle {
             match self
                 .attach_and_verify_remote(
                     session_id,
-                    remote_ref,
-                    Some(matched_scope),
+                    LocatedRemoteActor {
+                        remote_ref,
+                        preferred_scope: Some(matched_scope),
+                        outcome: RemoteConnectOutcome::Reattached,
+                    },
                     &merged,
-                    RemoteConnectOutcome::Reattached,
                     prepared_slot,
                     options.windowed,
                 )
@@ -988,10 +1014,12 @@ impl LocalAgentHandle {
             .await?;
         self.attach_and_verify_remote(
             session_id,
-            remote_ref,
-            None,
+            LocatedRemoteActor {
+                remote_ref,
+                preferred_scope: None,
+                outcome: RemoteConnectOutcome::Resumed,
+            },
             &merged,
-            RemoteConnectOutcome::Resumed,
             prepared_slot,
             options.windowed,
         )
@@ -1005,13 +1033,16 @@ impl LocalAgentHandle {
     async fn attach_and_verify_remote(
         &self,
         session_id: &str,
-        remote_ref: kameo::actor::RemoteActorRef<crate::agent::session_actor::SessionActor>,
-        preferred_scope: Option<crate::agent::remote::scope::MeshScopeId>,
+        located: LocatedRemoteActor,
         bookmark: &RemoteSessionBookmark,
-        outcome: RemoteConnectOutcome,
         prepared_slot: &PreparedCandidateSlot,
         windowed: bool,
     ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
+        let LocatedRemoteActor {
+            remote_ref,
+            preferred_scope,
+            outcome,
+        } = located;
         if !Self::remote_actor_matches_node(&remote_ref, &bookmark.node_id) {
             return Err(RemoteSessionConnectError::LocationConflict {
                 session_id: session_id.to_string(),
@@ -1184,17 +1215,14 @@ impl LocalAgentHandle {
             .remote_sync(session_id, &bookmark.node_id)
             .begin_sync();
         tokio::spawn(
-            crate::agent::remote::event_backfill::backfill_remote_events(
+            crate::agent::remote::event_backfill::RemoteSync::new(
                 backfill_sink,
                 session_ref.clone(),
-                session_id.to_string(),
-                bookmark.node_id.clone(),
-                bookmark.peer_label.clone(),
-                attachment_id,
-                sync_cursor,
-                windowed,
-                Some(sync_guard),
-            ),
+                session_id,
+                &bookmark.node_id,
+                &bookmark.peer_label,
+            )
+            .backfill(attachment_id, sync_cursor, windowed, Some(sync_guard)),
         );
 
         Ok(ConnectedRemoteSession {
@@ -2017,10 +2045,12 @@ mod tests {
         let error = handle
             .attach_and_verify_remote(
                 session_id,
-                remote.clone(),
-                None,
+                LocatedRemoteActor {
+                    remote_ref: remote.clone(),
+                    preferred_scope: None,
+                    outcome: RemoteConnectOutcome::Reattached,
+                },
                 &wrong,
-                RemoteConnectOutcome::Reattached,
                 &slot,
                 false,
             )
@@ -2053,10 +2083,12 @@ mod tests {
         let attached = handle
             .attach_and_verify_remote(
                 session_id,
-                remote.clone(),
-                None,
+                LocatedRemoteActor {
+                    remote_ref: remote.clone(),
+                    preferred_scope: None,
+                    outcome: RemoteConnectOutcome::Reattached,
+                },
                 &bookmark,
-                RemoteConnectOutcome::Reattached,
                 &slot,
                 false,
             )
@@ -2083,10 +2115,12 @@ mod tests {
             handle
                 .attach_and_verify_remote(
                     session_id,
-                    dead,
-                    None,
+                    LocatedRemoteActor {
+                        remote_ref: dead,
+                        preferred_scope: None,
+                        outcome: RemoteConnectOutcome::Reattached,
+                    },
                     &changed,
-                    RemoteConnectOutcome::Reattached,
                     &slot,
                     false
                 )

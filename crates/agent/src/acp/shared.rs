@@ -1852,9 +1852,10 @@ impl AcpLiveEventTranslator {
         };
         // Live requests before the window are already inside `prior`; those
         // at or after it are not (the replay skips ones seen live), so they
-        // are added on top. Without a boundary every live request is kept.
+        // are added on top. Earlier ones stay in `request_seqs` so repeated
+        // events are still deduplicated. Without a boundary every live
+        // request is added.
         let start = prior.window_start.unwrap_or(i64::MIN);
-        usage.request_seqs.retain(|seq, _| *seq >= start);
         let mut totals = prior
             .session_totals
             .as_ref()
@@ -1865,7 +1866,12 @@ impl AcpLiveEventTranslator {
                 cache_read_tokens: totals.cache_read_tokens,
                 cache_write_tokens: totals.cache_write_tokens,
             });
-        for request in usage.request_seqs.values().flatten() {
+        for request in usage
+            .request_seqs
+            .iter()
+            .filter(|(seq, _)| **seq >= start)
+            .filter_map(|(_, request)| request.as_ref())
+        {
             totals.get_or_insert_default().add(request);
         }
         usage.session_totals = totals;
@@ -7615,7 +7621,7 @@ mod session_update_tests {
     }
 
     #[test]
-    fn prior_usage_keeps_live_requests_inside_the_window_and_drops_earlier_ones() {
+    fn prior_usage_adds_live_requests_inside_the_window_and_excludes_earlier_ones() {
         use crate::session::history_window::{PriorUsage, SessionHistorySummary, UsageBreakdown};
         let session_id = "s";
         let mut translator = AcpLiveEventTranslator::new();
@@ -7646,10 +7652,14 @@ mod session_update_tests {
             "prior totals plus the live request inside the window only"
         );
         assert!(usage.request_seqs.contains_key(&12));
-        assert!(!usage.request_seqs.contains_key(&5));
-        // Replaying the window's own event does not count it again.
+        assert!(
+            usage.request_seqs.contains_key(&5),
+            "pre-window requests stay known for deduplication"
+        );
+        // Replaying earlier or in-window events does not count them again.
         let usage = translator.usage.get_mut(session_id).unwrap();
         usage.observe(session_id, 12, request_with_tokens(12).kind());
+        usage.observe(session_id, 5, request_with_tokens(5).kind());
         assert_eq!(
             usage.session_totals.as_ref().unwrap().output_tokens,
             1000 + 162

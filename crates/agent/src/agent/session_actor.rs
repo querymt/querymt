@@ -4701,7 +4701,7 @@ mod tests {
     #[cfg(feature = "remote")]
     #[tokio::test]
     async fn backfill_recovers_missed_events_and_dedups_overlap() {
-        use crate::agent::remote::event_backfill::backfill_remote_events;
+        use crate::agent::remote::event_backfill::RemoteSync;
         let fixture = ActorFixture::new().await;
         for _ in 0..3 {
             fixture
@@ -4765,17 +4765,14 @@ mod tests {
             None
         );
 
-        backfill_remote_events(
+        RemoteSync::new(
             sink.clone(),
             session_ref.clone(),
-            "test-session".into(),
-            "node-a".into(),
-            "peer-a".into(),
-            1,
-            cursor,
-            false,
-            None,
+            "test-session",
+            "node-a",
+            "peer-a",
         )
+        .backfill(1, cursor, false, None)
         .await
         .unwrap();
         assert_eq!(
@@ -4811,19 +4808,10 @@ mod tests {
                 ..
             }
         ));
-        backfill_remote_events(
-            sink,
-            session_ref,
-            "test-session".into(),
-            "node-a".into(),
-            "peer-a".into(),
-            2,
-            Some(3),
-            false,
-            None,
-        )
-        .await
-        .unwrap();
+        RemoteSync::new(sink, session_ref, "test-session", "node-a", "peer-a")
+            .backfill(2, Some(3), false, None)
+            .await
+            .unwrap();
         assert!(matches!(
             rx.recv().await.unwrap().kind(),
             crate::events::AgentEventKind::RemoteSessionSyncCompleted {

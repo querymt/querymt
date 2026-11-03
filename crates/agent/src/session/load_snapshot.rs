@@ -789,7 +789,7 @@ mod tests {
     #[tokio::test]
     async fn remote_snapshot_is_owner_ordered_covered_only_with_history_positions() {
         use crate::events::{AgentEventKind, EventOrigin};
-        use crate::session::projection::{EventJournal, NewDurableEvent};
+        use crate::session::projection::NewDurableEvent;
 
         let storage = Arc::new(
             crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())

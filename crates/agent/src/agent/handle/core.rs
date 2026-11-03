@@ -793,19 +793,35 @@ impl LocalAgentHandle {
                         windowed: load_window.is_some(),
                     },
                 )
-                .await
-                .map_err(|error| error.to_acp_error())?;
-            // Snapshot (which also observes runtime status), profile and
-            // config options are independent: run them together. Only the
-            // snapshot can fail the load.
-            let (snapshot, profile, config_options) =
-                super::model_registry::join_remote_load_requests(
-                    &session_id,
-                    self.load_remote_snapshot(&session_id, &connected, load_window),
-                    self.remote_session_profile(&bookmark.node_id, &session_id),
-                    self.remote_session_config_options(&session_id),
-                )
-                .await?;
+                .await;
+            let (snapshot, profile, config_options) = match connected {
+                Ok(connected) => {
+                    // Snapshot (which also observes runtime status), profile
+                    // and config options are independent: run them together.
+                    // Only the snapshot can fail the load.
+                    super::model_registry::join_remote_load_requests(
+                        &session_id,
+                        self.load_remote_snapshot(&session_id, &connected, load_window),
+                        self.remote_session_profile(&bookmark.node_id, &session_id),
+                        self.remote_session_config_options(&session_id),
+                    )
+                    .await?
+                }
+                // The owner cannot be reached: a window that is already local
+                // is served as a stale snapshot; otherwise the connect error
+                // stands.
+                Err(error) => {
+                    let stale = if error.owner_unreachable() {
+                        self.stale_remote_snapshot(&session_id, load_window).await
+                    } else {
+                        None
+                    };
+                    match stale {
+                        Some(snapshot) => (snapshot, None, Default::default()),
+                        None => return Err(error.to_acp_error()),
+                    }
+                }
+            };
             let mut meta = serde_json::Map::new();
             meta.insert("querymt/sessionLoadSnapshot.v1".into(), snapshot);
             meta.insert("location".into(), serde_json::json!("remote"));

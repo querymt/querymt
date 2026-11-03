@@ -248,7 +248,8 @@ pub async fn create_remote_session(
                 Some(response.handoff),
                 false,
             )
-            .await?;
+            .await
+            .map_err(|error| error.to_acp_error())?;
         let (snapshot, profile, config_options) =
             crate::agent::handle::model_registry::join_remote_load_requests(
                 &response.session_id,
@@ -285,14 +286,40 @@ pub async fn attach_remote_session(
     #[cfg(feature = "remote")]
     {
         let window = request.load_window();
-        let connected = agent
+        let connected = match agent
             .connect_remote_for_ext(
                 &request.node_id,
                 &request.session_id,
                 None,
                 window.is_some(),
             )
-            .await?;
+            .await
+        {
+            Ok(connected) => connected,
+            Err(error) => {
+                // The owner cannot be reached: a window that is already local
+                // is served as a stale snapshot, without an attachment.
+                let stale = if error.owner_unreachable() {
+                    agent
+                        .stale_remote_snapshot(&request.session_id, window)
+                        .await
+                } else {
+                    None
+                };
+                return match stale {
+                    Some(snapshot) => Ok(RemoteSessionAttachInfo {
+                        session_id: request.session_id,
+                        node_id: request.node_id,
+                        attached: false,
+                        config_options: Vec::new(),
+                        profile_id: None,
+                        profile_label: None,
+                        snapshot: Some(snapshot),
+                    }),
+                    None => Err(error.to_acp_error()),
+                };
+            }
+        };
         // Snapshot, profile and config options are independent once the
         // session is connected; only the snapshot can fail the attach.
         let (snapshot, profile, config_options) =

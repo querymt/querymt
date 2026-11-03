@@ -276,9 +276,6 @@ impl LocalAgentHandle {
         // Each pass moves the window's lower edge down by one chunk; the
         // absolute deadline is the only bound on the transfer.
         let mut snapshot = loop {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(transfer_failed("history transfer timed out".into()));
-            }
             let built = crate::session::load_snapshot::load_session_snapshot_windowed(
                 self,
                 view_store.clone(),
@@ -295,6 +292,11 @@ impl LocalAgentHandle {
                     "the requested history is not available locally and the owner did not respond"
                         .into(),
                 ));
+            }
+            // A window already in the local journal is served even with no
+            // budget left; only a new transfer needs time.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(transfer_failed("history transfer timed out".into()));
             }
             let session_ref = {
                 let registry = self.registry.lock().await;

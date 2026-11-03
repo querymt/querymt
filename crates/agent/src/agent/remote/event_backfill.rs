@@ -36,7 +36,7 @@ const BACKFILL_PAGE_SIZE: usize = crate::agent::messages::MAX_EVENT_STREAM_PAGE_
 /// `session_seq`) from the host and persist/publish them in host order.
 ///
 /// Pages after `after_source_seq` up to the host tip. Unlike
-/// [`backfill_remote_events`] this never touches the remote sync checkpoint:
+/// [`RemoteSync::backfill`] this never touches the remote sync checkpoint:
 /// it repairs a hole in the live stream and says nothing about whether the
 /// historical snapshot is complete. Persistence is idempotent per source
 /// identity, so overlap with the live event that revealed the gap is a no-op.
@@ -442,57 +442,50 @@ impl RemoteSync {
     }
 }
 
-/// Backfill durable events for a freshly (re)attached remote session.
-///
-/// Spawn-and-forget: must never block connection establishment nor fail it.
-/// Events are persisted without publishing. `tail_first` fetches the recent
-/// window first (first windowed open); the older history is filled afterwards.
-pub(crate) async fn backfill_remote_events(
-    event_sink: Arc<EventSink>,
-    session_ref: SessionActorRef,
-    session_id: String,
-    source_node_id: String,
-    peer_label: String,
-    attachment_id: u64,
-    cursor: Option<i64>,
-    tail_first: bool,
-    pre_guard: Option<SyncGuard>,
-) -> Result<(), crate::error::AgentError> {
-    let span = tracing::info_span!(
-        "remote.session.sync",
-        session_id = %session_id,
-        node_id = %source_node_id,
-        attachment_id,
-    );
-    async move {
-        let boundary = cursor.is_none();
-        let sync = RemoteSync::new(
-            event_sink.clone(),
-            session_ref,
-            &session_id,
-            &source_node_id,
-            &peer_label,
+impl RemoteSync {
+    /// Backfill durable events for a freshly (re)attached remote session.
+    ///
+    /// Spawn-and-forget: must never block connection establishment nor fail
+    /// it. Events are persisted without publishing. `tail_first` fetches the
+    /// recent window first (first windowed open); the older history is filled
+    /// afterwards.
+    pub(crate) async fn backfill(
+        self,
+        attachment_id: u64,
+        cursor: Option<i64>,
+        tail_first: bool,
+        pre_guard: Option<SyncGuard>,
+    ) -> Result<(), crate::error::AgentError> {
+        let span = tracing::info_span!(
+            "remote.session.sync",
+            session_id = %self.session_id,
+            node_id = %self.node_id,
+            attachment_id,
         );
-        let backfilled = match sync.sync_all(tail_first, pre_guard).await {
-            Ok(count) => count,
-            Err(error) => {
-                tracing::warn!(session_id, %error, "backfill unavailable; history may be stale");
-                return Err(error);
-            }
-        };
-        tracing::info!(session_id, backfilled, "backfill completed");
-        event_sink.emit_ephemeral_with_origin(
-            &session_id,
-            AgentEventKind::RemoteSessionSyncCompleted {
-                backfilled: backfilled as _,
-                boundary,
-                node_id: Some(source_node_id),
-            },
-            EventOrigin::Local,
-            None,
-        );
-        Ok(())
+        async move {
+            let session_id = self.session_id.as_str();
+            let boundary = cursor.is_none();
+            let backfilled = match self.sync_all(tail_first, pre_guard).await {
+                Ok(count) => count,
+                Err(error) => {
+                    tracing::warn!(session_id, %error, "backfill unavailable; history may be stale");
+                    return Err(error);
+                }
+            };
+            tracing::info!(session_id, backfilled, "backfill completed");
+            self.sink.emit_ephemeral_with_origin(
+                session_id,
+                AgentEventKind::RemoteSessionSyncCompleted {
+                    backfilled: backfilled as _,
+                    boundary,
+                    node_id: Some(self.node_id.clone()),
+                },
+                EventOrigin::Local,
+                None,
+            );
+            Ok(())
+        }
+        .instrument(span)
+        .await
     }
-    .instrument(span)
-    .await
 }

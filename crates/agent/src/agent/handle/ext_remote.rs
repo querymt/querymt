@@ -56,7 +56,10 @@ impl LocalAgentHandle {
         session_id: &str,
         handoff: Option<crate::agent::remote::node_manager::SessionHandoff>,
         windowed: bool,
-    ) -> Result<super::remote_connect::ConnectedRemoteSession, Error> {
+    ) -> Result<
+        super::remote_connect::ConnectedRemoteSession,
+        super::remote_connect::RemoteSessionConnectError,
+    > {
         // A persisted remote identity means this attach is a repair reconnect
         // (plan §12), not a first-time attach: reinstall the attachment instead
         // of early-returning a possibly-broken one.
@@ -102,7 +105,6 @@ impl LocalAgentHandle {
             },
         )
         .await
-        .map_err(|err| err.to_acp_error())
     }
 
     pub(super) async fn handle_ext_remote_dismiss_session(
