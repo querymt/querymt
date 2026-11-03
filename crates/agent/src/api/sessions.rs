@@ -200,12 +200,14 @@ fn acp_session_source_from_meta(
         .get(crate::acp::shared::QUERYMT_META_NAMESPACE)
         .and_then(|querymt| querymt.get("sessionSource"))
         .or_else(|| meta.get("sessionSource"));
-    match value.and_then(serde_json::Value::as_str) {
-        None => Ok(AcpSessionSource::All),
+    let Some(value) = value else {
+        return Ok(AcpSessionSource::All);
+    };
+    match value.as_str() {
         Some("all") => Ok(AcpSessionSource::All),
         Some("local") => Ok(AcpSessionSource::Local),
         Some("remote") => Ok(AcpSessionSource::Remote),
-        Some(other) => Err(anyhow!("invalid _meta.querymt.sessionSource: {other}").into()),
+        _ => Err(anyhow!("invalid _meta.querymt.sessionSource: {value}").into()),
     }
 }
 
@@ -2399,5 +2401,53 @@ mod remote_page_tests {
                 "after-timeout".to_string(),
             ])
         );
+    }
+}
+
+#[cfg(test)]
+mod session_source_tests {
+    use super::*;
+
+    fn meta(value: serde_json::Value) -> Meta {
+        value.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn session_source_defaults_to_all_only_when_absent() {
+        assert_eq!(
+            acp_session_source_from_meta(None).unwrap(),
+            AcpSessionSource::All
+        );
+        let empty = meta(serde_json::json!({}));
+        assert_eq!(
+            acp_session_source_from_meta(Some(&empty)).unwrap(),
+            AcpSessionSource::All
+        );
+    }
+
+    #[test]
+    fn session_source_prefers_nested_key_and_rejects_non_strings() {
+        let nested = meta(serde_json::json!({
+            "querymt": { "sessionSource": "local" },
+            "sessionSource": "remote",
+        }));
+        assert_eq!(
+            acp_session_source_from_meta(Some(&nested)).unwrap(),
+            AcpSessionSource::Local
+        );
+        let top = meta(serde_json::json!({ "sessionSource": "remote" }));
+        assert_eq!(
+            acp_session_source_from_meta(Some(&top)).unwrap(),
+            AcpSessionSource::Remote
+        );
+        for bad in [
+            serde_json::json!({ "sessionSource": null }),
+            serde_json::json!({ "sessionSource": 5 }),
+            serde_json::json!({ "querymt": { "sessionSource": null } }),
+            serde_json::json!({ "querymt": { "sessionSource": "nope" } }),
+        ] {
+            let bad = meta(bad);
+            assert!(acp_session_source_from_meta(Some(&bad)).is_err());
+        }
     }
 }

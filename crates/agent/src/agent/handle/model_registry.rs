@@ -100,9 +100,10 @@ impl LocalAgentHandle {
         connected: &super::remote_connect::ConnectedRemoteSession,
         window: Option<crate::session::history_window::LoadWindow>,
     ) -> Result<serde_json::Value, agent_client_protocol::Error> {
-        let budget = remote_transfer_budget();
-        let sync = match tokio::time::timeout(
-            budget,
+        // One deadline for the sync and the snapshot's own backfill.
+        let deadline = tokio::time::Instant::now() + remote_transfer_budget();
+        let sync = match tokio::time::timeout_at(
+            deadline,
             self.sync_remote_for_load(session_id, connected, window.is_some()),
         )
         .await
@@ -115,7 +116,8 @@ impl LocalAgentHandle {
         if let Err(error) = &sync {
             log::warn!("remote history sync before load failed: session_id={session_id}: {error}");
         }
-        self.build_remote_attach_snapshot_with_budget(session_id, window, sync, budget)
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        self.build_remote_attach_snapshot_with_budget(session_id, window, sync, remaining)
             .await
     }
 
@@ -176,6 +178,10 @@ impl LocalAgentHandle {
             .load_remote_history(session_id, &bookmark.node_id)
             .await
             .map_err(internal)?;
+        // Nothing synced and nothing local: let the caller use its own source.
+        if tip == 0 && history.is_empty() {
+            return Ok(None);
+        }
         Ok(Some(
             history
                 .into_iter()
@@ -267,8 +273,12 @@ impl LocalAgentHandle {
         }
 
         let probe = crate::agent::load_telemetry::LoadProbe::start();
-        let mut snapshot = None;
-        for _ in 0..8 {
+        // Each pass moves the window's lower edge down by one chunk; the
+        // absolute deadline is the only bound on the transfer.
+        let mut snapshot = loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(transfer_failed("history transfer timed out".into()));
+            }
             let built = crate::session::load_snapshot::load_session_snapshot_windowed(
                 self,
                 view_store.clone(),
@@ -278,8 +288,7 @@ impl LocalAgentHandle {
             .await
             .map_err(|error| internal(format!("Failed to build session load snapshot: {error}")))?;
             let Some((start, end)) = missing_older_range(&state, &built, window.is_some()) else {
-                snapshot = Some(built);
-                break;
+                break built;
             };
             if stale || !state.has_data() && state.tip() == 0 && sync.is_err() {
                 return Err(transfer_failed(
@@ -306,9 +315,7 @@ impl LocalAgentHandle {
                 Ok(Err(error)) => return Err(transfer_failed(error.to_string())),
                 Err(_) => return Err(transfer_failed("history transfer timed out".into())),
             }
-        }
-        let mut snapshot = snapshot
-            .ok_or_else(|| transfer_failed("remote history kept changing during load".into()))?;
+        };
         if stale && !state.has_data() {
             return Err(transfer_failed(
                 "the owner did not respond and no history is available locally".into(),

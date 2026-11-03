@@ -335,6 +335,9 @@ impl RemoteSyncState {
     /// repairs gaps), so coverage follows it - unless a fetch is reserving
     /// that range, which will cover it itself.
     pub async fn note_live(&self, seq: i64) -> SessionResult<()> {
+        // Decide only after taking the apply lock: an epoch reset or a fetch
+        // may have changed the state while this call waited.
+        let _guard = self.apply.lock().await;
         let range = {
             let inner = self.inner.lock();
             let max = inner.coverage.max_end().unwrap_or(0);
@@ -346,7 +349,6 @@ impl RemoteSyncState {
             }
             (max + 1, seq)
         };
-        let _guard = self.apply.lock().await;
         self.journal
             .add_remote_coverage(&self.session_id, &self.node_id, range.0, range.1)
             .await?;
@@ -502,6 +504,34 @@ mod tests {
         state.release(11, 20);
         state.note_live(14).await.unwrap();
         assert_eq!(state.max_covered(), 14);
+    }
+
+    #[tokio::test]
+    async fn live_note_waiting_for_apply_lock_revalidates_after_epoch_reset() {
+        let (state, journal) = state().await;
+        assert_eq!(state.check_epoch(0).await.unwrap(), EpochCheck::Current);
+        state.mark_covered(1, 10, 10).await.unwrap();
+        state.set_live_anchored(true);
+
+        let guard = state.lock_apply().await;
+        let waiting = {
+            let state = state.clone();
+            tokio::spawn(async move { state.note_live(14).await })
+        };
+        tokio::task::yield_now().await;
+        // The reset runs while note_live is queued behind the apply lock.
+        assert_eq!(state.check_epoch(1).await.unwrap(), EpochCheck::Reset);
+        drop(guard);
+        waiting.await.unwrap().unwrap();
+
+        assert_eq!(state.max_covered(), 0, "no coverage after the reset");
+        assert!(
+            journal
+                .remote_coverage("s1", "node-a")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -219,6 +219,11 @@ pub struct SummaryUsage {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PriorUsage {
+    /// Journal position of the window's first event; the prior totals cover
+    /// exactly the events with a smaller position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[typeshare(serialized_as = "Option<number>")]
+    pub window_start: Option<i64>,
     pub session_totals: Option<UsageBreakdown>,
     pub partial: bool,
     #[typeshare(serialized_as = "number")]
@@ -799,6 +804,7 @@ pub async fn summarize_history(
         context_position: acc.context.map(|(_, position)| position),
         accounting: reducer.session().clone(),
         before_window: prior.map(|prior| PriorUsage {
+            window_start,
             session_totals: prior.totals,
             partial: prior.partial,
             request_count: prior.requests,

@@ -1423,7 +1423,9 @@ struct SessionUsageProjection {
     latest_request: Option<TokenUsageBreakdown>,
     session_totals: Option<TokenUsageBreakdown>,
     partial: bool,
-    request_seqs: HashSet<i64>,
+    /// Observed main requests by journal position, with their usage, so a
+    /// windowed seed can split live requests around the window boundary.
+    request_seqs: HashMap<i64, Option<TokenUsageBreakdown>>,
     latest_request_seq: Option<i64>,
     provider_seq: Option<i64>,
     history_loaded: bool,
@@ -1453,6 +1455,20 @@ impl From<&querymt::Usage> for TokenUsageBreakdown {
             cache_read_tokens: u64::from(usage.cache_read),
             cache_write_tokens: u64::from(usage.cache_write),
         }
+    }
+}
+
+impl TokenUsageBreakdown {
+    fn add(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
     }
 }
 
@@ -1528,30 +1544,19 @@ impl SessionUsageProjection {
                 accounting,
                 ..
             } => {
-                if !self.request_seqs.insert(seq) {
+                if self.request_seqs.contains_key(&seq) {
                     return false;
                 }
+                let request = usage.as_ref().map(TokenUsageBreakdown::from);
+                self.request_seqs.insert(seq, request.clone());
                 self.observe_context_used(seq, *context_tokens);
                 let legacy_changed = if accounting.is_none() {
                     self.apply_accounting(session_id, seq, kind)
                 } else {
                     false
                 };
-                let request = usage.as_ref().map(TokenUsageBreakdown::from);
                 if let Some(request) = request.as_ref() {
-                    let totals = self.session_totals.get_or_insert_default();
-                    totals.input_tokens = totals.input_tokens.saturating_add(request.input_tokens);
-                    totals.output_tokens =
-                        totals.output_tokens.saturating_add(request.output_tokens);
-                    totals.reasoning_tokens = totals
-                        .reasoning_tokens
-                        .saturating_add(request.reasoning_tokens);
-                    totals.cache_read_tokens = totals
-                        .cache_read_tokens
-                        .saturating_add(request.cache_read_tokens);
-                    totals.cache_write_tokens = totals
-                        .cache_write_tokens
-                        .saturating_add(request.cache_write_tokens);
+                    self.session_totals.get_or_insert_default().add(request);
                 } else {
                     self.partial = true;
                 }
@@ -1845,7 +1850,12 @@ impl AcpLiveEventTranslator {
         let Some(prior) = &summary.usage.before_window else {
             return;
         };
-        usage.session_totals = prior
+        // Live requests before the window are already inside `prior`; those
+        // at or after it are not (the replay skips ones seen live), so they
+        // are added on top. Without a boundary every live request is kept.
+        let start = prior.window_start.unwrap_or(i64::MIN);
+        usage.request_seqs.retain(|seq, _| *seq >= start);
+        let mut totals = prior
             .session_totals
             .as_ref()
             .map(|totals| TokenUsageBreakdown {
@@ -1855,6 +1865,10 @@ impl AcpLiveEventTranslator {
                 cache_read_tokens: totals.cache_read_tokens,
                 cache_write_tokens: totals.cache_write_tokens,
             });
+        for request in usage.request_seqs.values().flatten() {
+            totals.get_or_insert_default().add(request);
+        }
+        usage.session_totals = totals;
         usage.partial |= prior.partial;
         usage.prior_requests = prior.request_count;
     }
@@ -7598,6 +7612,48 @@ mod session_update_tests {
         assert!(!usage.partial);
         assert_eq!(usage.context_limit, Some(100_000));
         assert_eq!(usage.session_totals.as_ref().unwrap().output_tokens, 162);
+    }
+
+    #[test]
+    fn prior_usage_keeps_live_requests_inside_the_window_and_drops_earlier_ones() {
+        use crate::session::history_window::{PriorUsage, SessionHistorySummary, UsageBreakdown};
+        let session_id = "s";
+        let mut translator = AcpLiveEventTranslator::new();
+        {
+            let usage = translator.usage.entry(session_id.to_owned()).or_default();
+            // Seq 5 precedes the window (already inside the prior totals);
+            // seq 12 is inside it and was observed live before seeding.
+            usage.observe(session_id, 5, request_with_tokens(5).kind());
+            usage.observe(session_id, 12, request_with_tokens(12).kind());
+        }
+        let mut summary = SessionHistorySummary::default();
+        summary.usage.before_window = Some(PriorUsage {
+            window_start: Some(10),
+            session_totals: Some(UsageBreakdown {
+                output_tokens: 1000,
+                ..UsageBreakdown::default()
+            }),
+            partial: false,
+            request_count: 4,
+            accounting: Default::default(),
+        });
+        translator.seed_prior_usage(session_id, &summary);
+
+        let usage = &translator.usage[session_id];
+        assert_eq!(
+            usage.session_totals.as_ref().unwrap().output_tokens,
+            1000 + 162,
+            "prior totals plus the live request inside the window only"
+        );
+        assert!(usage.request_seqs.contains_key(&12));
+        assert!(!usage.request_seqs.contains_key(&5));
+        // Replaying the window's own event does not count it again.
+        let usage = translator.usage.get_mut(session_id).unwrap();
+        usage.observe(session_id, 12, request_with_tokens(12).kind());
+        assert_eq!(
+            usage.session_totals.as_ref().unwrap().output_tokens,
+            1000 + 162
+        );
     }
 
     #[tokio::test]
