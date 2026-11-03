@@ -1768,6 +1768,26 @@ impl Message<crate::agent::messages::GetEventStreamSince> for SessionActor {
     }
 }
 
+/// Serve one size-bounded chunk of the durable event stream, forward or
+/// backward (see `agent::event_chunk`). Replaces per-200-event paging for
+/// sync and history on peers that support it.
+impl Message<crate::agent::messages::GetEventStreamChunk> for SessionActor {
+    type Reply = Result<crate::agent::messages::EventStreamChunk, AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: crate::agent::messages::GetEventStreamChunk,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        crate::agent::event_chunk::build_event_stream_chunk(
+            &**self.config.event_sink.journal(),
+            &self.session_id,
+            &msg,
+        )
+        .await
+    }
+}
+
 /// Subscribe a remote event relay to this session's events.
 ///
 /// New peers hand off a direct relay capability. The DHT name remains a
@@ -3604,6 +3624,10 @@ mod tests {
         async fn max_stream_seq(&self, session_id: &str) -> SessionResult<i64> {
             self.inner.max_stream_seq(session_id).await
         }
+
+        async fn history_epoch(&self, session_id: &str) -> SessionResult<u64> {
+            self.inner.history_epoch(session_id).await
+        }
     }
 
     struct ActorFixture {
@@ -4430,6 +4454,247 @@ mod tests {
         assert_eq!(at_tip.latest_source_seq, 3);
     }
 
+    /// Owner (spawned actor) + attaching node (separate sink/journal) for the
+    /// single-transfer sync tests.
+    #[cfg(feature = "remote")]
+    struct SyncRig {
+        owner: ActorFixture,
+        journal: Arc<dyn EventJournal>,
+        sink: Arc<crate::event_sink::EventSink>,
+        rx: tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+    }
+
+    #[cfg(feature = "remote")]
+    impl SyncRig {
+        async fn new(owner_events: usize) -> Self {
+            let owner = ActorFixture::new().await;
+            owner.append_owner_events(owner_events).await;
+            let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap();
+            let journal = storage.event_journal();
+            let fanout = Arc::new(crate::event_fanout::EventFanout::new());
+            let rx = fanout.subscribe();
+            let sink = Arc::new(crate::event_sink::EventSink::new(journal.clone(), fanout));
+            Self {
+                owner,
+                journal,
+                sink,
+                rx,
+            }
+        }
+
+        fn sync(&self) -> crate::agent::remote::event_backfill::RemoteSync {
+            crate::agent::remote::event_backfill::RemoteSync::new(
+                self.sink.clone(),
+                crate::agent::remote::SessionActorRef::from(self.owner.actor_ref.clone()),
+                "test-session",
+                "node-a",
+                "peer-a",
+            )
+        }
+
+        async fn local_positions(&self) -> Vec<i64> {
+            self.journal
+                .load_remote_history("test-session", "node-a")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(position, _)| position)
+                .collect()
+        }
+
+        async fn owner_tip(&self) -> i64 {
+            self.owner
+                .config
+                .event_sink
+                .journal()
+                .max_stream_seq("test-session")
+                .await
+                .unwrap()
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    impl ActorFixture {
+        async fn append_owner_events(&self, count: usize) {
+            let journal = self.config.event_sink.journal();
+            for _ in 0..count {
+                journal
+                    .append_durable(&NewDurableEvent {
+                        session_id: "test-session".into(),
+                        origin: crate::events::EventOrigin::Local,
+                        source_node: None,
+                        source_node_id: None,
+                        source_seq: None,
+                        session_seq: None,
+                        kind: crate::events::AgentEventKind::SessionCreated,
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn typical_remote_session_transfers_in_one_request_without_live_updates() {
+        let mut rig = SyncRig::new(3_000).await;
+        let sync = rig.sync();
+        let tip = rig.owner_tip().await;
+        sync.sync_all(false, None).await.unwrap();
+        let (requests, received, inserted) = sync.state().transfers();
+        assert_eq!(
+            (requests, received, inserted),
+            (1, tip as u64, tip as u64),
+            "3,000 events take exactly one request"
+        );
+        assert_eq!(rig.local_positions().await, (1..=tip).collect::<Vec<_>>());
+        // History is persisted without publishing.
+        assert!(rig.rx.try_recv().is_err(), "no session/update for history");
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn tail_first_open_reads_in_owner_order_and_resumes_without_gaps() {
+        let rig = SyncRig::new(50).await;
+        let tip = rig.owner_tip().await;
+        let sync = rig.sync().with_window_events(10);
+        assert_eq!(sync.open(true).await.unwrap(), 10);
+        // Only the covered recent window is visible, in owner order.
+        assert_eq!(
+            rig.local_positions().await,
+            ((tip - 9)..=tip).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rig.journal
+                .remote_sync_cursor("test-session", "node-a")
+                .await
+                .unwrap(),
+            Some(0),
+            "cursor only advances over a contiguous prefix"
+        );
+
+        // Interrupted before the fill: a restarted node (new sink, same
+        // journal) resumes from the persisted coverage.
+        let restarted = Arc::new(crate::event_sink::EventSink::new(
+            rig.journal.clone(),
+            Arc::new(crate::event_fanout::EventFanout::new()),
+        ));
+        let resumed = crate::agent::remote::event_backfill::RemoteSync::new(
+            restarted,
+            crate::agent::remote::SessionActorRef::from(rig.owner.actor_ref.clone()),
+            "test-session",
+            "node-a",
+            "peer-a",
+        );
+        assert_eq!(resumed.fill().await.unwrap(), Some((tip - 10) as usize));
+        assert_eq!(rig.local_positions().await, (1..=tip).collect::<Vec<_>>());
+        assert_eq!(
+            rig.journal
+                .remote_sync_cursor("test-session", "node-a")
+                .await
+                .unwrap(),
+            Some(tip)
+        );
+        let stored = rig
+            .journal
+            .load_session_stream("test-session", None, None)
+            .await
+            .unwrap();
+        assert_eq!(stored.len() as i64, tip, "no duplicates");
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn on_demand_and_fill_transfer_each_event_once() {
+        let rig = SyncRig::new(200).await;
+        let tip = rig.owner_tip().await;
+        let sync = rig.sync().with_window_events(20);
+        sync.open(true).await.unwrap();
+        let (fill, demand_a, demand_b) = tokio::join!(
+            sync.fill(),
+            sync.ensure_covered(1, 100),
+            sync.ensure_covered(50, 150)
+        );
+        fill.unwrap();
+        demand_a.unwrap();
+        demand_b.unwrap();
+        let (_, received, inserted) = sync.state().transfers();
+        assert_eq!(inserted, tip as u64);
+        assert_eq!(received, tip as u64, "every event crossed the mesh once");
+        assert_eq!(rig.local_positions().await, (1..=tip).collect::<Vec<_>>());
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn undone_turns_disappear_after_epoch_resync() {
+        let rig = SyncRig::new(30).await;
+        let sync = rig.sync();
+        sync.sync_all(false, None).await.unwrap();
+        assert_eq!(rig.local_positions().await.len(), 30);
+
+        // Owner undoes events 21.. (bumps its history epoch), then continues.
+        let owner_journal = rig.owner.config.event_sink.journal();
+        owner_journal
+            .delete_session_events_from("test-session", 21)
+            .await
+            .unwrap();
+        rig.owner.append_owner_events(5).await;
+        let tip = rig.owner_tip().await;
+
+        sync.sync_all(false, None).await.unwrap();
+        let positions = rig.local_positions().await;
+        assert_eq!(positions.len() as i64, 20 + (tip - 30).max(0));
+        assert!(positions.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(
+            positions.len(),
+            owner_journal
+                .load_session_stream("test-session", None, None)
+                .await
+                .unwrap()
+                .len(),
+            "local copy equals the owner's rewritten history"
+        );
+        assert_eq!(sync.state().epoch(), Some(1));
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn reopen_transfers_only_new_events() {
+        let rig = SyncRig::new(100).await;
+        let sync = rig.sync();
+        sync.sync_all(false, None).await.unwrap();
+
+        let (_, before, _) = sync.state().transfers();
+        // Reopen with no changes: no history events cross the mesh.
+        assert_eq!(sync.open(false).await.unwrap(), 0);
+        assert_eq!(sync.state().transfers().1, before);
+
+        // 30 new events: exactly those 30 cross, on the same state (reused
+        // attachment) and on a fresh node state after restart.
+        rig.owner.append_owner_events(30).await;
+        assert_eq!(sync.open(false).await.unwrap(), 30);
+        assert_eq!(sync.state().transfers().1, before + 30);
+
+        rig.owner.append_owner_events(30).await;
+        let restarted = Arc::new(crate::event_sink::EventSink::new(
+            rig.journal.clone(),
+            Arc::new(crate::event_fanout::EventFanout::new()),
+        ));
+        let fresh = crate::agent::remote::event_backfill::RemoteSync::new(
+            restarted,
+            crate::agent::remote::SessionActorRef::from(rig.owner.actor_ref.clone()),
+            "test-session",
+            "node-a",
+            "peer-a",
+        );
+        assert_eq!(fresh.open(false).await.unwrap(), 30);
+        assert_eq!(fresh.state().transfers().1, 30);
+        let tip = rig.owner_tip().await;
+        assert_eq!(rig.local_positions().await, (1..=tip).collect::<Vec<_>>());
+    }
+
     /// End-to-end backfill loop (plan §16) against a spawned session actor:
     /// legacy boundary skips the fetch, a persisted cursor recovers missed
     /// events exactly once, and re-running after reaching the tip is a no-op.
@@ -4508,6 +4773,8 @@ mod tests {
             "peer-a".into(),
             1,
             cursor,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -4534,11 +4801,8 @@ mod tests {
                 .unwrap(),
             Some(3)
         );
-        // Both missed events publish, followed by sync completion. Live overlap
-        // must not be published a second time.
-        for _ in 0..2 {
-            assert!(rx.recv().await.unwrap().is_durable());
-        }
+        // History is persisted without publishing: only sync completion is
+        // delivered (2 newly persisted events; the live overlap was a no-op).
         assert!(matches!(
             rx.recv().await.unwrap().kind(),
             crate::events::AgentEventKind::RemoteSessionSyncCompleted {
@@ -4555,6 +4819,8 @@ mod tests {
             "peer-a".into(),
             2,
             Some(3),
+            false,
+            None,
         )
         .await
         .unwrap();

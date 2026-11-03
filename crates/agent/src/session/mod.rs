@@ -61,8 +61,12 @@ pub use domain_schedule::{
 pub use repo_schedule::ScheduleRepository;
 
 // Projection stores
+pub mod history_window;
 pub mod load_snapshot;
 pub mod projection;
+pub mod ranges;
+pub mod remote_sync;
+pub mod turns;
 
 pub use load_snapshot::{
     SessionLoadSnapshot, StreamCursor, cursor_from_events, load_session_snapshot,

@@ -481,6 +481,14 @@ impl AccountingReducer {
         &self.session
     }
 
+    /// Replace the session-lifetime totals with whole-session totals computed
+    /// elsewhere (a windowed load only replays part of the journal). Attempt
+    /// tracking, cycles and purposes are untouched, so attempts seen in the
+    /// replayed window still resolve normally when they settle live.
+    pub fn replace_session_totals(&mut self, totals: ScopeTotals) {
+        self.session = totals;
+    }
+
     /// Totals for attempts attributed to one execution cycle (zero if none).
     pub fn cycle(&self, cycle_id: &str) -> ScopeTotals {
         self.cycles.get(cycle_id).cloned().unwrap_or_default()

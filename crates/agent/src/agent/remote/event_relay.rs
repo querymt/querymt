@@ -333,6 +333,20 @@ impl Message<RelayedEvent> for EventRelayActor {
                         .await
                         .map(|_| ()),
                 };
+                // A persisted live event extends the covered range once a sync
+                // anchored the live stream (see `RemoteSyncState::note_live`).
+                if result.is_ok()
+                    && let (Some(node_id), Some(seq)) = (&self.remote_node_id, source_seq)
+                {
+                    let state = self.event_sink.remote_sync(&self.session_id, node_id);
+                    if let Err(e) = state.note_live(seq).await {
+                        log::warn!(
+                            "EventRelayActor({}): failed to record live coverage: {}",
+                            self.source_label,
+                            e
+                        );
+                    }
+                }
                 if let Err(e) = result {
                     log::warn!(
                         "EventRelayActor({}): failed to persist relayed durable event: {}",

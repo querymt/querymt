@@ -1867,3 +1867,147 @@ async fn test_querymt_remote_dismiss_session_returns_structured_result() {
     assert_eq!(dismissed["success"], true);
     assert_eq!(dismissed["session_id"], "remote-session-1");
 }
+
+#[cfg(feature = "remote")]
+async fn viewer_with_synced_history(
+    session_id: &str,
+    node_id: &str,
+    count: i64,
+) -> (RealStorageHandleFixture, Vec<crate::events::AgentEventKind>) {
+    use crate::events::AgentEventKind;
+    use crate::session::store::RemoteSessionBookmark;
+    let viewer = RealStorageHandleFixture::new().await;
+    viewer
+        .storage
+        .session_store()
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: session_id.into(),
+            node_id: node_id.into(),
+            peer_label: "owner".into(),
+            cwd: None,
+            created_at: 1_700_000_000,
+            title: None,
+        })
+        .await
+        .unwrap();
+    let sink = viewer.handle.config.event_sink.clone();
+    let mut kinds = Vec::new();
+    for seq in 1..=count {
+        let kind = if seq % 2 == 1 {
+            AgentEventKind::RunStarted {
+                run_id: format!("r{seq}"),
+                origin: "interactive".into(),
+            }
+        } else {
+            AgentEventKind::PromptReceived {
+                content: format!("prompt {seq}"),
+                message_id: None,
+            }
+        };
+        kinds.push(kind.clone());
+        sink.persist_durable_from_source(
+            session_id,
+            kind,
+            Some("owner".into()),
+            node_id.into(),
+            seq,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let state = sink.remote_sync(session_id, node_id);
+    state.hydrate().await.unwrap();
+    let _guard = state.lock_apply().await;
+    state.mark_covered(1, count, count).await.unwrap();
+    drop(_guard);
+    (viewer, kinds)
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn remote_snapshot_matches_owner_history_in_owner_order() {
+    let (viewer, kinds) = viewer_with_synced_history("rs-1", "node-x", 6).await;
+    for window in [
+        None,
+        Some(crate::session::history_window::LoadWindow::default()),
+    ] {
+        let snapshot = viewer
+            .handle
+            .build_remote_attach_snapshot_with_budget(
+                "rs-1",
+                window,
+                Ok(()),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let events: Vec<crate::events::AgentEvent> =
+            serde_json::from_value(snapshot["audit"]["events"].clone()).unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            (1..=6).collect::<Vec<_>>()
+        );
+        for (event, kind) in events.iter().zip(&kinds) {
+            assert_eq!(
+                serde_json::to_value(&event.kind).unwrap(),
+                serde_json::to_value(kind).unwrap()
+            );
+        }
+        assert!(snapshot["history"]["stale"].is_null());
+    }
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn unreachable_owner_without_local_window_fails_retryably_without_partial_history() {
+    let viewer = RealStorageHandleFixture::new().await;
+    viewer
+        .storage
+        .session_store()
+        .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+            session_id: "rs-2".into(),
+            node_id: "node-y".into(),
+            peer_label: "owner".into(),
+            cwd: None,
+            created_at: 1_700_000_000,
+            title: None,
+        })
+        .await
+        .unwrap();
+    let error = viewer
+        .handle
+        .build_remote_attach_snapshot_with_budget(
+            "rs-2",
+            Some(crate::session::history_window::LoadWindow::default()),
+            Err(crate::error::AgentError::Internal(
+                "owner unreachable".into(),
+            )),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+    let data = error.data.unwrap();
+    assert_eq!(data["code"], "remote_transfer_failed");
+    assert_eq!(data["retryable"], true);
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn unreachable_owner_with_local_window_serves_stale_snapshot() {
+    let (viewer, _) = viewer_with_synced_history("rs-3", "node-z", 4).await;
+    let snapshot = viewer
+        .handle
+        .build_remote_attach_snapshot_with_budget(
+            "rs-3",
+            Some(crate::session::history_window::LoadWindow::default()),
+            Err(crate::error::AgentError::Internal(
+                "owner unreachable".into(),
+            )),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot["history"]["stale"], true);
+    assert_eq!(snapshot["audit"]["events"].as_array().unwrap().len(), 4);
+}

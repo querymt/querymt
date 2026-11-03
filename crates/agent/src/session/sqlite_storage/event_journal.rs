@@ -5,7 +5,8 @@ use uuid::Uuid;
 use crate::events::{AgentEventKind, DurableEvent, EventOrigin};
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::projection::{
-    EventJournal, NewDurableEvent, RunLifecycle, last_unfinished_run_in,
+    EventJournal, HistoryPageDirection, NewDurableEvent, RunLifecycle, last_unfinished_run_in,
+    slice_history_page,
 };
 
 use super::SqliteStorage;
@@ -206,6 +207,140 @@ impl EventJournal for SqliteStorage {
         .map_err(SessionError::from)
     }
 
+    async fn load_session_page_before(
+        &self,
+        session_id: &str,
+        before_seq: Option<i64>,
+        limit: usize,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        let session_id = session_id.to_string();
+        let conn_arc = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<DurableEvent>, rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+            let before = before_seq.unwrap_or(i64::MAX);
+            let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+            let mut stmt = conn.prepare(
+                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json, session_seq \
+                 FROM event_journal \
+                 WHERE session_id = ? AND stream_seq < ? \
+                 ORDER BY stream_seq DESC \
+                 LIMIT ?",
+            )?;
+            let mut events = stmt
+                .query_map(params![session_id, before, lim], parse_journal_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            events.reverse();
+            Ok(events)
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+
+    async fn load_history_page(
+        &self,
+        session_id: &str,
+        source_node_id: Option<&str>,
+        direction: HistoryPageDirection,
+        limit: usize,
+    ) -> SessionResult<Vec<(i64, DurableEvent)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(node_id) = source_node_id else {
+            let events = match direction {
+                HistoryPageDirection::Forward { after } => {
+                    self.load_session_page(session_id, Some(after), Some(limit))
+                        .await?
+                }
+                HistoryPageDirection::Backward { before } => {
+                    self.load_session_page_before(session_id, before, limit)
+                        .await?
+                }
+            };
+            return Ok(events
+                .into_iter()
+                .map(|event| (event.stream_seq, event))
+                .collect());
+        };
+        let session = session_id.to_owned();
+        let node = node_id.to_owned();
+        let conn = self.conn.clone();
+        let paged = tokio::task::spawn_blocking(
+            move || -> SessionResult<Option<Vec<(i64, DurableEvent)>>> {
+                let conn = conn.lock().unwrap();
+                let (cursor, complete) = read_sync_row(&conn, &session, &node)?;
+                let mut covered = read_coverage(&conn, &session, &node)?;
+                if cursor > 0 {
+                    covered.insert(1, cursor);
+                }
+                if !complete && covered.is_empty() {
+                    // Cursorless legacy copies are visible: take the slow path.
+                    return Ok(None);
+                }
+                const COLUMNS: &str = "SELECT event_id, stream_seq, session_id, timestamp, origin, \
+                     source_node, payload_json, session_seq, source_seq FROM event_journal \
+                     WHERE session_id = ?1 AND source_node_id = ?2 AND source_seq BETWEEN ?3 AND ?4";
+                let read = |lo: i64, hi: i64, desc: bool, take: usize| -> SessionResult<Vec<(i64, DurableEvent)>> {
+                    let sql = format!(
+                        "{COLUMNS} ORDER BY source_seq {} LIMIT ?5",
+                        if desc { "DESC" } else { "ASC" }
+                    );
+                    let mut stmt = conn.prepare_cached(&sql)?;
+                    let take = i64::try_from(take).unwrap_or(i64::MAX);
+                    let rows = stmt.query_map(params![session, node, lo, hi, take], |row| {
+                        Ok((parse_journal_row(row)?, row.get::<_, i64>(8)?))
+                    })?;
+                    let mut out = Vec::new();
+                    for row in rows {
+                        let (event, position) = row?;
+                        out.push((position, event));
+                    }
+                    Ok(out)
+                };
+                let mut out: Vec<(i64, DurableEvent)> = Vec::new();
+                match direction {
+                    HistoryPageDirection::Forward { after } => {
+                        for &(a, b) in covered.ranges() {
+                            if b <= after {
+                                continue;
+                            }
+                            let lo = a.max(after.saturating_add(1));
+                            out.extend(read(lo, b, false, limit - out.len())?);
+                            if out.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                    HistoryPageDirection::Backward { before } => {
+                        for &(a, b) in covered.ranges().iter().rev() {
+                            let hi = before.map_or(b, |before| b.min(before.saturating_sub(1)));
+                            if hi < a {
+                                continue;
+                            }
+                            out.extend(read(a, hi, true, limit - out.len())?);
+                            if out.len() >= limit {
+                                break;
+                            }
+                        }
+                        out.reverse();
+                    }
+                }
+                Ok(Some(out))
+            },
+        )
+        .await
+        .map_err(|e| SessionError::Other(e.to_string()))??;
+        match paged {
+            Some(page) => Ok(page),
+            None => {
+                let history = self.load_remote_history(session_id, node_id).await?;
+                Ok(slice_history_page(history, direction, limit))
+            }
+        }
+    }
+
     async fn load_session_range(
         &self,
         session_id: &str,
@@ -285,15 +420,44 @@ impl EventJournal for SqliteStorage {
             //   record whose cost cannot be reconstructed, so it is kept to
             //   keep historical coverage honestly incomplete.
             // Retained rows keep their numbers; the resulting gaps are valid.
-            let deleted = conn.execute(
+            let tx = conn.unchecked_transaction()?;
+            let deleted = tx.execute(
                 "DELETE FROM event_journal \
                  WHERE session_id = ? AND stream_seq >= ? \
-                   AND kind NOT IN ('llm_attempt_started', 'llm_attempt_settled') \
+                    AND kind NOT IN ('llm_attempt_started', 'llm_attempt_settled') \
                    AND NOT (kind = 'llm_request_end' \
                             AND json_extract(payload_json, '$.data.accounting') IS NULL)",
                 params![session_id, from_seq],
             )?;
+            if deleted > 0 {
+                tx.execute(
+                    "INSERT INTO event_journal_history_epoch (session_id, epoch) VALUES (?1, 1) \
+                     ON CONFLICT(session_id) DO UPDATE SET epoch = epoch + 1",
+                    params![session_id],
+                )?;
+            }
+            tx.commit()?;
             Ok(deleted)
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+
+    async fn history_epoch(&self, session_id: &str) -> SessionResult<u64> {
+        let session_id = session_id.to_string();
+        let conn_arc = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<u64, rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+            let epoch: Option<i64> = conn
+                .query_row(
+                    "SELECT epoch FROM event_journal_history_epoch WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(epoch.unwrap_or(0).max(0) as u64)
         })
         .await
         .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
@@ -444,6 +608,183 @@ impl EventJournal for SqliteStorage {
         }).await.map_err(|e| SessionError::Other(e.to_string()))?
     }
 
+    async fn load_remote_history(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> SessionResult<Vec<(i64, DurableEvent)>> {
+        let session_id = session_id.to_owned();
+        let source_node_id = source_node_id.to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> SessionResult<Vec<(i64, DurableEvent)>> {
+            let conn = conn.lock().unwrap();
+            let (cursor, complete) = read_sync_row(&conn, &session_id, &source_node_id)?;
+            let mut covered = read_coverage(&conn, &session_id, &source_node_id)?;
+            if cursor > 0 {
+                covered.insert(1, cursor);
+            }
+            // Cursorless legacy copies stay visible only until any
+            // source-identified history exists for this session.
+            let include_legacy = !complete && covered.is_empty();
+            let mut stmt = conn.prepare(
+                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, \
+                        payload_json, session_seq, source_seq \
+                 FROM event_journal WHERE session_id = ?1 AND ( \
+                     source_node_id = ?2 OR (source_node_id IS NULL AND ?3)) \
+                 ORDER BY CASE WHEN source_seq IS NULL THEN 0 ELSE 1 END, source_seq, stream_seq",
+            )?;
+            let rows = stmt
+                .query_map(params![session_id, source_node_id, include_legacy], |row| {
+                    Ok((parse_journal_row(row)?, row.get::<_, Option<i64>>(8)?))
+                })?;
+            let mut history = Vec::new();
+            for row in rows {
+                let (event, source_seq) = row?;
+                match source_seq {
+                    Some(seq) if covered.contains(seq) => history.push((seq, event)),
+                    Some(_) => {}
+                    None => history.push((event.stream_seq, event)),
+                }
+            }
+            Ok(history)
+        })
+        .await
+        .map_err(|e| SessionError::Other(e.to_string()))?
+    }
+
+    async fn remote_coverage(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> SessionResult<Vec<(i64, i64)>> {
+        let session_id = session_id.to_owned();
+        let source_node_id = source_node_id.to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> SessionResult<Vec<(i64, i64)>> {
+            let conn = conn.lock().unwrap();
+            Ok(read_coverage(&conn, &session_id, &source_node_id)?
+                .ranges()
+                .to_vec())
+        })
+        .await
+        .map_err(|e| SessionError::Other(e.to_string()))?
+    }
+
+    async fn add_remote_coverage(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+        start: i64,
+        end: i64,
+    ) -> SessionResult<()> {
+        let session_id = session_id.to_owned();
+        let source_node_id = source_node_id.to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> SessionResult<()> {
+            let mut conn = conn.lock().unwrap();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let mut set = read_coverage(&tx, &session_id, &source_node_id)?;
+            set.insert(start, end);
+            tx.execute(
+                "DELETE FROM remote_session_coverage WHERE session_id = ?1 AND source_node_id = ?2",
+                params![session_id, source_node_id],
+            )?;
+            for (a, b) in set.ranges() {
+                tx.execute(
+                    "INSERT INTO remote_session_coverage (session_id, source_node_id, start_seq, end_seq) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![session_id, source_node_id, a, b],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| SessionError::Other(e.to_string()))?
+    }
+
+    async fn remote_history_epoch(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> SessionResult<Option<u64>> {
+        let session_id = session_id.to_owned();
+        let source_node_id = source_node_id.to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> SessionResult<Option<u64>> {
+            let conn = conn.lock().unwrap();
+            let epoch: Option<i64> = conn
+                .query_row(
+                    "SELECT epoch FROM remote_session_epoch WHERE session_id = ?1 AND source_node_id = ?2",
+                    params![session_id, source_node_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(epoch.map(|epoch| epoch.max(0) as u64))
+        })
+        .await
+        .map_err(|e| SessionError::Other(e.to_string()))?
+    }
+
+    async fn set_remote_history_epoch(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+        epoch: u64,
+    ) -> SessionResult<()> {
+        let session_id = session_id.to_owned();
+        let source_node_id = source_node_id.to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> SessionResult<()> {
+            conn.lock().unwrap().execute(
+                "INSERT INTO remote_session_epoch (session_id, source_node_id, epoch) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (session_id, source_node_id) DO UPDATE SET epoch = excluded.epoch",
+                params![session_id, source_node_id, i64::try_from(epoch).unwrap_or(i64::MAX)],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| SessionError::Other(e.to_string()))?
+    }
+
+    async fn reset_remote_source(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> SessionResult<usize> {
+        let session_id = session_id.to_owned();
+        let source_node_id = source_node_id.to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> SessionResult<usize> {
+            let mut conn = conn.lock().unwrap();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let deleted = tx.execute(
+                "DELETE FROM event_journal WHERE session_id = ?1 AND source_node_id = ?2",
+                params![session_id, source_node_id],
+            )?;
+            tx.execute(
+                "DELETE FROM remote_session_coverage WHERE session_id = ?1 AND source_node_id = ?2",
+                params![session_id, source_node_id],
+            )?;
+            tx.execute(
+                "DELETE FROM remote_session_epoch WHERE session_id = ?1 AND source_node_id = ?2",
+                params![session_id, source_node_id],
+            )?;
+            // Cursor back to 0 but marked authoritative, so cursorless legacy
+            // copies of the rewritten history never reappear.
+            tx.execute(
+                "INSERT INTO remote_session_sync (session_id, source_node_id, source_seq, complete) \
+                 VALUES (?1, ?2, 0, 1) \
+                 ON CONFLICT (session_id, source_node_id) DO UPDATE SET source_seq = 0, complete = 1",
+                params![session_id, source_node_id],
+            )?;
+            tx.commit()?;
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| SessionError::Other(e.to_string()))?
+    }
+
     async fn max_stream_seq(&self, session_id: &str) -> SessionResult<i64> {
         let session_id = session_id.to_string();
         let conn_arc = self.conn.clone();
@@ -460,6 +801,41 @@ impl EventJournal for SqliteStorage {
         .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
         .map_err(SessionError::from)
     }
+}
+
+/// Remote sync cursor and completeness flag (`(0, false)` when absent).
+fn read_sync_row(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    source_node_id: &str,
+) -> Result<(i64, bool), rusqlite::Error> {
+    Ok(conn
+        .query_row(
+            "SELECT source_seq, complete FROM remote_session_sync \
+             WHERE session_id = ?1 AND source_node_id = ?2",
+            params![session_id, source_node_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
+        )
+        .optional()?
+        .unwrap_or((0, false)))
+}
+
+/// Stored transferred `source_seq` ranges of one remote source.
+fn read_coverage(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    source_node_id: &str,
+) -> Result<crate::session::ranges::RangeSet, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT start_seq, end_seq FROM remote_session_coverage \
+         WHERE session_id = ?1 AND source_node_id = ?2 ORDER BY start_seq",
+    )?;
+    let ranges = stmt
+        .query_map(params![session_id, source_node_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(crate::session::ranges::RangeSet::from_ranges(ranges))
 }
 
 /// Shared event-journal insertion: derives the storage columns from the event,

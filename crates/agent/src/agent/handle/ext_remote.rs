@@ -50,12 +50,13 @@ impl LocalAgentHandle {
     /// of an already-bookmarked remote session are repair reconnects and always
     /// reinstall through lookup/resume/attach/health validation.
     #[cfg(feature = "remote")]
-    pub(crate) async fn attach_remote_session_for_ext(
+    pub(crate) async fn connect_remote_for_ext(
         &self,
         node_id: &str,
         session_id: &str,
         handoff: Option<crate::agent::remote::node_manager::SessionHandoff>,
-    ) -> Result<serde_json::Value, Error> {
+        windowed: bool,
+    ) -> Result<super::remote_connect::ConnectedRemoteSession, Error> {
         // A persisted remote identity means this attach is a repair reconnect
         // (plan §12), not a first-time attach: reinstall the attachment instead
         // of early-returning a possibly-broken one.
@@ -88,24 +89,20 @@ impl LocalAgentHandle {
                 RemoteReplacePolicy::ReuseIfPresent,
             )
         };
-        let _connected = self
-            .connect_remote_session(
-                session_id,
-                RemoteConnectOptions {
-                    node_hint: Some(node_id),
-                    peer_label: None,
-                    preferred_scope: None,
-                    reason,
-                    replace,
-                    handoff,
-                },
-            )
-            .await
-            .map_err(|err| err.to_acp_error())?;
-
-        self.build_remote_attach_snapshot(session_id)
-            .await
-            .map_err(|e| Error::internal_error().data(e.message))
+        self.connect_remote_session(
+            session_id,
+            RemoteConnectOptions {
+                node_hint: Some(node_id),
+                peer_label: None,
+                preferred_scope: None,
+                reason,
+                replace,
+                handoff,
+                windowed,
+            },
+        )
+        .await
+        .map_err(|err| err.to_acp_error())
     }
 
     pub(super) async fn handle_ext_remote_dismiss_session(

@@ -30,6 +30,9 @@ pub struct EventSink {
     journal: Arc<dyn EventJournal>,
     fanout: Arc<EventFanout>,
     streams: Mutex<StreamRegistry>,
+    /// Sync state (coverage, reservations, barrier) of remote sessions. Owned
+    /// here so it outlives any attachment or backfill task.
+    remote_syncs: crate::session::remote_sync::RemoteSyncRegistry,
     /// One shared accounting projection per live session, so every component
     /// that records or reads spend (execution, compaction, delegation
     /// summaries) sees the same totals. Released with the session's stream.
@@ -57,8 +60,18 @@ impl EventSink {
             journal,
             fanout,
             streams: Mutex::new(StreamRegistry::default()),
+            remote_syncs: Default::default(),
             accounting: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Sync state of one remote session / owner node pair.
+    pub fn remote_sync(
+        &self,
+        session_id: &str,
+        node_id: &str,
+    ) -> Arc<crate::session::remote_sync::RemoteSyncState> {
+        self.remote_syncs.state(session_id, node_id, &self.journal)
     }
 
     /// The session's shared accounting projection, hydrated from the journal
@@ -225,6 +238,39 @@ impl EventSink {
         source_seq: i64,
         session_seq: Option<i64>,
     ) -> SessionResult<Option<DurableEvent>> {
+        let persisted = self
+            .persist_durable_from_source(
+                session_id,
+                kind,
+                source_node,
+                source_node_id,
+                source_seq,
+                session_seq,
+            )
+            .await?;
+        if let Some(persisted) = &persisted {
+            // Publish to fanout for live subscribers
+            self.fanout
+                .publish(EventEnvelope::Durable(persisted.clone()));
+        }
+        Ok(persisted)
+    }
+
+    /// Persist a remote-sourced durable event without publishing it.
+    ///
+    /// Same idempotent `(session_id, source_node_id, source_seq)` dedup as
+    /// [`Self::emit_durable_from_source`], but never reaches the fanout.
+    /// Used for history transfers, which must not appear to connected clients
+    /// as live updates.
+    pub async fn persist_durable_from_source(
+        &self,
+        session_id: &str,
+        kind: AgentEventKind,
+        source_node: Option<String>,
+        source_node_id: String,
+        source_seq: i64,
+        session_seq: Option<i64>,
+    ) -> SessionResult<Option<DurableEvent>> {
         let new_event = NewDurableEvent {
             session_id: session_id.to_string(),
             origin: EventOrigin::Remote,
@@ -234,17 +280,7 @@ impl EventSink {
             session_seq: session_seq.filter(|seq| *seq > 0),
             kind,
         };
-
-        match self.journal.append_durable_from_source(&new_event).await? {
-            // Duplicate replay: no insert, no fanout republish.
-            None => Ok(None),
-            Some(persisted) => {
-                // Publish to fanout for live subscribers
-                self.fanout
-                    .publish(EventEnvelope::Durable(persisted.clone()));
-                Ok(Some(persisted))
-            }
-        }
+        self.journal.append_durable_from_source(&new_event).await
     }
 
     /// Emit a locally produced ephemeral event through the session's ordered

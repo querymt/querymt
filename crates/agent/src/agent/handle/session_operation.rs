@@ -285,6 +285,7 @@ impl LocalAgentHandle {
                         reason: remote_connect::RemoteConnectReason::OperationRecovery,
                         replace: remote_connect::RemoteReplacePolicy::ReplaceIfMatches(attachment_id),
                         handoff: None,
+                        windowed: false,
                     },
                 )
                 .await

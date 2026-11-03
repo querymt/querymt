@@ -870,18 +870,84 @@ impl SessionActorRef {
                 .map_err(|e| AgentError::RemoteActor(e.to_string())),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&message)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
-                .send()
+            Self::Remote { actor_ref, .. } => {
+                let page = actor_ref
+                    .ask(&message)
+                    .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                    .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        Self::map_agent_timeout_remote_send_error(
+                            e,
+                            "GetEventStreamSince timed out on remote session",
+                        )
+                    })?;
+                crate::agent::load_telemetry::record_mesh_history_request(page.events.len());
+                Ok(page)
+            }
+        }
+    }
+
+    /// Get one size-bounded chunk of the durable event stream.
+    ///
+    /// Remote owners that predate `GetEventStreamChunk` fail with a typed
+    /// protocol-mismatch transport failure; the request then falls back to
+    /// `GetEventStreamSince` paging, and the owner is remembered as lacking
+    /// chunk support for the rest of the process.
+    #[tracing::instrument(
+        name = "remote.session_ref.get_event_stream_chunk",
+        skip(self, request),
+        fields(is_remote = self.is_remote(), peer_label = %self.node_label())
+    )]
+    pub async fn get_event_stream_chunk(
+        &self,
+        request: messages::GetEventStreamChunk,
+    ) -> Result<messages::EventStreamChunk, AgentError> {
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(request)
                 .await
-                .map_err(|e| {
-                    Self::map_agent_timeout_remote_send_error(
-                        e,
-                        "GetEventStreamSince timed out on remote session",
-                    )
-                }),
+                .map_err(Self::map_local_agent_send_error),
+
+            #[cfg(feature = "remote")]
+            Self::Remote {
+                actor_ref,
+                peer_label,
+                remote_node_id,
+            } => {
+                let owner = remote_node_id.as_deref().unwrap_or(peer_label);
+                crate::agent::event_chunk::chunk_with_fallback(
+                    owner,
+                    &crate::agent::event_chunk::CHUNK_SUPPORT,
+                    request,
+                    |request| async move {
+                        let chunk = actor_ref
+                            .ask(&request)
+                            .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                            .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
+                            .send()
+                            .await
+                            .map_err(|e| {
+                                Self::map_agent_timeout_remote_send_error(
+                                    e,
+                                    "GetEventStreamChunk timed out on remote session",
+                                )
+                            })?;
+                        crate::agent::load_telemetry::record_mesh_history_request(
+                            chunk.events.len(),
+                        );
+                        Ok(chunk)
+                    },
+                    |after| {
+                        self.get_event_stream_since(
+                            Some(after),
+                            messages::MAX_EVENT_STREAM_PAGE_SIZE,
+                        )
+                    },
+                )
+                .await
+            }
         }
     }
 

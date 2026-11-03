@@ -3,6 +3,9 @@ use crate::agent::LocalAgentHandle;
 use crate::events::AgentEvent;
 use crate::model::MessagePart;
 use crate::session::error::{SessionError, SessionResult};
+use crate::session::history_window::{
+    HistoryInfo, LoadWindow, SessionHistorySummary, TruncatedEntry, read_window, summarize_history,
+};
 use crate::session::projection::{AuditView, ViewStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -54,31 +57,43 @@ pub struct SessionLoadSnapshot {
         skip_serializing_if = "Option::is_none"
     )]
     pub user_prompts: Option<Vec<UserPromptRecord>>,
+    /// Present only for windowed loads: where the returned events sit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<HistoryInfo>,
+    /// Present only for windowed loads: whole-session state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SessionHistorySummary>,
+    /// Present only for windowed loads that shortened tool content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<Vec<TruncatedEntry>>,
+}
+
+/// Fold one event into a stream cursor.
+pub(crate) fn observe_cursor(cursor: &mut StreamCursor, event: &AgentEvent) {
+    match event.origin {
+        crate::events::EventOrigin::Local => {
+            cursor.local_seq = cursor.local_seq.max(event.seq);
+        }
+        crate::events::EventOrigin::Remote => {
+            if let Some(source) = event.source_node.as_ref() {
+                cursor
+                    .remote_seq_by_source
+                    .entry(source.clone())
+                    .and_modify(|seq| *seq = (*seq).max(event.seq))
+                    .or_insert(event.seq);
+            }
+        }
+        crate::events::EventOrigin::Unknown(_) => {
+            cursor.local_seq = cursor.local_seq.max(event.seq);
+        }
+    }
 }
 
 pub fn cursor_from_events(events: &[AgentEvent]) -> StreamCursor {
     let mut cursor = StreamCursor::default();
-
     for event in events {
-        match event.origin {
-            crate::events::EventOrigin::Local => {
-                cursor.local_seq = cursor.local_seq.max(event.seq);
-            }
-            crate::events::EventOrigin::Remote => {
-                if let Some(source) = event.source_node.as_ref() {
-                    cursor
-                        .remote_seq_by_source
-                        .entry(source.clone())
-                        .and_modify(|seq| *seq = (*seq).max(event.seq))
-                        .or_insert(event.seq);
-                }
-            }
-            crate::events::EventOrigin::Unknown(_) => {
-                cursor.local_seq = cursor.local_seq.max(event.seq);
-            }
-        }
+        observe_cursor(&mut cursor, event);
     }
-
     cursor
 }
 
@@ -108,6 +123,21 @@ pub async fn load_session_snapshot(
     view_store: Arc<dyn ViewStore>,
     session_id: &str,
 ) -> SessionResult<SessionLoadSnapshot> {
+    load_session_snapshot_windowed(agent, view_store, session_id, None).await
+}
+
+/// Build a load snapshot. Without a `window` this is exactly the full,
+/// untruncated snapshot; with one, only the most recent turns are returned
+/// together with a whole-session summary (see `history_window`).
+pub async fn load_session_snapshot_windowed(
+    agent: &LocalAgentHandle,
+    view_store: Arc<dyn ViewStore>,
+    session_id: &str,
+    window: Option<LoadWindow>,
+) -> SessionResult<SessionLoadSnapshot> {
+    if let Some(window) = window {
+        return windowed_snapshot(agent, view_store, session_id, window.clamped()).await;
+    }
     let bookmark = agent
         .config
         .provider
@@ -115,15 +145,27 @@ pub async fn load_session_snapshot(
         .get_remote_session_bookmark(session_id)
         .await?;
     let journal_backed = bookmark.is_some();
+    let mut positions = None;
     let audit = if let Some(bookmark) = bookmark {
-        journal_backed_audit_view(agent, session_id, &bookmark.node_id).await?
+        let (audit, history_positions) =
+            journal_backed_audit_view(agent, session_id, &bookmark.node_id).await?;
+        positions = Some(history_positions);
+        audit
     } else {
         // Close a dead process's run before the audit view is read, so the
         // served snapshot already contains the closing event.
         crate::session::run_reconcile::reconcile_orphaned_run(&agent.config, session_id).await;
         view_store.get_audit_view(session_id, false).await?
     };
+    // The cursor keeps its meaning (local `stream_seq`), so it is computed
+    // before remote events switch to their history position.
     let cursor = cursor_from_events(&audit.events);
+    let mut audit = audit;
+    if let Some(positions) = positions {
+        for (event, position) in audit.events.iter_mut().zip(positions) {
+            event.seq = position;
+        }
+    }
     let accounting = crate::accounting::AccountingSnapshot::from_events(
         session_id,
         audit.events.iter().map(|event| &event.kind),
@@ -176,6 +218,123 @@ pub async fn load_session_snapshot(
         accounting,
         delegation_updates,
         user_prompts,
+        history: None,
+        summary: None,
+        truncated: None,
+    })
+}
+
+async fn windowed_snapshot(
+    agent: &LocalAgentHandle,
+    view_store: Arc<dyn ViewStore>,
+    session_id: &str,
+    window: LoadWindow,
+) -> SessionResult<SessionLoadSnapshot> {
+    let history_store = agent.config.provider.history_store();
+    let bookmark = history_store
+        .get_remote_session_bookmark(session_id)
+        .await?;
+    let journal_backed = bookmark.is_some();
+    let journal = agent.config.event_sink.journal().clone();
+    let source_node = bookmark.as_ref().map(|bookmark| bookmark.node_id.clone());
+    let mut audit = match &bookmark {
+        Some(_) => AuditView {
+            session_id: session_id.to_string(),
+            events: Vec::new(),
+            tasks: Vec::new(),
+            intent_snapshots: Vec::new(),
+            decisions: Vec::new(),
+            progress_entries: Vec::new(),
+            artifacts: Vec::new(),
+            delegations: Vec::new(),
+            generated_at: OffsetDateTime::now_utc(),
+        },
+        None => {
+            crate::session::run_reconcile::reconcile_orphaned_run(&agent.config, session_id).await;
+            view_store.get_audit_view_metadata(session_id).await?
+        }
+    };
+    let epoch = match source_node.as_deref() {
+        Some(node) => journal
+            .remote_history_epoch(session_id, node)
+            .await?
+            .unwrap_or(0),
+        None => journal.history_epoch(session_id).await?,
+    };
+    // Runtime observation is independent of the journal reads; a failure
+    // there only makes the runtime status unavailable.
+    let observe = async {
+        agent
+            .observe_session_runtimes(&[session_id.to_string()])
+            .await
+            .remove(session_id)
+            .unwrap_or_else(|| {
+                crate::agent::messages::SessionRuntimeStatus::unavailable("observation_unavailable")
+            })
+    };
+    let read_journal = async {
+        let read = read_window(
+            journal.as_ref(),
+            session_id,
+            source_node.as_deref(),
+            None,
+            epoch,
+            &window,
+        )
+        .await?;
+        let window_start = if read.history.complete {
+            None
+        } else {
+            read.events.first().map(|event| event.seq)
+        };
+        let pass = summarize_history(
+            journal.as_ref(),
+            session_id,
+            source_node.as_deref(),
+            window_start,
+        )
+        .await?;
+        SessionResult::Ok((read, pass))
+    };
+    let (journal_result, runtime_status) = tokio::join!(read_journal, observe);
+    let (read, pass) = journal_result?;
+    audit.events = read.events;
+
+    let mut delegation_updates = pass.delegation_updates;
+    for live in &runtime_status.delegation_activity {
+        if let Some(previous) = delegation_updates
+            .iter_mut()
+            .find(|entry| entry.delegation_id == live.delegation_id)
+        {
+            *previous = live.clone();
+        } else {
+            delegation_updates.push(live.clone());
+        }
+    }
+    let messages = match history_store.get_history(session_id).await {
+        Ok(messages) => messages,
+        Err(SessionError::SessionNotFound(_)) if journal_backed => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let mut prompts = user_prompt_records(&messages);
+    if !read.history.complete
+        && let Some(first) = audit.events.first()
+    {
+        // Only prompts at or after the window's first event are returned;
+        // older ones arrive with their events.
+        let from = first.timestamp;
+        prompts.retain(|record| record.timestamp >= from);
+    }
+    Ok(SessionLoadSnapshot {
+        runtime_status,
+        audit,
+        cursor: pass.cursor,
+        accounting: pass.accounting,
+        delegation_updates,
+        user_prompts: Some(prompts),
+        history: Some(read.history),
+        summary: Some(pass.summary),
+        truncated: (!read.truncated.is_empty()).then_some(read.truncated),
     })
 }
 
@@ -186,18 +345,23 @@ async fn journal_backed_audit_view(
     agent: &LocalAgentHandle,
     session_id: &str,
     node_id: &str,
-) -> SessionResult<AuditView> {
-    let events = agent
+) -> SessionResult<(AuditView, Vec<i64>)> {
+    // Owner order, covered ranges only. Each event's history position is the
+    // owner's `source_seq`; the caller stamps it into `AgentEvent.seq` so the
+    // desktop's `eventIndex` ordering follows the owner.
+    let history = agent
         .config
         .event_sink
         .journal()
-        .load_remote_session_stream(session_id, node_id)
-        .await?
+        .load_remote_history(session_id, node_id)
+        .await?;
+    let positions: Vec<i64> = history.iter().map(|(position, _)| *position).collect();
+    let events = history
         .into_iter()
-        .map(AgentEvent::from)
+        .map(|(_, event)| AgentEvent::from(event))
         .collect();
 
-    Ok(AuditView {
+    let view = AuditView {
         session_id: session_id.to_string(),
         events,
         tasks: Vec::new(),
@@ -207,7 +371,8 @@ async fn journal_backed_audit_view(
         artifacts: Vec::new(),
         delegations: Vec::new(),
         generated_at: OffsetDateTime::now_utc(),
-    })
+    };
+    Ok((view, positions))
 }
 
 #[cfg(test)]
@@ -616,5 +781,95 @@ mod tests {
             .unwrap();
         assert!(snapshot.audit.events.is_empty());
         assert_eq!(snapshot.user_prompts, Some(Vec::new()));
+    }
+
+    /// Tail-first persisted remote history: reads and snapshots come back in
+    /// owner order, only covered ranges are visible, and each event's `seq`
+    /// is its history position (the owner's `source_seq`).
+    #[tokio::test]
+    async fn remote_snapshot_is_owner_ordered_covered_only_with_history_positions() {
+        use crate::events::{AgentEventKind, EventOrigin};
+        use crate::session::projection::{EventJournal, NewDurableEvent};
+
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let session_id = "remote-tail-first".to_string();
+        let journal = storage.event_journal();
+        // Arrival order: tail (source 8..=10) first, a stray uncovered event
+        // (source 5), then the older fill (source 1..=4).
+        for source_seq in [8, 9, 10, 5, 6, 7, 1, 2, 3, 4] {
+            journal
+                .append_durable_from_source(&NewDurableEvent {
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Remote,
+                    source_node: Some("peer-abc".into()),
+                    source_node_id: Some("node-abc".into()),
+                    source_seq: Some(source_seq),
+                    session_seq: None,
+                    kind: AgentEventKind::SessionCreated,
+                })
+                .await
+                .unwrap();
+        }
+        journal
+            .add_remote_coverage(&session_id, "node-abc", 8, 10)
+            .await
+            .unwrap();
+        // Before the fill completes only the tail window is visible, ordered.
+        let tail: Vec<i64> = journal
+            .load_remote_history(&session_id, "node-abc")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(position, _)| position)
+            .collect();
+        assert_eq!(tail, vec![8, 9, 10], "uncovered events are not returned");
+
+        journal
+            .add_remote_coverage(&session_id, "node-abc", 1, 4)
+            .await
+            .unwrap();
+        journal
+            .add_remote_coverage(&session_id, "node-abc", 5, 7)
+            .await
+            .unwrap();
+        let mut store = MockSessionStore::new();
+        store
+            .expect_get_history()
+            .returning(|_| Err(SessionError::SessionNotFound("no local history".into())));
+        store.expect_get_remote_session_bookmark().returning({
+            let session_id = session_id.clone();
+            move |_| {
+                Ok(Some(RemoteSessionBookmark {
+                    session_id: session_id.clone(),
+                    node_id: "node-abc".to_string(),
+                    peer_label: "peer-abc".to_string(),
+                    cwd: None,
+                    created_at: 0,
+                    title: None,
+                }))
+            }
+        });
+        store.expect_get_session().returning(|_| Ok(None));
+        let (plugin_registry, _temp_dir) = empty_plugin_registry().unwrap();
+        let provider = Arc::new(SessionProvider::new(
+            Arc::new(plugin_registry),
+            Arc::new(store),
+            LLMParams::new().provider("mock").model("mock-model"),
+        ));
+        let config = Arc::new(
+            AgentConfigBuilder::from_provider(storage.clone(), provider, storage.event_journal())
+                .build(),
+        );
+        let agent = crate::agent::LocalAgentHandle::from_config(config);
+
+        let snapshot = load_session_snapshot(&agent, Arc::new(FailingAuditViewStore), &session_id)
+            .await
+            .unwrap();
+        let seqs: Vec<i64> = snapshot.audit.events.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, (1..=10).collect::<Vec<_>>(), "owner order, no gaps");
     }
 }

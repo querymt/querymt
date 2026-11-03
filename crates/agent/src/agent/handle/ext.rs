@@ -46,6 +46,8 @@ impl LocalAgentHandle {
                 self.handle_ext_session_discard_queued_input(req).await
             }
             "querymt/session/runtimeState" => self.handle_ext_session_runtime_state(req).await,
+            "querymt/session/history" => self.handle_ext_session_history(req).await,
+            "querymt/session/toolContent" => self.handle_ext_session_tool_content(req).await,
             "querymt/session/undo" => self.handle_ext_session_undo(req).await,
             "querymt/session/redo" => self.handle_ext_session_redo(req).await,
             "querymt/session/undoStack" => self.handle_ext_session_undo_stack(req).await,

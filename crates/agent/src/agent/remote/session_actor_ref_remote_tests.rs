@@ -332,7 +332,15 @@ mod session_actor_ref_remote_tests {
                     .any(|event| event["kind"]["type"] == "prompt_received"),
                 "owner history must remain present"
             );
-            assert!(snapshot["cursor"]["local_seq"].as_i64().unwrap() > 0);
+            // Built from the local journal, the owner's events are
+            // remote-origin: the cursor reports them per source node.
+            assert!(
+                snapshot["cursor"]["remote_seq_by_source"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .any(|seq| seq.as_i64().unwrap_or(0) > 0)
+            );
             let events: Vec<crate::events::AgentEvent> =
                 serde_json::from_value(snapshot["audit"]["events"].clone()).unwrap();
             assert!(

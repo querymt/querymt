@@ -406,6 +406,9 @@ pub(crate) struct RemoteConnectOptions<'a> {
     /// Pre-resolved handoff from a create/resume response. Skips DHT lookup
     /// and node-manager resume entirely.
     pub(crate) handoff: Option<crate::agent::remote::node_manager::SessionHandoff>,
+    /// The caller will load a recent window: a fresh attachment fetches the
+    /// recent tail first and fills older history afterwards.
+    pub(crate) windowed: bool,
 }
 
 // ── Per-session failure cooldown ────────────────────────────────────────
@@ -517,6 +520,7 @@ impl LocalAgentHandle {
                 reason,
                 replace: reason.default_replace_policy(),
                 handoff: None,
+                windowed: false,
             },
         )
         .await
@@ -858,6 +862,7 @@ impl LocalAgentHandle {
                     &merged,
                     RemoteConnectOutcome::Resumed,
                     prepared_slot,
+                    options.windowed,
                 )
                 .await;
         }
@@ -884,6 +889,7 @@ impl LocalAgentHandle {
                     &merged,
                     RemoteConnectOutcome::Reattached,
                     prepared_slot,
+                    options.windowed,
                 )
                 .await
             {
@@ -987,6 +993,7 @@ impl LocalAgentHandle {
             &merged,
             RemoteConnectOutcome::Resumed,
             prepared_slot,
+            options.windowed,
         )
         .await
     }
@@ -1003,6 +1010,7 @@ impl LocalAgentHandle {
         bookmark: &RemoteSessionBookmark,
         outcome: RemoteConnectOutcome,
         prepared_slot: &PreparedCandidateSlot,
+        windowed: bool,
     ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
         if !Self::remote_actor_matches_node(&remote_ref, &bookmark.node_id) {
             return Err(RemoteSessionConnectError::LocationConflict {
@@ -1169,6 +1177,12 @@ impl LocalAgentHandle {
         // lost; historical pages after the last persisted source cursor are
         // recovered with overlap-safe deduplication. Spawn-and-forget so
         // connect latency never waits on backfill volume.
+        //
+        // The sync is registered before the spawn so a load racing the task
+        // start still waits on the barrier (see `RemoteSyncState::wait_synced`).
+        let sync_guard = backfill_sink
+            .remote_sync(session_id, &bookmark.node_id)
+            .begin_sync();
         tokio::spawn(
             crate::agent::remote::event_backfill::backfill_remote_events(
                 backfill_sink,
@@ -1178,6 +1192,8 @@ impl LocalAgentHandle {
                 bookmark.peer_label.clone(),
                 attachment_id,
                 sync_cursor,
+                windowed,
+                Some(sync_guard),
             ),
         );
 
@@ -1187,6 +1203,43 @@ impl LocalAgentHandle {
             bookmark: Some(bookmark.clone()),
             outcome,
         })
+    }
+
+    /// Make a connected remote session's recent history local before a load
+    /// reads the journal (the sync barrier).
+    ///
+    /// A reused attachment starts no backfill of its own, so an incremental
+    /// chunk (`after = highest covered`) is requested here; a fresh attachment
+    /// already has a backfill registered, which this waits on. Older history
+    /// keeps filling in the background.
+    pub(crate) async fn sync_remote_for_load(
+        &self,
+        session_id: &str,
+        connected: &ConnectedRemoteSession,
+        windowed: bool,
+    ) -> Result<(), crate::error::AgentError> {
+        let Some(bookmark) = connected.bookmark.as_ref() else {
+            return Ok(());
+        };
+        let sink = self.config.event_sink.clone();
+        let state = sink.remote_sync(session_id, &bookmark.node_id);
+        if connected.outcome == RemoteConnectOutcome::Reused {
+            let sync = crate::agent::remote::event_backfill::RemoteSync::new(
+                sink,
+                connected.session_ref.clone(),
+                session_id,
+                &bookmark.node_id,
+                &bookmark.peer_label,
+            );
+            sync.open(windowed).await?;
+            tokio::spawn(async move {
+                if let Err(error) = sync.fill().await {
+                    tracing::warn!(%error, "background history fill failed");
+                }
+            });
+        }
+        state.wait_synced().await;
+        Ok(())
     }
 
     /// Build candidate metadata without mutating durable state. Persistence is
@@ -1838,6 +1891,105 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_and_subscription_transfer_each_event_once_and_replay_matches() {
+        use crate::session::projection::NewDurableEvent;
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh()
+            .await
+            .clone();
+        let (owner, _owner_storage, _t1) = handle_with_real_storage().await;
+        let (viewer, viewer_storage, _t2) = handle_with_real_storage().await;
+        viewer.set_mesh(mesh.clone());
+        let session_id = "once-session";
+        let journal = owner.config.event_sink.journal().clone();
+        for n in 0..40 {
+            journal
+                .append_durable(&NewDurableEvent {
+                    session_id: session_id.into(),
+                    origin: crate::events::EventOrigin::Local,
+                    source_node: None,
+                    source_node_id: None,
+                    source_seq: None,
+                    session_seq: None,
+                    kind: if n % 2 == 0 {
+                        AgentEventKind::RunStarted {
+                            run_id: format!("r{n}"),
+                            origin: "interactive".into(),
+                        }
+                    } else {
+                        AgentEventKind::PromptReceived {
+                            content: format!("p{n}"),
+                            message_id: None,
+                        }
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        let actor = SessionActor::spawn(
+            SessionActor::new(
+                owner.config.clone(),
+                session_id.into(),
+                SessionRuntime::new(
+                    None,
+                    Default::default(),
+                    crate::agent::core::McpToolState::empty(),
+                ),
+            )
+            .with_mesh(Some(mesh.clone())),
+        );
+        let remote = actor.clone().into_remote_ref().await;
+        let peer = mesh.peer_id().to_string();
+        viewer_storage
+            .session_store()
+            .save_remote_session_bookmark(&test_bookmark(session_id, &peer))
+            .await
+            .unwrap();
+        let session_ref = SessionActorRef::remote(remote, "test-node".into());
+
+        // Attach: one sync transfers the history.
+        let sync = crate::agent::remote::event_backfill::RemoteSync::new(
+            viewer.config.event_sink.clone(),
+            session_ref.clone(),
+            session_id,
+            &peer,
+            "test-node",
+        );
+        sync.sync_all(false, None).await.unwrap();
+        let (requests, _, inserted) = sync.state().transfers();
+        assert_eq!(inserted, 40);
+
+        // Connection subscription / replay: read the journal, no new transfer.
+        let first = viewer
+            .remote_session_events_from_journal(session_id, &session_ref)
+            .await
+            .unwrap()
+            .expect("remote session reads the journal");
+        let second = viewer
+            .remote_session_events_from_journal(session_id, &session_ref)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sync.state().transfers().0,
+            requests,
+            "no extra mesh requests"
+        );
+        assert_eq!(sync.state().transfers().2, 40, "each event persisted once");
+        assert_eq!(first.len(), 40);
+        assert_eq!(second.len(), 40);
+
+        // Non-snapshot clients get the same replay as the owner's stream.
+        let owner_stream = session_ref.get_event_stream().await.unwrap();
+        let strip = |events: &[crate::events::AgentEvent]| {
+            events
+                .iter()
+                .map(|e| (e.seq, serde_json::to_value(&e.kind).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(&first), strip(&owner_stream));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unverified_candidates_cannot_write_bookmarks_or_replace_attachment() {
         let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh()
             .await
@@ -1870,6 +2022,7 @@ mod tests {
                 &wrong,
                 RemoteConnectOutcome::Reattached,
                 &slot,
+                false,
             )
             .await
             .unwrap_err();
@@ -1905,6 +2058,7 @@ mod tests {
                 &bookmark,
                 RemoteConnectOutcome::Reattached,
                 &slot,
+                false,
             )
             .await
             .unwrap();
@@ -1933,7 +2087,8 @@ mod tests {
                     None,
                     &changed,
                     RemoteConnectOutcome::Reattached,
-                    &slot
+                    &slot,
+                    false
                 )
                 .await
                 .is_err()

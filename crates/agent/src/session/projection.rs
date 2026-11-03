@@ -130,6 +130,36 @@ pub struct NewDurableEvent {
     pub kind: AgentEventKind,
 }
 
+/// Direction of an [`EventJournal::load_history_page`] read. Positions are
+/// exclusive bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryPageDirection {
+    /// The first events with position `> after`.
+    Forward { after: i64 },
+    /// The newest events with position `< before` (`None` = up to the tip).
+    Backward { before: Option<i64> },
+}
+
+/// Select one page out of position-ordered history (ascending result).
+pub(crate) fn slice_history_page(
+    mut history: Vec<(i64, DurableEvent)>,
+    direction: HistoryPageDirection,
+    limit: usize,
+) -> Vec<(i64, DurableEvent)> {
+    match direction {
+        HistoryPageDirection::Forward { after } => {
+            history.retain(|(position, _)| *position > after);
+            history.truncate(limit);
+            history
+        }
+        HistoryPageDirection::Backward { before } => {
+            history.retain(|(position, _)| before.is_none_or(|before| *position < before));
+            let skip = history.len().saturating_sub(limit);
+            history.split_off(skip)
+        }
+    }
+}
+
 /// Run lifecycle marker used by [`last_unfinished_run_in`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunLifecycle {
@@ -238,6 +268,71 @@ pub trait EventJournal: Send + Sync {
         Ok(events)
     }
 
+    /// Load up to `limit` events with `stream_seq < before_seq` (`None` = up to
+    /// the tip), the newest ones first, returned in ascending `stream_seq`
+    /// order. Used for tail-first transfer and older-history paging.
+    ///
+    /// The default filters the full stream; storage backends should override
+    /// it with an indexed `ORDER BY stream_seq DESC LIMIT` read.
+    async fn load_session_page_before(
+        &self,
+        session_id: &str,
+        before_seq: Option<i64>,
+        limit: usize,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        let mut events = self.load_session_stream(session_id, None, None).await?;
+        events.sort_by_key(|event| event.stream_seq);
+        events.retain(|event| before_seq.is_none_or(|before| event.stream_seq < before));
+        let skip = events.len().saturating_sub(limit);
+        Ok(events.split_off(skip))
+    }
+
+    /// Load one page of a session's history by **history position**, never
+    /// materialising the whole stream.
+    ///
+    /// The position is `stream_seq` for local sessions
+    /// (`source_node_id == None`) and the owner's `source_seq` for the remote
+    /// source `source_node_id`, restricted to fully transferred ranges (the
+    /// same rows [`Self::load_remote_history`] returns). Pages are returned in
+    /// ascending position order whatever the direction, so paging forward or
+    /// backward visits every event exactly once.
+    ///
+    /// The default derives pages from the existing reads; storage backends
+    /// should override it with indexed, limited queries.
+    async fn load_history_page(
+        &self,
+        session_id: &str,
+        source_node_id: Option<&str>,
+        direction: HistoryPageDirection,
+        limit: usize,
+    ) -> SessionResult<Vec<(i64, DurableEvent)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        match source_node_id {
+            None => {
+                let events = match direction {
+                    HistoryPageDirection::Forward { after } => {
+                        self.load_session_page(session_id, Some(after), Some(limit))
+                            .await?
+                    }
+                    HistoryPageDirection::Backward { before } => {
+                        self.load_session_page_before(session_id, before, limit)
+                            .await?
+                    }
+                };
+                Ok(events
+                    .into_iter()
+                    .map(|event| (event.stream_seq, event))
+                    .collect())
+            }
+            Some(node_id) => {
+                let history = self.load_remote_history(session_id, node_id).await?;
+                Ok(slice_history_page(history, direction, limit))
+            }
+        }
+    }
+
     /// Run id of the most recent `run_started` that has no `run_completed`,
     /// considering only events produced by this node (`EventOrigin::Local`).
     /// Mirrored events of a remote host are ignored: that host owns and closes
@@ -310,6 +405,15 @@ pub trait EventJournal: Send + Sync {
         from_seq: i64,
     ) -> SessionResult<usize>;
 
+    /// Owner-side history epoch: a counter bumped whenever
+    /// [`Self::delete_session_events_from`] actually deletes rows (undo
+    /// cleanup). Appends never change it. Remote peers compare it across
+    /// chunk replies to detect rewritten history. `0` until the first rewrite;
+    /// backends without persistence report `0`.
+    async fn history_epoch(&self, _session_id: &str) -> SessionResult<u64> {
+        Ok(0)
+    }
+
     /// Idempotent append for durable events that carry remote source identity
     /// (plan §15/§16).
     ///
@@ -364,6 +468,79 @@ pub trait EventJournal: Send + Sync {
     /// (0 when empty). Serves as the completion marker for cursor-based
     /// backfill paging (plan §16.5).
     async fn max_stream_seq(&self, session_id: &str) -> SessionResult<i64>;
+
+    /// Cached remote history with each event's **history position**: the
+    /// owner's `source_seq` for source-identified rows (legacy cursorless
+    /// rows report their local `stream_seq`). Ordered by position, and only
+    /// ranges that were fully transferred are returned (see
+    /// [`Self::remote_coverage`]).
+    ///
+    /// The default derives positions from [`Self::load_remote_session_stream`].
+    async fn load_remote_history(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> SessionResult<Vec<(i64, DurableEvent)>> {
+        Ok(self
+            .load_remote_session_stream(session_id, source_node_id)
+            .await?
+            .into_iter()
+            .map(|event| (event.stream_seq, event))
+            .collect())
+    }
+
+    /// `source_seq` ranges (inclusive, merged) of a remote session's history
+    /// that were fully transferred. Does not include the legacy contiguous
+    /// cursor range, which [`Self::remote_sync_cursor`] reports. Backends
+    /// without persistence report no ranges.
+    async fn remote_coverage(
+        &self,
+        _session_id: &str,
+        _source_node_id: &str,
+    ) -> SessionResult<Vec<(i64, i64)>> {
+        Ok(Vec::new())
+    }
+
+    /// Record `[start, end]` as fully transferred, merging with stored ranges.
+    async fn add_remote_coverage(
+        &self,
+        _session_id: &str,
+        _source_node_id: &str,
+        _start: i64,
+        _end: i64,
+    ) -> SessionResult<()> {
+        Ok(())
+    }
+
+    /// The owner's history epoch seen at the last sync (`None` = never
+    /// recorded).
+    async fn remote_history_epoch(
+        &self,
+        _session_id: &str,
+        _source_node_id: &str,
+    ) -> SessionResult<Option<u64>> {
+        Ok(None)
+    }
+
+    async fn set_remote_history_epoch(
+        &self,
+        _session_id: &str,
+        _source_node_id: &str,
+        _epoch: u64,
+    ) -> SessionResult<()> {
+        Ok(())
+    }
+
+    /// Drop everything synced from one source: its journal rows, coverage,
+    /// sync cursor and recorded epoch. Used when the owner rewrote its
+    /// history. Returns the number of deleted journal rows.
+    async fn reset_remote_source(
+        &self,
+        _session_id: &str,
+        _source_node_id: &str,
+    ) -> SessionResult<usize> {
+        Ok(0)
+    }
 }
 
 /// Upper bound on one flat `list_session_items*` page; the ACP global page size must fit under it.
@@ -384,6 +561,16 @@ pub trait ViewStore: Send + Sync {
         session_id: &str,
         include_children: bool,
     ) -> SessionResult<AuditView>;
+
+    /// The audit view's whole-session fields (tasks, decisions, intents,
+    /// progress, artifacts, delegations) with an empty `events` list, for
+    /// windowed loads that read events separately. The default derives it
+    /// from [`Self::get_audit_view`]; backends should skip the event read.
+    async fn get_audit_view_metadata(&self, session_id: &str) -> SessionResult<AuditView> {
+        let mut view = self.get_audit_view(session_id, false).await?;
+        view.events = Vec::new();
+        Ok(view)
+    }
 
     /// Generate a redacted view for a session
     async fn get_redacted_view(

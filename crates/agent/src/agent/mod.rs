@@ -15,10 +15,12 @@
 pub mod agent_config;
 pub mod agent_config_builder;
 pub mod core;
+pub(crate) mod event_chunk;
 pub mod execution;
 pub mod execution_context;
 pub mod file_proxy;
 pub mod handle;
+pub(crate) mod load_telemetry;
 pub mod mcp;
 pub mod messages;
 pub(crate) mod objective;

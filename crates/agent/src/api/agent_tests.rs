@@ -945,7 +945,10 @@ async fn acp_list_sessions_global_page_size_bounds_local_pages() -> Result<()> {
         AcpListSessionsRequest::new(),
     )
     .await?;
-    assert_eq!(first.sessions.len(), crate::api::sessions::ACP_GLOBAL_PAGE_SIZE);
+    assert_eq!(
+        first.sessions.len(),
+        crate::api::sessions::ACP_GLOBAL_PAGE_SIZE
+    );
     let cursor = first.next_cursor.expect("first page should continue");
     let second = AgentSessions::list_for_acp_from_view_store(
         view_store,
@@ -1026,7 +1029,10 @@ async fn acp_list_sessions_source_splits_local_and_remote_listings() -> Result<(
         .await?;
     assert_eq!(remote_page.sessions.len(), 3);
     assert!(remote_page.sessions.iter().all(|session| {
-        session.meta.as_ref().is_some_and(|meta| meta["location"] == "remote")
+        session
+            .meta
+            .as_ref()
+            .is_some_and(|meta| meta["location"] == "remote")
     }));
     assert_eq!(remote_page.next_cursor, None);
 

@@ -907,9 +907,7 @@ impl AgentSessions {
             Self::list_for_acp_from_view_store(view_store.clone(), request).await?
         };
         #[cfg(feature = "remote")]
-        if source == AcpSessionSource::All
-            && !remote_nodes.is_empty()
-            && page.next_cursor.is_none()
+        if source == AcpSessionSource::All && !remote_nodes.is_empty() && page.next_cursor.is_none()
         {
             let remote_page = Self::list_acp_remote_page(
                 agent,
@@ -1059,7 +1057,10 @@ impl AgentSessions {
             });
         // Ask the store about just this page's ids instead of scanning every local session:
         // the scan made each remote page cost O(all local sessions).
-        let page_ids: Vec<String> = entries.iter().map(|entry| entry.session_id.clone()).collect();
+        let page_ids: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.session_id.clone())
+            .collect();
         let local_ids: std::collections::HashSet<String> = store
             .resolve_session_locations(&page_ids)
             .await

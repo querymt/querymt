@@ -308,7 +308,7 @@ impl LocalAgentHandle {
         })
     }
 
-    async fn profile_session_op_handle(
+    pub(super) async fn profile_session_op_handle(
         &self,
         session_id: &str,
     ) -> Result<Option<Arc<LocalAgentHandle>>, Error> {
