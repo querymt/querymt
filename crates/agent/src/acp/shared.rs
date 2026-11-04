@@ -8262,7 +8262,9 @@ mod session_update_tests {
         let mut translator = AcpLiveEventTranslator::new();
         translator.seed_history_from_meta(
             "s-1",
-            Some(&seed(serde_json::json!([{ "kind": "untransferred_history" }]))),
+            Some(&seed(
+                serde_json::json!([{ "kind": "untransferred_history" }]),
+            )),
         );
         let snapshot = translator.usage["s-1"].accounting_snapshot().unwrap();
         assert!(!snapshot.session.complete);
