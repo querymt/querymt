@@ -292,7 +292,7 @@ impl RemoteSyncState {
     }
 
     /// As [`Self::reset_local_copy`]; the caller holds the apply guard.
-    async fn reset_local_copy_locked(&self, epoch: u64) -> SessionResult<()> {
+    pub async fn reset_local_copy_locked(&self, epoch: u64) -> SessionResult<()> {
         self.journal
             .reset_remote_source(&self.session_id, &self.node_id)
             .await?;

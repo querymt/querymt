@@ -1433,6 +1433,9 @@ struct SessionUsageProjection {
     prior_requests: u64,
     /// The windowed-load summary was already applied (seeding is repeatable).
     summary_seeded: bool,
+    /// The seeding snapshot reported older remote history as not yet local, so
+    /// accounting totals must never claim completeness.
+    untransferred_history: bool,
 }
 
 /// Exclusive categories: provider adapters already separate caching and reasoning.
@@ -1513,9 +1516,13 @@ impl SessionUsageProjection {
     }
 
     fn accounting_snapshot(&self) -> Option<crate::accounting::AccountingSnapshot> {
-        self.accounting
-            .as_ref()
-            .map(crate::accounting::AccountingSnapshot::from_reducer)
+        self.accounting.as_ref().map(|reducer| {
+            let mut snapshot = crate::accounting::AccountingSnapshot::from_reducer(reducer);
+            if self.untransferred_history {
+                snapshot.mark_untransferred_history();
+            }
+            snapshot
+        })
     }
 
     /// Observe one event. Returns `true` when an accounting *settlement* (or a
@@ -1832,7 +1839,18 @@ impl AcpLiveEventTranslator {
         if let Some(summary) = &summary {
             self.seed_whole_session_state(session_id, summary);
         }
-        self.usage.entry(session_id.to_owned()).or_default().partial |= partial;
+        let untransferred = meta
+            .and_then(|meta| meta.get("querymt/sessionLoadSnapshot.v1"))
+            .and_then(|snapshot| snapshot["accounting"]["session"]["reasons"].as_array())
+            .is_some_and(|reasons| {
+                reasons
+                    .iter()
+                    .any(|reason| reason["kind"] == "untransferred_history")
+            });
+        let usage = self.usage.entry(session_id.to_owned()).or_default();
+        usage.partial |= partial;
+        // A later load after the fill reports exact values and lifts the limit.
+        usage.untransferred_history = untransferred;
         Some(recovered)
     }
 
@@ -8222,6 +8240,43 @@ mod session_update_tests {
         );
         let snapshot = translator.usage["s-1"].accounting_snapshot().unwrap();
         assert_eq!(snapshot.session.priced_attempts, 1);
+        assert!(snapshot.session.complete);
+    }
+
+    #[test]
+    fn untransferred_history_limit_survives_live_accounting_updates() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let events: Vec<AgentEvent> = attempt_events(1, "a1", "c1", MainResponse, true)
+            .iter()
+            .map(|e| agent_event(e.seq(), e.kind().clone()))
+            .collect();
+        let seed = |reasons: serde_json::Value| {
+            serde_json::Map::from_iter([(
+                "querymt/sessionLoadSnapshot.v1".to_string(),
+                serde_json::json!({
+                    "audit": { "events": events },
+                    "accounting": { "session": { "reasons": reasons } },
+                }),
+            )])
+        };
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.seed_history_from_meta(
+            "s-1",
+            Some(&seed(serde_json::json!([{ "kind": "untransferred_history" }]))),
+        );
+        let snapshot = translator.usage["s-1"].accounting_snapshot().unwrap();
+        assert!(!snapshot.session.complete);
+        assert!(snapshot.session.complete_total_usd.is_none());
+        assert!(
+            snapshot
+                .session
+                .reasons
+                .contains(&crate::accounting::AccountingReason::UntransferredHistory)
+        );
+
+        // A later load that reports full history lifts the limit.
+        translator.seed_history_from_meta("s-1", Some(&seed(serde_json::json!([]))));
+        let snapshot = translator.usage["s-1"].accounting_snapshot().unwrap();
         assert!(snapshot.session.complete);
     }
 

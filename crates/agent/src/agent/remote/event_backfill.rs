@@ -332,6 +332,54 @@ impl RemoteSync {
         }
     }
 
+    /// Replace the local copy with a complete transfer from an owner without
+    /// chunk support. Every page is staged first; rows and coverage are
+    /// swapped only once all of them arrived, so a failure changes nothing.
+    async fn replace_local_copy(&self) -> Result<usize, crate::error::AgentError> {
+        let mut staged = Vec::new();
+        let mut after = 0;
+        let tip = loop {
+            let req = chunk_request(Some(after), None, false, MAX_EVENT_STREAM_CHUNK_EVENTS);
+            let chunk = self.session_ref.get_event_stream_chunk(req).await?;
+            self.state.record_request(chunk.events.len());
+            let last = chunk.events.last().map(|e| e.seq);
+            let (has_more, latest) = (chunk.has_more, chunk.latest_source_seq);
+            for event in &chunk.events {
+                if event.session_id != self.session_id || event.seq <= after {
+                    return Err(invalid_chunk());
+                }
+                after = event.seq;
+            }
+            staged.extend(chunk.events);
+            if !has_more {
+                break latest;
+            }
+            if last.is_none() {
+                return Err(invalid_chunk());
+            }
+        };
+        let _apply = self.state.lock_apply().await;
+        self.state.reset_local_copy_locked(0).await?;
+        let mut inserted = 0;
+        for event in staged {
+            let persisted = self
+                .sink
+                .persist_durable_from_source(
+                    &self.session_id,
+                    event.kind,
+                    Some(self.peer_label.clone()),
+                    self.node_id.clone(),
+                    event.seq,
+                    (event.session_seq > 0).then_some(event.session_seq),
+                )
+                .await?;
+            inserted += usize::from(persisted.is_some());
+        }
+        self.state.mark_covered(1, tip, tip).await?;
+        self.state.record_inserted(inserted);
+        Ok(inserted)
+    }
+
     /// Bring the recent history local: the tail chunk on a first windowed
     /// open, otherwise everything newer than what is already held. Returns
     /// the number of newly persisted events. The load barrier
@@ -343,13 +391,18 @@ impl RemoteSync {
         // An owner without chunk support cannot report a history rewrite
         // (its replies carry no epoch), so an incremental sync could keep
         // undone turns. Replace the local copy with a full paged transfer.
-        if self.state.has_data() && !self.session_ref.owner_supports_chunks().await {
+        // The local copy is kept until the whole replacement has arrived, so a
+        // failed transfer leaves the cached history for the stale fallback. An
+        // inconclusive support probe fails the open for the same reason.
+        if self.state.has_data() && !self.session_ref.owner_supports_chunks().await? {
             tracing::info!(
                 session_id = %self.session_id,
                 node_id = %self.node_id,
                 "owner lacks chunked transfer; replacing local history copy"
             );
-            self.state.reset_local_copy().await?;
+            let inserted = self.replace_local_copy().await?;
+            self.state.set_live_anchored(true);
+            return Ok(inserted);
         }
         for _ in 0..3 {
             let result = if windowed && !self.state.has_data() {

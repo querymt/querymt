@@ -955,9 +955,11 @@ impl SessionActorRef {
     /// cannot report history rewrites (their fallback replies carry no epoch),
     /// so callers must not sync them incrementally. The first call for an owner
     /// sends one empty probe chunk; the answer is cached for the process.
-    pub async fn owner_supports_chunks(&self) -> bool {
+    /// A probe that fails for any other reason leaves support unknown and is
+    /// returned as an error, never treated as confirmed support.
+    pub async fn owner_supports_chunks(&self) -> Result<bool, AgentError> {
         match self {
-            Self::Local(_) => true,
+            Self::Local(_) => Ok(true),
             #[cfg(feature = "remote")]
             Self::Remote {
                 peer_label,
@@ -967,12 +969,12 @@ impl SessionActorRef {
                 use crate::agent::event_chunk::CHUNK_SUPPORT;
                 let owner = remote_node_id.as_deref().unwrap_or(peer_label);
                 if CHUNK_SUPPORT.lacks_support(owner) {
-                    return false;
+                    return Ok(false);
                 }
                 if !CHUNK_SUPPORT.has_support(owner) {
                     // Past any real sequence: an empty reply, or the
                     // protocol-mismatch fallback that records the answer.
-                    let _ = self
+                    let probe = self
                         .get_event_stream_chunk(messages::GetEventStreamChunk {
                             after_source_seq: Some(i64::MAX),
                             before_source_seq: None,
@@ -981,8 +983,13 @@ impl SessionActorRef {
                             max_bytes: messages::MAX_EVENT_STREAM_CHUNK_BYTES,
                         })
                         .await;
+                    if let Err(error) = probe
+                        && !CHUNK_SUPPORT.lacks_support(owner)
+                    {
+                        return Err(error);
+                    }
                 }
-                !CHUNK_SUPPORT.lacks_support(owner)
+                Ok(!CHUNK_SUPPORT.lacks_support(owner))
             }
         }
     }
