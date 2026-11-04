@@ -40,7 +40,7 @@ When a client requests a load window, the agent SHALL return only the most recen
 A windowed load SHALL report, computed over the entire session: token usage totals, cost accounting, delegation state, the current model and provider, queued and steered inputs that are still pending, and links to child sessions. After a windowed load, live usage updates SHALL continue to report whole-session totals.
 
 #### Scenario: State matches a full load
-- **WHEN** the same session is loaded once with a window and once without
+- **WHEN** the same session is loaded once with a window and once without, and the same history is held locally for both
 - **THEN** both loads report identical token totals, accounting, delegation state, current model, pending inputs and child-session links
 
 #### Scenario: Model chosen before the window
@@ -49,7 +49,7 @@ A windowed load SHALL report, computed over the entire session: token usage tota
 
 #### Scenario: Remote session whose older history is not yet local
 - **WHEN** a windowed load of a remote session is answered before the attaching agent holds the session's whole history
-- **THEN** the whole-session state is computed from the events held so far and is marked partial, and a later load, once the history is complete locally, reports the exact state
+- **THEN** the whole-session state, including accounting, is computed from the events held so far and is marked partial (accounting through its completeness metadata), and a later load, once the history is complete locally, reports the exact state
 
 #### Scenario: Usage after a windowed load
 - **WHEN** a request completes after a windowed load
@@ -71,19 +71,23 @@ The agent SHALL provide a request that returns the turns immediately preceding a
 - **THEN** the request fails with a session-not-found error
 
 ### Requirement: Truncated tool content in loads
-A load or older-history response SHALL replace any tool result, and any string tool-call argument, larger than 32 KiB with a valid UTF-8 leading portion and a marker giving the full size. Stored history SHALL never be truncated.
+A windowed load and an older-history response SHALL replace any tool result, and any string tool-call argument, larger than 32 KiB with a valid UTF-8 leading portion and a marker giving the full size. A load without a load window SHALL return tool content untruncated. Stored history SHALL never be truncated.
 
 #### Scenario: Large tool result
 - **WHEN** a session contains a tool result of 500 KiB
-- **THEN** the load contains at most 32 KiB of that result together with a truncation marker reporting 500 KiB
+- **THEN** the windowed load contains at most 32 KiB of that result together with a truncation marker reporting 500 KiB
 
 #### Scenario: Large tool argument
 - **WHEN** a session contains a file-write tool call whose content argument is 5 MB
-- **THEN** the load contains at most 32 KiB of that argument together with a truncation marker reporting its full size
+- **THEN** the windowed load contains at most 32 KiB of that argument together with a truncation marker reporting its full size
 
 #### Scenario: Small tool content
 - **WHEN** a tool result or argument is 32 KiB or smaller
 - **THEN** the load contains it unchanged with no truncation marker
+
+#### Scenario: Load without a window
+- **WHEN** a session contains a tool result of 500 KiB and the client loads it without a load window
+- **THEN** the load contains the complete result with no truncation marker
 
 ### Requirement: Full tool content on demand
 The agent SHALL provide a request that returns the complete result or the complete arguments of a tool call in a session, for local and remote sessions.

@@ -25,7 +25,7 @@ QueryMT SHALL replay durable session-update state in materialized form when sess
 - **AND** no event crosses the mesh a second time for the replay
 
 ### Requirement: Load snapshots contain authoritative ordered accounting
-`SessionLoadSnapshot.accounting` SHALL contain the shared reducer's authoritative replacement DTO at the existing snapshot cursor, without requiring historical replay or known context limits. Snapshot and captured-live application SHALL respect existing local/remote ordering and deduplication. Older state SHALL NOT overwrite newer accounting or restore an invalidated complete total. When a client requests a load window, `accounting` SHALL still cover the entire session, not only the events in the window.
+`SessionLoadSnapshot.accounting` SHALL contain the shared reducer's authoritative replacement DTO at the existing snapshot cursor, without requiring historical replay or known context limits. Snapshot and captured-live application SHALL respect existing local/remote ordering and deduplication. Older state SHALL NOT overwrite newer accounting or restore an invalidated complete total. When a client requests a load window, `accounting` SHALL still cover the entire session, not only the events in the window. When older history of a remote-hosted session is not yet held locally, `accounting` SHALL cover the locally held events and SHALL report the missing history through the existing completeness metadata: `complete` false, `completeTotalUsd` null and a reason identifying untransferred history. Once that history is local, the reason SHALL be absent.
 
 #### Scenario: Desktop follow-up consumes backend accounting
 - **WHEN** the backend client contract is documented for desktop implementation
@@ -48,5 +48,10 @@ QueryMT SHALL replay durable session-update state in materialized form when sess
 - **AND** ordinary in-flight attempts alone do not trigger a missing-price budget warning
 
 #### Scenario: Windowed load reports whole-session accounting
-- **WHEN** the same session is loaded once with a load window that excludes older turns and once without a window
-- **THEN** both snapshots carry identical accounting
+- **WHEN** the same session is loaded once with a load window that excludes older turns and once without a window, and the same history is held locally for both
+- **THEN** both snapshots carry identical accounting values and completeness metadata
+
+#### Scenario: Remote older history not yet local
+- **WHEN** a windowed load of a remote-hosted session is answered before its older history is held locally
+- **THEN** `accounting` reports `complete` false, a null `completeTotalUsd` and a reason identifying untransferred history
+- **AND** a later load after the history is local reports the exact accounting without that reason

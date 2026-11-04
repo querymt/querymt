@@ -150,6 +150,23 @@ fn budget_snapshot(totals: &ScopeTotals) -> AccountingBudgetSnapshot {
 }
 
 impl AccountingSnapshot {
+    /// Mark the session totals as covering only locally held events because
+    /// older history of a remote session is not transferred yet: the complete
+    /// total is withdrawn and the reason is recorded. Idempotent.
+    pub fn mark_untransferred_history(&mut self) {
+        self.session.complete = false;
+        self.session.complete_total_usd = None;
+        if !self
+            .session
+            .reasons
+            .contains(&AccountingReason::UntransferredHistory)
+        {
+            self.session
+                .reasons
+                .push(AccountingReason::UntransferredHistory);
+        }
+    }
+
     /// Project the reducer's current state.
     pub fn from_reducer(reducer: &AccountingReducer) -> Self {
         let cycle = reducer.latest_cycle_id().map(|id| {
@@ -194,6 +211,25 @@ mod tests {
     use super::*;
     use crate::accounting::tests::{sample_pricing, sample_settlement, sample_start};
     use querymt::providers::{UsageValuation, value_usage};
+
+    #[test]
+    fn untransferred_history_withdraws_complete_total_once() {
+        let kinds = settled("a1", "c1");
+        let mut snapshot = AccountingSnapshot::from_events("s1", kinds.iter());
+        snapshot.mark_untransferred_history();
+        snapshot.mark_untransferred_history();
+        assert!(!snapshot.session.complete);
+        assert_eq!(snapshot.session.complete_total_usd, None);
+        let count = snapshot
+            .session
+            .reasons
+            .iter()
+            .filter(|r| **r == AccountingReason::UntransferredHistory)
+            .count();
+        assert_eq!(count, 1);
+        let json = serde_json::to_value(AccountingReason::UntransferredHistory).unwrap();
+        assert_eq!(json["kind"], "untransferred_history");
+    }
 
     fn settled(id: &str, cycle: &str) -> [AgentEventKind; 2] {
         let mut start = sample_start();

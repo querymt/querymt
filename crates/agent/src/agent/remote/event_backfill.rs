@@ -8,6 +8,8 @@
 //! requests fetch uncovered ranges backwards. Ranges are reserved before they
 //! are requested, so no event crosses the mesh twice concurrently. A changed
 //! owner history epoch discards the source's local copy and resyncs.
+//! Owners without chunk support report no epoch, so each open replaces the
+//! local copy with a full paged transfer instead of syncing incrementally.
 //!
 //! Live relay and gap repair (`recover_source_gap`) still publish.
 
@@ -338,6 +340,17 @@ impl RemoteSync {
         self.state.hydrate().await?;
         let _sync = self.state.begin_sync();
         let _open = self.state.lock_open().await;
+        // An owner without chunk support cannot report a history rewrite
+        // (its replies carry no epoch), so an incremental sync could keep
+        // undone turns. Replace the local copy with a full paged transfer.
+        if self.state.has_data() && !self.session_ref.owner_supports_chunks().await {
+            tracing::info!(
+                session_id = %self.session_id,
+                node_id = %self.node_id,
+                "owner lacks chunked transfer; replacing local history copy"
+            );
+            self.state.reset_local_copy().await?;
+        }
         for _ in 0..3 {
             let result = if windowed && !self.state.has_data() {
                 let req = chunk_request(None, None, true, self.window_events);

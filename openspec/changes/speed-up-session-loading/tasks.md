@@ -23,6 +23,7 @@ Agent half of `speed-up-session-loading`. The desktop half (windowed-load UI, ra
 - [x] 2.5 On-demand backward fetch of uncovered ranges, reserving ranges so fill and on-demand never fetch the same range. Verify each event crosses the mesh once with concurrent fill and history requests.
 - [x] 2.6 Epoch mismatch handling: delete the source's local rows and coverage, reset the cursor, resync before releasing the barrier. Verify that turns undone on the owner disappear from the next load on another node.
 - [x] 2.7 Reused attachments: a load triggers an incremental chunk and waits on the sync state. Verify: reopen after 30 new events transfers exactly 30 (with and without attachment reuse); reopen with no changes transfers none.
+- [x] 2.8 Owners without chunk support report no epoch: `RemoteSync::open` replaces the local copy (`RemoteSyncState::reset_local_copy`) with a full paged transfer instead of syncing incrementally, using `SessionActorRef::owner_supports_chunks`. Verify with unit tests for the support cache and the local-copy reset.
 
 ## 3. Windowed snapshot builder
 
@@ -33,6 +34,7 @@ Agent half of `speed-up-session-loading`. The desktop half (windowed-load UI, ra
 - [x] 3.5 Seed the live usage projection from `summary.usage` in `seed_history_from_meta`. Verify that a request after a windowed load reports whole-session totals.
 - [x] 3.6 Truncate `ToolCallEnd.result` and string tool-call arguments above 32 KiB with UTF-8-safe prefixes and `truncated` entries (`part`, `path`, `full_bytes`), leaving the journal untouched. Verify with 500 KiB result, 5 MB argument, 32 KiB boundary, multi-byte boundary and unchanged-journal tests.
 - [x] 3.7 Verify that a load without a window produces exactly the previous snapshot (existing `load_snapshot` and `acp::shared` snapshot tests unchanged) and that the mobile FFI tests pass unchanged.
+- [x] 3.9 Report partial remote accounting: add `AccountingReason::UntransferredHistory` and apply `AccountingSnapshot::mark_untransferred_history` in `build_remote_attach_snapshot` when older history is not yet local (`complete: false`, null total). Verify with a snapshot unit test.
 - [x] 3.8 Add a 50k-event benchmark/test with time bounds for the window build and the `toolContent` lookup. Verify it passes in `cargo test -p querymt-agent`.
 
 ## 4. One load path for local and remote

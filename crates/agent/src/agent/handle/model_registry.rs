@@ -331,6 +331,7 @@ impl LocalAgentHandle {
             && let Some(summary) = snapshot.summary.as_mut()
         {
             summary.usage.partial = true;
+            snapshot.accounting.mark_untransferred_history();
         }
         if stale {
             match snapshot.history.as_mut() {

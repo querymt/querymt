@@ -951,6 +951,42 @@ impl SessionActorRef {
         }
     }
 
+    /// Whether the owner serves `GetEventStreamChunk`. Owners without it
+    /// cannot report history rewrites (their fallback replies carry no epoch),
+    /// so callers must not sync them incrementally. The first call for an owner
+    /// sends one empty probe chunk; the answer is cached for the process.
+    pub async fn owner_supports_chunks(&self) -> bool {
+        match self {
+            Self::Local(_) => true,
+            #[cfg(feature = "remote")]
+            Self::Remote {
+                peer_label,
+                remote_node_id,
+                ..
+            } => {
+                use crate::agent::event_chunk::CHUNK_SUPPORT;
+                let owner = remote_node_id.as_deref().unwrap_or(peer_label);
+                if CHUNK_SUPPORT.lacks_support(owner) {
+                    return false;
+                }
+                if !CHUNK_SUPPORT.has_support(owner) {
+                    // Past any real sequence: an empty reply, or the
+                    // protocol-mismatch fallback that records the answer.
+                    let _ = self
+                        .get_event_stream_chunk(messages::GetEventStreamChunk {
+                            after_source_seq: Some(i64::MAX),
+                            before_source_seq: None,
+                            tail: false,
+                            max_events: 1,
+                            max_bytes: messages::MAX_EVENT_STREAM_CHUNK_BYTES,
+                        })
+                        .await;
+                }
+                !CHUNK_SUPPORT.lacks_support(owner)
+            }
+        }
+    }
+
     /// Get current LLM config for this session.
     pub async fn get_llm_config(&self) -> Result<Option<LLMConfig>, AcpError> {
         match self {

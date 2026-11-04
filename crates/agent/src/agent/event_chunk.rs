@@ -168,15 +168,27 @@ pub(crate) async fn build_event_stream_chunk(
 /// Owners (by stable node key) known not to support `GetEventStreamChunk`.
 /// Lives for the process lifetime.
 #[derive(Default)]
-pub(crate) struct ChunkSupportCache(Mutex<HashSet<String>>);
+pub(crate) struct ChunkSupportCache {
+    unsupported: Mutex<HashSet<String>>,
+    supported: Mutex<HashSet<String>>,
+}
 
 impl ChunkSupportCache {
     pub(crate) fn lacks_support(&self, owner: &str) -> bool {
-        self.0.lock().unwrap().contains(owner)
+        self.unsupported.lock().unwrap().contains(owner)
+    }
+
+    /// True once a chunk request to `owner` has succeeded.
+    pub(crate) fn has_support(&self, owner: &str) -> bool {
+        self.supported.lock().unwrap().contains(owner)
     }
 
     pub(crate) fn mark_unsupported(&self, owner: &str) {
-        self.0.lock().unwrap().insert(owner.to_string());
+        self.unsupported.lock().unwrap().insert(owner.to_string());
+    }
+
+    pub(crate) fn mark_supported(&self, owner: &str) {
+        self.supported.lock().unwrap().insert(owner.to_string());
     }
 }
 
@@ -212,7 +224,12 @@ where
     if !cache.lacks_support(owner) {
         match chunk(msg.clone()).await {
             Err(error) if is_unsupported_message(&error) => cache.mark_unsupported(owner),
-            other => return other,
+            other => {
+                if other.is_ok() {
+                    cache.mark_supported(owner);
+                }
+                return other;
+            }
         }
     }
     chunk_from_pages(&msg, pages).await
@@ -599,6 +616,29 @@ mod tests {
             append(&dst, e.kind).await;
         }
         dst
+    }
+
+    #[tokio::test]
+    async fn successful_chunk_marks_owner_supported() {
+        static PAGES: AtomicUsize = AtomicUsize::new(0);
+        let cache = ChunkSupportCache::default();
+        let owner = storage().await;
+        append(&owner, text("e")).await;
+        let chunk = build_event_stream_chunk(&owner, SID, &fwd(None, 10, 4 << 20))
+            .await
+            .unwrap();
+        chunk_with_fallback(
+            "owner-new",
+            &cache,
+            fwd(None, 10, 4 << 20),
+            |_| async move { Ok(chunk) },
+            paged_owner(storage().await, 200, &PAGES),
+        )
+        .await
+        .unwrap();
+        assert!(cache.has_support("owner-new"));
+        assert!(!cache.lacks_support("owner-new"));
+        assert!(!cache.has_support("owner-old"));
     }
 
     #[tokio::test]

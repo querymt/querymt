@@ -47,6 +47,10 @@ pub enum AccountingReason {
     /// accounting existed. Their cost is unknown: old cumulative amounts are
     /// not trusted and no historical rate is applied.
     UnaccountedHistory,
+    /// A remote session's older history has not been transferred to this
+    /// agent yet, so the totals cover only the events held locally. Never
+    /// produced by the reducer; added to a load snapshot while history fills.
+    UntransferredHistory,
 }
 
 /// Summed USD per category. Unknown components contribute nothing.

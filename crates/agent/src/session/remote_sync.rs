@@ -277,21 +277,35 @@ impl RemoteSyncState {
                 Ok(EpochCheck::Current)
             }
             _ => {
-                self.journal
-                    .reset_remote_source(&self.session_id, &self.node_id)
-                    .await?;
-                self.journal
-                    .set_remote_history_epoch(&self.session_id, &self.node_id, chunk_epoch)
-                    .await?;
-                let mut inner = self.inner.lock();
-                inner.coverage.clear();
-                inner.epoch = Some(chunk_epoch);
-                inner.tip = 0;
-                inner.live_anchored = false;
-                self.bump(&mut inner);
+                self.reset_local_copy_locked(chunk_epoch).await?;
                 Ok(EpochCheck::Reset)
             }
         }
+    }
+
+    /// Discard the local copy of this source (rows, coverage, cursor) so the
+    /// next sync transfers it afresh. Used when the owner cannot report
+    /// rewrites (no chunk support), where each sync replaces the copy.
+    pub async fn reset_local_copy(&self) -> SessionResult<()> {
+        let _apply = self.lock_apply().await;
+        self.reset_local_copy_locked(0).await
+    }
+
+    /// As [`Self::reset_local_copy`]; the caller holds the apply guard.
+    async fn reset_local_copy_locked(&self, epoch: u64) -> SessionResult<()> {
+        self.journal
+            .reset_remote_source(&self.session_id, &self.node_id)
+            .await?;
+        self.journal
+            .set_remote_history_epoch(&self.session_id, &self.node_id, epoch)
+            .await?;
+        let mut inner = self.inner.lock();
+        inner.coverage.clear();
+        inner.epoch = Some(epoch);
+        inner.tip = 0;
+        inner.live_anchored = false;
+        self.bump(&mut inner);
+        Ok(())
     }
 
     /// Record `[start, end]` as fully held and advance the contiguous sync
@@ -439,6 +453,28 @@ mod tests {
         assert_eq!(state.claim(1, 30), Claim::Busy);
         state.release(1, 9);
         assert_eq!(state.claim(1, 30), Claim::Part(1, 9));
+    }
+
+    #[tokio::test]
+    async fn reset_local_copy_clears_rows_coverage_and_cursor() {
+        let (state, journal) = state().await;
+        state.mark_covered(1, 20, 20).await.unwrap();
+        assert!(state.has_data());
+        state.reset_local_copy().await.unwrap();
+        assert!(!state.has_data());
+        assert_eq!(state.tip(), 0);
+        assert_eq!(state.claim(1, 20), Claim::Part(1, 20));
+        assert_eq!(
+            journal.remote_sync_cursor("s1", "node-a").await.unwrap(),
+            Some(0)
+        );
+        assert!(
+            journal
+                .remote_coverage("s1", "node-a")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

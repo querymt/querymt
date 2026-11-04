@@ -58,7 +58,7 @@ On the first open of a remote session with a load window, the attaching agent SH
 - **THEN** the load response is returned after the recent window has been transferred, without waiting for the older events
 
 ### Requirement: Incremental transfer on reopen
-When a remote session is reopened, the attaching agent SHALL transfer only events newer than those it already holds locally, and the load response SHALL include them, whether or not an existing attachment is reused.
+When a remote session whose owner supports chunked transfer is reopened, the attaching agent SHALL transfer only events newer than those it already holds locally, and the load response SHALL include them, whether or not an existing attachment is reused.
 
 #### Scenario: Reopening after new activity
 - **WHEN** a remote session that was previously synced has gained 30 events since, and is reopened
@@ -73,11 +73,16 @@ When a remote session is reopened, the attaching agent SHALL transfer only event
 - **THEN** the load response includes those events
 
 ### Requirement: Rewritten owner history is detected
-When the owner's history changes other than by appending, such as after an undo, the attaching agent SHALL detect the change on its next sync and SHALL replace the affected part of its local copy before answering a load.
+When the owner of a session that supports chunked transfer changes its history other than by appending, such as after an undo, the attaching agent SHALL detect the change on its next sync and SHALL replace the affected part of its local copy before answering a load. An owner without chunked transfer cannot report such a change, so for it the attaching agent SHALL instead replace its local copy with a full transfer on each sync.
 
 #### Scenario: Undo on the owner
 - **WHEN** turns are undone on the owner and the session is then reopened from another node
 - **THEN** the undone turns do not appear in the load response
+
+#### Scenario: Undo on an older owner
+- **WHEN** turns are undone on an owner without chunked transfer and the session is then reopened from another node
+- **THEN** the attaching agent replaces its local copy with a full paged transfer
+- **AND** the undone turns do not appear in the load response
 
 ### Requirement: Older history available from the attaching agent
 An older-history request for a remote session SHALL be answered from the attaching agent's local copy, transferring any part of the requested range that is not yet local.
@@ -102,7 +107,7 @@ After a remote session is connected, the attaching agent SHALL obtain the sessio
 - **THEN** the load still succeeds without runtime status
 
 ### Requirement: Older owners remain supported
-When the owner does not support chunked transfer, the attaching agent SHALL fall back to the existing paged transfer and the load SHALL still succeed with the same content. The attaching agent SHALL remember that the owner lacks support, so later transfers do not repeat the failed request.
+When the owner does not support chunked transfer, the attaching agent SHALL fall back to the existing paged transfer and the load SHALL still succeed with the same content. The attaching agent SHALL remember that the owner lacks support, so later transfers do not repeat the failed request. Incremental transfer, tail-first transfer and epoch-based rewrite detection are not available for such an owner; each sync replaces the local copy with a full paged transfer.
 
 #### Scenario: Owner on an older version
 - **WHEN** a remote session is opened from an owner that rejects chunked requests as unknown

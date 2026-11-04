@@ -60,6 +60,9 @@ fn describe(reason: &AccountingReason) -> String {
         AccountingReason::UnaccountedHistory => {
             "earlier history has no recorded pricing basis".into()
         }
+        AccountingReason::UntransferredHistory => {
+            "earlier history has not been transferred yet".into()
+        }
         AccountingReason::Valuation { reason } => match reason {
             IncompleteReason::UsageUnavailable => "a request reported no usage".into(),
             IncompleteReason::PricingUnavailable => "no price is available for the model".into(),
