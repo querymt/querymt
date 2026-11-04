@@ -102,6 +102,11 @@ pub enum AgentError {
     #[error("remote session not found: {details}")]
     RemoteSessionNotFound { details: String },
 
+    /// The events a load needs could not be transferred from the owner in
+    /// time. Retryable; never returned together with partial history.
+    #[error("remote history transfer failed for session {session_id}: {message}")]
+    RemoteTransferFailed { session_id: String, message: String },
+
     #[error("mesh admission rejected: {reason}")]
     AdmissionRejected { reason: String },
 
@@ -186,6 +191,20 @@ impl From<AgentError> for AcpError {
                 "category": "remote_upgrade_required",
                 "node": node,
                 "message": e.to_string(),
+            }));
+        }
+        if let AgentError::RemoteTransferFailed {
+            session_id,
+            message,
+        } = &e
+        {
+            return AcpError::new(-32603, e.to_string()).data(serde_json::json!({
+                "category": "remote_transfer",
+                "code": "remote_transfer_failed",
+                "retryable": true,
+                "session_id": session_id,
+                "sessionId": session_id,
+                "message": message,
             }));
         }
         if let AgentError::SessionRunningElsewhere { session_id } = &e {

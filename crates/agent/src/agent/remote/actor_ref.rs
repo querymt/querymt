@@ -870,18 +870,127 @@ impl SessionActorRef {
                 .map_err(|e| AgentError::RemoteActor(e.to_string())),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&message)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
-                .send()
+            Self::Remote { actor_ref, .. } => {
+                let page = actor_ref
+                    .ask(&message)
+                    .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                    .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        Self::map_agent_timeout_remote_send_error(
+                            e,
+                            "GetEventStreamSince timed out on remote session",
+                        )
+                    })?;
+                crate::agent::load_telemetry::record_mesh_history_request(page.events.len());
+                Ok(page)
+            }
+        }
+    }
+
+    /// Get one size-bounded chunk of the durable event stream.
+    ///
+    /// Remote owners that predate `GetEventStreamChunk` fail with a typed
+    /// protocol-mismatch transport failure; the request then falls back to
+    /// `GetEventStreamSince` paging, and the owner is remembered as lacking
+    /// chunk support for the rest of the process.
+    #[tracing::instrument(
+        name = "remote.session_ref.get_event_stream_chunk",
+        skip(self, request),
+        fields(is_remote = self.is_remote(), peer_label = %self.node_label())
+    )]
+    pub async fn get_event_stream_chunk(
+        &self,
+        request: messages::GetEventStreamChunk,
+    ) -> Result<messages::EventStreamChunk, AgentError> {
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(request)
                 .await
-                .map_err(|e| {
-                    Self::map_agent_timeout_remote_send_error(
-                        e,
-                        "GetEventStreamSince timed out on remote session",
-                    )
-                }),
+                .map_err(Self::map_local_agent_send_error),
+
+            #[cfg(feature = "remote")]
+            Self::Remote {
+                actor_ref,
+                peer_label,
+                remote_node_id,
+            } => {
+                let owner = remote_node_id.as_deref().unwrap_or(peer_label);
+                crate::agent::event_chunk::chunk_with_fallback(
+                    owner,
+                    &crate::agent::event_chunk::CHUNK_SUPPORT,
+                    request,
+                    |request| async move {
+                        let chunk = actor_ref
+                            .ask(&request)
+                            .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                            .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
+                            .send()
+                            .await
+                            .map_err(|e| {
+                                Self::map_agent_timeout_remote_send_error(
+                                    e,
+                                    "GetEventStreamChunk timed out on remote session",
+                                )
+                            })?;
+                        crate::agent::load_telemetry::record_mesh_history_request(
+                            chunk.events.len(),
+                        );
+                        Ok(chunk)
+                    },
+                    |after| {
+                        self.get_event_stream_since(
+                            Some(after),
+                            messages::MAX_EVENT_STREAM_PAGE_SIZE,
+                        )
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    /// Whether the owner serves `GetEventStreamChunk`. Owners without it
+    /// cannot report history rewrites (their fallback replies carry no epoch),
+    /// so callers must not sync them incrementally. The first call for an owner
+    /// sends one empty probe chunk; the answer is cached for the process.
+    /// A probe that fails for any other reason leaves support unknown and is
+    /// returned as an error, never treated as confirmed support.
+    pub async fn owner_supports_chunks(&self) -> Result<bool, AgentError> {
+        match self {
+            Self::Local(_) => Ok(true),
+            #[cfg(feature = "remote")]
+            Self::Remote {
+                peer_label,
+                remote_node_id,
+                ..
+            } => {
+                use crate::agent::event_chunk::CHUNK_SUPPORT;
+                let owner = remote_node_id.as_deref().unwrap_or(peer_label);
+                if CHUNK_SUPPORT.lacks_support(owner) {
+                    return Ok(false);
+                }
+                if !CHUNK_SUPPORT.has_support(owner) {
+                    // Past any real sequence: an empty reply, or the
+                    // protocol-mismatch fallback that records the answer.
+                    let probe = self
+                        .get_event_stream_chunk(messages::GetEventStreamChunk {
+                            after_source_seq: Some(i64::MAX),
+                            before_source_seq: None,
+                            tail: false,
+                            max_events: 1,
+                            max_bytes: messages::MAX_EVENT_STREAM_CHUNK_BYTES,
+                        })
+                        .await;
+                    if let Err(error) = probe
+                        && !CHUNK_SUPPORT.lacks_support(owner)
+                    {
+                        return Err(error);
+                    }
+                }
+                Ok(!CHUNK_SUPPORT.lacks_support(owner))
+            }
         }
     }
 

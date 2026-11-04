@@ -15,7 +15,7 @@ use crate::session::lifecycle::{
     ArchiveFilter, ResolutionFilter, SessionLifecycleFilter, SessionLifecyclePatch,
 };
 use crate::session::projection::{
-    EventJournal, NewDurableEvent, RecentModelEntry, SessionScope, ViewStore,
+    EventJournal, HistoryPageDirection, NewDurableEvent, RecentModelEntry, SessionScope, ViewStore,
 };
 use crate::session::store::{RemoteSessionBookmark, SessionStore};
 
@@ -3549,6 +3549,211 @@ impl EventJournal for StreamOnlyJournal {
     async fn max_stream_seq(&self, session_id: &str) -> SessionResult<i64> {
         self.0.max_stream_seq(session_id).await
     }
+}
+
+/// Walk the whole history in pages of `page` events in both directions and
+/// assert that every position is seen exactly once, in ascending order.
+async fn assert_paging_visits_each_event_once(
+    journal: &dyn EventJournal,
+    session: &str,
+    node: Option<&str>,
+    expected: &[i64],
+    page: usize,
+) {
+    let mut forward = Vec::new();
+    let mut after = 0;
+    loop {
+        let chunk = journal
+            .load_history_page(session, node, HistoryPageDirection::Forward { after }, page)
+            .await
+            .unwrap();
+        if chunk.is_empty() {
+            break;
+        }
+        assert!(chunk.len() <= page);
+        let positions: Vec<i64> = chunk.iter().map(|(p, _)| *p).collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{positions:?}");
+        after = *positions.last().unwrap();
+        forward.extend(positions);
+    }
+    assert_eq!(forward, expected, "forward paging");
+
+    let mut backward: Vec<i64> = Vec::new();
+    let mut before = None;
+    loop {
+        let chunk = journal
+            .load_history_page(
+                session,
+                node,
+                HistoryPageDirection::Backward { before },
+                page,
+            )
+            .await
+            .unwrap();
+        if chunk.is_empty() {
+            break;
+        }
+        assert!(chunk.len() <= page);
+        let positions: Vec<i64> = chunk.iter().map(|(p, _)| *p).collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{positions:?}");
+        before = Some(positions[0]);
+        backward.splice(0..0, positions);
+    }
+    assert_eq!(backward, expected, "backward paging");
+}
+
+async fn seed_local_history(journal: &dyn EventJournal, session: &str, count: usize) {
+    for _ in 0..count {
+        journal
+            .append_durable(&new_durable(session, AgentEventKind::Cancelled))
+            .await
+            .unwrap();
+    }
+}
+
+async fn seed_remote_history(journal: &dyn EventJournal, session: &str, seqs: &[i64]) {
+    for &source_seq in seqs {
+        journal
+            .append_durable_from_source(&NewDurableEvent {
+                origin: EventOrigin::Remote,
+                source_node: Some("peer".to_string()),
+                source_node_id: Some("node-a".to_string()),
+                source_seq: Some(source_seq),
+                ..new_durable(session, AgentEventKind::Cancelled)
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn history_paging_local_returns_each_event_once_in_both_directions() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+    seed_local_history(journal, "other", 3).await;
+    seed_local_history(journal, "s1", 7).await;
+    let all: Vec<i64> = journal
+        .load_session_page("s1", None, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.stream_seq)
+        .collect();
+    for page in [1, 3, 7, 50] {
+        assert_paging_visits_each_event_once(journal, "s1", None, &all, page).await;
+    }
+    assert!(
+        journal
+            .load_history_page(
+                "s1",
+                None,
+                HistoryPageDirection::Backward { before: None },
+                0
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn history_paging_default_impl_matches_override() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    seed_local_history(&storage, "s1", 7).await;
+    seed_remote_history(&storage, "r1", &[1, 2, 3, 4, 5, 6]).await;
+    storage
+        .add_remote_coverage("r1", "node-a", 1, 6)
+        .await
+        .unwrap();
+    let all: Vec<i64> = storage
+        .load_session_page("s1", None, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.stream_seq)
+        .collect();
+    // Backends that don't override `load_remote_history` report `stream_seq`
+    // as the position of remote rows (trait default).
+    let remote_default_positions: Vec<i64> = storage
+        .load_remote_session_stream("r1", "node-a")
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.stream_seq)
+        .collect();
+    let default_impl = StreamOnlyJournal(storage);
+    for page in [1, 2, 4, 20] {
+        assert_paging_visits_each_event_once(&default_impl, "s1", None, &all, page).await;
+        assert_paging_visits_each_event_once(
+            &default_impl,
+            "r1",
+            Some("node-a"),
+            &remote_default_positions,
+            page,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn history_paging_remote_uses_source_positions_and_covered_ranges_only() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+    // Tail-first arrival order, one stray uncovered event (5), and an older
+    // covered range separated by a gap.
+    seed_remote_history(journal, "r1", &[20, 21, 22, 23, 5, 10, 11, 12, 1, 2, 3]).await;
+    journal
+        .add_remote_coverage("r1", "node-a", 20, 23)
+        .await
+        .unwrap();
+    journal
+        .add_remote_coverage("r1", "node-a", 10, 12)
+        .await
+        .unwrap();
+    journal
+        .add_remote_coverage("r1", "node-a", 1, 3)
+        .await
+        .unwrap();
+    let expected = [1, 2, 3, 10, 11, 12, 20, 21, 22, 23];
+    for page in [1, 2, 3, 4, 10, 100] {
+        assert_paging_visits_each_event_once(journal, "r1", Some("node-a"), &expected, page).await;
+    }
+    // The page read agrees with the whole-history read.
+    let whole: Vec<i64> = journal
+        .load_remote_history("r1", "node-a")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect();
+    assert_eq!(whole, expected);
+    // Exclusive bounds at range edges.
+    let page = journal
+        .load_history_page(
+            "r1",
+            Some("node-a"),
+            HistoryPageDirection::Backward { before: Some(20) },
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+        vec![11, 12]
+    );
+    let page = journal
+        .load_history_page(
+            "r1",
+            Some("node-a"),
+            HistoryPageDirection::Forward { after: 3 },
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+        vec![10, 11]
+    );
 }
 
 async fn assert_last_unfinished_run_semantics(journal: &dyn EventJournal) {

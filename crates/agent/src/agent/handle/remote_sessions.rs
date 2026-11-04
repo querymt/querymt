@@ -546,6 +546,7 @@ impl LocalAgentHandle {
                         session_ref: remote_ref,
                     },
                 ),
+                windowed: false,
             },
         )
         .await

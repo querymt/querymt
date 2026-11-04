@@ -493,6 +493,7 @@ mod capabilities;
 mod core_a;
 mod core_b;
 mod ext_auth;
+mod ext_session_history;
 mod mesh;
 mod remote;
 mod remote_ext;

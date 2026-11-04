@@ -441,6 +441,56 @@ pub struct EventStreamPage {
     pub latest_source_seq: i64,
 }
 
+/// Upper bound on events in one [`EventStreamChunk`].
+pub(crate) const MAX_EVENT_STREAM_CHUNK_EVENTS: usize = 5_000;
+
+/// Upper bound on the msgpack-encoded size of the events in one
+/// [`EventStreamChunk`]. A chunk always carries at least one event, so a single
+/// oversized event can exceed this and still make progress.
+pub(crate) const MAX_EVENT_STREAM_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Retrieve one size-bounded chunk of the durable event stream, forward from a
+/// cursor or backward from a position (tail-first sync and older history).
+///
+/// Reply: `Result<EventStreamChunk, Error>`
+///
+/// * Forward (`tail == false`): events with `seq > after_source_seq` (and
+///   `seq < before_source_seq` when set), ascending.
+/// * Backward (`tail == true`): events with `seq < before_source_seq` (or up to
+///   the tip when `None`), returned ascending, starting at a run-based turn
+///   boundary when one fits within the limits. `after_source_seq` is an
+///   exclusive lower bound.
+///
+/// Owners that predate this message produce a typed transport failure; the
+/// requester falls back to [`GetEventStreamSince`] paging.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GetEventStreamChunk {
+    #[serde(default)]
+    pub after_source_seq: Option<i64>,
+    #[serde(default)]
+    pub before_source_seq: Option<i64>,
+    #[serde(default)]
+    pub tail: bool,
+    /// Requested event limit; clamped to [`MAX_EVENT_STREAM_CHUNK_EVENTS`].
+    pub max_events: usize,
+    /// Requested encoded-size limit; clamped to [`MAX_EVENT_STREAM_CHUNK_BYTES`].
+    pub max_bytes: usize,
+}
+
+/// One chunk of the durable event stream.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventStreamChunk {
+    /// Events in ascending source-sequence order (`AgentEvent.seq`).
+    pub events: Vec<crate::events::AgentEvent>,
+    /// The owner's current stream tip.
+    pub latest_source_seq: i64,
+    /// Owner-side counter bumped whenever journal events are deleted (undo).
+    /// A change means previously transferred history was rewritten.
+    pub history_epoch: u64,
+    /// More events remain beyond this chunk in the requested direction.
+    pub has_more: bool,
+}
+
 /// Subscribe a remote `EventRelayActor` to this session's events.
 ///
 /// Reply: `Result<(), Error>`
@@ -821,6 +871,77 @@ mod tests {
         assert_eq!(rt.path, "/tmp/test.txt");
         assert_eq!(rt.offset, 10);
         assert_eq!(rt.limit, 100);
+    }
+
+    fn chunk_test_event(seq: i64) -> crate::events::AgentEvent {
+        crate::events::AgentEvent {
+            seq,
+            session_seq: seq,
+            timestamp: 1,
+            session_id: "sess-1".into(),
+            origin: crate::events::EventOrigin::Local,
+            source_node: None,
+            kind: crate::events::AgentEventKind::PromptReceived {
+                content: "hi".into(),
+                message_id: None,
+            },
+        }
+    }
+
+    fn msgpack_roundtrip<T: Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
+        let bytes = rmp_serde::to_vec_named(value).expect("encode");
+        rmp_serde::from_slice(&bytes).expect("decode")
+    }
+
+    #[test]
+    fn get_event_stream_chunk_msgpack_roundtrip() {
+        let msg = GetEventStreamChunk {
+            after_source_seq: Some(7),
+            before_source_seq: None,
+            tail: true,
+            max_events: 5_000,
+            max_bytes: 4 * 1024 * 1024,
+        };
+        let rt = msgpack_roundtrip(&msg);
+        assert_eq!(rt.after_source_seq, Some(7));
+        assert_eq!(rt.before_source_seq, None);
+        assert!(rt.tail);
+        assert_eq!(rt.max_events, 5_000);
+        assert_eq!(rt.max_bytes, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn event_stream_chunk_msgpack_roundtrip_keeps_epoch_and_events() {
+        let chunk = EventStreamChunk {
+            events: vec![chunk_test_event(3), chunk_test_event(4)],
+            latest_source_seq: 9,
+            history_epoch: 2,
+            has_more: true,
+        };
+        let rt = msgpack_roundtrip(&chunk);
+        assert_eq!(rt.events.len(), 2);
+        assert_eq!(rt.events[1].seq, 4);
+        assert_eq!(rt.latest_source_seq, 9);
+        assert_eq!(rt.history_epoch, 2);
+        assert!(rt.has_more);
+    }
+
+    #[test]
+    fn get_event_stream_chunk_defaults_optional_fields() {
+        #[derive(Serialize)]
+        struct Minimal {
+            max_events: usize,
+            max_bytes: usize,
+        }
+        let bytes = rmp_serde::to_vec_named(&Minimal {
+            max_events: 10,
+            max_bytes: 100,
+        })
+        .unwrap();
+        let rt: GetEventStreamChunk = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(rt.after_source_seq, None);
+        assert_eq!(rt.before_source_seq, None);
+        assert!(!rt.tail);
     }
 
     #[test]

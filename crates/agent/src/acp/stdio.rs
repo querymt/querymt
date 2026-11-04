@@ -154,13 +154,13 @@ pub(crate) async fn replay_loaded_session(
     };
     let session_ref_missing = session_ref.is_none();
     let (events, prompt_blocks) = match session_ref {
-        Some(session_ref) => match session_ref
-            .get_event_stream()
-            .instrument(info_span!("session.event_stream.load", session.id = %session_id))
-            .await
-        {
-            Ok(events) => {
-                let history = session_ref
+        Some(session_ref) => {
+            match crate::acp::shared::session_events(agent, session_id, &session_ref)
+                .instrument(info_span!("session.event_stream.load", session.id = %session_id))
+                .await
+            {
+                Ok(events) => {
+                    let history = session_ref
                     .get_history()
                     .instrument(info_span!("session.history.load", session.id = %session_id))
                     .await
@@ -171,13 +171,14 @@ pub(crate) async fn replay_loaded_session(
                             "sessionId": session_id,
                         }))
                     })?;
-                (events, stored_user_prompt_blocks(history))
+                    (events, stored_user_prompt_blocks(history))
+                }
+                Err(err) => {
+                    tracing::warn!(session.id = %session_id, error = %err, "failed to load ACP replay events");
+                    return Err(err);
+                }
             }
-            Err(err) => {
-                tracing::warn!(session.id = %session_id, error = %err, "failed to load ACP replay events");
-                return Err(err);
-            }
-        },
+        }
         // A read-only previous owner has no actor: read the journal and the
         // history store directly, as the actor handlers do.
         // Only a read-only session (transferred owner, archived workspace) may

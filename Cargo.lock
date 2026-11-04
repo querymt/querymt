@@ -11891,6 +11891,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.5",
  "rmcp",
+ "rmp-serde",
  "rusqlite",
  "rust-embed",
  "rust-stemmers",

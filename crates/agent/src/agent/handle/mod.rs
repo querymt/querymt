@@ -15,9 +15,10 @@ mod ext_plugins;
 mod ext_profiles;
 mod ext_remote;
 mod ext_schedules;
+mod ext_session_history;
 mod ext_session_ops;
 mod ext_worktree_ops;
-mod model_registry;
+pub(crate) mod model_registry;
 #[cfg(feature = "remote")]
 pub(crate) mod remote_connect;
 mod remote_mesh;

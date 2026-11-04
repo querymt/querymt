@@ -145,6 +145,11 @@ remote_msg_impl!(
     REG_GET_EVENT_STREAM_SINCE
 );
 remote_msg_impl!(
+    messages::GetEventStreamChunk,
+    "querymt::GetEventStreamChunk",
+    REG_GET_EVENT_STREAM_CHUNK
+);
+remote_msg_impl!(
     messages::GetLlmConfig,
     "querymt::GetLlmConfig",
     REG_GET_LLM_CONFIG

@@ -64,6 +64,16 @@ pub struct CreateRemoteSessionRequest {
 pub struct AttachRemoteSessionRequest {
     pub node_id: String,
     pub session_id: String,
+    /// ACP-style `_meta`; `_meta.querymt.loadWindow` requests a windowed load.
+    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+    #[typeshare(serialized_as = "any")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl AttachRemoteSessionRequest {
+    pub fn load_window(&self) -> Option<crate::session::history_window::LoadWindow> {
+        crate::session::history_window::load_window_from_meta(self.meta.as_ref())
+    }
 }
 
 #[typeshare]
@@ -231,18 +241,23 @@ pub async fn create_remote_session(
             });
         }
 
-        let snapshot = agent
-            .attach_remote_session_for_ext(
+        let connected = agent
+            .connect_remote_for_ext(
                 &request.node_id,
                 &response.session_id,
                 Some(response.handoff),
+                false,
+            )
+            .await
+            .map_err(|error| error.to_acp_error())?;
+        let (snapshot, profile, config_options) =
+            crate::agent::handle::model_registry::join_remote_load_requests(
+                &response.session_id,
+                agent.load_remote_snapshot(&response.session_id, &connected, None),
+                agent.remote_session_profile(&request.node_id, &response.session_id),
+                async { Ok(attached_remote_config_options(agent, &response.session_id).await) },
             )
             .await?;
-
-        let profile = agent
-            .remote_session_profile(&request.node_id, &response.session_id)
-            .await;
-        let config_options = attached_remote_config_options(agent, &response.session_id).await;
         Ok(RemoteSessionAttachInfo {
             session_id: response.session_id,
             node_id: request.node_id,
@@ -270,13 +285,51 @@ pub async fn attach_remote_session(
 ) -> Result<RemoteSessionAttachInfo, Error> {
     #[cfg(feature = "remote")]
     {
-        let snapshot = agent
-            .attach_remote_session_for_ext(&request.node_id, &request.session_id, None)
+        let window = request.load_window();
+        let connected = match agent
+            .connect_remote_for_ext(
+                &request.node_id,
+                &request.session_id,
+                None,
+                window.is_some(),
+            )
+            .await
+        {
+            Ok(connected) => connected,
+            Err(error) => {
+                // The owner cannot be reached: a window that is already local
+                // is served as a stale snapshot, without an attachment.
+                let stale = if error.owner_unreachable() {
+                    agent
+                        .stale_remote_snapshot(&request.session_id, window)
+                        .await
+                } else {
+                    None
+                };
+                return match stale {
+                    Some(snapshot) => Ok(RemoteSessionAttachInfo {
+                        session_id: request.session_id,
+                        node_id: request.node_id,
+                        attached: false,
+                        config_options: Vec::new(),
+                        profile_id: None,
+                        profile_label: None,
+                        snapshot: Some(snapshot),
+                    }),
+                    None => Err(error.to_acp_error()),
+                };
+            }
+        };
+        // Snapshot, profile and config options are independent once the
+        // session is connected; only the snapshot can fail the attach.
+        let (snapshot, profile, config_options) =
+            crate::agent::handle::model_registry::join_remote_load_requests(
+                &request.session_id,
+                agent.load_remote_snapshot(&request.session_id, &connected, window),
+                agent.remote_session_profile(&request.node_id, &request.session_id),
+                async { Ok(attached_remote_config_options(agent, &request.session_id).await) },
+            )
             .await?;
-        let profile = agent
-            .remote_session_profile(&request.node_id, &request.session_id)
-            .await;
-        let config_options = attached_remote_config_options(agent, &request.session_id).await;
         Ok(RemoteSessionAttachInfo {
             session_id: request.session_id,
             node_id: request.node_id,

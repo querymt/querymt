@@ -753,6 +753,7 @@ impl LocalAgentHandle {
         req: crate::acp::protocol::LoadSessionRequest,
     ) -> std::result::Result<crate::acp::protocol::LoadSessionResponse, Error> {
         let session_id = req.session_id.to_string();
+        let load_window = crate::session::history_window::load_window_from_meta(req.meta.as_ref());
 
         // Resolve durable remote ownership before profile routing or local
         // materialization. A bookmark lookup is local I/O; mesh recovery is
@@ -779,17 +780,48 @@ impl LocalAgentHandle {
                     "sessionId": session_id,
                 })));
             }
-            self.ensure_remote_session_connected(
-                &session_id,
-                Some(&bookmark.node_id),
-                RemoteConnectReason::Open,
-            )
-            .await
-            .map_err(|error| error.to_acp_error())?;
-            let snapshot = self
-                .build_remote_attach_snapshot(&session_id)
-                .await
-                .map_err(|error| Error::internal_error().data(error.to_string()))?;
+            let connected = self
+                .connect_remote_session(
+                    &session_id,
+                    crate::agent::handle::remote_connect::RemoteConnectOptions {
+                        node_hint: Some(&bookmark.node_id),
+                        peer_label: None,
+                        preferred_scope: None,
+                        reason: RemoteConnectReason::Open,
+                        replace: RemoteConnectReason::Open.default_replace_policy(),
+                        handoff: None,
+                        windowed: load_window.is_some(),
+                    },
+                )
+                .await;
+            let (snapshot, profile, config_options) = match connected {
+                Ok(connected) => {
+                    // Snapshot (which also observes runtime status), profile
+                    // and config options are independent: run them together.
+                    // Only the snapshot can fail the load.
+                    super::model_registry::join_remote_load_requests(
+                        &session_id,
+                        self.load_remote_snapshot(&session_id, &connected, load_window),
+                        self.remote_session_profile(&bookmark.node_id, &session_id),
+                        self.remote_session_config_options(&session_id),
+                    )
+                    .await?
+                }
+                // The owner cannot be reached: a window that is already local
+                // is served as a stale snapshot; otherwise the connect error
+                // stands.
+                Err(error) => {
+                    let stale = if error.owner_unreachable() {
+                        self.stale_remote_snapshot(&session_id, load_window).await
+                    } else {
+                        None
+                    };
+                    match stale {
+                        Some(snapshot) => (snapshot, None, Default::default()),
+                        None => return Err(error.to_acp_error()),
+                    }
+                }
+            };
             let mut meta = serde_json::Map::new();
             meta.insert("querymt/sessionLoadSnapshot.v1".into(), snapshot);
             meta.insert("location".into(), serde_json::json!("remote"));
@@ -797,10 +829,7 @@ impl LocalAgentHandle {
             meta.insert("nodeLabel".into(), serde_json::json!(bookmark.peer_label));
             meta.insert("cwd".into(), serde_json::json!(bookmark.cwd));
             meta.insert("title".into(), serde_json::json!(bookmark.title));
-            if let Some(profile) = self
-                .remote_session_profile(&bookmark.node_id, &session_id)
-                .await
-            {
+            if let Some(profile) = profile {
                 meta.insert(
                     "profileId".into(),
                     serde_json::json!(profile.as_ref().map(|value| &value.profile_id)),
@@ -810,13 +839,6 @@ impl LocalAgentHandle {
                     serde_json::json!(profile.as_ref().map(|value| &value.profile_label)),
                 );
             }
-            let config_options = self
-                .remote_session_config_options(&session_id)
-                .await
-                .unwrap_or_else(|error| {
-                    tracing::warn!(session_id, error = %error, "remote configuration unavailable during session load");
-                    Vec::new()
-                });
             return Ok(LoadSessionResponse::new()
                 .config_options(config_options)
                 .meta(meta));
@@ -838,7 +860,7 @@ impl LocalAgentHandle {
                 .and_then(|(handle, _)| handle.as_any().downcast_ref::<LocalAgentHandle>())
                 .unwrap_or(self);
             let mut meta = meta_handle
-                .session_load_snapshot_meta(&session_id)
+                .session_load_snapshot_meta(&session_id, load_window)
                 .await?
                 .unwrap_or_default();
             let namespace = meta
@@ -944,7 +966,7 @@ impl LocalAgentHandle {
                 .modes(crate::agent::session_registry::mode_state(current_mode))
                 .config_options(config_options);
             if let Some(meta) = profile_handle
-                .session_load_snapshot_meta(&session_id)
+                .session_load_snapshot_meta(&session_id, load_window)
                 .await?
             {
                 response = response.meta(meta);
@@ -970,7 +992,10 @@ impl LocalAgentHandle {
             let mut response = LoadSessionResponse::new()
                 .modes(crate::agent::session_registry::mode_state(current_mode))
                 .config_options(config_options);
-            if let Some(meta) = self.session_load_snapshot_meta(&session_id).await? {
+            if let Some(meta) = self
+                .session_load_snapshot_meta(&session_id, load_window)
+                .await?
+            {
                 response = response.meta(meta);
             }
             return Ok(response);
@@ -1014,7 +1039,10 @@ impl LocalAgentHandle {
         let mut response = LoadSessionResponse::new()
             .modes(crate::agent::session_registry::mode_state(current_mode))
             .config_options(config_options);
-        if let Some(meta) = self.session_load_snapshot_meta(&session_id).await? {
+        if let Some(meta) = self
+            .session_load_snapshot_meta(&session_id, load_window)
+            .await?
+        {
             response = response.meta(meta);
         }
 
@@ -1028,23 +1056,28 @@ impl LocalAgentHandle {
     async fn session_load_snapshot_meta(
         &self,
         session_id: &str,
+        window: Option<crate::session::history_window::LoadWindow>,
     ) -> std::result::Result<Option<serde_json::Map<String, serde_json::Value>>, Error> {
         let mut meta = serde_json::Map::new();
         if let Some(view_store) = self.config.storage.view_store() {
-            let snapshot = crate::session::load_session_snapshot(self, view_store, session_id)
-                .await
-                .map_err(|error| {
-                    Error::internal_error().data(serde_json::json!({
-                        "message": format!("Failed to build session load snapshot: {error}"),
-                        "sessionId": session_id,
-                    }))
-                })?;
+            let probe = crate::agent::load_telemetry::LoadProbe::start();
+            let snapshot = crate::session::load_snapshot::load_session_snapshot_windowed(
+                self, view_store, session_id, window,
+            )
+            .await
+            .map_err(|error| {
+                Error::internal_error().data(serde_json::json!({
+                    "message": format!("Failed to build session load snapshot: {error}"),
+                    "sessionId": session_id,
+                }))
+            })?;
             let snapshot = serde_json::to_value(snapshot).map_err(|error| {
                 Error::internal_error().data(serde_json::json!({
                     "message": format!("Failed to serialize session load snapshot: {error}"),
                     "sessionId": session_id,
                 }))
             })?;
+            probe.log_finished("local_load", session_id, &snapshot);
             meta.insert("querymt/sessionLoadSnapshot.v1".to_string(), snapshot);
         }
 

@@ -31,6 +31,16 @@ pub struct ControlFeatureInfo {
     pub session_lifecycle: bool,
     #[serde(default)]
     pub session_pins: bool,
+    /// `session/list` honours `_meta.querymt.sessionSource` (`local` | `remote`), so clients
+    /// can page local and remote sessions independently and in parallel.
+    #[serde(default)]
+    pub session_source_listing: bool,
+    /// `loadWindow` on load/attach, the whole-session `summary`, and `querymt/session/history`.
+    #[serde(default)]
+    pub session_history_window: bool,
+    /// `querymt/session/toolContent` returns complete tool results / arguments.
+    #[serde(default)]
+    pub session_tool_content: bool,
     pub schedules: bool,
     pub remote_schedules: bool,
     pub profiles: bool,
@@ -100,6 +110,8 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/session/undo".to_string(),
         "querymt/session/redo".to_string(),
         "querymt/session/undoStack".to_string(),
+        "querymt/session/history".to_string(),
+        "querymt/session/toolContent".to_string(),
         "querymt/schedules/create".to_string(),
         "querymt/schedules/list".to_string(),
         "querymt/schedules/get".to_string(),
@@ -209,6 +221,9 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
             remote_sessions: cfg!(feature = "remote"),
             session_lifecycle: agent.supports_session_lifecycle_contract(),
             session_pins,
+            session_source_listing: true,
+            session_history_window: true,
+            session_tool_content: true,
             schedules: true,
             remote_schedules: cfg!(feature = "remote") && mesh_enabled,
             profiles: agent.profiles().is_some(),

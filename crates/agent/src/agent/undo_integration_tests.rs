@@ -716,6 +716,55 @@ async fn test_cleanup_revert_prunes_event_journal() -> Result<()> {
     Ok(())
 }
 
+/// The owner-side history epoch changes only when undo cleanup deletes journal
+/// events; appends leave it alone. Remote peers use it to detect rewrites.
+#[tokio::test]
+async fn test_undo_cleanup_bumps_history_epoch_and_appends_do_not() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    let session_id = fixture.create_session().await?;
+    let journal = fixture.storage.event_journal();
+
+    let msg1_id = fixture.add_user_message(&session_id, "first").await?;
+    append_prompt_event(&*journal, &session_id, &msg1_id).await;
+    let msg2_id = fixture.add_user_message(&session_id, "second").await?;
+    append_prompt_event(&*journal, &session_id, &msg2_id).await;
+    append_generic_event(&*journal, &session_id).await;
+
+    assert_eq!(journal.history_epoch(&session_id).await?, 0);
+    append_generic_event(&*journal, &session_id).await;
+    assert_eq!(
+        journal.history_epoch(&session_id).await?,
+        0,
+        "appends must not change the epoch"
+    );
+
+    fixture.undo(&session_id, &msg2_id).await?;
+    assert_eq!(
+        journal.history_epoch(&session_id).await?,
+        0,
+        "undo alone keeps events until the next prompt"
+    );
+    crate::agent::undo::cleanup_revert_on_prompt(
+        &fixture.handle.config.provider,
+        &*fixture.storage.event_journal(),
+        &session_id,
+    )
+    .await
+    .expect("cleanup should succeed");
+    assert_eq!(journal.history_epoch(&session_id).await?, 1);
+
+    append_generic_event(&*journal, &session_id).await;
+    assert_eq!(journal.history_epoch(&session_id).await?, 1);
+
+    // Another session is unaffected, and a delete that removes nothing is a no-op.
+    assert_eq!(journal.history_epoch("other-session").await?, 0);
+    journal
+        .delete_session_events_from(&session_id, i64::MAX)
+        .await?;
+    assert_eq!(journal.history_epoch(&session_id).await?, 1);
+    Ok(())
+}
+
 /// Rewinding past a turn that incurred charges prunes the conversation but
 /// keeps the accounting ledger, so session spend is unchanged and journal
 /// numbers are not reused or shifted.

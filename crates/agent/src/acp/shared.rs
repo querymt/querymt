@@ -529,6 +529,26 @@ pub(crate) async fn send_recovered_delegations(
     Ok(())
 }
 
+/// A session's events for history restore/replay. Remote sessions read the
+/// local journal (after the sync barrier) instead of downloading the owner's
+/// stream again.
+pub(crate) async fn session_events(
+    agent: &AgentHandle,
+    session_id: &str,
+    session_ref: &crate::agent::remote::SessionActorRef,
+) -> Result<Vec<AgentEvent>, Error> {
+    #[cfg(feature = "remote")]
+    if let Some(events) = agent
+        .remote_session_events_from_journal(session_id, session_ref)
+        .await
+        .map_err(Error::from)?
+    {
+        return Ok(events);
+    }
+    let _ = (agent, session_id);
+    session_ref.get_event_stream().await
+}
+
 pub(crate) async fn restore_session_history(
     agent: &AgentHandle,
     session_id: &str,
@@ -567,7 +587,8 @@ pub(crate) async fn restore_session_history(
     let Some(session_ref) = session_ref else {
         return Vec::new();
     };
-    match session_ref.get_event_stream().await {
+    let events = session_events(agent, session_id, &session_ref).await;
+    match events {
         Ok(events) => translator
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1373,6 +1394,18 @@ impl AcpSessionUpdateCapabilities {
 /// `_meta.querymt.accounting` key carrying the replacement accounting DTO.
 pub const QUERYMT_ACCOUNTING_META_KEY: &str = "accounting";
 
+/// The whole-session summary of a windowed load snapshot, when the snapshot
+/// does not contain the complete history.
+fn windowed_summary(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<crate::session::history_window::SessionHistorySummary> {
+    let snapshot = meta?.get("querymt/sessionLoadSnapshot.v1")?;
+    if snapshot["history"]["complete"].as_bool() != Some(false) {
+        return None;
+    }
+    serde_json::from_value(snapshot.get("summary")?.clone()).ok()
+}
+
 /// Per-session usage projection state for the live context meter.
 ///
 /// Token telemetry (`_meta.querymt.usage` v1) is derived from main-request
@@ -1390,10 +1423,19 @@ struct SessionUsageProjection {
     latest_request: Option<TokenUsageBreakdown>,
     session_totals: Option<TokenUsageBreakdown>,
     partial: bool,
-    request_seqs: HashSet<i64>,
+    /// Observed main requests by journal position, with their usage, so a
+    /// windowed seed can split live requests around the window boundary.
+    request_seqs: HashMap<i64, Option<TokenUsageBreakdown>>,
     latest_request_seq: Option<i64>,
     provider_seq: Option<i64>,
     history_loaded: bool,
+    /// Main requests that happened before a windowed load's first event.
+    prior_requests: u64,
+    /// The windowed-load summary was already applied (seeding is repeatable).
+    summary_seeded: bool,
+    /// The seeding snapshot reported older remote history as not yet local, so
+    /// accounting totals must never claim completeness.
+    untransferred_history: bool,
 }
 
 /// Exclusive categories: provider adapters already separate caching and reasoning.
@@ -1416,6 +1458,20 @@ impl From<&querymt::Usage> for TokenUsageBreakdown {
             cache_read_tokens: u64::from(usage.cache_read),
             cache_write_tokens: u64::from(usage.cache_write),
         }
+    }
+}
+
+impl TokenUsageBreakdown {
+    fn add(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
     }
 }
 
@@ -1460,9 +1516,13 @@ impl SessionUsageProjection {
     }
 
     fn accounting_snapshot(&self) -> Option<crate::accounting::AccountingSnapshot> {
-        self.accounting
-            .as_ref()
-            .map(crate::accounting::AccountingSnapshot::from_reducer)
+        self.accounting.as_ref().map(|reducer| {
+            let mut snapshot = crate::accounting::AccountingSnapshot::from_reducer(reducer);
+            if self.untransferred_history {
+                snapshot.mark_untransferred_history();
+            }
+            snapshot
+        })
     }
 
     /// Observe one event. Returns `true` when an accounting *settlement* (or a
@@ -1491,30 +1551,19 @@ impl SessionUsageProjection {
                 accounting,
                 ..
             } => {
-                if !self.request_seqs.insert(seq) {
+                if self.request_seqs.contains_key(&seq) {
                     return false;
                 }
+                let request = usage.as_ref().map(TokenUsageBreakdown::from);
+                self.request_seqs.insert(seq, request.clone());
                 self.observe_context_used(seq, *context_tokens);
                 let legacy_changed = if accounting.is_none() {
                     self.apply_accounting(session_id, seq, kind)
                 } else {
                     false
                 };
-                let request = usage.as_ref().map(TokenUsageBreakdown::from);
                 if let Some(request) = request.as_ref() {
-                    let totals = self.session_totals.get_or_insert_default();
-                    totals.input_tokens = totals.input_tokens.saturating_add(request.input_tokens);
-                    totals.output_tokens =
-                        totals.output_tokens.saturating_add(request.output_tokens);
-                    totals.reasoning_tokens = totals
-                        .reasoning_tokens
-                        .saturating_add(request.reasoning_tokens);
-                    totals.cache_read_tokens = totals
-                        .cache_read_tokens
-                        .saturating_add(request.cache_read_tokens);
-                    totals.cache_write_tokens = totals
-                        .cache_write_tokens
-                        .saturating_add(request.cache_write_tokens);
+                    self.session_totals.get_or_insert_default().add(request);
                 } else {
                     self.partial = true;
                 }
@@ -1538,7 +1587,7 @@ impl SessionUsageProjection {
         include_usage: bool,
     ) -> Option<serde_json::Map<String, serde_json::Value>> {
         let mut querymt = serde_json::Map::new();
-        if include_usage && !self.request_seqs.is_empty() {
+        if include_usage && (!self.request_seqs.is_empty() || self.prior_requests > 0) {
             querymt.insert(
                 "usage".to_string(),
                 serde_json::json!({
@@ -1782,9 +1831,116 @@ impl AcpLiveEventTranslator {
                 Err(_) => partial = true,
             }
         }
+        let summary = windowed_summary(meta);
+        if let Some(summary) = &summary {
+            self.seed_prior_usage(session_id, summary);
+        }
         let recovered = self.seed_history(session_id, &history);
-        self.usage.entry(session_id.to_owned()).or_default().partial |= partial;
+        if let Some(summary) = &summary {
+            self.seed_whole_session_state(session_id, summary);
+        }
+        let untransferred = meta
+            .and_then(|meta| meta.get("querymt/sessionLoadSnapshot.v1"))
+            .and_then(|snapshot| snapshot["accounting"]["session"]["reasons"].as_array())
+            .is_some_and(|reasons| {
+                reasons
+                    .iter()
+                    .any(|reason| reason["kind"] == "untransferred_history")
+            });
+        let usage = self.usage.entry(session_id.to_owned()).or_default();
+        usage.partial |= partial;
+        // A later load after the fill reports exact values and lifts the limit.
+        usage.untransferred_history = untransferred;
         Some(recovered)
+    }
+
+    /// Before the window's own events are observed: start token totals from
+    /// the history that precedes the window, so no event is counted twice.
+    fn seed_prior_usage(
+        &mut self,
+        session_id: &str,
+        summary: &crate::session::history_window::SessionHistorySummary,
+    ) {
+        let usage = self.usage.entry(session_id.to_owned()).or_default();
+        if usage.summary_seeded {
+            return;
+        }
+        let Some(prior) = &summary.usage.before_window else {
+            return;
+        };
+        // Live requests before the window are already inside `prior`; those
+        // at or after it are not (the replay skips ones seen live), so they
+        // are added on top. Earlier ones stay in `request_seqs` so repeated
+        // events are still deduplicated. Without a boundary every live
+        // request is added.
+        let start = prior.window_start.unwrap_or(i64::MIN);
+        let mut totals = prior
+            .session_totals
+            .as_ref()
+            .map(|totals| TokenUsageBreakdown {
+                input_tokens: totals.input_tokens,
+                output_tokens: totals.output_tokens,
+                reasoning_tokens: totals.reasoning_tokens,
+                cache_read_tokens: totals.cache_read_tokens,
+                cache_write_tokens: totals.cache_write_tokens,
+            });
+        for request in usage
+            .request_seqs
+            .iter()
+            .filter(|(seq, _)| **seq >= start)
+            .filter_map(|(_, request)| request.as_ref())
+        {
+            totals.get_or_insert_default().add(request);
+        }
+        usage.session_totals = totals;
+        usage.partial |= prior.partial;
+        usage.prior_requests = prior.request_count;
+    }
+
+    /// After the window's events were observed: state that may live entirely
+    /// before the window (latest request, context size, model, accounting).
+    fn seed_whole_session_state(
+        &mut self,
+        session_id: &str,
+        summary: &crate::session::history_window::SessionHistorySummary,
+    ) {
+        let usage = self.usage.entry(session_id.to_owned()).or_default();
+        if usage.summary_seeded {
+            return;
+        }
+        usage.summary_seeded = true;
+        if usage.latest_request.is_none() {
+            usage.latest_request =
+                summary
+                    .usage
+                    .latest_request
+                    .as_ref()
+                    .map(|request| TokenUsageBreakdown {
+                        input_tokens: request.input_tokens,
+                        output_tokens: request.output_tokens,
+                        reasoning_tokens: request.reasoning_tokens,
+                        cache_read_tokens: request.cache_read_tokens,
+                        cache_write_tokens: request.cache_write_tokens,
+                    });
+        }
+        if let Some(provider) = &summary.provider
+            && usage.provider_seq.is_none_or(|seq| provider.position > seq)
+        {
+            usage.context_limit = provider.context_limit;
+            usage.provider_seq = Some(provider.position);
+        }
+        if let (Some(tokens), Some(position)) =
+            (summary.usage.context_tokens, summary.usage.context_position)
+        {
+            usage.observe_context_used(position, tokens);
+        }
+        if let Some(reducer) = usage.accounting.as_mut() {
+            reducer.replace_session_totals(summary.usage.accounting.clone());
+        } else if summary.usage.accounting != crate::accounting::ScopeTotals::default() {
+            let mut reducer = crate::accounting::AccountingReducer::new(session_id);
+            reducer.replace_session_totals(summary.usage.accounting.clone());
+            usage.accounting = Some(reducer);
+        }
     }
 
     /// Seed options that have not already been observed on the live stream.
@@ -7482,6 +7638,140 @@ mod session_update_tests {
         assert_eq!(usage.session_totals.as_ref().unwrap().output_tokens, 162);
     }
 
+    #[test]
+    fn prior_usage_adds_live_requests_inside_the_window_and_excludes_earlier_ones() {
+        use crate::session::history_window::{PriorUsage, SessionHistorySummary, UsageBreakdown};
+        let session_id = "s";
+        let mut translator = AcpLiveEventTranslator::new();
+        {
+            let usage = translator.usage.entry(session_id.to_owned()).or_default();
+            // Seq 5 precedes the window (already inside the prior totals);
+            // seq 12 is inside it and was observed live before seeding.
+            usage.observe(session_id, 5, request_with_tokens(5).kind());
+            usage.observe(session_id, 12, request_with_tokens(12).kind());
+        }
+        let mut summary = SessionHistorySummary::default();
+        summary.usage.before_window = Some(PriorUsage {
+            window_start: Some(10),
+            session_totals: Some(UsageBreakdown {
+                output_tokens: 1000,
+                ..UsageBreakdown::default()
+            }),
+            partial: false,
+            request_count: 4,
+            accounting: Default::default(),
+        });
+        translator.seed_prior_usage(session_id, &summary);
+
+        let usage = &translator.usage[session_id];
+        assert_eq!(
+            usage.session_totals.as_ref().unwrap().output_tokens,
+            1000 + 162,
+            "prior totals plus the live request inside the window only"
+        );
+        assert!(usage.request_seqs.contains_key(&12));
+        assert!(
+            usage.request_seqs.contains_key(&5),
+            "pre-window requests stay known for deduplication"
+        );
+        // Replaying earlier or in-window events does not count them again.
+        let usage = translator.usage.get_mut(session_id).unwrap();
+        usage.observe(session_id, 12, request_with_tokens(12).kind());
+        usage.observe(session_id, 5, request_with_tokens(5).kind());
+        assert_eq!(
+            usage.session_totals.as_ref().unwrap().output_tokens,
+            1000 + 162
+        );
+    }
+
+    #[tokio::test]
+    async fn windowed_load_seeds_whole_session_usage_and_live_requests_add_to_it() {
+        use crate::session::backend::StorageBackend;
+        use crate::session::history_window::LoadWindow;
+        use crate::session::projection::NewDurableEvent;
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = fixture.create_session().await;
+        let journal = fixture.storage.event_journal();
+        let mut kinds = vec![provider_changed(1, Some(100_000)).kind().clone()];
+        for n in 0..30 {
+            kinds.push(AgentEventKind::RunStarted {
+                run_id: format!("r{n}"),
+                origin: "interactive".into(),
+            });
+            kinds.push(request_with_tokens(2).kind().clone());
+        }
+        for kind in kinds {
+            journal
+                .append_durable(&NewDurableEvent {
+                    session_seq: None,
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    source_node_id: None,
+                    source_seq: None,
+                    kind,
+                })
+                .await
+                .unwrap();
+        }
+        let load = |window: Option<LoadWindow>| {
+            let fixture = &fixture;
+            let session_id = session_id.clone();
+            async move {
+                let snapshot = crate::session::load_snapshot::load_session_snapshot_windowed(
+                    fixture.handle.as_ref(),
+                    fixture.storage.view_store().unwrap(),
+                    &session_id,
+                    window,
+                )
+                .await
+                .unwrap();
+                serde_json::Map::from_iter([(
+                    "querymt/sessionLoadSnapshot.v1".to_string(),
+                    serde_json::to_value(snapshot).unwrap(),
+                )])
+            }
+        };
+        let windowed_meta = load(Some(LoadWindow {
+            max_turns: 5,
+            ..LoadWindow::default()
+        }))
+        .await;
+        assert_eq!(
+            windowed_meta["querymt/sessionLoadSnapshot.v1"]["history"]["complete"],
+            false
+        );
+        let full_meta = load(None).await;
+
+        let mut windowed = AcpLiveEventTranslator::new();
+        windowed
+            .seed_history_from_meta(&session_id, Some(&windowed_meta))
+            .unwrap();
+        let mut full = AcpLiveEventTranslator::new();
+        full.seed_history_from_meta(&session_id, Some(&full_meta))
+            .unwrap();
+        let w = &windowed.usage[&session_id];
+        let f = &full.usage[&session_id];
+        assert_eq!(w.session_totals, f.session_totals);
+        assert_eq!(w.session_totals.as_ref().unwrap().output_tokens, 162 * 30);
+        assert_eq!(w.context_limit, Some(100_000), "model chosen before window");
+        assert_eq!(w.latest_request, f.latest_request);
+        assert_eq!(w.reliable_used(), f.reliable_used());
+
+        // A request after the windowed load reports whole-session totals.
+        for translator in [&mut windowed, &mut full] {
+            translator.usage.get_mut(&session_id).unwrap().observe(
+                &session_id,
+                10_000,
+                request_with_tokens(10_000).kind(),
+            );
+        }
+        let w = &windowed.usage[&session_id];
+        let f = &full.usage[&session_id];
+        assert_eq!(w.session_totals, f.session_totals);
+        assert_eq!(w.session_totals.as_ref().unwrap().output_tokens, 162 * 31);
+    }
+
     #[tokio::test]
     async fn load_snapshot_carries_authoritative_accounting_without_context_or_replay() {
         use crate::accounting::AttemptPurpose::{Compaction, MainResponse};
@@ -7950,6 +8240,45 @@ mod session_update_tests {
         );
         let snapshot = translator.usage["s-1"].accounting_snapshot().unwrap();
         assert_eq!(snapshot.session.priced_attempts, 1);
+        assert!(snapshot.session.complete);
+    }
+
+    #[test]
+    fn untransferred_history_limit_survives_live_accounting_updates() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let events: Vec<AgentEvent> = attempt_events(1, "a1", "c1", MainResponse, true)
+            .iter()
+            .map(|e| agent_event(e.seq(), e.kind().clone()))
+            .collect();
+        let seed = |reasons: serde_json::Value| {
+            serde_json::Map::from_iter([(
+                "querymt/sessionLoadSnapshot.v1".to_string(),
+                serde_json::json!({
+                    "audit": { "events": events },
+                    "accounting": { "session": { "reasons": reasons } },
+                }),
+            )])
+        };
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.seed_history_from_meta(
+            "s-1",
+            Some(&seed(
+                serde_json::json!([{ "kind": "untransferred_history" }]),
+            )),
+        );
+        let snapshot = translator.usage["s-1"].accounting_snapshot().unwrap();
+        assert!(!snapshot.session.complete);
+        assert!(snapshot.session.complete_total_usd.is_none());
+        assert!(
+            snapshot
+                .session
+                .reasons
+                .contains(&crate::accounting::AccountingReason::UntransferredHistory)
+        );
+
+        // A later load that reports full history lifts the limit.
+        translator.seed_history_from_meta("s-1", Some(&seed(serde_json::json!([]))));
+        let snapshot = translator.usage["s-1"].accounting_snapshot().unwrap();
         assert!(snapshot.session.complete);
     }
 

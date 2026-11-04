@@ -153,7 +153,48 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0032_event_journal_run_lifecycle_index",
         apply: migration_0032_event_journal_run_lifecycle_index,
     },
+    Migration {
+        version: "0033_event_journal_history_epoch",
+        apply: migration_0033_event_journal_history_epoch,
+    },
+    Migration {
+        version: "0034_remote_session_coverage",
+        apply: migration_0034_remote_session_coverage,
+    },
 ];
+
+/// Per-source transferred `source_seq` ranges and the owner's history epoch
+/// seen at the last sync. Older agents ignore both tables.
+fn migration_0034_remote_session_coverage(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS remote_session_coverage (\
+            session_id TEXT NOT NULL, \
+            source_node_id TEXT NOT NULL, \
+            start_seq INTEGER NOT NULL, \
+            end_seq INTEGER NOT NULL, \
+            PRIMARY KEY (session_id, source_node_id, start_seq)\
+         );\
+         CREATE TABLE IF NOT EXISTS remote_session_epoch (\
+            session_id TEXT NOT NULL, \
+            source_node_id TEXT NOT NULL, \
+            epoch INTEGER NOT NULL, \
+            PRIMARY KEY (session_id, source_node_id)\
+         );",
+    )
+}
+
+/// Per-session history epoch, bumped when journal events are deleted so remote
+/// peers can detect rewritten history. Older agents ignore the table.
+fn migration_0033_event_journal_history_epoch(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS event_journal_history_epoch (\
+            session_id TEXT PRIMARY KEY, \
+            epoch INTEGER NOT NULL DEFAULT 0\
+         );",
+    )
+}
 
 /// Partial index over run lifecycle rows so finding a session's unfinished
 /// run reads only those rows instead of every event of the session.

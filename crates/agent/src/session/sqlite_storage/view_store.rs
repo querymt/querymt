@@ -246,6 +246,7 @@ impl ViewStore for SqliteStorage {
         session_id: &str,
         include_children: bool,
     ) -> SessionResult<AuditView> {
+        let mut view = self.get_audit_view_metadata(session_id).await?;
         let mut events: Vec<AgentEvent> = self
             .load_session_stream(session_id, None, None)
             .await?
@@ -270,7 +271,11 @@ impl ViewStore for SqliteStorage {
 
         // Sort by sequence number for correct chronological order
         events.sort_by_key(|e| e.seq);
+        view.events = events;
+        Ok(view)
+    }
 
+    async fn get_audit_view_metadata(&self, session_id: &str) -> SessionResult<AuditView> {
         let task_repo = SqliteTaskRepository::new(self.conn.clone());
         let intent_repo = SqliteIntentRepository::new(self.conn.clone());
         let decision_repo = SqliteDecisionRepository::new(self.conn.clone());
@@ -289,7 +294,7 @@ impl ViewStore for SqliteStorage {
 
         Ok(AuditView {
             session_id: session_id.to_string(),
-            events,
+            events: Vec::new(),
             tasks,
             intent_snapshots,
             decisions,
@@ -1312,7 +1317,7 @@ impl ViewStore for SqliteStorage {
             .and_then(|cursor| cursor.parse::<i64>().ok())
             .filter(|offset| *offset >= 0)
             .unwrap_or(0);
-        let limit = limit.clamp(1, 200);
+        let limit = limit.clamp(1, crate::session::projection::MAX_SESSION_ITEMS_PAGE);
         let scope_where = format!(
             "{} AND {} AND {}",
             session_scope_where(session_scope, "s"),

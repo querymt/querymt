@@ -174,6 +174,43 @@ pub struct AcpSessionListPage {
     pub total_count: u64,
 }
 
+/// Rows per global (non-workspace) ACP list page. Large catalogs need fewer round trips;
+/// workspace-scoped pages stay small because they load incrementally.
+pub(crate) const ACP_GLOBAL_PAGE_SIZE: usize = 250;
+
+/// Which listing a `session/list` request reads. `All` is the legacy chained listing
+/// (local pages, then remote pages behind `remote:` cursors); `Local` and `Remote`
+/// let a client walk both independently and in parallel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AcpSessionSource {
+    #[default]
+    All,
+    Local,
+    Remote,
+}
+
+/// `_meta.querymt.sessionSource` (also accepted at the top level of the meta).
+fn acp_session_source_from_meta(
+    meta: Option<&Meta>,
+) -> std::result::Result<AcpSessionSource, AcpSessionListError> {
+    let Some(meta) = meta else {
+        return Ok(AcpSessionSource::All);
+    };
+    let value = meta
+        .get(crate::acp::shared::QUERYMT_META_NAMESPACE)
+        .and_then(|querymt| querymt.get("sessionSource"))
+        .or_else(|| meta.get("sessionSource"));
+    let Some(value) = value else {
+        return Ok(AcpSessionSource::All);
+    };
+    match value.as_str() {
+        Some("all") => Ok(AcpSessionSource::All),
+        Some("local") => Ok(AcpSessionSource::Local),
+        Some("remote") => Ok(AcpSessionSource::Remote),
+        _ => Err(anyhow!("invalid _meta.querymt.sessionSource: {value}").into()),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AcpSessionListError {
     #[error("invalid session list cursor")]
@@ -787,10 +824,19 @@ impl AgentSessions {
         request: AcpListSessionsRequest,
     ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
         let (lifecycle, pinned) = acp_session_filters(request.meta.as_ref())?;
+        let source = acp_session_source_from_meta(request.meta.as_ref())?;
+        #[cfg(not(feature = "remote"))]
+        if source == AcpSessionSource::Remote {
+            return Ok(AcpSessionListPage {
+                sessions: Vec::new(),
+                next_cursor: None,
+                total_count: 0,
+            });
+        }
         #[cfg(feature = "remote")]
         let remote_nodes = acp_remote_node_ids(request.meta.as_ref());
         #[cfg(feature = "remote")]
-        if pinned.is_some() && !remote_nodes.is_empty() {
+        if pinned.is_some() && !remote_nodes.is_empty() && source != AcpSessionSource::Local {
             return Err(
                 anyhow!("pinned session filters cannot be combined with remoteNodeIds").into(),
             );
@@ -803,7 +849,14 @@ impl AgentSessions {
             .map(parse_acp_remote_cursor)
             .transpose()?;
         #[cfg(feature = "remote")]
-        if remote_cursor.is_some() && remote_nodes.is_empty() {
+        if remote_cursor.is_some() && (remote_nodes.is_empty() || source == AcpSessionSource::Local)
+        {
+            return Err(AcpSessionListError::InvalidCursor);
+        }
+        // A remote-only listing never accepts a local cursor.
+        #[cfg(feature = "remote")]
+        if source == AcpSessionSource::Remote && request.cursor.is_some() && remote_cursor.is_none()
+        {
             return Err(AcpSessionListError::InvalidCursor);
         }
         #[cfg(feature = "remote")]
@@ -814,7 +867,16 @@ impl AgentSessions {
         #[cfg(feature = "remote")]
         let remote_scope = acp_session_scope_from_meta(request.meta.as_ref());
         #[cfg(feature = "remote")]
-        if let Some(cursor) = remote_cursor {
+        if remote_cursor.is_some() || source == AcpSessionSource::Remote {
+            if remote_nodes.is_empty() {
+                // Remote-only listing with no selected peers has nothing to read.
+                return Ok(AcpSessionListPage {
+                    sessions: Vec::new(),
+                    next_cursor: None,
+                    total_count: 0,
+                });
+            }
+            let cursor = remote_cursor.unwrap_or_default();
             let mut page = Self::list_acp_remote_page(
                 agent,
                 &remote_nodes,
@@ -847,7 +909,8 @@ impl AgentSessions {
             Self::list_for_acp_from_view_store(view_store.clone(), request).await?
         };
         #[cfg(feature = "remote")]
-        if !remote_nodes.is_empty() && page.next_cursor.is_none() {
+        if source == AcpSessionSource::All && !remote_nodes.is_empty() && page.next_cursor.is_none()
+        {
             let remote_page = Self::list_acp_remote_page(
                 agent,
                 &remote_nodes,
@@ -890,14 +953,6 @@ impl AgentSessions {
             .iter()
             .map(|bookmark| (bookmark.session_id.as_str(), bookmark.node_id.as_str()))
             .collect();
-        let local_ids: std::collections::HashSet<_> = store
-            .list_sessions()
-            .await
-            .map_err(anyhow::Error::from)?
-            .into_iter()
-            .map(|session| session.public_id)
-            .collect();
-
         // Explicit lifecycle predicates run at the owner; otherwise retain raw-page
         // traversal for workspace and relationship filtering.
         let (owner_cwd, owner_scope) = if lifecycle.is_filtered() {
@@ -1002,6 +1057,26 @@ impl AgentSessions {
             .or_else(|| {
                 (cursor.node + 1 < nodes.len()).then(|| format!("remote:{}:0", cursor.node + 1))
             });
+        // Ask the store about just this page's ids instead of scanning every local session:
+        // the scan made each remote page cost O(all local sessions).
+        let page_ids: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.session_id.clone())
+            .collect();
+        let local_ids: std::collections::HashSet<String> = store
+            .resolve_session_locations(&page_ids)
+            .await
+            .map_err(anyhow::Error::from)?
+            .into_iter()
+            .filter(|(_, location)| {
+                matches!(
+                    location,
+                    crate::session::location::SessionLocation::Local
+                        | crate::session::location::SessionLocation::Conflict { .. }
+                )
+            })
+            .map(|(id, _)| id)
+            .collect();
         let mut sessions = Vec::new();
         for entry in entries {
             let same_cwd = cwd.is_none_or(|requested| {
@@ -1112,7 +1187,11 @@ impl AgentSessions {
             .map(|cwd| normalize_group_cwd(cwd.display().to_string()));
         let session_scope = acp_session_scope_from_meta(request.meta.as_ref());
         // ACP workspace requests load incrementally; global discovery remains a larger flat page.
-        let limit = if requested_cwd.is_some() { 10 } else { 100 };
+        let limit = if requested_cwd.is_some() {
+            10
+        } else {
+            ACP_GLOBAL_PAGE_SIZE
+        };
 
         // `children` + `_meta.querymt.parentSessionId` pages one parent's
         // direct children (forks and worktree siblings; delegates stay hidden).
@@ -2322,5 +2401,53 @@ mod remote_page_tests {
                 "after-timeout".to_string(),
             ])
         );
+    }
+}
+
+#[cfg(test)]
+mod session_source_tests {
+    use super::*;
+
+    fn meta(value: serde_json::Value) -> Meta {
+        value.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn session_source_defaults_to_all_only_when_absent() {
+        assert_eq!(
+            acp_session_source_from_meta(None).unwrap(),
+            AcpSessionSource::All
+        );
+        let empty = meta(serde_json::json!({}));
+        assert_eq!(
+            acp_session_source_from_meta(Some(&empty)).unwrap(),
+            AcpSessionSource::All
+        );
+    }
+
+    #[test]
+    fn session_source_prefers_nested_key_and_rejects_non_strings() {
+        let nested = meta(serde_json::json!({
+            "querymt": { "sessionSource": "local" },
+            "sessionSource": "remote",
+        }));
+        assert_eq!(
+            acp_session_source_from_meta(Some(&nested)).unwrap(),
+            AcpSessionSource::Local
+        );
+        let top = meta(serde_json::json!({ "sessionSource": "remote" }));
+        assert_eq!(
+            acp_session_source_from_meta(Some(&top)).unwrap(),
+            AcpSessionSource::Remote
+        );
+        for bad in [
+            serde_json::json!({ "sessionSource": null }),
+            serde_json::json!({ "sessionSource": 5 }),
+            serde_json::json!({ "querymt": { "sessionSource": null } }),
+            serde_json::json!({ "querymt": { "sessionSource": "nope" } }),
+        ] {
+            let bad = meta(bad);
+            assert!(acp_session_source_from_meta(Some(&bad)).is_err());
+        }
     }
 }

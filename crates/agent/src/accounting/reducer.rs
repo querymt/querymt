@@ -47,6 +47,10 @@ pub enum AccountingReason {
     /// accounting existed. Their cost is unknown: old cumulative amounts are
     /// not trusted and no historical rate is applied.
     UnaccountedHistory,
+    /// A remote session's older history has not been transferred to this
+    /// agent yet, so the totals cover only the events held locally. Never
+    /// produced by the reducer; added to a load snapshot while history fills.
+    UntransferredHistory,
 }
 
 /// Summed USD per category. Unknown components contribute nothing.
@@ -479,6 +483,14 @@ impl AccountingReducer {
     /// Lifetime totals for this session.
     pub fn session(&self) -> &ScopeTotals {
         &self.session
+    }
+
+    /// Replace the session-lifetime totals with whole-session totals computed
+    /// elsewhere (a windowed load only replays part of the journal). Attempt
+    /// tracking, cycles and purposes are untouched, so attempts seen in the
+    /// replayed window still resolve normally when they settle live.
+    pub fn replace_session_totals(&mut self, totals: ScopeTotals) {
+        self.session = totals;
     }
 
     /// Totals for attempts attributed to one execution cycle (zero if none).

@@ -123,6 +123,8 @@ async fn test_querymt_capabilities_lists_control_surface() {
         "querymt/session/undo",
         "querymt/session/redo",
         "querymt/session/undoStack",
+        "querymt/session/history",
+        "querymt/session/toolContent",
         "querymt/session/getLifecycle",
         "querymt/session/setLifecycle",
         "querymt/session/setPinned",
@@ -143,6 +145,8 @@ async fn test_querymt_capabilities_lists_control_surface() {
             "missing capability method {expected}"
         );
     }
+    assert_eq!(result["features"]["session_history_window"], true);
+    assert_eq!(result["features"]["session_tool_content"], true);
     assert_eq!(result["features"]["auth"], true);
     assert_eq!(result["features"]["session_lifecycle"], true);
     assert_eq!(result["features"]["session_pins"], true);
