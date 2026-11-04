@@ -78,6 +78,7 @@ pub struct AgentConfigBuilder {
     slash_commands_config: Option<crate::config::SlashCommandsConfig>,
     hooks: Hooks,
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    speech_service: Option<Arc<crate::speech::SpeechService>>,
 }
 
 impl AgentConfigBuilder {
@@ -139,6 +140,7 @@ impl AgentConfigBuilder {
             slash_commands_config: None,
             hooks: Hooks::disabled(),
             workspace_service: None,
+            speech_service: None,
         }
     }
 
@@ -194,6 +196,7 @@ impl AgentConfigBuilder {
             slash_commands_config: None,
             hooks: Hooks::disabled(),
             workspace_service: None,
+            speech_service: None,
         }
     }
 
@@ -244,6 +247,7 @@ impl AgentConfigBuilder {
             slash_commands_config: self.slash_commands_config,
             hooks: self.hooks,
             workspace_service: self.workspace_service,
+            speech_service: self.speech_service,
         }
     }
 
@@ -535,6 +539,15 @@ impl AgentConfigBuilder {
         service: Arc<crate::worktree::WorkspaceService>,
     ) -> Self {
         self.workspace_service = Some(service);
+        self
+    }
+
+    /// Inject a session-independent speech-to-text service.
+    pub(crate) fn with_speech_service(
+        mut self,
+        service: Arc<crate::speech::SpeechService>,
+    ) -> Self {
+        self.speech_service = Some(service);
         self
     }
 

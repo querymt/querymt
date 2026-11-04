@@ -52,6 +52,10 @@ pub struct QuorumConfig {
     /// Optional `.agents` Protocol loading settings (disabled by default).
     #[serde(default)]
     pub dotagents: crate::dotagents::DotagentsSettings,
+
+    /// Session-independent speech. Absent or empty disables ACP methods.
+    #[serde(default)]
+    pub speech: SpeechConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq, Eq, Default)]

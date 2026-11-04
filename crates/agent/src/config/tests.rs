@@ -1391,6 +1391,63 @@ fn workspace_storage_root_resolves_against_config_dir() {
 }
 
 #[test]
+fn speech_schema_is_generated_for_both_config_roots() {
+    for schema in [
+        serde_json::to_value(schemars::schema_for!(SingleAgentConfig)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(QuorumConfig)).unwrap(),
+    ] {
+        assert!(
+            schema.pointer("/properties/speech").is_some(),
+            "speech must exist on the config root"
+        );
+    }
+}
+
+#[tokio::test]
+async fn load_config_accepts_speech_profiles_and_rejects_missing_default() {
+    let valid = r#"
+[agent]
+provider = "test"
+model = "test-model"
+
+[speech]
+default_transcription = "local-stt"
+
+[[speech.profiles]]
+id = "local-stt"
+provider = "izwi"
+model = "Qwen3-ASR-0.6B"
+"#;
+    let cfg = load_config(ConfigSource::Toml(valid.to_string()))
+        .await
+        .expect("speech config should load");
+    let Config::Single(config) = cfg else {
+        panic!("single config");
+    };
+    assert!(config.speech.is_configured());
+    assert_eq!(
+        config.speech.default_transcription.as_deref(),
+        Some("local-stt")
+    );
+
+    let invalid = r#"
+[agent]
+provider = "test"
+model = "test-model"
+
+[speech]
+default_transcription = "missing"
+"#;
+    let err = load_config(ConfigSource::Toml(invalid.to_string()))
+        .await
+        .expect_err("missing speech default should fail");
+    assert!(
+        err.to_string().contains("does not match any profile"),
+        "{err}"
+    );
+}
+
+#[test]
 fn workspace_schema_is_generated_for_both_config_roots() {
     for schema in [
         serde_json::to_value(schemars::schema_for!(SingleAgentConfig)).unwrap(),
