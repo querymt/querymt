@@ -22,7 +22,8 @@ fn with_skipped_mcp_servers(
     let namespace = map
         .entry(crate::acp::shared::QUERYMT_META_NAMESPACE.to_string())
         .or_insert_with(|| serde_json::json!({}));
-    if let (Some(namespace), Ok(value)) = (namespace.as_object_mut(), serde_json::to_value(&skipped))
+    if let (Some(namespace), Ok(value)) =
+        (namespace.as_object_mut(), serde_json::to_value(&skipped))
     {
         namespace.insert(SKIPPED_MCP_SERVERS_META_KEY.to_string(), value);
     }

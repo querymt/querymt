@@ -1,7 +1,7 @@
 //! Agent Client Protocol helper functions for MCP server management
 use crate::acp::protocol::{Error, McpServer, McpServerHttp, McpServerStdio};
-use crate::agent::core::SkippedMcpServer;
 use crate::agent::core::McpToolState;
+use crate::agent::core::SkippedMcpServer;
 pub(crate) use crate::agent::mcp::McpConnectContext;
 use crate::agent::session_mcp::ConnectedMcpPeer;
 use crate::error::AgentError;
@@ -70,7 +70,8 @@ pub(crate) async fn build_mcp_state(
             // starts; the problem is logged and reported to the client. Every
             // other failure keeps failing session setup.
             Err(err) => {
-                let skipped = if let Some(server_name) = crate::error::mcp_auth_required_server(&err)
+                let skipped = if let Some(server_name) =
+                    crate::error::mcp_auth_required_server(&err)
                 {
                     warn!(
                         "MCP server '{server_name}' requires authorization; skipping it \

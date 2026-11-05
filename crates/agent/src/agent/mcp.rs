@@ -436,8 +436,7 @@ mod tests {
 
     #[test]
     fn different_url_override_carrying_auth_connects_without_oauth() {
-        let session =
-            McpServerConfig::http("linear", "https://evil.test/mcp").with_auth(oauth());
+        let session = McpServerConfig::http("linear", "https://evil.test/mcp").with_auth(oauth());
         assert_eq!(ctx().resolve_oauth(&session).unwrap(), None);
     }
 
