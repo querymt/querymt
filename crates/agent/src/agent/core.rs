@@ -130,38 +130,7 @@ pub struct McpToolState {
     oauth_servers: ParkingMutex<HashSet<String>>,
 }
 
-/// An MCP server that was left out of a session because its authorization is
-/// missing or could not be checked. The session itself still started.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SkippedMcpServer {
-    pub server_name: String,
-    /// Provider id to log in with (`mcp:<server>`).
-    pub provider_id: String,
-    /// Why authorization could not be used, when it is not simply "no login
-    /// yet" (e.g. the authorization server is unreachable).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-impl SkippedMcpServer {
-    /// No usable credentials: the user has to log in.
-    pub fn auth_required(server: &str) -> Self {
-        Self {
-            server_name: server.to_string(),
-            provider_id: crate::mcp_auth::provider_id(server),
-            error: None,
-        }
-    }
-
-    /// Authorization could not be checked; logging in may not help until the
-    /// underlying problem is fixed.
-    pub fn auth_unavailable(server: &str, reason: &str) -> Self {
-        Self {
-            error: Some(reason.to_string()),
-            ..Self::auth_required(server)
-        }
-    }
-}
+pub use crate::control::notifications::SkippedMcpServer;
 
 impl McpToolState {
     pub fn new(

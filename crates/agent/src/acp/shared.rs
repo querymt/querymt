@@ -720,16 +720,17 @@ pub fn mcp_auth_required_notification(
     provider_id: &str,
     error: Option<&str>,
 ) -> serde_json::Value {
-    let mut params = serde_json::json!({
-        "version": 1,
-        "session_id": session_id,
-        "server_name": server_name,
-        "provider_id": provider_id,
-    });
-    if let Some(error) = error {
-        params["error"] = serde_json::json!(error);
-    }
-    ext_notification(QMT_NOTIFICATION_MCP_AUTH_REQUIRED, params)
+    let params = crate::control::notifications::McpAuthRequiredNotification {
+        version: crate::control::notifications::MCP_AUTH_REQUIRED_VERSION,
+        session_id: session_id.to_string(),
+        server_name: server_name.to_string(),
+        provider_id: provider_id.to_string(),
+        error: error.map(str::to_string),
+    };
+    ext_notification(
+        QMT_NOTIFICATION_MCP_AUTH_REQUIRED,
+        serde_json::to_value(params).expect("serialize mcp auth required notification"),
+    )
 }
 
 pub fn delegate_models_changed_notification(

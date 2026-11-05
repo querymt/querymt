@@ -76,4 +76,5 @@
 - [x] 10.4 Auth-required reporting uses "OAuth applied at connect time" (`McpToolState::is_oauth_server`) instead of a name match; a same-name override carrying `auth` connects without OAuth.
 - [x] 10.5 `session/new` / `session/load` responses carry `_meta.querymt.skippedMcpServers`.
 - [x] 10.6 Unix-socket headers: reserved names rejected naming the server.
-- [x] 10.7 Typeshare: ran `scripts/generate-types.sh`; `target/generated/types.ts` (gitignored build output) contains `tool_call_progress` and `mcp_server_auth_required` (with optional `error`). Consumers pick it up from the script output; nothing to commit.
+- [x] 10.7 Typeshare: ran `scripts/generate-types.sh`; `target/generated/types.ts` (gitignored build output) contains `tool_call_progress` and `mcp_server_auth_required` (with optional `error`). That covered the event kind only; 10.8 adds the remaining payload types.
+- [x] 10.8 Typeshare the MCP auth payloads: `SkippedMcpServer` (moved to `control/notifications.rs`, re-exported from `agent::core`) and `McpAuthRequiredNotification` (params of `querymt/session/mcpAuthRequired`, now built from the struct). Wire format unchanged (snake_case, `error` only when set); tests pin it. `_meta.querymt.skippedMcpServers` stays an untyped meta key whose value is `SkippedMcpServer[]`. Verify: `scripts/generate-types.sh` output contains both types.
