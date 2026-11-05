@@ -38,6 +38,9 @@ tools = [
   # Git & codebase analysis (read-only)
   "read_tool", "index", "glob", "search_text", "ls", "shell",
 
+  # Recover context cleared by pruning/compaction
+  "session_history",
+
   # Knowledge lifecycle
   "knowledge_ingest",
   "knowledge_query",

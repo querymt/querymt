@@ -42,6 +42,9 @@ tools = [
   # Codebase analysis (read-only)
   "read_tool", "index", "glob", "search_text", "ls", "shell",
 
+  # Recover context cleared by pruning/compaction
+  "session_history",
+
   # Knowledge lifecycle — the audit trail
   "knowledge_ingest",
   "knowledge_query",

@@ -18,6 +18,7 @@ const DEFAULT_READ_LINES: usize = 400;
 const SNIPPET_CONTEXT_BYTES: usize = 120;
 const MAX_ARGUMENTS_BYTES: usize = 500;
 
+/// Built-in tool that searches session history and reads back cleared tool results.
 pub struct SessionHistoryTool;
 
 impl Default for SessionHistoryTool {
@@ -27,6 +28,7 @@ impl Default for SessionHistoryTool {
 }
 
 impl SessionHistoryTool {
+    /// Create a new `SessionHistoryTool`.
     pub fn new() -> Self {
         Self
     }
@@ -145,6 +147,7 @@ Exactly one of `query` or `call_id` is required."
     }
 }
 
+/// Concatenate the text parts of a tool result, one per line.
 fn tool_result_text(content: &[ToolResultPart]) -> String {
     content
         .iter()
@@ -153,6 +156,7 @@ fn tool_result_text(content: &[ToolResultPart]) -> String {
         .join("\n")
 }
 
+/// Largest char boundary of `s` that is `<= idx`.
 fn floor_boundary(s: &str, mut idx: usize) -> usize {
     idx = idx.min(s.len());
     while !s.is_char_boundary(idx) {
@@ -161,6 +165,7 @@ fn floor_boundary(s: &str, mut idx: usize) -> usize {
     idx
 }
 
+/// Smallest char boundary of `s` that is `>= idx`.
 fn ceil_boundary(s: &str, mut idx: usize) -> usize {
     idx = idx.min(s.len());
     while !s.is_char_boundary(idx) {
@@ -192,10 +197,16 @@ fn snippet(text: &str, query_lower: &str) -> Option<String> {
     Some(out)
 }
 
+/// Lowercase role name used in search result labels.
 fn role_label(message: &AgentMessage) -> String {
     format!("{:?}", message.role).to_lowercase()
 }
 
+/// Case-insensitive substring search over history, newest matches first.
+///
+/// Earlier `session_history` results are skipped so repeated searches do not
+/// match (and crowd out results with) their own prior output; they stay
+/// readable by `call_id` via [`read_tool_result`].
 fn search_history(messages: &[AgentMessage], query: &str, limit: usize) -> String {
     let query_lower = query.to_lowercase();
     let mut matches: Vec<String> = Vec::new();
@@ -224,6 +235,9 @@ fn search_history(messages: &[AgentMessage], query: &str, limit: usize) -> Strin
                     compacted_at,
                     ..
                 } => {
+                    if tool_name.as_deref() == Some("session_history") {
+                        continue;
+                    }
                     let name = tool_name.as_deref().unwrap_or("unknown");
                     let cleared = if compacted_at.is_some() {
                         " cleared_from_context"
@@ -270,6 +284,7 @@ fn search_history(messages: &[AgentMessage], query: &str, limit: usize) -> Strin
     out
 }
 
+/// Render one tool result by `call_id`, paged by line `offset`/`limit`.
 fn read_tool_result(
     messages: &[AgentMessage],
     call_id: &str,
@@ -418,6 +433,21 @@ mod tests {
         assert!(read.contains("the NEEDLE failure is here"), "{read}");
         assert!(read.contains("1 more lines; use offset=2"), "{read}");
         assert!(!read.contains("line three"), "{read}");
+    }
+
+    #[test]
+    fn search_skips_session_history_results() {
+        let mut own = tool_result_message("s", "call-own", "echoed NEEDLE", false);
+        if let MessagePart::ToolResult { tool_name, .. } = &mut own.parts[0] {
+            *tool_name = Some("session_history".to_string());
+        }
+        let real = tool_result_message("s", "call-real", "real NEEDLE", false);
+        let out = search_history(&[real, own.clone()], "needle", 10);
+        assert!(out.contains("call-real"), "{out}");
+        assert!(!out.contains("call-own"), "{out}");
+        assert!(out.starts_with("1 match(es)"), "{out}");
+        // Still readable by call_id.
+        assert!(read_tool_result(&[own], "call-own", 0, 10).is_ok());
     }
 
     #[tokio::test]
