@@ -18,14 +18,72 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Default compaction prompt used to generate conversation summaries
-pub const COMPACTION_PROMPT: &str = r#"Provide a detailed prompt for continuing our conversation above. Focus on:
-- What was done
-- What is currently being worked on
-- Which files are being modified
-- What needs to be done next
-- Key user requests, constraints, or preferences that should persist
+///
+/// Written as a handoff brief for the work still to be done, not a narrative of
+/// what happened: the most accuracy-preserving compactions select the facts the
+/// next stretch of work needs. The user's own request is appended verbatim by
+/// [`original_task_section`], so the model is not relied on to copy it.
+pub const COMPACTION_PROMPT: &str = r#"Stop work. Write only a concise handoff brief for continuing our conversation; do not call tools.
+This brief will replace the conversation history. Write it for the work that remains, not as a narrative of what happened. Record:
+1. Objective - one line describing the required result, including user constraints and preferences that must persist.
+2. Established facts - exact paths, relevant symbols or commands, observed values, and important errors/output. Separate verified observations from unverified ideas.
+3. Applied changes - each changed or created file, what changed, and whether it was verified.
+4. Verification - exact checks run, their outcomes, failures, obstacles, and workarounds.
+5. Dead ends - failed approaches that should not be repeated.
+6. Remaining plan - outstanding subgoals in execution order, the immediate next command or edit, and the condition for completion.
 
-Be comprehensive but concise. This summary will replace the conversation history."#;
+If needed output was cleared or truncated, name the `session_history` call_id or a narrow command to retrieve it. Do not invent observations."#;
+
+/// Upper bound on the verbatim user prompts carried across a compaction.
+const ORIGINAL_TASK_MAX_BYTES: usize = 16 * 1024;
+/// Most recent user prompts carried across a compaction.
+const ORIGINAL_TASK_MAX_PROMPTS: usize = 3;
+
+/// The user's recent prompts, verbatim, for appending to a compaction summary.
+///
+/// Compaction drops everything before it, so without this the user's actual
+/// request survives only if the model happens to restate it. Returns `None`
+/// when `messages` hold no user prompt with text (for example when compacting
+/// an earlier summary only, which already carries the task).
+pub(crate) fn original_task_section(messages: &[AgentMessage]) -> Option<String> {
+    let mut prompts: Vec<String> = Vec::new();
+    let mut remaining = ORIGINAL_TASK_MAX_BYTES;
+    for message in messages.iter().rev() {
+        if message.role != ChatRole::User {
+            continue;
+        }
+        for part in message.parts.iter().rev() {
+            let MessagePart::Prompt { blocks } = part else {
+                continue;
+            };
+            let text = crate::agent::utils::render_prompt_for_display(blocks);
+            if text.is_empty() {
+                continue;
+            }
+            if remaining == 0 || prompts.len() >= ORIGINAL_TASK_MAX_PROMPTS {
+                break;
+            }
+            let text = crate::agent::utils::truncate_to_bytes(&text, remaining);
+            remaining = remaining.saturating_sub(text.len());
+            prompts.push(text);
+        }
+        if remaining == 0 || prompts.len() >= ORIGINAL_TASK_MAX_PROMPTS {
+            break;
+        }
+    }
+    if prompts.is_empty() {
+        return None;
+    }
+    prompts.reverse();
+    let body = prompts
+        .iter()
+        .map(|p| format!("<user_prompt>\n{p}\n</user_prompt>"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "<original_task note=\"verbatim user prompts before this summary, oldest first\">\n{body}\n</original_task>"
+    ))
+}
 
 /// Configuration for retry behavior
 #[derive(Debug, Clone)]
@@ -130,6 +188,12 @@ impl SessionCompaction {
             )
             .await?;
 
+        // The summary is validated before this point; the verbatim task is
+        // appended afterwards so it can never rescue an empty summary.
+        let summary = match original_task_section(messages) {
+            Some(task) => format!("{summary}\n\n{task}"),
+            None => summary,
+        };
         let summary_token_count = self.estimator.estimate(&summary);
 
         Ok(CompactionResult {
@@ -1319,6 +1383,47 @@ mod tests {
             .unwrap();
         assert_eq!(result.summary, "Valid continuation summary");
         assert_eq!(provider.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn compaction_appends_verbatim_user_prompts_after_the_summary() {
+        use crate::acp::protocol::{ContentBlock, TextContent};
+
+        let prompt = |id: &str, text: &str| AgentMessage {
+            id: id.into(),
+            session_id: "s1".into(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::Prompt {
+                blocks: vec![ContentBlock::Text(TextContent::new(text))],
+            }],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        let messages = vec![
+            prompt("1", "Refactor the parser, keep the public API"),
+            MessageFixture::assistant_message("2", "s1", "ok"),
+            prompt("3", "Also add tests"),
+        ];
+        let provider = Arc::new(MockCompactionProvider::new(vec![Ok("Model brief".into())]));
+        let result = SessionCompaction::new()
+            .process(
+                &messages,
+                provider,
+                "model",
+                &retry_config(0),
+                None,
+                &test_ledger().await,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.summary.starts_with("Model brief"));
+        let first = result.summary.find("Refactor the parser").unwrap();
+        let second = result.summary.find("Also add tests").unwrap();
+        assert!(first < second, "prompts are oldest first");
+        assert!(result.summary.contains("<original_task"));
     }
 
     #[tokio::test]

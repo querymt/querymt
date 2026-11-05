@@ -564,7 +564,7 @@ async fn pruning_keeps_call_result_mapping_for_structured_turns() {
     assert_eq!(result.call_id, "call_1");
     assert_eq!(
         result.parts[0].as_text(),
-        Some("[Old tool result content cleared]")
+        Some("[Old tool result content cleared; retrieve it with session_history call_id=call_1]")
     );
 }
 

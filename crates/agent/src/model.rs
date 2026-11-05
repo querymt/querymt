@@ -838,9 +838,9 @@ impl AgentMessage {
                     ..
                 } => {
                     let parts = if compacted_at.is_some() {
-                        vec![querymt::chat::ToolResultPart::text(
-                            "[Old tool result content cleared]",
-                        )]
+                        vec![querymt::chat::ToolResultPart::text(format!(
+                            "[Old tool result content cleared; retrieve it with session_history call_id={call_id}]"
+                        ))]
                     } else {
                         content.clone()
                     };
@@ -1523,7 +1523,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             tr.parts[0].as_text(),
-            Some("[Old tool result content cleared]")
+            Some(
+                "[Old tool result content cleared; retrieve it with session_history call_id=call-1]"
+            )
         );
     }
 
