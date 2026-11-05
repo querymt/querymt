@@ -25,6 +25,7 @@ pub mod read_shared;
 pub mod read_tool;
 pub mod replace_symbol;
 pub mod search_text;
+pub mod session_history;
 pub mod shell;
 pub mod task;
 pub mod todo;
@@ -61,6 +62,7 @@ pub use question::QuestionTool;
 pub use read_tool::ReadTool;
 pub use replace_symbol::ReplaceSymbolTool;
 pub use search_text::SearchTextTool;
+pub use session_history::SessionHistoryTool;
 pub use shell::ShellTool;
 pub use task::{CompleteTaskTool, ReadTaskTool, UpdateTaskTool};
 pub use todo::{TodoReadTool, TodoWriteTool};
@@ -108,6 +110,7 @@ pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(ReadTool::new()),
         Arc::new(ReplaceSymbolTool::new()),
         Arc::new(SearchTextTool::new()),
+        Arc::new(SessionHistoryTool::new()),
         Arc::new(ShellTool::new()),
         Arc::new(TodoReadTool::new()),
         Arc::new(TodoWriteTool::new()),

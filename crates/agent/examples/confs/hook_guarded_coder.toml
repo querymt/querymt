@@ -22,6 +22,7 @@ mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
 tools = [
   "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
   "glob", "search_text", "ls", "index", "get_symbol", "get_function", "skill",
+  "session_history",
   "shell",
   "create_task", "read_task", "update_task", "complete_task", "todowrite", "todoread",
   "question",

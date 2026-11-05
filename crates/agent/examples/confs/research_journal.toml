@@ -41,6 +41,9 @@ tools = [
   "web_fetch",
   "read_tool", "glob", "search_text", "ls",
 
+  # Recover context cleared by pruning/compaction
+  "session_history",
+
   # Knowledge lifecycle — the core of this demo
   "knowledge_ingest",
   "knowledge_query",

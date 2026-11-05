@@ -145,7 +145,7 @@ pub struct AgentSettings {
     /// `semantic_edit`, `multiedit`, `get_function`, `get_symbol`,
     /// `replace_symbol`, `find_symbol_references`,
     /// `knowledge_consolidate`, `knowledge_ingest`, `knowledge_list_unconsolidated`,
-    /// `knowledge_query`, `knowledge_stats`, `language_query`.
+    /// `knowledge_query`, `knowledge_stats`, `language_query`, `session_history`.
     ///
     /// MCP patterns: `"server_name.*"` (all tools from server),
     /// `"server_name.tool_name"` (specific tool).
