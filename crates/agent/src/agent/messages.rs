@@ -393,6 +393,21 @@ pub struct Shutdown;
 #[derive(Serialize, Deserialize)]
 pub struct GetHistory;
 
+/// Structured user prompt records (prompt / steering content blocks) of this
+/// session, projected from the owner's message history.
+///
+/// Reply: `Result<Vec<UserPromptRecord>, Error>`
+///
+/// `message_ids: Some(ids)` restricts the reply to those prompt messages, so
+/// a peer transfers only prompts it does not hold yet. Owners that predate
+/// this message fail with a typed protocol mismatch; the requester then falls
+/// back to [`GetHistory`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GetUserPrompts {
+    #[serde(default)]
+    pub message_ids: Option<Vec<String>>,
+}
+
 /// Retrieve the full durable event stream for this session.
 ///
 /// Reply: `Result<Vec<AgentEvent>, Error>`
