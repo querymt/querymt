@@ -151,12 +151,11 @@ pub(crate) fn convert_server_with_diagnostics(
                 &server.source,
             )?;
             Ok((
-                Some(McpServerConfig::Stdio {
-                    name: server.name.clone(),
-                    command,
-                    args: server.args.clone(),
-                    env,
-                }),
+                Some(
+                    McpServerConfig::stdio(server.name.clone(), command)
+                        .with_args(server.args.iter().cloned())
+                        .with_env(env),
+                ),
                 Vec::new(),
             ))
         }
@@ -183,11 +182,7 @@ pub(crate) fn convert_server_with_diagnostics(
                 return Ok((None, diagnostics));
             }
             Ok((
-                Some(McpServerConfig::Http {
-                    name: server.name.clone(),
-                    url,
-                    headers,
-                }),
+                Some(McpServerConfig::http(server.name.clone(), url).with_headers(headers)),
                 diagnostics,
             ))
         }

@@ -945,20 +945,13 @@ mod tests {
     async fn with_mcp_servers_stores_and_builds() {
         let (builder, _td) = make_builder().await;
         let servers = vec![
-            McpServerConfig::Http {
-                name: "test-server".to_string(),
-                url: "https://mcp.example.com/mcp".to_string(),
-                headers: std::collections::HashMap::from([(
+            McpServerConfig::http("test-server", "https://mcp.example.com/mcp").with_headers(
+                std::collections::HashMap::from([(
                     "Authorization".to_string(),
                     "Bearer token".to_string(),
                 )]),
-            },
-            McpServerConfig::Stdio {
-                name: "local-server".to_string(),
-                command: "npx".to_string(),
-                args: vec!["-y".to_string(), "@example/mcp-server".to_string()],
-                env: std::collections::HashMap::new(),
-            },
+            ),
+            McpServerConfig::stdio("local-server", "npx").with_args(["-y", "@example/mcp-server"]),
         ];
         let builder = builder.with_mcp_servers(servers);
         let config = builder.build();

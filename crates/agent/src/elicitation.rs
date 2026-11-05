@@ -1273,6 +1273,10 @@ pub struct McpClientHandler {
     session_id: String,
     client_impl: Implementation,
     tool_state: Arc<crate::agent::core::McpToolState>,
+    /// Routes this connection's progress / task-status notifications to calls.
+    router: querymt::mcp::progress::McpNotificationRouter,
+    /// Declare the MCP tasks extension during `initialize`.
+    tasks: bool,
 }
 
 impl McpClientHandler {
@@ -1291,7 +1295,21 @@ impl McpClientHandler {
             session_id,
             client_impl,
             tool_state,
+            router: Default::default(),
+            tasks: false,
         }
+    }
+
+    /// Declare the MCP tasks extension to the server (default: not declared).
+    #[must_use]
+    pub fn with_tasks(mut self, enabled: bool) -> Self {
+        self.tasks = enabled;
+        self
+    }
+
+    /// The router adapters of this connection must carry to receive progress.
+    pub fn router(&self) -> querymt::mcp::progress::McpNotificationRouter {
+        self.router.clone()
     }
 }
 
@@ -1380,7 +1398,34 @@ impl ClientHandler for McpClientHandler {
     }
 
     fn get_info(&self) -> ClientConfig {
-        ClientConfig::new(ClientCapabilities::default(), self.client_impl.clone())
+        // The builder needs rmcp's `server` feature; the fields are public.
+        let mut capabilities = ClientCapabilities::default();
+        if self.tasks {
+            capabilities.extensions = Some(
+                [(
+                    rmcp::model::TASKS_EXTENSION_ID.to_string(),
+                    rmcp::model::JsonObject::new(),
+                )]
+                .into(),
+            );
+        }
+        ClientConfig::new(capabilities, self.client_impl.clone())
+    }
+
+    async fn on_progress(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        self.router.handle_progress(params);
+    }
+
+    async fn on_task_status(
+        &self,
+        params: rmcp::model::TaskStatusNotificationParams,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        self.router.handle_task_status(&params);
     }
 
     async fn on_tool_list_changed(&self, context: NotificationContext<RoleClient>) -> () {
@@ -1414,6 +1459,7 @@ impl ClientHandler for McpClientHandler {
                 for tool in new_tool_list {
                     match McpToolAdapter::try_new(tool, peer.clone(), self.server_name.clone()) {
                         Ok(adapter) => {
+                            let adapter = adapter.with_router(self.router.clone());
                             let name = adapter.descriptor().function.name.clone();
                             if new_tools.contains_key(&name) {
                                 log::warn!(

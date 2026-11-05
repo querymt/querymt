@@ -273,7 +273,7 @@ pub(crate) fn validate_delegate_isolation(config: &QuorumConfig) -> Result<()> {
     }
 }
 
-/// Validate MCP servers have unique names
+/// Validate MCP servers have unique names and consistent settings
 pub(crate) fn validate_mcp_servers(servers: &[McpServerConfig]) -> Result<()> {
     let mut seen = HashSet::new();
     for server in servers {
@@ -281,6 +281,7 @@ pub(crate) fn validate_mcp_servers(servers: &[McpServerConfig]) -> Result<()> {
         if !seen.insert(name) {
             return Err(anyhow!("Duplicate MCP server name: {}", name));
         }
+        crate::agent::mcp::validate_mcp_server(server)?;
     }
     Ok(())
 }

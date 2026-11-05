@@ -6,6 +6,7 @@
 pub mod drivers;
 pub mod fixtures;
 pub mod helpers;
+pub mod mcp_harness;
 pub mod mocks;
 
 // Re-export commonly used items

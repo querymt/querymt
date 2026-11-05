@@ -755,6 +755,29 @@ async fn forward_stdio_event(
             }
             Err(error) => Err(error),
         }
+    } else if let crate::events::AgentEventKind::McpServerAuthRequired {
+        server_name,
+        provider_id,
+        error,
+    } = event.kind()
+    {
+        let notification = crate::acp::shared::mcp_auth_required_notification(
+            event.session_id(),
+            server_name,
+            provider_id,
+            error.as_deref(),
+        );
+        match serde_json::value::RawValue::from_string(notification["params"].to_string()) {
+            Ok(params) => {
+                bridge
+                    .notify_ext(crate::acp::protocol::ExtNotification::new(
+                        crate::acp::shared::QMT_NOTIFICATION_MCP_AUTH_REQUIRED,
+                        Arc::from(params),
+                    ))
+                    .await
+            }
+            Err(error) => Err(acp::Error::into_internal_error(error)),
+        }
     } else if let Some(update) = input_state {
         let params = serde_json::value::RawValue::from_string(
             serde_json::to_string(&update).unwrap_or_else(|_| "null".to_string()),

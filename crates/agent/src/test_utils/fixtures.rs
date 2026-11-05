@@ -82,6 +82,15 @@ impl TestAgent {
     pub(crate) async fn execution_context(
         &self,
     ) -> crate::agent::execution_context::ExecutionContext {
+        self.execution_context_with_mcp(crate::agent::core::McpToolState::empty())
+            .await
+    }
+
+    /// Like [`Self::execution_context`], with the given live MCP tool state.
+    pub(crate) async fn execution_context_with_mcp(
+        &self,
+        mcp_tool_state: Arc<crate::agent::core::McpToolState>,
+    ) -> crate::agent::execution_context::ExecutionContext {
         let session_handle = self
             .config
             .provider
@@ -95,11 +104,8 @@ impl TestAgent {
         )
         .await
         .unwrap();
-        let runtime = crate::agent::core::SessionRuntime::new(
-            None,
-            Default::default(),
-            crate::agent::core::McpToolState::empty(),
-        );
+        let runtime =
+            crate::agent::core::SessionRuntime::new(None, Default::default(), mcp_tool_state);
         crate::agent::execution_context::ExecutionContext::new(
             session_id,
             runtime,

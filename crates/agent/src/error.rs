@@ -51,6 +51,17 @@ pub enum AgentError {
     #[error("MCP {transport} server failed: {reason}")]
     McpServerFailed { transport: String, reason: String },
 
+    /// An OAuth MCP server has no usable credentials; the user must log in
+    /// with provider `mcp:<server>`.
+    #[error("authorization required for MCP server {server}; log in with provider mcp:{server}")]
+    McpAuthRequired { server: String },
+
+    /// The authorization of an OAuth MCP server could not be checked (for
+    /// example the authorization server is unreachable). The server is
+    /// skipped; the session continues without it.
+    #[error("authorization for MCP server {server} is unavailable: {reason}")]
+    McpAuthUnavailable { server: String, reason: String },
+
     #[error("method not implemented: {method}")]
     MethodNotImplemented { method: String },
 
@@ -144,6 +155,30 @@ pub enum AgentError {
 /// | -32601  | MethodNotFound     | `MethodNotImplemented`                            |
 /// | -32002  | ResourceNotFound   | `SessionNotFound`, `RemoteSessionNotFound`, `ScheduleNotFound` |
 /// | -32603  | InternalError      | everything else (replaces the old -32000 catch-all) |
+const MCP_AUTH_REQUIRED_CATEGORY: &str = "mcp_auth_required";
+
+/// The server name when `err` is an [`AgentError::McpAuthRequired`] converted
+/// to ACP, so callers can recognise it without parsing messages.
+pub(crate) fn mcp_auth_required_server(err: &AcpError) -> Option<&str> {
+    let data = err.data.as_ref()?;
+    if data.get("category")?.as_str()? != MCP_AUTH_REQUIRED_CATEGORY {
+        return None;
+    }
+    data.get("server")?.as_str()
+}
+
+const MCP_AUTH_UNAVAILABLE_CATEGORY: &str = "mcp_auth_unavailable";
+
+/// `(server, reason)` when `err` is an [`AgentError::McpAuthUnavailable`]
+/// converted to ACP.
+pub(crate) fn mcp_auth_unavailable(err: &AcpError) -> Option<(&str, &str)> {
+    let data = err.data.as_ref()?;
+    if data.get("category")?.as_str()? != MCP_AUTH_UNAVAILABLE_CATEGORY {
+        return None;
+    }
+    Some((data.get("server")?.as_str()?, data.get("reason")?.as_str()?))
+}
+
 impl From<AgentError> for AcpError {
     fn from(e: AgentError) -> Self {
         if let AgentError::ProviderFailure {
@@ -211,6 +246,22 @@ impl From<AgentError> for AcpError {
             return AcpError::new(-32603, e.to_string()).data(serde_json::json!({
                 "category": "session_running_elsewhere",
                 "session_id": session_id,
+                "message": e.to_string(),
+            }));
+        }
+        if let AgentError::McpAuthRequired { server } = &e {
+            return AcpError::new(-32603, e.to_string()).data(serde_json::json!({
+                "category": MCP_AUTH_REQUIRED_CATEGORY,
+                "server": server,
+                "provider_id": format!("mcp:{server}"),
+                "message": e.to_string(),
+            }));
+        }
+        if let AgentError::McpAuthUnavailable { server, reason } = &e {
+            return AcpError::new(-32603, e.to_string()).data(serde_json::json!({
+                "category": MCP_AUTH_UNAVAILABLE_CATEGORY,
+                "server": server,
+                "reason": reason,
                 "message": e.to_string(),
             }));
         }

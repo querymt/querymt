@@ -1,6 +1,34 @@
 use super::utils::format_prefixed_error_chain;
 use super::*;
 
+/// `_meta.querymt.skippedMcpServers` key: MCP servers left out of a session
+/// because their authorization is missing or could not be checked.
+pub(crate) const SKIPPED_MCP_SERVERS_META_KEY: &str = "skippedMcpServers";
+
+/// Disclose servers skipped while connecting `state` in a session response.
+///
+/// The transient `McpServerAuthRequired` event is emitted while the session is
+/// still being created, which can be before the client listens for the new
+/// session, so the response carries the same information.
+fn with_skipped_mcp_servers(
+    mut meta: Option<serde_json::Map<String, serde_json::Value>>,
+    state: &crate::agent::core::McpToolState,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let skipped = state.skipped_servers();
+    if skipped.is_empty() {
+        return meta;
+    }
+    let map = meta.get_or_insert_with(serde_json::Map::new);
+    let namespace = map
+        .entry(crate::acp::shared::QUERYMT_META_NAMESPACE.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let (Some(namespace), Ok(value)) = (namespace.as_object_mut(), serde_json::to_value(&skipped))
+    {
+        namespace.insert(SKIPPED_MCP_SERVERS_META_KEY.to_string(), value);
+    }
+    meta
+}
+
 impl LocalAgentHandle {
     /// Construct a `LocalAgentHandle` from a shared `AgentConfig`.
     ///
@@ -682,6 +710,7 @@ impl LocalAgentHandle {
                     "profile_source": "querymt_profile_manager",
                 }),
             );
+            let meta = with_skipped_mcp_servers(Some(meta), &prepared.runtime.mcp_tool_state);
             return Ok(NewSessionResponse::new(session_id)
                 .modes(crate::agent::session_registry::mode_state(current_mode))
                 .config_options(config_options)
@@ -717,6 +746,12 @@ impl LocalAgentHandle {
             .modes(crate::agent::session_registry::mode_state(current_mode))
             .config_options(config_options);
 
+        let skipped_meta = with_skipped_mcp_servers(None, &prepared.runtime.mcp_tool_state);
+        let response = match skipped_meta {
+            Some(meta) => response.meta(meta),
+            None => response,
+        };
+
         // Disclose the resolved binding for isolated sessions only; a local
         // session's response is unchanged.
         let Some(service) = self.config.workspace_service() else {
@@ -727,15 +762,19 @@ impl LocalAgentHandle {
             .await
             .map_err(|err| Error::internal_error().data(err.to_string()))?;
         Ok(match binding {
-            Some(binding) => response.meta(
-                serde_json::json!({
-                    crate::acp::shared::QUERYMT_META_NAMESPACE: {
-                        crate::worktree::SESSION_WORKSPACE_META_KEY: binding.disclosure(),
-                    },
-                })
-                .as_object()
-                .cloned(),
-            ),
+            Some(binding) => {
+                let mut meta = response.meta.clone().unwrap_or_default();
+                let namespace = meta
+                    .entry(crate::acp::shared::QUERYMT_META_NAMESPACE.to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(namespace) = namespace.as_object_mut() {
+                    namespace.insert(
+                        crate::worktree::SESSION_WORKSPACE_META_KEY.to_string(),
+                        serde_json::json!(binding.disclosure()),
+                    );
+                }
+                response.meta(meta)
+            }
             None => response,
         })
     }
@@ -1039,10 +1078,14 @@ impl LocalAgentHandle {
         let mut response = LoadSessionResponse::new()
             .modes(crate::agent::session_registry::mode_state(current_mode))
             .config_options(config_options);
-        if let Some(meta) = self
+        let mut meta = self
             .session_load_snapshot_meta(&session_id, load_window)
-            .await?
-        {
+            .await?;
+        // Only a freshly materialized session connected its MCP servers now.
+        if let Some(prepared) = prepared.as_ref() {
+            meta = with_skipped_mcp_servers(meta, &prepared.runtime.mcp_tool_state);
+        }
+        if let Some(meta) = meta {
             response = response.meta(meta);
         }
 
@@ -1132,4 +1175,34 @@ fn requested_profile_id_from_meta(
 ) -> Option<&str> {
     let profile_id = meta?.get("querymt")?.get("profile_id")?.as_str()?.trim();
     (!profile_id.is_empty() && profile_id != "default").then_some(profile_id)
+}
+
+#[cfg(test)]
+mod skipped_mcp_meta_tests {
+    use super::*;
+    use crate::agent::core::{McpToolState, SkippedMcpServer};
+
+    #[test]
+    fn no_skipped_servers_leaves_meta_untouched() {
+        let state = McpToolState::empty();
+        assert_eq!(with_skipped_mcp_servers(None, &state), None);
+    }
+
+    #[test]
+    fn skipped_servers_are_disclosed_and_existing_meta_is_kept() {
+        let state = McpToolState::empty();
+        state.set_skipped_servers(vec![
+            SkippedMcpServer::auth_required("linear"),
+            SkippedMcpServer::auth_unavailable("corp", "idp unreachable"),
+        ]);
+        let mut existing = serde_json::Map::new();
+        existing.insert("other".into(), serde_json::json!(1));
+        let meta = with_skipped_mcp_servers(Some(existing), &state).unwrap();
+        assert_eq!(meta["other"], 1);
+        let skipped = &meta["querymt"][SKIPPED_MCP_SERVERS_META_KEY];
+        assert_eq!(skipped[0]["server_name"], "linear");
+        assert_eq!(skipped[0]["provider_id"], "mcp:linear");
+        assert!(skipped[0].get("error").is_none());
+        assert_eq!(skipped[1]["error"], "idp unreachable");
+    }
 }

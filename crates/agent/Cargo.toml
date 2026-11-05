@@ -21,7 +21,7 @@ agent-tracing = ["querymt/tracing"]
 # QMT_UI_DIST and QMT_UI_REVISION optionally override the default source build.
 dashboard = ["api", "plugin-loaders", "dep:flate2", "dep:tar", "dep:ureq"]
 # Enables OAuth token support for authentication (reads tokens from system keyring)
-oauth = ["querymt-utils/oauth"]
+oauth = ["querymt-utils/oauth", "rmcp/auth"]
 
 zbus-secret-service = ["querymt-utils/zbus-secret-service"]
 systemd-credentials = ["querymt-utils/systemd-credentials"]
@@ -59,6 +59,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "s
 rusqlite = { version = "0.41", features = ["bundled", "uuid", "time"] }
 time = { version = "0.3", features = ["serde", "formatting", "macros", "local-offset"] }
 uuid = { version = "1.18", features = ["v4", "v7"] }
+url.workspace = true
 rapidhash = "4.2"
 rand = "0.10"
 ignore = "0.4.25"
@@ -73,7 +74,7 @@ parking_lot = "0.13"
 moka = { version = "0.12", features = ["future", "sync"] }
 
 imara-diff = "0.2"
-rmcp = { version = "3.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-async-rw", "elicitation", "reqwest"] }
+rmcp = { version = "3.8", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-async-rw", "elicitation", "reqwest"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 # NOTE: Enabled `debug-embed` for testing debug builds on mobile.
 rust-embed = { version = "8.6", features = ["axum", "include-exclude", "debug-embed", "interpolate-folder-path", "deterministic-timestamps"] }
@@ -159,6 +160,7 @@ syn = { version = "2", features = ["full", "visit"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rmcp = { version = "3.8", features = ["transport-streamable-http-client-unix-socket"] }
 
 [lib]
 name = "querymt_agent"
@@ -173,6 +175,7 @@ tar = { version = "0.4", optional = true, default-features = false }
 ureq = { version = "3", optional = true, default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
+rmcp = { version = "3.8", features = ["server"] }
 qmt-openai = { path = "../providers/openai", default-features = false, features = ["api"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 mockall = "0.15"
