@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rmcp::{
     RoleClient, ServiceExt,
-    model::{ClientCapabilities, ClientInfo, Implementation},
+    model::{ClientCapabilities, ClientConfig, Implementation},
     service::{DynService, RunningService},
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -44,7 +44,7 @@ impl McpServerTransportConfig {
         &self,
         client_impl: &Implementation,
     ) -> Result<RunningService<RoleClient, Box<dyn DynService<RoleClient>>>> {
-        let client_info = ClientInfo::new(ClientCapabilities::default(), client_impl.clone());
+        let client_info = ClientConfig::new(ClientCapabilities::default(), client_impl.clone());
         let client = match self {
             McpServerTransportConfig::Http { url, token } => {
                 let config = match token {

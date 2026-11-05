@@ -9,8 +9,7 @@
 use rmcp::RoleClient;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    ClientCapabilities, ClientInfo, CreateElicitationRequestParams, CreateElicitationResult,
-    Implementation,
+    ClientCapabilities, ClientConfig, ElicitRequestParams, ElicitResult, Implementation,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use serde::{Deserialize, Serialize};
@@ -43,6 +42,8 @@ impl From<rmcp::model::ElicitationAction> for ElicitationAction {
             rmcp::model::ElicitationAction::Accept => ElicitationAction::Accept,
             rmcp::model::ElicitationAction::Decline => ElicitationAction::Decline,
             rmcp::model::ElicitationAction::Cancel => ElicitationAction::Cancel,
+            // Non-exhaustive upstream: treat unknown actions as a cancel.
+            _ => ElicitationAction::Cancel,
         }
     }
 }
@@ -1298,17 +1299,16 @@ impl ClientHandler for McpClientHandler {
     #[allow(clippy::manual_async_fn)]
     fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParams,
+        request: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
-    ) -> impl std::future::Future<Output = Result<CreateElicitationResult, rmcp::ErrorData>> + Send + '_
-    {
+    ) -> impl std::future::Future<Output = Result<ElicitResult, rmcp::ErrorData>> + Send + '_ {
         async move {
             let elicitation_id = uuid::Uuid::new_v4().to_string();
             let (tx, rx) = oneshot::channel();
 
             // Extract message and schema from the enum variant.
             let (message, schema_json) = match &request {
-                CreateElicitationRequestParams::FormElicitationParams {
+                ElicitRequestParams::FormElicitationParams {
                     meta,
                     message,
                     requested_schema,
@@ -1316,9 +1316,14 @@ impl ClientHandler for McpClientHandler {
                     message.clone(),
                     form_schema_with_meta(requested_schema, meta.as_ref()),
                 ),
-                CreateElicitationRequestParams::UrlElicitationParams { message, url, .. } => {
+                ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
                     (message.clone(), serde_json::json!({ "url": url }))
                 }
+                // Non-exhaustive: surface unknown variants as raw JSON.
+                other => (
+                    String::new(),
+                    serde_json::to_value(other).unwrap_or(serde_json::Value::Null),
+                ),
             };
             let source = format!("mcp:{}", self.server_name);
 
@@ -1362,22 +1367,20 @@ impl ClientHandler for McpClientHandler {
 
             // Wait for response from UI/ACP
             match rx.await {
-                Ok(response) => Ok(CreateElicitationResult {
-                    action: response.action.into(),
-                    content: response.content,
-                    meta: None,
-                }),
-                Err(_) => Ok(CreateElicitationResult {
-                    action: rmcp::model::ElicitationAction::Cancel,
-                    content: None,
-                    meta: None,
-                }),
+                Ok(response) => {
+                    let result = ElicitResult::new(response.action.into());
+                    Ok(match response.content {
+                        Some(content) => result.with_content(content),
+                        None => result,
+                    })
+                }
+                Err(_) => Ok(ElicitResult::new(rmcp::model::ElicitationAction::Cancel)),
             }
         }
     }
 
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::new(ClientCapabilities::default(), self.client_impl.clone())
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::new(ClientCapabilities::default(), self.client_impl.clone())
     }
 
     async fn on_tool_list_changed(&self, context: NotificationContext<RoleClient>) -> () {

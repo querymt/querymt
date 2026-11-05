@@ -6,7 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use base64::Engine;
 use jsonschema::ValidationError;
-use rmcp::model::{RawContent, ResourceContents, Tool as RmcpTool};
+use rmcp::model::{ContentBlock, ResourceContents, Tool as RmcpTool};
 use rmcp::{model::CallToolRequestParams, service::ServerSink};
 use serde_json::Value;
 use std::convert::TryFrom;
@@ -103,30 +103,30 @@ impl McpToolAdapter {
     }
 }
 
-/// Convert an MCP `RawContent` value into a canonical bounded tool-result part.
+/// Convert an MCP `ContentBlock` value into a canonical bounded tool-result part.
 ///
 /// The conversion preserves each block's order and metadata. Media blocks use
 /// the validated attachment model, so malformed MIME declarations fail
 /// explicitly instead of being silently dropped. An unparseable blob MIME
 /// falls back to an opaque attachment rather than fabricating a concrete type.
 impl ToolResultPart {
-    pub fn from_mcp_raw(raw: RawContent) -> Self {
+    pub fn from_mcp_content(block: ContentBlock) -> Self {
         let b64 = base64::engine::general_purpose::STANDARD;
-        match raw {
-            RawContent::Text(t) => ToolResultPart::Text { text: t.text },
-            RawContent::Image(img) => attachment_part(
+        match block {
+            ContentBlock::Text(t) => ToolResultPart::Text { text: t.text },
+            ContentBlock::Image(img) => attachment_part(
                 MediaKind::Image,
                 Some(img.mime_type),
                 b64.decode(&img.data).unwrap_or_default(),
                 None,
             ),
-            RawContent::Audio(a) => attachment_part(
+            ContentBlock::Audio(a) => attachment_part(
                 MediaKind::Audio,
                 Some(a.mime_type),
                 b64.decode(&a.data).unwrap_or_default(),
                 None,
             ),
-            RawContent::Resource(r) => match r.resource {
+            ContentBlock::Resource(r) => match r.resource {
                 ResourceContents::TextResourceContents { text, .. } => {
                     ToolResultPart::Text { text }
                 }
@@ -138,8 +138,12 @@ impl ToolResultPart {
                     b64.decode(&blob).unwrap_or_default(),
                     None,
                 ),
+                // Non-exhaustive: preserve unknown variants as JSON.
+                other => ToolResultPart::Text {
+                    text: serde_json::to_string(&other).unwrap_or_default(),
+                },
             },
-            RawContent::ResourceLink(r) => {
+            ContentBlock::ResourceLink(r) => {
                 let kind = r
                     .mime_type
                     .as_deref()
@@ -159,6 +163,11 @@ impl ToolResultPart {
                 media.detail = r.description;
                 ToolResultPart::Attachment(Box::new(media))
             }
+            // `ContentBlock` is non-exhaustive: preserve unknown future block
+            // types as their JSON form rather than silently dropping them.
+            other => ToolResultPart::Text {
+                text: serde_json::to_string(&other).unwrap_or_default(),
+            },
         }
     }
 }
@@ -223,7 +232,7 @@ impl CallFunctionTool for McpToolAdapter {
         Ok(call_result
             .content
             .into_iter()
-            .map(|c| ToolResultPart::from_mcp_raw(c.raw))
+            .map(ToolResultPart::from_mcp_content)
             .collect())
     }
 }
