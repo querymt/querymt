@@ -74,3 +74,6 @@
 - Implement backward compatibility only when explicitly requested by the user.
   Do not add compatibility layers or preserve legacy behavior by default. If a change
   appears to require backward compatibility, flag it for user review before implementing it.
+- SQLite schema changes (`crates/agent/src/session/schema.rs`) need a new migration in
+  `crates/agent/src/session/sqlite_storage/migrations.rs`; `init_schema` only covers fresh
+  installs. Never edit a released migration. The schema drift test enforces this.

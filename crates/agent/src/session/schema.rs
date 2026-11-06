@@ -9,6 +9,11 @@ use rusqlite::Connection;
 use std::collections::HashSet;
 
 /// Initialize the hybrid INTEGER PK + UUID v7 public_id schema
+///
+/// This is the fresh-install path only (called by `0001_initial_reset` and
+/// tests). Existing databases never re-run it, so every object or column added
+/// here must also get a new migration in `sqlite_storage/migrations.rs`; the
+/// `legacy_baseline_upgrade_matches_fresh_install` test fails otherwise.
 pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         r#"
