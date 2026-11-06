@@ -2848,9 +2848,23 @@ dynamic client registration unless <code>client_id</code> is set, automatic refr
   <code>socket_path</code> or an <code>Authorization</code> header.</li>
 <li><strong>Login:</strong> use the <code>_querymt/auth/*</code> extension methods (<code>start</code>, <code>complete</code>,
   <code>status</code>, <code>logout</code>) with the provider id <code>mcp:&lt;server name&gt;</code>, for example
-  <code>mcp:linear</code>. Login flows are scoped to the client that started them. The
+  <code>mcp:linear</code>. Servers are offered from the agent configuration, every profile
+  (its <code>[[mcp]]</code> entries, quorum delegate <code>mcp</code> entries and <code>.agents/mcp.json</code>
+  servers) and the running profile runtimes, so a server declared only in a
+  profile can be logged into before any session uses it. A name declared with
+  different settings by several sources is refused with an <code>invalid_params</code>
+  error naming the sources; credentials are stored per name, so make the
+  declarations agree or rename one. Login flows are scoped to the client that started them. The
   loopback redirect URI is <code>http://127.0.0.1:&lt;redirect_port&gt;/callback</code>; the
   default port is <code>47821</code>. Register that URI when using a fixed <code>client_id</code>.</li>
+<li><strong>Strict scopes:</strong> authorization servers may grant more than was requested.
+  With <code>strict_scopes = true</code> (requires <code>scopes</code>), a login or refresh whose
+  token carries any scope beyond <code>scopes</code> (and <code>offline_access</code>) is not stored,
+  and stored credentials with a wider grant are not used to connect. The grant
+  is read from the token response <code>scope</code> and, for JWT access tokens, the
+  <code>scope</code>/<code>scp</code> claim. Example: <code>auth = { type = "oauth", scopes = ["mcp.read"], strict_scopes = true }</code>.</li>
+<li><strong><code>.agents/mcp.json</code>:</strong> an HTTP entry may carry the same <code>auth</code> object, e.g.
+  <code>"auth": {"type": "oauth", "scopes": ["read"]}</code>.</li>
 <li><strong>Storage:</strong> tokens are kept in the secret store under <code>mcp-oauth:&lt;server&gt;</code>,
   bound to the server URL, and never written to config, logs, events, or
   session history.</li>
