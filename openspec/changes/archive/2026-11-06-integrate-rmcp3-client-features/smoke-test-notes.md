@@ -46,7 +46,22 @@ steps: Invalid input: expected number, received string
 (In the agent this becomes a failed tool call with this text verbatim; covered
 by `is_error_result_is_a_failed_tool_call_with_server_text`.)
 
-## Not covered
+## OAuth against a real server (Linear)
 
-No real OAuth-protected HTTP server was exercised; OAuth is covered by mock
-authorization/MCP servers in the unit and integration tests.
+Server: `https://mcp.linear.app/mcp`, configured with
+`auth = { type = "oauth", scopes = ["read"] }`, run manually (by hand, after the
+review follow-ups in tasks 10.1-10.9 landed). The login only works with the
+RFC 9207 `iss` handling (task 10.9): Linear advertises
+`authorization_response_iss_parameter_supported`, and the token exchange is
+refused without the redirect's `iss`.
+
+Observed: the OAuth login for provider `mcp:linear` completed against the real
+Linear authorization server (discovery, dynamic client registration, browser
+login), and the agent then connected with the stored credentials and listed
+Linear issues through the MCP tools.
+
+Not exercised against a real server (covered by mock authorization/MCP servers
+in the unit and integration tests only): the skipped-server notification and
+`_meta.querymt.skippedMcpServers` before login, token refresh and rejected
+refresh, logout, a changed `redirect_port`, an unreachable authorization
+server, and private-address discovery (needs an internal identity provider).

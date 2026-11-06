@@ -207,14 +207,25 @@ impl OAuthService {
         let svc = self.clone();
         let id = identity.clone();
         let task = tokio::spawn(async move {
-            let Some((code, cb_state)) =
+            let Some(callback) =
                 await_loopback_callback(&id.flow_id, &id.provider, port, state, &mut stop_rx).await
             else {
                 return;
             };
             let flow = svc.mcp_flows.lock().await.get(&id).cloned();
             let Some(flow) = flow else { return };
-            match flow.session.handle_callback(&code, &cb_state).await {
+            // Hand over the RFC 9207 `iss` of the redirect: servers that
+            // advertise `authorization_response_iss_parameter_supported`
+            // (Linear) are refused without it.
+            match flow
+                .session
+                .handle_callback_with_issuer(
+                    &callback.code,
+                    &callback.state,
+                    callback.issuer.as_deref(),
+                )
+                .await
+            {
                 Ok(_) => {
                     svc.mcp_flows.lock().await.remove(&id);
                     let mut active = svc.listener_slot.lock().await;
@@ -274,6 +285,8 @@ impl OAuthService {
         let exchanged = if input.starts_with("http://") || input.starts_with("https://") {
             flow.session.handle_callback_url(input).await
         } else {
+            // A bare code carries no `iss`; servers that require it reject
+            // this, and the error then asks for the full callback URL.
             let code = input.split('#').next().unwrap_or(input);
             flow.session.handle_callback(code, &flow.state).await
         };
@@ -284,6 +297,15 @@ impl OAuthService {
                 result(
                     true,
                     format!("Successfully authenticated with {}", identity.provider),
+                )
+            }
+            Err(rmcp::transport::AuthError::AuthorizationServerMissingIssuer { .. })
+                if !input.starts_with("http") =>
+            {
+                result(
+                    false,
+                    "This server needs the full callback URL (it includes the `iss` parameter); paste the whole URL, not just the code"
+                        .to_string(),
                 )
             }
             Err(e) => result(false, format!("Token exchange failed: {e}")),
@@ -351,6 +373,8 @@ mod tests {
                 "authorization_endpoint": format!("{}/authorize", s.base),
                 "token_endpoint": format!("{}/token", s.base),
                 "registration_endpoint": format!("{}/register", s.base),
+                // Like Linear: the redirect must carry `iss` (RFC 9207).
+                "authorization_response_iss_parameter_supported": true,
                 "response_types_supported": ["code"],
                 "code_challenge_methods_supported": ["S256"],
             }))
@@ -456,6 +480,13 @@ mod tests {
             .into_owned()
     }
 
+    /// Query string of a redirect as the authorization server sends it: with
+    /// the RFC 9207 `iss` of the server.
+    fn redirect_query(auth: &AuthServer, authorization_url: &str) -> String {
+        let iss: String = url::form_urlencoded::byte_serialize(auth.base.as_bytes()).collect();
+        format!("code=abc&state={}&iss={iss}", state_of(authorization_url))
+    }
+
     async fn hit_callback(port: u16, query: &str) {
         for _ in 0..100 {
             if let Ok(r) = reqwest::get(format!("http://127.0.0.1:{port}/callback?{query}")).await
@@ -536,11 +567,7 @@ mod tests {
             );
         }
 
-        hit_callback(
-            port,
-            &format!("code=abc&state={}", state_of(&started.authorization_url)),
-        )
-        .await;
+        hit_callback(port, &redirect_query(&auth, &started.authorization_url)).await;
         let stored = wait_for_credentials(&backend).await;
         assert!(stored.contains("login-access"));
         assert!(stored.contains(&url), "bound to the server URL");
@@ -551,6 +578,73 @@ mod tests {
             status_of(&statuses, "mcp:linear"),
             Some(OAuthStatus::Connected)
         );
+    }
+
+    #[tokio::test]
+    async fn loopback_redirect_without_issuer_is_refused() {
+        let auth = serve_auth_server().await;
+        let backend = Arc::new(MemoryBackend::default());
+        let port = free_port();
+        let (svc, _) = service(&auth, &backend, port).await;
+
+        let started = svc.start_flow("acp", "mcp:linear").await.unwrap();
+        // The server requires `iss`; a redirect without it must not log in.
+        hit_callback(
+            port,
+            &format!("code=abc&state={}", state_of(&started.authorization_url)),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(backend.0.lock().is_empty(), "nothing persisted");
+        let statuses = svc.auth_status(Some("mcp:linear")).await.unwrap();
+        assert_eq!(
+            status_of(&statuses, "mcp:linear"),
+            Some(OAuthStatus::NotAuthenticated)
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_redirect_with_a_foreign_issuer_is_refused() {
+        let auth = serve_auth_server().await;
+        let backend = Arc::new(MemoryBackend::default());
+        let port = free_port();
+        let (svc, _) = service(&auth, &backend, port).await;
+
+        let started = svc.start_flow("acp", "mcp:linear").await.unwrap();
+        hit_callback(
+            port,
+            &format!(
+                "code=abc&state={}&iss=https%3A%2F%2Fevil.example",
+                state_of(&started.authorization_url)
+            ),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(backend.0.lock().is_empty(), "nothing persisted");
+    }
+
+    #[tokio::test]
+    async fn pasting_a_bare_code_explains_that_the_full_url_is_needed() {
+        let auth = serve_auth_server().await;
+        let backend = Arc::new(MemoryBackend::default());
+        let (svc, _) = service(&auth, &backend, free_port()).await;
+        let started = svc.start_flow("acp", "mcp:linear").await.unwrap();
+        let state = state_of(&started.authorization_url);
+
+        let bare = svc
+            .complete_flow("acp", &started.flow_id, &format!("abc#{state}"))
+            .await;
+        assert!(!bare.success);
+        assert!(bare.message.contains("full callback URL"), "{bare:?}");
+        assert!(backend.0.lock().is_empty());
+
+        // The full redirect URL still completes the same flow.
+        let redirect = format!(
+            "http://127.0.0.1:1/callback?{}",
+            redirect_query(&auth, &started.authorization_url)
+        );
+        let done = svc.complete_flow("acp", &started.flow_id, &redirect).await;
+        assert!(done.success, "{done:?}");
     }
 
     #[tokio::test]
@@ -569,7 +663,10 @@ mod tests {
         assert!(backend.0.lock().is_empty(), "nothing persisted");
 
         // The owner can still finish it by pasting the redirect URL.
-        let redirect = format!("http://127.0.0.1:1/callback?code=abc&state={state}");
+        let redirect = format!(
+            "http://127.0.0.1:1/callback?{}",
+            redirect_query(&auth, &started.authorization_url)
+        );
         let done = svc
             .complete_flow("owner-a", &started.flow_id, &redirect)
             .await;
@@ -668,10 +765,11 @@ mod tests {
 
         // The login completes without restarting anything.
         let started = svc.start_flow("acp", "mcp:linear").await.unwrap();
-        let state = state_of(&started.authorization_url);
-        let done = svc
-            .complete_flow("acp", &started.flow_id, &format!("abc#{state}"))
-            .await;
+        let redirect = format!(
+            "http://127.0.0.1:1/callback?{}",
+            redirect_query(&auth, &started.authorization_url)
+        );
+        let done = svc.complete_flow("acp", &started.flow_id, &redirect).await;
         assert!(done.success, "{done:?}");
 
         // Session B connects the server and has its tools.
@@ -690,10 +788,11 @@ mod tests {
         let backend = Arc::new(MemoryBackend::default());
         let (svc, _) = service(&auth, &backend, free_port()).await;
         let started = svc.start_flow("acp", "mcp:linear").await.unwrap();
-        let state = state_of(&started.authorization_url);
-        let done = svc
-            .complete_flow("acp", &started.flow_id, &format!("abc#{state}"))
-            .await;
+        let redirect = format!(
+            "http://127.0.0.1:1/callback?{}",
+            redirect_query(&auth, &started.authorization_url)
+        );
+        let done = svc.complete_flow("acp", &started.flow_id, &redirect).await;
         assert!(done.success, "{done:?}");
         assert!(backend.0.lock().contains_key("mcp-oauth:linear"));
 

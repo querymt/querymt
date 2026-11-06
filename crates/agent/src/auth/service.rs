@@ -42,9 +42,18 @@ pub type OAuthFlowMap = Arc<Mutex<HashMap<String, PendingOAuthFlow>>>;
 /// Thread-safe slot for the single active callback listener.
 pub type CallbackListenerSlot = Arc<Mutex<Option<ActiveOAuthCallbackListener>>>;
 
+/// A valid loopback redirect: authorization code, the checked `state`, and the
+/// RFC 9207 `iss` parameter when the authorization server sent one.
+#[cfg(feature = "oauth")]
+struct LoopbackCallback {
+    code: String,
+    state: String,
+    issuer: Option<String>,
+}
+
 /// Result sent from the HTTP callback handler back to the listener task.
 #[cfg(feature = "oauth")]
-type CallbackResult = Result<(String, String), String>;
+type CallbackResult = Result<LoopbackCallback, String>;
 #[cfg(feature = "oauth")]
 type CallbackResultSender = Arc<Mutex<Option<tokio::sync::oneshot::Sender<CallbackResult>>>>;
 
@@ -1059,9 +1068,11 @@ async fn wait_for_oauth_callback(
 }
 
 /// Serve the loopback OAuth redirect on `callback_port` until a callback
-/// arrives, the listener is stopped, or the wait times out. Returns the
-/// `(code, state)` of a valid callback (state already checked against
-/// `state_param`).
+/// arrives, the listener is stopped, or the wait times out. Returns a valid
+/// callback (state already checked against `state_param`). The `iss` parameter
+/// is kept: servers that advertise
+/// `authorization_response_iss_parameter_supported` (e.g. Linear) are rejected
+/// by the token exchange without it.
 #[cfg(feature = "oauth")]
 async fn await_loopback_callback(
     flow_id: &str,
@@ -1069,7 +1080,7 @@ async fn await_loopback_callback(
     callback_port: u16,
     state_param: String,
     stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
-) -> Option<(String, String)> {
+) -> Option<LoopbackCallback> {
     use axum::{
         Router,
         extract::{Query, State},
@@ -1090,6 +1101,7 @@ async fn await_loopback_callback(
         code: Option<String>,
         state: Option<String>,
         error: Option<String>,
+        iss: Option<String>,
     }
 
     async fn cb_handler(
@@ -1103,7 +1115,11 @@ async fn await_loopback_callback(
             if received_state != st.expected_state {
                 Err("State mismatch - possible CSRF attack".to_string())
             } else {
-                Ok((code, received_state))
+                Ok(LoopbackCallback {
+                    code,
+                    state: received_state,
+                    issuer: params.iss.filter(|iss| !iss.is_empty()),
+                })
             }
         } else {
             Err("No authorization code received".to_string())
@@ -1170,7 +1186,7 @@ async fn await_loopback_callback(
     let _ = shutdown_tx.send(());
     let _ = server_task.await;
 
-    let (code, cb_state) = match wait {
+    let callback = match wait {
         WaitResult::Stopped => {
             log::debug!(
                 "OAuth callback listener stopped for flow '{}' (provider='{}')",
@@ -1187,13 +1203,13 @@ async fn await_loopback_callback(
             );
             return None;
         }
-        WaitResult::Callback(Ok(pair)) => pair,
+        WaitResult::Callback(Ok(callback)) => callback,
         WaitResult::Callback(Err(err)) => {
             log::debug!("OAuth callback error for flow '{}': {}", flow_id, err);
             return None;
         }
     };
-    Some((code, cb_state))
+    Some(callback)
 }
 
 #[cfg(feature = "oauth")]
@@ -1220,7 +1236,11 @@ async fn run_callback_listener_task(
         (flow.state.clone(), flow.verifier.clone())
     };
 
-    let Some((code, cb_state)) = await_loopback_callback(
+    let Some(LoopbackCallback {
+        code,
+        state: cb_state,
+        ..
+    }) = await_loopback_callback(
         &flow_id,
         &provider,
         callback_port,
