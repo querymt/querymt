@@ -2152,12 +2152,53 @@ produces a tree of child spans describing every step that was executed.</p>
 <td><code>acp.ext_method</code></td>
 <td>Handling an extension JSON-RPC method</td>
 </tr>
+</tbody>
+</table>
+<p>Every ACP request span is marked as an error (<code>error.type = rpc_error</code>, plus
+<code>rpc.response.status_code</code>) when the handler returns an error. The error text
+is not exported.</p>
+<p><strong>MCP OAuth logins</strong> (<code>_querymt/auth/*</code> with provider id <code>mcp:&lt;server&gt;</code>)</p>
+<table>
+<thead>
 <tr>
-<td><code>acp.ext_notification</code></td>
-<td>Handling an extension notification</td>
+<th>Span name</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>auth.mcp.start</code></td>
+<td>Starting a login (<code>provider_id</code>, <code>server</code>, <code>sources</code>, <code>scopes_requested</code>)</td>
+</tr>
+<tr>
+<td><code>auth.mcp.discover</code></td>
+<td>Discovering the authorization server's metadata</td>
+</tr>
+<tr>
+<td><code>auth.mcp.register</code></td>
+<td>Dynamic client registration (<code>preregistered</code>: a stored client is reused)</td>
+</tr>
+<tr>
+<td><code>auth.mcp.callback</code></td>
+<td>Exchanging the authorization code (<code>channel</code>: <code>loopback</code> or <code>paste</code>)</td>
+</tr>
+<tr>
+<td><code>auth.mcp.logout</code></td>
+<td>Removing stored credentials</td>
 </tr>
 </tbody>
 </table>
+<p>A failed operation sets the span status to error and <code>error.type</code> to one of
+<code>unknown_server</code>, <code>conflicting_server</code>, <code>empty_provider</code>, <code>metadata</code>,
+<code>metadata_http_403</code>, <code>registration</code>, <code>registration_http_403</code>, <code>token_exchange</code>,
+<code>missing_issuer</code>, <code>scope_exceeded</code> (a token wider than <code>strict_scopes</code> allows),
+<code>credential_store</code>, <code>http</code>, <code>url</code> or <code>other</code>. Spans never carry URLs, codes or
+tokens; the full cause chain is logged once per failure (<code>error</code> for server or
+agent failures, <code>warn</code> for configuration mistakes such as an unknown server).</p>
+<p>The counter <code>querymt.auth.mcp.login{operation, outcome, error.type}</code> counts
+these operations (<code>operation</code>: <code>start</code>, <code>callback</code>, <code>logout</code>; <code>outcome</code>: <code>ok</code> or
+<code>error</code>).
+| <code>acp.ext_notification</code> | Handling an extension notification |</p>
 <p><strong>UI / Dashboard</strong></p>
 <table>
 <thead>
