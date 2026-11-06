@@ -5830,6 +5830,38 @@ fn knowledge_junction_migration_is_idempotent_and_skips_malformed_json() {
     assert_eq!(count("knowledge_entry_topics"), 1);
 }
 
+/// Apply 0035, re-run it, and return (entity rows, topic rows).
+fn run_junction_migration_twice(mut conn: Connection) -> (i64, i64) {
+    apply_migrations(&mut conn).expect("apply 0035");
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0035_knowledge_junction_tables")
+        .unwrap();
+    (migration.apply)(&mut conn).expect("second run");
+    let count = |table: &str| -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    (
+        count("knowledge_entry_entities"),
+        count("knowledge_entry_topics"),
+    )
+}
+
+#[test]
+fn knowledge_junction_migration_backfills_entities_when_topics_malformed() {
+    let conn = legacy_db_without_knowledge_junctions();
+    insert_knowledge_entry(&conn, "e", r#"["Tokio"]"#, "not json");
+    assert_eq!(run_junction_migration_twice(conn), (1, 0));
+}
+
+#[test]
+fn knowledge_junction_migration_backfills_topics_when_entities_malformed() {
+    let conn = legacy_db_without_knowledge_junctions();
+    insert_knowledge_entry(&conn, "e", "not json", r#"["async"]"#);
+    assert_eq!(run_junction_migration_twice(conn), (0, 1));
+}
+
 #[tokio::test]
 async fn knowledge_query_finds_backfilled_entries_after_upgrade() {
     use crate::knowledge::sqlite::SqliteKnowledgeStore;

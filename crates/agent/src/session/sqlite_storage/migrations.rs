@@ -190,7 +190,8 @@ pub(super) const MIGRATIONS: &[Migration] = &[
 /// Existing entries are backfilled from `entities_json` / `topics_json` with
 /// the same normalization `ingest` uses. Only entries without any junction
 /// rows are touched, so the backfill is idempotent and a no-op on fresh
-/// installs. Malformed JSON skips that entry instead of blocking startup.
+/// installs. Each JSON field is parsed independently (matching `row_to_entry`):
+/// a malformed field is treated as empty instead of blocking startup.
 fn migration_0035_knowledge_junction_tables(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     let tx = conn.transaction()?;
     tx.execute_batch(
@@ -226,19 +227,19 @@ fn migration_0035_knowledge_junction_tables(conn: &mut Connection) -> Result<(),
     };
 
     for (id, entities_json, topics_json) in entries {
-        let parsed = serde_json::from_str::<Vec<String>>(&entities_json)
-            .and_then(|e| serde_json::from_str::<Vec<String>>(&topics_json).map(|t| (e, t)));
-        let (entities, topics) = match parsed {
-            Ok(v) => v,
-            Err(err) => {
+        let parse = |field: &str, json: &str| -> Vec<String> {
+            serde_json::from_str::<Vec<String>>(json).unwrap_or_else(|err| {
                 tracing::warn!(
                     entry_id = id,
+                    field,
                     error = %err,
-                    "skipping knowledge junction backfill for entry with malformed JSON"
+                    "malformed JSON in knowledge junction backfill; treating field as empty"
                 );
-                continue;
-            }
+                Vec::new()
+            })
         };
+        let entities = parse("entities_json", &entities_json);
+        let topics = parse("topics_json", &topics_json);
         for entity in &entities {
             tx.execute(
                 "INSERT INTO knowledge_entry_entities (entry_id, entity, entity_normalized) \
