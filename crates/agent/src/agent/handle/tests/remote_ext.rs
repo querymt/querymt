@@ -2074,3 +2074,233 @@ async fn exhausted_budget_still_serves_a_window_already_in_the_local_journal() {
         .unwrap();
     assert_eq!(snapshot["audit"]["events"].as_array().unwrap().len(), 4);
 }
+
+// ── Remote snapshot prompt blocks ─────────────────────────────────────────
+
+/// An owner with `turns` stored prompts, each a text block plus an image of
+/// `image_bytes` base64 bytes, and a viewer whose journal holds the owner's
+/// events for them (`PromptReceived` carries only text). The owner's actor
+/// is installed as the viewer's attachment.
+#[cfg(feature = "remote")]
+async fn owner_and_viewer_with_image_prompts(
+    turns: usize,
+    image_bytes: usize,
+) -> (
+    RealStorageHandleFixture,
+    RealStorageHandleFixture,
+    String,
+    Vec<String>,
+) {
+    use crate::acp::protocol::{ContentBlock, ImageContent, TextContent};
+    use crate::events::AgentEventKind;
+    use crate::session::store::RemoteSessionBookmark;
+    let owner = RealStorageHandleFixture::new().await;
+    let store = owner.handle.config.provider.history_store();
+    let session = store.create_session(None, None, None, None).await.unwrap();
+    let session_id = session.public_id.clone();
+
+    let viewer = RealStorageHandleFixture::new().await;
+    let node_id = "node-owner";
+    viewer
+        .storage
+        .session_store()
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: session_id.clone(),
+            node_id: node_id.into(),
+            peer_label: "owner".into(),
+            cwd: None,
+            created_at: 1_700_000_000,
+            title: None,
+        })
+        .await
+        .unwrap();
+    let sink = viewer.handle.config.event_sink.clone();
+    let image = "A".repeat(image_bytes.max(4));
+    let mut message_ids = Vec::new();
+    let mut seq = 0i64;
+    for turn in 0..turns {
+        let message_id = format!("prompt-msg-{turn}");
+        store
+            .add_message(
+                &session_id,
+                crate::model::AgentMessage {
+                    id: message_id.clone(),
+                    session_id: session_id.clone(),
+                    role: querymt::chat::ChatRole::User,
+                    parts: vec![crate::model::MessagePart::Prompt {
+                        blocks: vec![
+                            ContentBlock::Text(TextContent::new(format!("look {turn}"))),
+                            ContentBlock::Image(ImageContent::new(image.clone(), "image/png")),
+                        ],
+                    }],
+                    created_at: 1_700_000_100 + turn as i64,
+                    parent_message_id: None,
+                    source_provider: None,
+                    source_model: None,
+                },
+            )
+            .await
+            .unwrap();
+        for kind in [
+            AgentEventKind::RunStarted {
+                run_id: format!("r{turn}"),
+                origin: "interactive".into(),
+            },
+            AgentEventKind::PromptReceived {
+                content: format!("look {turn}\n\n[Image: image/png]"),
+                message_id: Some(message_id.clone()),
+            },
+        ] {
+            seq += 1;
+            sink.persist_durable_from_source(
+                &session_id,
+                kind,
+                Some("owner".into()),
+                node_id.into(),
+                seq,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        message_ids.push(message_id);
+    }
+    let state = sink.remote_sync(&session_id, node_id);
+    state.hydrate().await.unwrap();
+    let guard = state.lock_apply().await;
+    state.mark_covered(1, seq, seq).await.unwrap();
+    drop(guard);
+
+    let runtime = crate::agent::core::SessionRuntime::new(
+        None,
+        std::collections::HashMap::new(),
+        crate::agent::core::McpToolState::empty(),
+    );
+    let actor = SessionActor::spawn(SessionActor::new(
+        owner.handle.config.clone(),
+        session_id.clone(),
+        runtime,
+    ));
+    viewer
+        .handle
+        .registry
+        .lock()
+        .await
+        .insert(session_id.clone(), actor);
+    (owner, viewer, session_id, message_ids)
+}
+
+#[cfg(feature = "remote")]
+fn assert_image_prompt(snapshot: &serde_json::Value, message_id: &str) {
+    let prompts = snapshot["userPrompts"].as_array().expect("userPrompts");
+    let record = prompts
+        .iter()
+        .find(|record| record["messageId"] == message_id)
+        .unwrap_or_else(|| panic!("prompt {message_id} missing from {prompts:?}"));
+    assert_eq!(record["blocks"][0]["type"], "text");
+    assert_eq!(record["blocks"][1]["type"], "image");
+    assert_eq!(record["blocks"][1]["mimeType"], "image/png");
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn remote_snapshot_contains_structured_prompt_blocks_from_owner() {
+    let (_owner, viewer, session_id, ids) = owner_and_viewer_with_image_prompts(1, 4).await;
+    for window in [
+        None,
+        Some(crate::session::history_window::LoadWindow::default()),
+    ] {
+        let snapshot = viewer
+            .handle
+            .build_remote_attach_snapshot_with_budget(
+                &session_id,
+                window,
+                Ok(()),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_image_prompt(&snapshot, &ids[0]);
+        let prompt = &snapshot["userPrompts"][0]["blocks"][1];
+        assert_eq!(prompt["data"], "AAAA");
+    }
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn unreachable_owner_loads_with_text_only_prompts() {
+    let (_owner, viewer, session_id, _) = owner_and_viewer_with_image_prompts(1, 4).await;
+    viewer.handle.registry.lock().await.remove(&session_id);
+    // Owner unreachable: no mesh in this fixture, so connecting fails and the
+    // local window is served as stale.
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        crate::acp::shared::QUERYMT_META_NAMESPACE.into(),
+        serde_json::json!({ "loadWindow": {} }),
+    );
+    let response = viewer
+        .handle
+        .load_session(
+            crate::acp::protocol::LoadSessionRequest::new(
+                SessionId::from(session_id.clone()),
+                std::path::PathBuf::new(),
+            )
+            .meta(meta),
+        )
+        .await
+        .expect("load must not fail because prompt blocks are unavailable");
+    let snapshot = &response.meta.unwrap()["querymt/sessionLoadSnapshot.v1"];
+    assert_eq!(snapshot["history"]["stale"], true);
+    assert!(
+        snapshot["userPrompts"]
+            .as_array()
+            .is_none_or(|prompts| prompts.is_empty()),
+        "{}",
+        snapshot["userPrompts"]
+    );
+    let events = snapshot["audit"]["events"].as_array().unwrap();
+    assert!(
+        events.iter().any(|event| {
+            event["kind"]["type"] == "prompt_received"
+                && event["kind"]["data"]["content"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("look 0"))
+        }),
+        "{events:?}"
+    );
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn prompt_attachments_do_not_count_toward_the_window_byte_budget() {
+    // Three small turns fit the 16 KiB budget; their 64 KiB images would not.
+    let (_owner, viewer, session_id, ids) = owner_and_viewer_with_image_prompts(3, 64 * 1024).await;
+    let window = crate::session::history_window::LoadWindow {
+        max_turns: 20,
+        max_bytes: 16 * 1024,
+        truncate_bytes: 1024,
+    };
+    let snapshot = viewer
+        .handle
+        .build_remote_attach_snapshot_with_budget(
+            &session_id,
+            Some(window),
+            Ok(()),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot["audit"]["events"].as_array().unwrap().len(), 6);
+    assert_eq!(snapshot["history"]["complete"], true);
+    for id in &ids {
+        assert_image_prompt(&snapshot, id);
+    }
+    // Not truncated either.
+    assert_eq!(
+        snapshot["userPrompts"][0]["blocks"][1]["data"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64 * 1024
+    );
+}

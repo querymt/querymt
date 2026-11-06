@@ -818,6 +818,55 @@ impl SessionActorRef {
         }
     }
 
+    /// Structured user prompt records of this session, optionally restricted
+    /// to `message_ids`. Owners that predate `GetUserPrompts` are served via
+    /// `GetHistory` and projected locally.
+    #[tracing::instrument(
+        name = "remote.session_ref.get_user_prompts",
+        skip(self, message_ids),
+        fields(is_remote = self.is_remote(), peer_label = %self.node_label())
+    )]
+    pub async fn get_user_prompts(
+        &self,
+        message_ids: Option<Vec<String>>,
+    ) -> Result<Vec<crate::session::load_snapshot::UserPromptRecord>, AgentError> {
+        let request = messages::GetUserPrompts {
+            message_ids: message_ids.clone(),
+        };
+        let direct = match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(request)
+                .await
+                .map_err(Self::map_local_agent_send_error),
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&request)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
+                .send()
+                .await
+                .map_err(|e| {
+                    Self::map_agent_timeout_remote_send_error(
+                        e,
+                        "GetUserPrompts timed out on remote session",
+                    )
+                }),
+        };
+        match direct {
+            Err(error) if crate::agent::event_chunk::is_unsupported_message(&error) => {
+                let history = self
+                    .get_history()
+                    .await
+                    .map_err(|error| AgentError::RemoteActor(error.to_string()))?;
+                Ok(crate::session::load_snapshot::filter_prompt_records(
+                    crate::session::load_snapshot::user_prompt_records(&history),
+                    message_ids.as_deref(),
+                ))
+            }
+            other => other,
+        }
+    }
+
     /// Get the full durable event stream for this session.
     ///
     /// Returns all persisted `AgentEvent` entries, ordered by sequence number.

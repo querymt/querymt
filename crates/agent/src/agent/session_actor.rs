@@ -1699,6 +1699,29 @@ impl Message<crate::agent::messages::GetHistory> for SessionActor {
     }
 }
 
+/// Structured user prompt records of this session (see `GetUserPrompts`).
+impl Message<crate::agent::messages::GetUserPrompts> for SessionActor {
+    type Reply = Result<Vec<crate::session::load_snapshot::UserPromptRecord>, AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: crate::agent::messages::GetUserPrompts,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let history = self
+            .config
+            .provider
+            .history_store()
+            .get_history(&self.session_id)
+            .await
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
+        Ok(crate::session::load_snapshot::filter_prompt_records(
+            crate::session::load_snapshot::user_prompt_records(&history),
+            msg.message_ids.as_deref(),
+        ))
+    }
+}
+
 /// Return the full durable event stream for this session from the local journal.
 impl Message<crate::agent::messages::GetEventStream> for SessionActor {
     type Reply = Result<Vec<crate::events::AgentEvent>, AgentError>;
