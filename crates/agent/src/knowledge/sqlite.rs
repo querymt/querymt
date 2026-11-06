@@ -193,7 +193,10 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 
         let id = self
             .run_blocking(move |conn| {
-                conn.execute(
+                // Atomic: a failing junction insert must not leave a committed
+                // entry without its entity/topic links.
+                let tx = conn.transaction().map_err(KnowledgeError::from)?;
+                tx.execute(
                     "INSERT INTO knowledge_entries (
                         public_id, scope, source, raw_text, summary,
                         entities_json, topics_json, connections_json,
@@ -213,12 +216,12 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                     ],
                 )
                 .map_err(KnowledgeError::from)?;
-                let row_id = conn.last_insert_rowid();
+                let row_id = tx.last_insert_rowid();
 
                 // Populate junction tables with normalized forms for indexed matching
                 for entity in &entry.entities {
                     let normalized = crate::knowledge::text_processing::normalize_term(entity);
-                    conn.execute(
+                    tx.execute(
                         "INSERT INTO knowledge_entry_entities (entry_id, entity, entity_normalized) \
                          VALUES (?, ?, ?)",
                         params![row_id, entity, normalized],
@@ -227,7 +230,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                 }
                 for topic in &entry.topics {
                     let normalized = crate::knowledge::text_processing::normalize_term(topic);
-                    conn.execute(
+                    tx.execute(
                         "INSERT INTO knowledge_entry_topics (entry_id, topic, topic_normalized) \
                          VALUES (?, ?, ?)",
                         params![row_id, topic, normalized],
@@ -235,6 +238,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                     .map_err(KnowledgeError::from)?;
                 }
 
+                tx.commit().map_err(KnowledgeError::from)?;
                 Ok(row_id)
             })
             .await?;
@@ -1481,6 +1485,36 @@ mod tests {
         assert!(!result.entries.is_empty());
         // The entry with matching entity+topic and high importance should rank first
         assert_eq!(result.entries[0].summary, "General coding notes");
+    }
+
+    #[tokio::test]
+    async fn ingest_is_atomic_when_junction_insert_fails() {
+        let db = setup_db();
+        db.lock()
+            .unwrap()
+            .execute_batch("DROP TABLE knowledge_entry_topics;")
+            .unwrap();
+        let store = SqliteKnowledgeStore::new(db.clone());
+
+        let result = store
+            .ingest("scope", make_ingest("user", "Should not persist"))
+            .await;
+        assert!(result.is_err(), "ingest must fail without the topics table");
+
+        let rows: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM knowledge_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "failed ingest must not leave a committed entry");
+        let entity_rows: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM knowledge_entry_entities", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(entity_rows, 0, "failed ingest must not leave entity links");
     }
 
     #[tokio::test]

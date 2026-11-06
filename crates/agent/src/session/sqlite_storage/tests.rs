@@ -5540,3 +5540,318 @@ fn schema_ensure_source_cwd(conn: &mut Connection) {
     crate::session::schema::ensure_workspace_source_cwd(conn).unwrap();
     crate::session::schema::ensure_workspace_handoff(conn).unwrap();
 }
+
+/// Frozen `init_schema` DDL from commit 6c152f18: what a database got when it
+/// applied `0001_initial_reset` before later tables were added to `init_schema`.
+const LEGACY_BASELINE_SCHEMA: &str =
+    include_str!("../../../tests/fixtures/schema_0001_baseline.sql");
+
+/// Schema differences between a fresh install and a legacy upgrade that are
+/// understood and harmless. Each entry is the exact line printed by
+/// `schema_snapshot`, with a comment saying why it is benign. Anything else
+/// that differs needs a real migration, not an entry here.
+const KNOWN_BENIGN_DRIFT: &[&str] = &[];
+
+fn collapse_whitespace(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Order-insensitive description of every schema object, so `ALTER TABLE ADD
+/// COLUMN` (which appends) compares equal to a fresh `CREATE TABLE`.
+fn schema_snapshot(conn: &Connection) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut objects = conn
+        .prepare(
+            "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master \
+             WHERE name NOT LIKE 'sqlite_%'",
+        )
+        .unwrap();
+    let rows: Vec<(String, String, String, String)> = objects
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    for (kind, name, tbl_name, sql) in rows {
+        match kind.as_str() {
+            "table" => {
+                out.insert(format!("table {name}"));
+                let mut cols = conn
+                    .prepare(
+                        "SELECT name, type, \"notnull\", dflt_value, pk, hidden \
+                         FROM pragma_table_xinfo(?1)",
+                    )
+                    .unwrap();
+                let col_rows: Vec<String> = cols
+                    .query_map([&name], |r| {
+                        Ok(format!(
+                            "column {name}.{} type={} notnull={} default={:?} pk={} hidden={}",
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, i64>(5)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                out.extend(col_rows);
+                let mut fks = conn
+                    .prepare(
+                        "SELECT \"from\", \"table\", \"to\", on_delete FROM pragma_foreign_key_list(?1)",
+                    )
+                    .unwrap();
+                let fk_rows: Vec<String> = fks
+                    .query_map([&name], |r| {
+                        Ok(format!(
+                            "fk {name}.{} -> {}.{:?} on_delete={}",
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                out.extend(fk_rows);
+            }
+            "index" => {
+                let (unique, partial): (i64, i64) = conn
+                    .query_row(
+                        "SELECT \"unique\", partial FROM pragma_index_list(?1) WHERE name = ?2",
+                        [&tbl_name, &name],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                let mut cols = conn
+                    .prepare(
+                        "SELECT COALESCE(name, '<expr>'), desc FROM pragma_index_xinfo(?1) \
+                         WHERE key = 1 ORDER BY seqno",
+                    )
+                    .unwrap();
+                let col_list: Vec<String> = cols
+                    .query_map([&name], |r| {
+                        Ok(format!(
+                            "{} desc={}",
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                let predicate = if partial == 1 {
+                    let upper = sql.to_uppercase();
+                    upper
+                        .find(" WHERE ")
+                        .map(|i| collapse_whitespace(&sql[i + 7..]))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                out.insert(format!(
+                    "index {name} on {tbl_name} unique={unique} cols=[{}] where=[{predicate}]",
+                    col_list.join(", ")
+                ));
+            }
+            "trigger" => {
+                out.insert(format!("trigger {name}: {}", collapse_whitespace(&sql)));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A table or index added to `init_schema` only reaches databases created after
+/// that change; existing databases need a migration. This test models a legacy
+/// install (the 0001 baseline) and requires that running every migration yields
+/// the same schema as a fresh install.
+#[test]
+fn legacy_baseline_upgrade_matches_fresh_install() {
+    let mut legacy = Connection::open_in_memory().unwrap();
+    legacy.execute("PRAGMA foreign_keys = ON;", []).unwrap();
+    legacy.execute_batch(LEGACY_BASELINE_SCHEMA).unwrap();
+    legacy
+        .execute_batch(
+            "CREATE TABLE schema_migrations (
+                 version TEXT PRIMARY KEY,
+                 applied_at INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations (version, applied_at) VALUES ('0001_initial_reset', 0);",
+        )
+        .unwrap();
+    apply_migrations(&mut legacy).expect("upgrade legacy baseline");
+
+    let mut fresh = Connection::open_in_memory().unwrap();
+    fresh.execute("PRAGMA foreign_keys = ON;", []).unwrap();
+    apply_migrations(&mut fresh).expect("fresh install");
+
+    let upgraded = schema_snapshot(&legacy);
+    let fresh = schema_snapshot(&fresh);
+    let benign: std::collections::BTreeSet<String> =
+        KNOWN_BENIGN_DRIFT.iter().map(|s| s.to_string()).collect();
+
+    let missing_after_upgrade: Vec<_> = fresh
+        .difference(&upgraded)
+        .filter(|l| !benign.contains(*l))
+        .collect();
+    let only_after_upgrade: Vec<_> = upgraded
+        .difference(&fresh)
+        .filter(|l| !benign.contains(*l))
+        .collect();
+
+    assert!(
+        missing_after_upgrade.is_empty() && only_after_upgrade.is_empty(),
+        "schema drift between fresh install and legacy upgrade.\n\
+         On a fresh install but missing after upgrade (add a migration):\n  {}\n\
+         Present after upgrade but not on a fresh install:\n  {}",
+        missing_after_upgrade
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  "),
+        only_after_upgrade
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  "),
+    );
+}
+
+/// Build a database that looks like one created before the junction tables
+/// existed: every migration applied except 0035, junction tables absent.
+fn legacy_db_without_knowledge_junctions() -> Connection {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute("PRAGMA foreign_keys = ON;", []).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schema_migrations (
+             version TEXT PRIMARY KEY,
+             applied_at INTEGER NOT NULL
+         );",
+    )
+    .unwrap();
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|m| m.version != "0035_knowledge_junction_tables")
+    {
+        (migration.apply)(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, 0)",
+            [migration.version],
+        )
+        .unwrap();
+    }
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS knowledge_entry_entities;
+         DROP TABLE IF EXISTS knowledge_entry_topics;",
+    )
+    .unwrap();
+    conn
+}
+
+fn insert_knowledge_entry(conn: &Connection, public_id: &str, entities: &str, topics: &str) {
+    conn.execute(
+        "INSERT INTO knowledge_entries
+            (public_id, scope, source, summary, entities_json, topics_json, created_at)
+         VALUES (?1, 'global', 'test', 'summary', ?2, ?3, '2026-01-01T00:00:00Z')",
+        rusqlite::params![public_id, entities, topics],
+    )
+    .unwrap();
+}
+
+#[test]
+fn knowledge_junction_migration_creates_tables_and_backfills_entries() {
+    let mut conn = legacy_db_without_knowledge_junctions();
+    insert_knowledge_entry(&conn, "e1", r#"["Tokio","Serde"]"#, r#"["Async Runtimes"]"#);
+    insert_knowledge_entry(&conn, "e2", "[]", "[]");
+
+    apply_migrations(&mut conn).expect("apply 0035");
+
+    let entities: Vec<(String, String)> = conn
+        .prepare("SELECT entity, entity_normalized FROM knowledge_entry_entities ORDER BY entity")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        entities,
+        vec![
+            (
+                "Serde".to_string(),
+                crate::knowledge::text_processing::normalize_term("Serde")
+            ),
+            (
+                "Tokio".to_string(),
+                crate::knowledge::text_processing::normalize_term("Tokio")
+            ),
+        ]
+    );
+    let topics: Vec<(String, String)> = conn
+        .prepare("SELECT topic, topic_normalized FROM knowledge_entry_topics")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        topics,
+        vec![(
+            "Async Runtimes".to_string(),
+            crate::knowledge::text_processing::normalize_term("Async Runtimes")
+        )]
+    );
+}
+
+#[test]
+fn knowledge_junction_migration_is_idempotent_and_skips_malformed_json() {
+    let mut conn = legacy_db_without_knowledge_junctions();
+    insert_knowledge_entry(&conn, "good", r#"["Tokio"]"#, r#"["async"]"#);
+    insert_knowledge_entry(&conn, "bad", "not json", "[]");
+
+    apply_migrations(&mut conn).expect("apply 0035 despite malformed entry");
+
+    // Re-run the migration body directly: must not duplicate rows.
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0035_knowledge_junction_tables")
+        .unwrap();
+    (migration.apply)(&mut conn).expect("second run");
+
+    let count = |table: &str| -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count("knowledge_entry_entities"), 1);
+    assert_eq!(count("knowledge_entry_topics"), 1);
+}
+
+#[tokio::test]
+async fn knowledge_query_finds_backfilled_entries_after_upgrade() {
+    use crate::knowledge::sqlite::SqliteKnowledgeStore;
+    use crate::knowledge::{KnowledgeStore, QueryOpts, RetrievalMode};
+
+    let mut conn = legacy_db_without_knowledge_junctions();
+    insert_knowledge_entry(&conn, "e1", r#"["tokio"]"#, r#"["async"]"#);
+    apply_migrations(&mut conn).unwrap();
+
+    let store = SqliteKnowledgeStore::new(std::sync::Arc::new(std::sync::Mutex::new(conn)));
+    // The entry summary does not mention "tokio", so only the backfilled
+    // entity junction row can make Hybrid retrieval find it.
+    let result = store
+        .query(
+            "global",
+            "tokio",
+            QueryOpts {
+                retrieval_mode: RetrievalMode::Hybrid,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query must not fail with missing junction tables");
+    assert_eq!(result.entries.len(), 1);
+}

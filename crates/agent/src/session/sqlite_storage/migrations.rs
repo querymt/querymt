@@ -1,3 +1,15 @@
+//! Forward-only SQLite migrations for the session database.
+//!
+//! Rules:
+//! - Released migrations are frozen snapshots. Never edit one: it does nothing
+//!   on databases that already applied it. Every schema change needs a new
+//!   migration appended to `MIGRATIONS`.
+//! - `schema::init_schema` only runs through `0001_initial_reset`, i.e. on fresh
+//!   installs. Any table, index, trigger or column added there must also get its
+//!   own migration, or existing databases will lack it.
+//! - `legacy_baseline_upgrade_matches_fresh_install` (tests.rs) enforces this by
+//!   comparing a legacy-baseline upgrade against a fresh install.
+
 use rusqlite::{Connection, params};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -161,7 +173,98 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0034_remote_session_coverage",
         apply: migration_0034_remote_session_coverage,
     },
+    Migration {
+        version: "0035_knowledge_junction_tables",
+        apply: migration_0035_knowledge_junction_tables,
+    },
 ];
+
+/// Entity/topic junction tables used for indexed knowledge matching.
+///
+/// These were added to `init_schema` without a migration, so databases that
+/// applied `0001_initial_reset` earlier lack them and every knowledge ingest
+/// or query fails with `no such table`. The DDL is an intentionally inlined,
+/// frozen copy (not shared with `init_schema`); the schema drift test keeps
+/// the two in agreement.
+///
+/// Existing entries are backfilled from `entities_json` / `topics_json` with
+/// the same normalization `ingest` uses. Only entries without any junction
+/// rows are touched, so the backfill is idempotent and a no-op on fresh
+/// installs. Malformed JSON skips that entry instead of blocking startup.
+fn migration_0035_knowledge_junction_tables(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS knowledge_entry_entities (
+            entry_id INTEGER NOT NULL REFERENCES knowledge_entries(id) ON DELETE CASCADE,
+            entity TEXT NOT NULL,
+            entity_normalized TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_kee_entry
+            ON knowledge_entry_entities(entry_id);
+        CREATE INDEX IF NOT EXISTS idx_kee_normalized
+            ON knowledge_entry_entities(entity_normalized);
+
+        CREATE TABLE IF NOT EXISTS knowledge_entry_topics (
+            entry_id INTEGER NOT NULL REFERENCES knowledge_entries(id) ON DELETE CASCADE,
+            topic TEXT NOT NULL,
+            topic_normalized TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ket_entry
+            ON knowledge_entry_topics(entry_id);
+        CREATE INDEX IF NOT EXISTS idx_ket_normalized
+            ON knowledge_entry_topics(topic_normalized);",
+    )?;
+
+    let entries: Vec<(i64, String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, entities_json, topics_json FROM knowledge_entries e
+             WHERE NOT EXISTS (SELECT 1 FROM knowledge_entry_entities WHERE entry_id = e.id)
+               AND NOT EXISTS (SELECT 1 FROM knowledge_entry_topics WHERE entry_id = e.id)",
+        )?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<_, _>>()?
+    };
+
+    for (id, entities_json, topics_json) in entries {
+        let parsed = serde_json::from_str::<Vec<String>>(&entities_json)
+            .and_then(|e| serde_json::from_str::<Vec<String>>(&topics_json).map(|t| (e, t)));
+        let (entities, topics) = match parsed {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    entry_id = id,
+                    error = %err,
+                    "skipping knowledge junction backfill for entry with malformed JSON"
+                );
+                continue;
+            }
+        };
+        for entity in &entities {
+            tx.execute(
+                "INSERT INTO knowledge_entry_entities (entry_id, entity, entity_normalized) \
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    id,
+                    entity,
+                    crate::knowledge::text_processing::normalize_term(entity)
+                ],
+            )?;
+        }
+        for topic in &topics {
+            tx.execute(
+                "INSERT INTO knowledge_entry_topics (entry_id, topic, topic_normalized) \
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    id,
+                    topic,
+                    crate::knowledge::text_processing::normalize_term(topic)
+                ],
+            )?;
+        }
+    }
+
+    tx.commit()
+}
 
 /// Per-source transferred `source_seq` ranges and the owner's history epoch
 /// seen at the last sync. Older agents ignore both tables.
@@ -684,6 +787,9 @@ fn migration_0004_add_session_kind(conn: &mut Connection) -> Result<(), rusqlite
     Ok(())
 }
 
+// FROZEN: reflects the schema as of March 2026. Later knowledge schema lives in
+// its own migrations (protocol columns in 0019, entity/topic junction tables in
+// 0035). Do not extend this one; add a new migration instead.
 fn migration_0005_add_scheduler_and_knowledge_tables(
     conn: &mut Connection,
 ) -> Result<(), rusqlite::Error> {
@@ -790,6 +896,7 @@ fn migration_0007_intent_session_id_index(conn: &mut Connection) -> Result<(), r
     )
 }
 
+// FROZEN: historical snapshot, see `migration_0005_add_scheduler_and_knowledge_tables`.
 fn migration_0006_add_knowledge_fts5(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     // Add FTS5 full-text search indexes for the knowledge layer.
     // Uses external-content tables backed by the base knowledge tables,
