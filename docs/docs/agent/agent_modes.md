@@ -275,13 +275,16 @@ unsupported Preview variants are never sent.
 
 ### Via Configuration
 
-Set default mode in configuration:
+Set the initial mode with the typed `mode` key on `[agent]`, `[planner]` or a `[[delegates]]` entry:
 
 ```toml
-[[middleware]]
-type = "agent_mode"
-default = "plan"  # "build", "plan", or "review"
+[agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+mode = "plan"  # "build" (default), "plan" or "review"; new sessions start in this mode.
 ```
+
+An unknown value fails the config load with an error naming `mode`. The `agent_mode` middleware only configures reminders and rejects unknown keys, so a leftover `default = "plan"` there fails the build.
 
 ## Mode Transition Flow
 
@@ -298,34 +301,18 @@ flowchart LR
 
 ## Mode-Aware Behavior
 
-### Tool Access
-
-| Tool | Build | Plan | Review |
-|------|-------|------|--------|
-| `read_tool` | ✓ | ✓ | ✓ |
-| `edit` | ✓ |  |  |
-| `write_file` | ✓ |  |  |
-| `delete_file` | ✓ |  |  |
-| `shell` | ✓* | ✓ (read-only) | ✓ (read-only) |
-| `glob` | ✓ | ✓ | ✓ |
-| `search_text` | ✓ | ✓ | ✓ |
-| `ls` | ✓ | ✓ | ✓ |
-
-*Shell commands are restricted in Plan/Review mode
+Modes change what the agent is *told*, not what it is *allowed* to do.
 
 ### System Prompt Injection
 
-When in Plan or Review mode, the `AgentModeMiddleware` injects a system reminder that:
-- Reminds the agent of its mode restrictions
-- Clarifies what actions are allowed
-- Provides guidance on the mode's purpose
+In Plan and Review mode the `AgentModeMiddleware` injects the configured reminder before each model call. The reminder is the only effect of the mode on the model.
 
-### Permission Handling
+### Enforcement
 
-In Plan and Review modes:
-- Mutating tools are automatically denied
-- No permission prompts are shown (access is denied by design)
-- The agent receives clear feedback about mode restrictions
+Tools are not filtered or denied by mode. To restrict a mode, enforce it yourself:
+
+- give a profile only the tools it needs, and
+- use a `pre_tool_use` hook, which sees the mode as `permission_mode` (`default` = build, `plan` = plan, `accept_edits` = review) and can block the call. See `examples/confs/trading_desk.toml`.
 
 ## Use Cases
 
@@ -396,7 +383,6 @@ Customize the system reminders for Plan and Review modes:
 ```toml
 [[middleware]]
 type = "agent_mode"
-default = "build"
 reminder = """<system-reminder>
 Custom plan mode reminder here.
 </system-reminder>"""
@@ -405,20 +391,6 @@ Custom review mode reminder here.
 </system-reminder>"""
 ```
 
-### Mode-Specific Tools
-
-Configure different tools per mode:
-
-```toml
-# Build mode tools (default)
-tools = ["read_tool", "edit", "write_file", "shell"]
-
-# Plan mode tools (automatically filtered)
-# Only read-only tools are available
-
-# Review mode tools (automatically filtered)
-# Only read-only tools are available
-```
 
 ## Best Practices
 
@@ -463,7 +435,7 @@ When switching modes, communicate with the user:
 1. Check that `AgentModeMiddleware` is in the middleware stack
 2. Verify the mode is actually set in the session configuration
 3. Check logs for mode-related warnings
-4. Ensure mutating tools are in the `mutating_tools` list
+4. Remember modes only inject reminders; enforce restrictions with `tools`, `[agent.permissions]` or hooks
 
 ### Mode Not Switching
 
@@ -474,8 +446,8 @@ When switching modes, communicate with the user:
 
 ### Permission Errors in Build Mode
 
-1. Verify `assume_mutating` setting
-2. Check `mutating_tools` configuration
+1. Check `[agent.permissions]` (`ask` / `always_ask`) and the `permission_request` hooks
+2. Check that `tools` selects the tool
 3. Ensure tools are properly registered
 4. Check for tool-specific permission requirements
 

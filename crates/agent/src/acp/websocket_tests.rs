@@ -2577,7 +2577,7 @@ fn permission_request_for_test(session_id: &str, tool_call_id: &str) -> RequestP
                 PermissionOptionKind::AllowOnce,
             ),
             PermissionOption::new(
-                PermissionOptionId::from("reject_once"),
+                PermissionOptionId::from("reject"),
                 "Reject once",
                 PermissionOptionKind::RejectOnce,
             ),
@@ -2883,7 +2883,7 @@ async fn permission_disconnect_keeps_request_pending_and_next_client_decides() {
         route_websocket_response(
             &pending,
             request["id"].clone(),
-            Some(selected("reject_once")),
+            Some(selected("reject")),
             None
         )
         .await
@@ -2892,7 +2892,7 @@ async fn permission_disconnect_keeps_request_pending_and_next_client_decides() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(answer.selected_permission_option(), Some("reject_once"));
+    assert_eq!(answer.selected_permission_option(), Some("reject"));
 }
 
 #[tokio::test]
@@ -3012,7 +3012,7 @@ async fn permission_two_connections_first_valid_answer_wins_second_is_stale() {
         route_websocket_response(
             &pending_b,
             request_b["id"].clone(),
-            Some(selected("reject_once")),
+            Some(selected("reject")),
             None
         )
         .await
@@ -3021,7 +3021,7 @@ async fn permission_two_connections_first_valid_answer_wins_second_is_stale() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(answer.selected_permission_option(), Some("reject_once"));
+    assert_eq!(answer.selected_permission_option(), Some("reject"));
 
     // Resolved once: any later answer is rejected as not pending.
     let late = crate::elicitation::resolve_claimed_elicitation(

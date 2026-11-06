@@ -132,11 +132,13 @@ pub(crate) async fn build_mcp_state(
     tool_state.set_skipped_servers(skipped_servers);
 
     // Populate the shared tool state with the initial tool list.
-    tool_state.store(crate::agent::core::McpToolSnapshot {
+    let snapshot = crate::agent::core::McpToolSnapshot {
         tools,
         tool_defs,
         tools_hash: None,
-    });
+    };
+    crate::agent::mcp::warn_unmatched_permissions(connect_ctx.permissions(), &snapshot, None);
+    tool_state.store(snapshot);
 
     Ok(clients)
 }
@@ -277,6 +279,7 @@ async fn start_mcp_server(
             tool_state.clone(),
         )
         .with_tasks(config.tasks_enabled())
+        .with_permissions(connect_ctx.permissions().clone())
     };
     match server {
         McpServer::Stdio(stdio) => {
@@ -372,10 +375,14 @@ async fn oauth_transport(
         crate::mcp_auth::redirect_uri(*redirect_port),
         connect_ctx.secret_backend(),
     )
+    .with_auth_policy(auth)
     .for_connection();
-    // Private addresses are allowed for the discovered authorization server:
-    // internal MCP servers commonly sit behind an internal identity provider.
-    let mut manager = AuthorizationManager::new_allowing_private_addresses(url)
+    // The OAuth client sends a `User-Agent` (some authorization servers refuse
+    // requests without one) and, like `new_allowing_private_addresses`, lets
+    // the discovered authorization server be on a private address: internal MCP
+    // servers commonly sit behind an internal identity provider.
+    let http = crate::mcp_auth::oauth_http_client().map_err(|e| unavailable(e.to_string()))?;
+    let mut manager = AuthorizationManager::new_with_oauth_http_client(url, http)
         .await
         .map_err(|e| unavailable(e.to_string()))?;
     manager.set_credential_store(store);
@@ -572,6 +579,7 @@ pub(crate) mod tests {
                 client_id: None,
                 scopes: vec![],
                 redirect_port: None,
+                strict_scopes: false,
             })
             .to_acp();
         let Err(err) = build_mcp_state(
@@ -701,6 +709,7 @@ pub(crate) mod tests {
                 client_id: None,
                 scopes: vec![],
                 redirect_port: None,
+                strict_scopes: false,
             })
         }
 
@@ -1159,6 +1168,7 @@ pub(crate) mod tests {
                 client_id: None,
                 scopes: vec![],
                 redirect_port: None,
+                strict_scopes: false,
             },
         );
         let ctx = McpConnectContext::from_config(std::slice::from_ref(&server));

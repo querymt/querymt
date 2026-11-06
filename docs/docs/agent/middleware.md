@@ -142,7 +142,6 @@ Enforces mode-specific restrictions (build/plan/review).
 ```toml
 [[middleware]]
 type = "agent_mode"
-default = "build"
 reminder = """<system-reminder>
 You are in plan mode. Read-only access.
 </system-reminder>"""
@@ -152,7 +151,7 @@ You are in review mode. Provide feedback only.
 ```
 
 **Features:**
-- `default`: Default mode on session start
+- The initial session mode is not set here; use `mode` on `[agent]`, `[planner]` or `[[delegates]]`
 - `reminder`: System message for plan mode
 - `review_reminder`: System message for review mode
 

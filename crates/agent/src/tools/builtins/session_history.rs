@@ -40,6 +40,10 @@ impl ToolTrait for SessionHistoryTool {
         "session_history"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> Tool {
         Tool {
             tool_type: "function".to_string(),

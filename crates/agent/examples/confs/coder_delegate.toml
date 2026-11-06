@@ -36,6 +36,7 @@ max_parallel_delegations = 5
 # -----------------------------------------------------------------------------
 
 [planner]
+mode = "plan"
 provider = "codex"
 model = "gpt-6.1-sol"
 tools = [
@@ -75,7 +76,6 @@ fallback_max_tokens = 128000
 
 [[planner.middleware]]
 type = "agent_mode"
-default = "plan"
 reminder = """<system-reminder>
 # Plan Mode - System Reminder
 
@@ -149,7 +149,6 @@ provider = "codex"
 model = "gpt-6.1-sol"
 description = "Specialized in implementation and code writing"
 capabilities = ["rust", "python"]
-mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
 tools = [
   # File operations
   "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
@@ -165,7 +164,6 @@ tools = [
   "browse",
 ]
 
-assume_mutating = false
 system = [
   { file = "../prompts/default_system.txt" }
 ]
@@ -210,8 +208,6 @@ tools = [
   "browse",
 ]
 
-assume_mutating = false
-mutating_tools = []
 system = ["""You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
 
 Your strengths:

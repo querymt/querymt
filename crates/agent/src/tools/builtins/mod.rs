@@ -421,3 +421,86 @@ mod canonical_naming_tests {
         assert_eq!(args["replacements"][0]["new_text"], json!("x"));
     }
 }
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::all_builtin_tools;
+    use std::collections::BTreeSet;
+
+    /// Built-ins that never change workspace files (they read, or only touch
+    /// session / knowledge state); everything else takes a snapshot. The remote
+    /// tools `use_remote_provider` and `route_delegation_to_peer` are also
+    /// read-only but are registered outside `all_builtin_tools`.
+    const READ_ONLY: &[&str] = &[
+        "browse",
+        "complete_task",
+        "create_task",
+        "delegate",
+        "find_symbol_references",
+        "get_function",
+        "get_symbol",
+        "glob",
+        "index",
+        "knowledge_consolidate",
+        "knowledge_ingest",
+        "knowledge_list_unconsolidated",
+        "knowledge_query",
+        "knowledge_stats",
+        "language_query",
+        "ls",
+        "mdq",
+        "question",
+        "read_task",
+        "read_tool",
+        "search_text",
+        "session_history",
+        "todoread",
+        "todowrite",
+        "update_task",
+        "web_fetch",
+    ];
+
+    #[test]
+    fn read_only_set_is_exactly_the_documented_one() {
+        let actual: BTreeSet<String> = all_builtin_tools()
+            .iter()
+            .filter(|tool| tool.is_read_only())
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let expected: BTreeSet<String> = READ_ONLY.iter().map(|s| s.to_string()).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn only_accept_delegation_result_demands_approval_by_default() {
+        use crate::config::ApprovalNeed;
+        for tool in all_builtin_tools() {
+            let expected = if tool.name() == "accept_delegation_result" {
+                ApprovalNeed::Session
+            } else {
+                ApprovalNeed::None
+            };
+            assert_eq!(tool.default_approval(), expected, "{}", tool.name());
+        }
+    }
+
+    #[test]
+    fn mutating_builtins_are_not_read_only() {
+        let tools = all_builtin_tools();
+        for name in [
+            "edit",
+            "multiedit",
+            "write_file",
+            "delete_file",
+            "replace_symbol",
+            "shell",
+            "accept_delegation_result",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name() == name)
+                .unwrap_or_else(|| panic!("{name}"));
+            assert!(!tool.is_read_only(), "{name}");
+        }
+    }
+}

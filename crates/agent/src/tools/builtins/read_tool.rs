@@ -30,6 +30,10 @@ impl ToolTrait for ReadTool {
         "read_tool"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> Tool {
         Tool {
             tool_type: "function".to_string(),

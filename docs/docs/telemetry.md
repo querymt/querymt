@@ -94,6 +94,32 @@ produces a tree of child spans describing every step that was executed.
 | `acp.set_session_mode` | Changing the session mode |
 | `acp.set_session_config_option` | Updating a session config option |
 | `acp.ext_method` | Handling an extension JSON-RPC method |
+
+Every ACP request span is marked as an error (`error.type = rpc_error`, plus
+`rpc.response.status_code`) when the handler returns an error. The error text
+is not exported.
+
+**MCP OAuth logins** (`_querymt/auth/*` with provider id `mcp:<server>`)
+
+| Span name | Description |
+|---|---|
+| `auth.mcp.start` | Starting a login (`provider_id`, `server`, `sources`, `scopes_requested`) |
+| `auth.mcp.discover` | Discovering the authorization server's metadata |
+| `auth.mcp.register` | Dynamic client registration (`preregistered`: a stored client is reused) |
+| `auth.mcp.callback` | Exchanging the authorization code (`channel`: `loopback` or `paste`) |
+| `auth.mcp.logout` | Removing stored credentials |
+
+A failed operation sets the span status to error and `error.type` to one of
+`unknown_server`, `conflicting_server`, `empty_provider`, `metadata`,
+`metadata_http_403`, `registration`, `registration_http_403`, `token_exchange`,
+`missing_issuer`, `scope_exceeded` (a token wider than `strict_scopes` allows),
+`credential_store`, `http`, `url` or `other`. Spans never carry URLs, codes or
+tokens; the full cause chain is logged once per failure (`error` for server or
+agent failures, `warn` for configuration mistakes such as an unknown server).
+
+The counter `querymt.auth.mcp.login{operation, outcome, error.type}` counts
+these operations (`operation`: `start`, `callback`, `logout`; `outcome`: `ok` or
+`error`).
 | `acp.ext_notification` | Handling an extension notification |
 
 **UI / Dashboard**

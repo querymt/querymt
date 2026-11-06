@@ -44,6 +44,11 @@ impl Tool for TodoWriteTool {
         "todowrite"
     }
 
+    fn is_read_only(&self) -> bool {
+        // Touches session or knowledge state, never the workspace files.
+        true
+    }
+
     fn definition(&self) -> ChatTool {
         ChatTool {
             tool_type: "function".to_string(),
@@ -163,6 +168,10 @@ impl Default for TodoReadTool {
 impl Tool for TodoReadTool {
     fn name(&self) -> &str {
         "todoread"
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
     }
 
     fn definition(&self) -> ChatTool {

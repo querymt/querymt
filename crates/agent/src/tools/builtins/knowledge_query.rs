@@ -26,6 +26,10 @@ impl ToolTrait for KnowledgeQueryTool {
         "knowledge_query"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> Tool {
         Tool {
             tool_type: "function".to_string(),

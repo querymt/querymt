@@ -83,6 +83,9 @@ pub struct OAuthService {
     /// Where MCP OAuth credentials are stored (the system keyring).
     #[cfg(feature = "oauth")]
     mcp_backend: Arc<dyn crate::mcp_auth::SecretBackend>,
+    /// Profiles whose MCP servers can be logged into besides `config`'s.
+    #[cfg(feature = "oauth")]
+    profiles: crate::agent::handle::ProfileRuntimeSlot,
 }
 
 #[cfg(feature = "oauth")]
@@ -105,7 +108,22 @@ impl OAuthService {
             mcp_flows: Default::default(),
             #[cfg(feature = "oauth")]
             mcp_backend: Arc::new(crate::mcp_auth::KeyringBackend),
+            #[cfg(feature = "oauth")]
+            profiles: Default::default(),
         }
+    }
+
+    /// Also offer `mcp:<server>` logins for the MCP servers of the profiles
+    /// in `profiles` (read whenever a login or status is requested, so a
+    /// slot filled later is picked up).
+    #[cfg(feature = "oauth")]
+    #[must_use]
+    pub(crate) fn with_profile_slot(
+        mut self,
+        profiles: crate::agent::handle::ProfileRuntimeSlot,
+    ) -> Self {
+        self.profiles = profiles;
+        self
     }
 
     /// Use a different credential backend for MCP logins (tests).
@@ -185,6 +203,127 @@ pub struct AuthMutationResult {
     pub message: String,
 }
 
+/// Why an auth operation could not be carried out.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AuthFlowError {
+    #[error("provider name is required")]
+    EmptyProvider,
+    #[error("unknown OAuth MCP server: {0}")]
+    UnknownMcpServer(String),
+    /// The same server name is declared with different OAuth settings by
+    /// several sources (agent config, profiles, `.agents/`). Its credentials
+    /// are stored per name, so it cannot be logged into until they agree.
+    #[error("MCP server {server} is defined differently in {}", .sources.join(", "))]
+    ConflictingMcpServer {
+        server: String,
+        sources: Vec<String>,
+    },
+    #[cfg(feature = "oauth")]
+    #[error("failed to start OAuth flow for MCP server {server} ({step})")]
+    McpAuthorization {
+        server: String,
+        /// What was being done: `http client`, `metadata discovery` or
+        /// `client registration`.
+        step: &'static str,
+        #[source]
+        source: rmcp::transport::AuthError,
+    },
+    /// A provider (non-MCP) login failure.
+    #[error("{0}")]
+    Provider(String),
+}
+
+impl AuthFlowError {
+    /// Low-cardinality failure class for the `error.type` span attribute and
+    /// metric label.
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            Self::EmptyProvider => "empty_provider",
+            Self::UnknownMcpServer(_) => "unknown_server",
+            Self::ConflictingMcpServer { .. } => "conflicting_server",
+            #[cfg(feature = "oauth")]
+            Self::McpAuthorization { source, .. } => crate::mcp_auth::auth_error_type(source),
+            Self::Provider(_) => "provider",
+        }
+    }
+
+    /// A mistake in the request or configuration rather than a failure of the
+    /// agent or the authorization server.
+    pub fn is_user_error(&self) -> bool {
+        matches!(
+            self,
+            Self::EmptyProvider | Self::UnknownMcpServer(_) | Self::ConflictingMcpServer { .. }
+        )
+    }
+
+    /// Log the failure of `operation` once, with its whole cause chain:
+    /// `warn` for user mistakes, `error` otherwise (so it shows on the default
+    /// console and in exported logs). Never logs tokens or codes.
+    pub fn log(&self, operation: &'static str, provider: &str) {
+        let error = self.message_chain();
+        let error_type = self.error_type();
+        if self.is_user_error() {
+            tracing::warn!(operation, provider, error_type, %error, "auth request refused");
+        } else {
+            tracing::error!(operation, provider, error_type, %error, "auth request failed");
+        }
+    }
+
+    /// The message with its whole source chain.
+    pub fn message_chain(&self) -> String {
+        let mut message = self.to_string();
+        let mut source = std::error::Error::source(self);
+        while let Some(error) = source {
+            message.push_str(": ");
+            message.push_str(&error.to_string());
+            source = error.source();
+        }
+        message
+    }
+}
+
+impl From<AuthFlowError> for agent_client_protocol::Error {
+    fn from(error: AuthFlowError) -> Self {
+        // The message itself carries the reason: clients show `message`, and
+        // `Error::internal_error()` alone would read just "Internal error".
+        let message = error.message_chain();
+        let code = match error {
+            AuthFlowError::EmptyProvider
+            | AuthFlowError::UnknownMcpServer(_)
+            | AuthFlowError::ConflictingMcpServer { .. } => {
+                agent_client_protocol::ErrorCode::InvalidParams
+            }
+            _ => agent_client_protocol::ErrorCode::InternalError,
+        };
+        // `error` is kept for clients that read the previous shape.
+        Self::new(i32::from(code), message.clone())
+            .data(serde_json::json!({ "message": message, "error": message }))
+    }
+}
+
+/// A parsed `provider` argument of the auth methods.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AuthTarget<'a> {
+    /// `mcp:<server>`; server names are case-sensitive.
+    Mcp(&'a str),
+    /// A model provider, trimmed and lowercased.
+    Provider(String),
+}
+
+impl<'a> AuthTarget<'a> {
+    pub(crate) fn parse(raw: &'a str) -> Result<Self, AuthFlowError> {
+        let raw = raw.trim();
+        if let Some(server) = crate::mcp_auth::server_of_provider(raw) {
+            return Ok(Self::Mcp(server));
+        }
+        if raw.is_empty() {
+            return Err(AuthFlowError::EmptyProvider);
+        }
+        Ok(Self::Provider(raw.to_lowercase()))
+    }
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "oauth")]
@@ -212,7 +351,10 @@ impl OAuthService {
         // `mcp:<server>` entries come from the agent's MCP configuration and
         // the MCP credential store, never from the provider registry.
         #[cfg(feature = "oauth")]
-        if provider_filter.is_some_and(|f| crate::mcp_auth::server_of_provider(f).is_some()) {
+        if matches!(
+            provider_filter.map(AuthTarget::parse),
+            Some(Ok(AuthTarget::Mcp(_)))
+        ) {
             return Ok(self.mcp_auth_status(provider_filter).await);
         }
         let registry = self.config.provider.plugin_registry();
@@ -328,28 +470,35 @@ impl OAuthService {
     /// On receiving the callback it will call [`Self::complete_flow`] server-side,
     /// persist credentials, and invalidate caches so ACP clients can discover
     /// completion via [`Self::auth_status`].
-    pub async fn start_flow(&self, owner: &str, provider: &str) -> Result<StartFlowResult, String> {
+    ///
+    /// # Errors
+    /// An empty or unknown provider, an MCP server that is not an OAuth server
+    /// or is declared inconsistently, or a failure to begin authorization.
+    pub async fn start_flow(
+        &self,
+        owner: &str,
+        provider: &str,
+    ) -> Result<StartFlowResult, AuthFlowError> {
         #[cfg(feature = "oauth")]
         {
-            // MCP server names are case-sensitive: dispatch before lowercasing.
-            if let Some(server) = crate::mcp_auth::server_of_provider(provider.trim()) {
-                return self.start_mcp_flow(owner, server).await;
-            }
-            let provider_name = provider.trim().to_lowercase();
-            if provider_name.is_empty() {
-                return Err("Provider name is required".to_string());
-            }
+            let provider_name = match AuthTarget::parse(provider)? {
+                AuthTarget::Mcp(server) => return self.start_mcp_flow(owner, server).await,
+                AuthTarget::Provider(name) => name,
+            };
 
-            validate_provider_configured(&self.config, &provider_name)?;
+            validate_provider_configured(&self.config, &provider_name)
+                .map_err(AuthFlowError::Provider)?;
 
             let mode = oauth_mode_for_provider(&provider_name);
-            let oauth_provider =
-                crate::auth::get_oauth_provider(&provider_name, mode).map_err(|e| e.to_string())?;
+            let oauth_provider = crate::auth::get_oauth_provider(&provider_name, mode)
+                .map_err(|e| AuthFlowError::Provider(e.to_string()))?;
 
-            let flow = oauth_provider
-                .start_flow()
-                .await
-                .map_err(|e| format!("Failed to start OAuth flow for {}: {}", provider_name, e))?;
+            let flow = oauth_provider.start_flow().await.map_err(|e| {
+                AuthFlowError::Provider(format!(
+                    "Failed to start OAuth flow for {}: {}",
+                    provider_name, e
+                ))
+            })?;
 
             let flow_id = uuid::Uuid::now_v7().to_string();
             {
@@ -402,7 +551,9 @@ impl OAuthService {
         #[cfg(not(feature = "oauth"))]
         {
             let _ = (owner, provider);
-            Err("OAuth support is not enabled in this build".to_string())
+            Err(AuthFlowError::Provider(
+                "OAuth support is not enabled in this build".to_string(),
+            ))
         }
     }
 
@@ -547,17 +698,17 @@ impl OAuthService {
     pub async fn logout(&self, owner: &str, provider: &str) -> LogoutResult {
         #[cfg(feature = "oauth")]
         {
-            if let Some(server) = crate::mcp_auth::server_of_provider(provider.trim()) {
-                return self.logout_mcp(owner, server).await;
-            }
-            let provider_name = provider.trim().to_lowercase();
-            if provider_name.is_empty() {
-                return LogoutResult {
-                    provider: provider_name,
-                    success: false,
-                    message: "Provider name is required".to_string(),
-                };
-            }
+            let provider_name = match AuthTarget::parse(provider) {
+                Ok(AuthTarget::Mcp(server)) => return self.logout_mcp(owner, server).await,
+                Ok(AuthTarget::Provider(name)) => name,
+                Err(error) => {
+                    return LogoutResult {
+                        provider: String::new(),
+                        success: false,
+                        message: error.to_string(),
+                    };
+                }
+            };
 
             if let Err(e) = validate_provider_configured(&self.config, &provider_name) {
                 return LogoutResult {

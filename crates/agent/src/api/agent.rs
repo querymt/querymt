@@ -19,10 +19,10 @@ use crate::agent::core::{SnapshotPolicy, ToolPolicy};
 use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{
     ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, SingleAgentConfig,
-    SkillsConfig, SlashCommandsConfig,
+    SkillsConfig, SlashCommandsConfig, ToolSpec,
 };
 use crate::event_fanout::EventFanout;
-use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
+use crate::middleware::MiddlewareDriver;
 use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
 #[cfg(feature = "api")]
@@ -102,12 +102,13 @@ type MiddlewareFactory = Box<dyn FnOnce(&AgentHandle) -> Arc<dyn MiddlewareDrive
 
 pub struct AgentBuilder {
     pub(super) llm_config: Option<LLMParams>,
-    pub(super) tools: Vec<String>,
+    pub(super) tools: Vec<ToolSpec>,
+    tool_error: Option<crate::config::ToolSpecError>,
     pub(super) cwd: Option<PathBuf>,
     pub(super) snapshot_policy: SnapshotPolicy,
     pub(super) db_path: Option<PathBuf>,
-    assume_mutating: Option<bool>,
-    mutating_tools: Option<Vec<String>>,
+    mode: crate::agent::core::AgentMode,
+    permissions: crate::config::Permissions,
     middleware_factories: Vec<MiddlewareFactory>,
     middleware_entries: Vec<MiddlewareEntry>,
     execution: Option<ExecutionPolicy>,
@@ -153,11 +154,12 @@ impl AgentBuilder {
         Self {
             llm_config: None,
             tools: Vec::new(),
+            tool_error: None,
             cwd: None,
             snapshot_policy: SnapshotPolicy::Diff,
             db_path: None,
-            assume_mutating: None,
-            mutating_tools: None,
+            mode: crate::agent::core::AgentMode::default(),
+            permissions: crate::config::Permissions::default(),
             middleware_factories: Vec::new(),
             middleware_entries: Vec::new(),
             execution: None,
@@ -212,12 +214,21 @@ impl AgentBuilder {
         self
     }
 
+    /// Tool selectors (`name`, `server.tool`, `server.*`). A malformed
+    /// selector is reported by `build()`.
     pub fn tools<I, S>(mut self, tools: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: AsRef<str>,
     {
-        self.tools = tools.into_iter().map(Into::into).collect();
+        (self.tools, self.tool_error) = super::config::parse_tool_specs(tools);
+        self
+    }
+
+    /// Tool selectors that are already typed.
+    pub fn tool_specs(mut self, tools: impl IntoIterator<Item = ToolSpec>) -> Self {
+        self.tools = tools.into_iter().collect();
+        self.tool_error = None;
         self
     }
 
@@ -379,15 +390,15 @@ impl AgentBuilder {
         .map_err(|error| anyhow::Error::new(*error))
     }
 
-    /// Set whether to assume all tools are mutating.
-    pub fn assume_mutating(mut self, yes: bool) -> Self {
-        self.assume_mutating = Some(yes);
+    /// Initial mode of new sessions (default: build).
+    pub fn mode(mut self, mode: crate::agent::core::AgentMode) -> Self {
+        self.mode = mode;
         self
     }
 
-    /// Set specific tools to be considered mutating.
-    pub fn mutating_tools(mut self, tools: Vec<String>) -> Self {
-        self.mutating_tools = Some(tools);
+    /// Tool approval policy: which calls prompt the user and for how long.
+    pub fn permissions(mut self, permissions: crate::config::Permissions) -> Self {
+        self.permissions = permissions;
         self
     }
 
@@ -445,6 +456,9 @@ impl AgentBuilder {
     }
 
     pub async fn build(mut self) -> Result<Agent> {
+        if let Some(error) = self.tool_error.take() {
+            return Err(anyhow!("invalid `tools` selector: {error}"));
+        }
         let snapshot_policy = self.snapshot_policy;
         let cwd = if let Some(path) = self.cwd {
             Some(to_absolute_path(path)?)
@@ -568,7 +582,7 @@ impl AgentBuilder {
         // Delegation is considered enabled only when the host actually wired a
         // delegation path: the `delegate` tool, or a non-empty registry of
         // pre-registered targets. Protocol loading never changes this.
-        let delegation_enabled = self.tools.iter().any(|tool| tool == "delegate")
+        let delegation_enabled = self.tools.iter().any(|tool| tool.is_builtin("delegate"))
             || explicit_registry
                 .as_ref()
                 .is_some_and(|registry| !registry.list_agents().is_empty());
@@ -619,12 +633,7 @@ impl AgentBuilder {
             builder = builder.with_knowledge_store(ks);
         }
 
-        if let Some(assume_mutating) = self.assume_mutating {
-            builder = builder.with_assume_mutating(assume_mutating);
-        }
-        if let Some(mutating_tools) = self.mutating_tools {
-            builder = builder.with_mutating_tools(mutating_tools);
-        }
+        builder = builder.with_permissions(self.permissions);
 
         // Apply execution overrides from builder methods
         if let Some(max_steps) = self.max_steps_override {
@@ -643,7 +652,7 @@ impl AgentBuilder {
                 || self
                     .tools
                     .iter()
-                    .any(|tool| tool == crate::skills::SkillTool::NAME))
+                    .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME)))
         {
             let project_root = cwd.as_deref().unwrap_or_else(|| std::path::Path::new("."));
             builder
@@ -667,7 +676,7 @@ impl AgentBuilder {
             let has_external_tools = self.tools.iter().any(|t| {
                 // MCP-style specs contain a dot: "server.*" or "server.tool_name"
                 // while builtins are plain names like "create_task", "read_tool".
-                t.contains('.') || self.mcp_servers.iter().any(|m| t == m.name())
+                t.is_mcp() || self.mcp_servers.iter().any(|m| t.is_builtin(m.name()))
             });
             let policy = if has_external_tools || !self.mcp_servers.is_empty() {
                 ToolPolicy::BuiltInAndProvider
@@ -725,6 +734,8 @@ impl AgentBuilder {
             builder = builder.with_snapshot_from_execution(exec);
         }
 
+        builder = builder.with_agent_mode(self.mode);
+
         if let Some(hooks_config) = self.hooks_config.take() {
             let hooks = crate::hooks::Hooks::new(hooks_config)?;
             builder = builder.with_hooks(hooks);
@@ -772,69 +783,14 @@ impl AgentBuilder {
             middleware_drivers.push(middleware);
         }
 
-        // Apply config-based middleware entries
-        for entry in &self.middleware_entries {
-            match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, &initial_config)
-            {
-                Ok(middleware) => {
-                    middleware_drivers.push(middleware);
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.contains("disabled") {
-                        return Err(anyhow!(
-                            "Failed to create middleware '{}': {}",
-                            entry.middleware_type,
-                            e
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Auto-add ContextMiddleware if compaction.auto is true and user didn't provide one
-        if initial_config.execution_policy.compaction.auto {
-            let already_has = middleware_drivers
-                .iter()
-                .any(|d| d.name() == "ContextMiddleware");
-            if !already_has {
-                log::info!("Auto-enabling ContextMiddleware for compaction");
-                middleware_drivers.push(Arc::new(crate::middleware::ContextMiddleware::new(
-                    crate::middleware::ContextConfig::default().auto_compact(true),
-                )));
-            }
-        }
-
-        // Auto-add output-limit recovery unless the user supplied a driver or any
-        // `output_limit_recovery` config entry (including a disabled one).
-        let has_recovery_entry = self
-            .middleware_entries
-            .iter()
-            .any(|e| e.middleware_type == "output_limit_recovery");
-        let has_recovery_driver = middleware_drivers
-            .iter()
-            .any(|d| d.name() == "OutputLimitRecoveryMiddleware");
-        if !has_recovery_entry && !has_recovery_driver {
-            middleware_drivers.push(Arc::new(
-                crate::middleware::OutputLimitRecoveryMiddleware::default(),
-            ));
-        }
-
-        // Auto-add ParallelEditGuard (warn mode) unless the user supplied a driver
-        // or any `parallel_edit_guard` config entry (including a disabled one).
-        let has_guard_entry = self
-            .middleware_entries
-            .iter()
-            .any(|e| e.middleware_type == "parallel_edit_guard");
-        let has_guard_driver = middleware_drivers
-            .iter()
-            .any(|d| d.name() == "ParallelEditGuard");
-        if !has_guard_entry && !has_guard_driver {
-            middleware_drivers.push(Arc::new(crate::middleware::ParallelEditGuard::new(
-                initial_config.tool_registry.clone(),
-                crate::middleware::ParallelEditMode::Warn,
-            )));
-        }
+        // Config-based entries plus the auto-added defaults share one assembly
+        // path with quorum members; any real error fails the build.
+        let assembled = crate::middleware::build_from_entries(
+            &self.middleware_entries,
+            &middleware_drivers,
+            &initial_config,
+        )?;
+        middleware_drivers.extend(assembled);
 
         // Drop the temporary handle so Arc::try_unwrap can succeed
         // (avoids a full clone of AgentConfig).
@@ -1411,6 +1367,23 @@ impl Agent {
         self.quorum.as_ref().map(|q| q.planner())
     }
 
+    /// MCP servers this agent's runtimes were built with, including those
+    /// merged in from `.agents/`: the agent's own, or for a quorum the
+    /// planner's and every local delegate's.
+    pub fn mcp_server_configs(&self) -> Vec<crate::config::McpServerConfig> {
+        let mut servers = self.inner.config.mcp_servers.clone();
+        if let Some(quorum) = &self.quorum {
+            let handles = std::iter::once(quorum.planner())
+                .chain(quorum.delegates().iter().map(|d| d.agent.clone()));
+            for handle in handles {
+                if let Some(local) = handle.as_any().downcast_ref::<AgentHandle>() {
+                    servers.extend(local.config.mcp_servers.iter().cloned());
+                }
+            }
+        }
+        servers
+    }
+
     /// Access a delegate handle by ID (returns `None` for single agents or if not found).
     pub fn delegate(&self, id: &str) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
         self.quorum.as_ref().and_then(|q| q.delegate(id))
@@ -1570,7 +1543,7 @@ impl Agent {
         };
         let mut builder = AgentBuilder::new()
             .provider(config.agent.provider, config.agent.model)
-            .tools(config.agent.tools)
+            .tool_specs(config.agent.tools)
             .dotagents_options(dotagents_options);
 
         if let Some(api_key) = config.agent.api_key {
@@ -1589,8 +1562,8 @@ impl Agent {
         if let Some(cwd) = config.agent.cwd {
             builder.cwd = Some(cwd);
         }
-        builder.assume_mutating = Some(config.agent.assume_mutating);
-        builder.mutating_tools = Some(config.agent.mutating_tools);
+        builder.mode = config.agent.mode;
+        builder.permissions = config.agent.permissions.to_permissions();
 
         // Inject pre-populated registry (Phase 7).
         if let Some(registry) = initial_registry {

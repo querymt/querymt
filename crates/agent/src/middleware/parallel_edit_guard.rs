@@ -377,13 +377,9 @@ impl MiddlewareFactory for ParallelEditGuardFactory {
         &self,
         config: &Value,
         agent_config: &crate::agent::agent_config::AgentConfig,
-    ) -> AnyhowResult<Arc<dyn MiddlewareDriver>> {
-        let enabled = config
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        if !enabled {
-            return Err(anyhow::anyhow!("Middleware disabled"));
+    ) -> AnyhowResult<Option<Arc<dyn MiddlewareDriver>>> {
+        if !crate::middleware::enabled_flag(config)? {
+            return Ok(None);
         }
 
         let mode = match config.get("mode") {
@@ -398,10 +394,10 @@ impl MiddlewareFactory for ParallelEditGuardFactory {
                 })?,
         };
 
-        Ok(Arc::new(ParallelEditGuard::new(
+        Ok(Some(Arc::new(ParallelEditGuard::new(
             agent_config.tool_registry.clone(),
             mode,
-        )))
+        ))))
     }
 }
 
@@ -908,7 +904,7 @@ mod tests {
         assert_eq!(ParallelEditMode::parse("block"), None);
     }
 
-    async fn run_factory(config: Value) -> AnyhowResult<Arc<dyn MiddlewareDriver>> {
+    async fn run_factory(config: Value) -> AnyhowResult<Option<Arc<dyn MiddlewareDriver>>> {
         let agent = crate::test_utils::TestAgent::new().await;
         ParallelEditGuardFactory.create(&config, &agent.config)
     }
@@ -950,20 +946,26 @@ mod tests {
 
     #[tokio::test]
     async fn factory_defaults_to_warn() {
-        let driver = run_factory(json!({})).await.unwrap();
+        let driver = run_factory(json!({})).await.unwrap().expect("enabled");
         assert_eq!(driver.name(), "ParallelEditGuard");
         assert!(!denies_second_edit(&driver).await);
     }
 
     #[tokio::test]
     async fn factory_explicit_deny() {
-        let driver = run_factory(json!({"mode": "deny"})).await.unwrap();
+        let driver = run_factory(json!({"mode": "deny"}))
+            .await
+            .unwrap()
+            .expect("enabled");
         assert!(denies_second_edit(&driver).await);
     }
 
     #[tokio::test]
     async fn factory_explicit_warn() {
-        let driver = run_factory(json!({"mode": "warn"})).await.unwrap();
+        let driver = run_factory(json!({"mode": "warn"}))
+            .await
+            .unwrap()
+            .expect("enabled");
         assert!(!denies_second_edit(&driver).await);
     }
 
@@ -976,17 +978,22 @@ mod tests {
                 .expect("invalid mode must fail");
             let msg = err.to_string();
             assert!(msg.contains("mode"), "{msg}");
-            assert!(!msg.contains("disabled"), "{msg}");
         }
     }
 
     #[tokio::test]
-    async fn factory_disabled_returns_disabled_error() {
-        let err = run_factory(json!({"enabled": false}))
+    async fn factory_rejects_a_non_boolean_enabled() {
+        let err = run_factory(json!({"enabled": "false"}))
             .await
             .err()
-            .expect("disabled must fail");
-        assert!(err.to_string().contains("disabled"));
+            .expect("non-boolean enabled must fail");
+        assert!(err.to_string().contains("enabled"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn factory_disabled_returns_none() {
+        let result = run_factory(json!({"enabled": false})).await.unwrap();
+        assert!(result.is_none());
     }
 
     #[test]

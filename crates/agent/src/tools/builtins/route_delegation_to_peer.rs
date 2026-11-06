@@ -28,6 +28,11 @@ impl ToolTrait for RouteDelegationToPeerTool {
         "route_delegation_to_peer"
     }
 
+    fn is_read_only(&self) -> bool {
+        // Touches session or knowledge state, never the workspace files.
+        true
+    }
+
     fn definition(&self) -> Tool {
         Tool {
             tool_type: "function".to_string(),

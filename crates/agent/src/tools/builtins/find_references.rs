@@ -45,6 +45,10 @@ impl Tool for FindSymbolReferencesTool {
         "find_symbol_references"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> ChatTool {
         ChatTool {
             tool_type: "function".to_string(),

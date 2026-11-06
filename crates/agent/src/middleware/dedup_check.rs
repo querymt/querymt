@@ -208,19 +208,9 @@ impl DedupCheckMiddleware {
             if let Some(ref snapshot) = result.snapshot_part
                 && let Some(paths) = snapshot.changed_paths()
             {
-                combined.added.extend(paths.added.iter().cloned());
-                combined.modified.extend(paths.modified.iter().cloned());
-                combined.removed.extend(paths.removed.iter().cloned());
+                combined.merge(paths.clone());
             }
         }
-
-        // Deduplicate paths
-        combined.added.sort();
-        combined.added.dedup();
-        combined.modified.sort();
-        combined.modified.dedup();
-        combined.removed.sort();
-        combined.removed.dedup();
 
         combined
     }
@@ -858,15 +848,10 @@ impl MiddlewareFactory for DedupCheckFactory {
         &self,
         config: &Value,
         agent_config: &crate::agent::agent_config::AgentConfig,
-    ) -> AnyhowResult<Arc<dyn MiddlewareDriver>> {
+    ) -> AnyhowResult<Option<Arc<dyn MiddlewareDriver>>> {
         // Check if explicitly disabled
-        let enabled = config
-            .get("enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-
-        if !enabled {
-            return Err(anyhow::anyhow!("Middleware disabled"));
+        if !crate::middleware::enabled_flag(config)? {
+            return Ok(None);
         }
 
         let mut mw = DedupCheckMiddleware::new().with_event_sink(agent_config.event_sink.clone());
@@ -878,7 +863,7 @@ impl MiddlewareFactory for DedupCheckFactory {
             mw = mw.min_lines(v as usize);
         }
 
-        Ok(Arc::new(mw))
+        Ok(Some(Arc::new(mw)))
     }
 }
 
@@ -1074,6 +1059,15 @@ mod tests {
         let results: Vec<ToolResult> = vec![];
         let paths = DedupCheckMiddleware::extract_changed_paths(&results);
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn factory_rejects_a_non_boolean_enabled() {
+        let err =
+            crate::middleware::enabled_flag(&serde_json::json!({"enabled": "false"})).unwrap_err();
+        assert!(err.to_string().contains("enabled"), "{err}");
+        assert!(crate::middleware::enabled_flag(&serde_json::json!({})).unwrap());
+        assert!(!crate::middleware::enabled_flag(&serde_json::json!({"enabled": false})).unwrap());
     }
 
     #[test]

@@ -4,8 +4,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::sync::Arc;
 
+use ::querymt_agent::agent::core::AgentMode;
 use ::querymt_agent::api::{AgentWorktrees, SessionOptions};
-use ::querymt_agent::config::WorkspaceSettings;
+use ::querymt_agent::config::{Permissions, ToolSpec, WorkspaceSettings};
 use ::querymt_agent::worktree::{
     BaselineMode, HandoffOptions, WorkspaceTarget, WorktreeCreateRequest, WorktreeOpError,
 };
@@ -42,7 +43,7 @@ struct PyAgentSession {
 #[pymethods]
 impl PyAgent {
     #[staticmethod]
-    #[pyo3(signature = (provider, model, cwd=None, tools=None, system=None, api_key=None, base_url=None, db=None, assume_mutating=None, mutating_tools=None, max_steps=None, max_prompt_bytes=None, execution_timeout_secs=None, worktrees=None))]
+    #[pyo3(signature = (provider, model, cwd=None, tools=None, system=None, api_key=None, base_url=None, db=None, ask=None, always_ask=None, approval_timeout_sec=None, mode=None, max_steps=None, max_prompt_bytes=None, execution_timeout_secs=None, worktrees=None))]
     fn single<'py>(
         py: Python<'py>,
         provider: String,
@@ -53,8 +54,10 @@ impl PyAgent {
         api_key: Option<String>,
         base_url: Option<String>,
         db: Option<String>,
-        assume_mutating: Option<bool>,
-        mutating_tools: Option<Vec<String>>,
+        ask: Option<Vec<String>>,
+        always_ask: Option<Vec<String>>,
+        approval_timeout_sec: Option<i64>,
+        mode: Option<String>,
         max_steps: Option<usize>,
         max_prompt_bytes: Option<usize>,
         execution_timeout_secs: Option<u64>,
@@ -62,6 +65,8 @@ impl PyAgent {
     ) -> PyResult<Bound<'py, PyAny>> {
         // Parsed eagerly so a bad argument raises ValueError at the call site.
         let workspace = parse_worktrees(worktrees.as_ref())?;
+        let permissions = parse_permissions(ask, always_ask, approval_timeout_sec)?;
+        let mode = mode.as_deref().map(parse_mode).transpose()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut builder = AgentHandle::single().provider(provider, model);
             if let Some(settings) = workspace {
@@ -86,11 +91,11 @@ impl PyAgent {
             if let Some(db) = db {
                 builder = builder.db(db);
             }
-            if let Some(assume_mutating) = assume_mutating {
-                builder = builder.assume_mutating(assume_mutating);
+            if let Some(permissions) = permissions {
+                builder = builder.permissions(permissions);
             }
-            if let Some(mutating_tools) = mutating_tools {
-                builder = builder.mutating_tools(mutating_tools);
+            if let Some(mode) = mode {
+                builder = builder.mode(mode);
             }
             if let Some(max_steps) = max_steps {
                 builder = builder.max_steps(max_steps);
@@ -432,8 +437,50 @@ fn querymt_agent(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// Translate `worktrees=` (`True`/`False`/`None` or a settings dict) into
-/// workspace settings. Unknown keys raise `ValueError`.
+/// Approval lists and timeout; a bad selector or a non-positive timeout
+/// raises `ValueError` at the call site.
+fn parse_permissions(
+    ask: Option<Vec<String>>,
+    always_ask: Option<Vec<String>>,
+    timeout_sec: Option<i64>,
+) -> PyResult<Option<Permissions>> {
+    if ask.is_none() && always_ask.is_none() && timeout_sec.is_none() {
+        return Ok(None);
+    }
+    let specs = |list: Option<Vec<String>>| -> PyResult<Vec<ToolSpec>> {
+        list.unwrap_or_default()
+            .iter()
+            .map(|s| s.parse::<ToolSpec>().map_err(into_value_err))
+            .collect()
+    };
+    let mut permissions = Permissions::new()
+        .ask(specs(ask)?)
+        .always_ask(specs(always_ask)?);
+    if let Some(secs) = timeout_sec {
+        let secs = u64::try_from(secs)
+            .ok()
+            .filter(|secs| *secs > 0)
+            .ok_or_else(|| PyValueError::new_err("approval_timeout_sec must be positive"))?;
+        permissions = permissions.timeout(std::time::Duration::from_secs(secs));
+    }
+    Ok(Some(permissions))
+}
+
+fn parse_mode(mode: &str) -> PyResult<AgentMode> {
+    match mode {
+        "build" => Ok(AgentMode::Build),
+        "plan" => Ok(AgentMode::Plan),
+        "review" => Ok(AgentMode::Review),
+        other => Err(PyValueError::new_err(format!(
+            "unknown mode `{other}` (expected `build`, `plan` or `review`)"
+        ))),
+    }
+}
+
+fn into_value_err(err: impl std::fmt::Display) -> PyErr {
+    PyValueError::new_err(err.to_string())
+}
+
 fn parse_worktrees(arg: Option<&Bound<'_, PyAny>>) -> PyResult<Option<WorkspaceSettings>> {
     let Some(arg) = arg.filter(|a| !a.is_none()) else {
         return Ok(None);

@@ -67,10 +67,12 @@ pub(super) fn latest_assistant_message(messages: &[AgentMessage]) -> Option<Stri
         })
 }
 
-pub(super) fn infer_required_capabilities(tools: &[String]) -> HashSet<CapabilityRequirement> {
+pub(super) fn infer_required_capabilities(
+    tools: &[crate::config::ToolSpec],
+) -> HashSet<CapabilityRequirement> {
     let mut caps = HashSet::new();
     for tool in tools {
-        if tool_requires_filesystem(tool) {
+        if tool.as_builtin().is_some_and(tool_requires_filesystem) {
             caps.insert(CapabilityRequirement::Filesystem);
         }
     }

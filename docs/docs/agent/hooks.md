@@ -18,8 +18,8 @@ Hooks are a good fit for:
 
 Hooks execute arbitrary local commands.
 
-- Hooks are disabled by default.
-- Enable hooks only in trusted agent configs or profiles.
+- Hooks run whenever an agent config declares any; set `enabled = false` under `[agent.hooks]` to switch them off.
+- Use hooks only in trusted agent configs or profiles.
 - Hook commands receive prompt and tool metadata on stdin.
 - For now, QueryMT supports config/profile-level hooks only.
 - Automatic `~/.qmt/hooks` or project `.qmt/hooks` discovery is not implemented yet.
@@ -88,6 +88,21 @@ input = { query = "$event.model", messages = "$event.messages" }
 ```
 
 MCP hook handlers are bound to both `server` and `tool`, bypass the model-visible tool loop, and therefore cannot recursively trigger tool hooks. Template strings must be exact `$event.<field>` paths into the event payload; arbitrary interpolation is not supported. MCP handlers currently require an execution-scoped event (`pre_tool_use`, `permission_request`, `post_tool_use`, or `context`) where connected tool state is available. The MCP tool's text content is parsed with the same output contract as a command hook.
+
+### Matchers and paths
+
+- A tool matcher is a regex that may match the plain tool name (`place_order`) or the server-qualified name (`ibkr.place_order`) for MCP tools. An invalid regex fails the config load instead of silently never matching.
+- Hook commands run in the session's working directory. Use `$QMT_PROFILE_DIR`, the folder of the config file the hooks came from (not set for inline configs), to reference scripts: `command = "sh \"$QMT_PROFILE_DIR/../hooks/check-shell.sh\""`.
+- `pre_tool_use` and `post_tool_use` input carries `mcp_server` (`null` for built-in tools).
+
+### Failure behavior
+
+- A failing, crashing or timed-out `pre_tool_use` hook blocks the call (fail closed).
+- A failing `post_tool_use` hook cannot undo a call that already ran: the tool result is kept and a `hook_notice` is emitted, so the model does not retry an action that took effect.
+
+### Asking the user
+
+A `pre_tool_use` hook may print `permission_decision: "ask"` with a `permission_decision_reason`. QueryMT then shows the user a permission prompt with the reason as its title and "Allow once" / "Reject" options, whatever the approval lists say, and runs the tool only after "Allow once". An earlier "Allow for this session" does not satisfy it. Reject, cancel, timeout (`[agent.permissions] timeout_sec`) or a transport failure all mean the tool does not run. `permission_decision: "allow"` skips the prompt even for tools listed in `[agent.permissions]`. See [Tool approval](configuration.md#tool-approval).
 
 ## Hook Command Protocol
 
@@ -195,7 +210,7 @@ Expected hook output:
 }
 ```
 
-Multiple matching `pre_tool_use` handlers see this rewritten object in order. A rewrite is accepted only with `permission_decision: \"allow\"`; `ask` follows normal interactive permission handling.
+Multiple matching `pre_tool_use` handlers see this rewritten object in order. A rewrite is accepted only with `permission_decision: \"allow\"`; `ask` follows the approval prompt described above.
 
 #### Tool input uses canonical parameter names
 

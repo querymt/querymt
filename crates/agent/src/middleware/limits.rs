@@ -568,7 +568,8 @@ mod tests {
                 }),
                 &agent_config,
             )
-            .unwrap();
+            .unwrap()
+            .expect("enabled middleware");
         let p = driver.budget_pricing().expect("budget pricing");
         assert_eq!(
             (
@@ -600,7 +601,10 @@ mod tests {
         let json = serde_json::to_value(&entry).unwrap();
 
         let (agent_config, _td) = factory_agent_config().await;
-        let driver = LimitsFactory.create(&json, &agent_config).unwrap();
+        let driver = LimitsFactory
+            .create(&json, &agent_config)
+            .unwrap()
+            .expect("enabled middleware");
         let p = driver.budget_pricing().expect("budget pricing");
         assert_eq!(
             (p.cache_read, p.cache_write, p.cache_write_1h),
@@ -614,8 +618,18 @@ mod tests {
         let (agent_config, _td) = factory_agent_config().await;
         let driver = LimitsFactory
             .create(&serde_json::json!({"max_steps": 5}), &agent_config)
-            .unwrap();
+            .unwrap()
+            .expect("enabled middleware");
         assert!(driver.budget_pricing().is_none());
+    }
+
+    #[tokio::test]
+    async fn factory_disabled_returns_none() {
+        let (agent_config, _td) = factory_agent_config().await;
+        let result = LimitsFactory
+            .create(&serde_json::json!({"enabled": false}), &agent_config)
+            .unwrap();
+        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -767,11 +781,11 @@ impl MiddlewareFactory for LimitsFactory {
         &self,
         config: &serde_json::Value,
         _agent_config: &crate::agent::agent_config::AgentConfig,
-    ) -> anyhow::Result<Arc<dyn MiddlewareDriver>> {
+    ) -> anyhow::Result<Option<Arc<dyn MiddlewareDriver>>> {
         let cfg: LimitsFactoryConfig = serde_json::from_value(config.clone())?;
 
         if !cfg.enabled {
-            return Err(anyhow::anyhow!("Middleware disabled"));
+            return Ok(None);
         }
 
         let mut limits_config = LimitsConfig::default();
@@ -807,6 +821,6 @@ impl MiddlewareFactory for LimitsFactory {
         }
 
         // Invalid (negative / non-finite) manual rates fail validation.
-        Ok(Arc::new(LimitsMiddleware::try_new(limits_config)?))
+        Ok(Some(Arc::new(LimitsMiddleware::try_new(limits_config)?)))
     }
 }

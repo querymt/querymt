@@ -522,8 +522,7 @@ pub struct AgentConfig {
     pub mcp_servers: Vec<McpServerConfig>,
     pub max_steps: Option<usize>,
     pub snapshot_policy: SnapshotPolicy,
-    pub assume_mutating: bool,
-    pub mutating_tools: HashSet<String>,
+    pub permissions: Permissions, // ask / always_ask / timeout
     pub execution_policy: RuntimeExecutionPolicy,
     // ... more fields
 }

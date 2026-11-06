@@ -1756,7 +1756,8 @@ impl SessionMaterializer {
         }
         let tool_state = crate::agent::core::McpToolState::empty();
         let connect_ctx =
-            crate::agent::mcp::McpConnectContext::from_config(&self.config.mcp_servers);
+            crate::agent::mcp::McpConnectContext::from_config(&self.config.mcp_servers)
+                .with_permissions(self.config.permissions.clone());
         let mcp_services = crate::agent::protocol::build_mcp_state(
             mcp_servers,
             &connect_ctx,

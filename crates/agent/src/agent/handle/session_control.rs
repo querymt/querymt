@@ -9,6 +9,46 @@ const STOP_LOCAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 const STOP_REMOTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl LocalAgentHandle {
+    /// In profile mode, give a locally stored session that has no usable profile
+    /// binding one (see `ProfileRuntimeManager::adopt_unbound_session`), so history
+    /// created before profiles existed, or by a config-file run, stays openable.
+    /// Unknown session ids are left alone and fail later as before.
+    pub(super) async fn adopt_unbound_session_binding(
+        &self,
+        session_id: &str,
+    ) -> Result<(), Error> {
+        let Some(profiles) = self.profiles() else {
+            return Ok(());
+        };
+        if profiles.session_binding(session_id).await.is_some() {
+            return Ok(());
+        }
+        let exists = self
+            .config
+            .provider
+            .history_store()
+            .get_session(session_id)
+            .await
+            .map_err(|err| Error::internal_error().data(err.to_string()))?
+            .is_some();
+        if !exists {
+            return Ok(());
+        }
+        profiles
+            .adopt_unbound_session(session_id)
+            .await
+            .map_err(|err| {
+                Error::internal_error().data(serde_json::json!({
+                    "message": format_prefixed_error_chain(
+                        "Failed to bind session to a profile",
+                        &err,
+                    ),
+                    "sessionId": session_id,
+                }))
+            })?;
+        Ok(())
+    }
+
     pub(super) async fn bound_session_handle(
         &self,
         session_id: &str,

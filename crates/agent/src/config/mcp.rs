@@ -128,7 +128,30 @@ pub enum McpAuth {
         /// Loopback redirect port. Defaults to a fixed port.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         redirect_port: Option<u16>,
+        /// Refuse grants wider than `scopes` (default `false`).
+        ///
+        /// Authorization servers may grant more than was requested. With
+        /// `strict_scopes = true` a login whose token carries any scope beyond
+        /// `scopes` (plus `offline_access`) is discarded, and stored
+        /// credentials with such a grant are not used to connect. Checked
+        /// against the token response `scope` and, for JWT access tokens, the
+        /// `scope` / `scp` claim. Requires a nonempty `scopes`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        strict_scopes: bool,
     },
+}
+
+impl McpAuth {
+    /// OAuth with dynamic registration, the default redirect port and the
+    /// given scopes.
+    pub fn oauth(scopes: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::OAuth {
+            client_id: None,
+            scopes: scopes.into_iter().map(Into::into).collect(),
+            redirect_port: None,
+            strict_scopes: false,
+        }
+    }
 }
 
 fn is_false(v: &bool) -> bool {

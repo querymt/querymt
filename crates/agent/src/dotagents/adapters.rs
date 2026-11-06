@@ -181,10 +181,33 @@ pub(crate) fn convert_server_with_diagnostics(
             if !diagnostics.is_empty() {
                 return Ok((None, diagnostics));
             }
-            Ok((
-                Some(McpServerConfig::http(server.name.clone(), url).with_headers(headers)),
-                diagnostics,
-            ))
+            let mut config = McpServerConfig::http(server.name.clone(), url).with_headers(headers);
+            // QueryMT extension: `"auth": {"type": "oauth", "scopes": [...]}`,
+            // the same shape as `auth` of a TOML `[[mcp]]` entry.
+            if let Some(auth) = server
+                .extensions
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("auth"))
+                .map(|(_, value)| value)
+            {
+                let auth: crate::config::McpAuth = serde_json::from_value(auth.clone())
+                    .map_err(|error| {
+                        DotagentsDiagnostic::error(
+                            DotagentsDiagnosticCode::ParseError,
+                            format!("MCP server `{}`: invalid `auth`: {error}", server.name),
+                        )
+                        .with_source(server.source.clone())
+                    })?;
+                config = config.with_auth(auth);
+                crate::agent::mcp::validate_mcp_server(&config).map_err(|error| {
+                    DotagentsDiagnostic::error(
+                        DotagentsDiagnosticCode::ConflictingFields,
+                        error.to_string(),
+                    )
+                    .with_source(server.source.clone())
+                })?;
+            }
+            Ok((Some(config), diagnostics))
         }
         DotagentsMcpTransport::WebSocket | DotagentsMcpTransport::Unknown => {
             Err(DotagentsDiagnostic::error(

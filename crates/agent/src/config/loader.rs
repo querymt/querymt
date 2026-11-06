@@ -90,6 +90,12 @@ async fn build_config_from_toml_value(
 
         // Step 4: Validate
         validate_mcp_servers(&config.mcp)?;
+        validate_permissions(
+            "agent",
+            &config.agent.tools,
+            &config.agent.permissions,
+            &config.mcp.iter().collect::<Vec<_>>(),
+        )?;
 
         // Step 5: Resolve system prompt file references
         match &resolution {
@@ -106,6 +112,7 @@ async fn build_config_from_toml_value(
         if let PromptResolution::ResolveFiles { base_path } = &resolution {
             config.agent.workspace =
                 std::mem::take(&mut config.agent.workspace).anchored_at(base_path);
+            config.agent.hooks.base_dir = std::path::absolute(base_path).ok();
         }
 
         Config::Single(Box::new(config))
@@ -121,6 +128,20 @@ async fn build_config_from_toml_value(
             validate_mcp_servers(&delegate.mcp)?;
         }
         validate_peer_delegates(&config.delegates, &config.mesh)?;
+        validate_permissions(
+            "planner",
+            &config.planner.tools,
+            &config.planner.permissions,
+            &config.mcp.iter().collect::<Vec<_>>(),
+        )?;
+        for delegate in &config.delegates {
+            validate_permissions(
+                &format!("delegate '{}'", delegate.id),
+                &delegate.tools,
+                &delegate.permissions,
+                &config.mcp.iter().chain(&delegate.mcp).collect::<Vec<_>>(),
+            )?;
+        }
 
         // Step 5: Resolve system prompt file references
         match &resolution {
@@ -271,6 +292,40 @@ pub(crate) fn validate_delegate_isolation(config: &QuorumConfig) -> Result<()> {
         )),
         None => Ok(()),
     }
+}
+
+/// Check an agent's approval lists against its configured MCP servers and its
+/// `tools` selection.
+///
+/// An MCP selector must name a configured server, and when `tools` is
+/// non-empty every listed selector must also be selected by `tools`, because a
+/// tool the agent cannot see can never be approved.
+///
+/// # Errors
+///
+/// Names the agent (`context`), the offending list entry and the field to fix.
+pub(crate) fn validate_permissions(
+    context: &str,
+    tools: &[ToolSpec],
+    permissions: &PermissionsConfig,
+    servers: &[&McpServerConfig],
+) -> Result<()> {
+    let available: ToolSet = tools.iter().cloned().collect();
+    for (field, spec) in permissions.selectors() {
+        if let Some(server) = spec.server()
+            && !servers.iter().any(|s| s.name() == server)
+        {
+            return Err(anyhow!(
+                "{context}: `{field}` entry `{spec}` names MCP server `{server}`, which is not configured"
+            ));
+        }
+        if !tools.is_empty() && !available.covers(spec) {
+            return Err(anyhow!(
+                "{context}: `{field}` entry `{spec}` is not selected by `tools`; add it to `tools` or remove it"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validate MCP servers have unique names and consistent settings

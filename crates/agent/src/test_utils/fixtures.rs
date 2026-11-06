@@ -91,6 +91,23 @@ impl TestAgent {
         &self,
         mcp_tool_state: Arc<crate::agent::core::McpToolState>,
     ) -> crate::agent::execution_context::ExecutionContext {
+        self.execution_context_with(None, mcp_tool_state).await
+    }
+
+    /// Like [`Self::execution_context`], rooted at `cwd`.
+    pub(crate) async fn execution_context_in(
+        &self,
+        cwd: std::path::PathBuf,
+    ) -> crate::agent::execution_context::ExecutionContext {
+        self.execution_context_with(Some(cwd), crate::agent::core::McpToolState::empty())
+            .await
+    }
+
+    async fn execution_context_with(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+        mcp_tool_state: Arc<crate::agent::core::McpToolState>,
+    ) -> crate::agent::execution_context::ExecutionContext {
         let session_handle = self
             .config
             .provider
@@ -105,7 +122,7 @@ impl TestAgent {
         .await
         .unwrap();
         let runtime =
-            crate::agent::core::SessionRuntime::new(None, Default::default(), mcp_tool_state);
+            crate::agent::core::SessionRuntime::new(cwd, Default::default(), mcp_tool_state);
         crate::agent::execution_context::ExecutionContext::new(
             session_id,
             runtime,

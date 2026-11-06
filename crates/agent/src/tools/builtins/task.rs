@@ -42,6 +42,10 @@ impl ToolTrait for ReadTaskTool {
         "read_task"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> Tool {
         Tool {
             tool_type: "function".to_string(),
@@ -87,6 +91,11 @@ impl UpdateTaskTool {
 impl ToolTrait for UpdateTaskTool {
     fn name(&self) -> &str {
         "update_task"
+    }
+
+    fn is_read_only(&self) -> bool {
+        // Touches session or knowledge state, never the workspace files.
+        true
     }
 
     fn definition(&self) -> Tool {
@@ -210,6 +219,11 @@ impl CompleteTaskTool {
 impl ToolTrait for CompleteTaskTool {
     fn name(&self) -> &str {
         "complete_task"
+    }
+
+    fn is_read_only(&self) -> bool {
+        // Touches session or knowledge state, never the workspace files.
+        true
     }
 
     fn definition(&self) -> Tool {

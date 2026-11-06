@@ -103,11 +103,9 @@ system = [
 temperature = 0.7
 max_tokens = 4096
 
-# Assume unknown tools are mutating (requires permission)
-assume_mutating = false
-
-# Explicit list of mutating tools
-mutating_tools = ["edit", "write_file", "shell"]
+# Tools that need the user's approval (see "Tool approval" below)
+[agent.permissions]
+ask = ["edit", "write_file", "shell"]
 ```
 
 For reusable system-prefix annotations, TTL behavior, and provider limitations,
@@ -274,9 +272,23 @@ auth = { type = "oauth", scopes = ["read"] }
   `socket_path` or an `Authorization` header.
 - **Login:** use the `_querymt/auth/*` extension methods (`start`, `complete`,
   `status`, `logout`) with the provider id `mcp:<server name>`, for example
-  `mcp:linear`. Login flows are scoped to the client that started them. The
+  `mcp:linear`. Servers are offered from the agent configuration, every profile
+  (its `[[mcp]]` entries, quorum delegate `mcp` entries and `.agents/mcp.json`
+  servers) and the running profile runtimes, so a server declared only in a
+  profile can be logged into before any session uses it. A name declared with
+  different settings by several sources is refused with an `invalid_params`
+  error naming the sources; credentials are stored per name, so make the
+  declarations agree or rename one. Login flows are scoped to the client that started them. The
   loopback redirect URI is `http://127.0.0.1:<redirect_port>/callback`; the
   default port is `47821`. Register that URI when using a fixed `client_id`.
+- **Strict scopes:** authorization servers may grant more than was requested.
+  With `strict_scopes = true` (requires `scopes`), a login or refresh whose
+  token carries any scope beyond `scopes` (and `offline_access`) is not stored,
+  and stored credentials with a wider grant are not used to connect. The grant
+  is read from the token response `scope` and, for JWT access tokens, the
+  `scope`/`scp` claim. Example: `auth = { type = "oauth", scopes = ["mcp.read"], strict_scopes = true }`.
+- **`.agents/mcp.json`:** an HTTP entry may carry the same `auth` object, e.g.
+  `"auth": {"type": "oauth", "scopes": ["read"]}`.
 - **Storage:** tokens are kept in the secret store under `mcp-oauth:<server>`,
   bound to the server URL, and never written to config, logs, events, or
   session history.
@@ -314,13 +326,12 @@ tools = ["read_tool", "filesystem.*", "shell"]
 
 ## Middleware Configuration
 
-Middleware extends agent behavior through a pluggable stack:
+Middleware extends agent behavior through a pluggable stack. Building an agent (single agent, quorum planner or delegate) fails when an entry has an unknown `type` or invalid configuration; an entry turned off by its own config (for example `enabled = false`) is skipped. The initial session mode is the `mode` key on `[agent]`, `[planner]` and `[[delegates]]`, not a middleware setting:
 
 ```toml
 # Agent mode middleware (build/plan/review modes)
 [[middleware]]
 type = "agent_mode"
-default = "build"
 reminder = """<system-reminder>
 You are in plan mode. Read-only access.
 </system-reminder>"""
@@ -596,12 +607,12 @@ tags = ["review", "read-only"]
 [agent]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
+mode = "review"
 tools = ["read_tool", "glob", "search_text", "question"]
 system = "You are a code review specialist."
 
 [[middleware]]
 type = "agent_mode"
-default = "review"
 ```
 
 For complete profiles documentation, see [Profiles Guide](profiles.md).
@@ -879,17 +890,34 @@ tools = [
 ]
 ```
 
-### Tool Permissions
-
-Configure which tools are mutating:
+### Tool approval
 
 ```toml
-[agent]
-assume_mutating = false
-mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
+[agent.permissions]
+ask         = ["shell"]              # prompt; "Allow for this session" is offered
+always_ask  = ["ibkr.place_order"]   # prompt on every call, never remembered
+timeout_sec = 120                    # unanswered prompts are rejected; unset waits
 ```
 
-A permission-required tool call that no cached choice, tool policy or hook decides waits for an explicit user answer, delivered as an ACP `session/request_permission` request. It is never auto-granted, including when no client is attached. Unattended runs (schedules, headless) must restrict `tools` / `mutating_tools` or add `permission_request` hooks, or they pause at the first unanswered permission. See [Session Interactions](mesh.md#session-interactions) for the full lifecycle and the all-nodes-upgrade requirement (`RemoteNodeUpgradeRequired`).
+The same `[permissions]` table is accepted under `[planner]` and each `[[delegates]]`. Entries are tool selectors: `shell` (built-in or provider tool), `server.tool` (one MCP tool) or `server.*` (every tool of an MCP server). A bare name never matches an MCP tool. Loading fails when an MCP selector names a server that is not configured, or when `tools` is set and does not select a listed tool.
+
+Approval works the same for built-in, MCP and provider tools, and runs before the tool does:
+
+| Situation | Prompt options |
+| --- | --- |
+| Tool matched by `ask` | Allow once, Allow for this session, Reject |
+| Tool matched by `always_ask` (wins over `ask`) | Allow once, Reject |
+| `pre_tool_use` hook returns `ask` | Allow once, Reject; the hook's reason is the prompt title |
+| `pre_tool_use` hook returns `allow` | No prompt, even for a listed tool |
+| Tool that asks by default (`accept_delegation_result`), no configuration | Allow once, Allow for this session, Reject; listing it in `always_ask` asks on every call; a `pre_tool_use` `allow` hook skips it |
+
+"Allow for this session" covers later calls of the same server-qualified tool in that session only. It never applies to `always_ask` tools, hook asks or other sessions, and a rejection is never remembered. A denied call returns an error to the model that names the reason (rejected, timed out, run cancelled, task not active, or the `permission_request` hook's message) and says the tool was not run. A call whose task is not active is denied without a prompt.
+
+`timeout_sec` applies to every prompt, including hook asks when both lists are empty. Unattended profiles (schedules, headless runs) must set it, or add `permission_request` hooks, otherwise they wait at the first prompt. A prompt that is not answered, or whose client is not attached, is never granted automatically. See [Session Interactions](mesh.md#session-interactions) for the full lifecycle and the all-nodes-upgrade requirement (`RemoteNodeUpgradeRequired`).
+
+Snapshots need no per-tool list. A call is snapshotted when a snapshot policy other than `none` is enabled (`AgentBuilder` defaults to `diff`, Quorum to `none`), the session has a working directory, and the tool does not declare itself read-only. Read-only tools are the built-ins that only read or only change session and knowledge state (for example `read_tool`, `search_text`, `delegate`, `todowrite`, `skill`) and MCP tools with `readOnlyHint = true`. Every other built-in (`edit`, `shell`, `accept_delegation_result`, ...) and every MCP tool without the hint is treated as mutating. Calls that reach no registered tool (the LLM-client provider fallback) are not snapshotted. With the `diff` policy each session reuses its last workspace tree, so a call only re-hashes files whose size or modification time changed. A delegate running in its own worktree is snapshotted in that checkout, not in the planner's.
+
+The removed keys `assume_mutating`, `mutating_tools`, `confirm_tools` and `confirm_timeout_sec` are rejected as unknown fields; see the CHANGELOG for replacements.
 
 ## Scheduled Tasks Configuration
 

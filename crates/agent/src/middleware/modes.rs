@@ -22,7 +22,6 @@
 //! ```toml
 //! [[middleware]]
 //! type = "agent_mode"
-//! default = "build"
 //!
 //! [middleware.reminders]
 //! plan = "You are in plan mode. Only observe, analyze, and plan."
@@ -122,7 +121,6 @@ impl MiddlewareDriver for AgentModeMiddleware {
 /// ```toml
 /// [[middleware]]
 /// type = "agent_mode"
-/// default = "build"
 /// reminder = "Plan mode message"
 /// review_reminder = "Review mode message"
 /// ```
@@ -131,19 +129,17 @@ impl MiddlewareDriver for AgentModeMiddleware {
 /// ```toml
 /// [[middleware]]
 /// type = "agent_mode"
-/// default = "build"
 /// [middleware.reminders]
 /// plan = "Plan mode message"
 /// review = "Review mode message"
 /// ```
+///
+/// The initial session mode is not configured here; it is the typed `mode`
+/// key on `[agent]`, `[planner]` and `[[delegates]]`. Unknown keys (including
+/// the former `default`) are rejected.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentModeFactoryConfig {
-    /// Initial mode (defaults to "build").
-    /// Used by the builder/config layer to set `AgentConfig.default_mode`.
-    /// The factory itself only builds reminders; the mode is set per-session.
-    #[serde(default = "default_mode")]
-    #[allow(dead_code)]
-    default: String,
     /// Plan mode reminder (simple format, backward compat)
     #[serde(default)]
     reminder: Option<String>,
@@ -153,10 +149,6 @@ struct AgentModeFactoryConfig {
     /// Explicit reminders map (advanced format, takes precedence)
     #[serde(default)]
     reminders: Option<HashMap<String, String>>,
-}
-
-fn default_mode() -> String {
-    "build".to_string()
 }
 
 fn default_plan_reminder() -> String {
@@ -182,12 +174,8 @@ impl MiddlewareFactory for AgentModeFactory {
         &self,
         config: &serde_json::Value,
         _agent_config: &crate::agent::agent_config::AgentConfig,
-    ) -> anyhow::Result<Arc<dyn MiddlewareDriver>> {
+    ) -> anyhow::Result<Option<Arc<dyn MiddlewareDriver>>> {
         let cfg: AgentModeFactoryConfig = serde_json::from_value(config.clone())?;
-
-        // Note: initial mode from config is used as the default_mode in AgentConfig.
-        // Per-session mode is set on ConversationContext by the session actor.
-        // We no longer set a global AtomicU8 here.
 
         // Build reminders map
         let mut reminders = HashMap::new();
@@ -211,7 +199,9 @@ impl MiddlewareFactory for AgentModeFactory {
         }
 
         // Use per-session mode path (reads from ConversationContext.session_mode)
-        Ok(Arc::new(AgentModeMiddleware::with_reminders(reminders)))
+        Ok(Some(Arc::new(AgentModeMiddleware::with_reminders(
+            reminders,
+        ))))
     }
 }
 
@@ -228,7 +218,7 @@ impl MiddlewareFactory for PlanModeCompatFactory {
         &self,
         config: &serde_json::Value,
         _agent_config: &crate::agent::agent_config::AgentConfig,
-    ) -> anyhow::Result<Arc<dyn MiddlewareDriver>> {
+    ) -> anyhow::Result<Option<Arc<dyn MiddlewareDriver>>> {
         // Parse the old plan_mode config format
         #[derive(Debug, Deserialize)]
         struct LegacyConfig {
@@ -259,7 +249,9 @@ impl MiddlewareFactory for PlanModeCompatFactory {
         );
 
         // Use per-session mode path (reads from ConversationContext.session_mode)
-        Ok(Arc::new(AgentModeMiddleware::with_reminders(reminders)))
+        Ok(Some(Arc::new(AgentModeMiddleware::with_reminders(
+            reminders,
+        ))))
     }
 }
 
@@ -284,7 +276,6 @@ mod tests {
     fn test_agent_mode_config_defaults() {
         let config = serde_json::json!({});
         let cfg: AgentModeFactoryConfig = serde_json::from_value(config).unwrap();
-        assert_eq!(cfg.default, "build");
         assert!(cfg.reminder.is_none());
         assert!(cfg.review_reminder.is_none());
         assert!(cfg.reminders.is_none());
@@ -293,12 +284,10 @@ mod tests {
     #[test]
     fn test_agent_mode_config_simple_format() {
         let config = serde_json::json!({
-            "default": "plan",
             "reminder": "Custom plan reminder",
             "review_reminder": "Custom review reminder"
         });
         let cfg: AgentModeFactoryConfig = serde_json::from_value(config).unwrap();
-        assert_eq!(cfg.default, "plan");
         assert_eq!(cfg.reminder.unwrap(), "Custom plan reminder");
         assert_eq!(cfg.review_reminder.unwrap(), "Custom review reminder");
     }
@@ -306,17 +295,25 @@ mod tests {
     #[test]
     fn test_agent_mode_config_advanced_format() {
         let config = serde_json::json!({
-            "default": "build",
             "reminders": {
                 "plan": "Plan msg",
                 "review": "Review msg"
             }
         });
         let cfg: AgentModeFactoryConfig = serde_json::from_value(config).unwrap();
-        assert_eq!(cfg.default, "build");
         let reminders = cfg.reminders.unwrap();
         assert_eq!(reminders.get("plan").unwrap(), "Plan msg");
         assert_eq!(reminders.get("review").unwrap(), "Review msg");
+    }
+
+    #[test]
+    fn agent_mode_config_rejects_the_former_default_key() {
+        let err = serde_json::from_value::<AgentModeFactoryConfig>(
+            serde_json::json!({"default": "plan"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("default"), "{err}");
     }
 
     #[test]

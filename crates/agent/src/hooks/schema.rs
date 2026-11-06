@@ -455,6 +455,8 @@ pub struct PreToolUseCommandInput {
     pub model: String,
     #[schemars(schema_with = "permission_mode_schema")]
     pub permission_mode: String,
+    /// MCP server providing the tool; `null` for other tools.
+    pub mcp_server: Option<String>,
     pub tool_name: String,
     pub tool_input: Value,
     pub tool_use_id: String,
@@ -499,6 +501,8 @@ pub struct PostToolUseCommandInput {
     pub model: String,
     #[schemars(schema_with = "permission_mode_schema")]
     pub permission_mode: String,
+    /// MCP server providing the tool; `null` for other tools.
+    pub mcp_server: Option<String>,
     pub tool_name: String,
     pub tool_input: Value,
     pub tool_response: Value,

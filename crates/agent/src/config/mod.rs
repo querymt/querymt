@@ -17,6 +17,7 @@ mod hooks;
 mod loader;
 mod mcp;
 mod mesh;
+mod permissions;
 mod prompt;
 mod quorum;
 mod schema;
@@ -30,6 +31,7 @@ pub use hooks::*;
 pub use loader::{ConfigSource, interpolate_env_vars, load_config};
 pub use mcp::*;
 pub use mesh::*;
+pub use permissions::*;
 pub use prompt::SystemPart;
 pub(crate) use prompt::{deserialize_system_parts, resolve_system_parts};
 pub use quorum::*;
@@ -45,11 +47,38 @@ pub enum Config {
     Multi(Box<QuorumConfig>),
 }
 
-fn default_true() -> bool {
-    true
+impl Config {
+    /// Every MCP server the configuration declares: the top-level `[[mcp]]`
+    /// entries and, for a quorum, each delegate's own `mcp` entries.
+    ///
+    /// A server shared by several delegates is yielded once per declaration.
+    pub fn mcp_servers(&self) -> impl Iterator<Item = &McpServerConfig> {
+        let (top, delegates): (&[McpServerConfig], &[DelegateConfig]) = match self {
+            Self::Single(config) => (&config.mcp, &[]),
+            Self::Multi(config) => (&config.mcp, &config.delegates),
+        };
+        top.iter()
+            .chain(delegates.iter().flat_map(|delegate| delegate.mcp.iter()))
+    }
+
+    /// Protocol (`.agents/`) settings of the configuration.
+    pub(crate) fn dotagents(&self) -> &crate::dotagents::DotagentsSettings {
+        match self {
+            Self::Single(config) => &config.dotagents,
+            Self::Multi(config) => &config.dotagents,
+        }
+    }
+
+    /// Working directory the configuration selects, if any.
+    pub(crate) fn cwd(&self) -> Option<&Path> {
+        match self {
+            Self::Single(config) => config.agent.cwd.as_deref(),
+            Self::Multi(config) => config.quorum.cwd.as_deref(),
+        }
+    }
 }
 
-pub(crate) fn default_assume_mutating() -> bool {
+fn default_true() -> bool {
     true
 }
 

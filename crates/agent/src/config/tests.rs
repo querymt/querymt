@@ -82,19 +82,6 @@ async fn plain_file_and_inline_sections_receive_runtime_cache_defaults() {
 }
 
 #[test]
-fn test_parse_tool_spec() {
-    assert_eq!(parse_tool_spec("edit"), ToolSpec::Builtin("edit".into()));
-    assert_eq!(
-        parse_tool_spec("github.*"),
-        ToolSpec::McpAll("github".into())
-    );
-    assert_eq!(
-        parse_tool_spec("github.search_repos"),
-        ToolSpec::McpSpecific("github".into(), "search_repos".into())
-    );
-}
-
-#[test]
 fn test_interpolate_env_vars() {
     unsafe {
         std::env::set_var("TEST_VAR", "test_value");
@@ -152,17 +139,39 @@ fn temp_config_path(filename: &str) -> PathBuf {
 fn test_system_absent() {
     let agent = parse_agent("");
     assert!(agent.system.is_empty());
-    assert!(agent.assume_mutating);
-    assert!(agent.mutating_tools.is_empty());
+    assert_eq!(agent.permissions, PermissionsConfig::default());
 }
 
 #[test]
-fn test_mutating_tool_settings_parse() {
+fn test_permissions_section_parses() {
     let agent = parse_agent(
-        "assume_mutating = false\nmutating_tools = [\"edit\", \"write_file\", \"shell\"]",
+        "[agent.permissions]\nask = [\"shell\"]\nalways_ask = [\"ibkr.place_order\"]\ntimeout_sec = 120",
     );
-    assert!(!agent.assume_mutating);
-    assert_eq!(agent.mutating_tools, vec!["edit", "write_file", "shell"]);
+    assert_eq!(agent.permissions.ask, vec!["shell".parse().unwrap()]);
+    assert_eq!(
+        agent.permissions.always_ask,
+        vec!["ibkr.place_order".parse().unwrap()]
+    );
+    assert_eq!(agent.permissions.timeout_sec.map(|s| s.get()), Some(120));
+}
+
+#[test]
+fn test_removed_permission_keys_fail_naming_the_key() {
+    for (key, line) in [
+        ("assume_mutating", "assume_mutating = false"),
+        ("mutating_tools", "mutating_tools = [\"edit\"]"),
+        ("confirm_tools", "confirm_tools = [\"shell\"]"),
+        ("confirm_timeout_sec", "confirm_timeout_sec = 30"),
+    ] {
+        let err =
+            toml::from_str::<AgentSettings>(&format!("provider = \"p\"\nmodel = \"m\"\n{line}"))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("unknown field") && err.contains(key),
+            "{key}: {err}"
+        );
+    }
 }
 
 #[test]
@@ -1634,6 +1643,7 @@ socket_path = "/run/mcp.sock"
                 client_id,
                 scopes,
                 redirect_port,
+                ..
             }),
         tasks,
         cache,
@@ -1706,6 +1716,7 @@ fn mcp_acp_round_trip_preserves_new_fields() {
         client_id: None,
         scopes: vec!["s".into()],
         redirect_port: Some(1234),
+        strict_scopes: false,
     });
     let McpServerConfig::Http { auth, .. } = McpServerConfig::from_acp(&oauth.to_acp()).unwrap()
     else {
@@ -1716,7 +1727,8 @@ fn mcp_acp_round_trip_preserves_new_fields() {
         Some(McpAuth::OAuth {
             client_id: None,
             scopes: vec!["s".into()],
-            redirect_port: Some(1234)
+            redirect_port: Some(1234),
+            strict_scopes: false,
         })
     );
 }
@@ -1752,4 +1764,228 @@ auth = { type = "oauth" }
         .await
         .expect_err("socket_path + oauth must be rejected");
     assert!(format!("{err:#}").contains("bad-sock"), "{err:#}");
+}
+
+/// The trading examples load from their real paths (prompt files resolve),
+/// split read and order scopes between the two profiles, and the desk starts
+/// disarmed in plan mode with its guard hooks wired.
+#[tokio::test]
+#[ignore = "trading example profiles are disabled in tests"]
+async fn trading_examples_load_with_split_scopes_and_a_disarmed_desk() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/confs");
+    let load = |name: &str| load_config(dir.join(name));
+    let (Config::Single(analyst), Config::Single(desk)) = (
+        load("trading_analyst.toml").await.unwrap(),
+        load("trading_desk.toml").await.unwrap(),
+    ) else {
+        panic!("single configs");
+    };
+
+    let scopes = |config: &SingleAgentConfig| match &config.mcp[0] {
+        McpServerConfig::Http {
+            auth: Some(McpAuth::OAuth { scopes, .. }),
+            ..
+        } => scopes.clone(),
+        other => panic!("expected an OAuth http server, got {other:?}"),
+    };
+    assert_eq!(scopes(&analyst), ["mcp.read"]);
+    assert!(scopes(&desk).contains(&"mcp.orders.submit".to_string()));
+    assert_ne!(analyst.mcp[0].name(), desk.mcp[0].name());
+
+    // The analyst has no way to place orders or to edit code symbolically.
+    let analyst_tools = &analyst.agent.tools;
+    assert!(analyst_tools.contains(&"ibkr_read.*".parse().unwrap()));
+    assert!(
+        !analyst_tools
+            .iter()
+            .any(|t| t.server().is_some_and(|s| s.starts_with("ibkr_trade")))
+    );
+    assert!(!analyst_tools.contains(&"replace_symbol".parse().unwrap()));
+    // The desk cannot reach around its guard.
+    for forbidden in ["shell", "write_file", "edit", "browse", "web_fetch"] {
+        assert!(
+            !desk.agent.tools.contains(&forbidden.parse().unwrap()),
+            "{forbidden}"
+        );
+    }
+
+    assert_eq!(
+        desk.agent.permissions.timeout_sec.map(|s| s.get()),
+        Some(120)
+    );
+    assert_eq!(desk.agent.hooks.pre_tool_use.len(), 1);
+    assert_eq!(desk.agent.hooks.pre_tool_use[0].matcher, None);
+    assert_eq!(desk.agent.hooks.post_tool_use.len(), 1);
+    assert!(desk.agent.hooks.base_dir.is_some());
+    assert_eq!(desk.agent.mode, crate::agent::core::AgentMode::Plan);
+}
+
+/// First fenced `toml` block that follows `marker` in a docs page.
+fn doc_toml_after(docs: &str, marker: &str) -> String {
+    let start = docs
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing {marker}"));
+    docs[start..]
+        .split("```toml")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .expect("toml block")
+        .to_string()
+}
+
+/// The `mode` snippet in `agent_modes.md` and the review profile in
+/// `configuration.md` must load.
+#[tokio::test]
+async fn documented_mode_snippets_load() {
+    let modes = include_str!("../../../../docs/docs/agent/agent_modes.md");
+    let toml = doc_toml_after(modes, "Set the initial mode with the typed `mode` key");
+    match load_config(ConfigSource::Toml(toml)).await.expect("loads") {
+        Config::Single(single) => {
+            assert_eq!(single.agent.mode, crate::agent::core::AgentMode::Plan)
+        }
+        _ => panic!("expected a single agent"),
+    }
+
+    let config = include_str!("../../../../docs/docs/agent/configuration.md");
+    let start = config.find("mode = \"review\"").expect("review snippet");
+    let block_start = config[..start].rfind("```toml").expect("fence") + "```toml".len();
+    let block = config[block_start..].split("```").next().unwrap();
+    match load_config(ConfigSource::Toml(block.to_string()))
+        .await
+        .expect("review profile loads")
+    {
+        Config::Single(single) => {
+            assert_eq!(single.agent.mode, crate::agent::core::AgentMode::Review)
+        }
+        _ => panic!("expected a single agent"),
+    }
+}
+
+#[tokio::test]
+async fn malformed_tool_selector_fails_loading_naming_the_field() {
+    for (section, toml) in [
+        (
+            "tools",
+            "[agent]\nprovider = \"t\"\nmodel = \"m\"\ntools = [\"github.\"]\n",
+        ),
+        (
+            "tools",
+            "[quorum]\n[planner]\nprovider=\"t\"\nmodel=\"m\"\ntools = [\"a.*.b\"]\n",
+        ),
+        (
+            "tools",
+            "[quorum]\n[planner]\nprovider=\"t\"\nmodel=\"m\"\n[[delegates]]\nid=\"d\"\nprovider=\"t\"\nmodel=\"m\"\ntools = [\"\"]\n",
+        ),
+    ] {
+        let err = load_config(ConfigSource::Toml(toml.to_string()))
+            .await
+            .expect_err("malformed selector must fail");
+        let text = format!("{err:#}");
+        assert!(text.contains(section), "{text}");
+    }
+}
+
+const MCP_IBKR: &str =
+    "[[mcp]]\ntransport = \"stdio\"\nname = \"ibkr_trade\"\ncommand = \"true\"\n";
+
+#[tokio::test]
+async fn permissions_naming_an_unconfigured_server_fail_loading() {
+    let toml = format!(
+        "[agent]\nprovider = \"t\"\nmodel = \"m\"\n[agent.permissions]\nalways_ask = [\"ibkr-trade.place_order\"]\n{MCP_IBKR}"
+    );
+    let err = load_config(ConfigSource::Toml(toml)).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("ibkr-trade") && text.contains("not configured"),
+        "{text}"
+    );
+
+    let ok = format!(
+        "[agent]\nprovider = \"t\"\nmodel = \"m\"\n[agent.permissions]\nalways_ask = [\"ibkr_trade.place_order\"]\n{MCP_IBKR}"
+    );
+    load_config(ConfigSource::Toml(ok)).await.unwrap();
+}
+
+#[tokio::test]
+async fn permissions_outside_a_tools_selection_fail_naming_tools() {
+    let toml = "[agent]\nprovider = \"t\"\nmodel = \"m\"\ntools = [\"read_tool\"]\n[agent.permissions]\nask = [\"shell\"]\n";
+    let err = load_config(ConfigSource::Toml(toml.into()))
+        .await
+        .unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("shell") && text.contains("`tools`"), "{text}");
+}
+
+#[tokio::test]
+async fn planner_and_delegate_permissions_are_validated_with_their_servers() {
+    let planner = "[quorum]\n[planner]\nprovider=\"t\"\nmodel=\"m\"\n[planner.permissions]\nask = [\"nope.x\"]\n";
+    let err = load_config(ConfigSource::Toml(planner.into()))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("planner"));
+
+    // A delegate-level server is visible to that delegate only.
+    let delegate = |perm_server: &str| {
+        format!(
+            "[quorum]\n[planner]\nprovider=\"t\"\nmodel=\"m\"\n[[delegates]]\nid=\"d\"\nprovider=\"t\"\nmodel=\"m\"\n[delegates.permissions]\nask = [\"{perm_server}.x\"]\n[[delegates.mcp]]\ntransport = \"stdio\"\nname = \"own\"\ncommand = \"true\"\n"
+        )
+    };
+    load_config(ConfigSource::Toml(delegate("own")))
+        .await
+        .unwrap();
+    let err = load_config(ConfigSource::Toml(delegate("other")))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("delegate 'd'"));
+}
+
+/// The approval example in `configuration.md` must load.
+#[tokio::test]
+async fn documented_approval_snippet_loads() {
+    let docs = include_str!("../../../../docs/docs/agent/configuration.md");
+    let table = doc_toml_after(docs, "### Tool approval");
+    let toml = format!(
+        "[agent]\nprovider = \"t\"\nmodel = \"m\"\n{table}\n[[mcp]]\ntransport = \"stdio\"\nname = \"ibkr\"\ncommand = \"true\"\n"
+    );
+    let Config::Single(single) = load_config(ConfigSource::Toml(toml)).await.expect("loads") else {
+        panic!("expected a single agent");
+    };
+    assert_eq!(single.agent.permissions.ask, vec!["shell".parse().unwrap()]);
+    assert_eq!(
+        single.agent.permissions.timeout_sec.map(|s| s.get()),
+        Some(120)
+    );
+}
+
+#[tokio::test]
+async fn config_mcp_servers_include_quorum_delegate_servers() {
+    let toml = r#"
+[quorum]
+cwd = "/tmp"
+
+[[mcp]]
+name = "shared"
+transport = "stdio"
+command = "true"
+
+[planner]
+provider = "openai"
+model = "gpt-4"
+
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+
+[[delegates.mcp]]
+name = "private"
+transport = "http"
+url = "https://private.example/mcp"
+auth = { type = "oauth", scopes = ["read"] }
+"#;
+    let config = load_config(ConfigSource::Toml(toml.to_string()))
+        .await
+        .unwrap();
+    let names: Vec<_> = config.mcp_servers().map(|s| s.name()).collect();
+    assert_eq!(names, ["shared", "private"]);
 }

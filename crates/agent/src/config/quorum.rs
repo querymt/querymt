@@ -93,7 +93,7 @@ pub struct QuorumSettings {
     /// - `"diff"`: Capture file diffs between snapshots.
     /// - `"metadata"`: Capture file metadata only.
     /// - absent / `null`: No snapshots.
-    #[serde(default = "default_snapshot_policy")]
+    #[serde(default)]
     #[schemars(extend("enum" = ["diff", "metadata"]))]
     pub snapshot_policy: Option<String>,
 
@@ -130,10 +130,6 @@ fn default_true() -> bool {
     true
 }
 
-fn default_snapshot_policy() -> Option<String> {
-    None
-}
-
 /// Planner agent configuration.
 ///
 /// The planner decomposes tasks and delegates subtasks to worker agents.
@@ -157,7 +153,11 @@ pub struct PlannerConfig {
         ["delegate", "read_tool", "shell", "glob"],
         ["delegate", "read_tool", "shell", "glob", "search_text", "question"]
     ]))]
-    pub tools: Vec<String>,
+    pub tools: Vec<ToolSpec>,
+
+    /// Initial mode of new planner sessions: `build` (default), `plan` or `review`.
+    #[serde(default)]
+    pub mode: crate::agent::core::AgentMode,
 
     /// System prompt for the planner. Accepts a string or mixed array of
     /// inline strings and `{ file = "path" }` references.
@@ -180,6 +180,10 @@ pub struct PlannerConfig {
     /// Skills system configuration.
     #[serde(default)]
     pub skills: SkillsConfig,
+
+    /// Tool approval for the planner.
+    #[serde(default)]
+    pub permissions: PermissionsConfig,
 }
 
 /// Delegate (worker) agent configuration.
@@ -216,7 +220,11 @@ pub struct DelegateConfig {
         ["edit", "write_file", "shell", "read_tool", "glob", "search_text"],
         ["edit", "write_file", "read_tool", "glob"]
     ]))]
-    pub tools: Vec<String>,
+    pub tools: Vec<ToolSpec>,
+
+    /// Initial mode of new delegate sessions: `build` (default), `plan` or `review`.
+    #[serde(default)]
+    pub mode: crate::agent::core::AgentMode,
 
     /// System prompt for this delegate. Accepts a string or mixed array of
     /// inline strings and `{ file = "path" }` references.
@@ -244,15 +252,9 @@ pub struct DelegateConfig {
     #[serde(default)]
     pub skills: SkillsConfig,
 
-    /// Whether to treat unknown tools as mutating, requiring snapshot + permission confirmation.
-    /// Set to `false` and use `mutating_tools` for explicit control.
-    #[serde(default = "crate::config::default_assume_mutating")]
-    pub assume_mutating: bool,
-
-    /// Explicit allowlist of tools that modify the filesystem or execute commands.
-    /// Common values: `["edit", "write_file", "delete_file", "shell"]`.
+    /// Tool approval for this delegate.
     #[serde(default)]
-    pub mutating_tools: Vec<String>,
+    pub permissions: PermissionsConfig,
 
     /// Optional mesh peer name (references a `[[mesh.peers]]` entry).
     ///

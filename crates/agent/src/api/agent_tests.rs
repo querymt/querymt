@@ -2789,3 +2789,154 @@ mod workspace_api {
         assert!(dir.path().join("wt").is_dir());
     }
 }
+
+// ── Typed mode and shared middleware assembly ───────────────────────────────
+
+async fn build_single_from_toml(toml: &str) -> Result<Agent> {
+    let config: crate::config::SingleAgentConfig = toml::from_str(toml)?;
+    let (registry, _dir) = empty_plugin_registry()?;
+    Agent::builder_from_config(config, None)?
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await
+}
+
+#[tokio::test]
+async fn single_agent_starts_in_the_configured_mode() -> Result<()> {
+    let agent = build_single_from_toml(
+        "[agent]\nprovider = \"openai\"\nmodel = \"gpt-4\"\nmode = \"plan\"\n",
+    )
+    .await?;
+    let mode = *agent.inner.config.default_mode.lock().unwrap();
+    assert_eq!(mode, crate::agent::core::AgentMode::Plan);
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_mode_middleware_rejects_the_former_default_key() {
+    let err = build_single_from_toml(
+        "[agent]\nprovider = \"openai\"\nmodel = \"gpt-4\"\n\n[[middleware]]\ntype = \"agent_mode\"\ndefault = \"plan\"\n",
+    )
+    .await
+    .err()
+    .expect("leftover default must fail the build");
+    let text = format!("{err:#}");
+    assert!(text.contains("middleware 'agent_mode'"), "{text}");
+    assert!(text.contains("default"), "{text}");
+}
+
+#[tokio::test]
+async fn turned_off_middleware_builds_without_error() -> Result<()> {
+    let agent = build_single_from_toml(
+        "[agent]\nprovider = \"openai\"\nmodel = \"gpt-4\"\n\n[[middleware]]\ntype = \"context\"\nenabled = false\n",
+    )
+    .await?;
+    assert!(
+        !agent
+            .inner
+            .config
+            .middleware_drivers
+            .iter()
+            .any(|d| d.name() == "ContextMiddleware")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_middleware_fails_single_and_quorum_with_the_same_error() {
+    let entry = "[[middleware]]\ntype = \"limits\"\ncache_write_cost_per_million = -2.0\n";
+    let single = build_single_from_toml(&format!(
+        "[agent]\nprovider = \"openai\"\nmodel = \"gpt-4\"\n\n{entry}"
+    ))
+    .await
+    .err()
+    .expect("single must fail");
+
+    let quorum_toml = "[quorum]\ncwd = \"/tmp\"\n\n[planner]\nprovider = \"openai\"\nmodel = \"gpt-4\"\ntools = [\"delegate\"]\n\n[[planner.middleware]]\ntype = \"limits\"\ncache_write_cost_per_million = -2.0\n";
+    let config: crate::config::QuorumConfig = toml::from_str(quorum_toml).unwrap();
+    let (registry, _dir) = empty_plugin_registry().unwrap();
+    let quorum = Agent::builder_from_quorum_config(config, None)
+        .unwrap()
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                    .await
+                    .unwrap(),
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await
+        .err()
+        .expect("quorum must fail");
+
+    let single_text = format!("{single:#}");
+    let quorum_text = format!("{quorum:#}");
+    assert!(
+        quorum_text.contains(&single_text),
+        "single: {single_text}\nquorum: {quorum_text}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "trading example profiles are disabled in tests"]
+async fn built_trading_desk_agent_has_a_120s_approval_timeout() -> Result<()> {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/confs/trading_desk.toml");
+    let crate::config::Config::Single(mut config) = crate::config::load_config(path).await? else {
+        panic!("single config");
+    };
+    // The example's `~/trading` workspace does not exist here.
+    let workspace = tempfile::tempdir()?;
+    config.agent.cwd = Some(workspace.path().to_path_buf());
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = Agent::from_config(
+        *config,
+        AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        agent.inner().config.permissions.timeout,
+        Some(std::time::Duration::from_secs(120))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn build_reports_a_malformed_tool_selector() {
+    let (registry, _temp_dir) = empty_plugin_registry().unwrap();
+    let err = Agent::single()
+        .provider("openai", "gpt-4o-mini")
+        .tools(["github."])
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: None,
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await
+        .err()
+        .expect("malformed selector must fail the build");
+    assert!(
+        err.to_string().contains("invalid `tools` selector"),
+        "{err}"
+    );
+}

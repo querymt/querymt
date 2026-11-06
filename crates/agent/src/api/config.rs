@@ -1,11 +1,34 @@
 //! Agent configuration types for the simple builder API
 
 use super::utils::infer_required_capabilities;
-use crate::config::{ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, SkillsConfig};
+use crate::agent::core::AgentMode;
+use crate::config::{
+    ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, Permissions, SkillsConfig,
+    ToolSpec, ToolSpecError,
+};
 use crate::tools::CapabilityRequirement;
 use crate::worktree::DelegationIsolation;
 use querymt::{LLMParams, chat::ReasoningEffort};
 use serde_json::Value;
+
+/// Parses tool selectors; keeps the valid ones and the first error.
+pub(super) fn parse_tool_specs<I, S>(tools: I) -> (Vec<ToolSpec>, Option<ToolSpecError>)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut specs = Vec::new();
+    let mut error = None;
+    for tool in tools {
+        match tool.as_ref().parse() {
+            Ok(spec) => specs.push(spec),
+            Err(e) => {
+                error.get_or_insert(e);
+            }
+        }
+    }
+    (specs, error)
+}
 
 /// Internal configuration for building agents
 #[derive(Clone)]
@@ -13,14 +36,16 @@ pub(super) struct AgentConfig {
     pub id: String,
     pub llm_config: Option<LLMParams>,
     pub capabilities: Vec<String>,
-    pub tools: Vec<String>,
+    pub tools: Vec<ToolSpec>,
+    /// First malformed selector passed to `tools(..)`; reported by `build()`.
+    pub tool_error: Option<ToolSpecError>,
     pub description: Option<String>,
     pub required_capabilities: Vec<CapabilityRequirement>,
     pub middleware: Vec<MiddlewareEntry>,
     pub execution: ExecutionPolicy,
     pub skills: Option<SkillsConfig>,
-    pub assume_mutating: Option<bool>,
-    pub mutating_tools: Option<Vec<String>>,
+    pub mode: AgentMode,
+    pub permissions: Permissions,
     pub hooks: HooksConfig,
     /// MCP servers resolved for this agent, attached to its runtime through the
     /// existing stdio and streamable-http transports.
@@ -36,13 +61,14 @@ impl AgentConfig {
             llm_config: None,
             capabilities: Vec::new(),
             tools: Vec::new(),
+            tool_error: None,
             description: None,
             required_capabilities: Vec::new(),
             middleware: Vec::new(),
             execution: ExecutionPolicy::default(),
             skills: None,
-            assume_mutating: None,
-            mutating_tools: None,
+            mode: AgentMode::default(),
+            permissions: Permissions::default(),
             hooks: HooksConfig::default(),
             mcp_servers: Vec::new(),
             isolation: DelegationIsolation::default(),
@@ -119,9 +145,21 @@ impl PlannerConfigBuilder {
     pub fn tools<I, S>(mut self, tools: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: AsRef<str>,
     {
-        self.config.tools = tools.into_iter().map(Into::into).collect();
+        (self.config.tools, self.config.tool_error) = parse_tool_specs(tools);
+        self
+    }
+
+    /// Initial mode of new sessions for this agent.
+    pub fn mode(mut self, mode: AgentMode) -> Self {
+        self.config.mode = mode;
+        self
+    }
+
+    /// Tool approval policy for this agent.
+    pub fn permissions(mut self, permissions: Permissions) -> Self {
+        self.config.permissions = permissions;
         self
     }
 
@@ -218,9 +256,15 @@ impl DelegateConfigBuilder {
     pub fn tools<I, S>(mut self, tools: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: AsRef<str>,
     {
-        self.config.tools = tools.into_iter().map(Into::into).collect();
+        (self.config.tools, self.config.tool_error) = parse_tool_specs(tools);
+        self
+    }
+
+    /// Initial mode of new sessions for this agent.
+    pub fn mode(mut self, mode: AgentMode) -> Self {
+        self.config.mode = mode;
         self
     }
 
@@ -236,17 +280,9 @@ impl DelegateConfigBuilder {
         self
     }
 
-    pub fn assume_mutating(mut self, value: bool) -> Self {
-        self.config.assume_mutating = Some(value);
-        self
-    }
-
-    pub fn mutating_tools<I, S>(mut self, tools: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.config.mutating_tools = Some(tools.into_iter().map(Into::into).collect());
+    /// Tool approval policy for this delegate.
+    pub fn permissions(mut self, permissions: Permissions) -> Self {
+        self.config.permissions = permissions;
         self
     }
 

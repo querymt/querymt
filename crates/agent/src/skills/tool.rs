@@ -316,6 +316,10 @@ impl Tool for SkillTool {
         Self::NAME
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> querymt::chat::Tool {
         self.definition_for_workspace(None)
     }

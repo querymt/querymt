@@ -44,6 +44,10 @@ impl Tool for GetSymbolTool {
         "get_symbol"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> ChatTool {
         ChatTool {
             tool_type: "function".to_string(),

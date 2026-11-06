@@ -12,8 +12,8 @@ use crate::agent::core::{
 };
 use crate::agent::session_mcp::{NoopSessionMcpAttachmentSource, SessionMcpAttachmentSource};
 use crate::config::{
-    CompactionConfig, DelegationWaitPolicy, McpServerConfig, PruningConfig, RateLimitConfig,
-    RuntimeExecutionPolicy, ToolOutputConfig,
+    CompactionConfig, DelegationWaitPolicy, McpServerConfig, Permissions, PruningConfig,
+    RateLimitConfig, RuntimeExecutionPolicy, ToolOutputConfig, ToolSpec,
 };
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
 use crate::event_fanout::EventFanout;
@@ -32,7 +32,6 @@ use crate::tools::ToolRegistry;
 use arc_swap::ArcSwap;
 use querymt::LLMParams;
 use querymt::plugin::host::PluginRegistry;
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
@@ -50,8 +49,7 @@ pub struct AgentConfigBuilder {
     default_mode: Arc<StdMutex<AgentMode>>,
     max_steps: Option<usize>,
     snapshot_policy: SnapshotPolicy,
-    assume_mutating: bool,
-    mutating_tools: HashSet<String>,
+    permissions: Permissions,
     max_prompt_bytes: Option<usize>,
     tool_config: ToolConfig,
     tool_registry: ToolRegistry,
@@ -106,8 +104,7 @@ impl AgentConfigBuilder {
             default_mode: Arc::new(StdMutex::new(AgentMode::Build)),
             max_steps: None,
             snapshot_policy: SnapshotPolicy::None,
-            assume_mutating: true,
-            mutating_tools: HashSet::new(),
+            permissions: Permissions::default(),
             max_prompt_bytes: None,
             tool_config: ToolConfig::default(),
             tool_registry,
@@ -161,8 +158,7 @@ impl AgentConfigBuilder {
             default_mode: Arc::new(StdMutex::new(AgentMode::Build)),
             max_steps: None,
             snapshot_policy: SnapshotPolicy::None,
-            assume_mutating: true,
-            mutating_tools: HashSet::new(),
+            permissions: Permissions::default(),
             max_prompt_bytes: None,
             tool_config: ToolConfig::default(),
             tool_registry: ToolRegistry::new(),
@@ -223,8 +219,7 @@ impl AgentConfigBuilder {
             auth_methods: self.auth_methods,
             max_steps: self.max_steps,
             snapshot_policy: self.snapshot_policy,
-            assume_mutating: self.assume_mutating,
-            mutating_tools: self.mutating_tools,
+            permissions: self.permissions,
             max_prompt_bytes: self.max_prompt_bytes,
             execution_timeout_secs: self.execution_timeout_secs,
             delegation_wait_policy: self.delegation_wait_policy,
@@ -558,43 +553,21 @@ impl AgentConfigBuilder {
         self
     }
 
-    /// Sets the allowed tools allowlist.
-    pub fn with_allowed_tools<I, S>(mut self, tool_names: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.tool_config.allowlist = Some(
-            tool_names
-                .into_iter()
-                .map(Into::into)
-                .collect::<HashSet<_>>(),
-        );
+    /// Sets the allowlist; only tools matched by these selectors are available.
+    pub fn with_allowed_tools(mut self, tools: impl IntoIterator<Item = ToolSpec>) -> Self {
+        self.tool_config.allow = Some(tools.into_iter().collect());
         self
     }
 
-    /// Sets the denied tools denylist.
-    pub fn with_denied_tools<I, S>(mut self, tool_names: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.tool_config.denylist = tool_names.into_iter().map(Into::into).collect();
+    /// Sets the deny list; tools matched by these selectors are never available.
+    pub fn with_denied_tools(mut self, tools: impl IntoIterator<Item = ToolSpec>) -> Self {
+        self.tool_config.deny = tools.into_iter().collect();
         self
     }
 
-    /// Sets specific tools to be considered mutating.
-    pub fn with_mutating_tools<I>(mut self, tools: I) -> Self
-    where
-        I: IntoIterator<Item = String>,
-    {
-        self.mutating_tools = tools.into_iter().collect();
-        self
-    }
-
-    /// Sets whether to assume all tools are mutating by default.
-    pub fn with_assume_mutating(mut self, assume: bool) -> Self {
-        self.assume_mutating = assume;
+    /// Sets the tool approval policy.
+    pub fn with_permissions(mut self, permissions: Permissions) -> Self {
+        self.permissions = permissions;
         self
     }
 
@@ -642,9 +615,10 @@ impl AgentConfigBuilder {
 
     /// Sets the initial agent mode.
     pub fn with_agent_mode(self, mode: AgentMode) -> Self {
-        if let Ok(mut default_mode) = self.default_mode.lock() {
-            *default_mode = mode;
-        }
+        *self
+            .default_mode
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = mode;
         self
     }
 
@@ -690,9 +664,9 @@ impl AgentConfigBuilder {
         self.middleware_drivers.push(driver);
     }
 
-    /// Whether a middleware driver with this `name()` was already pushed.
-    pub fn has_middleware_named(&self, name: &str) -> bool {
-        self.middleware_drivers.iter().any(|d| d.name() == name)
+    /// Clone of the middleware drivers pushed so far.
+    pub fn middleware_snapshot(&self) -> Vec<Arc<dyn MiddlewareDriver>> {
+        self.middleware_drivers.clone()
     }
 
     /// Clone of the current tool registry.
@@ -745,6 +719,7 @@ mod tests {
     use super::*;
     use crate::agent::core::{AgentMode, SnapshotPolicy, ToolPolicy};
     use crate::config::PruningConfig;
+    use crate::config::ToolRef;
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::test_utils::helpers::empty_plugin_registry;
     use querymt::LLMParams;
@@ -814,14 +789,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_assume_mutating_false() {
-        let (builder, _td) = make_builder().await;
-        let builder = builder.with_assume_mutating(false);
-        let config = builder.build();
-        assert!(!config.assume_mutating);
-    }
-
-    #[tokio::test]
     async fn with_tool_policy_changes_policy() {
         let (builder, _td) = make_builder().await;
         let builder = builder.with_tool_policy(ToolPolicy::BuiltInOnly);
@@ -832,21 +799,28 @@ mod tests {
     #[tokio::test]
     async fn with_allowed_tools_sets_allowlist() {
         let (builder, _td) = make_builder().await;
-        let builder = builder.with_allowed_tools(["shell", "read_tool"]);
+        let builder =
+            builder.with_allowed_tools(["shell".parse().unwrap(), "read_tool".parse().unwrap()]);
         let config = builder.build();
-        let allowlist = config.tool_config.allowlist.unwrap();
-        assert!(allowlist.contains("shell"));
-        assert!(allowlist.contains("read_tool"));
-        assert!(!allowlist.contains("delete_file"));
+        let allow = config.tool_config.allow.unwrap();
+        assert!(allow.contains(ToolRef::builtin("shell")));
+        assert!(allow.contains(ToolRef::builtin("read_tool")));
+        assert!(!allow.contains(ToolRef::builtin("delete_file")));
     }
 
     #[tokio::test]
     async fn with_denied_tools_sets_denylist() {
         let (builder, _td) = make_builder().await;
-        let builder = builder.with_denied_tools(["shell".to_string(), "delete_file".to_string()]);
+        let builder =
+            builder.with_denied_tools(["shell".parse().unwrap(), "github.*".parse().unwrap()]);
         let config = builder.build();
-        assert!(config.tool_config.denylist.contains("shell"));
-        assert!(config.tool_config.denylist.contains("delete_file"));
+        assert!(config.tool_config.deny.contains(ToolRef::builtin("shell")));
+        assert!(
+            config
+                .tool_config
+                .deny
+                .contains(ToolRef::mcp("github", "x"))
+        );
     }
 
     #[tokio::test]
@@ -870,11 +844,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_mutating_tools_sets_set() {
+    async fn with_permissions_sets_policy() {
         let (builder, _td) = make_builder().await;
-        let builder = builder.with_mutating_tools(["my_tool".to_string()]);
-        let config = builder.build();
-        assert!(config.mutating_tools.contains("my_tool"));
+        let perms = Permissions::new()
+            .ask(["shell".parse().unwrap()])
+            .timeout(std::time::Duration::from_secs(5));
+        let config = builder.with_permissions(perms.clone()).build();
+        assert_eq!(config.permissions, perms);
     }
 
     // ── build() produces valid AgentConfig ──────────────────────────────────

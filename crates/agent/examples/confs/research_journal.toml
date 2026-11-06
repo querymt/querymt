@@ -33,8 +33,6 @@
 [agent]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-assume_mutating = false
-mutating_tools = []
 
 tools = [
   # Research tools
