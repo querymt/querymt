@@ -102,3 +102,104 @@ pub(crate) async fn emit_session_pins_changed_notification(
         log::warn!("Failed to send session-pins-changed notification: {error}");
     }
 }
+
+/// An MCP server that was left out of a session because its authorization is
+/// missing or could not be checked. The session itself still started.
+///
+/// Carried by the `McpServerAuthRequired` event, by session responses
+/// (`_meta.querymt.skippedMcpServers`) and, with the session id, by the
+/// `querymt/session/mcpAuthRequired` notification.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedMcpServer {
+    pub server_name: String,
+    /// Provider id to log in with (`mcp:<server>`).
+    pub provider_id: String,
+    /// Why authorization could not be used, when it is not simply "no login
+    /// yet" (e.g. the authorization server is unreachable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl SkippedMcpServer {
+    /// No usable credentials: the user has to log in.
+    pub fn auth_required(server: &str) -> Self {
+        Self {
+            server_name: server.to_string(),
+            provider_id: crate::mcp_auth::provider_id(server),
+            error: None,
+        }
+    }
+
+    /// Authorization could not be checked; logging in may not help until the
+    /// underlying problem is fixed.
+    pub fn auth_unavailable(server: &str, reason: &str) -> Self {
+        Self {
+            error: Some(reason.to_string()),
+            ..Self::auth_required(server)
+        }
+    }
+}
+
+pub const MCP_AUTH_REQUIRED_VERSION: u32 = 1;
+
+/// Params of the `querymt/session/mcpAuthRequired` notification.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpAuthRequiredNotification {
+    pub version: u32,
+    pub session_id: String,
+    pub server_name: String,
+    pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod mcp_auth_tests {
+    use super::*;
+
+    #[test]
+    fn auth_required_params_keep_their_wire_format() {
+        let n = McpAuthRequiredNotification {
+            version: MCP_AUTH_REQUIRED_VERSION,
+            session_id: "s1".into(),
+            server_name: "linear".into(),
+            provider_id: "mcp:linear".into(),
+            error: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&n).unwrap(),
+            serde_json::json!({
+                "version": 1, "session_id": "s1",
+                "server_name": "linear", "provider_id": "mcp:linear",
+            })
+        );
+        let n = McpAuthRequiredNotification {
+            error: Some("idp unreachable".into()),
+            ..n
+        };
+        assert_eq!(
+            serde_json::to_value(&n).unwrap(),
+            serde_json::json!({
+                "version": 1, "session_id": "s1",
+                "server_name": "linear", "provider_id": "mcp:linear",
+                "error": "idp unreachable",
+            })
+        );
+    }
+
+    #[test]
+    fn skipped_server_wire_format() {
+        assert_eq!(
+            serde_json::to_value(SkippedMcpServer::auth_required("linear")).unwrap(),
+            serde_json::json!({"server_name": "linear", "provider_id": "mcp:linear"})
+        );
+        assert_eq!(
+            serde_json::to_value(SkippedMcpServer::auth_unavailable("corp", "down")).unwrap(),
+            serde_json::json!({
+                "server_name": "corp", "provider_id": "mcp:corp", "error": "down"
+            })
+        );
+    }
+}

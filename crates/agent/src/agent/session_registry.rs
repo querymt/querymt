@@ -483,8 +483,11 @@ impl SessionRegistry {
     ) -> Result<SessionMaterialization, Error> {
         let merged_mcp = self.merged_mcp_servers(mcp_servers);
         let tool_state = crate::agent::core::McpToolState::empty();
+        let connect_ctx =
+            crate::agent::mcp::McpConnectContext::from_config(&self.config.mcp_servers);
         let mcp_services = crate::agent::protocol::build_mcp_state(
             &merged_mcp,
+            &connect_ctx,
             self.config.pending_elicitations(),
             self.config.event_sink.clone(),
             session_id.clone(),
@@ -1570,11 +1573,10 @@ mod tests {
         Arc::get_mut(&mut f.registry.config)
             .expect("single owner")
             .mcp_servers
-            .push(crate::config::McpServerConfig::Http {
-                name: "config-server".to_string(),
-                url: "https://mcp.example.com/mcp".to_string(),
-                headers: std::collections::HashMap::new(),
-            });
+            .push(crate::config::McpServerConfig::http(
+                "config-server",
+                "https://mcp.example.com/mcp",
+            ));
 
         let merged = f.registry.merged_mcp_servers(&[]);
         assert_eq!(merged.len(), 1);
@@ -1601,11 +1603,10 @@ mod tests {
         Arc::get_mut(&mut f.registry.config)
             .expect("single owner")
             .mcp_servers
-            .push(crate::config::McpServerConfig::Http {
-                name: "shared-name".to_string(),
-                url: "https://config.example.com/mcp".to_string(),
-                headers: std::collections::HashMap::new(),
-            });
+            .push(crate::config::McpServerConfig::http(
+                "shared-name",
+                "https://config.example.com/mcp",
+            ));
 
         // Request provides a different URL for the same name — should win.
         let req_server = crate::acp::protocol::McpServerHttp::new(
@@ -1629,11 +1630,10 @@ mod tests {
         Arc::get_mut(&mut f.registry.config)
             .expect("single owner")
             .mcp_servers
-            .push(crate::config::McpServerConfig::Http {
-                name: "config-server".to_string(),
-                url: "https://config.example.com/mcp".to_string(),
-                headers: std::collections::HashMap::new(),
-            });
+            .push(crate::config::McpServerConfig::http(
+                "config-server",
+                "https://config.example.com/mcp",
+            ));
 
         let req_server = crate::acp::protocol::McpServerHttp::new(
             "req-server".to_string(),

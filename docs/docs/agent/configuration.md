@@ -253,6 +253,52 @@ url = "https://mcp.context7.com/mcp"
 headers = { AUTHORIZATION = "Bearer ${CONTEXT7_API_KEY}" }
 ```
 
+### OAuth for HTTP MCP servers
+
+HTTP servers declared here can authorize with OAuth 2.1 (discovery, PKCE,
+dynamic client registration unless `client_id` is set, automatic refresh):
+
+```toml
+[[mcp]]
+name = "linear"
+transport = "http"
+url = "https://mcp.linear.app/mcp"
+auth = { type = "oauth", scopes = ["read"] }
+# auth = { type = "oauth", client_id = "my-client-id", redirect_port = 47821 }
+```
+
+- **Scope:** OAuth applies only to servers declared in the agent configuration.
+  A client-supplied server that asks for OAuth without a matching name and URL
+  fails to connect; one that overrides a configured OAuth server with a
+  different URL connects without OAuth. OAuth cannot be combined with
+  `socket_path` or an `Authorization` header.
+- **Login:** use the `_querymt/auth/*` extension methods (`start`, `complete`,
+  `status`, `logout`) with the provider id `mcp:<server name>`, for example
+  `mcp:linear`. Login flows are scoped to the client that started them. The
+  loopback redirect URI is `http://127.0.0.1:<redirect_port>/callback`; the
+  default port is `47821`. Register that URI when using a fixed `client_id`.
+- **Storage:** tokens are kept in the secret store under `mcp-oauth:<server>`,
+  bound to the server URL, and never written to config, logs, events, or
+  session history.
+- **Without a login:** the server is skipped, the session starts with the
+  remaining servers, and clients receive a `querymt/session/mcpAuthRequired`
+  notification (also the transient `McpServerAuthRequired` event) naming the
+  provider id. Other connection failures still fail session setup.
+- **Availability:** a completed login applies to sessions that connect their
+  MCP servers afterwards (new, loaded, resumed, forked), without restarting the
+  agent. Sessions that are already running keep their current connections. If a
+  refresh token is rejected during a live session, that server's tool calls
+  fail with `authorization required for MCP server <name>; log in with provider
+  mcp:<name>` until a new session connects after login.
+
+### Other MCP server options
+
+- `tasks = true` declares the MCP tasks extension to the server (default
+  `false`); long-running tasks are followed until they finish.
+- `cache = false` turns off response caching of tool listings (default `true`).
+- `socket_path = "/run/mcp.sock"` (HTTP, Unix only) connects over a Unix domain
+  socket; `url` is still used for addressing and the `Host` header.
+
 ### Tool Selection with MCP
 
 ```toml

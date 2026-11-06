@@ -416,6 +416,7 @@ fn approved_workspace_mcp_stdio_conversion_uses_existing_process_config() {
         command,
         args,
         env,
+        ..
     }) = config
     else {
         panic!("expected the existing stdio process configuration, got {config:?}");
@@ -458,7 +459,10 @@ fn mcp_streamable_http_conversion_uses_existing_http_config() {
         .insert("Authorization".to_string(), "Bearer x".to_string());
 
     let config = adapters::convert_server(&server).expect("conversion succeeds");
-    let Some(crate::config::McpServerConfig::Http { name, url, headers }) = config else {
+    let Some(crate::config::McpServerConfig::Http {
+        name, url, headers, ..
+    }) = config
+    else {
         panic!("expected the existing streamable HTTP configuration, got {config:?}");
     };
     assert_eq!(name, "test");

@@ -9,8 +9,7 @@
 use rmcp::RoleClient;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    ClientCapabilities, ClientInfo, CreateElicitationRequestParams, CreateElicitationResult,
-    Implementation,
+    ClientCapabilities, ClientConfig, ElicitRequestParams, ElicitResult, Implementation,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use serde::{Deserialize, Serialize};
@@ -43,6 +42,8 @@ impl From<rmcp::model::ElicitationAction> for ElicitationAction {
             rmcp::model::ElicitationAction::Accept => ElicitationAction::Accept,
             rmcp::model::ElicitationAction::Decline => ElicitationAction::Decline,
             rmcp::model::ElicitationAction::Cancel => ElicitationAction::Cancel,
+            // Non-exhaustive upstream: treat unknown actions as a cancel.
+            _ => ElicitationAction::Cancel,
         }
     }
 }
@@ -1272,6 +1273,10 @@ pub struct McpClientHandler {
     session_id: String,
     client_impl: Implementation,
     tool_state: Arc<crate::agent::core::McpToolState>,
+    /// Routes this connection's progress / task-status notifications to calls.
+    router: querymt::mcp::progress::McpNotificationRouter,
+    /// Declare the MCP tasks extension during `initialize`.
+    tasks: bool,
 }
 
 impl McpClientHandler {
@@ -1290,7 +1295,21 @@ impl McpClientHandler {
             session_id,
             client_impl,
             tool_state,
+            router: Default::default(),
+            tasks: false,
         }
+    }
+
+    /// Declare the MCP tasks extension to the server (default: not declared).
+    #[must_use]
+    pub fn with_tasks(mut self, enabled: bool) -> Self {
+        self.tasks = enabled;
+        self
+    }
+
+    /// The router adapters of this connection must carry to receive progress.
+    pub fn router(&self) -> querymt::mcp::progress::McpNotificationRouter {
+        self.router.clone()
     }
 }
 
@@ -1298,17 +1317,16 @@ impl ClientHandler for McpClientHandler {
     #[allow(clippy::manual_async_fn)]
     fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParams,
+        request: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
-    ) -> impl std::future::Future<Output = Result<CreateElicitationResult, rmcp::ErrorData>> + Send + '_
-    {
+    ) -> impl std::future::Future<Output = Result<ElicitResult, rmcp::ErrorData>> + Send + '_ {
         async move {
             let elicitation_id = uuid::Uuid::new_v4().to_string();
             let (tx, rx) = oneshot::channel();
 
             // Extract message and schema from the enum variant.
             let (message, schema_json) = match &request {
-                CreateElicitationRequestParams::FormElicitationParams {
+                ElicitRequestParams::FormElicitationParams {
                     meta,
                     message,
                     requested_schema,
@@ -1316,9 +1334,14 @@ impl ClientHandler for McpClientHandler {
                     message.clone(),
                     form_schema_with_meta(requested_schema, meta.as_ref()),
                 ),
-                CreateElicitationRequestParams::UrlElicitationParams { message, url, .. } => {
+                ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
                     (message.clone(), serde_json::json!({ "url": url }))
                 }
+                // Non-exhaustive: surface unknown variants as raw JSON.
+                other => (
+                    String::new(),
+                    serde_json::to_value(other).unwrap_or(serde_json::Value::Null),
+                ),
             };
             let source = format!("mcp:{}", self.server_name);
 
@@ -1362,22 +1385,47 @@ impl ClientHandler for McpClientHandler {
 
             // Wait for response from UI/ACP
             match rx.await {
-                Ok(response) => Ok(CreateElicitationResult {
-                    action: response.action.into(),
-                    content: response.content,
-                    meta: None,
-                }),
-                Err(_) => Ok(CreateElicitationResult {
-                    action: rmcp::model::ElicitationAction::Cancel,
-                    content: None,
-                    meta: None,
-                }),
+                Ok(response) => {
+                    let result = ElicitResult::new(response.action.into());
+                    Ok(match response.content {
+                        Some(content) => result.with_content(content),
+                        None => result,
+                    })
+                }
+                Err(_) => Ok(ElicitResult::new(rmcp::model::ElicitationAction::Cancel)),
             }
         }
     }
 
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::new(ClientCapabilities::default(), self.client_impl.clone())
+    fn get_info(&self) -> ClientConfig {
+        // The builder needs rmcp's `server` feature; the fields are public.
+        let mut capabilities = ClientCapabilities::default();
+        if self.tasks {
+            capabilities.extensions = Some(
+                [(
+                    rmcp::model::TASKS_EXTENSION_ID.to_string(),
+                    rmcp::model::JsonObject::new(),
+                )]
+                .into(),
+            );
+        }
+        ClientConfig::new(capabilities, self.client_impl.clone())
+    }
+
+    async fn on_progress(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        self.router.handle_progress(params);
+    }
+
+    async fn on_task_status(
+        &self,
+        params: rmcp::model::TaskStatusNotificationParams,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        self.router.handle_task_status(&params);
     }
 
     async fn on_tool_list_changed(&self, context: NotificationContext<RoleClient>) -> () {
@@ -1411,6 +1459,7 @@ impl ClientHandler for McpClientHandler {
                 for tool in new_tool_list {
                     match McpToolAdapter::try_new(tool, peer.clone(), self.server_name.clone()) {
                         Ok(adapter) => {
+                            let adapter = adapter.with_router(self.router.clone());
                             let name = adapter.descriptor().function.name.clone();
                             if new_tools.contains_key(&name) {
                                 log::warn!(

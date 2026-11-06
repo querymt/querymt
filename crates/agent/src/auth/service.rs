@@ -42,14 +42,24 @@ pub type OAuthFlowMap = Arc<Mutex<HashMap<String, PendingOAuthFlow>>>;
 /// Thread-safe slot for the single active callback listener.
 pub type CallbackListenerSlot = Arc<Mutex<Option<ActiveOAuthCallbackListener>>>;
 
+/// A valid loopback redirect: authorization code, the checked `state`, and the
+/// RFC 9207 `iss` parameter when the authorization server sent one.
+#[cfg(feature = "oauth")]
+struct LoopbackCallback {
+    code: String,
+    state: String,
+    issuer: Option<String>,
+}
+
 /// Result sent from the HTTP callback handler back to the listener task.
 #[cfg(feature = "oauth")]
-type CallbackResult = Result<(String, String), String>;
+type CallbackResult = Result<LoopbackCallback, String>;
 #[cfg(feature = "oauth")]
 type CallbackResultSender = Arc<Mutex<Option<tokio::sync::oneshot::Sender<CallbackResult>>>>;
 
 /// Identifies a specific OAuth flow (used internally by listener lifecycle).
 #[cfg(feature = "oauth")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FlowIdentity {
     flow_id: String,
     owner: String,
@@ -67,7 +77,16 @@ pub struct OAuthService {
     model_inventory: ModelInventory,
     flows: OAuthFlowMap,
     listener_slot: CallbackListenerSlot,
+    /// Pending `mcp:<server>` logins, keyed like provider flows.
+    #[cfg(feature = "oauth")]
+    mcp_flows: mcp::McpFlowMap,
+    /// Where MCP OAuth credentials are stored (the system keyring).
+    #[cfg(feature = "oauth")]
+    mcp_backend: Arc<dyn crate::mcp_auth::SecretBackend>,
 }
+
+#[cfg(feature = "oauth")]
+mod mcp;
 
 impl OAuthService {
     /// Construct a new `OAuthService` from the shared dependencies.
@@ -82,7 +101,21 @@ impl OAuthService {
             model_inventory,
             flows,
             listener_slot,
+            #[cfg(feature = "oauth")]
+            mcp_flows: Default::default(),
+            #[cfg(feature = "oauth")]
+            mcp_backend: Arc::new(crate::mcp_auth::KeyringBackend),
         }
+    }
+
+    /// Use a different credential backend for MCP logins (tests).
+    #[cfg(all(test, feature = "oauth"))]
+    pub(crate) fn with_mcp_secret_backend(
+        mut self,
+        backend: Arc<dyn crate::mcp_auth::SecretBackend>,
+    ) -> Self {
+        self.mcp_backend = backend;
+        self
     }
 }
 
@@ -176,6 +209,12 @@ impl OAuthService {
         &self,
         provider_filter: Option<&str>,
     ) -> Result<Vec<AuthProviderStatus>, String> {
+        // `mcp:<server>` entries come from the agent's MCP configuration and
+        // the MCP credential store, never from the provider registry.
+        #[cfg(feature = "oauth")]
+        if provider_filter.is_some_and(|f| crate::mcp_auth::server_of_provider(f).is_some()) {
+            return Ok(self.mcp_auth_status(provider_filter).await);
+        }
         let registry = self.config.provider.plugin_registry();
         let provider_names = auth_provider_names(&registry);
         let mut provider_configs = Vec::new();
@@ -192,7 +231,7 @@ impl OAuthService {
             provider_configs.push((provider_name, env_var_name));
         }
 
-        tokio::task::spawn_blocking(move || {
+        let providers = tokio::task::spawn_blocking(move || {
             let store = crate::auth::SecretStore::new()
                 .map_err(|error| format!("Failed to open secret store: {error}"))?;
             let mut providers = Vec::new();
@@ -262,10 +301,19 @@ impl OAuthService {
                     preferred_method,
                 });
             }
-            Ok(providers)
+            Ok::<_, String>(providers)
         })
         .await
-        .map_err(|error| format!("Secret store task failed: {error}"))?
+        .map_err(|error| format!("Secret store task failed: {error}"))??;
+        #[cfg(feature = "oauth")]
+        let providers = {
+            let mut providers = providers;
+            if provider_filter.is_none() {
+                providers.extend(self.mcp_auth_status(None).await);
+            }
+            providers
+        };
+        Ok(providers)
     }
 
     // ── start_flow ────────────────────────────────────────────────────────
@@ -283,6 +331,10 @@ impl OAuthService {
     pub async fn start_flow(&self, owner: &str, provider: &str) -> Result<StartFlowResult, String> {
         #[cfg(feature = "oauth")]
         {
+            // MCP server names are case-sensitive: dispatch before lowercasing.
+            if let Some(server) = crate::mcp_auth::server_of_provider(provider.trim()) {
+                return self.start_mcp_flow(owner, server).await;
+            }
             let provider_name = provider.trim().to_lowercase();
             if provider_name.is_empty() {
                 return Err("Provider name is required".to_string());
@@ -368,6 +420,10 @@ impl OAuthService {
     ) -> CompleteFlowResult {
         #[cfg(feature = "oauth")]
         {
+            // A flow another owner started is treated as nonexistent.
+            if let Some(result) = self.complete_mcp_flow(owner, flow_id, response).await {
+                return result;
+            }
             let flow = {
                 let map = self.flows.lock().await;
                 map.get(flow_id).cloned()
@@ -491,6 +547,9 @@ impl OAuthService {
     pub async fn logout(&self, owner: &str, provider: &str) -> LogoutResult {
         #[cfg(feature = "oauth")]
         {
+            if let Some(server) = crate::mcp_auth::server_of_provider(provider.trim()) {
+                return self.logout_mcp(owner, server).await;
+            }
             let provider_name = provider.trim().to_lowercase();
             if provider_name.is_empty() {
                 return LogoutResult {
@@ -1008,35 +1067,25 @@ async fn wait_for_oauth_callback(
     }
 }
 
+/// Serve the loopback OAuth redirect on `callback_port` until a callback
+/// arrives, the listener is stopped, or the wait times out. Returns a valid
+/// callback (state already checked against `state_param`). The `iss` parameter
+/// is kept: servers that advertise
+/// `authorization_response_iss_parameter_supported` (e.g. Linear) are rejected
+/// by the token exchange without it.
 #[cfg(feature = "oauth")]
-async fn run_callback_listener_task(
-    svc: OAuthService,
-    identity: FlowIdentity,
-    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+async fn await_loopback_callback(
+    flow_id: &str,
+    provider: &str,
     callback_port: u16,
-) {
+    state_param: String,
+    stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
+) -> Option<LoopbackCallback> {
     use axum::{
         Router,
         extract::{Query, State},
         response::Html,
         routing::get,
-    };
-
-    let FlowIdentity {
-        flow_id,
-        owner,
-        provider,
-    } = identity;
-
-    let (state_param, verifier) = {
-        let map = svc.flows.lock().await;
-        let Some(flow) = map.get(&flow_id) else {
-            return;
-        };
-        if flow.owner != owner || flow.provider != provider {
-            return;
-        }
-        (flow.state.clone(), flow.verifier.clone())
     };
 
     let callback_bind_addr = format!("{}:{}", OAUTH_CALLBACK_HOST, callback_port);
@@ -1052,6 +1101,7 @@ async fn run_callback_listener_task(
         code: Option<String>,
         state: Option<String>,
         error: Option<String>,
+        iss: Option<String>,
     }
 
     async fn cb_handler(
@@ -1065,7 +1115,11 @@ async fn run_callback_listener_task(
             if received_state != st.expected_state {
                 Err("State mismatch - possible CSRF attack".to_string())
             } else {
-                Ok((code, received_state))
+                Ok(LoopbackCallback {
+                    code,
+                    state: received_state,
+                    issuer: params.iss.filter(|iss| !iss.is_empty()),
+                })
             }
         } else {
             Err("No authorization code received".to_string())
@@ -1107,7 +1161,7 @@ async fn run_callback_listener_task(
                 callback_bind_addr,
                 err
             );
-            return;
+            return None;
         }
     };
 
@@ -1127,19 +1181,19 @@ async fn run_callback_listener_task(
             .await;
     });
 
-    let wait = wait_for_oauth_callback(&mut stop_rx, callback_rx).await;
+    let wait = wait_for_oauth_callback(&mut *stop_rx, callback_rx).await;
 
     let _ = shutdown_tx.send(());
     let _ = server_task.await;
 
-    let (code, cb_state) = match wait {
+    let callback = match wait {
         WaitResult::Stopped => {
             log::debug!(
                 "OAuth callback listener stopped for flow '{}' (provider='{}')",
                 flow_id,
                 provider
             );
-            return;
+            return None;
         }
         WaitResult::Timeout => {
             log::debug!(
@@ -1147,13 +1201,55 @@ async fn run_callback_listener_task(
                 flow_id,
                 provider
             );
-            return;
+            return None;
         }
-        WaitResult::Callback(Ok(pair)) => pair,
+        WaitResult::Callback(Ok(callback)) => callback,
         WaitResult::Callback(Err(err)) => {
             log::debug!("OAuth callback error for flow '{}': {}", flow_id, err);
+            return None;
+        }
+    };
+    Some(callback)
+}
+
+#[cfg(feature = "oauth")]
+async fn run_callback_listener_task(
+    svc: OAuthService,
+    identity: FlowIdentity,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    callback_port: u16,
+) {
+    let FlowIdentity {
+        flow_id,
+        owner,
+        provider,
+    } = identity;
+
+    let (state_param, verifier) = {
+        let map = svc.flows.lock().await;
+        let Some(flow) = map.get(&flow_id) else {
+            return;
+        };
+        if flow.owner != owner || flow.provider != provider {
             return;
         }
+        (flow.state.clone(), flow.verifier.clone())
+    };
+
+    let Some(LoopbackCallback {
+        code,
+        state: cb_state,
+        ..
+    }) = await_loopback_callback(
+        &flow_id,
+        &provider,
+        callback_port,
+        state_param,
+        &mut stop_rx,
+    )
+    .await
+    else {
+        return;
     };
 
     // Verify the flow is still active.

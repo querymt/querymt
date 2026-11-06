@@ -2449,6 +2449,133 @@ async fn apply_clarification_answer(
 mod tests {
     use super::*;
 
+    mod mcp_cancel_tests {
+        use super::*;
+        use crate::events::{AgentEventKind, EventEnvelope};
+        use crate::test_utils::mcp_harness::{HarnessOptions, McpHarness, TaskScript};
+        use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent, mock_tool_call};
+        use serde_json::json;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        /// Run `tool` through the real cancel race, cancel once the server is
+        /// busy, and return the result plus every event published afterwards.
+        async fn cancel_run(
+            harness: &McpHarness,
+            tool: &str,
+            args: serde_json::Value,
+        ) -> (ToolResult, Vec<EventEnvelope>, Vec<EventEnvelope>) {
+            let agent = TestAgent::with_mock_provider(SharedLlmProvider::new(
+                MockLlmProvider::new(),
+                vec![],
+            ))
+            .await;
+            let token = CancellationToken::new();
+            let exec = agent
+                .execution_context_with_mcp(harness.tool_state.clone())
+                .await
+                .with_cancellation_token(token.clone());
+            let mut events = agent.config.event_sink.fanout().subscribe();
+
+            let call = mock_tool_call("c1", tool, &args.to_string());
+            let prepared =
+                crate::agent::execution::tool_calls::prepare_tool_call(&agent.config, &call, &exec)
+                    .await
+                    .unwrap();
+
+            let mut before_cancel = Vec::new();
+            let canceller = async {
+                tokio::time::timeout(Duration::from_secs(5), harness.log.started.notified())
+                    .await
+                    .expect("server started the call");
+                // Let the task id / progress reach the client before cancelling.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                // Drain with no await between this and the cancel, so
+                // everything left in `events` was published afterwards.
+                while let Ok(e) = events.try_recv() {
+                    before_cancel.push(e);
+                }
+                token.cancel();
+            };
+            let (result, ()) = tokio::join!(
+                run_prepared_tool_call(&agent.config, &call, prepared, &exec),
+                canceller
+            );
+
+            // A cancelled call is dropped, so it never emits ToolCallEnd; what
+            // matters is that nothing for it is published after the cancel.
+            let mut after_cancel = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(700);
+            while let Ok(Ok(e)) = tokio::time::timeout_at(deadline, events.recv()).await {
+                after_cancel.push(e);
+            }
+            (result, before_cancel, after_cancel)
+        }
+
+        fn assert_cancelled_once(result: &ToolResult) {
+            assert!(result.is_error);
+            let text: String = result.content.iter().filter_map(|b| b.as_text()).collect();
+            assert!(text.contains("Cancelled by user"), "{text}");
+        }
+
+        fn no_progress(after_cancel: &[EventEnvelope]) {
+            assert!(
+                !after_cancel
+                    .iter()
+                    .any(|e| matches!(e.kind(), AgentEventKind::ToolCallProgress { .. })),
+                "no ToolCallProgress after the run was cancelled"
+            );
+        }
+
+        #[tokio::test]
+        async fn mcp_cancel_sends_notifications_cancelled_and_one_error_result() {
+            let harness = McpHarness::start(HarnessOptions::default()).await;
+            // `progress` with a long hold emits a burst, then blocks.
+            let (result, _before, after) = cancel_run(
+                &harness,
+                "progress",
+                json!({"count": 10, "hold_ms": 30_000}),
+            )
+            .await;
+
+            assert_cancelled_once(&result);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while harness.log.cancelled.lock().is_empty() {
+                    harness.log.cancel_seen.notified().await;
+                }
+            })
+            .await
+            .expect("server received notifications/cancelled");
+            assert!(
+                harness.request_id_of_first_cancel().is_some(),
+                "cancellation names the request id"
+            );
+            no_progress(&after);
+        }
+
+        #[tokio::test]
+        async fn mcp_cancel_during_a_task_sends_tasks_cancel() {
+            let harness = McpHarness::start(HarnessOptions {
+                tasks: true,
+                ..HarnessOptions::default()
+            })
+            .await;
+            harness.set_task_script(TaskScript::default()); // working forever
+            let (result, _before, after) = cancel_run(&harness, "task", json!({})).await;
+
+            assert_cancelled_once(&result);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while harness.log.task_cancels.lock().is_empty() {
+                    harness.log.cancel_seen.notified().await;
+                }
+            })
+            .await
+            .expect("server received tasks/cancel");
+            assert_eq!(*harness.log.task_cancels.lock(), ["t1"]);
+            no_progress(&after);
+        }
+    }
+
     mod genai_trace_tests {
         use super::*;
         use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};

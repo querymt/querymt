@@ -122,7 +122,15 @@ pub struct McpToolSnapshot {
 /// atomically replace the entire snapshot — no multi-lock consistency issue.
 pub struct McpToolState {
     snapshot: ArcSwap<McpToolSnapshot>,
+    /// Servers skipped while connecting (login needed, or authorization could
+    /// not be checked). Set once by `build_mcp_state`.
+    skipped: ParkingMutex<Vec<SkippedMcpServer>>,
+    /// Servers connected with OAuth applied (matched an agent-config OAuth
+    /// server). Only these can need a login later.
+    oauth_servers: ParkingMutex<HashSet<String>>,
 }
+
+pub use crate::control::notifications::SkippedMcpServer;
 
 impl McpToolState {
     pub fn new(
@@ -135,7 +143,31 @@ impl McpToolState {
                 tool_defs,
                 tools_hash: None,
             }),
+            skipped: ParkingMutex::new(Vec::new()),
+            oauth_servers: ParkingMutex::new(HashSet::new()),
         })
+    }
+
+    /// Record the servers skipped while connecting.
+    pub fn set_skipped_servers(&self, skipped: Vec<SkippedMcpServer>) {
+        *self.skipped.lock() = skipped;
+    }
+
+    /// Servers skipped while connecting this session's MCP servers.
+    pub fn skipped_servers(&self) -> Vec<SkippedMcpServer> {
+        self.skipped.lock().clone()
+    }
+
+    /// Record that `server` was connected with OAuth applied.
+    pub fn mark_oauth_server(&self, server: &str) {
+        self.oauth_servers.lock().insert(server.to_string());
+    }
+
+    /// Whether `server` was connected with OAuth applied. Only such servers
+    /// can ask the user to log in: a 401 from any other server is an ordinary
+    /// failure that a login with `mcp:<server>` would not fix.
+    pub fn is_oauth_server(&self, server: &str) -> bool {
+        self.oauth_servers.lock().contains(server)
     }
 
     pub fn empty() -> Arc<Self> {

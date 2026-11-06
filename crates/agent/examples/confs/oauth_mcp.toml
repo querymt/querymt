@@ -1,0 +1,36 @@
+# OAuth-protected HTTP MCP server
+#
+# `auth = { type = "oauth" }` makes QueryMT authorize against the server with
+# OAuth 2.1 (discovery, PKCE, dynamic client registration unless `client_id` is
+# set, automatic token refresh). Tokens are kept in the secret store, bound to
+# the server URL, never in this file.
+#
+# Logging in: an ACP client calls the `_querymt/auth/start` method with the
+# provider id `mcp:<server name>` (here `mcp:linear`), opens the returned URL,
+# and the loopback redirect completes the login. `_querymt/auth/status` lists
+# one entry per OAuth MCP server, `_querymt/auth/logout` clears it.
+#
+# Until a login exists the server is skipped: the session still starts with the
+# other servers and clients get a `querymt/session/mcpAuthRequired`
+# notification naming the provider id. A login applies to sessions that
+# connect afterwards (new, loaded, resumed, forked); sessions that are already
+# running keep their current connections.
+
+[agent]
+cwd = "."
+provider = "openai"
+model = "${MODEL:-gpt-4}"
+tools = ["read_tool", "shell", "linear.*"]
+system = "You are a helpful assistant with access to Linear."
+
+[[mcp]]
+name = "linear"
+transport = "http"
+url = "https://mcp.linear.app/mcp"
+# `redirect_port` defaults to 47821, so the redirect URI is always
+# http://127.0.0.1:47821/callback. Register that URI when using a fixed
+# `client_id`; set `redirect_port` only if the port is taken.
+auth = { type = "oauth", scopes = ["read"] }
+# auth = { type = "oauth", client_id = "my-client-id", scopes = ["read", "write"], redirect_port = 47821 }
+
+# OAuth cannot be combined with `socket_path` or an `Authorization` header.

@@ -629,8 +629,35 @@ async fn execute_prepared_inner(
             }
         } else if let Some(tool) = mcp_tool {
             use querymt::tool_decorator::CallFunctionTool;
-            match tool
-                .call(args.clone())
+            // Progress is throttled and closed when the call ends or is
+            // dropped, so no update can follow this call's `ToolCallEnd`.
+            let (progress_sink, _close_progress) = {
+                let event_sink = config.event_sink.clone();
+                let (session_id, tool_call_id, tool_name) = (
+                    exec_ctx.session_id.clone(),
+                    call.id.clone(),
+                    call.function.name.clone(),
+                );
+                super::progress_sink::AgentProgressSink::new(
+                    super::progress_sink::THROTTLE,
+                    move |u| {
+                        event_sink.session_stream(&session_id).emit_ephemeral_seq(
+                            AgentEventKind::ToolCallProgress {
+                                tool_call_id: tool_call_id.clone(),
+                                tool_name: tool_name.clone(),
+                                progress: u.progress,
+                                total: u.total,
+                                message: u.message,
+                            },
+                        );
+                    },
+                )
+            };
+            match querymt::mcp::progress::CURRENT_PROGRESS
+                .scope(
+                    Arc::new(progress_sink) as Arc<dyn querymt::mcp::progress::ProgressSink>,
+                    tool.call(args.clone()),
+                )
                 .instrument(info_span!(
                     "agent.tool.invoke",
                     source = "mcp",
@@ -640,14 +667,50 @@ async fn execute_prepared_inner(
                 .await
             {
                 Ok(res) => (res, false, "mcp", "executed"),
-                Err(e) => (
-                    vec![querymt::chat::ToolResultPart::Text {
-                        text: format!("Error: {}", e),
-                    }],
-                    true,
-                    "mcp",
-                    "executed",
-                ),
+                // A rejected/missing OAuth login tells the user which provider
+                // to log in with instead of surfacing a transport error.
+                Err(e) => {
+                    let login_text = mcp_server_name.as_deref().and_then(|server| {
+                        crate::agent::mcp::report_auth_required(
+                            &e,
+                            server,
+                            exec_ctx.runtime.mcp_tool_state.is_oauth_server(server),
+                            &config.event_sink,
+                            &exec_ctx.session_id,
+                        )
+                    });
+                    if let Some(text) = login_text {
+                        (
+                            vec![querymt::chat::ToolResultPart::Text { text }],
+                            true,
+                            "mcp",
+                            "executed",
+                        )
+                    } else {
+                        // In-band `isError` results keep the server's content verbatim.
+                        match e.downcast::<querymt::mcp::adapter::McpToolError>() {
+                            Ok(querymt::mcp::adapter::McpToolError::Reported { parts }) => {
+                                (parts, true, "mcp", "executed")
+                            }
+                            Ok(other) => (
+                                vec![querymt::chat::ToolResultPart::Text {
+                                    text: format!("Error: {other}"),
+                                }],
+                                true,
+                                "mcp",
+                                "executed",
+                            ),
+                            Err(e) => (
+                                vec![querymt::chat::ToolResultPart::Text {
+                                    text: format!("Error: {e}"),
+                                }],
+                                true,
+                                "mcp",
+                                "executed",
+                            ),
+                        }
+                    }
+                }
             }
         } else if !ensure_tool_permission(
             config,
@@ -3494,5 +3557,358 @@ mod prepared_call_tests {
             );
         }
         assert!(log.lock().unwrap().is_empty(), "no call executed");
+    }
+}
+
+#[cfg(test)]
+mod mcp_tool_tests {
+    use super::*;
+    use crate::acp::protocol::{SessionUpdate, ToolCallStatus};
+    use crate::events::EventEnvelope;
+    use crate::test_utils::mcp_harness::{HarnessOptions, McpHarness};
+    use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent, mock_tool_call};
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+
+    struct Fixture {
+        agent: TestAgent,
+        harness: McpHarness,
+        exec: ExecutionContext,
+        events: broadcast::Receiver<EventEnvelope>,
+    }
+
+    async fn fixture() -> Fixture {
+        let agent =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let harness = McpHarness::start(HarnessOptions::default()).await;
+        let exec = agent
+            .execution_context_with_mcp(harness.tool_state.clone())
+            .await;
+        let events = agent.config.event_sink.fanout().subscribe();
+        Fixture {
+            agent,
+            harness,
+            exec,
+            events,
+        }
+    }
+
+    /// Everything published within `window`, in order.
+    async fn collect(
+        rx: &mut broadcast::Receiver<EventEnvelope>,
+        window: Duration,
+    ) -> Vec<EventEnvelope> {
+        let deadline = tokio::time::Instant::now() + window;
+        let mut out = Vec::new();
+        while let Ok(received) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            match received {
+                Ok(envelope) => out.push(envelope),
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        out
+    }
+
+    fn progress_values(events: &[EventEnvelope]) -> Vec<Option<f64>> {
+        events
+            .iter()
+            .filter_map(|e| match e.kind() {
+                AgentEventKind::ToolCallProgress { progress, .. } => Some(*progress),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn is_error_result_is_a_failed_tool_call_with_server_text() {
+        let mut f = fixture().await;
+        let call = mock_tool_call("c1", "error", "{}");
+
+        let result = execute_tool_call(&f.agent.config, &call, &f.exec)
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_error && result.execution_is_error,
+            "outcome is `error`"
+        );
+        let texts: Vec<_> = result.content.iter().filter_map(|b| b.as_text()).collect();
+        assert_eq!(texts, ["quota exceeded"], "server text is used verbatim");
+
+        let events = collect(&mut f.events, Duration::from_millis(300)).await;
+        let end = events
+            .iter()
+            .find(|e| matches!(e.kind(), AgentEventKind::ToolCallEnd { .. }))
+            .expect("ToolCallEnd emitted");
+        assert!(matches!(
+            end.kind(),
+            AgentEventKind::ToolCallEnd { is_error: true, result, .. } if result == "quota exceeded"
+        ));
+        let Some(SessionUpdate::ToolCallUpdate(update)) =
+            crate::acp::shared::translate_replay_event_to_update(end)
+        else {
+            panic!("expected tool call update");
+        };
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Failed));
+    }
+
+    #[tokio::test]
+    async fn transport_errors_keep_the_error_prefix() {
+        let f = fixture().await;
+        // The harness rejects unknown tools with a protocol error.
+        let mut tool = f
+            .harness
+            .running
+            .peer()
+            .list_all_tools()
+            .await
+            .unwrap()
+            .remove(0);
+        tool.name = "missing".into();
+        let adapter = querymt::mcp::adapter::McpToolAdapter::try_new(
+            tool,
+            f.harness.running.peer().clone(),
+            "harness".into(),
+        )
+        .unwrap();
+        f.exec
+            .runtime
+            .mcp_tool_state
+            .store(crate::agent::core::McpToolSnapshot {
+                tool_defs: vec![],
+                tools: [("missing".to_string(), Arc::new(adapter))].into(),
+                tools_hash: None,
+            });
+        let call = mock_tool_call("c1", "missing", "{}");
+        let result = execute_tool_call(&f.agent.config, &call, &f.exec)
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        let text = result
+            .content
+            .iter()
+            .filter_map(|b| b.as_text())
+            .collect::<String>();
+        assert!(text.starts_with("Error: "), "{text}");
+    }
+
+    #[tokio::test]
+    async fn progress_burst_is_throttled_and_the_latest_update_is_delivered() {
+        let mut f = fixture().await;
+        let args = json!({"count": 20, "total": 20, "gap_ms": 5, "hold_ms": 500}).to_string();
+        let call = mock_tool_call("c1", "progress", &args);
+
+        execute_tool_call(&f.agent.config, &call, &f.exec)
+            .await
+            .unwrap();
+
+        let events = collect(&mut f.events, Duration::from_millis(300)).await;
+        let progress = progress_values(&events);
+        assert!(
+            (1..=2).contains(&progress.len()),
+            "throttled to at most 2 events, got {progress:?}"
+        );
+        assert_eq!(
+            progress.last(),
+            Some(&Some(20.0)),
+            "latest update delivered"
+        );
+    }
+
+    /// Task 9.3 manual smoke test against a real MCP server
+    /// (`@modelcontextprotocol/server-everything`). Prints what it observes.
+    ///
+    /// `QMT_SMOKE_MCP` is `stdio` (default) or the URL of a Streamable HTTP
+    /// endpoint, e.g. `http://127.0.0.1:3001/mcp`.
+    #[tokio::test]
+    #[ignore = "manual smoke test: needs node/npx (and network for npx); see task 9.3"]
+    async fn smoke_real_mcp_server() {
+        use crate::agent::mcp::McpConnectContext;
+        use crate::config::McpServerConfig;
+        use querymt::tool_decorator::CallFunctionTool;
+
+        let spec = std::env::var("QMT_SMOKE_MCP").unwrap_or_else(|_| "stdio".into());
+        let server = if spec == "stdio" {
+            McpServerConfig::stdio("everything", "npx").with_args([
+                "-y",
+                "@modelcontextprotocol/server-everything",
+                "stdio",
+            ])
+        } else {
+            McpServerConfig::http("everything", spec.clone())
+        };
+        let agent =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let tool_state = crate::agent::core::McpToolState::empty();
+        let _clients = tokio::time::timeout(
+            Duration::from_secs(120),
+            crate::agent::protocol::build_mcp_state(
+                &[server.to_acp()],
+                &McpConnectContext::default(),
+                Default::default(),
+                agent.config.event_sink.clone(),
+                "smoke".into(),
+                &crate::agent::mcp::agent_implementation(),
+                tool_state.clone(),
+                None,
+            ),
+        )
+        .await
+        .expect("server starts in time")
+        .expect("connects");
+        let mut names: Vec<String> = tool_state.load().tools.keys().cloned().collect();
+        names.sort();
+        println!("SMOKE[{spec}] tools: {names:?}");
+
+        let long = names
+            .iter()
+            .find(|n| n.contains("long-running"))
+            .expect("server exposes a long-running (progress) tool")
+            .clone();
+        let exec = agent.execution_context_with_mcp(tool_state.clone()).await;
+        let mut events = agent.config.event_sink.fanout().subscribe();
+        let args = json!({"duration": 2, "steps": 4}).to_string();
+        let call = mock_tool_call("smoke1", &long, &args);
+        let result = execute_tool_call(&agent.config, &call, &exec)
+            .await
+            .unwrap();
+        let seen = collect(&mut events, Duration::from_millis(500)).await;
+        let progress: Vec<_> = seen
+            .iter()
+            .filter_map(|e| match e.kind() {
+                AgentEventKind::ToolCallProgress {
+                    progress,
+                    total,
+                    message,
+                    ..
+                } => Some((*progress, *total, message.clone())),
+                _ => None,
+            })
+            .collect();
+        println!(
+            "SMOKE[{spec}] {long}: is_error={} progress updates={progress:?}",
+            result.is_error
+        );
+        println!(
+            "SMOKE[{spec}] {long}: result={:?}",
+            result
+                .content
+                .iter()
+                .filter_map(|b| b.as_text())
+                .collect::<String>()
+        );
+        assert!(!result.is_error);
+        assert!(!progress.is_empty(), "progress updates were observed");
+
+        // An `isError` result: invalid arguments sent straight to the adapter
+        // (the agent would reject them against the schema first).
+        let adapter = tool_state.load().tools.get(&long).cloned().unwrap();
+        let err = adapter
+            .call(json!({"duration": "not-a-number", "steps": "x"}))
+            .await
+            .expect_err("server reports the invalid input as an error");
+        match err.downcast_ref::<querymt::mcp::adapter::McpToolError>() {
+            Some(querymt::mcp::adapter::McpToolError::Reported { parts }) => {
+                println!("SMOKE[{spec}] isError result -> Reported: {parts:?}");
+            }
+            other => panic!("expected McpToolError::Reported, got {other:?} ({err})"),
+        }
+    }
+
+    /// Task 8.8: no access or refresh token string reaches events or results,
+    /// including on the path that reports a login requirement.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn oauth_tokens_never_reach_events_or_results() {
+        use crate::agent::protocol::tests::oauth_connect as oc;
+        use crate::mcp_auth::test_support::{MemoryBackend, creds};
+
+        const TOKENS: [&str; 4] = [
+            "good-token",
+            "refresh-secret",
+            "fresh-token",
+            "rotated-refresh",
+        ];
+        let mock = Arc::new(oc::Mock::default());
+        let url = format!("{}/mcp", oc::serve(mock.clone()).await);
+        let backend = Arc::new(MemoryBackend::default());
+        oc::seed(&backend, &url, creds("good-token")).await;
+        let server = oc::oauth_server(&url);
+        let tool_state = crate::agent::core::McpToolState::empty();
+        let _clients = oc::connect(&server, &backend, tool_state.clone())
+            .await
+            .expect("connects with stored credentials");
+
+        let agent =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let exec = agent.execution_context_with_mcp(tool_state).await;
+        let mut config = (*agent.config).clone();
+        config.mcp_servers = vec![server];
+        let mut events = agent.config.event_sink.fanout().subscribe();
+
+        // The token is revoked and the refresh token rejected mid-session.
+        mock.revoked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        mock.reject_refresh
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let call = mock_tool_call("c1", "secret", "{}");
+        let result = execute_tool_call(&config, &call, &exec).await.unwrap();
+
+        assert!(result.is_error);
+        let text: String = result.content.iter().filter_map(|b| b.as_text()).collect();
+        assert_eq!(
+            text,
+            "Error: authorization required for MCP server secured; \
+             log in with provider mcp:secured"
+        );
+        let seen = collect(&mut events, Duration::from_millis(300)).await;
+        let kinds: Vec<_> = seen.iter().map(|e| e.kind()).collect();
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, AgentEventKind::ToolCallStart { .. }))
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, AgentEventKind::ToolCallEnd { .. }))
+        );
+        assert!(kinds.iter().any(|k| matches!(
+            k,
+            AgentEventKind::McpServerAuthRequired { server_name, .. } if server_name == "secured"
+        )));
+
+        let published = serde_json::to_string(&seen).unwrap();
+        for token in TOKENS {
+            assert!(!published.contains(token), "event stream leaked `{token}`");
+            assert!(!text.contains(token), "tool result leaked `{token}`");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_progress_follows_tool_call_end() {
+        let mut f = fixture().await;
+        // Burst, then the call ends at once: the pending update must be dropped.
+        let call = mock_tool_call("c1", "progress", &json!({"count": 20}).to_string());
+
+        execute_tool_call(&f.agent.config, &call, &f.exec)
+            .await
+            .unwrap();
+
+        // Longer than the throttle window, so a leaked trailing timer would fire.
+        let events = collect(&mut f.events, Duration::from_millis(700)).await;
+        let end = events
+            .iter()
+            .position(|e| matches!(e.kind(), AgentEventKind::ToolCallEnd { .. }))
+            .expect("ToolCallEnd emitted");
+        assert!(
+            progress_values(&events[end + 1..]).is_empty(),
+            "no ToolCallProgress after ToolCallEnd"
+        );
     }
 }

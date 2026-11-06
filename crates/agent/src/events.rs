@@ -183,6 +183,7 @@ impl From<McpServerConfig> for McpServerInfo {
                 command,
                 args,
                 env,
+                ..
             } => Self {
                 transport: "stdio".into(),
                 name,
@@ -192,7 +193,9 @@ impl From<McpServerConfig> for McpServerInfo {
                 url: None,
                 headers: None,
             },
-            McpServerConfig::Http { name, url, headers } => Self {
+            McpServerConfig::Http {
+                name, url, headers, ..
+            } => Self {
                 transport: "http".into(),
                 name,
                 command: None,
@@ -529,6 +532,34 @@ pub enum AgentEventKind {
         tool_name: String,
         is_error: bool,
         result: String,
+    },
+    /// Progress of an in-flight MCP tool call. Transient: throttled, never
+    /// persisted or replayed, and never published after the call's
+    /// `ToolCallEnd`.
+    ToolCallProgress {
+        tool_call_id: String,
+        tool_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        progress: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        total: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// An OAuth MCP server was skipped (or failed a call) because it needs
+    /// authorization, or because its authorization could not be checked
+    /// (`error`). Transient: clients log in with `provider_id`
+    /// (`mcp:<server>`) through the `_querymt/auth/*` methods.
+    McpServerAuthRequired {
+        server_name: String,
+        provider_id: String,
+        /// Set when authorization could not be checked at all (for example
+        /// the authorization server is unreachable) rather than merely
+        /// missing. The server was skipped either way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     HookNotice {
         event_name: String,
@@ -1171,6 +1202,12 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         // Rationale: command output is a transient reply to one prompt; the
         // registry is authoritative and the handoff has its own durable event.
         AgentEventKind::WorktreeCommandOutput { .. } => Durability::Ephemeral,
+        // Rationale: live MCP progress hint, superseded by ToolCallEnd; must
+        // not be journaled or replayed.
+        AgentEventKind::ToolCallProgress { .. } => Durability::Ephemeral,
+        // Rationale: live login prompt; authoritative state is the credential
+        // store (`auth_status`), so it must not be journaled or replayed.
+        AgentEventKind::McpServerAuthRequired { .. } => Durability::Ephemeral,
 
         // ── Durable: accounting ledger ──────────────────────────────
         // Rationale: the start must survive a crash to expose unresolved
@@ -1190,12 +1227,9 @@ mod tests {
 
     #[test]
     fn mcp_stdio_info_preserves_config_wire_shape() {
-        let config = McpServerConfig::Stdio {
-            name: "filesystem".into(),
-            command: "npx".into(),
-            args: vec!["-y".into(), "server-filesystem".into()],
-            env: HashMap::from([("TOKEN".into(), "secret".into())]),
-        };
+        let config = McpServerConfig::stdio("filesystem", "npx")
+            .with_args(["-y", "server-filesystem"])
+            .with_env(HashMap::from([("TOKEN".into(), "secret".into())]));
         let expected = serde_json::to_value(&config).unwrap();
         let info = McpServerInfo::from(config);
 
@@ -1208,11 +1242,9 @@ mod tests {
 
     #[test]
     fn mcp_http_info_preserves_config_wire_shape() {
-        let config = McpServerConfig::Http {
-            name: "remote".into(),
-            url: "https://example.test/mcp".into(),
-            headers: HashMap::from([("Authorization".into(), "Bearer secret".into())]),
-        };
+        let config = McpServerConfig::http("remote", "https://example.test/mcp").with_headers(
+            HashMap::from([("Authorization".into(), "Bearer secret".into())]),
+        );
         let expected = serde_json::to_value(&config).unwrap();
         let info = McpServerInfo::from(config);
 
@@ -1221,6 +1253,28 @@ mod tests {
             serde_json::from_value::<McpServerInfo>(expected).unwrap(),
             info
         );
+    }
+
+    #[test]
+    fn tool_call_progress_is_ephemeral() {
+        let kind = AgentEventKind::ToolCallProgress {
+            tool_call_id: "c".into(),
+            tool_name: "t".into(),
+            progress: Some(1.0),
+            total: None,
+            message: None,
+        };
+        assert_eq!(classify_durability(&kind), Durability::Ephemeral);
+    }
+
+    #[test]
+    fn mcp_server_auth_required_is_ephemeral() {
+        let kind = AgentEventKind::McpServerAuthRequired {
+            server_name: "linear".into(),
+            provider_id: "mcp:linear".into(),
+            error: None,
+        };
+        assert_eq!(classify_durability(&kind), Durability::Ephemeral);
     }
 
     // ── StopType -> StopReason conversion ──────────────────────────────────

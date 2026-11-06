@@ -1648,9 +1648,12 @@ impl SessionMaterializer {
         let mcp_servers = prepared
             .mcp_servers
             .iter()
-            .map(crate::config::McpServerConfig::from_acp)
-            .map(crate::events::McpServerInfo::from)
-            .collect();
+            .map(|server| {
+                crate::config::McpServerConfig::from_acp(server)
+                    .map(crate::events::McpServerInfo::from)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map_err(|e| Error::invalid_params().data(e.to_string()))?;
         self.config
             .emit_event_persisted(
                 &prepared.session_id,
@@ -1752,8 +1755,11 @@ impl SessionMaterializer {
             ));
         }
         let tool_state = crate::agent::core::McpToolState::empty();
+        let connect_ctx =
+            crate::agent::mcp::McpConnectContext::from_config(&self.config.mcp_servers);
         let mcp_services = crate::agent::protocol::build_mcp_state(
             mcp_servers,
+            &connect_ctx,
             self.config.pending_elicitations(),
             self.config.event_sink.clone(),
             session_id.clone(),

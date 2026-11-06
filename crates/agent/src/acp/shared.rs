@@ -643,6 +643,7 @@ pub const QMT_NOTIFICATION_MODELS_CHANGED: &str = "querymt/models/changed";
 pub const QMT_NOTIFICATION_SCHEDULES_CHANGED: &str = "querymt/schedules/changed";
 pub const QMT_NOTIFICATION_DELEGATION_UPDATE: &str = "querymt/session/delegationUpdate";
 pub const QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED: &str = "querymt/session/delegateModelsChanged";
+pub const QMT_NOTIFICATION_MCP_AUTH_REQUIRED: &str = "querymt/session/mcpAuthRequired";
 pub const QMT_NOTIFICATION_INPUT_STATE: &str = "querymt/session/inputState";
 pub const QMT_NOTIFICATION_RUNTIME_CHANGED: &str = "querymt/session/runtimeChanged";
 pub const QMT_NOTIFICATION_SESSION_PINS_CHANGED: &str = "querymt/session/pinsChanged";
@@ -705,6 +706,30 @@ pub fn schedules_changed_notification(
     ext_notification(
         QMT_NOTIFICATION_SCHEDULES_CHANGED,
         serde_json::to_value(payload).expect("serialize schedules changed notification"),
+    )
+}
+
+/// Session notification: MCP server `server_name` needs a login with
+/// `provider_id` (`mcp:<server>`).
+///
+/// `error` is present when authorization could not be checked at all (the
+/// server was skipped, and logging in may not help until that is fixed).
+pub fn mcp_auth_required_notification(
+    session_id: &str,
+    server_name: &str,
+    provider_id: &str,
+    error: Option<&str>,
+) -> serde_json::Value {
+    let params = crate::control::notifications::McpAuthRequiredNotification {
+        version: crate::control::notifications::MCP_AUTH_REQUIRED_VERSION,
+        session_id: session_id.to_string(),
+        server_name: server_name.to_string(),
+        provider_id: provider_id.to_string(),
+        error: error.map(str::to_string),
+    };
+    ext_notification(
+        QMT_NOTIFICATION_MCP_AUTH_REQUIRED,
+        serde_json::to_value(params).expect("serialize mcp auth required notification"),
     )
 }
 
@@ -1999,6 +2024,19 @@ impl AcpLiveEventTranslator {
                 *revision,
             )];
         }
+        if let AgentEventKind::McpServerAuthRequired {
+            server_name,
+            provider_id,
+            error,
+        } = event.kind()
+        {
+            return vec![mcp_auth_required_notification(
+                event.session_id(),
+                server_name,
+                provider_id,
+                error.as_deref(),
+            )];
+        }
         if let Some(update) = self.translate_delegation_update(event) {
             return vec![delegation_update_notification(update)];
         }
@@ -2334,6 +2372,21 @@ impl AcpLiveEventTranslator {
                 }
                 vec![SessionUpdate::CompactionUpdate(update)]
             }
+            AgentEventKind::ToolCallProgress {
+                tool_call_id,
+                tool_name,
+                progress,
+                total,
+                message,
+            } => tool_progress_update(
+                tool_call_id,
+                tool_name,
+                *progress,
+                *total,
+                message.as_deref(),
+            )
+            .into_iter()
+            .collect(),
             _ => translate_replayable_updates(event),
         }
     }
@@ -2365,6 +2418,48 @@ impl AcpLiveEventTranslator {
         }
         vec![SessionUpdate::Plan(Plan::new(entries))]
     }
+}
+
+/// Text shown for an MCP progress report: `"{message} ({pct}%)"`,
+/// `"{message}"` or `"{pct}%"`; `None` when there is neither.
+///
+/// The percentage is floored and clamped to 0-100, and only computed when
+/// `total` is positive.
+fn progress_text(
+    progress: Option<f64>,
+    total: Option<f64>,
+    message: Option<&str>,
+) -> Option<String> {
+    let pct = progress.zip(total).filter(|(_, t)| *t > 0.0).map(|(p, t)| {
+        // Clamped to 0..=100 first, so the saturating cast is exact.
+        (p / t * 100.0).floor().clamp(0.0, 100.0) as u8
+    });
+    match (message.filter(|m| !m.is_empty()), pct) {
+        (Some(m), Some(pct)) => Some(format!("{m} ({pct}%)")),
+        (Some(m), None) => Some(m.to_owned()),
+        (None, Some(pct)) => Some(format!("{pct}%")),
+        (None, None) => None,
+    }
+}
+
+/// In-progress `tool_call_update` carrying MCP progress text.
+fn tool_progress_update(
+    tool_call_id: &str,
+    tool_name: &str,
+    progress: Option<f64>,
+    total: Option<f64>,
+    message: Option<&str>,
+) -> Option<SessionUpdate> {
+    let text = progress_text(progress, total, message)?;
+    Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        ToolCallId::from(tool_call_id.to_owned()),
+        ToolCallUpdateFields::new()
+            .kind(tool_kind_for_tool(tool_name))
+            .status(ToolCallStatus::InProgress)
+            .content(vec![ToolCallContent::Content(Content::new(
+                ContentBlock::Text(TextContent::new(text)),
+            ))]),
+    )))
 }
 
 /// Translate an internal agent event to a replay JSON-RPC notification.
@@ -2443,6 +2538,10 @@ fn translate_replayable_updates(event: &EventEnvelope) -> Vec<SessionUpdate> {
                 .message_id(message_id.clone().map(MessageId::from)),
         )],
         AgentEventKind::UserPromptBlock { .. } => Vec::new(),
+        // Live-only: progress is transient and never part of replayed history.
+        AgentEventKind::ToolCallProgress { .. } => Vec::new(),
+        // Live-only: delivered as an ext notification, never replayed.
+        AgentEventKind::McpServerAuthRequired { .. } => Vec::new(),
         AgentEventKind::AssistantMessageStored {
             content,
             message_id,
@@ -3783,6 +3882,65 @@ mod tests {
                 is_error: false,
             },
         })
+    }
+
+    #[test]
+    fn progress_text_formats() {
+        assert_eq!(
+            progress_text(Some(3.0), Some(10.0), Some("indexing")).as_deref(),
+            Some("indexing (30%)")
+        );
+        assert_eq!(
+            progress_text(Some(1.0), Some(3.0), None).as_deref(),
+            Some("33%")
+        );
+        // No total, or a non-positive total: no percentage.
+        assert_eq!(
+            progress_text(Some(3.0), None, Some("indexing")).as_deref(),
+            Some("indexing")
+        );
+        assert_eq!(
+            progress_text(Some(3.0), Some(0.0), Some("indexing")).as_deref(),
+            Some("indexing")
+        );
+        assert_eq!(progress_text(Some(3.0), Some(0.0), None), None);
+        assert_eq!(progress_text(Some(3.0), None, None), None);
+        // Over- and under-shoot are clamped.
+        assert_eq!(
+            progress_text(Some(30.0), Some(10.0), None).as_deref(),
+            Some("100%")
+        );
+        assert_eq!(
+            progress_text(Some(-1.0), Some(10.0), None).as_deref(),
+            Some("0%")
+        );
+    }
+
+    #[test]
+    fn tool_call_progress_maps_to_in_progress_update_and_is_not_replayed() {
+        let event = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::ToolCallProgress {
+                tool_call_id: "tc-1".into(),
+                tool_name: "mcp_tool".into(),
+                progress: Some(3.0),
+                total: Some(10.0),
+                message: Some("indexing".into()),
+            },
+        });
+        let update =
+            tool_progress_update("tc-1", "mcp_tool", Some(3.0), Some(10.0), Some("indexing"))
+                .expect("update");
+        let SessionUpdate::ToolCallUpdate(u) = update else {
+            panic!("expected tool call update");
+        };
+        assert_eq!(u.fields.status, Some(ToolCallStatus::InProgress));
+        // Replay projection ignores it.
+        assert!(translate_replay_event_to_updates(&event).is_empty());
     }
 
     #[test]

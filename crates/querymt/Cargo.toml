@@ -25,7 +25,7 @@ reqwest-client = ["http-client"]
 plugin_host = ["dirs", "toml", "serde_yaml"]
 model-registry = ["dirs", "http-client"]
 native = ["plugin_host", "http-client", "libloading", "once_cell"]
-mcp = ["rmcp", "toml", "tokio", "jsonschema", "reqwest"]
+mcp = ["rmcp", "toml", "tokio", "jsonschema", "reqwest", "uuid"]
 extism_host = ["plugin_host", "http-client", "tracing", "dep:extism", "docker_credential", "sigstore", "oci-client", "tar", "flate2", "sha2", "serde_yaml", "dirs", "hex", "tempfile"]
 extism_plugin = ["http-serde-ext"]
 tracing = ["dep:tracing"]
@@ -45,7 +45,7 @@ futures = "0.3"
 url.workspace = true
 http.workspace = true
 libloading = { version = "0.9", optional = true}
-rmcp = { version = "1.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"], optional = true }
+rmcp = { version = "3.8", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"], optional = true }
 toml = { workspace = true, optional = true}
 thiserror = "1.0"
 extism = { version = "1.11", optional = true}

@@ -1485,6 +1485,33 @@ async fn output_limit_recovery_example_loads_with_the_documented_defaults() {
     assert_eq!(cfg, OutputLimitConfig::default());
 }
 
+/// The shipped OAuth MCP example loads and declares an OAuth HTTP server that
+/// passes the shared server validation.
+#[tokio::test]
+async fn oauth_mcp_example_loads_with_an_oauth_server() {
+    let config = load_config(ConfigSource::Toml(
+        include_str!("../../examples/confs/oauth_mcp.toml").into(),
+    ))
+    .await
+    .unwrap();
+    let Config::Single(config) = config else {
+        panic!("single config");
+    };
+    let linear = config
+        .mcp
+        .iter()
+        .find(|s| s.name() == "linear")
+        .expect("example declares the linear server");
+    assert!(matches!(
+        linear,
+        McpServerConfig::Http {
+            auth: Some(McpAuth::OAuth { scopes, redirect_port: None, .. }),
+            ..
+        } if scopes == &["read".to_string()]
+    ));
+    crate::agent::mcp::validate_mcp_server(linear).unwrap();
+}
+
 /// 21.12: the shipped example/embedded profiles only gain commented-out
 /// workspace blocks, so they still parse with the service disabled and every
 /// delegate on the default `inherit` isolation.
@@ -1531,4 +1558,198 @@ async fn example_profiles_keep_workspace_disabled_and_delegates_inheriting() {
                 .all(|d| d.isolation == crate::worktree::DelegationIsolation::Inherit)
         );
     }
+}
+
+// ── MCP server settings (rmcp3 client features) ─────────────────────────
+
+fn parse_mcp(toml: &str) -> Vec<McpServerConfig> {
+    #[derive(serde::Deserialize)]
+    struct Wrapper {
+        mcp: Vec<McpServerConfig>,
+    }
+    toml::from_str::<Wrapper>(toml)
+        .expect("TOML should parse")
+        .mcp
+}
+
+#[test]
+fn mcp_config_without_new_keys_uses_defaults() {
+    let servers = parse_mcp(
+        r#"
+[[mcp]]
+name = "fs"
+transport = "stdio"
+command = "npx"
+
+[[mcp]]
+name = "remote"
+transport = "http"
+url = "https://example.test/mcp"
+headers = { Authorization = "Bearer x" }
+"#,
+    );
+    for server in &servers {
+        assert!(!server.tasks_enabled());
+        assert!(server.cache_enabled());
+    }
+    let McpServerConfig::Http {
+        auth, socket_path, ..
+    } = &servers[1]
+    else {
+        panic!("expected http");
+    };
+    assert!(auth.is_none() && socket_path.is_none());
+}
+
+#[test]
+fn mcp_config_parses_every_new_key() {
+    let servers = parse_mcp(
+        r#"
+[[mcp]]
+name = "fs"
+transport = "stdio"
+command = "npx"
+tasks = true
+cache = false
+
+[[mcp]]
+name = "linear"
+transport = "http"
+url = "https://mcp.linear.app/mcp"
+tasks = true
+cache = false
+auth = { type = "oauth", client_id = "abc", scopes = ["read", "write"], redirect_port = 5000 }
+
+[[mcp]]
+name = "sock"
+transport = "http"
+url = "http://localhost/mcp"
+socket_path = "/run/mcp.sock"
+"#,
+    );
+    assert!(servers[0].tasks_enabled() && !servers[0].cache_enabled());
+    let McpServerConfig::Http {
+        auth:
+            Some(McpAuth::OAuth {
+                client_id,
+                scopes,
+                redirect_port,
+            }),
+        tasks,
+        cache,
+        ..
+    } = &servers[1]
+    else {
+        panic!("expected oauth http");
+    };
+    assert_eq!(client_id.as_deref(), Some("abc"));
+    assert_eq!(scopes, &["read", "write"]);
+    assert_eq!(*redirect_port, Some(5000));
+    assert!(*tasks && !*cache);
+    let McpServerConfig::Http { socket_path, .. } = &servers[2] else {
+        panic!("expected http");
+    };
+    assert_eq!(
+        socket_path.as_deref(),
+        Some(std::path::Path::new("/run/mcp.sock"))
+    );
+}
+
+#[test]
+fn mcp_acp_round_trip_defaults_has_no_meta() {
+    for config in [
+        McpServerConfig::stdio("a", "cmd").with_args(["x"]),
+        McpServerConfig::http("b", "https://e.test/mcp"),
+    ] {
+        let acp = config.to_acp();
+        let meta = match &acp {
+            McpServer::Stdio(s) => s.meta.as_ref(),
+            McpServer::Http(s) => s.meta.as_ref(),
+            _ => unreachable!(),
+        };
+        assert!(meta.is_none(), "defaults must not emit _meta");
+        let back = McpServerConfig::from_acp(&acp).unwrap();
+        assert_eq!(back.name(), config.name());
+        assert!(!back.tasks_enabled() && back.cache_enabled());
+    }
+}
+
+#[test]
+fn mcp_acp_round_trip_preserves_new_fields() {
+    let stdio = McpServerConfig::stdio("a", "cmd")
+        .with_tasks(true)
+        .with_cache(false);
+    let back = McpServerConfig::from_acp(&stdio.to_acp()).unwrap();
+    assert!(back.tasks_enabled() && !back.cache_enabled());
+
+    let http = McpServerConfig::http("b", "https://e.test/mcp")
+        .with_tasks(true)
+        .with_cache(false)
+        .with_socket_path("/run/x.sock");
+    let back = McpServerConfig::from_acp(&http.to_acp()).unwrap();
+    let McpServerConfig::Http {
+        socket_path,
+        tasks,
+        cache,
+        ..
+    } = back
+    else {
+        panic!("expected http");
+    };
+    assert_eq!(
+        socket_path.as_deref(),
+        Some(std::path::Path::new("/run/x.sock"))
+    );
+    assert!(tasks && !cache);
+
+    let oauth = McpServerConfig::http("c", "https://e.test/mcp").with_auth(McpAuth::OAuth {
+        client_id: None,
+        scopes: vec!["s".into()],
+        redirect_port: Some(1234),
+    });
+    let McpServerConfig::Http { auth, .. } = McpServerConfig::from_acp(&oauth.to_acp()).unwrap()
+    else {
+        panic!("expected http");
+    };
+    assert_eq!(
+        auth,
+        Some(McpAuth::OAuth {
+            client_id: None,
+            scopes: vec!["s".into()],
+            redirect_port: Some(1234)
+        })
+    );
+}
+
+#[test]
+fn mcp_from_acp_tolerates_partial_and_rejects_malformed_meta() {
+    let mut server = McpServerHttp::new("p", "https://e.test/mcp");
+    server.meta = serde_json::from_value(serde_json::json!({"querymt": {"tasks": true}})).ok();
+    let cfg = McpServerConfig::from_acp(&McpServer::Http(server.clone())).unwrap();
+    assert!(cfg.tasks_enabled() && cfg.cache_enabled());
+
+    server.meta = serde_json::from_value(serde_json::json!({"querymt": {"tasks": "yes"}})).ok();
+    let err = McpServerConfig::from_acp(&McpServer::Http(server)).unwrap_err();
+    assert!(err.to_string().contains("`p`"));
+}
+
+#[tokio::test]
+async fn load_config_rejects_socket_path_with_oauth_naming_server() {
+    let inline = r#"
+[agent]
+provider = "test"
+model = "m"
+tools = []
+
+[[mcp]]
+name = "bad-sock"
+transport = "http"
+url = "http://localhost/mcp"
+socket_path = "/run/mcp.sock"
+auth = { type = "oauth" }
+"#;
+    let err = load_config(ConfigSource::Toml(inline.to_string()))
+        .await
+        .expect_err("socket_path + oauth must be rejected");
+    assert!(format!("{err:#}").contains("bad-sock"), "{err:#}");
 }

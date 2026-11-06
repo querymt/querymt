@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod error;
+pub mod mcp_auth;
 pub mod prelude;
 
 /// Backward-compatible alias for the `api` module.
