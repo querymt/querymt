@@ -1382,9 +1382,12 @@ async fn test_delete_profile_bound_delegate_session_releases_runtime() {
 }
 
 #[tokio::test]
-async fn test_profile_handle_rejects_unbound_session_load_and_resume() {
+async fn test_profile_handle_adopts_stored_unbound_session_on_load_and_resume() {
     let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
-    let session = f
+    let profiles = f.handle.profiles().expect("profiles configured");
+
+    // Stored session without a binding (e.g. created by an older config-file run).
+    let load_session = f
         .handle
         .config
         .provider
@@ -1392,33 +1395,74 @@ async fn test_profile_handle_rejects_unbound_session_load_and_resume() {
         .create_session(None, None, None, None)
         .await
         .expect("create unbound session");
-    let req = crate::acp::protocol::LoadSessionRequest::new(
-        SessionId::from(session.public_id.clone()),
-        std::path::PathBuf::new(),
+    assert!(
+        profiles
+            .session_binding(&load_session.public_id)
+            .await
+            .is_none()
     );
-
-    let err = f
+    let _ = f
         .handle
-        .load_session(req)
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            SessionId::from(load_session.public_id.clone()),
+            std::path::PathBuf::new(),
+        ))
+        .await;
+    // Whatever happens when materializing, the session must no longer be rejected
+    // for lacking a binding: it is adopted by the active profile.
+    let binding = profiles
+        .session_binding(&load_session.public_id)
         .await
-        .expect_err("unbound load must fail");
-    assert!(err.to_string().contains("profile binding"));
-    let err = SendAgent::resume_session(
+        .expect("load adopts unbound session");
+    assert_eq!(binding.profile_id, "alpha");
+
+    let resume_session = f
+        .handle
+        .config
+        .provider
+        .history_store()
+        .create_session(None, None, None, None)
+        .await
+        .expect("create second unbound session");
+    let result = SendAgent::resume_session(
         &f.handle,
         crate::acp::protocol::ResumeSessionRequest::new(
-            SessionId::from(session.public_id.clone()),
+            SessionId::from(resume_session.public_id.clone()),
             std::path::PathBuf::new(),
         ),
     )
-    .await
-    .expect_err("unbound resume must fail");
+    .await;
+    if let Err(err) = result {
+        assert!(!err.to_string().contains("no profile binding"), "{err}");
+    }
+    assert_eq!(
+        profiles
+            .session_binding(&resume_session.public_id)
+            .await
+            .expect("resume adopts unbound session")
+            .profile_id,
+        "alpha"
+    );
+}
+
+#[tokio::test]
+async fn test_profile_handle_does_not_bind_unknown_session_ids() {
+    let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+    let err = f
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            SessionId::from("does-not-exist"),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .expect_err("unknown session must fail");
     assert!(err.to_string().contains("profile binding"));
     assert!(
         f.handle
-            .registry
-            .lock()
+            .profiles()
+            .expect("profiles configured")
+            .session_binding("does-not-exist")
             .await
-            .get(&session.public_id)
             .is_none()
     );
 }

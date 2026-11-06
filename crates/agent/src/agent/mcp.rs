@@ -98,6 +98,15 @@ pub fn validate_mcp_server(server: &McpServerConfig) -> AnyResult<()> {
     {
         bail!("MCP server `{name}`: `auth` cannot be combined with an `Authorization` header");
     }
+    if let Some(McpAuth::OAuth {
+        scopes,
+        strict_scopes: true,
+        ..
+    }) = auth
+        && scopes.is_empty()
+    {
+        bail!("MCP server `{name}`: `strict_scopes` needs the allowed `scopes` listed");
+    }
     Ok(())
 }
 
@@ -337,6 +346,7 @@ mod tests {
             client_id: None,
             scopes: vec![],
             redirect_port: None,
+            strict_scopes: false,
         }
     }
 
@@ -403,11 +413,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn strict_scopes_need_scopes() {
+        let strict = |scopes: &[&str]| McpAuth::OAuth {
+            client_id: None,
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            redirect_port: None,
+            strict_scopes: true,
+        };
+        let msg = err(McpServerConfig::http("s", "https://e.test").with_auth(strict(&[])));
+        assert!(
+            msg.contains("`s`") && msg.contains("strict_scopes"),
+            "{msg}"
+        );
+        validate_mcp_server(
+            &McpServerConfig::http("s", "https://e.test").with_auth(strict(&["r"])),
+        )
+        .unwrap();
+    }
+
     fn oauth_with(scopes: &[&str]) -> McpAuth {
         McpAuth::OAuth {
             client_id: Some("cfg".into()),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             redirect_port: Some(5000),
+            strict_scopes: false,
         }
     }
 

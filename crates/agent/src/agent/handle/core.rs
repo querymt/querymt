@@ -81,12 +81,16 @@ impl LocalAgentHandle {
         let session_materializer = Arc::new(SessionMaterializer::new(config.clone()));
         let model_inventory = crate::model_inventory::ModelInventory::new(config.clone());
         let (ext_notifications, _) = broadcast::channel(64);
+        let profiles: ProfileRuntimeSlot = Arc::new(ArcSwap::from_pointee(None));
         let oauth_service = crate::auth::service::OAuthService::new(
             config.clone(),
             model_inventory.clone(),
             std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
             std::sync::Arc::new(Mutex::new(None)),
         );
+        // MCP logins also cover the servers of profiles installed later.
+        #[cfg(feature = "oauth")]
+        let oauth_service = oauth_service.with_profile_slot(profiles.clone());
         let default_mode = *config
             .default_mode
             .lock()
@@ -116,7 +120,7 @@ impl LocalAgentHandle {
             remote_connect_cooldowns: Default::default(),
             model_inventory,
             oauth_service,
-            profiles: Arc::new(ArcSwap::from_pointee(None)),
+            profiles,
             scheduler_handle: Arc::new(parking_lot::Mutex::new(None)),
             shutdown_done: AtomicBool::new(false),
         }
@@ -917,6 +921,7 @@ impl LocalAgentHandle {
         }
 
         if let Some(profiles) = self.profiles() {
+            self.adopt_unbound_session_binding(&session_id).await?;
             let binding = profiles.session_binding(&session_id).await.ok_or_else(|| {
                 Error::invalid_params().data(serde_json::json!({
                     "message": "Session has no profile binding",

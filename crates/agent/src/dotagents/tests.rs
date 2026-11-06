@@ -428,6 +428,43 @@ fn approved_workspace_mcp_stdio_conversion_uses_existing_process_config() {
 }
 
 #[test]
+fn http_mcp_conversion_carries_oauth_auth_extension() {
+    let mut server = mcp_server(DotagentsMcpTransport::StreamableHttp, true);
+    server.url = Some("https://corp.example/mcp".to_string());
+    server.extensions.insert(
+        "auth".to_string(),
+        serde_json::json!({"type": "oauth", "scopes": ["read"], "strict_scopes": true}),
+    );
+    let config = adapters::convert_server(&server).expect("conversion succeeds");
+    let Some(crate::config::McpServerConfig::Http {
+        auth:
+            Some(crate::config::McpAuth::OAuth {
+                scopes,
+                strict_scopes,
+                ..
+            }),
+        ..
+    }) = config
+    else {
+        panic!("expected an OAuth http server, got {config:?}");
+    };
+    assert_eq!(scopes, ["read"]);
+    assert!(strict_scopes);
+
+    // Invalid auth is reported, not silently dropped.
+    server
+        .extensions
+        .insert("auth".to_string(), serde_json::json!({"type": "basic"}));
+    let diagnostic = adapters::convert_server(&server).unwrap_err();
+    assert_eq!(diagnostic.code, DotagentsDiagnosticCode::ParseError);
+    assert!(
+        diagnostic.message.contains("invalid `auth`"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
 fn workspace_mcp_stdio_conversion_requires_approval() {
     let mut server = mcp_server(DotagentsMcpTransport::Stdio, true);
     server.command = Some("npx".to_string());

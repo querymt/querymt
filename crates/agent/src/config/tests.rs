@@ -1643,6 +1643,7 @@ socket_path = "/run/mcp.sock"
                 client_id,
                 scopes,
                 redirect_port,
+                ..
             }),
         tasks,
         cache,
@@ -1715,6 +1716,7 @@ fn mcp_acp_round_trip_preserves_new_fields() {
         client_id: None,
         scopes: vec!["s".into()],
         redirect_port: Some(1234),
+        strict_scopes: false,
     });
     let McpServerConfig::Http { auth, .. } = McpServerConfig::from_acp(&oauth.to_acp()).unwrap()
     else {
@@ -1725,7 +1727,8 @@ fn mcp_acp_round_trip_preserves_new_fields() {
         Some(McpAuth::OAuth {
             client_id: None,
             scopes: vec!["s".into()],
-            redirect_port: Some(1234)
+            redirect_port: Some(1234),
+            strict_scopes: false,
         })
     );
 }
@@ -1952,4 +1955,37 @@ async fn documented_approval_snippet_loads() {
         single.agent.permissions.timeout_sec.map(|s| s.get()),
         Some(120)
     );
+}
+
+#[tokio::test]
+async fn config_mcp_servers_include_quorum_delegate_servers() {
+    let toml = r#"
+[quorum]
+cwd = "/tmp"
+
+[[mcp]]
+name = "shared"
+transport = "stdio"
+command = "true"
+
+[planner]
+provider = "openai"
+model = "gpt-4"
+
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+
+[[delegates.mcp]]
+name = "private"
+transport = "http"
+url = "https://private.example/mcp"
+auth = { type = "oauth", scopes = ["read"] }
+"#;
+    let config = load_config(ConfigSource::Toml(toml.to_string()))
+        .await
+        .unwrap();
+    let names: Vec<_> = config.mcp_servers().map(|s| s.name()).collect();
+    assert_eq!(names, ["shared", "private"]);
 }

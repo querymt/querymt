@@ -375,6 +375,7 @@ async fn oauth_transport(
         crate::mcp_auth::redirect_uri(*redirect_port),
         connect_ctx.secret_backend(),
     )
+    .with_auth_policy(auth)
     .for_connection();
     // Private addresses are allowed for the discovered authorization server:
     // internal MCP servers commonly sit behind an internal identity provider.
@@ -575,6 +576,7 @@ pub(crate) mod tests {
                 client_id: None,
                 scopes: vec![],
                 redirect_port: None,
+                strict_scopes: false,
             })
             .to_acp();
         let Err(err) = build_mcp_state(
@@ -704,6 +706,7 @@ pub(crate) mod tests {
                 client_id: None,
                 scopes: vec![],
                 redirect_port: None,
+                strict_scopes: false,
             })
         }
 
@@ -1162,6 +1165,7 @@ pub(crate) mod tests {
                 client_id: None,
                 scopes: vec![],
                 redirect_port: None,
+                strict_scopes: false,
             },
         );
         let ctx = McpConnectContext::from_config(std::slice::from_ref(&server));

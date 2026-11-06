@@ -173,6 +173,7 @@ impl LocalAgentHandle {
                 .config_options(self.remote_session_config_options(&session_id).await?));
         }
 
+        self.adopt_unbound_session_binding(&session_id).await?;
         let session_ref =
             if let Some((owner, binding)) = self.bound_session_handle(&session_id).await? {
                 let owner = owner

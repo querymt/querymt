@@ -493,6 +493,7 @@ impl ProfileCatalogBuilder {
             include_default_user_dir: self.include_default_user_dir,
             default_user_dir_override: self.default_user_dir_override,
             local_dirs: self.local_dirs,
+            explicit_files: Vec::new(),
         }
     }
 }
@@ -505,6 +506,10 @@ pub struct LocalProfileCatalog {
     include_default_user_dir: bool,
     default_user_dir_override: Option<PathBuf>,
     local_dirs: Vec<PathBuf>,
+    /// Individual config files exposed under a caller-chosen profile id.
+    /// The id wins over any `[profile].id` inside the file so an explicit
+    /// config can never collide with an embedded profile.
+    explicit_files: Vec<(String, PathBuf)>,
 }
 
 impl Default for LocalProfileCatalog {
@@ -523,6 +528,43 @@ impl LocalProfileCatalog {
             .include_embedded_default(true)
             .with_local_dirs(local_dirs)
             .build()
+    }
+
+    /// Expose a single config file as a profile with the given id.
+    ///
+    /// Used when a config path is passed on the command line: the config
+    /// becomes a regular profile, so sessions get a persisted profile binding
+    /// and the other catalog profiles stay selectable.
+    pub fn with_explicit_profile_file(
+        mut self,
+        id: impl Into<String>,
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        self.explicit_files.push((id.into(), path.into()));
+        self
+    }
+
+    fn explicit_file_metadata(id: &str, path: &Path) -> Result<ProfileMetadata> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file '{}'", path.display()))?;
+        let file_meta = parse_profile_file_metadata(&content)?.unwrap_or_default();
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+            .or(file_meta.name)
+            .unwrap_or_else(|| id.to_string());
+        Ok(ProfileMetadata {
+            id: id.to_string(),
+            name,
+            description: Some("Explicit config path".to_string()),
+            tags: file_meta.tags,
+            source: ProfileSource::LocalPath {
+                path: path.to_path_buf(),
+            },
+            config_kind: infer_config_kind_from_toml(&content).ok().flatten(),
+            fingerprint: Some(profile_file_fingerprint(path, &content)),
+        })
     }
 
     fn embedded_default_metadata() -> Result<ProfileMetadata> {
@@ -630,6 +672,10 @@ impl ProfileCatalog for LocalProfileCatalog {
             let mut local = list_local_profiles(dir)
                 .with_context(|| format!("Failed to list local profiles in '{}'", dir.display()))?;
             profiles.append(&mut local);
+        }
+
+        for (id, path) in &self.explicit_files {
+            profiles.push(Self::explicit_file_metadata(id, path)?);
         }
 
         profiles.sort_by(|a, b| {
@@ -1139,8 +1185,136 @@ where
         Some(binding)
     }
 
+    /// Give a locally stored session without a usable profile binding a binding.
+    ///
+    /// Sessions created before profiles existed (or by a config-file run of an
+    /// older build) have no persisted binding, and sessions bound to a profile
+    /// that no longer exists cannot be routed. Both are adopted by the embedded
+    /// `default` profile when present, otherwise by the active profile.
+    ///
+    /// An existing binding to a profile that is still listed is never
+    /// overwritten: if that profile merely fails to load, the error should
+    /// surface instead of silently re-routing the session.
+    pub async fn adopt_unbound_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionProfileBinding>> {
+        if let Some(binding) = self.session_binding(session_id).await {
+            return Ok(Some(binding));
+        }
+        let profiles = self.catalog.list_profiles().await?;
+        if let Some(storage) = &self.shared_infra.storage
+            && let Some(route) = storage
+                .session_store()
+                .get_session_runtime_binding(session_id)
+                .await
+                .map_err(|err| anyhow!("Failed to read session profile binding: {err}"))?
+        {
+            if profiles
+                .iter()
+                .any(|profile| profile.id == route.profile_id)
+            {
+                return Ok(None);
+            }
+            warn!(
+                session_id,
+                missing_profile = %route.profile_id,
+                "session is bound to a profile that is not in the catalog; rebinding"
+            );
+        }
+        let fallback = if profiles
+            .iter()
+            .any(|profile| profile.id == DEFAULT_EMBEDDED_PROFILE_KEY)
+        {
+            DEFAULT_EMBEDDED_PROFILE_KEY.to_string()
+        } else {
+            self.active_profile_id().await
+        };
+        info!(session_id, profile_id = %fallback, "binding unbound session to fallback profile");
+        self.bind_session_to_profile(session_id, &fallback)
+            .await
+            .map(Some)
+    }
+
     pub async fn materialized_runtimes(&self) -> Vec<Arc<ProfileRuntime>> {
         self.runtimes.lock().await.values().cloned().collect()
+    }
+
+    /// Every MCP server declaration across profiles, labelled with its source
+    /// (`profile <id>` or `profile <id> (.agents)`).
+    ///
+    /// Reads each catalog profile (its `[[mcp]]` entries and the MCP servers
+    /// of its `.agents/` layers), so servers are known before a profile
+    /// runtime exists, and the running profile runtimes, whose configuration
+    /// carries the `.agents/` servers they were actually built with. A profile
+    /// that fails to load is skipped with a warning.
+    pub async fn mcp_servers(&self) -> Vec<(String, crate::config::McpServerConfig)> {
+        let mut out = Vec::new();
+        match self.catalog.list_profiles().await {
+            Ok(profiles) => {
+                for metadata in profiles {
+                    match self.catalog.load_profile(&metadata.id).await {
+                        Ok(document) => {
+                            out.extend(self.profile_mcp_servers(&metadata.id, &document.config))
+                        }
+                        Err(error) => warn!(
+                            profile_id = %metadata.id,
+                            error = %format!("{error:#}"),
+                            "skipping profile while collecting MCP servers"
+                        ),
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "cannot list profiles for MCP servers")
+            }
+        }
+        for runtime in self.materialized_runtimes().await {
+            let source = format!("profile {} (running)", runtime.profile_id());
+            out.extend(
+                runtime
+                    .agent()
+                    .mcp_server_configs()
+                    .into_iter()
+                    .map(|server| (source.clone(), server)),
+            );
+        }
+        out
+    }
+
+    /// `[[mcp]]` servers of a profile configuration plus its `.agents/` ones.
+    fn profile_mcp_servers(
+        &self,
+        profile_id: &str,
+        config: &Config,
+    ) -> Vec<(String, crate::config::McpServerConfig)> {
+        let source = format!("profile {profile_id}");
+        let mut out: Vec<_> = config
+            .mcp_servers()
+            .map(|server| (source.clone(), server.clone()))
+            .collect();
+        let mut options = config.dotagents().load_options();
+        if let Some(workspace) = config.cwd().or(self.dotagents_workspace.as_deref()) {
+            options = options.with_workspace_fallback(workspace);
+        }
+        match crate::dotagents::resolve_for_builder(None, Some(options), None) {
+            Ok(Some(manifest)) => {
+                let dotagents_source = format!("profile {profile_id} (.agents)");
+                out.extend(
+                    crate::dotagents::DotagentsMcpPlan::from_manifest(&manifest)
+                        .servers
+                        .into_iter()
+                        .map(|server| (dotagents_source.clone(), server)),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => warn!(
+                profile_id,
+                error = %error,
+                "skipping .agents MCP servers of profile"
+            ),
+        }
+        out
     }
 
     /// Set the workspace used to derive `<workspace>/.agents/` for profile runtimes.
@@ -3070,6 +3244,139 @@ system = "inline"
         assert!(manager.session_binding("unknown-session").await.is_none());
 
         manager.shutdown().await;
+    }
+
+    const ADOPT_TEST_PROFILE: &str = r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "inline"
+"#;
+
+    async fn adopt_test_manager(
+        dir: &Path,
+        infra: AgentInfra,
+    ) -> ProfileRuntimeManager<LocalProfileCatalog> {
+        let catalog = LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .embedded_config_toml(
+                DEFAULT_EMBEDDED_PROFILE_KEY,
+                "Default",
+                None,
+                ADOPT_TEST_PROFILE,
+            )
+            .local_dir(dir)
+            .build();
+        ProfileRuntimeManager::with_infra(catalog, "alpha", infra)
+    }
+
+    #[tokio::test]
+    async fn adopt_unbound_session_binds_to_default_and_persists() {
+        let dir = temp_profile_dir();
+        write_profile(dir.path(), "alpha.toml", ADOPT_TEST_PROFILE);
+        let (infra, _registry_dir) = test_infra().await;
+        let manager = adopt_test_manager(dir.path(), infra.clone()).await;
+
+        let binding = manager
+            .adopt_unbound_session("legacy-session")
+            .await
+            .expect("adopt succeeds")
+            .expect("binding created");
+        assert_eq!(binding.profile_id, DEFAULT_EMBEDDED_PROFILE_KEY);
+        assert_eq!(
+            infra
+                .storage
+                .as_ref()
+                .expect("shared storage")
+                .session_store()
+                .get_profile_binding("legacy-session")
+                .await
+                .expect("binding row"),
+            Some(DEFAULT_EMBEDDED_PROFILE_KEY.to_string())
+        );
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn adopt_unbound_session_keeps_existing_binding() {
+        let dir = temp_profile_dir();
+        write_profile(dir.path(), "alpha.toml", ADOPT_TEST_PROFILE);
+        let (infra, _registry_dir) = test_infra().await;
+        let manager = adopt_test_manager(dir.path(), infra).await;
+        manager
+            .bind_session_to_profile("bound-session", "alpha")
+            .await
+            .expect("bind");
+
+        let binding = manager
+            .adopt_unbound_session("bound-session")
+            .await
+            .expect("adopt succeeds")
+            .expect("existing binding returned");
+        assert_eq!(binding.profile_id, "alpha");
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn adopt_unbound_session_rebinds_when_profile_was_removed() {
+        let dir = temp_profile_dir();
+        write_profile(dir.path(), "alpha.toml", ADOPT_TEST_PROFILE);
+        let (infra, _registry_dir) = test_infra().await;
+        infra
+            .storage
+            .as_ref()
+            .expect("shared storage")
+            .session_store()
+            .set_profile_binding("orphan-session", "deleted-profile")
+            .await
+            .expect("binding row");
+        let manager = adopt_test_manager(dir.path(), infra).await;
+
+        let binding = manager
+            .adopt_unbound_session("orphan-session")
+            .await
+            .expect("adopt succeeds")
+            .expect("binding replaced");
+        assert_eq!(binding.profile_id, DEFAULT_EMBEDDED_PROFILE_KEY);
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_profile_file_is_listed_and_loadable_under_given_id() {
+        let dir = temp_profile_dir();
+        let path = write_profile(
+            dir.path(),
+            "my_config.toml",
+            r#"
+[profile]
+id = "ignored-inner-id"
+
+[agent]
+provider = "test"
+model = "test-model"
+system = "inline"
+"#,
+        );
+        let catalog = LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .build()
+            .with_explicit_profile_file("config-file", &path);
+
+        let profiles = catalog.list_profiles().await.expect("profiles list");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, "config-file");
+        assert_eq!(profiles[0].name, "my_config");
+        assert_eq!(profiles[0].config_kind, Some(ProfileConfigKind::Single));
+        assert!(profiles[0].fingerprint.is_some());
+
+        let document = catalog
+            .load_profile("config-file")
+            .await
+            .expect("explicit profile loads");
+        assert!(matches!(document.config, Config::Single(_)));
     }
 
     #[tokio::test]

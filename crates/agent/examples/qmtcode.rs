@@ -45,8 +45,7 @@ use clap::{ArgAction, ArgGroup, Parser};
 use querymt_agent::prelude::*;
 use querymt_agent::profiles::{
     DEFAULT_EMBEDDED_PROFILE_KEY, LocalProfileCatalog, ProfileCatalog, ProfileConfigKind,
-    ProfileMetadata, ProfileSource, ensure_unique_profile_ids,
-    standard_embedded_profile_catalog_builder,
+    ProfileSource, ensure_unique_profile_ids, standard_embedded_profile_catalog_builder,
 };
 #[cfg(any(feature = "api", feature = "dashboard"))]
 use querymt_agent::server::ServerMode;
@@ -254,8 +253,20 @@ fn merge_mesh_peers(cli_peers: &[String], toml_peers: &[String]) -> anyhow::Resu
     Ok(merged)
 }
 
-fn qmtcode_profile_catalog(profiles_dirs: &[PathBuf]) -> anyhow::Result<LocalProfileCatalog> {
-    qmtcode_profile_catalog_with_user_dir(profiles_dirs, None)
+/// Profile id under which an explicit config path is registered.
+const CONFIG_FILE_PROFILE_ID: &str = "config-file";
+
+fn qmtcode_profile_catalog(
+    profiles_dirs: &[PathBuf],
+    config_file: Option<&std::path::Path>,
+) -> anyhow::Result<LocalProfileCatalog> {
+    let catalog = qmtcode_profile_catalog_with_user_dir(profiles_dirs, None)?;
+    // An explicit config is just another profile, so its sessions get a persisted
+    // binding and the profiles in ~/.qmt/profiles stay selectable.
+    Ok(match config_file {
+        Some(path) => catalog.with_explicit_profile_file(CONFIG_FILE_PROFILE_ID, path),
+        None => catalog,
+    })
 }
 
 fn qmtcode_profile_catalog_with_user_dir(
@@ -307,7 +318,7 @@ struct MeshGsoProfileCatalog {
 #[cfg(feature = "remote")]
 #[async_trait::async_trait]
 impl ProfileCatalog for MeshGsoProfileCatalog {
-    async fn list_profiles(&self) -> anyhow::Result<Vec<ProfileMetadata>> {
+    async fn list_profiles(&self) -> anyhow::Result<Vec<querymt_agent::profiles::ProfileMetadata>> {
         self.inner.list_profiles().await
     }
 
@@ -338,6 +349,9 @@ fn validate_profile_args(cli: &Cli) -> anyhow::Result<()> {
 }
 
 fn selected_profile_id(cli: &Cli) -> &str {
+    if cli.config_file.is_some() {
+        return CONFIG_FILE_PROFILE_ID;
+    }
     cli.profile
         .as_deref()
         .unwrap_or(DEFAULT_EMBEDDED_PROFILE_KEY)
@@ -519,31 +533,9 @@ async fn run(
 
     validate_profile_args(&cli)?;
 
-    let profile_catalog = qmtcode_profile_catalog(&cli.profiles_dir)?;
+    let profile_catalog = qmtcode_profile_catalog(&cli.profiles_dir, cli.config_file.as_deref())?;
     if cli.list_profiles {
-        let mut profiles = profile_catalog.list_profiles().await?;
-        if let Some(config_path) = &cli.config_file {
-            let config = querymt_agent::config::load_config(config_path).await?;
-            let config_kind = match &config {
-                Config::Single(_) => ProfileConfigKind::Single,
-                Config::Multi(_) => ProfileConfigKind::Quorum,
-            };
-            profiles.push(ProfileMetadata {
-                id: "config-file".to_string(),
-                name: config_path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or("Config File")
-                    .to_string(),
-                description: Some("Explicit config path".to_string()),
-                tags: Vec::new(),
-                source: ProfileSource::LocalPath {
-                    path: config_path.clone(),
-                },
-                config_kind: Some(config_kind),
-                fingerprint: None,
-            });
-        }
+        let profiles = profile_catalog.list_profiles().await?;
         ensure_unique_profile_ids(&profiles)?;
         println!("{}", format_profile_list(&profiles));
         return Ok(());
@@ -575,21 +567,16 @@ async fn run(
     #[cfg(feature = "remote")]
     let mesh_toml_peers;
 
-    let runner = if let Some(config_path) = &cli.config_file {
-        eprintln!("Loading agent from: {}", config_path.display());
-        let config = querymt_agent::config::load_config(config_path).await?;
-        #[cfg(feature = "remote")]
-        let config = {
-            let (config, gso) = configure_mesh_iroh_gso(config, cli.mesh_iroh_gso);
-            mesh_iroh_gso = gso;
-            mesh_iroh_dns = mesh_dns(&config);
-            mesh_toml_peers = mesh_peers(&config);
-            config
-        };
-        from_config_value_with_infra(config, shared_infra.clone()).await?
-    } else {
+    let runner = {
         let selected_profile = selected_profile_id(&cli).to_string();
-        eprintln!("Loading agent from profile: {selected_profile}");
+        if let Some(config_path) = &cli.config_file {
+            eprintln!(
+                "Loading agent from: {} (profile '{selected_profile}'; other profiles stay available)",
+                config_path.display()
+            );
+        } else {
+            eprintln!("Loading agent from profile: {selected_profile}");
+        }
         #[cfg(feature = "remote")]
         let profile_catalog = {
             let document = profile_catalog.load_profile(&selected_profile).await?;

@@ -1367,6 +1367,23 @@ impl Agent {
         self.quorum.as_ref().map(|q| q.planner())
     }
 
+    /// MCP servers this agent's runtimes were built with, including those
+    /// merged in from `.agents/`: the agent's own, or for a quorum the
+    /// planner's and every local delegate's.
+    pub fn mcp_server_configs(&self) -> Vec<crate::config::McpServerConfig> {
+        let mut servers = self.inner.config.mcp_servers.clone();
+        if let Some(quorum) = &self.quorum {
+            let handles = std::iter::once(quorum.planner())
+                .chain(quorum.delegates().iter().map(|d| d.agent.clone()));
+            for handle in handles {
+                if let Some(local) = handle.as_any().downcast_ref::<AgentHandle>() {
+                    servers.extend(local.config.mcp_servers.iter().cloned());
+                }
+            }
+        }
+        servers
+    }
+
     /// Access a delegate handle by ID (returns `None` for single agents or if not found).
     pub fn delegate(&self, id: &str) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
         self.quorum.as_ref().and_then(|q| q.delegate(id))

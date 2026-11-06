@@ -407,6 +407,22 @@ impl RpcDispatchContext {
     }
 }
 
+/// True for the `invalid_params` "unknown session" errors raised when a session id is not
+/// live in any registry.
+fn is_unknown_session_error(error: &Error) -> bool {
+    if error.code != agent_client_protocol::ErrorCode::InvalidParams {
+        return false;
+    }
+    match error.data.as_ref() {
+        Some(serde_json::Value::String(message)) => message.starts_with("unknown session"),
+        Some(data) => data
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| message.starts_with("unknown session")),
+        None => false,
+    }
+}
+
 async fn attach_rpc_session<S: SendAgent>(
     agent: &S,
     session_owners: &SessionOwnerMap,
@@ -481,7 +497,11 @@ async fn attach_rpc_session_locked<S: SendAgent>(
             }
             return Err(error);
         }
-        log::warn!("Failed to attach ACP bridge for session {session_id}: {error}");
+        if is_unknown_session_error(&error) {
+            log::debug!("Session {session_id} is not materialized; skipping ACP bridge attach");
+        } else {
+            log::warn!("Failed to attach ACP bridge for session {session_id}: {error}");
+        }
     }
     if let Some(hooks) = context.session_hooks.as_ref()
         && let Err(error) = hooks.on_session_attached(local_agent, session_id).await
@@ -569,6 +589,11 @@ pub(crate) async fn restore_session_history(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .seed_config_options(session_id, &options),
+            Err(error) if is_unknown_session_error(&error) => {
+                // Status probes (e.g. runtimeState) may name sessions that are stored but
+                // not materialized; that is expected and not worth a warning.
+                tracing::debug!(session.id = %session_id, %error, "session not materialized; skipping ACP configuration restore")
+            }
             Err(error) => {
                 tracing::warn!(session.id = %session_id, %error, "failed to restore ACP configuration")
             }
@@ -3617,6 +3642,24 @@ fn acp_method_span(method: &str) -> tracing::Span {
 mod tests {
     use super::*;
     use crate::agent::core::AgentMode;
+
+    #[test]
+    fn unknown_session_errors_are_recognized() {
+        assert!(is_unknown_session_error(
+            &Error::invalid_params().data("unknown session")
+        ));
+        assert!(is_unknown_session_error(&Error::invalid_params().data(
+            serde_json::json!({"message": "unknown session", "sessionId": "s"})
+        )));
+        assert!(!is_unknown_session_error(
+            &Error::invalid_params().data("bad params")
+        ));
+        assert!(!is_unknown_session_error(
+            &Error::internal_error().data("unknown session")
+        ));
+        assert!(!is_unknown_session_error(&Error::invalid_params()));
+    }
+
     use crate::elicitation::ElicitationAction;
     use crate::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
     use crate::session::backend::StorageBackend;

@@ -272,9 +272,23 @@ auth = { type = "oauth", scopes = ["read"] }
   `socket_path` or an `Authorization` header.
 - **Login:** use the `_querymt/auth/*` extension methods (`start`, `complete`,
   `status`, `logout`) with the provider id `mcp:<server name>`, for example
-  `mcp:linear`. Login flows are scoped to the client that started them. The
+  `mcp:linear`. Servers are offered from the agent configuration, every profile
+  (its `[[mcp]]` entries, quorum delegate `mcp` entries and `.agents/mcp.json`
+  servers) and the running profile runtimes, so a server declared only in a
+  profile can be logged into before any session uses it. A name declared with
+  different settings by several sources is refused with an `invalid_params`
+  error naming the sources; credentials are stored per name, so make the
+  declarations agree or rename one. Login flows are scoped to the client that started them. The
   loopback redirect URI is `http://127.0.0.1:<redirect_port>/callback`; the
   default port is `47821`. Register that URI when using a fixed `client_id`.
+- **Strict scopes:** authorization servers may grant more than was requested.
+  With `strict_scopes = true` (requires `scopes`), a login or refresh whose
+  token carries any scope beyond `scopes` (and `offline_access`) is not stored,
+  and stored credentials with a wider grant are not used to connect. The grant
+  is read from the token response `scope` and, for JWT access tokens, the
+  `scope`/`scp` claim. Example: `auth = { type = "oauth", scopes = ["mcp.read"], strict_scopes = true }`.
+- **`.agents/mcp.json`:** an HTTP entry may carry the same `auth` object, e.g.
+  `"auth": {"type": "oauth", "scopes": ["read"]}`.
 - **Storage:** tokens are kept in the secret store under `mcp-oauth:<server>`,
   bound to the server URL, and never written to config, logs, events, or
   session history.
