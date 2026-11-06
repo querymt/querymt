@@ -11,12 +11,11 @@ use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::SnapshotPolicy;
 use crate::agent::core::ToolPolicy;
-use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
+use crate::config::{MiddlewareEntry, QuorumConfig, ToolSpec, resolve_tools};
 use crate::delegation::AgentInfo;
 
 use crate::acp::protocol::{ContentBlock, PromptRequest, TextContent};
 use crate::agent::handle::AgentHandle as AgentHandleTrait;
-use crate::middleware::MIDDLEWARE_REGISTRY;
 use crate::runner::ChatSession;
 use crate::session::backend::resolve_agent_db_path;
 use crate::session::provider::SessionProvider;
@@ -337,7 +336,7 @@ impl QuorumBuilder {
         if planner_config
             .tools
             .iter()
-            .any(|tool| tool == crate::skills::SkillTool::NAME)
+            .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME))
         {
             match planner_config.skills.as_ref() {
                 Some(skills) if skills.enabled => {}
@@ -359,7 +358,7 @@ impl QuorumBuilder {
             if delegate
                 .tools
                 .iter()
-                .any(|tool| tool == crate::skills::SkillTool::NAME)
+                .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME))
             {
                 match delegate.skills.as_ref() {
                     Some(skills) if skills.enabled => {}
@@ -544,11 +543,11 @@ impl QuorumBuilder {
             let tools = delegate.tools.clone();
             let delegate_mcp_servers = delegate.mcp_servers.clone();
             let middleware_entries = delegate.middleware.clone();
+            let delegate_mode = delegate.mode;
             let exec = delegate.execution.clone();
             let skills = delegate.skills.clone();
             let skills_project_root_for_delegate = skills_project_root.clone();
-            let assume_mutating = delegate.assume_mutating;
-            let mutating_tools = delegate.mutating_tools.clone().unwrap_or_default();
+            let delegate_permissions = delegate.permissions.clone();
             let registry = registry.clone();
             let delegate_agent_id = delegate.id.clone();
             let snapshot_policy_for_delegate = self.snapshot_policy;
@@ -573,7 +572,7 @@ impl QuorumBuilder {
                     && (tools.is_empty()
                         || tools
                             .iter()
-                            .any(|tool| tool == crate::skills::SkillTool::NAME))
+                            .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME)))
                 {
                     b.tool_registry_mut().add(crate::skills::build_skill_tool(
                         skills,
@@ -588,7 +587,7 @@ impl QuorumBuilder {
                     // MCP selection needs BuiltInAndProvider so MCP tool
                     // definitions reach the LLM; otherwise BuiltInOnly is
                     // sufficient.
-                    let has_external_tools = tools.iter().any(|tool| tool.contains('.'));
+                    let has_external_tools = tools.iter().any(ToolSpec::is_mcp);
                     let policy = if has_external_tools || !delegate_mcp_servers.is_empty() {
                         ToolPolicy::BuiltInAndProvider
                     } else {
@@ -602,23 +601,20 @@ impl QuorumBuilder {
                     b = b.with_mcp_servers(delegate_mcp_servers.clone());
                 }
 
-                let auto_compact = exec.compaction.auto;
                 b = b
+                    .with_agent_mode(delegate_mode)
                     .with_snapshot_from_execution(&exec)
                     .with_delegation_wait_policy(delegation_wait_policy_for_delegate.clone())
                     .with_delegation_wait_timeout_secs(delegation_wait_timeout_for_delegate)
                     .with_delegation_cancel_grace_secs(delegation_cancel_grace_for_delegate)
-                    .with_mutating_tools(mutating_tools.clone());
-                if let Some(am) = assume_mutating {
-                    b = b.with_assume_mutating(am);
-                }
-                apply_middleware_from_config(&mut b, &middleware_entries, auto_compact);
+                    .with_permissions(delegate_permissions.clone());
+                apply_middleware_from_config(&mut b, &middleware_entries)?;
                 if let Some(service) = workspace_for_delegate.clone() {
                     b = b.with_workspace_service(service);
                 }
 
                 let config = Arc::new(b.build());
-                Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>
+                Ok(Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>)
             });
         }
 
@@ -679,8 +675,8 @@ impl QuorumBuilder {
                     move |_storage: Arc<dyn StorageBackend>, _event_fanout| match factory
                         .create(&target_plan)
                     {
-                        Some(handle) => handle,
-                        None => Arc::new(AgentHandle::from_config(Arc::new(
+                        Some(handle) => Ok(handle),
+                        None => Ok(Arc::new(AgentHandle::from_config(Arc::new(
                             AgentConfigBuilder::new(
                                 registry_for_fallback.clone(),
                                 _storage.clone(),
@@ -689,7 +685,7 @@ impl QuorumBuilder {
                             .with_agent_id(target_plan.id.clone())
                             .with_event_fanout(_event_fanout)
                             .build(),
-                        ))) as Arc<dyn AgentHandleTrait>,
+                        ))) as Arc<dyn AgentHandleTrait>),
                     },
                 );
             }
@@ -778,6 +774,8 @@ impl QuorumBuilder {
         let planner_tools = planner_config.tools.clone();
         let planner_mcp_servers = planner_config.mcp_servers.clone();
         let planner_middleware = planner_config.middleware.clone();
+        let planner_mode = planner_config.mode;
+        let planner_permissions = planner_config.permissions.clone();
         let planner_exec = planner_config.execution.clone();
         let planner_skills = planner_config.skills.clone();
         let skills_project_root_for_planner = skills_project_root;
@@ -807,7 +805,7 @@ impl QuorumBuilder {
                 && (planner_tools.is_empty()
                     || planner_tools
                         .iter()
-                        .any(|tool| tool == crate::skills::SkillTool::NAME))
+                        .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME)))
             {
                 b.tool_registry_mut().add(crate::skills::build_skill_tool(
                     skills,
@@ -821,7 +819,7 @@ impl QuorumBuilder {
                 // single-agent path: any external tool spec or resolved MCP
                 // selection needs BuiltInAndProvider so MCP tool definitions
                 // reach the LLM; otherwise BuiltInOnly is sufficient.
-                let has_external_tools = planner_tools.iter().any(|tool| tool.contains('.'));
+                let has_external_tools = planner_tools.iter().any(ToolSpec::is_mcp);
                 let policy = if has_external_tools || !planner_mcp_servers.is_empty() {
                     ToolPolicy::BuiltInAndProvider
                 } else {
@@ -837,13 +835,14 @@ impl QuorumBuilder {
                 b = b.with_mcp_servers(planner_mcp_servers.clone());
             }
 
-            let auto_compact = planner_exec.compaction.auto;
             b = b
+                .with_agent_mode(planner_mode)
+                .with_permissions(planner_permissions.clone())
                 .with_snapshot_from_execution(&planner_exec)
                 .with_delegation_wait_policy(delegation_wait_policy_for_planner.clone())
                 .with_delegation_wait_timeout_secs(delegation_wait_timeout_for_planner)
                 .with_delegation_cancel_grace_secs(delegation_cancel_grace_for_planner);
-            apply_middleware_from_config(&mut b, &planner_middleware, auto_compact);
+            apply_middleware_from_config(&mut b, &planner_middleware)?;
 
             // Register routing planner tools if RoutingActor is available.
             #[cfg(feature = "remote")]
@@ -873,7 +872,7 @@ impl QuorumBuilder {
             }
 
             let config = Arc::new(b.build());
-            Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>
+            Ok(Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>)
         });
 
         if let Some(profile_id) = self.profile_id {
@@ -1153,6 +1152,8 @@ impl super::agent::Agent {
             .map(|(config, _)| config.clone())
             .collect();
 
+        planner_config.mode = config.planner.mode;
+        planner_config.permissions = config.planner.permissions.to_permissions();
         planner_config.middleware = config.planner.middleware;
         planner_config.execution = config.planner.execution;
         planner_config.skills = Some(config.planner.skills);
@@ -1210,11 +1211,11 @@ impl super::agent::Agent {
                     .into_iter()
                     .collect();
 
+            delegate_config.mode = delegate.mode;
             delegate_config.middleware = delegate.middleware;
             delegate_config.execution = delegate.execution;
             delegate_config.skills = Some(delegate.skills);
-            delegate_config.assume_mutating = Some(delegate.assume_mutating);
-            delegate_config.mutating_tools = Some(delegate.mutating_tools);
+            delegate_config.permissions = delegate.permissions.to_permissions();
             delegate_config.hooks = crate::config::HooksConfig::default();
             delegate_config.isolation = delegate.isolation;
 
@@ -1382,95 +1383,48 @@ fn merge_dotagents_mcp_servers(
     diagnostics
 }
 
-/// Helper to apply middleware from config entries to a builder.
+/// Applies middleware from config entries (plus the shared defaults) to a builder.
 ///
-/// `factory_config` is a snapshot of the config built so far (before middleware
-/// are appended). Middleware factories only need `compaction_config` and
-/// `event_journal` from it.
+/// Uses the same assembly path as `AgentBuilder::build`, so an invalid entry
+/// fails identically for single agents, planners and delegates.
+///
+/// # Errors
+///
+/// Fails when an entry has an unknown type or invalid configuration.
 fn apply_middleware_from_config(
     builder: &mut AgentConfigBuilder,
     entries: &[MiddlewareEntry],
-    auto_compact: bool,
-) {
-    // Build a lightweight AgentConfig snapshot that factory closures can read.
-    // Middleware factories only consult compaction_config and event_journal.
+) -> anyhow::Result<()> {
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::config::RuntimeExecutionPolicy;
-    use std::sync::Arc;
 
+    // Lightweight snapshot of the config built so far: factories only read the
+    // compaction policy, event journal/sink and tool registry from it.
     let ephemeral_policy = RuntimeExecutionPolicy {
         compaction: builder.compaction_config().clone(),
         ..Default::default()
     };
+    let factory_config = AgentConfigBuilder::from_provider(
+        builder.storage().clone(),
+        builder.provider().clone(),
+        builder.event_journal(),
+    )
+    .with_agent_registry(builder.agent_registry())
+    .with_execution_policy(ephemeral_policy)
+    .with_tool_registry(builder.tool_registry_snapshot())
+    .build();
 
-    let factory_config = Arc::new(
-        AgentConfigBuilder::from_provider(
-            builder.storage().clone(),
-            builder.provider().clone(),
-            builder.event_journal(),
-        )
-        .with_agent_registry(builder.agent_registry())
-        .with_execution_policy(ephemeral_policy)
-        // Tool-aware middleware (e.g. parallel_edit_guard) read the registry.
-        .with_tool_registry(builder.tool_registry_snapshot())
-        .build(),
-    );
-
-    for entry in entries {
-        match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, &factory_config) {
-            Ok(middleware) => {
-                builder.push_middleware(middleware);
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.contains("disabled") {
-                    log::warn!(
-                        "Failed to create middleware '{}': {}",
-                        entry.middleware_type,
-                        e
-                    );
-                }
-            }
-        }
+    let existing = builder.middleware_snapshot();
+    for driver in crate::middleware::build_from_entries(entries, &existing, &factory_config)? {
+        builder.push_middleware(driver);
     }
-
-    let has_context_middleware = entries.iter().any(|e| e.middleware_type == "context");
-    if auto_compact && !has_context_middleware {
-        log::info!("Auto-enabling ContextMiddleware for compaction");
-        builder.push_middleware(Arc::new(crate::middleware::ContextMiddleware::new(
-            crate::middleware::ContextConfig::default().auto_compact(true),
-        )));
-    }
-
-    // Output-limit recovery is on by default; any `output_limit_recovery` entry
-    // (including a disabled one) or an explicit driver replaces it.
-    let has_recovery_entry = entries
-        .iter()
-        .any(|e| e.middleware_type == "output_limit_recovery");
-    if !has_recovery_entry && !builder.has_middleware_named("OutputLimitRecoveryMiddleware") {
-        builder.push_middleware(Arc::new(
-            crate::middleware::OutputLimitRecoveryMiddleware::default(),
-        ));
-    }
-
-    // The guard goes last (same order as `AgentBuilder::build`) so its note is
-    // the final message of the request, after any compaction.
-    // Auto-add ParallelEditGuard (warn mode) unless a driver or any
-    // `parallel_edit_guard` entry (including a disabled one) is present.
-    let has_guard_entry = entries
-        .iter()
-        .any(|e| e.middleware_type == "parallel_edit_guard");
-    if !has_guard_entry && !builder.has_middleware_named("ParallelEditGuard") {
-        builder.push_middleware(Arc::new(crate::middleware::ParallelEditGuard::new(
-            builder.tool_registry_snapshot(),
-            crate::middleware::ParallelEditMode::Warn,
-        )));
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::core::AgentMode;
     #[cfg(feature = "remote")]
     use crate::agent::remote::test_helpers::fixtures::{get_test_mesh, random_node_id};
     use crate::config::McpServerConfig;
@@ -1632,12 +1586,14 @@ include_external = false
                 .as_ref()
                 .expect("planner config")
                 .tools
-                .contains(&crate::skills::SkillTool::NAME.to_string())
+                .iter()
+                .any(|t| t.is_builtin(crate::skills::SkillTool::NAME))
         );
         assert!(
             builder.delegates[0]
                 .tools
-                .contains(&crate::skills::SkillTool::NAME.to_string())
+                .iter()
+                .any(|t| t.is_builtin(crate::skills::SkillTool::NAME))
         );
     }
 
@@ -1841,7 +1797,9 @@ include_external = false
         assert!(
             planner
                 .config
-                .is_tool_allowed(crate::skills::SkillTool::NAME)
+                .is_tool_allowed(crate::config::ToolRef::builtin(
+                    crate::skills::SkillTool::NAME
+                ))
         );
 
         let delegate = agent.delegate("coder").expect("coder delegate");
@@ -1859,7 +1817,9 @@ include_external = false
         assert!(
             delegate
                 .config
-                .is_tool_allowed(crate::skills::SkillTool::NAME)
+                .is_tool_allowed(crate::config::ToolRef::builtin(
+                    crate::skills::SkillTool::NAME
+                ))
         );
     }
 
@@ -2130,12 +2090,12 @@ tools = ["read_tool", "stdio-tool.fetch"]
 
         let planner = builder.planner_config.expect("planner config");
         assert!(
-            planner.tools.contains(&"stdio-tool.*".to_string()),
+            planner.tools.contains(&"stdio-tool.*".parse().unwrap()),
             "planner tool list must keep the wildcard selector: {:?}",
             planner.tools
         );
         assert!(
-            planner.tools.contains(&"http-tool.*".to_string()),
+            planner.tools.contains(&"http-tool.*".parse().unwrap()),
             "planner tool list must keep the wildcard selector: {:?}",
             planner.tools
         );
@@ -2154,7 +2114,7 @@ tools = ["read_tool", "stdio-tool.fetch"]
             .expect("coder delegate");
         assert_eq!(
             delegate.tools,
-            vec!["stdio-tool.*".to_string()],
+            vec!["stdio-tool.*".parse::<ToolSpec>().unwrap()],
             "delegate tool list must keep the wildcard selector"
         );
     }
@@ -2167,14 +2127,14 @@ tools = ["read_tool", "stdio-tool.fetch"]
 
         let planner = builder.planner_config.expect("planner config");
         // Wildcard selections keep the server-qualified form...
-        assert!(planner.tools.contains(&"stdio-tool.*".to_string()));
+        assert!(planner.tools.contains(&"stdio-tool.*".parse().unwrap()));
         // ...and specific selections stay server-qualified so the originating
         // server remains part of the authorization decision (MCP tools are
         // advertised under bare names that can collide across servers).
-        assert!(planner.tools.contains(&"http-tool.lookup".to_string()));
-        assert!(!planner.tools.contains(&"lookup".to_string()));
+        assert!(planner.tools.contains(&"http-tool.lookup".parse().unwrap()));
+        assert!(!planner.tools.contains(&"lookup".parse().unwrap()));
         // Local tools survive alongside the selectors.
-        assert!(planner.tools.contains(&"shell".to_string()));
+        assert!(planner.tools.contains(&"shell".parse().unwrap()));
 
         let delegate = builder
             .delegates
@@ -2183,7 +2143,10 @@ tools = ["read_tool", "stdio-tool.fetch"]
             .expect("coder delegate");
         assert_eq!(
             delegate.tools,
-            vec!["read_tool".to_string(), "stdio-tool.fetch".to_string()],
+            vec![
+                "read_tool".parse::<ToolSpec>().unwrap(),
+                "stdio-tool.fetch".parse().unwrap()
+            ],
             "delegate keeps local tools and the qualified specific selection"
         );
     }
@@ -2237,6 +2200,92 @@ model = "gpt-4"
             },
             registry_dir,
         )
+    }
+
+    fn mode_quorum_config(planner_extra: &str, delegate_extra: &str) -> QuorumConfig {
+        let toml = format!(
+            r#"
+[quorum]
+cwd = "/tmp"
+
+[planner]
+provider = "openai"
+model = "gpt-4"
+tools = ["delegate"]
+{planner_extra}
+
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+{delegate_extra}
+"#
+        );
+        toml::from_str(&toml).expect("parse quorum config")
+    }
+
+    fn default_mode_of(agent: &crate::api::agent::Agent, id: Option<&str>) -> AgentMode {
+        let handle = match id {
+            Some(id) => agent.delegate(id).expect("delegate"),
+            None => agent.planner().expect("planner"),
+        };
+        *handle
+            .as_any()
+            .downcast_ref::<AgentHandle>()
+            .expect("local handle")
+            .config
+            .default_mode
+            .lock()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn quorum_agents_start_in_their_configured_mode() {
+        let (infra, _dir) = quorum_infra().await;
+        let agent = crate::api::agent::Agent::builder_from_quorum_config(
+            mode_quorum_config("mode = \"plan\"", "mode = \"review\""),
+            None,
+        )
+        .unwrap()
+        .infra(infra)
+        .build()
+        .await
+        .expect("quorum builds");
+        assert_eq!(default_mode_of(&agent, None), AgentMode::Plan);
+        assert_eq!(default_mode_of(&agent, Some("coder")), AgentMode::Review);
+    }
+
+    #[test]
+    fn quorum_mode_typo_fails_loading_naming_mode() {
+        for (planner, delegate) in [("mode = \"plna\"", ""), ("", "mode = \"plna\"")] {
+            let toml = format!(
+                "[quorum]\n[planner]\nprovider=\"o\"\nmodel=\"m\"\n{planner}\n[[delegates]]\nid=\"d\"\nprovider=\"o\"\nmodel=\"m\"\n{delegate}\n"
+            );
+            let err = toml::from_str::<QuorumConfig>(&toml)
+                .expect_err("typo must fail")
+                .to_string();
+            assert!(err.contains("plna") && err.contains("build"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_delegate_middleware_fails_the_quorum_build_naming_the_delegate() {
+        let (infra, _dir) = quorum_infra().await;
+        let delegate =
+            "[[delegates.middleware]]\ntype = \"limits\"\ncache_write_cost_per_million = -2.0\n";
+        let err = crate::api::agent::Agent::builder_from_quorum_config(
+            mode_quorum_config("", delegate),
+            None,
+        )
+        .unwrap()
+        .infra(infra)
+        .build()
+        .await
+        .err()
+        .expect("invalid middleware must fail the build");
+        let text = format!("{err:#}");
+        assert!(text.contains("coder"), "{text}");
+        assert!(text.contains("middleware 'limits'"), "{text}");
     }
 
     /// 21.8: one `Arc<WorkspaceService>` is shared by the planner and every
@@ -2369,38 +2418,38 @@ model = "gpt-4"
         // Policy must admit provider tools so MCP tool definitions reach the
         // LLM, and the allowlist must keep the server-qualified selectors.
         assert_eq!(planner.tool_config.policy, ToolPolicy::BuiltInAndProvider);
-        let allowlist = planner.tool_config.allowlist.as_ref().expect("allowlist");
-        assert!(allowlist.contains("stdio-tool.*"));
-        assert!(allowlist.contains("http-tool.lookup"));
+        let allowlist = planner.tool_config.allow.as_ref().expect("allowlist");
+        assert!(allowlist.covers(&"stdio-tool.*".parse().unwrap()));
+        assert!(allowlist.covers(&"http-tool.lookup".parse().unwrap()));
         assert!(
-            !allowlist.contains("lookup"),
+            !allowlist.covers(&"lookup".parse().unwrap()),
             "bare names must not be flattened into the allowlist"
         );
-        assert!(allowlist.contains("shell"));
+        assert!(allowlist.covers(&"shell".parse().unwrap()));
         // The shared runtime filter admits wildcard MCP tools and specific
         // MCP tools by their server-qualified allowlist entries.
-        assert!(crate::agent::tools::is_mcp_tool_allowed_with(
-            &planner.tool_config,
-            "any_stdio_tool",
-            Some("stdio-tool")
-        ));
-        assert!(crate::agent::tools::is_mcp_tool_allowed_with(
-            &planner.tool_config,
-            "lookup",
-            Some("http-tool")
-        ));
+        assert!(
+            planner
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("stdio-tool", "any_stdio_tool"))
+        );
+        assert!(
+            planner
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("http-tool", "lookup"))
+        );
         // A same-named tool from a server the planner has no selection for is
         // denied: the bare name is not in the allowlist (PR #967 regression).
-        assert!(!crate::agent::tools::is_mcp_tool_allowed_with(
-            &planner.tool_config,
-            "lookup",
-            Some("unattached-server")
-        ));
-        assert!(!crate::agent::tools::is_mcp_tool_allowed_with(
-            &planner.tool_config,
-            "other_http_tool",
-            Some("http-tool")
-        ));
+        assert!(
+            !planner
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("unattached-server", "lookup"))
+        );
+        assert!(
+            !planner
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("http-tool", "other_http_tool"))
+        );
 
         let delegate = agent
             .delegate("coder")
@@ -2412,30 +2461,30 @@ model = "gpt-4"
             .clone();
 
         assert_eq!(delegate.tool_config.policy, ToolPolicy::BuiltInAndProvider);
-        let allowlist = delegate.tool_config.allowlist.as_ref().expect("allowlist");
-        assert!(allowlist.contains("stdio-tool.fetch"));
+        let allowlist = delegate.tool_config.allow.as_ref().expect("allowlist");
+        assert!(allowlist.covers(&"stdio-tool.fetch".parse().unwrap()));
         assert!(
-            !allowlist.contains("fetch"),
+            !allowlist.covers(&"fetch".parse().unwrap()),
             "bare names must not be flattened into the allowlist"
         );
-        assert!(allowlist.contains("read_tool"));
-        assert!(crate::agent::tools::is_mcp_tool_allowed_with(
-            &delegate.tool_config,
-            "fetch",
-            Some("stdio-tool")
-        ));
+        assert!(allowlist.covers(&"read_tool".parse().unwrap()));
+        assert!(
+            delegate
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("stdio-tool", "fetch"))
+        );
         // A bare built-in allowlist entry ("read_tool") cannot admit an MCP
         // tool that happens to share the name.
-        assert!(!crate::agent::tools::is_mcp_tool_allowed_with(
-            &delegate.tool_config,
-            "read_tool",
-            Some("stdio-tool")
-        ));
-        assert!(!crate::agent::tools::is_mcp_tool_allowed_with(
-            &delegate.tool_config,
-            "unrelated",
-            Some("stdio-tool")
-        ));
+        assert!(
+            !delegate
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("stdio-tool", "read_tool"))
+        );
+        assert!(
+            !delegate
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("stdio-tool", "unrelated"))
+        );
     }
 
     // ---- #967: specific MCP selectors must stay server-scoped when servers
@@ -2508,29 +2557,30 @@ tools = ["beta.lookup"]
             .clone();
 
         // The allowlist keeps the qualified selector only — no bare `lookup`.
-        let allowlist = planner.tool_config.allowlist.as_ref().expect("allowlist");
-        assert!(allowlist.contains("alpha.lookup"));
-        assert!(!allowlist.contains("lookup"));
+        let allowlist = planner.tool_config.allow.as_ref().expect("allowlist");
+        assert!(allowlist.covers(&"alpha.lookup".parse().unwrap()));
+        assert!(!allowlist.covers(&"lookup".parse().unwrap()));
 
         // Alpha's tool is admitted...
-        assert!(crate::agent::tools::is_mcp_tool_allowed_with(
-            &planner.tool_config,
-            "lookup",
-            Some("alpha")
-        ));
+        assert!(
+            planner
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("alpha", "lookup"))
+        );
         // ...while beta's same-named tool is denied, even if beta wins the
         // runtime's bare-name tool index (previously admitted via the
         // flattened bare entry).
-        assert!(!crate::agent::tools::is_mcp_tool_allowed_with(
-            &planner.tool_config,
-            "lookup",
-            Some("beta")
-        ));
+        assert!(
+            !planner
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("beta", "lookup"))
+        );
         // The bare built-in path cannot admit the MCP tool either.
-        assert!(!crate::agent::tools::is_tool_allowed_with(
-            &planner.tool_config,
-            "lookup"
-        ));
+        assert!(
+            !planner
+                .tool_config
+                .allows(crate::config::ToolRef::builtin("lookup"))
+        );
 
         // The delegate's mirror selection (`beta.lookup`) gets the inverse.
         let delegate = agent
@@ -2541,18 +2591,18 @@ tools = ["beta.lookup"]
             .expect("local delegate")
             .config
             .clone();
-        let allowlist = delegate.tool_config.allowlist.as_ref().expect("allowlist");
-        assert!(allowlist.contains("beta.lookup"));
-        assert!(!allowlist.contains("lookup"));
-        assert!(crate::agent::tools::is_mcp_tool_allowed_with(
-            &delegate.tool_config,
-            "lookup",
-            Some("beta")
-        ));
-        assert!(!crate::agent::tools::is_mcp_tool_allowed_with(
-            &delegate.tool_config,
-            "lookup",
-            Some("alpha")
-        ));
+        let allowlist = delegate.tool_config.allow.as_ref().expect("allowlist");
+        assert!(allowlist.covers(&"beta.lookup".parse().unwrap()));
+        assert!(!allowlist.covers(&"lookup".parse().unwrap()));
+        assert!(
+            delegate
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("beta", "lookup"))
+        );
+        assert!(
+            !delegate
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("alpha", "lookup"))
+        );
     }
 }

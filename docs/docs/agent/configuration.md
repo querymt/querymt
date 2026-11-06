@@ -103,11 +103,9 @@ system = [
 temperature = 0.7
 max_tokens = 4096
 
-# Assume unknown tools are mutating (requires permission)
-assume_mutating = false
-
-# Explicit list of mutating tools
-mutating_tools = ["edit", "write_file", "shell"]
+# Tools that need the user's approval (see "Tool approval" below)
+[agent.permissions]
+ask = ["edit", "write_file", "shell"]
 ```
 
 For reusable system-prefix annotations, TTL behavior, and provider limitations,
@@ -314,13 +312,12 @@ tools = ["read_tool", "filesystem.*", "shell"]
 
 ## Middleware Configuration
 
-Middleware extends agent behavior through a pluggable stack:
+Middleware extends agent behavior through a pluggable stack. Building an agent (single agent, quorum planner or delegate) fails when an entry has an unknown `type` or invalid configuration; an entry turned off by its own config (for example `enabled = false`) is skipped. The initial session mode is the `mode` key on `[agent]`, `[planner]` and `[[delegates]]`, not a middleware setting:
 
 ```toml
 # Agent mode middleware (build/plan/review modes)
 [[middleware]]
 type = "agent_mode"
-default = "build"
 reminder = """<system-reminder>
 You are in plan mode. Read-only access.
 </system-reminder>"""
@@ -596,12 +593,12 @@ tags = ["review", "read-only"]
 [agent]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
+mode = "review"
 tools = ["read_tool", "glob", "search_text", "question"]
 system = "You are a code review specialist."
 
 [[middleware]]
 type = "agent_mode"
-default = "review"
 ```
 
 For complete profiles documentation, see [Profiles Guide](profiles.md).
@@ -879,17 +876,33 @@ tools = [
 ]
 ```
 
-### Tool Permissions
-
-Configure which tools are mutating:
+### Tool approval
 
 ```toml
-[agent]
-assume_mutating = false
-mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
+[agent.permissions]
+ask         = ["shell"]              # prompt; "Allow for this session" is offered
+always_ask  = ["ibkr.place_order"]   # prompt on every call, never remembered
+timeout_sec = 120                    # unanswered prompts are rejected; unset waits
 ```
 
-A permission-required tool call that no cached choice, tool policy or hook decides waits for an explicit user answer, delivered as an ACP `session/request_permission` request. It is never auto-granted, including when no client is attached. Unattended runs (schedules, headless) must restrict `tools` / `mutating_tools` or add `permission_request` hooks, or they pause at the first unanswered permission. See [Session Interactions](mesh.md#session-interactions) for the full lifecycle and the all-nodes-upgrade requirement (`RemoteNodeUpgradeRequired`).
+The same `[permissions]` table is accepted under `[planner]` and each `[[delegates]]`. Entries are tool selectors: `shell` (built-in or provider tool), `server.tool` (one MCP tool) or `server.*` (every tool of an MCP server). A bare name never matches an MCP tool. Loading fails when an MCP selector names a server that is not configured, or when `tools` is set and does not select a listed tool.
+
+Approval works the same for built-in, MCP and provider tools, and runs before the tool does:
+
+| Situation | Prompt options |
+| --- | --- |
+| Tool matched by `ask` | Allow once, Allow for this session, Reject |
+| Tool matched by `always_ask` (wins over `ask`) | Allow once, Reject |
+| `pre_tool_use` hook returns `ask` | Allow once, Reject; the hook's reason is the prompt title |
+| `pre_tool_use` hook returns `allow` | No prompt, even for a listed tool |
+
+"Allow for this session" covers later calls of the same server-qualified tool in that session only. It never applies to `always_ask` tools, hook asks or other sessions, and a rejection is never remembered. A denied call returns an error to the model that names the reason (rejected, timed out, run cancelled, task not active, or the `permission_request` hook's message) and says the tool was not run. A call whose task is not active is denied without a prompt.
+
+`timeout_sec` applies to every prompt, including hook asks when both lists are empty. Unattended profiles (schedules, headless runs) must set it, or add `permission_request` hooks, otherwise they wait at the first prompt. A prompt that is not answered, or whose client is not attached, is never granted automatically. See [Session Interactions](mesh.md#session-interactions) for the full lifecycle and the all-nodes-upgrade requirement (`RemoteNodeUpgradeRequired`).
+
+Snapshots no longer need configuration: a call is snapshotted unless its tool declares itself read-only (built-in read-only tools, or an MCP tool with `readOnlyHint = true`). Provider tools are always snapshotted.
+
+The removed keys `assume_mutating`, `mutating_tools`, `confirm_tools` and `confirm_timeout_sec` are rejected as unknown fields; see the CHANGELOG for replacements.
 
 ## Scheduled Tasks Configuration
 

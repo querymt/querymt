@@ -64,6 +64,10 @@ impl Tool for QuestionTool {
         "question"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> ChatTool {
         ChatTool {
             tool_type: "function".to_string(),

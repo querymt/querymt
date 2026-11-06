@@ -8,6 +8,7 @@ use crate::agent::core::SnapshotPolicy;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::snapshots::{SnapshotState, snapshot_metadata};
 use crate::agent::utils::genai;
+use crate::config::{ApprovalNeed, ToolRef};
 use crate::events::AgentEventKind;
 use crate::hooks::{
     PermissionRequestDecision, PostToolUseRequest, PreDelegationRequest, PreToolUseRequest,
@@ -17,11 +18,14 @@ use crate::middleware::ToolCall as MiddlewareToolCall;
 use crate::middleware::{ExecutionState, ToolResult, WaitCondition};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::TaskStatus;
+use crate::tools::Tool;
 use crate::tools::args::{Repair, normalize_arguments};
 use log::debug;
 use querymt::chat::ChatRole;
+use querymt::mcp::adapter::McpToolAdapter;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{Instrument, Span, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
@@ -98,9 +102,11 @@ pub(super) struct PreparedCall {
     /// Changes applied by normalisation, from the initial arguments and from any
     /// pre-tool hook replacement. Reported once, by `prepare_tool_call`.
     pub repairs: Vec<Repair>,
-    /// A pre-tool hook explicitly allowed this call, so interactive permission
-    /// prompts are skipped.
-    pub hook_allows_interactive: bool,
+    /// What the call resolves to, decided once during preparation.
+    pub target: ToolTarget,
+    /// Approval the call needs before it runs: a hook allow means none, a hook
+    /// ask means every call, otherwise the agent's permission lists decide.
+    pub approval: ApprovalNeed,
     /// Context contributed by pre-tool hooks, delivered with the call's result.
     pub hook_contexts: Vec<crate::hooks::HookContextContribution>,
     /// The call's outer input was invalid (provider-marked, malformed or not an
@@ -225,7 +231,8 @@ async fn prepare_tool_call_inner(
             args: serde_json::Value::Null,
             arguments_json: call.function.arguments.clone(),
             repairs: Vec::new(),
-            hook_allows_interactive: false,
+            target: ToolTarget::Provider,
+            approval: ApprovalNeed::None,
             hook_contexts: Vec::new(),
             invalid_input: true,
             disposition: Disposition::Rejected(Box::new(invalid_input_result(call))),
@@ -234,6 +241,7 @@ async fn prepare_tool_call_inner(
     }
     let mut args: serde_json::Value = serde_json::from_str(&call.function.arguments)?;
     let tool = config.tool_registry.find(&call.function.name);
+    let target = ToolTarget::resolve(tool.clone(), exec_ctx, &call.function.name);
     let schema = resolve_tool_schema(config, exec_ctx, &call.function.name).await;
     let mut repairs: Vec<Repair> = Vec::new();
 
@@ -241,7 +249,6 @@ async fn prepare_tool_call_inner(
                   repairs: Vec<Repair>,
                   text: String,
                   execution: &'static str,
-                  hook_allows_interactive: bool,
                   hook_contexts: Vec<crate::hooks::HookContextContribution>| {
         let result = rejection_result(call, &args, text, execution, hook_contexts);
         let arguments_json = result.tool_arguments.clone().unwrap_or_default();
@@ -249,7 +256,8 @@ async fn prepare_tool_call_inner(
             args,
             arguments_json,
             repairs,
-            hook_allows_interactive,
+            target: ToolTarget::Provider,
+            approval: ApprovalNeed::None,
             hook_contexts: Vec::new(),
             invalid_input: false,
             disposition: Disposition::Rejected(Box::new(result)),
@@ -268,7 +276,6 @@ async fn prepare_tool_call_inner(
                 repairs,
                 format!("Error: invalid tool arguments: {conflict}"),
                 "validation",
-                false,
                 Vec::new(),
             ));
         }
@@ -278,6 +285,7 @@ async fn prepare_tool_call_inner(
         .hooks
         .run_pre_tool_use(PreToolUseRequest {
             session_id: exec_ctx.session_id.clone(),
+            mcp_server: target.server().map(str::to_owned),
             mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
             turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
@@ -305,10 +313,15 @@ async fn prepare_tool_call_inner(
         );
     }
 
-    let hook_allows_interactive = matches!(
-        hook_result.permission_decision,
-        Some(crate::hooks::engine::PreToolPermissionDecision::Allow)
-    );
+    let approval = match hook_result.permission_decision {
+        Some(crate::hooks::engine::PreToolPermissionDecision::Allow) => ApprovalNeed::None,
+        Some(crate::hooks::engine::PreToolPermissionDecision::Ask { reason }) => {
+            ApprovalNeed::EveryCall { reason }
+        }
+        None => config
+            .permissions
+            .need(target.tool_ref(&call.function.name)),
+    };
     let hook_contexts = hook_result.context_contributions;
 
     // A hook replacement is normalised like model input. A conflict inside it
@@ -333,7 +346,6 @@ async fn prepare_tool_call_inner(
             repairs,
             format!("Error: {reason}"),
             "blocked",
-            hook_allows_interactive,
             hook_contexts,
         ));
     }
@@ -346,7 +358,6 @@ async fn prepare_tool_call_inner(
             repairs,
             format!("Error: invalid tool arguments: {conflict}"),
             "validation",
-            hook_allows_interactive,
             hook_contexts,
         ));
     }
@@ -359,7 +370,6 @@ async fn prepare_tool_call_inner(
             repairs,
             format!("Error: invalid tool arguments: {error}"),
             "validation",
-            hook_allows_interactive,
             hook_contexts,
         ));
     }
@@ -370,7 +380,8 @@ async fn prepare_tool_call_inner(
         args,
         arguments_json,
         repairs,
-        hook_allows_interactive,
+        target,
+        approval,
         hook_contexts,
         invalid_input: false,
         disposition: Disposition::Ready,
@@ -413,7 +424,8 @@ async fn execute_prepared_inner(
     let PreparedCall {
         args,
         arguments_json,
-        hook_allows_interactive,
+        approval,
+        target,
         hook_contexts,
         disposition,
         ..
@@ -431,38 +443,6 @@ async fn execute_prepared_inner(
             arguments: arguments_json.clone(),
         },
     );
-
-    let snapshot = if config.should_snapshot_tool(&call.function.name) {
-        info_span!(
-            "agent.tool.snapshot.prepare",
-            session_id = %exec_ctx.session_id,
-            tool_name = %call.function.name,
-            tool_call_id = %call.id,
-        )
-        .in_scope(|| {
-            config
-                .prepare_snapshot(exec_ctx.cwd())
-                .map(|(root, policy)| {
-                    config.emit_event(
-                        &exec_ctx.session_id,
-                        AgentEventKind::SnapshotStart {
-                            policy: policy.to_string(),
-                        },
-                    );
-                    match policy {
-                        SnapshotPolicy::Diff => {
-                            let pre_tree = crate::index::merkle::MerkleTree::scan(root.as_path());
-                            SnapshotState::Diff { pre_tree, root }
-                        }
-                        SnapshotPolicy::Metadata => SnapshotState::Metadata { root },
-                        SnapshotPolicy::None => SnapshotState::None,
-                    }
-                })
-                .unwrap_or(SnapshotState::None)
-        })
-    } else {
-        SnapshotState::None
-    };
 
     // Progress recording is observational — a failure here must not abort the
     // tool call itself, otherwise the tool_use block ends up without a matching
@@ -492,288 +472,20 @@ async fn execute_prepared_inner(
         }
     }
 
-    // Set up elicitation channel for this tool call
-    let (elicitation_tx, mut elicitation_rx) =
-        tokio::sync::mpsc::channel::<crate::tools::ElicitationRequest>(1);
-
-    let event_sink = config.event_sink.clone();
-    let session_id_clone = exec_ctx.session_id.clone();
-    let run_id_clone = exec_ctx.turn_id().unwrap_or_default().to_string();
-    let tool_call_id_clone = call.id.clone();
-    let pending_elicitations = config.pending_elicitations.clone();
-    let cancellation_token = exec_ctx.cancellation_token.clone();
-    tokio::spawn(async move {
-        while let Some(request) = elicitation_rx.recv().await {
-            let elicitation_id = request.elicitation_id.clone();
-            crate::elicitation::register_pending_elicitation(
-                &pending_elicitations,
-                elicitation_id.clone(),
-                crate::elicitation::PendingElicitationRegistration {
-                    session_id: session_id_clone.clone(),
-                    form: crate::elicitation::PendingElicitationForm {
-                        message: request.message.clone(),
-                        requested_schema: request.requested_schema.clone(),
-                        source: request.source.clone(),
-                    },
-                    owner_authority: None,
-                    run_id: Some(run_id_clone.clone()),
-                    tool_call_id: Some(tool_call_id_clone.clone()),
-                },
-                request.response_tx,
-            )
-            .await;
-            // Close the race where cancellation happens just before this request
-            // reaches the shared pending map.
-            if cancellation_token.is_cancelled() {
-                crate::elicitation::cancel_pending_elicitations_for_session(
-                    &pending_elicitations,
-                    &session_id_clone,
-                )
-                .await;
-                continue;
-            }
-            // Durable: elicitation must be visible in UI replay.
-            if let Err(err) = event_sink
-                .emit_durable(
-                    &session_id_clone,
-                    crate::events::AgentEventKind::ElicitationRequested {
-                        elicitation_id,
-                        session_id: session_id_clone.clone(),
-                        message: request.message,
-                        requested_schema: request.requested_schema,
-                        source: request.source,
-                    },
-                )
-                .await
-            {
-                log::warn!("failed to emit ElicitationRequested: {}", err);
-            }
-        }
-
-        crate::elicitation::remove_pending_elicitations_for_tool(
-            &pending_elicitations,
-            &session_id_clone,
-            &run_id_clone,
-            &tool_call_id_clone,
-        )
-        .await;
-    });
-
-    let tool_context = exec_ctx
-        .tool_context(config.agent_registry.clone(), Some(elicitation_tx))
-        .with_workspace_service(config.workspace_service())
-        .with_session_store(exec_ctx.state.store.clone())
-        .with_task_service(crate::session::TaskService::new(
-            exec_ctx.state.store.clone(),
-            exec_ctx.session_id.clone(),
-            call.id.clone(),
-        ));
-
-    // Check tool permission using the per-session tool config so that runtime
-    // mutations (SetAllowedTools / SetDeniedTools) are respected. Also look up
-    // the MCP server name so that "servername.*" wildcard entries in the
-    // allowlist correctly permit MCP tools (e.g. "context7.*" → "resolve-library-id").
-    //
-    // Load a lock-free snapshot of the MCP tool state. The `Guard` is
-    // dropped before any `.await` (same discipline as the old RwLock).
-    let (mcp_server_name, mcp_tool) = {
-        let snap = exec_ctx.runtime.mcp_tool_state.load();
-        let server_name = snap
-            .tools
-            .get(&call.function.name)
-            .map(|a| a.server_name().to_owned());
-        let tool = snap.tools.get(&call.function.name).cloned();
-        (server_name, tool)
-    };
-
-    let (raw_result_blocks, is_error, tool_source, execution) =
-        if !crate::agent::tools::is_mcp_tool_allowed_with(
-            &exec_ctx.tool_config,
-            &call.function.name,
-            mcp_server_name.as_deref(),
-        ) {
-            (
-                vec![querymt::chat::ToolResultPart::Text {
-                    text: format!("Error: tool '{}' is not allowed", call.function.name),
-                }],
-                true,
-                "blocked",
-                "policy_blocked",
-            )
-        } else if let Some(tool) = config.tool_registry.find(&call.function.name) {
-            match genai::tool_scope(
-                Span::current(),
-                tool.call(args.clone(), &tool_context)
-                    .instrument(info_span!(
-                        "agent.tool.invoke",
-                        source = "builtin",
-                        tool_name = %call.function.name,
-                        tool_call_id = %call.id,
-                    )),
-            )
-            .await
-            {
-                Ok(res) => (res, false, "builtin", "executed"),
-                Err(e) => (
-                    vec![querymt::chat::ToolResultPart::Text {
-                        text: format!("Error: {}", e),
-                    }],
-                    true,
-                    "builtin",
-                    if matches!(&e, crate::tools::ToolError::PermissionDenied(_)) {
-                        "permission_denied"
-                    } else {
-                        "executed"
-                    },
-                ),
-            }
-        } else if let Some(tool) = mcp_tool {
-            use querymt::tool_decorator::CallFunctionTool;
-            // Progress is throttled and closed when the call ends or is
-            // dropped, so no update can follow this call's `ToolCallEnd`.
-            let (progress_sink, _close_progress) = {
-                let event_sink = config.event_sink.clone();
-                let (session_id, tool_call_id, tool_name) = (
-                    exec_ctx.session_id.clone(),
-                    call.id.clone(),
-                    call.function.name.clone(),
-                );
-                super::progress_sink::AgentProgressSink::new(
-                    super::progress_sink::THROTTLE,
-                    move |u| {
-                        event_sink.session_stream(&session_id).emit_ephemeral_seq(
-                            AgentEventKind::ToolCallProgress {
-                                tool_call_id: tool_call_id.clone(),
-                                tool_name: tool_name.clone(),
-                                progress: u.progress,
-                                total: u.total,
-                                message: u.message,
-                            },
-                        );
-                    },
-                )
-            };
-            match querymt::mcp::progress::CURRENT_PROGRESS
-                .scope(
-                    Arc::new(progress_sink) as Arc<dyn querymt::mcp::progress::ProgressSink>,
-                    tool.call(args.clone()),
-                )
-                .instrument(info_span!(
-                    "agent.tool.invoke",
-                    source = "mcp",
-                    tool_name = %call.function.name,
-                    tool_call_id = %call.id,
-                ))
-                .await
-            {
-                Ok(res) => (res, false, "mcp", "executed"),
-                // A rejected/missing OAuth login tells the user which provider
-                // to log in with instead of surfacing a transport error.
-                Err(e) => {
-                    let login_text = mcp_server_name.as_deref().and_then(|server| {
-                        crate::agent::mcp::report_auth_required(
-                            &e,
-                            server,
-                            exec_ctx.runtime.mcp_tool_state.is_oauth_server(server),
-                            &config.event_sink,
-                            &exec_ctx.session_id,
-                        )
-                    });
-                    if let Some(text) = login_text {
-                        (
-                            vec![querymt::chat::ToolResultPart::Text { text }],
-                            true,
-                            "mcp",
-                            "executed",
-                        )
-                    } else {
-                        // In-band `isError` results keep the server's content verbatim.
-                        match e.downcast::<querymt::mcp::adapter::McpToolError>() {
-                            Ok(querymt::mcp::adapter::McpToolError::Reported { parts }) => {
-                                (parts, true, "mcp", "executed")
-                            }
-                            Ok(other) => (
-                                vec![querymt::chat::ToolResultPart::Text {
-                                    text: format!("Error: {other}"),
-                                }],
-                                true,
-                                "mcp",
-                                "executed",
-                            ),
-                            Err(e) => (
-                                vec![querymt::chat::ToolResultPart::Text {
-                                    text: format!("Error: {e}"),
-                                }],
-                                true,
-                                "mcp",
-                                "executed",
-                            ),
-                        }
-                    }
-                }
-            }
-        } else if !ensure_tool_permission(
-            config,
-            exec_ctx,
-            &call.id,
-            &call.function.name,
-            &args,
-            PermissionContext {
-                turn_id: exec_ctx.turn_id().unwrap_or_default(),
-                bypass_interactive_prompt: hook_allows_interactive,
-            },
-        )
-        .instrument(info_span!(
-            "agent.tool.permission_wait",
-            tool_name = %call.function.name,
-            tool_call_id = %call.id,
-            session_id = %exec_ctx.session_id,
-        ))
-        .await
-        .map_err(|e| anyhow::anyhow!("Permission check failed: {}", e))?
-        {
-            (
-                vec![querymt::chat::ToolResultPart::Text {
-                    text: "Error: permission denied".to_string(),
-                }],
-                true,
-                "provider",
-                "permission_denied",
-            )
-        } else {
-            match exec_ctx
-                .session_handle
-                .call_tool(&call.function.name, args.clone())
-                .instrument(info_span!(
-                    "agent.tool.invoke",
-                    source = "provider",
-                    tool_name = %call.function.name,
-                    tool_call_id = %call.id,
-                ))
-                .await
-            {
-                Ok(res) => (res, false, "provider", "executed"),
-                Err(e) => (
-                    vec![querymt::chat::ToolResultPart::Text {
-                        text: format!("Error: {}", e),
-                    }],
-                    true,
-                    "provider",
-                    "executed",
-                ),
-            }
-        };
+    let (outcome, snapshot) = dispatch(config, exec_ctx, call, &args, &target, approval).await?;
+    let ToolOutcome {
+        parts: raw_result_blocks,
+        is_error,
+        source: tool_source,
+        execution,
+    } = outcome;
 
     let span = Span::current();
-    span.record("tool_source", tool_source);
+    span.record("tool_source", tool_source.as_str());
     span.record("is_error", is_error);
-    span.set_attribute("querymt.tool.execution", execution);
+    span.set_attribute("querymt.tool.execution", execution.as_str());
     if is_error && !exec_ctx.cancellation_token.is_cancelled() {
-        genai::error(match execution {
-            "policy_blocked" => "policy_blocked",
-            "permission_denied" => "permission_denied",
-            _ => "tool_error",
-        });
+        genai::error(execution.error_type());
     }
 
     // Post hooks inspect the complete canonical output; truncation is applied once
@@ -785,6 +497,7 @@ async fn execute_prepared_inner(
         .hooks
         .run_post_tool_use(PostToolUseRequest {
             session_id: exec_ctx.session_id.clone(),
+            mcp_server: target.server().map(str::to_owned),
             mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
             turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
@@ -798,7 +511,7 @@ async fn execute_prepared_inner(
             content: result_blocks.clone(),
             is_error,
             execution_is_error,
-            tool_source: tool_source.to_string(),
+            tool_source: tool_source.as_str().to_string(),
             tool_use_id: call.id.clone(),
         })
         .await?;
@@ -898,7 +611,7 @@ async fn execute_prepared_inner(
         Some(call.function.name.clone()),
         Some(arguments_json.clone()),
     )
-    .with_execution(execution_is_error, tool_source)
+    .with_execution(execution_is_error, tool_source.as_str())
     .with_hook_contexts(hook_contexts);
     if let Some(part) = snapshot_part {
         tool_result = tool_result.with_snapshot(part);
@@ -1065,82 +778,566 @@ async fn truncate_model_tool_output(
     result
 }
 
-pub(super) struct PermissionContext<'a> {
-    turn_id: &'a str,
-    bypass_interactive_prompt: bool,
+/// What a call resolves to, decided once during preparation in dispatch
+/// order: built-in registry, then the MCP snapshot, then the provider.
+pub(super) enum ToolTarget {
+    Builtin(Arc<dyn Tool>),
+    Mcp(Arc<McpToolAdapter>),
+    Provider,
 }
 
-/// Check if a tool call requires permission and request it if needed.
+impl ToolTarget {
+    fn resolve(builtin: Option<Arc<dyn Tool>>, exec_ctx: &ExecutionContext, name: &str) -> Self {
+        if let Some(tool) = builtin {
+            return Self::Builtin(tool);
+        }
+        let snapshot = exec_ctx.runtime.mcp_tool_state.load();
+        match snapshot.tools.get(name) {
+            Some(adapter) => Self::Mcp(Arc::clone(adapter)),
+            None => Self::Provider,
+        }
+    }
+
+    /// MCP server serving the tool, if it is an MCP tool.
+    fn server(&self) -> Option<&str> {
+        match self {
+            Self::Mcp(adapter) => Some(adapter.server_name()),
+            _ => None,
+        }
+    }
+
+    /// Server-qualified identity used by allow, deny and approval lists.
+    fn tool_ref<'a>(&'a self, name: &'a str) -> ToolRef<'a> {
+        ToolRef {
+            name,
+            server: self.server(),
+        }
+    }
+
+    /// Provider tools are always treated as mutating.
+    fn is_read_only(&self) -> bool {
+        match self {
+            Self::Builtin(tool) => tool.is_read_only(),
+            Self::Mcp(adapter) => adapter.is_read_only(),
+            Self::Provider => false,
+        }
+    }
+
+    fn source(&self) -> ToolSource {
+        match self {
+            Self::Builtin(_) => ToolSource::Builtin,
+            Self::Mcp(_) => ToolSource::Mcp,
+            Self::Provider => ToolSource::Provider,
+        }
+    }
+}
+
+/// Where a result came from; `Blocked` means the tool never ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolSource {
+    Builtin,
+    Mcp,
+    Provider,
+    Blocked,
+}
+
+impl ToolSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Mcp => "mcp",
+            Self::Provider => "provider",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+/// How the call ended, as reported on the tool span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Execution {
+    Executed,
+    PolicyBlocked,
+    PermissionDenied,
+}
+
+impl Execution {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Executed => "executed",
+            Self::PolicyBlocked => "policy_blocked",
+            Self::PermissionDenied => "permission_denied",
+        }
+    }
+
+    /// `error.type` recorded when the call ended in an error.
+    fn error_type(self) -> &'static str {
+        match self {
+            Self::Executed => "tool_error",
+            Self::PolicyBlocked => "policy_blocked",
+            Self::PermissionDenied => "permission_denied",
+        }
+    }
+}
+
+/// Result of dispatching one call, before post-tool hooks.
+struct ToolOutcome {
+    parts: Vec<querymt::chat::ToolResultPart>,
+    is_error: bool,
+    source: ToolSource,
+    execution: Execution,
+}
+
+impl ToolOutcome {
+    fn new(
+        parts: Vec<querymt::chat::ToolResultPart>,
+        is_error: bool,
+        source: ToolSource,
+        execution: Execution,
+    ) -> Self {
+        Self {
+            parts,
+            is_error,
+            source,
+            execution,
+        }
+    }
+
+    fn error_text(text: String, source: ToolSource, execution: Execution) -> Self {
+        Self::new(
+            vec![querymt::chat::ToolResultPart::Text { text }],
+            true,
+            source,
+            execution,
+        )
+    }
+}
+
+/// Allow check, approval, snapshot, then invocation, for every tool source.
 ///
-/// Returns `true` if permission is granted (or not required), `false` if denied.
+/// A denied or blocked call yields an error outcome and never reaches its
+/// tool; no snapshot is taken for it.
+async fn dispatch(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    call: &MiddlewareToolCall,
+    args: &serde_json::Value,
+    target: &ToolTarget,
+    approval: ApprovalNeed,
+) -> Result<(ToolOutcome, SnapshotState), anyhow::Error> {
+    let tool = target.tool_ref(&call.function.name);
+
+    // Per-session config so that runtime SetAllowedTools / SetDeniedTools apply.
+    if !exec_ctx.tool_config.allows(tool) {
+        let text = format!("Error: tool '{}' is not allowed", call.function.name);
+        return Ok((
+            ToolOutcome::error_text(text, ToolSource::Blocked, Execution::PolicyBlocked),
+            SnapshotState::None,
+        ));
+    }
+
+    if !matches!(approval, ApprovalNeed::None) {
+        let approved = request_approval(config, exec_ctx, &call.id, tool, args, approval)
+            .instrument(info_span!(
+                "agent.tool.permission_wait",
+                tool_name = %call.function.name,
+                tool_call_id = %call.id,
+                session_id = %exec_ctx.session_id,
+            ))
+            .await
+            .map_err(|e| anyhow::anyhow!("Permission check failed: {}", e))?;
+        if let Approval::Denied(denial) = approved {
+            let text = format!("Error: {denial}; the tool was not run");
+            return Ok((
+                ToolOutcome::error_text(text, ToolSource::Blocked, Execution::PermissionDenied),
+                SnapshotState::None,
+            ));
+        }
+    }
+
+    let snapshot = if target.is_read_only() {
+        SnapshotState::None
+    } else {
+        begin_snapshot(config, exec_ctx, call)
+    };
+    let outcome = run_tool(config, exec_ctx, call, args, target).await;
+    Ok((outcome, snapshot))
+}
+
+/// Capture the pre-call state of the workspace, per the snapshot policy.
+fn begin_snapshot(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    call: &MiddlewareToolCall,
+) -> SnapshotState {
+    info_span!(
+        "agent.tool.snapshot.prepare",
+        session_id = %exec_ctx.session_id,
+        tool_name = %call.function.name,
+        tool_call_id = %call.id,
+    )
+    .in_scope(|| {
+        config
+            .prepare_snapshot(exec_ctx.cwd())
+            .map(|(root, policy)| {
+                config.emit_event(
+                    &exec_ctx.session_id,
+                    AgentEventKind::SnapshotStart {
+                        policy: policy.to_string(),
+                    },
+                );
+                match policy {
+                    SnapshotPolicy::Diff => {
+                        let pre_tree = crate::index::merkle::MerkleTree::scan(root.as_path());
+                        SnapshotState::Diff { pre_tree, root }
+                    }
+                    SnapshotPolicy::Metadata => SnapshotState::Metadata { root },
+                    SnapshotPolicy::None => SnapshotState::None,
+                }
+            })
+            .unwrap_or(SnapshotState::None)
+    })
+}
+
+/// Invoke the resolved target.
+async fn run_tool(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    call: &MiddlewareToolCall,
+    args: &serde_json::Value,
+    target: &ToolTarget,
+) -> ToolOutcome {
+    let source = target.source();
+    match target {
+        ToolTarget::Builtin(tool) => {
+            let tool_context = tool_context_for_call(config, exec_ctx, call);
+            let result = genai::tool_scope(
+                Span::current(),
+                tool.call(args.clone(), &tool_context)
+                    .instrument(info_span!(
+                        "agent.tool.invoke",
+                        source = "builtin",
+                        tool_name = %call.function.name,
+                        tool_call_id = %call.id,
+                    )),
+            )
+            .await;
+            match result {
+                Ok(parts) => ToolOutcome::new(parts, false, source, Execution::Executed),
+                Err(e) => {
+                    let execution = if matches!(&e, crate::tools::ToolError::PermissionDenied(_)) {
+                        Execution::PermissionDenied
+                    } else {
+                        Execution::Executed
+                    };
+                    ToolOutcome::error_text(format!("Error: {e}"), source, execution)
+                }
+            }
+        }
+        ToolTarget::Mcp(adapter) => run_mcp_tool(config, exec_ctx, call, args, adapter).await,
+        ToolTarget::Provider => {
+            let result = exec_ctx
+                .session_handle
+                .call_tool(&call.function.name, args.clone())
+                .instrument(info_span!(
+                    "agent.tool.invoke",
+                    source = "provider",
+                    tool_name = %call.function.name,
+                    tool_call_id = %call.id,
+                ))
+                .await;
+            match result {
+                Ok(parts) => ToolOutcome::new(parts, false, source, Execution::Executed),
+                Err(e) => {
+                    ToolOutcome::error_text(format!("Error: {e}"), source, Execution::Executed)
+                }
+            }
+        }
+    }
+}
+
+async fn run_mcp_tool(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    call: &MiddlewareToolCall,
+    args: &serde_json::Value,
+    adapter: &McpToolAdapter,
+) -> ToolOutcome {
+    use querymt::tool_decorator::CallFunctionTool;
+    const SOURCE: ToolSource = ToolSource::Mcp;
+
+    // Progress is throttled and closed when the call ends or is dropped, so
+    // no update can follow this call's `ToolCallEnd`.
+    let (progress_sink, _close_progress) = {
+        let event_sink = config.event_sink.clone();
+        let (session_id, tool_call_id, tool_name) = (
+            exec_ctx.session_id.clone(),
+            call.id.clone(),
+            call.function.name.clone(),
+        );
+        super::progress_sink::AgentProgressSink::new(super::progress_sink::THROTTLE, move |u| {
+            event_sink.session_stream(&session_id).emit_ephemeral_seq(
+                AgentEventKind::ToolCallProgress {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    progress: u.progress,
+                    total: u.total,
+                    message: u.message,
+                },
+            );
+        })
+    };
+    let result = querymt::mcp::progress::CURRENT_PROGRESS
+        .scope(
+            Arc::new(progress_sink) as Arc<dyn querymt::mcp::progress::ProgressSink>,
+            adapter.call(args.clone()),
+        )
+        .instrument(info_span!(
+            "agent.tool.invoke",
+            source = "mcp",
+            tool_name = %call.function.name,
+            tool_call_id = %call.id,
+        ))
+        .await;
+
+    let e = match result {
+        Ok(parts) => return ToolOutcome::new(parts, false, SOURCE, Execution::Executed),
+        Err(e) => e,
+    };
+    // A rejected/missing OAuth login tells the user which provider to log in
+    // with instead of surfacing a transport error.
+    let server = adapter.server_name();
+    if let Some(text) = crate::agent::mcp::report_auth_required(
+        &e,
+        server,
+        exec_ctx.runtime.mcp_tool_state.is_oauth_server(server),
+        &config.event_sink,
+        &exec_ctx.session_id,
+    ) {
+        return ToolOutcome::error_text(text, SOURCE, Execution::Executed);
+    }
+    // In-band `isError` results keep the server's content verbatim.
+    match e.downcast::<querymt::mcp::adapter::McpToolError>() {
+        Ok(querymt::mcp::adapter::McpToolError::Reported { parts }) => {
+            ToolOutcome::new(parts, true, SOURCE, Execution::Executed)
+        }
+        Ok(other) => {
+            ToolOutcome::error_text(format!("Error: {other}"), SOURCE, Execution::Executed)
+        }
+        Err(e) => ToolOutcome::error_text(format!("Error: {e}"), SOURCE, Execution::Executed),
+    }
+}
+
+/// Build the context handed to a built-in tool, wiring its elicitation channel
+/// to the pending-interaction registry for this call.
+fn tool_context_for_call(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    call: &MiddlewareToolCall,
+) -> crate::tools::AgentToolContext {
+    let (elicitation_tx, mut elicitation_rx) =
+        tokio::sync::mpsc::channel::<crate::tools::ElicitationRequest>(1);
+
+    let event_sink = config.event_sink.clone();
+    let session_id_clone = exec_ctx.session_id.clone();
+    let run_id_clone = exec_ctx.turn_id().unwrap_or_default().to_string();
+    let tool_call_id_clone = call.id.clone();
+    let pending_elicitations = config.pending_elicitations.clone();
+    let cancellation_token = exec_ctx.cancellation_token.clone();
+    tokio::spawn(async move {
+        while let Some(request) = elicitation_rx.recv().await {
+            let elicitation_id = request.elicitation_id.clone();
+            crate::elicitation::register_pending_elicitation(
+                &pending_elicitations,
+                elicitation_id.clone(),
+                crate::elicitation::PendingElicitationRegistration {
+                    session_id: session_id_clone.clone(),
+                    form: crate::elicitation::PendingElicitationForm {
+                        message: request.message.clone(),
+                        requested_schema: request.requested_schema.clone(),
+                        source: request.source.clone(),
+                    },
+                    owner_authority: None,
+                    run_id: Some(run_id_clone.clone()),
+                    tool_call_id: Some(tool_call_id_clone.clone()),
+                },
+                request.response_tx,
+            )
+            .await;
+            // Close the race where cancellation happens just before this request
+            // reaches the shared pending map.
+            if cancellation_token.is_cancelled() {
+                crate::elicitation::cancel_pending_elicitations_for_session(
+                    &pending_elicitations,
+                    &session_id_clone,
+                )
+                .await;
+                continue;
+            }
+            // Durable: elicitation must be visible in UI replay.
+            if let Err(err) = event_sink
+                .emit_durable(
+                    &session_id_clone,
+                    crate::events::AgentEventKind::ElicitationRequested {
+                        elicitation_id,
+                        session_id: session_id_clone.clone(),
+                        message: request.message,
+                        requested_schema: request.requested_schema,
+                        source: request.source,
+                    },
+                )
+                .await
+            {
+                log::warn!("failed to emit ElicitationRequested: {}", err);
+            }
+        }
+
+        crate::elicitation::remove_pending_elicitations_for_tool(
+            &pending_elicitations,
+            &session_id_clone,
+            &run_id_clone,
+            &tool_call_id_clone,
+        )
+        .await;
+    });
+
+    exec_ctx
+        .tool_context(config.agent_registry.clone(), Some(elicitation_tx))
+        .with_workspace_service(config.workspace_service())
+        .with_session_store(exec_ctx.state.store.clone())
+        .with_task_service(crate::session::TaskService::new(
+            exec_ctx.state.store.clone(),
+            exec_ctx.session_id.clone(),
+            call.id.clone(),
+        ))
+}
+
+/// Outcome of an approval request.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Approval {
+    Granted,
+    Denied(Denial),
+}
+
+/// Why a call that needed approval will not run.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(super) enum Denial {
+    #[error("rejected by the user")]
+    Rejected,
+    #[error("no answer within {0:?}")]
+    TimedOut(Duration),
+    #[error("the run was cancelled")]
+    Cancelled,
+    #[error("the task is not active")]
+    TaskInactive,
+    #[error("denied by hook: {0}")]
+    Hook(String),
+}
+
+const OPTION_ALLOW_ONCE: &str = "allow_once";
+const OPTION_ALLOW_SESSION: &str = "allow_session";
+const OPTION_REJECT: &str = "reject";
+
+/// Options offered for `need`: the session option only for list-driven asks.
+fn permission_options(need: &ApprovalNeed) -> Vec<crate::acp::protocol::PermissionOption> {
+    use crate::acp::protocol::{PermissionOption, PermissionOptionId, PermissionOptionKind};
+    let mut options = vec![PermissionOption::new(
+        PermissionOptionId::from(OPTION_ALLOW_ONCE),
+        "Allow once",
+        PermissionOptionKind::AllowOnce,
+    )];
+    if matches!(need, ApprovalNeed::Session) {
+        options.push(PermissionOption::new(
+            PermissionOptionId::from(OPTION_ALLOW_SESSION),
+            "Allow for this session",
+            PermissionOptionKind::AllowAlways,
+        ));
+    }
+    options.push(PermissionOption::new(
+        PermissionOptionId::from(OPTION_REJECT),
+        "Reject",
+        PermissionOptionKind::RejectOnce,
+    ));
+    options
+}
+
+/// Resolves after `timeout`, or never when there is none.
+async fn sleep_or_pending(timeout: Option<Duration>) {
+    match timeout {
+        Some(timeout) => tokio::time::sleep(timeout).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Decide whether `tool` may run, asking the user when `need` requires it.
+///
+/// Order: no need, session grant, inactive task, `permission_request` hooks,
+/// then the user prompt. The prompt waits for an answer, run cancellation, or
+/// the configured timeout, and always retires its pending entry.
 #[instrument(
     name = "agent.tool.permission",
-    skip(config, exec_ctx, args, permission),
+    skip_all,
     fields(
         session_id = %exec_ctx.session_id,
-        tool_name = %tool_name,
-        tool_call_id = %tool_call_id,
-        requires_permission = tracing::field::Empty,
-        cache_hit = tracing::field::Empty,
+        tool_name = %tool.name,
+        tool_call_id = %call_id,
+        session_grant = tracing::field::Empty,
         granted = tracing::field::Empty
     )
 )]
-pub(super) async fn ensure_tool_permission(
+pub(super) async fn request_approval(
     config: &AgentConfig,
     exec_ctx: &ExecutionContext,
-    tool_call_id: &str,
-    tool_name: &str,
+    call_id: &str,
+    tool: ToolRef<'_>,
     args: &serde_json::Value,
-    permission: PermissionContext<'_>,
-) -> Result<bool, agent_client_protocol::Error> {
-    use crate::acp::protocol::{
-        PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionRequest,
-        ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    };
-    use crate::agent::utils::{extract_locations, tool_kind_for_tool};
+    need: ApprovalNeed,
+) -> Result<Approval, agent_client_protocol::Error> {
+    let span = Span::current();
+    let approval = decide_approval(config, exec_ctx, call_id, tool, args, need).await?;
+    span.record("granted", matches!(approval, Approval::Granted));
+    Ok(approval)
+}
 
-    let requires_permission = config.requires_permission_for_tool(tool_name);
-    Span::current().record("requires_permission", requires_permission);
-    if !requires_permission {
-        Span::current().record("cache_hit", false);
-        Span::current().record("granted", true);
-        return Ok(true);
+async fn decide_approval(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    call_id: &str,
+    tool: ToolRef<'_>,
+    args: &serde_json::Value,
+    need: ApprovalNeed,
+) -> Result<Approval, agent_client_protocol::Error> {
+    if matches!(need, ApprovalNeed::None) {
+        return Ok(Approval::Granted);
+    }
+
+    if matches!(need, ApprovalNeed::Session) {
+        let granted = exec_ctx.runtime.session_grants.lock().contains(tool);
+        Span::current().record("session_grant", granted);
+        if granted {
+            return Ok(Approval::Granted);
+        }
     }
 
     if let Some(task) = &exec_ctx.state.active_task
         && task.status != TaskStatus::Active
     {
-        return Ok(false);
+        return Ok(Approval::Denied(Denial::TaskInactive));
     }
 
-    {
-        let cache = exec_ctx.runtime.permission_cache.lock();
-        if let Some(cached) = cache.get(tool_name) {
-            Span::current().record("cache_hit", true);
-            Span::current().record("granted", *cached);
-            return Ok(*cached);
-        }
-    }
-    Span::current().record("cache_hit", false);
-
-    if permission.bypass_interactive_prompt {
-        Span::current().record("granted", true);
-        return Ok(true);
-    }
-
+    let turn_id = exec_ctx.turn_id().unwrap_or_default();
     let hook_decision = config
         .hooks
         .run_permission_request(crate::hooks::PermissionRequestRequest {
             session_id: exec_ctx.session_id.clone(),
             mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: permission.turn_id.to_string(),
+            turn_id: turn_id.to_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
                 .llm_config()
                 .map(|cfg| cfg.model.clone())
                 .unwrap_or_default(),
             permission_mode: exec_ctx.permission_mode().to_string(),
-            tool_name: tool_name.to_string(),
+            tool_name: tool.name.to_string(),
             tool_input: args.clone(),
         })
         .await
@@ -1156,27 +1353,50 @@ pub(super) async fn ensure_tool_permission(
         );
     }
     match hook_decision.decision {
-        Some(PermissionRequestDecision::Allow) => {
-            Span::current().record("granted", true);
-            return Ok(true);
-        }
+        Some(PermissionRequestDecision::Allow) => return Ok(Approval::Granted),
         Some(PermissionRequestDecision::Deny { message }) => {
             log::debug!(
                 "Session {}: permission hook denied {}: {}",
                 exec_ctx.session_id,
-                tool_name,
+                tool,
                 message
             );
-            Span::current().record("granted", false);
-            return Ok(false);
+            return Ok(Approval::Denied(Denial::Hook(message)));
         }
         None => {}
     }
 
+    Ok(prompt_user(config, exec_ctx, call_id, tool, args, &need, turn_id).await)
+}
+
+/// Register a permission interaction, announce it, and wait for the outcome.
+async fn prompt_user(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    call_id: &str,
+    tool: ToolRef<'_>,
+    args: &serde_json::Value,
+    need: &ApprovalNeed,
+    turn_id: &str,
+) -> Approval {
+    use crate::acp::protocol::{
+        RequestPermissionRequest, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    };
+    use crate::agent::utils::{extract_locations, tool_kind_for_tool};
+
+    let hook_reason = match need {
+        ApprovalNeed::EveryCall { reason } => reason.as_deref().filter(|r| !r.is_empty()),
+        _ => None,
+    };
+
     let locations = extract_locations(args);
     let tool_update_fields = ToolCallUpdateFields::new()
-        .title(format!("Run {}", tool_name))
-        .kind(tool_kind_for_tool(tool_name))
+        .title(
+            hook_reason
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Run {tool}")),
+        )
+        .kind(tool_kind_for_tool(tool.name))
         .status(ToolCallStatus::Pending)
         .locations(if locations.is_empty() {
             None
@@ -1197,32 +1417,8 @@ pub(super) async fn ensure_tool_permission(
 
     let request = RequestPermissionRequest::new(
         exec_ctx.session_id.clone(),
-        ToolCallUpdate::new(
-            ToolCallId::from(tool_call_id.to_string()),
-            tool_update_fields,
-        ),
-        vec![
-            PermissionOption::new(
-                PermissionOptionId::from("allow_once"),
-                "Allow once",
-                PermissionOptionKind::AllowOnce,
-            ),
-            PermissionOption::new(
-                PermissionOptionId::from("allow_always"),
-                "Always allow",
-                PermissionOptionKind::AllowAlways,
-            ),
-            PermissionOption::new(
-                PermissionOptionId::from("reject_once"),
-                "Reject once",
-                PermissionOptionKind::RejectOnce,
-            ),
-            PermissionOption::new(
-                PermissionOptionId::from("reject_always"),
-                "Always reject",
-                PermissionOptionKind::RejectAlways,
-            ),
-        ],
+        ToolCallUpdate::new(ToolCallId::from(call_id.to_string()), tool_update_fields),
+        permission_options(need),
     )
     .meta(request_meta);
 
@@ -1232,12 +1428,12 @@ pub(super) async fn ensure_tool_permission(
         permission_id.clone(),
         exec_ctx.session_id.clone(),
         request.clone(),
-        Some(permission.turn_id.to_string()),
-        Some(tool_call_id.to_string()),
+        Some(turn_id.to_string()),
+        Some(call_id.to_string()),
         response_tx,
     )
     .await;
-    // Retire the pending entry on every exit path (answer, cancel, drop).
+    // Retire the pending entry if this future is dropped mid-wait.
     let _cleanup = PendingPermissionGuard {
         pending_map: config.pending_elicitations.clone(),
         interaction_id: permission_id.clone(),
@@ -1256,9 +1452,11 @@ pub(super) async fn ensure_tool_permission(
                     .active_task
                     .as_ref()
                     .map(|task| task.public_id.clone()),
-                tool_name: tool_name.to_string(),
-                reason: format!("Tool {} requires explicit permission", tool_name),
-                tool_call_id: tool_call_id.to_string(),
+                tool_name: tool.name.to_string(),
+                reason: hook_reason
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Tool {tool} requires explicit permission")),
+                tool_call_id: call_id.to_string(),
                 request: Some(request),
             },
         )
@@ -1268,43 +1466,48 @@ pub(super) async fn ensure_tool_permission(
         log::warn!("failed to emit PermissionRequested: {}", err);
     }
 
-    // Wait for an explicit answer or run cancellation. No client attached,
-    // delivery failure and disconnect all keep the request pending; only an
-    // explicit selected option grants.
-    let response = tokio::select! {
-        response = response_rx => response.ok(),
-        _ = exec_ctx.cancellation_token.cancelled() => None,
+    // Wait for an explicit answer, run cancellation or the timeout. No client
+    // attached, delivery failure and disconnect all keep the request pending;
+    // only an explicit selected option grants.
+    let timeout = config.permissions.timeout;
+    let answer = tokio::select! {
+        response = response_rx => response.map_err(|_| Denial::Cancelled),
+        _ = exec_ctx.cancellation_token.cancelled() => Err(Denial::Cancelled),
+        _ = sleep_or_pending(timeout) => Err(Denial::TimedOut(timeout.unwrap_or_default())),
     };
 
-    let granted = match response
-        .as_ref()
-        .and_then(|r| r.selected_permission_option())
-    {
-        Some(option_id) => {
-            let allow = option_id == "allow_once" || option_id == "allow_always";
-            let mut cache = exec_ctx.runtime.permission_cache.lock();
-            if option_id == "allow_always" {
-                cache.insert(tool_name.to_string(), true);
-            } else if option_id == "reject_always" {
-                cache.insert(tool_name.to_string(), false);
-            }
-            allow
-        }
-        // Decline, cancel, run cancellation or a dropped waiter never grant.
-        None => false,
-    };
+    // Retire the request before reporting, so a late answer is never pending.
+    config
+        .pending_elicitations
+        .lock()
+        .await
+        .remove(&permission_id);
+
+    // `Ok(true)` = allowed for the session. Decline, cancel and unknown
+    // options never grant.
+    let decision = answer.and_then(|response| match response.selected_permission_option() {
+        Some(OPTION_ALLOW_ONCE) => Ok(false),
+        Some(OPTION_ALLOW_SESSION) => Ok(true),
+        _ => Err(Denial::Rejected),
+    });
 
     config.emit_event(
         &exec_ctx.session_id,
         AgentEventKind::PermissionGranted {
             permission_id,
-            granted,
+            granted: decision.is_ok(),
         },
     );
 
-    Span::current().record("granted", granted);
-
-    Ok(granted)
+    match decision {
+        Ok(session_wide) => {
+            if session_wide && matches!(need, ApprovalNeed::Session) {
+                exec_ctx.runtime.session_grants.lock().insert(tool);
+            }
+            Approval::Granted
+        }
+        Err(denial) => Approval::Denied(denial),
+    }
 }
 
 /// Removes a pending permission interaction when the waiting tool call exits.
@@ -2102,9 +2305,9 @@ mod genai_trace_tests {
             } else {
                 registry.add(Arc::new(ShellTool::new()));
             }
-            exec.tool_config.denylist.clear();
+            exec.tool_config.deny = Default::default();
             if mode == "policy_blocked" {
-                exec.tool_config.denylist.insert("shell".into());
+                exec.tool_config.deny = ["shell".parse().unwrap()].into_iter().collect();
             }
             let mut builder = AgentConfigBuilder::from_provider(
                 fixture.storage.clone(),
@@ -2337,16 +2540,16 @@ mod genai_trace_tests {
             let mock = MockLlmProvider::new(); // No execution expectation: rejection must not call it.
             let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
             let exec = fixture.execution_context().await;
-            exec.runtime
-                .permission_cache
-                .lock()
-                .insert("telemetry_tool".into(), false);
             let mut builder = AgentConfigBuilder::from_provider(
                 fixture.storage.clone(),
                 fixture.config.provider.clone(),
                 fixture.storage.event_journal(),
             )
-            .with_mutating_tools(vec!["telemetry_tool".to_string()]);
+            .with_permissions(
+                crate::config::Permissions::new()
+                    .ask(["telemetry_tool".parse().unwrap()])
+                    .timeout(std::time::Duration::from_millis(20)),
+            );
             if hook_blocked {
                 builder = builder.with_hooks(hooks("pre_tool_use", serde_json::json!({
                     "hook_specific_output": {"hook_event_name": "pre_tool_use", "permission_decision": "deny"}
@@ -2395,8 +2598,10 @@ mod permission_interaction_tests {
     use crate::elicitation::{ElicitationResponse, InteractionKind};
     use crate::hooks::{Hooks, HooksConfig};
     use crate::session::backend::StorageBackend;
+    use crate::session::domain::{Task, TaskKind};
     use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
-    use std::time::Duration;
+
+    const SHELL: ToolRef<'static> = ToolRef::builtin("shell");
 
     async fn fixture() -> (TestAgent, ExecutionContext) {
         let fixture =
@@ -2406,11 +2611,20 @@ mod permission_interaction_tests {
         (fixture, exec)
     }
 
-    fn permission_ctx() -> PermissionContext<'static> {
-        PermissionContext {
-            turn_id: "turn-1",
-            bypass_interactive_prompt: false,
-        }
+    fn every_call() -> ApprovalNeed {
+        ApprovalNeed::EveryCall { reason: None }
+    }
+
+    async fn approve(
+        config: &AgentConfig,
+        exec: &ExecutionContext,
+        call_id: &str,
+        tool: ToolRef<'_>,
+        need: ApprovalNeed,
+    ) -> Approval {
+        request_approval(config, exec, call_id, tool, &serde_json::json!({}), need)
+            .await
+            .unwrap()
     }
 
     /// Wait until a permission interaction for `tool_call_id` is pending and
@@ -2450,6 +2664,37 @@ mod permission_interaction_tests {
         );
     }
 
+    /// Option IDs of the pending request `id`, in presentation order.
+    async fn option_ids(config: &AgentConfig, id: &str) -> Vec<String> {
+        let pending = config.pending_elicitations.lock().await;
+        let InteractionKind::Permission { request } = &pending[id].kind else {
+            panic!("expected a permission interaction");
+        };
+        request
+            .options
+            .iter()
+            .map(|option| option.option_id.to_string())
+            .collect()
+    }
+
+    /// Prompt for `call_id`, answer it with `option` and return the outcome.
+    async fn prompt_and_answer(
+        config: &AgentConfig,
+        exec: &ExecutionContext,
+        call_id: &str,
+        tool: ToolRef<'_>,
+        need: ApprovalNeed,
+        option: &str,
+    ) -> Approval {
+        let request = approve(config, exec, call_id, tool, need);
+        let driver = async {
+            let id = wait_pending(config, call_id).await;
+            answer(config, &exec.session_id, &id, option).await;
+        };
+        let (approval, ()) = tokio::join!(request, driver);
+        approval
+    }
+
     async fn pending_is_empty(config: &AgentConfig) -> bool {
         for _ in 0..200 {
             if config.pending_elicitations.lock().await.is_empty() {
@@ -2460,23 +2705,41 @@ mod permission_interaction_tests {
         false
     }
 
+    async fn assert_prompts(
+        config: &AgentConfig,
+        exec: &ExecutionContext,
+        call_id: &str,
+        tool: ToolRef<'_>,
+        need: ApprovalNeed,
+    ) {
+        let outcome = prompt_and_answer(config, exec, call_id, tool, need, OPTION_REJECT).await;
+        assert!(matches!(outcome, Approval::Denied(Denial::Rejected)));
+    }
+
+    #[tokio::test]
+    async fn no_need_is_granted_without_a_prompt() {
+        let (fixture, exec) = fixture().await;
+        let config = fixture.config.as_ref();
+        let outcome = approve(config, &exec, "call-n", SHELL, ApprovalNeed::None).await;
+        assert!(matches!(outcome, Approval::Granted));
+        assert!(config.pending_elicitations.lock().await.is_empty());
+    }
+
     #[tokio::test]
     async fn waits_without_client_then_answer_decides() {
         let (fixture, exec) = fixture().await;
         let config = fixture.config.as_ref();
-        let args = serde_json::json!({"command": "ls"});
 
-        let ensure =
-            ensure_tool_permission(config, &exec, "call-1", "shell", &args, permission_ctx());
+        let request = approve(config, &exec, "call-1", SHELL, ApprovalNeed::Session);
         let driver = async {
             let id = wait_pending(config, "call-1").await;
             // No client answers yet: the call must still be waiting, not granted.
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(config.pending_elicitations.lock().await.contains_key(&id));
-            answer(config, &exec.session_id, &id, "allow_once").await;
+            answer(config, &exec.session_id, &id, OPTION_ALLOW_ONCE).await;
         };
-        let (granted, ()) = tokio::join!(ensure, driver);
-        assert!(granted.unwrap());
+        let (approval, ()) = tokio::join!(request, driver);
+        assert!(matches!(approval, Approval::Granted));
         assert!(pending_is_empty(config).await);
     }
 
@@ -2484,10 +2747,8 @@ mod permission_interaction_tests {
     async fn request_carries_its_interaction_id_in_meta() {
         let (fixture, exec) = fixture().await;
         let config = fixture.config.as_ref();
-        let args = serde_json::json!({});
 
-        let ensure =
-            ensure_tool_permission(config, &exec, "call-i", "shell", &args, permission_ctx());
+        let request = approve(config, &exec, "call-i", SHELL, ApprovalNeed::Session);
         let driver = async {
             let id = wait_pending(config, "call-i").await;
             let wire_id = {
@@ -2505,36 +2766,92 @@ mod permission_interaction_tests {
                 Some(id.as_str()),
                 "the wire request must carry the pending interaction ID"
             );
-            answer(config, &exec.session_id, &id, "allow_once").await;
+            answer(config, &exec.session_id, &id, OPTION_ALLOW_ONCE).await;
         };
-        let (granted, ()) = tokio::join!(ensure, driver);
-        assert!(granted.unwrap());
+        let (approval, ()) = tokio::join!(request, driver);
+        assert!(matches!(approval, Approval::Granted));
     }
 
     #[tokio::test]
-    async fn reject_option_denies_call() {
+    async fn options_follow_the_need() {
         let (fixture, exec) = fixture().await;
         let config = fixture.config.as_ref();
-        let args = serde_json::json!({});
+        let needs = [
+            (
+                ApprovalNeed::Session,
+                vec!["allow_once", "allow_session", "reject"],
+            ),
+            (every_call(), vec!["allow_once", "reject"]),
+            (
+                ApprovalNeed::EveryCall {
+                    reason: Some("EDIT a.rs".into()),
+                },
+                vec!["allow_once", "reject"],
+            ),
+        ];
+        for (index, (need, expected)) in needs.into_iter().enumerate() {
+            let call_id = format!("call-o{index}");
+            let request = approve(config, &exec, &call_id, SHELL, need);
+            let driver = async {
+                let id = wait_pending(config, &call_id).await;
+                assert_eq!(option_ids(config, &id).await, expected);
+                answer(config, &exec.session_id, &id, OPTION_ALLOW_ONCE).await;
+            };
+            let (approval, ()) = tokio::join!(request, driver);
+            assert!(matches!(approval, Approval::Granted));
+        }
+    }
 
-        let ensure =
-            ensure_tool_permission(config, &exec, "call-r", "shell", &args, permission_ctx());
-        let driver = async {
-            let id = wait_pending(config, "call-r").await;
-            answer(config, &exec.session_id, &id, "reject_once").await;
+    #[tokio::test]
+    async fn hook_reason_is_the_request_title() {
+        let (fixture, exec) = fixture().await;
+        let config = fixture.config.as_ref();
+        let need = ApprovalNeed::EveryCall {
+            reason: Some("EDIT a.rs".into()),
         };
-        let (granted, ()) = tokio::join!(ensure, driver);
-        assert!(!granted.unwrap());
+
+        let request = approve(config, &exec, "call-t", SHELL, need);
+        let driver = async {
+            let id = wait_pending(config, "call-t").await;
+            let title = {
+                let pending = config.pending_elicitations.lock().await;
+                let InteractionKind::Permission { request } = &pending[&id].kind else {
+                    panic!("expected a permission interaction");
+                };
+                request.tool_call.fields.title.clone()
+            };
+            assert_eq!(title.as_deref(), Some("EDIT a.rs"));
+            answer(config, &exec.session_id, &id, OPTION_ALLOW_ONCE).await;
+        };
+        let (approval, ()) = tokio::join!(request, driver);
+        assert!(matches!(approval, Approval::Granted));
+    }
+
+    #[tokio::test]
+    async fn reject_option_denies_call_and_is_not_remembered() {
+        let (fixture, exec) = fixture().await;
+        let config = fixture.config.as_ref();
+
+        assert_prompts(config, &exec, "call-r1", SHELL, ApprovalNeed::Session).await;
+        // The same tool prompts again, and can then be allowed.
+        let second = prompt_and_answer(
+            config,
+            &exec,
+            "call-r2",
+            SHELL,
+            ApprovalNeed::Session,
+            OPTION_ALLOW_ONCE,
+        )
+        .await;
+        assert!(matches!(second, Approval::Granted));
     }
 
     #[tokio::test]
     async fn unknown_option_stays_pending() {
         let (fixture, exec) = fixture().await;
         let config = fixture.config.as_ref();
-        let args = serde_json::json!({});
 
-        let ensure =
-            ensure_tool_permission(config, &exec, "call-m", "shell", &args, permission_ctx());
+        let request = approve(config, &exec, "call-m", SHELL, ApprovalNeed::Session);
         let driver = async {
             let id = wait_pending(config, "call-m").await;
             let err = crate::elicitation::resolve_in_map(
@@ -2548,27 +2865,25 @@ mod permission_interaction_tests {
             .await;
             assert!(err.is_err(), "malformed answer must be rejected");
             assert!(config.pending_elicitations.lock().await.contains_key(&id));
-            answer(config, &exec.session_id, &id, "allow_once").await;
+            answer(config, &exec.session_id, &id, OPTION_ALLOW_ONCE).await;
         };
-        let (granted, ()) = tokio::join!(ensure, driver);
-        assert!(granted.unwrap());
+        let (approval, ()) = tokio::join!(request, driver);
+        assert!(matches!(approval, Approval::Granted));
     }
 
     #[tokio::test]
     async fn cancel_while_waiting_does_not_grant() {
         let (fixture, exec) = fixture().await;
         let config = fixture.config.as_ref();
-        let args = serde_json::json!({});
 
-        let ensure =
-            ensure_tool_permission(config, &exec, "call-c", "shell", &args, permission_ctx());
+        let request = approve(config, &exec, "call-c", SHELL, ApprovalNeed::Session);
         let driver = async {
             let id = wait_pending(config, "call-c").await;
             exec.cancellation_token.cancel();
             id
         };
-        let (granted, id) = tokio::join!(ensure, driver);
-        assert!(!granted.unwrap());
+        let (approval, id) = tokio::join!(request, driver);
+        assert!(matches!(approval, Approval::Denied(Denial::Cancelled)));
         assert!(pending_is_empty(config).await);
         // A late answer is rejected as not pending.
         let late = crate::elicitation::resolve_in_map(
@@ -2577,7 +2892,7 @@ mod permission_interaction_tests {
             &id,
             "conn-1",
             None,
-            ElicitationResponse::permission_selected("allow_once"),
+            ElicitationResponse::permission_selected(OPTION_ALLOW_ONCE),
         )
         .await
         .unwrap();
@@ -2585,37 +2900,192 @@ mod permission_interaction_tests {
     }
 
     #[tokio::test]
-    async fn always_allow_is_cached_and_not_prompted_again() {
+    async fn allow_session_skips_later_prompts_for_the_same_tool() {
         let (fixture, exec) = fixture().await;
         let config = fixture.config.as_ref();
-        let args = serde_json::json!({});
 
-        let first =
-            ensure_tool_permission(config, &exec, "call-a", "shell", &args, permission_ctx());
-        let driver = async {
-            let id = wait_pending(config, "call-a").await;
-            answer(config, &exec.session_id, &id, "allow_always").await;
-        };
-        let (granted, ()) = tokio::join!(first, driver);
-        assert!(granted.unwrap());
+        let first = prompt_and_answer(
+            config,
+            &exec,
+            "call-a",
+            SHELL,
+            ApprovalNeed::Session,
+            OPTION_ALLOW_SESSION,
+        )
+        .await;
+        assert!(matches!(first, Approval::Granted));
 
-        let second =
-            ensure_tool_permission(config, &exec, "call-b", "shell", &args, permission_ctx())
-                .await
-                .unwrap();
-        assert!(second);
+        let second = approve(config, &exec, "call-b", SHELL, ApprovalNeed::Session).await;
+        assert!(matches!(second, Approval::Granted));
         assert!(config.pending_elicitations.lock().await.is_empty());
     }
 
     #[tokio::test]
-    async fn hook_decision_skips_prompt() {
+    async fn allow_session_does_not_cover_every_call_needs() {
         let (fixture, exec) = fixture().await;
-        for (behavior, expected) in [("allow", true), ("deny", false)] {
+        let config = fixture.config.as_ref();
+        prompt_and_answer(
+            config,
+            &exec,
+            "call-a",
+            SHELL,
+            ApprovalNeed::Session,
+            OPTION_ALLOW_SESSION,
+        )
+        .await;
+
+        // always_ask and hook asks still prompt, and never record a grant.
+        assert_prompts(config, &exec, "call-e1", SHELL, every_call()).await;
+        let hook_ask = ApprovalNeed::EveryCall {
+            reason: Some("EDIT a.rs".into()),
+        };
+        assert_prompts(config, &exec, "call-e2", SHELL, hook_ask).await;
+    }
+
+    #[tokio::test]
+    async fn every_call_never_records_a_session_grant() {
+        let (fixture, exec) = fixture().await;
+        let config = fixture.config.as_ref();
+        let first = prompt_and_answer(
+            config,
+            &exec,
+            "call-1",
+            SHELL,
+            every_call(),
+            OPTION_ALLOW_ONCE,
+        )
+        .await;
+        assert!(matches!(first, Approval::Granted));
+        // Even a plain `ask` need prompts: nothing was remembered.
+        assert_prompts(config, &exec, "call-2", SHELL, ApprovalNeed::Session).await;
+    }
+
+    #[tokio::test]
+    async fn allow_session_is_per_server_qualified_tool() {
+        let (fixture, exec) = fixture().await;
+        let config = fixture.config.as_ref();
+        let alpha = ToolRef::mcp("alpha", "lookup");
+        let beta = ToolRef::mcp("beta", "lookup");
+        prompt_and_answer(
+            config,
+            &exec,
+            "call-a",
+            alpha,
+            ApprovalNeed::Session,
+            OPTION_ALLOW_SESSION,
+        )
+        .await;
+
+        let again = approve(config, &exec, "call-a2", alpha, ApprovalNeed::Session).await;
+        assert!(matches!(again, Approval::Granted));
+        assert_prompts(config, &exec, "call-b", beta, ApprovalNeed::Session).await;
+    }
+
+    #[tokio::test]
+    async fn allow_session_does_not_leak_into_a_new_session() {
+        let (fixture, exec) = fixture().await;
+        let config = fixture.config.as_ref();
+        prompt_and_answer(
+            config,
+            &exec,
+            "call-a",
+            SHELL,
+            ApprovalNeed::Session,
+            OPTION_ALLOW_SESSION,
+        )
+        .await;
+
+        let other = fixture.execution_context().await;
+        assert_prompts(config, &other, "call-o", SHELL, ApprovalNeed::Session).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_request_times_out_and_is_retired() {
+        let (fixture, exec) = fixture().await;
+        let mut config = fixture.config.as_ref().clone();
+        config.permissions = crate::config::Permissions::new().timeout(Duration::from_secs(120));
+
+        let started = tokio::time::Instant::now();
+        let approval = approve(&config, &exec, "call-t", SHELL, ApprovalNeed::Session).await;
+
+        assert!(matches!(
+            approval,
+            Approval::Denied(Denial::TimedOut(d)) if d == Duration::from_secs(120)
+        ));
+        assert_eq!(started.elapsed(), Duration::from_secs(120));
+        // Retired on every client: nothing is left to answer late.
+        assert!(config.pending_elicitations.lock().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_applies_to_every_call_needs_with_empty_lists() {
+        let (fixture, exec) = fixture().await;
+        let mut config = fixture.config.as_ref().clone();
+        config.permissions = crate::config::Permissions::new().timeout(Duration::from_secs(30));
+        let need = ApprovalNeed::EveryCall {
+            reason: Some("hook says ask".into()),
+        };
+
+        let approval = approve(&config, &exec, "call-t", SHELL, need).await;
+
+        assert!(matches!(approval, Approval::Denied(Denial::TimedOut(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answer_before_the_timeout_wins() {
+        let (fixture, exec) = fixture().await;
+        let mut config = fixture.config.as_ref().clone();
+        config.permissions = crate::config::Permissions::new().timeout(Duration::from_secs(120));
+
+        let approval = prompt_and_answer(
+            &config,
+            &exec,
+            "call-t",
+            SHELL,
+            ApprovalNeed::Session,
+            OPTION_ALLOW_ONCE,
+        )
+        .await;
+
+        assert!(matches!(approval, Approval::Granted));
+    }
+
+    #[tokio::test]
+    async fn paused_task_denies_without_prompting() {
+        let (fixture, mut exec) = fixture().await;
+        let config = fixture.config.as_ref();
+        let now = time::OffsetDateTime::now_utc();
+        exec.state.active_task = Some(Task {
+            id: 1,
+            public_id: "task-1".into(),
+            session_id: 1,
+            kind: TaskKind::Finite,
+            status: TaskStatus::Paused,
+            expected_deliverable: None,
+            acceptance_criteria: None,
+            revision: 1,
+            creation_key: None,
+            completion_evidence: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        });
+
+        let approval = approve(config, &exec, "call-p", SHELL, ApprovalNeed::Session).await;
+
+        assert!(matches!(approval, Approval::Denied(Denial::TaskInactive)));
+        assert!(config.pending_elicitations.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn permission_request_hook_decision_skips_prompt() {
+        let (fixture, exec) = fixture().await;
+        for behavior in ["allow", "deny"] {
             let output = serde_json::json!({
                 "continue": true,
                 "hook_specific_output": {
                     "hook_event_name": "permission_request",
-                    "decision": {"behavior": behavior, "message": "policy"}
+                    "decision": {"behavior": behavior, "message": "outside trading hours"}
                 }
             })
             .to_string();
@@ -2638,15 +3108,19 @@ mod permission_interaction_tests {
             )
             .with_hooks(hooks)
             .build();
-            let args = serde_json::json!({});
-            let granted = tokio::time::timeout(
+            let approval = tokio::time::timeout(
                 Duration::from_secs(10),
-                ensure_tool_permission(&config, &exec, "call-h", "shell", &args, permission_ctx()),
+                approve(&config, &exec, "call-h", SHELL, ApprovalNeed::Session),
             )
             .await
-            .expect("hook decision must not wait for a user")
-            .unwrap();
-            assert_eq!(granted, expected, "behavior={behavior}");
+            .expect("hook decision must not wait for a user");
+            match (behavior, approval) {
+                ("allow", Approval::Granted) => {}
+                ("deny", Approval::Denied(Denial::Hook(message))) => {
+                    assert_eq!(message, "outside trading hours");
+                }
+                (behavior, other) => panic!("behavior={behavior}: {other:?}"),
+            }
             assert!(config.pending_elicitations.lock().await.is_empty());
         }
     }
@@ -2681,6 +3155,7 @@ mod prepared_call_tests {
     /// Builtin-style tool that records the arguments it was invoked with.
     struct Recorder {
         invocations: Arc<Mutex<Vec<Value>>>,
+        read_only: bool,
     }
 
     #[async_trait::async_trait]
@@ -2706,6 +3181,9 @@ mod prepared_call_tests {
                     strict: None,
                 },
             }
+        }
+        fn is_read_only(&self) -> bool {
+            self.read_only
         }
         fn arg_aliases(&self) -> &'static [ArgAlias] {
             ALIASES
@@ -2767,6 +3245,7 @@ mod prepared_call_tests {
             let mut registry = ToolRegistry::new();
             registry.add(Arc::new(Recorder {
                 invocations: self.invocations.clone(),
+                read_only: false,
             }));
             let mut builder = AgentConfigBuilder::from_provider(
                 self.agent.storage.clone(),
@@ -2866,6 +3345,121 @@ mod prepared_call_tests {
             result.tool_arguments.as_deref(),
             Some(r#"{"file_path":"redirected.rs","new_string":"z"}"#)
         );
+    }
+
+    #[tokio::test]
+    async fn unanswered_approval_keeps_a_listed_tool_from_running() {
+        let fx = Fixture::new().await;
+        let mut config = fx.config(None);
+        config.permissions = crate::config::Permissions::new()
+            .ask(["rec_edit".parse().unwrap()])
+            .timeout(std::time::Duration::from_millis(50));
+
+        let result = run(
+            &fx,
+            &config,
+            json!({"file_path": "a.rs", "new_string": "y"}),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert!(
+            text(&result).contains("no answer within")
+                && text(&result).contains("the tool was not run"),
+            "{}",
+            text(&result)
+        );
+        assert!(fx.invoked().is_empty(), "tool must not run");
+    }
+
+    #[tokio::test]
+    async fn hook_ask_requires_confirmation_before_the_tool_runs() {
+        let fx = Fixture::new().await;
+        let hooks = fx.hooks(json!({"hook_specific_output": {
+            "hook_event_name": "pre_tool_use",
+            "permission_decision": "ask",
+            "permission_decision_reason": "EDIT a.rs"
+        }}));
+        let mut config = fx.config(Some(hooks));
+        config.permissions =
+            crate::config::Permissions::new().timeout(std::time::Duration::from_millis(50));
+
+        let result = run(
+            &fx,
+            &config,
+            json!({"file_path": "a.rs", "new_string": "y"}),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert!(fx.invoked().is_empty(), "tool must not run unconfirmed");
+    }
+
+    #[tokio::test]
+    async fn unlisted_tool_runs_without_confirmation() {
+        let fx = Fixture::new().await;
+        let mut config = fx.config(None);
+        config.permissions = crate::config::Permissions::new().ask(["other_tool".parse().unwrap()]);
+
+        let result = run(
+            &fx,
+            &config,
+            json!({"file_path": "a.rs", "new_string": "y"}),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", text(&result));
+        assert_eq!(fx.invoked().len(), 1);
+    }
+
+    /// Config whose only tool is `rec_edit` (read-only or not), with a
+    /// metadata snapshot policy enabled.
+    fn snapshot_config(fx: &Fixture, read_only: bool) -> crate::agent::agent_config::AgentConfig {
+        let mut registry = ToolRegistry::new();
+        registry.add(Arc::new(Recorder {
+            invocations: fx.invocations.clone(),
+            read_only,
+        }));
+        AgentConfigBuilder::from_provider(
+            fx.agent.storage.clone(),
+            fx.agent.config.provider.clone(),
+            fx.agent.storage.event_journal(),
+        )
+        .with_tool_registry(registry)
+        .with_snapshot_policy(SnapshotPolicy::Metadata)
+        .build()
+    }
+
+    async fn run_in_workspace(fx: &Fixture, read_only: bool) -> ToolResult {
+        let dir = tempfile::tempdir().unwrap();
+        let exec = fx
+            .agent
+            .execution_context_in(dir.path().to_path_buf())
+            .await;
+        let config = snapshot_config(fx, read_only);
+        let call = mock_tool_call(
+            "call-1",
+            "rec_edit",
+            &json!({"file_path": "a.rs", "new_string": "y"}).to_string(),
+        );
+        execute_tool_call(&config, &call, &exec).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_takes_no_snapshot() {
+        let fx = Fixture::new().await;
+        let result = run_in_workspace(&fx, true).await;
+        assert!(!result.is_error, "{}", text(&result));
+        assert!(result.snapshot_part.is_none());
+        assert_eq!(fx.invoked().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mutating_tool_takes_a_snapshot_when_the_policy_is_enabled() {
+        let fx = Fixture::new().await;
+        let result = run_in_workspace(&fx, false).await;
+        assert!(!result.is_error, "{}", text(&result));
+        assert!(result.snapshot_part.is_some());
     }
 
     #[tokio::test]
@@ -3432,14 +4026,10 @@ mod prepared_call_tests {
 
     async fn replay_config(
         fx: &Fixture,
-        exec: &ExecutionContext,
         log: &Arc<Mutex<Vec<(String, Value)>>>,
     ) -> crate::agent::agent_config::AgentConfig {
         let mut registry = ToolRegistry::new();
         for tool in crate::tools::builtins::all_builtin_tools() {
-            let name = tool.name().to_string();
-            // Edit tools ask for permission; grant it so only argument handling is tested.
-            exec.runtime.permission_cache.lock().insert(name, true);
             registry.add(Arc::new(Replay {
                 inner: tool,
                 invocations: log.clone(),
@@ -3469,7 +4059,7 @@ mod prepared_call_tests {
         let fx = Fixture::new().await;
         let exec = fx.agent.execution_context().await;
         let log = Arc::new(Mutex::new(Vec::new()));
-        let config = replay_config(&fx, &exec, &log).await;
+        let config = replay_config(&fx, &log).await;
 
         let mut table = Vec::new();
         for (index, class) in classes.iter().enumerate() {
@@ -3535,7 +4125,7 @@ mod prepared_call_tests {
         let fx = Fixture::new().await;
         let exec = fx.agent.execution_context().await;
         let log = Arc::new(Mutex::new(Vec::new()));
-        let config = replay_config(&fx, &exec, &log).await;
+        let config = replay_config(&fx, &log).await;
 
         // Truncated object, a non-object, and a bare string: none become `{}`.
         for (index, raw) in [
@@ -3620,6 +4210,72 @@ mod mcp_tool_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn listed_mcp_tool_is_not_called_until_approved() {
+        let f = fixture().await;
+        let mut config = f.agent.config.as_ref().clone();
+        config.permissions = crate::config::Permissions::new()
+            .ask(["harness.echo".parse().unwrap()])
+            .timeout(Duration::from_millis(50));
+        let call = mock_tool_call("c-ask", "echo", r#"{"text":"hi"}"#);
+
+        // Nobody answers: the server must never see the call.
+        let result = execute_tool_call(&config, &call, &f.exec).await.unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(result.tool_source, "blocked");
+        let message: String = result.content.iter().filter_map(|b| b.as_text()).collect();
+        assert!(
+            message.contains("no answer within") && message.ends_with("; the tool was not run"),
+            "{message}"
+        );
+        assert!(f.harness.log.calls.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn approved_mcp_tool_reaches_the_server() {
+        let f = fixture().await;
+        let mut config = f.agent.config.as_ref().clone();
+        config.permissions =
+            crate::config::Permissions::new().ask(["harness.echo".parse().unwrap()]);
+        let call = mock_tool_call("c-ok", "echo", r#"{"text":"hi"}"#);
+
+        let run = execute_tool_call(&config, &call, &f.exec);
+        let driver = async {
+            for _ in 0..200 {
+                let id = config
+                    .pending_elicitations
+                    .lock()
+                    .await
+                    .iter()
+                    .find(|(_, e)| e.tool_call_id.as_deref() == Some("c-ok"))
+                    .map(|(id, _)| id.clone());
+                if let Some(id) = id {
+                    crate::elicitation::resolve_in_map(
+                        &config.pending_elicitations,
+                        Some(&f.exec.session_id),
+                        &id,
+                        "conn-1",
+                        None,
+                        crate::elicitation::ElicitationResponse::permission_selected(
+                            OPTION_ALLOW_ONCE,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("no permission request became pending");
+        };
+        let (result, ()) = tokio::join!(run, driver);
+
+        let result = result.unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(f.harness.log.calls.lock().len(), 1);
     }
 
     #[tokio::test]

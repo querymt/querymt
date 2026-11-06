@@ -30,6 +30,7 @@ max_parallel_delegations = 5
 # -----------------------------------------------------------------------------
 
 [planner]
+mode = "plan"
 provider = "anthropic"
 model = "claude-opus-4-5"
 #provider = "codex"
@@ -48,7 +49,6 @@ fallback_max_tokens = 32000
 
 [[planner.middleware]]
 type = "agent_mode"
-default = "plan"
 reminder = """<system-reminder>
 # Plan Mode - System Reminder
 

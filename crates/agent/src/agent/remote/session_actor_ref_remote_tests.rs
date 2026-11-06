@@ -1193,7 +1193,7 @@ mod session_actor_ref_remote_tests {
                     PermissionOptionKind::AllowOnce,
                 ),
                 PermissionOption::new(
-                    PermissionOptionId::from("reject_once"),
+                    PermissionOptionId::from("reject"),
                     "Reject once",
                     PermissionOptionKind::RejectOnce,
                 ),

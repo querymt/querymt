@@ -84,8 +84,10 @@ class Agent:
         api_key: str | None = None,
         base_url: str | None = None,
         db: str | None = None,
-        assume_mutating: bool | None = None,
-        mutating_tools: list[str] | None = None,
+        ask: list[str] | None = None,
+        always_ask: list[str] | None = None,
+        approval_timeout_sec: int | None = None,
+        mode: str | None = None,
         max_steps: int | None = None,
         max_prompt_bytes: int | None = None,
         execution_timeout_secs: int | None = None,
@@ -94,7 +96,13 @@ class Agent:
         """``worktrees=True`` (or a dict with ``storage_root``/``baseline``)
         enables the workspace service. It never isolates a session on its own:
         isolation is requested per session via ``chat_session(workspace=...)``.
-        Unknown dict keys raise ``ValueError``."""
+        Unknown dict keys raise ``ValueError``.
+
+        ``ask`` lists tools that prompt (with an "Allow for this session"
+        option); ``always_ask`` prompts on every call. Selectors are ``shell``,
+        ``server.tool`` or ``server.*``. ``approval_timeout_sec`` rejects
+        unanswered prompts. ``mode`` is ``"build"``, ``"plan"`` or ``"review"``.
+        Invalid values raise ``ValueError``."""
     @staticmethod
     async def from_config(path: str) -> Agent: ...
     async def chat(self, prompt: str) -> str: ...

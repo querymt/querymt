@@ -91,10 +91,13 @@ pub enum PermissionRequestDecision {
     Deny { message: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreToolPermissionDecision {
     Allow,
-    Ask,
+    /// Prompt the user on this call; `reason` is the hook's summary.
+    Ask {
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -161,6 +164,8 @@ pub struct UserPromptSubmitResult {
 #[derive(Clone)]
 pub struct PreToolUseRequest {
     pub session_id: String,
+    /// MCP server that provides the tool, if any.
+    pub mcp_server: Option<String>,
     pub mcp_tool_state: Option<Arc<crate::agent::core::McpToolState>>,
     pub turn_id: String,
     pub cwd: Option<PathBuf>,
@@ -223,6 +228,8 @@ pub struct ContextHookResult {
 #[derive(Clone)]
 pub struct PostToolUseRequest {
     pub session_id: String,
+    /// MCP server that provides the tool, if any.
+    pub mcp_server: Option<String>,
     pub mcp_tool_state: Option<Arc<crate::agent::core::McpToolState>>,
     pub turn_id: String,
     pub cwd: Option<PathBuf>,
@@ -414,11 +421,17 @@ impl Hooks {
     }
 
     pub fn disabled() -> Self {
-        Self::default()
+        Self {
+            config: HooksConfig {
+                enabled: false,
+                ..HooksConfig::default()
+            },
+            ..Self::default()
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.config.enabled
+        self.config.is_active()
     }
 
     pub fn take_session_context(&self, session_id: &str) -> Vec<HookContextContribution> {
@@ -641,8 +654,11 @@ impl Hooks {
             return Ok(PreToolUseResult::default());
         }
 
-        let handlers =
-            self.matching_handlers(HookEventConfig::PreToolUse, Some(&request.tool_name));
+        let handlers = self.tool_handlers(
+            HookEventConfig::PreToolUse,
+            &request.tool_name,
+            request.mcp_server.as_deref(),
+        );
         let mut current_input = request.tool_input.clone();
         let mut result = PreToolUseResult::default();
         for handler in handlers {
@@ -654,6 +670,7 @@ impl Hooks {
                 hook_event_name: HookEventConfig::PreToolUse.label().to_string(),
                 model: request.model.clone(),
                 permission_mode: request.permission_mode.clone(),
+                mcp_server: request.mcp_server.clone(),
                 tool_name: request.tool_name.clone(),
                 tool_input: current_input.clone(),
                 tool_use_id: request.tool_use_id.clone(),
@@ -711,7 +728,9 @@ impl Hooks {
                             }
                         }
                         Some(ParsedPermissionDecision::Ask) => {
-                            result.permission_decision = Some(PreToolPermissionDecision::Ask);
+                            result.permission_decision = Some(PreToolPermissionDecision::Ask {
+                                reason: parsed.reason.clone(),
+                            });
                             if parsed.updated_input.is_some() {
                                 result.notices.push(control_notice(
                                     HookEventConfig::PreToolUse,
@@ -776,7 +795,7 @@ impl Hooks {
 
         let mut result = PermissionRequestResult::default();
         for handler in
-            self.matching_handlers(HookEventConfig::PermissionRequest, Some(&request.tool_name))
+            self.matching_handlers(HookEventConfig::PermissionRequest, &[&request.tool_name])
         {
             let outcome = self
                 .invoke_handler(
@@ -828,7 +847,7 @@ impl Hooks {
 
         let mut messages = request.messages.clone();
         let mut notices = Vec::new();
-        for handler in self.matching_handlers(HookEventConfig::Context, None) {
+        for handler in self.matching_handlers(HookEventConfig::Context, &[]) {
             let input = ContextCommandInput {
                 session_id: request.session_id.clone(),
                 turn_id: request.turn_id.clone(),
@@ -931,8 +950,11 @@ impl Hooks {
             return Ok(PostToolUseResult::default());
         }
 
-        let handlers =
-            self.matching_handlers(HookEventConfig::PostToolUse, Some(&request.tool_name));
+        let handlers = self.tool_handlers(
+            HookEventConfig::PostToolUse,
+            &request.tool_name,
+            request.mcp_server.as_deref(),
+        );
         let mut current_content = request.content.clone();
         let mut current_is_error = request.is_error;
         let mut result = PostToolUseResult::default();
@@ -945,6 +967,7 @@ impl Hooks {
                 hook_event_name: HookEventConfig::PostToolUse.label().to_string(),
                 model: request.model.clone(),
                 permission_mode: request.permission_mode.clone(),
+                mcp_server: request.mcp_server.clone(),
                 tool_name: request.tool_name.clone(),
                 tool_input: request.tool_input.clone(),
                 tool_response: Value::String(flatten_content(&current_content)),
@@ -959,7 +982,9 @@ impl Hooks {
                 },
                 tool_use_id: request.tool_use_id.clone(),
             };
-            let outcome = self
+            // The tool already ran, so a failing hook must not turn its result
+            // into an error: the model would retry a call that took effect.
+            let outcome = match self
                 .invoke_handler(
                     HookEventConfig::PostToolUse,
                     &handler,
@@ -967,7 +992,23 @@ impl Hooks {
                     request.cwd.as_deref(),
                     request.mcp_tool_state.as_ref(),
                 )
-                .await?;
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let message = format!(
+                        "post_tool_use hook '{}' failed, tool result kept: {err}",
+                        handler.id
+                    );
+                    warn!("{message}");
+                    result.notices.push(HookNotice {
+                        event_name: HookEventConfig::PostToolUse.label().to_string(),
+                        message,
+                        is_error: true,
+                    });
+                    continue;
+                }
+            };
             result.notices.extend(outcome.notices);
             if let Some(reason) = outcome.hard_block_reason {
                 current_content = vec![querymt::chat::ToolResultPart::Text {
@@ -1133,7 +1174,7 @@ impl Hooks {
         };
 
         let mut result = PreCompactionResult::default();
-        for handler in self.matching_handlers(HookEventConfig::PreCompaction, None) {
+        for handler in self.matching_handlers(HookEventConfig::PreCompaction, &[]) {
             let mut handler_input = input.clone();
             handler_input.candidate_summary =
                 NullableString::from_string(result.custom_summary.clone());
@@ -1478,14 +1519,29 @@ impl Hooks {
         Ok(result)
     }
 
+    /// Handlers for a tool event; a matcher may name the tool (`place_order`)
+    /// or qualify it with its MCP server (`ibkr.place_order`).
+    fn tool_handlers(
+        &self,
+        event: HookEventConfig,
+        tool: &str,
+        server: Option<&str>,
+    ) -> Vec<ResolvedHookHandler> {
+        match server {
+            Some(server) => self.matching_handlers(event, &[tool, &format!("{server}.{tool}")]),
+            None => self.matching_handlers(event, &[tool]),
+        }
+    }
+
+    /// Handlers whose matcher is empty or matches any of `values`.
     fn matching_handlers(
         &self,
         event: HookEventConfig,
-        matcher: Option<&str>,
+        values: &[&str],
     ) -> Vec<ResolvedHookHandler> {
         let mut handlers = Vec::new();
         for (group_idx, group) in self.config.groups_for(event).iter().enumerate() {
-            if !matches_group(group.matcher.as_deref(), matcher) {
+            if !matches_group(group.matcher.as_deref(), values) {
                 continue;
             }
             for (handler_idx, hook) in group.hooks.iter().enumerate() {
@@ -1535,7 +1591,7 @@ impl Hooks {
             match &handler.kind {
                 ResolvedHookKind::Command(command) => {
                     run_command_hook(
-                        &spec_from_command(command),
+                        &spec_from_command(command, self.config.base_dir.as_deref()),
                         cwd.unwrap_or_else(|| Path::new(".")),
                         &stdin_json,
                     )
@@ -1600,7 +1656,7 @@ impl Hooks {
         cwd: Option<&Path>,
     ) -> anyhow::Result<Vec<HookInvocationOutcome>> {
         let mut outcomes = Vec::new();
-        for handler in self.matching_handlers(event, matcher) {
+        for handler in self.matching_handlers(event, matcher.as_slice()) {
             outcomes.push(
                 self.invoke_handler(event, &handler, &input, cwd, None)
                     .await?,
@@ -1695,24 +1751,25 @@ fn resolve_mcp_input_template(template: &Value, event: &Value) -> anyhow::Result
     }
 }
 
-fn spec_from_command(command: &HookCommandConfig) -> CommandHookSpec {
+fn spec_from_command(command: &HookCommandConfig, base_dir: Option<&Path>) -> CommandHookSpec {
+    let mut env = command.env.clone();
+    if let Some(dir) = base_dir {
+        env.entry("QMT_PROFILE_DIR".to_string())
+            .or_insert_with(|| dir.display().to_string());
+    }
     CommandHookSpec {
         command: command.command.clone(),
         timeout: Duration::from_secs(command.timeout_sec.unwrap_or(30)),
-        env: command.env.clone(),
+        env,
     }
 }
 
-fn matches_group(matcher: Option<&str>, value: Option<&str>) -> bool {
+fn matches_group(matcher: Option<&str>, values: &[&str]) -> bool {
     let Some(matcher) = matcher.filter(|matcher| !matcher.trim().is_empty()) else {
         return true;
     };
-    let Some(value) = value else {
-        return false;
-    };
-    regex::Regex::new(matcher)
-        .map(|regex| regex.is_match(value))
-        .unwrap_or(false)
+    // Patterns are validated when the config loads; an invalid one never matches.
+    regex::Regex::new(matcher).is_ok_and(|regex| values.iter().any(|value| regex.is_match(value)))
 }
 
 fn cwd_string(cwd: Option<&Path>) -> String {

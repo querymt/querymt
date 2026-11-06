@@ -17,6 +17,7 @@ mod hooks;
 mod loader;
 mod mcp;
 mod mesh;
+mod permissions;
 mod prompt;
 mod quorum;
 mod schema;
@@ -30,6 +31,7 @@ pub use hooks::*;
 pub use loader::{ConfigSource, interpolate_env_vars, load_config};
 pub use mcp::*;
 pub use mesh::*;
+pub use permissions::*;
 pub use prompt::SystemPart;
 pub(crate) use prompt::{deserialize_system_parts, resolve_system_parts};
 pub use quorum::*;
@@ -46,10 +48,6 @@ pub enum Config {
 }
 
 fn default_true() -> bool {
-    true
-}
-
-pub(crate) fn default_assume_mutating() -> bool {
     true
 }
 

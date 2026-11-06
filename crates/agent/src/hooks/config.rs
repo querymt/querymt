@@ -1,10 +1,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(default)]
 pub struct HooksConfig {
+    /// Hooks run whenever any are configured; set `false` to switch them off.
     pub enabled: bool,
     pub bypass_trust: bool,
     pub session_start: Vec<MatcherGroupConfig>,
@@ -24,6 +26,36 @@ pub struct HooksConfig {
     #[schemars(skip)]
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+    /// Folder of the config file the hooks were loaded from. Hook commands see
+    /// it as `QMT_PROFILE_DIR`, since they run in the session's directory.
+    #[schemars(skip)]
+    #[serde(skip)]
+    pub base_dir: Option<PathBuf>,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bypass_trust: false,
+            session_start: Vec::new(),
+            user_prompt_submit: Vec::new(),
+            pre_tool_use: Vec::new(),
+            permission_request: Vec::new(),
+            post_tool_use: Vec::new(),
+            context: Vec::new(),
+            stop: Vec::new(),
+            pre_compaction: Vec::new(),
+            post_compaction: Vec::new(),
+            pre_delegation: Vec::new(),
+            delegation_start: Vec::new(),
+            post_delegation: Vec::new(),
+            delegation_failure: Vec::new(),
+            session_end: Vec::new(),
+            extra: BTreeMap::new(),
+            base_dir: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -102,6 +134,23 @@ impl HookEventConfig {
     }
 }
 
+const ALL_EVENTS: [HookEventConfig; 14] = [
+    HookEventConfig::SessionStart,
+    HookEventConfig::UserPromptSubmit,
+    HookEventConfig::PreToolUse,
+    HookEventConfig::PermissionRequest,
+    HookEventConfig::PostToolUse,
+    HookEventConfig::Context,
+    HookEventConfig::Stop,
+    HookEventConfig::PreCompaction,
+    HookEventConfig::PostCompaction,
+    HookEventConfig::PreDelegation,
+    HookEventConfig::DelegationStart,
+    HookEventConfig::PostDelegation,
+    HookEventConfig::DelegationFailure,
+    HookEventConfig::SessionEnd,
+];
+
 fn validate_handler_fields(
     event: HookEventConfig,
     id: Option<&str>,
@@ -120,6 +169,11 @@ fn validate_handler_fields(
 }
 
 impl HooksConfig {
+    /// Hooks are on and at least one handler is configured.
+    pub fn is_active(&self) -> bool {
+        self.enabled && ALL_EVENTS.iter().any(|e| !self.groups_for(*e).is_empty())
+    }
+
     pub fn groups_for(&self, event: HookEventConfig) -> &[MatcherGroupConfig] {
         match event {
             HookEventConfig::SessionStart => &self.session_start,
@@ -146,23 +200,21 @@ impl HooksConfig {
             anyhow::bail!("unsupported hook event(s): {}", keys.join(", "));
         }
 
-        for event in [
-            HookEventConfig::SessionStart,
-            HookEventConfig::UserPromptSubmit,
-            HookEventConfig::PreToolUse,
-            HookEventConfig::PermissionRequest,
-            HookEventConfig::PostToolUse,
-            HookEventConfig::Context,
-            HookEventConfig::Stop,
-            HookEventConfig::PreCompaction,
-            HookEventConfig::PostCompaction,
-            HookEventConfig::PreDelegation,
-            HookEventConfig::DelegationStart,
-            HookEventConfig::PostDelegation,
-            HookEventConfig::DelegationFailure,
-            HookEventConfig::SessionEnd,
-        ] {
+        for event in ALL_EVENTS {
             for (group_idx, group) in self.groups_for(event).iter().enumerate() {
+                // An invalid pattern would otherwise never match, silently
+                // disabling the hook.
+                if let Some(pattern) = group.matcher.as_deref().filter(|m| !m.trim().is_empty())
+                    && let Err(err) = regex::Regex::new(pattern)
+                {
+                    anyhow::bail!(
+                        "{} matcher group {} has an invalid matcher regex `{}`: {}",
+                        event.label(),
+                        group_idx,
+                        pattern,
+                        err
+                    );
+                }
                 if group.hooks.is_empty() {
                     anyhow::bail!(
                         "{} matcher group {} must contain at least one hook",

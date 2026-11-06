@@ -196,6 +196,20 @@ impl McpToolAdapter {
     pub fn server_name(&self) -> &str {
         &self.server_name
     }
+
+    /// Whether the server declares this tool read-only (`readOnlyHint: true`).
+    /// A missing or false hint counts as mutating.
+    pub fn is_read_only(&self) -> bool {
+        declares_read_only(&self.mcp_tool)
+    }
+}
+
+/// `annotations.readOnlyHint == Some(true)`.
+fn declares_read_only(tool: &RmcpTool) -> bool {
+    tool.annotations
+        .as_ref()
+        .and_then(|a| a.read_only_hint)
+        .unwrap_or(false)
 }
 
 /// Convert an MCP `ContentBlock` value into a canonical bounded tool-result part.
@@ -584,6 +598,30 @@ impl Drop for TaskCancelGuard {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn tool_with(annotations: Option<Value>) -> RmcpTool {
+        let mut v = json!({"name": "t", "inputSchema": {"type": "object"}});
+        if let Some(a) = annotations {
+            v["annotations"] = a;
+        }
+        serde_json::from_value(v).expect("valid tool")
+    }
+
+    #[test]
+    fn read_only_hint_true_is_read_only() {
+        assert!(declares_read_only(&tool_with(Some(
+            json!({"readOnlyHint": true})
+        ))));
+    }
+
+    #[test]
+    fn read_only_hint_false_or_absent_is_mutating() {
+        assert!(!declares_read_only(&tool_with(Some(
+            json!({"readOnlyHint": false})
+        ))));
+        assert!(!declares_read_only(&tool_with(Some(json!({"title": "x"})))));
+        assert!(!declares_read_only(&tool_with(None)));
+    }
 
     fn result(v: Value) -> CallToolResult {
         serde_json::from_value(v).expect("valid CallToolResult")

@@ -87,6 +87,10 @@ impl LocalAgentHandle {
             std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
             std::sync::Arc::new(Mutex::new(None)),
         );
+        let default_mode = *config
+            .default_mode
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         Self {
             config,
             registry,
@@ -94,7 +98,7 @@ impl LocalAgentHandle {
             client_state: Arc::new(StdMutex::new(None)),
             bridge: Arc::new(StdMutex::new(None)),
             ext_notifications,
-            default_mode: StdMutex::new(crate::agent::core::AgentMode::Build),
+            default_mode: StdMutex::new(default_mode),
             default_reasoning_effort: ArcSwap::from_pointee(None),
             #[cfg(feature = "remote")]
             mesh: StdMutex::new(None),

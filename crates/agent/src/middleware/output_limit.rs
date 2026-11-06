@@ -432,12 +432,12 @@ impl MiddlewareFactory for OutputLimitRecoveryFactory {
         &self,
         config: &serde_json::Value,
         _agent_config: &AgentConfig,
-    ) -> anyhow::Result<Arc<dyn MiddlewareDriver>> {
+    ) -> anyhow::Result<Option<Arc<dyn MiddlewareDriver>>> {
         let cfg: OutputLimitConfig = serde_json::from_value(config.clone())?;
         if !cfg.enabled {
-            return Err(anyhow::anyhow!("Middleware disabled"));
+            return Ok(None);
         }
-        Ok(Arc::new(OutputLimitRecoveryMiddleware::new(cfg)))
+        Ok(Some(Arc::new(OutputLimitRecoveryMiddleware::new(cfg))))
     }
 }
 

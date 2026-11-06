@@ -13,15 +13,17 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-type DelegateFactory =
-    Box<dyn FnOnce(Arc<dyn StorageBackend>, Arc<EventFanout>) -> Arc<dyn AgentHandle> + Send>;
+type DelegateFactory = Box<
+    dyn FnOnce(Arc<dyn StorageBackend>, Arc<EventFanout>) -> anyhow::Result<Arc<dyn AgentHandle>>
+        + Send,
+>;
 
 type PlannerFactory = Box<
     dyn FnOnce(
             Arc<dyn StorageBackend>,
             Arc<dyn AgentRegistry + Send + Sync>,
             Arc<EventFanout>,
-        ) -> Arc<dyn AgentHandle>
+        ) -> anyhow::Result<Arc<dyn AgentHandle>>
         + Send,
 >;
 
@@ -35,6 +37,12 @@ pub enum AgentQuorumError {
     MissingCapability(CapabilityRequirement),
     #[error("{agent_id} agent did not use the quorum event fanout")]
     EventFanoutMismatch { agent_id: String },
+    #[error("failed to build agent '{agent_id}': {source:#}")]
+    Agent {
+        agent_id: String,
+        #[source]
+        source: anyhow::Error,
+    },
 }
 
 pub struct DelegateAgent {
@@ -241,7 +249,10 @@ impl AgentQuorumBuilder {
 
     pub fn add_delegate_agent<F>(mut self, info: AgentInfo, factory: F) -> Self
     where
-        F: FnOnce(Arc<dyn StorageBackend>, Arc<EventFanout>) -> Arc<dyn AgentHandle>
+        F: FnOnce(
+                Arc<dyn StorageBackend>,
+                Arc<EventFanout>,
+            ) -> anyhow::Result<Arc<dyn AgentHandle>>
             + Send
             + 'static,
     {
@@ -255,7 +266,7 @@ impl AgentQuorumBuilder {
                 Arc<dyn StorageBackend>,
                 Arc<dyn AgentRegistry + Send + Sync>,
                 Arc<EventFanout>,
-            ) -> Arc<dyn AgentHandle>
+            ) -> anyhow::Result<Arc<dyn AgentHandle>>
             + Send
             + 'static,
     {
@@ -349,7 +360,13 @@ impl AgentQuorumBuilder {
         }
 
         for (info, factory) in self.delegate_factories {
-            let agent = factory(self.storage.clone(), self.event_fanout.clone());
+            let agent =
+                factory(self.storage.clone(), self.event_fanout.clone()).map_err(|source| {
+                    AgentQuorumError::Agent {
+                        agent_id: info.id.clone(),
+                        source,
+                    }
+                })?;
             if !Arc::ptr_eq(agent.event_fanout(), &self.event_fanout) {
                 return Err(AgentQuorumError::EventFanoutMismatch {
                     agent_id: info.id.clone(),
@@ -369,7 +386,11 @@ impl AgentQuorumBuilder {
             self.storage.clone(),
             registry.clone(),
             self.event_fanout.clone(),
-        );
+        )
+        .map_err(|source| AgentQuorumError::Agent {
+            agent_id: "planner".to_string(),
+            source,
+        })?;
         if !Arc::ptr_eq(planner.event_fanout(), &self.event_fanout) {
             return Err(AgentQuorumError::EventFanoutMismatch {
                 agent_id: "planner".to_string(),
@@ -560,12 +581,12 @@ mod tests {
                 tools.add(Arc::new(ShellTool::new()));
                 let config = AgentConfigBuilder::new(Arc::new(registry), storage, LLMParams::new().provider("mock").model(format!("model-{target}")))
                     .with_agent_id(target).with_event_fanout(fanout).with_tool_registry(tools).build();
-                Arc::new(LocalAgentHandle::from_config(Arc::new(config)))
+                Ok(Arc::new(LocalAgentHandle::from_config(Arc::new(config))) as Arc<dyn AgentHandle>)
             });
         }
         let (registry, _registry_dir) = empty_plugin_registry().unwrap();
         builder = builder.with_planner(move |storage, registry_agents, fanout| {
-            Arc::new(LocalAgentHandle::from_config(Arc::new(
+            Ok(Arc::new(LocalAgentHandle::from_config(Arc::new(
                 AgentConfigBuilder::new(
                     Arc::new(registry),
                     storage,
@@ -574,7 +595,7 @@ mod tests {
                 .with_agent_registry(registry_agents)
                 .with_event_fanout(fanout)
                 .build(),
-            )))
+            ))) as Arc<dyn AgentHandle>)
         });
         // Do not construct an orchestrator here: exercise the production builder's wiring.
         let quorum = builder.build().unwrap();
@@ -780,7 +801,7 @@ mod tests {
         let quorum = AgentQuorumBuilder::from_backend(storage)
             .with_event_fanout(planner.event_fanout().clone())
             .with_delegation(true)
-            .with_planner(move |_, _, _| planner)
+            .with_planner(move |_, _, _| Ok(planner))
             .build()
             .unwrap();
         assert!(quorum.orchestrator().is_some());
@@ -818,7 +839,7 @@ mod tests {
                     .with_event_fanout(event_fanout)
                     .build(),
                 );
-                Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>
+                Ok(Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>)
             },
         );
 
@@ -834,7 +855,7 @@ mod tests {
                 .with_event_fanout(event_fanout)
                 .build(),
             );
-            Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>
+            Ok(Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>)
         });
 
         let expected_fanout = builder.event_fanout.clone();
@@ -869,7 +890,7 @@ mod tests {
                 .with_event_fanout(Arc::new(EventFanout::new()))
                 .build(),
             );
-            Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>
+            Ok(Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>)
         });
 
         assert!(matches!(
@@ -897,7 +918,7 @@ mod tests {
                 .with_event_fanout(event_fanout)
                 .build(),
             );
-            Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>
+            Ok(Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>)
         });
 
         let quorum = builder.build().unwrap();

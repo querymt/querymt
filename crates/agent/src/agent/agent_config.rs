@@ -4,7 +4,7 @@
 //! It holds all shared/immutable state that session actors need. It is NOT
 //! an actor — it has no lifecycle or message processing needs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use arc_swap::ArcSwap;
@@ -17,7 +17,7 @@ use crate::agent::core::{
     AgentMode, DelegationContextConfig, SnapshotPolicy, ToolConfig, ToolPolicy,
 };
 use crate::agent::session_mcp::SessionMcpAttachmentSource;
-use crate::config::{DelegationWaitPolicy, McpServerConfig, RuntimeExecutionPolicy};
+use crate::config::{DelegationWaitPolicy, McpServerConfig, RuntimeExecutionPolicy, ToolRef};
 use crate::delegation::AgentRegistry;
 use crate::event_sink::EventSink;
 use crate::events::{AgentEventKind, DurableEvent};
@@ -91,8 +91,8 @@ pub struct AgentConfig {
     // ── Execution config ─────────────────────────────────────────
     pub max_steps: Option<usize>,
     pub snapshot_policy: SnapshotPolicy,
-    pub assume_mutating: bool,
-    pub mutating_tools: HashSet<String>,
+    /// Tool approval policy (`ask` / `always_ask` lists and prompt timeout).
+    pub permissions: crate::config::Permissions,
     pub max_prompt_bytes: Option<usize>,
     pub execution_timeout_secs: u64,
     pub delegation_wait_policy: DelegationWaitPolicy,
@@ -211,17 +211,6 @@ impl AgentConfig {
         Some(meta)
     }
 
-    /// Checks if a tool requires permission for execution.
-    pub fn requires_permission_for_tool(&self, tool_name: &str) -> bool {
-        self.mutating_tools.contains(tool_name)
-            || matches!(
-                crate::agent::utils::tool_kind_for_tool(tool_name),
-                crate::acp::protocol::ToolKind::Edit
-                    | crate::acp::protocol::ToolKind::Delete
-                    | crate::acp::protocol::ToolKind::Execute
-            )
-    }
-
     /// Emits an event through the session's ordered stream (auto-classifies as
     /// durable/ephemeral).
     ///
@@ -303,12 +292,6 @@ impl AgentConfig {
         self.workspace_service.clone()
     }
 
-    /// Determines if a tool should trigger snapshotting.
-    #[allow(dead_code)]
-    pub fn should_snapshot_tool(&self, tool_name: &str) -> bool {
-        self.mutating_tools.contains(tool_name) || self.assume_mutating
-    }
-
     /// Prepares a snapshot configuration if enabled.
     #[allow(dead_code)]
     pub fn prepare_snapshot(
@@ -323,8 +306,8 @@ impl AgentConfig {
     }
 
     /// Checks if a tool is allowed by current configuration.
-    pub fn is_tool_allowed(&self, name: &str) -> bool {
-        crate::agent::tools::is_tool_allowed_with(&self.tool_config, name)
+    pub fn is_tool_allowed(&self, tool: crate::config::ToolRef<'_>) -> bool {
+        self.tool_config.allows(tool)
     }
 
     /// Gets a snapshot of the current tool configuration.
@@ -421,25 +404,21 @@ impl AgentConfig {
             .map(|s| s.tool_defs.clone())
             .unwrap_or_default();
 
-        // Filter built-in / provider tools with the basic allowlist check.
+        // Built-in / provider tools are matched by bare name.
         let mut filtered: Vec<querymt::chat::Tool> = tools
             .into_iter()
-            .filter(|tool| crate::agent::tools::is_tool_allowed_with(config, &tool.function.name))
+            .filter(|tool| config.allows(ToolRef::builtin(&tool.function.name)))
             .collect();
 
-        // Filter MCP tools with the server-name-aware check so that
-        // "servername.*" wildcard entries in the allowlist are honoured.
+        // MCP tools are matched with their serving server.
         if let Some(ref snap) = mcp_snapshot {
             for tool_def in mcp_tool_defs {
-                let server_name = snap
-                    .tools
-                    .get(&tool_def.function.name)
-                    .map(|a| a.server_name());
-                if crate::agent::tools::is_mcp_tool_allowed_with(
-                    config,
-                    &tool_def.function.name,
-                    server_name,
-                ) {
+                let name = &tool_def.function.name;
+                let tool = match snap.tools.get(name) {
+                    Some(adapter) => ToolRef::mcp(adapter.server_name(), name),
+                    None => ToolRef::builtin(name),
+                };
+                if config.allows(tool) {
                     filtered.push(tool_def);
                 }
             }
@@ -488,9 +467,9 @@ mod tests {
     #[tokio::test]
     async fn is_tool_allowed_defaults_all_allowed() {
         let (config, _td) = make_config().await;
-        assert!(config.is_tool_allowed("shell"));
-        assert!(config.is_tool_allowed("read_tool"));
-        assert!(config.is_tool_allowed("unknown_tool"));
+        assert!(config.is_tool_allowed(ToolRef::builtin("shell")));
+        assert!(config.is_tool_allowed(ToolRef::builtin("read_tool")));
+        assert!(config.is_tool_allowed(ToolRef::builtin("unknown_tool")));
     }
 
     #[tokio::test]
@@ -500,11 +479,11 @@ mod tests {
         let llm = LLMParams::new().provider("mock").model("mock");
         let config = Arc::new(
             AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm)
-                .with_denied_tools(["shell".to_string()])
+                .with_denied_tools(["shell".parse().unwrap()])
                 .build(),
         );
-        assert!(!config.is_tool_allowed("shell"));
-        assert!(config.is_tool_allowed("read_tool"));
+        assert!(!config.is_tool_allowed(ToolRef::builtin("shell")));
+        assert!(config.is_tool_allowed(ToolRef::builtin("read_tool")));
     }
 
     #[tokio::test]
@@ -514,12 +493,12 @@ mod tests {
         let llm = LLMParams::new().provider("mock").model("mock");
         let config = Arc::new(
             AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm)
-                .with_allowed_tools(["read_tool", "shell"])
+                .with_allowed_tools(["read_tool".parse().unwrap(), "shell".parse().unwrap()])
                 .build(),
         );
-        assert!(config.is_tool_allowed("read_tool"));
-        assert!(config.is_tool_allowed("shell"));
-        assert!(!config.is_tool_allowed("delete_file"));
+        assert!(config.is_tool_allowed(ToolRef::builtin("read_tool")));
+        assert!(config.is_tool_allowed(ToolRef::builtin("shell")));
+        assert!(!config.is_tool_allowed(ToolRef::builtin("delete_file")));
     }
 
     #[tokio::test]
@@ -557,29 +536,6 @@ mod tests {
         let (config, _td) = make_config().await;
         let meta = config.build_delegation_meta();
         assert!(meta.is_none());
-    }
-
-    #[tokio::test]
-    async fn requires_permission_for_tool_edit_tools() {
-        let (config, _td) = make_config().await;
-        // write_file and edit → ToolKind::Edit, delete_file → Delete, shell → Execute
-        assert!(config.requires_permission_for_tool("write_file"));
-        assert!(config.requires_permission_for_tool("edit"));
-        assert!(config.requires_permission_for_tool("multiedit"));
-        // Integration rewrites tracked files and advances the branch.
-        assert!(config.requires_permission_for_tool("accept_delegation_result"));
-        assert!(config.requires_permission_for_tool("delete_file"));
-        assert!(config.requires_permission_for_tool("shell"));
-        // read-only tools do NOT require permission
-        assert!(!config.requires_permission_for_tool("search_text"));
-    }
-
-    #[tokio::test]
-    async fn should_snapshot_tool_defaults_mutating_all() {
-        let (config, _td) = make_config().await;
-        // Default assume_mutating=true means all tools trigger snapshot
-        assert!(config.should_snapshot_tool("read_tool"));
-        assert!(config.should_snapshot_tool("shell"));
     }
 
     #[tokio::test]

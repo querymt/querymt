@@ -341,8 +341,6 @@ tags = ["coding", "development"]
 [agent]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-assume_mutating = false
-mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
 tools = [
     "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
     "glob", "search_text", "ls", "index", "get_symbol", "get_function",
@@ -385,7 +383,6 @@ tags = ["review", "read-only"]
 [agent]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-assume_mutating = false
 tools = [
     "read_tool", "glob", "search_text", "ls", "index",
     "get_symbol", "get_function", "find_symbol_references",

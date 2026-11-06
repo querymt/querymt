@@ -120,6 +120,8 @@ pub(crate) struct McpConnectContext {
     oauth_servers: Vec<ConfiguredOAuthServer>,
     /// Where OAuth credentials are read from (the system keyring by default).
     secret_backend: std::sync::Arc<dyn crate::mcp_auth::SecretBackend>,
+    /// Approval lists, checked against discovered tools to flag typos.
+    permissions: crate::config::Permissions,
 }
 
 impl Default for McpConnectContext {
@@ -127,6 +129,7 @@ impl Default for McpConnectContext {
         Self {
             oauth_servers: Vec::new(),
             secret_backend: std::sync::Arc::new(crate::mcp_auth::KeyringBackend),
+            permissions: crate::config::Permissions::default(),
         }
     }
 }
@@ -140,6 +143,17 @@ impl std::fmt::Debug for McpConnectContext {
 }
 
 impl McpConnectContext {
+    /// Approval lists to check against discovered tools.
+    #[must_use]
+    pub(crate) fn with_permissions(mut self, permissions: crate::config::Permissions) -> Self {
+        self.permissions = permissions;
+        self
+    }
+
+    pub(crate) fn permissions(&self) -> &crate::config::Permissions {
+        &self.permissions
+    }
+
     /// Use a different credential backend (tests).
     #[cfg(test)]
     pub(crate) fn with_secret_backend(
@@ -290,6 +304,27 @@ pub(crate) fn report_auth_required(
 /// Returns the standard `Implementation` descriptor for the querymt-agent.
 pub fn agent_implementation() -> rmcp::model::Implementation {
     rmcp::model::Implementation::new("querymt-agent", env!("QMT_BUILD_VERSION"))
+}
+
+/// Warn about approval entries (`ask` / `always_ask`) that name a tool the
+/// connected server does not expose. `only_server` limits the report to one
+/// server, for a refresh of that server's tool list.
+pub(crate) fn warn_unmatched_permissions(
+    permissions: &crate::config::Permissions,
+    snapshot: &crate::agent::core::McpToolSnapshot,
+    only_server: Option<&str>,
+) {
+    for spec in permissions.unmatched(snapshot) {
+        let server = spec.server().unwrap_or_default();
+        if only_server.is_some_and(|only| only != server) {
+            continue;
+        }
+        tracing::warn!(
+            server,
+            selector = %spec,
+            "approval entry matches no tool discovered on the server"
+        );
+    }
 }
 
 #[cfg(test)]

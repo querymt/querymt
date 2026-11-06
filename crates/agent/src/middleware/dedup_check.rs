@@ -858,7 +858,7 @@ impl MiddlewareFactory for DedupCheckFactory {
         &self,
         config: &Value,
         agent_config: &crate::agent::agent_config::AgentConfig,
-    ) -> AnyhowResult<Arc<dyn MiddlewareDriver>> {
+    ) -> AnyhowResult<Option<Arc<dyn MiddlewareDriver>>> {
         // Check if explicitly disabled
         let enabled = config
             .get("enabled")
@@ -866,7 +866,7 @@ impl MiddlewareFactory for DedupCheckFactory {
             .unwrap_or(true);
 
         if !enabled {
-            return Err(anyhow::anyhow!("Middleware disabled"));
+            return Ok(None);
         }
 
         let mut mw = DedupCheckMiddleware::new().with_event_sink(agent_config.event_sink.clone());
@@ -878,7 +878,7 @@ impl MiddlewareFactory for DedupCheckFactory {
             mw = mw.min_lines(v as usize);
         }
 
-        Ok(Arc::new(mw))
+        Ok(Some(Arc::new(mw)))
     }
 }
 

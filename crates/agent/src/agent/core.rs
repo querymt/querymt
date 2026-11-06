@@ -10,11 +10,14 @@ use tokio::sync::OnceCell;
 
 /// Runtime operating mode for the agent.
 /// Modes control what the agent is allowed to do and what system reminders are injected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum AgentMode {
     /// Full read/write mode - all tools available, no restrictions
+    #[default]
     Build = 0,
     /// Planning mode - read-only, agent observes and plans without making changes
     Plan = 1,
@@ -210,7 +213,9 @@ pub struct SessionRuntime {
     /// Live MCP tool state — refreshed in-place when a server sends
     /// `tools/list_changed`.
     pub mcp_tool_state: Arc<McpToolState>,
-    pub permission_cache: ParkingMutex<HashMap<String, bool>>,
+    /// Tools the user allowed for the rest of this session (`allow_session`).
+    /// Never held across `.await`.
+    pub session_grants: ParkingMutex<crate::config::ToolSet>,
     pub tool_validator_cache: ParkingMutex<HashMap<String, Arc<jsonschema::Validator>>>,
     /// Workspace handle for duplicate code detection (built asynchronously on session start)
     pub workspace_handle: Arc<OnceCell<crate::index::WorkspaceHandle>>,
@@ -277,7 +282,7 @@ impl SessionRuntime {
             cwd,
             _mcp_services: mcp_services,
             mcp_tool_state,
-            permission_cache: ParkingMutex::new(HashMap::new()),
+            session_grants: ParkingMutex::new(crate::config::ToolSet::new()),
             tool_validator_cache: ParkingMutex::new(HashMap::new()),
             workspace_handle: Arc::new(OnceCell::new()),
             turn_snapshot: ParkingMutex::new(None),
@@ -307,8 +312,21 @@ pub enum ToolPolicy {
 #[derive(Clone, Default)]
 pub struct ToolConfig {
     pub policy: ToolPolicy,
-    pub allowlist: Option<HashSet<String>>,
-    pub denylist: HashSet<String>,
+    /// When set, only tools matched by this set are available.
+    pub allow: Option<crate::config::ToolSet>,
+    /// Tools matched by this set are never available.
+    pub deny: crate::config::ToolSet,
+}
+
+impl ToolConfig {
+    /// Whether `tool` may be offered to the model and executed.
+    ///
+    /// One matching rule for both lists: a bare selector matches only non-MCP
+    /// tools, `server.tool` that tool of that server, `server.*` every tool of
+    /// the server. Deny wins over allow.
+    pub fn allows(&self, tool: crate::config::ToolRef<'_>) -> bool {
+        !self.deny.contains(tool) && self.allow.as_ref().is_none_or(|allow| allow.contains(tool))
+    }
 }
 
 /// Policy for filesystem snapshotting.

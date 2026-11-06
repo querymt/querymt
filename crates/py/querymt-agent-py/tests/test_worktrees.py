@@ -253,3 +253,16 @@ def test_invalid_arguments_raise_clear_errors(repo, tmp_path):
         assert bad.value.code == "invalid_options"
 
     run(scenario())
+
+
+@pytest.mark.parametrize(
+    "kwargs, needle",
+    [
+        ({"mode": "plna"}, "mode"),
+        ({"ask": ["a.*.b"]}, "selector"),
+        ({"approval_timeout_sec": 0}, "positive"),
+    ],
+)
+def test_invalid_approval_arguments_raise_value_error(kwargs, needle):
+    with pytest.raises(ValueError, match=needle):
+        run(Agent.single("mock", "m", **kwargs))

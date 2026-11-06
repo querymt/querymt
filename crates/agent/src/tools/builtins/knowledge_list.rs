@@ -25,6 +25,10 @@ impl ToolTrait for KnowledgeListTool {
         "knowledge_list_unconsolidated"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> Tool {
         Tool {
             tool_type: "function".to_string(),

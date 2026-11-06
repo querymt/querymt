@@ -2,7 +2,50 @@
 
 ## Unreleased
 
+### Behavior changes
+
+- **`agent_mode` / `plan_mode` `default`** is now applied: sessions start in the
+  configured mode (it was ignored and every session started in `build`). The
+  planners in `coder_agent`, `coder_delegate` and `learning_pair` now really
+  start in plan mode. An unknown mode name fails the config load.
+- **Hooks are enabled by default** when any are configured; set
+  `[agent.hooks] enabled = false` to switch them off. An invalid hook matcher
+  regex now fails the config load instead of never matching.
+- **A failing `post_tool_use` hook** no longer turns a successful tool result
+  into an error; the result is kept and a `hook_notice` is emitted.
+- Hook tool matchers also match the server-qualified MCP name
+  (`server.tool`); hook input gained `mcp_server`; hook commands get
+  `QMT_PROFILE_DIR`.
+
+### Added
+
+- **Tool approval**: `[agent.permissions]` (also `[planner]` and
+  `[[delegates]]`) with `ask`, `always_ask` and `timeout_sec`, and
+  `permission_decision: "ask"` from `pre_tool_use` hooks, show one standard
+  permission prompt before any built-in, MCP or provider tool runs. `ask`
+  offers "Allow for this session"; `always_ask` and hook asks never do.
+  Python: `ask=`, `always_ask=`, `approval_timeout_sec=`, `mode=`.
+- Example profiles `trading_analyst.toml` and `trading_desk.toml` with guard
+  hooks under `examples/hooks/trading/`.
+
 ### Breaking
+
+- **Tool permission keys removed** (unknown-field errors that name the key):
+
+  | Removed | Replacement |
+  | --- | --- |
+  | `mutating_tools`, `assume_mutating` | none; snapshots follow each tool's read-only declaration. Approval via `permissions.ask` |
+  | `confirm_tools` | `permissions.always_ask` |
+  | `confirm_timeout_sec` | `permissions.timeout_sec` |
+  | `agent_mode.default` | `mode` on `[agent]`, `[planner]`, `[[delegates]]` |
+  | Python `assume_mutating=`, `mutating_tools=` | `ask=`, `always_ask=`, `approval_timeout_sec=` |
+
+  Provider tools no longer prompt by kind; list them in `permissions.ask`.
+  A bare name in `tools` or in a deny list no longer matches MCP tools; use
+  `server.tool` or `server.*`. Permission option IDs are now `allow_once`,
+  `allow_session`, `reject`, and `SetAllowedTools` / `SetDeniedTools` carry
+  typed selectors: upgrade all mesh nodes and the desktop UI together.
+  Unattended profiles must set `permissions.timeout_sec`.
 
 - **`querymt_agent::config::McpServerConfig`** gained fields on both variants
   (`tasks`, `cache`; `auth` and `socket_path` on `Http`) and the variants are

@@ -296,7 +296,7 @@ pub struct SetToolPolicy {
 /// Set the allowed tools whitelist.
 #[derive(Serialize, Deserialize)]
 pub struct SetAllowedTools {
-    pub tools: Vec<String>,
+    pub tools: Vec<crate::config::ToolSpec>,
 }
 
 /// Clear the allowed tools whitelist.
@@ -306,7 +306,7 @@ pub struct ClearAllowedTools;
 /// Set the denied tools blacklist.
 #[derive(Serialize, Deserialize)]
 pub struct SetDeniedTools {
-    pub tools: Vec<String>,
+    pub tools: Vec<crate::config::ToolSpec>,
 }
 
 /// Clear the denied tools blacklist.
@@ -729,12 +729,18 @@ mod tests {
     #[test]
     fn set_allowed_tools_serializes() {
         let msg = SetAllowedTools {
-            tools: vec!["shell".to_string(), "read_tool".to_string()],
+            tools: vec!["shell".parse().unwrap(), "alpha.*".parse().unwrap()],
         };
         let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(json, r#"{"tools":["shell","alpha.*"]}"#);
         let rt: SetAllowedTools = serde_json::from_str(&json).unwrap();
-        assert_eq!(rt.tools.len(), 2);
-        assert!(rt.tools.contains(&"shell".to_string()));
+        assert_eq!(rt.tools, msg.tools);
+    }
+
+    #[test]
+    fn malformed_selector_fails_to_decode() {
+        assert!(serde_json::from_str::<SetAllowedTools>(r#"{"tools":["a."]}"#).is_err());
+        assert!(serde_json::from_str::<SetDeniedTools>(r#"{"tools":["a.*.b"]}"#).is_err());
     }
 
     #[test]
@@ -747,11 +753,11 @@ mod tests {
     #[test]
     fn set_denied_tools_serializes() {
         let msg = SetDeniedTools {
-            tools: vec!["dangerous_tool".to_string()],
+            tools: vec!["dangerous_tool".parse().unwrap()],
         };
         let json = serde_json::to_string(&msg).unwrap();
         let rt: SetDeniedTools = serde_json::from_str(&json).unwrap();
-        assert_eq!(rt.tools, vec!["dangerous_tool".to_string()]);
+        assert_eq!(rt.tools, msg.tools);
     }
 
     #[test]

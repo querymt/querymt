@@ -170,6 +170,7 @@ fn regenerate_committed_hook_schemas() {
 #[test]
 fn schema_examples_validate_against_generated_json_schemas() {
     let pre_tool_input = serde_json::to_value(PreToolUseCommandInput {
+        mcp_server: None,
         session_id: "s1".to_string(),
         turn_id: "t1".to_string(),
         transcript_path: crate::hooks::schema::NullableString::from_string(None),
@@ -330,6 +331,7 @@ printf '{"continue":true,"decision":"block","reason":"blocked from script"}'
     let result = Hooks::new(config)
         .expect("hooks")
         .run_pre_tool_use(PreToolUseRequest {
+            mcp_server: None,
             session_id: "s1".to_string(),
             mcp_tool_state: None,
             turn_id: "t1".to_string(),
@@ -378,6 +380,7 @@ printf 'this is not json'
     let result = Hooks::new(config)
         .expect("hooks")
         .run_post_tool_use(PostToolUseRequest {
+            mcp_server: None,
             session_id: "s1".to_string(),
             mcp_tool_state: None,
             turn_id: "t1".to_string(),
@@ -568,6 +571,7 @@ async fn exit_two_blocks_with_stderr_and_surfaces_system_message() {
     let result = Hooks::new(config)
         .unwrap()
         .run_pre_tool_use(PreToolUseRequest {
+            mcp_server: None,
             session_id: "s".into(),
             mcp_tool_state: None,
             turn_id: "t".into(),
@@ -602,6 +606,7 @@ async fn pre_tool_rewrites_chain_in_order() {
     let result = Hooks::new(config)
         .unwrap()
         .run_pre_tool_use(PreToolUseRequest {
+            mcp_server: None,
             session_id: "s".into(),
             mcp_tool_state: None,
             turn_id: "t".into(),
@@ -634,6 +639,7 @@ async fn post_tool_patches_chain_and_preserve_execution_truth() {
     let result = Hooks::new(config)
         .unwrap()
         .run_post_tool_use(PostToolUseRequest {
+            mcp_server: None,
             session_id: "s".into(),
             mcp_tool_state: None,
             turn_id: "t".into(),
@@ -753,4 +759,157 @@ where
     T: JsonSchema,
 {
     serde_json::from_slice(&schema::schema_json::<T>().expect("schema json")).expect("schema value")
+}
+
+fn post_request(tool: &str, server: Option<&str>, dir: &TempDir) -> PostToolUseRequest {
+    PostToolUseRequest {
+        mcp_server: server.map(Into::into),
+        session_id: "s1".into(),
+        mcp_tool_state: None,
+        turn_id: "t1".into(),
+        cwd: Some(dir.path().to_path_buf()),
+        model: "mock".into(),
+        permission_mode: "default".into(),
+        tool_name: tool.into(),
+        tool_input: json!({}),
+        content: vec![querymt::chat::ToolResultPart::text("filled")],
+        is_error: false,
+        execution_is_error: false,
+        tool_source: "mcp".into(),
+        tool_use_id: "tool1".into(),
+    }
+}
+
+fn pre_request(tool: &str, server: Option<&str>, dir: &TempDir) -> PreToolUseRequest {
+    PreToolUseRequest {
+        mcp_server: server.map(Into::into),
+        session_id: "s1".into(),
+        mcp_tool_state: None,
+        turn_id: "t1".into(),
+        cwd: Some(dir.path().to_path_buf()),
+        model: "mock".into(),
+        permission_mode: "default".into(),
+        tool_name: tool.into(),
+        tool_input: json!({}),
+        tool_use_id: "tool1".into(),
+    }
+}
+
+#[test]
+fn hooks_are_enabled_unless_switched_off() {
+    let on: HooksConfig = serde_json::from_value(json!({})).unwrap();
+    assert!(on.enabled);
+    let off: HooksConfig = serde_json::from_value(json!({"enabled": false})).unwrap();
+    assert!(!off.enabled);
+}
+
+#[test]
+fn invalid_matcher_regex_is_rejected_at_load() {
+    let config = HooksConfig {
+        pre_tool_use: vec![MatcherGroupConfig {
+            matcher: Some("(".into()),
+            hooks: vec![command_hook("true".into())],
+        }],
+        ..HooksConfig::default()
+    };
+    let err = Hooks::new(config).unwrap_err().to_string();
+    assert!(err.contains("invalid matcher regex"), "{err}");
+}
+
+#[tokio::test]
+async fn failing_post_tool_hook_keeps_the_tool_result() {
+    let dir = TempDir::new().unwrap();
+    let hooks = Hooks::new(HooksConfig {
+        post_tool_use: vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![command_hook("exit 1".into())],
+        }],
+        ..HooksConfig::default()
+    })
+    .unwrap();
+    let result = hooks
+        .run_post_tool_use(post_request("place_order", Some("ibkr"), &dir))
+        .await
+        .expect("a failing observer is not an error");
+    assert!(!result.should_block);
+    assert_eq!(result.is_error, Some(false));
+    assert!(result.notices.iter().any(|n| n.is_error));
+}
+
+#[tokio::test]
+async fn matcher_accepts_plain_and_server_qualified_tool_names() {
+    let dir = TempDir::new().unwrap();
+    let block = command_hook("echo blocked >&2; exit 2".into());
+    for matcher in ["^place_order$", "^ibkr\\.place_order$"] {
+        let hooks = Hooks::new(HooksConfig {
+            pre_tool_use: vec![MatcherGroupConfig {
+                matcher: Some(matcher.into()),
+                hooks: vec![block.clone()],
+            }],
+            ..HooksConfig::default()
+        })
+        .unwrap();
+        let hit = hooks
+            .run_pre_tool_use(pre_request("place_order", Some("ibkr"), &dir))
+            .await
+            .unwrap();
+        assert!(hit.should_block, "{matcher}");
+        let miss = hooks
+            .run_pre_tool_use(pre_request("place_order", Some("other"), &dir))
+            .await
+            .unwrap();
+        assert_eq!(miss.should_block, matcher == "^place_order$", "{matcher}");
+    }
+}
+
+#[tokio::test]
+async fn hook_commands_see_profile_dir_and_mcp_server() {
+    let dir = TempDir::new().unwrap();
+    let hooks = Hooks::new(HooksConfig {
+        pre_tool_use: vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![command_hook(
+                "cat > input.json; printf %s \"$QMT_PROFILE_DIR\" > profile-dir".into(),
+            )],
+        }],
+        base_dir: Some("/profiles".into()),
+        ..HooksConfig::default()
+    })
+    .unwrap();
+    hooks
+        .run_pre_tool_use(pre_request("get_quote", Some("ibkr"), &dir))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("profile-dir")).unwrap(),
+        "/profiles"
+    );
+    let input: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("input.json")).unwrap()).unwrap();
+    assert_eq!(input["mcp_server"], "ibkr");
+}
+
+#[tokio::test]
+async fn ask_decision_carries_the_hook_reason() {
+    let dir = TempDir::new().unwrap();
+    let hooks = Hooks::new(HooksConfig {
+        pre_tool_use: vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![command_hook(
+                r#"printf '{"hook_specific_output":{"hook_event_name":"pre_tool_use","permission_decision":"ask","permission_decision_reason":"BUY 1 SPY"}}'"#.into(),
+            )],
+        }],
+        ..HooksConfig::default()
+    })
+    .unwrap();
+    let result = hooks
+        .run_pre_tool_use(pre_request("place_order", Some("ibkr"), &dir))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.permission_decision,
+        Some(crate::hooks::engine::PreToolPermissionDecision::Ask {
+            reason: Some("BUY 1 SPY".into())
+        })
+    );
 }

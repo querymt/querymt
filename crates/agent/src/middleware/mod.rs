@@ -1,4 +1,5 @@
 // New state machine architecture
+mod assembly;
 pub mod driver;
 pub mod error;
 pub mod factory;
@@ -16,6 +17,8 @@ mod parallel_edit_guard;
 mod presets;
 mod specialized;
 mod tasks;
+
+pub(crate) use assembly::build_from_entries;
 
 // Re-export new architecture types
 pub use driver::{

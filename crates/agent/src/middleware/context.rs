@@ -284,11 +284,11 @@ impl MiddlewareFactory for ContextFactory {
         &self,
         config: &serde_json::Value,
         agent_config: &crate::agent::agent_config::AgentConfig,
-    ) -> anyhow::Result<Arc<dyn MiddlewareDriver>> {
+    ) -> anyhow::Result<Option<Arc<dyn MiddlewareDriver>>> {
         let cfg: ContextFactoryConfig = serde_json::from_value(config.clone())?;
 
         if !cfg.enabled {
-            return Err(anyhow::anyhow!("Middleware disabled"));
+            return Ok(None);
         }
 
         if cfg.warn_at_percent >= cfg.compact_at_percent {
@@ -310,7 +310,7 @@ impl MiddlewareFactory for ContextFactory {
             fallback_max_tokens: cfg.fallback_max_tokens,
         };
 
-        Ok(Arc::new(ContextMiddleware::new(context_config)))
+        Ok(Some(Arc::new(ContextMiddleware::new(context_config))))
     }
 }
 

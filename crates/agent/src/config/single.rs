@@ -20,8 +20,7 @@ use super::*;
         "model": "claude-sonnet-4-5-20250929",
         "tools": ["read_tool", "edit", "write_file", "shell", "glob", "search_text"],
         "system": "You are a helpful coding assistant.",
-        "mutating_tools": ["edit", "write_file", "shell"],
-        "assume_mutating": false,
+        "permissions": {"ask": ["shell"], "timeout_sec": 120},
         "execution": {
             "snapshot": {"backend": "git"},
             "compaction": {"auto": true}
@@ -155,7 +154,12 @@ pub struct AgentSettings {
         ["read_tool", "index", "edit", "write_file", "shell", "glob", "search_text", "ls", "web_fetch", "question", "create_task", "read_task", "update_task", "complete_task", "todowrite", "todoread"],
         ["read_tool", "index", "glob", "search_text", "filesystem.*"]
     ]))]
-    pub tools: Vec<String>,
+    pub tools: Vec<ToolSpec>,
+
+    /// Initial mode of new sessions: `build` (default), `plan` or `review`.
+    /// Modes only inject reminders; hooks enforce restrictions.
+    #[serde(default)]
+    pub mode: crate::agent::core::AgentMode,
 
     /// System prompt. Accepts a plain string, an array of strings, or a mixed
     /// array of inline strings and `{ file = "path" }` file references.
@@ -168,18 +172,9 @@ pub struct AgentSettings {
     #[serde(default)]
     pub parameters: Option<HashMap<String, Value>>,
 
-    /// Whether to treat unknown tools (e.g. MCP tools not listed in
-    /// `mutating_tools`) as mutating, requiring permission confirmation.
-    /// Set to `false` and use `mutating_tools` for explicit control.
-    #[serde(default = "crate::config::default_assume_mutating")]
-    pub assume_mutating: bool,
-
-    /// Explicit allowlist of tools that modify the filesystem or execute
-    /// commands and therefore require permission confirmation.
-    /// Common values: `["edit", "write_file", "delete_file", "shell"]`.
+    /// Tool approval: which calls prompt the user, and for how long.
     #[serde(default)]
-    #[schemars(extend("examples" = [["edit", "write_file", "shell"], ["edit", "write_file", "delete_file", "shell"]]))]
-    pub mutating_tools: Vec<String>,
+    pub permissions: PermissionsConfig,
 
     /// Execution policy (tool output truncation, pruning, compaction, snapshot, rate limit).
     #[serde(default)]
@@ -201,9 +196,4 @@ pub struct AgentSettings {
     /// default; enabling never isolates an option-less session.
     #[serde(default)]
     pub workspace: WorkspaceSettings,
-}
-
-#[allow(dead_code)]
-fn default_assume_mutating() -> bool {
-    true
 }

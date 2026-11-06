@@ -410,6 +410,12 @@ pub trait Tool: Send + Sync {
         self.definition()
     }
 
+    /// Whether the tool only reads state. Read-only tools take no snapshot.
+    /// Default: `false`, so a missing override only costs an extra snapshot.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
     /// Capabilities this tool requires. Default: empty.
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[]

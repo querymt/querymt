@@ -385,8 +385,6 @@ system = "You are a helpful assistant."
 [agent]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-assume_mutating = false
-mutating_tools = ["edit", "write_file", "shell"]
 tools = [
     "edit", "read_tool", "write_file",
     "glob", "search_text", "ls",
@@ -435,6 +433,10 @@ min_lines = 10
 ### `hook_guarded_coder.toml` — Single coder with lifecycle hooks
 
 Use this profile when you want config-level hook commands to inspect shell calls, automate approval decisions, or request one extra step at turn completion.
+
+### `trading_analyst.toml` / `trading_desk.toml` — Guarded stock trading
+
+Two profiles for Interactive Brokers' hosted MCP server. The analyst logs in with only the `mcp.read` scope, researches and writes small scripts and order tickets. The desk has the order scope but no shell, file-write or web tools, starts in `plan` mode, and runs `examples/hooks/trading/order_guard.py` before every order (risk limits, kill switch, build-mode-only, limit orders only) and asks you to confirm each order. Use a paper account first; see the header comments in both files for setup.
 
 ### `multi_agent.toml` — Planner + delegates
 
@@ -517,8 +519,6 @@ tags = ["coding", "single-agent"]
 [agent]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-assume_mutating = false
-mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
 tools = [
   "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
   "glob", "search_text", "ls", "index", "get_symbol", "get_function",
@@ -712,8 +712,6 @@ tags = ["coding", "development", "full-access"]
 [agent]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-assume_mutating = false
-mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
 tools = [
     "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
     "glob", "search_text", "ls", "index", "get_symbol", "get_function",
@@ -750,7 +748,6 @@ tags = ["review", "read-only"]
 [agent]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-assume_mutating = false
 tools = [
     "read_tool", "glob", "search_text", "ls", "index",
     "get_symbol", "get_function", "find_symbol_references",

@@ -42,6 +42,13 @@
       "const": "post_tool_use",
       "type": "string"
     },
+    "mcp_server": {
+      "description": "MCP server providing the tool; `null` for other tools.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "model": {
       "type": "string"
     },

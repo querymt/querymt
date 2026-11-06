@@ -35,12 +35,17 @@ pub trait MiddlewareFactory: Send + Sync {
     ///
     /// The config value contains all fields from the TOML section except "type".
     /// `agent_config` provides shared agent configuration and infrastructure.
-    /// Returns an error if the middleware is disabled or config is invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the config is invalid. `Ok(None)` means the
+    /// middleware is turned off by its own config (e.g. `enabled = false`) and
+    /// must be skipped without error.
     fn create(
         &self,
         config: &Value,
         agent_config: &AgentConfig,
-    ) -> Result<Arc<dyn MiddlewareDriver>>;
+    ) -> Result<Option<Arc<dyn MiddlewareDriver>>>;
 }
 
 /// Global middleware registry (lazy singleton)
@@ -87,20 +92,22 @@ impl MiddlewareRegistry {
 
     /// Create middleware from type name and config
     ///
-    /// Returns an error if:
-    /// - The middleware type is unknown
-    /// - The middleware is disabled (config has `enabled = false`)
-    /// - The config is invalid for this middleware type
+    /// Returns `Ok(None)` when the middleware is turned off by its own config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the middleware type is unknown or the config is
+    /// invalid for this middleware type.
     pub fn create(
         &self,
         type_name: &str,
         config: &Value,
         agent_config: &AgentConfig,
-    ) -> Result<Arc<dyn MiddlewareDriver>> {
+    ) -> Result<Option<Arc<dyn MiddlewareDriver>>> {
         let factory = self
             .factories
             .get(type_name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown middleware type: {}", type_name))?;
+            .ok_or_else(|| anyhow::anyhow!("unknown middleware type: {type_name}"))?;
         factory.create(config, agent_config)
     }
 

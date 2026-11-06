@@ -1371,7 +1371,7 @@ impl Message<SetAllowedTools> for SessionActor {
         msg: SetAllowedTools,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.tool_config.allowlist = Some(msg.tools.into_iter().collect());
+        self.tool_config.allow = Some(msg.tools.into_iter().collect());
     }
 }
 
@@ -1383,7 +1383,7 @@ impl Message<ClearAllowedTools> for SessionActor {
         _msg: ClearAllowedTools,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.tool_config.allowlist = None;
+        self.tool_config.allow = None;
     }
 }
 
@@ -1395,7 +1395,7 @@ impl Message<SetDeniedTools> for SessionActor {
         msg: SetDeniedTools,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.tool_config.denylist = msg.tools.into_iter().collect();
+        self.tool_config.deny = msg.tools.into_iter().collect();
     }
 }
 
@@ -1407,7 +1407,7 @@ impl Message<ClearDeniedTools> for SessionActor {
         _msg: ClearDeniedTools,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.tool_config.denylist.clear();
+        self.tool_config.deny = Default::default();
     }
 }
 
@@ -5516,7 +5516,7 @@ mod tests {
         // Instead: setting allowed tools should persist without error
         f.actor_ref
             .tell(SetAllowedTools {
-                tools: vec!["shell".to_string(), "read_tool".to_string()],
+                tools: vec!["shell".parse().unwrap(), "read_tool".parse().unwrap()],
             })
             .await
             .expect("tell SetAllowedTools");
@@ -5529,13 +5529,67 @@ mod tests {
             .expect("tell ClearAllowedTools");
     }
 
+    /// Test-only probe for the session's live tool lists.
+    struct ProbeToolConfig;
+
+    #[derive(kameo::Reply)]
+    struct ProbedToolConfig(ToolConfig);
+
+    impl Message<ProbeToolConfig> for SessionActor {
+        type Reply = ProbedToolConfig;
+
+        async fn handle(
+            &mut self,
+            _msg: ProbeToolConfig,
+            _ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            ProbedToolConfig(self.tool_config.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_deny_uses_the_shared_selector_rule() {
+        use crate::config::ToolRef;
+        let f = ActorFixture::new().await;
+        f.actor_ref
+            .tell(SetDeniedTools {
+                tools: vec!["github.*".parse().unwrap(), "lookup".parse().unwrap()],
+            })
+            .await
+            .expect("tell SetDeniedTools");
+        let ProbedToolConfig(config) = f.actor_ref.ask(ProbeToolConfig).await.expect("probe");
+        // `github.*` hides every github tool.
+        assert!(!config.allows(ToolRef::mcp("github", "create_issue")));
+        // A bare `lookup` deny hides the built-in but keeps `alpha.lookup`.
+        assert!(!config.allows(ToolRef::builtin("lookup")));
+        assert!(config.allows(ToolRef::mcp("alpha", "lookup")));
+    }
+
+    #[tokio::test]
+    async fn malformed_selector_leaves_session_lists_unchanged() {
+        use crate::config::ToolRef;
+        let f = ActorFixture::new().await;
+        f.actor_ref
+            .tell(SetDeniedTools {
+                tools: vec!["shell".parse().unwrap()],
+            })
+            .await
+            .expect("tell SetDeniedTools");
+        // A remote payload with a malformed selector cannot be decoded, so no
+        // message reaches the actor.
+        assert!(serde_json::from_str::<SetDeniedTools>(r#"{"tools":["github."]}"#).is_err());
+        let ProbedToolConfig(config) = f.actor_ref.ask(ProbeToolConfig).await.expect("probe");
+        assert!(!config.allows(ToolRef::builtin("shell")));
+        assert!(config.allows(ToolRef::builtin("read_tool")));
+    }
+
     #[tokio::test]
     async fn test_set_denied_tools() {
         let f = ActorFixture::new().await;
 
         f.actor_ref
             .tell(SetDeniedTools {
-                tools: vec!["shell".to_string()],
+                tools: vec!["shell".parse().unwrap()],
             })
             .await
             .expect("tell SetDeniedTools");

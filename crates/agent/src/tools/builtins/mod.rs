@@ -421,3 +421,69 @@ mod canonical_naming_tests {
         assert_eq!(args["replacements"][0]["new_text"], json!("x"));
     }
 }
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::all_builtin_tools;
+    use std::collections::BTreeSet;
+
+    /// Built-ins that only read state; everything else takes a snapshot.
+    const READ_ONLY: &[&str] = &[
+        "browse",
+        "find_symbol_references",
+        "get_function",
+        "get_symbol",
+        "glob",
+        "index",
+        "knowledge_list_unconsolidated",
+        "knowledge_query",
+        "knowledge_stats",
+        "language_query",
+        "ls",
+        "mdq",
+        "question",
+        "read_task",
+        "read_tool",
+        "search_text",
+        "session_history",
+        "todoread",
+        "web_fetch",
+    ];
+
+    #[test]
+    fn read_only_set_is_exactly_the_documented_one() {
+        let actual: BTreeSet<String> = all_builtin_tools()
+            .iter()
+            .filter(|tool| tool.is_read_only())
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let expected: BTreeSet<String> = READ_ONLY.iter().map(|s| s.to_string()).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn mutating_builtins_are_not_read_only() {
+        let tools = all_builtin_tools();
+        for name in [
+            "edit",
+            "multiedit",
+            "write_file",
+            "delete_file",
+            "replace_symbol",
+            "shell",
+            "create_task",
+            "update_task",
+            "complete_task",
+            "knowledge_ingest",
+            "knowledge_consolidate",
+            "delegate",
+            "todowrite",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name() == name)
+                .unwrap_or_else(|| panic!("{name}"));
+            assert!(!tool.is_read_only(), "{name}");
+        }
+    }
+}

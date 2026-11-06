@@ -132,11 +132,13 @@ pub(crate) async fn build_mcp_state(
     tool_state.set_skipped_servers(skipped_servers);
 
     // Populate the shared tool state with the initial tool list.
-    tool_state.store(crate::agent::core::McpToolSnapshot {
+    let snapshot = crate::agent::core::McpToolSnapshot {
         tools,
         tool_defs,
         tools_hash: None,
-    });
+    };
+    crate::agent::mcp::warn_unmatched_permissions(connect_ctx.permissions(), &snapshot, None);
+    tool_state.store(snapshot);
 
     Ok(clients)
 }
@@ -277,6 +279,7 @@ async fn start_mcp_server(
             tool_state.clone(),
         )
         .with_tasks(config.tasks_enabled())
+        .with_permissions(connect_ctx.permissions().clone())
     };
     match server {
         McpServer::Stdio(stdio) => {

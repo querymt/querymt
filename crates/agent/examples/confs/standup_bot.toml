@@ -29,10 +29,6 @@
 [agent]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-assume_mutating = false
-
-# No mutating tools — this agent is strictly read-only + knowledge writes
-mutating_tools = []
 
 tools = [
   # Git & codebase analysis (read-only)

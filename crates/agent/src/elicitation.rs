@@ -9,7 +9,8 @@
 use rmcp::RoleClient;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    ClientCapabilities, ClientConfig, ElicitRequestParams, ElicitResult, Implementation,
+    ClientCapabilities, ClientConfig, ElicitRequestParams, ElicitResult, ElicitationCapability,
+    FormElicitationCapability, Implementation,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use serde::{Deserialize, Serialize};
@@ -1277,6 +1278,8 @@ pub struct McpClientHandler {
     router: querymt::mcp::progress::McpNotificationRouter,
     /// Declare the MCP tasks extension during `initialize`.
     tasks: bool,
+    /// Approval lists, checked against refreshed tool lists.
+    permissions: crate::config::Permissions,
 }
 
 impl McpClientHandler {
@@ -1297,7 +1300,15 @@ impl McpClientHandler {
             tool_state,
             router: Default::default(),
             tasks: false,
+            permissions: Default::default(),
         }
+    }
+
+    /// Check refreshed tool lists against these approval lists.
+    #[must_use]
+    pub fn with_permissions(mut self, permissions: crate::config::Permissions) -> Self {
+        self.permissions = permissions;
+        self
     }
 
     /// Declare the MCP tasks extension to the server (default: not declared).
@@ -1400,6 +1411,9 @@ impl ClientHandler for McpClientHandler {
     fn get_info(&self) -> ClientConfig {
         // The builder needs rmcp's `server` feature; the fields are public.
         let mut capabilities = ClientCapabilities::default();
+        // `create_elicitation` answers form and URL requests, so say so.
+        capabilities.elicitation =
+            Some(ElicitationCapability::new().with_form(FormElicitationCapability::default()));
         if self.tasks {
             capabilities.extensions = Some(
                 [(
@@ -1483,11 +1497,17 @@ impl ClientHandler for McpClientHandler {
                 }
 
                 // Atomically swap the entire snapshot (tools + defs + cleared hash).
-                self.tool_state.store(crate::agent::core::McpToolSnapshot {
+                let snapshot = crate::agent::core::McpToolSnapshot {
                     tools: new_tools,
                     tool_defs: new_defs,
                     tools_hash: None,
-                });
+                };
+                crate::agent::mcp::warn_unmatched_permissions(
+                    &self.permissions,
+                    &snapshot,
+                    Some(&self.server_name),
+                );
+                self.tool_state.store(snapshot);
 
                 log::info!(
                     "session={} server='{}': MCP tool list refreshed",

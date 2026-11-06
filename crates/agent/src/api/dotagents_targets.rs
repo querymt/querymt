@@ -81,7 +81,13 @@ impl ProtocolTargetFactory for DotagentsTargetFactory {
         {
             builder = builder
                 .with_tool_policy(ToolPolicy::BuiltInOnly)
-                .with_allowed_tools(tools.clone());
+                .with_allowed_tools(tools.iter().filter_map(|tool| match tool.parse() {
+                    Ok(spec) => Some(spec),
+                    Err(error) => {
+                        log::warn!("dotagents: ignoring tool `{tool}`: {error}");
+                        None
+                    }
+                }));
         }
         if !plan.mcp_servers.is_empty() {
             builder = builder.with_mcp_servers(plan.mcp_servers.clone());

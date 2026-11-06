@@ -1072,11 +1072,11 @@ Tool permission requests and form questions (elicitation) follow the same lifecy
 
 Sessions and prompts carry no per-connection client bridge. `session/prompt` works the same for remote sessions as for local ones.
 
-**Unanswered permission waits.** A permission-required tool call that is not decided by a cached "always" choice, tool policy or hook waits for an explicit user answer. It is not granted because no client is attached, delivery failed, the client disconnected, the response timed out or the answer was malformed. The request stays pending and is delivered again to the next authorized client that attaches.
+**Unanswered permission waits.** A permission-required tool call that is not decided by a session allow, tool policy or hook waits for an explicit user answer. It is not granted because no client is attached, delivery failed, the client disconnected, the response timed out or the answer was malformed. The request stays pending and is delivered again to the next authorized client that attaches.
 
-> **Unattended runs.** Scheduled or headless runs that previously relied on implicit auto-grant now stay paused at the first unanswered permission until a user answers or the run is cancelled. Restrict the enabled `tools` list, set `mutating_tools` / `assume_mutating` so only intended tools need permission, or add `permission_request` hooks that allow or deny explicitly for those runs. See [Hooks](hooks.md).
+> **Unattended runs.** Scheduled or headless runs that previously relied on implicit auto-grant now stay paused at the first unanswered permission until a user answers or the run is cancelled. Restrict the enabled `tools` list, list only the intended tools in `[agent.permissions]` and set `timeout_sec` so unanswered prompts are rejected, or add `permission_request` hooks that allow or deny explicitly for those runs. See [Hooks](hooks.md).
 
-**"Always" choices.** Answering "Always allow" or "Always reject" applies to later calls of the same tool in that session, for local and remote sessions alike.
+**Session allow.** Answering "Allow for this session" applies to later calls of the same server-qualified tool in that session, for local and remote sessions alike. It is never offered for `always_ask` tools or hook asks, and rejections are not remembered.
 
 **Editor workspace queries.** The `language_query` tool needs a locally hosted session with an attached editor connection. For a session on a remote node it returns an "unavailable" result that names remote sessions, and the run continues.
 

@@ -32,11 +32,6 @@
 [agent]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-assume_mutating = false
-
-# Shell is mutating because git pull --ff-only updates the working tree.
-# All other shell usage (git log, cargo commands) is read-only.
-mutating_tools = ["shell"]
 
 tools = [
   # Codebase analysis (read-only)
