@@ -1365,6 +1365,45 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Configuration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#matchers-and-paths" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Matchers and paths
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#failure-behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Failure behavior
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#asking-the-user" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Asking the user
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -1989,8 +2028,8 @@
 <h2 id="security-model">Security Model</h2>
 <p>Hooks execute arbitrary local commands.</p>
 <ul>
-<li>Hooks are disabled by default.</li>
-<li>Enable hooks only in trusted agent configs or profiles.</li>
+<li>Hooks run whenever an agent config declares any; set <code>enabled = false</code> under <code>[agent.hooks]</code> to switch them off.</li>
+<li>Use hooks only in trusted agent configs or profiles.</li>
 <li>Hook commands receive prompt and tool metadata on stdin.</li>
 <li>For now, QueryMT supports config/profile-level hooks only.</li>
 <li>Automatic <code>~/.qmt/hooks</code> or project <code>.qmt/hooks</code> discovery is not implemented yet.</li>
@@ -2098,6 +2137,19 @@
 <a id="__codelineno-1-9" name="__codelineno-1-9"></a><span class="n">input</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">query</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"$event.model"</span><span class="p">,</span><span class="w"> </span><span class="n">messages</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"$event.messages"</span><span class="w"> </span><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <p>MCP hook handlers are bound to both <code>server</code> and <code>tool</code>, bypass the model-visible tool loop, and therefore cannot recursively trigger tool hooks. Template strings must be exact <code>$event.&lt;field&gt;</code> paths into the event payload; arbitrary interpolation is not supported. MCP handlers currently require an execution-scoped event (<code>pre_tool_use</code>, <code>permission_request</code>, <code>post_tool_use</code>, or <code>context</code>) where connected tool state is available. The MCP tool's text content is parsed with the same output contract as a command hook.</p>
+<h3 id="matchers-and-paths">Matchers and paths</h3>
+<ul>
+<li>A tool matcher is a regex that may match the plain tool name (<code>place_order</code>) or the server-qualified name (<code>ibkr.place_order</code>) for MCP tools. An invalid regex fails the config load instead of silently never matching.</li>
+<li>Hook commands run in the session's working directory. Use <code>$QMT_PROFILE_DIR</code>, the folder of the config file the hooks came from (not set for inline configs), to reference scripts: <code>command = "sh \"$QMT_PROFILE_DIR/../hooks/check-shell.sh\""</code>.</li>
+<li><code>pre_tool_use</code> and <code>post_tool_use</code> input carries <code>mcp_server</code> (<code>null</code> for built-in tools).</li>
+</ul>
+<h3 id="failure-behavior">Failure behavior</h3>
+<ul>
+<li>A failing, crashing or timed-out <code>pre_tool_use</code> hook blocks the call (fail closed).</li>
+<li>A failing <code>post_tool_use</code> hook cannot undo a call that already ran: the tool result is kept and a <code>hook_notice</code> is emitted, so the model does not retry an action that took effect.</li>
+</ul>
+<h3 id="asking-the-user">Asking the user</h3>
+<p>A <code>pre_tool_use</code> hook may print <code>permission_decision: "ask"</code> with a <code>permission_decision_reason</code>. QueryMT then shows the user a permission prompt with the reason as its title and "Allow once" / "Reject" options, whatever the approval lists say, and runs the tool only after "Allow once". An earlier "Allow for this session" does not satisfy it. Reject, cancel, timeout (<code>[agent.permissions] timeout_sec</code>) or a transport failure all mean the tool does not run. <code>permission_decision: "allow"</code> skips the prompt even for tools listed in <code>[agent.permissions]</code>. See <a href="../configuration/#tool-approval">Tool approval</a>.</p>
 <h2 id="hook-command-protocol">Hook Command Protocol</h2>
 <p>Each command hook:</p>
 <ul>
@@ -2277,7 +2329,7 @@
 <a id="__codelineno-5-8" name="__codelineno-5-8"></a><span class="w">  </span><span class="p">}</span>
 <a id="__codelineno-5-9" name="__codelineno-5-9"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
-<p>Multiple matching <code>pre_tool_use</code> handlers see this rewritten object in order. A rewrite is accepted only with <code>permission_decision: \"allow\"</code>; <code>ask</code> follows normal interactive permission handling.</p>
+<p>Multiple matching <code>pre_tool_use</code> handlers see this rewritten object in order. A rewrite is accepted only with <code>permission_decision: \"allow\"</code>; <code>ask</code> follows the approval prompt described above.</p>
 <h4 id="tool-input-uses-canonical-parameter-names">Tool input uses canonical parameter names</h4>
 <p><code>pre_tool_use</code> handlers receive the tool input with canonical <code>snake_case</code> names, after
 alias and shape normalisation. For the edit tools this means <code>file_path</code>, <code>old_string</code>,

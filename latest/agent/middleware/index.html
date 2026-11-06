@@ -2274,19 +2274,17 @@ and still produce exactly one result. See
 <span class="normal"><a href="#__codelineno-4-5">5</a></span>
 <span class="normal"><a href="#__codelineno-4-6">6</a></span>
 <span class="normal"><a href="#__codelineno-4-7">7</a></span>
-<span class="normal"><a href="#__codelineno-4-8">8</a></span>
-<span class="normal"><a href="#__codelineno-4-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="k">[[middleware]]</span>
+<span class="normal"><a href="#__codelineno-4-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="k">[[middleware]]</span>
 <a id="__codelineno-4-2" name="__codelineno-4-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
-<a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"build"</span>
-<a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="n">reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
-<a id="__codelineno-4-5" name="__codelineno-4-5"></a><span class="s2">You are in plan mode. Read-only access.</span>
-<a id="__codelineno-4-6" name="__codelineno-4-6"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
-<a id="__codelineno-4-7" name="__codelineno-4-7"></a><span class="n">review_reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
-<a id="__codelineno-4-8" name="__codelineno-4-8"></a><span class="s2">You are in review mode. Provide feedback only.</span>
-<a id="__codelineno-4-9" name="__codelineno-4-9"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="n">reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="s2">You are in plan mode. Read-only access.</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6"></a><span class="n">review_reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
+<a id="__codelineno-4-7" name="__codelineno-4-7"></a><span class="s2">You are in review mode. Provide feedback only.</span>
+<a id="__codelineno-4-8" name="__codelineno-4-8"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
 </code></pre></div></td></tr></table></div></p>
 <p><strong>Features:</strong>
-- <code>default</code>: Default mode on session start
+- The initial session mode is not set here; use <code>mode</code> on <code>[agent]</code>, <code>[planner]</code> or <code>[[delegates]]</code>
 - <code>reminder</code>: System message for plan mode
 - <code>review_reminder</code>: System message for review mode</p>
 <p><strong>Behavior:</strong>

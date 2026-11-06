@@ -1874,10 +1874,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#tool-permissions" class="md-nav__link">
+  <a href="#tool-approval" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        Tool Permissions
+        Tool approval
       </span>
     </span>
   </a>
@@ -2568,9 +2568,7 @@
 <span class="normal"><a href="#__codelineno-4-37">37</a></span>
 <span class="normal"><a href="#__codelineno-4-38">38</a></span>
 <span class="normal"><a href="#__codelineno-4-39">39</a></span>
-<span class="normal"><a href="#__codelineno-4-40">40</a></span>
-<span class="normal"><a href="#__codelineno-4-41">41</a></span>
-<span class="normal"><a href="#__codelineno-4-42">42</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="k">[agent]</span>
+<span class="normal"><a href="#__codelineno-4-40">40</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="k">[agent]</span>
 <a id="__codelineno-4-2" name="__codelineno-4-2"></a><span class="c1"># LLM Provider and Model</span>
 <a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span><span class="w">              </span><span class="c1"># Required: provider name</span>
 <a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span><span class="w">  </span><span class="c1"># Required: model identifier</span>
@@ -2607,11 +2605,9 @@
 <a id="__codelineno-4-35" name="__codelineno-4-35"></a><span class="n">temperature</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.7</span>
 <a id="__codelineno-4-36" name="__codelineno-4-36"></a><span class="n">max_tokens</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4096</span>
 <a id="__codelineno-4-37" name="__codelineno-4-37"></a>
-<a id="__codelineno-4-38" name="__codelineno-4-38"></a><span class="c1"># Assume unknown tools are mutating (requires permission)</span>
-<a id="__codelineno-4-39" name="__codelineno-4-39"></a><span class="n">assume_mutating</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
-<a id="__codelineno-4-40" name="__codelineno-4-40"></a>
-<a id="__codelineno-4-41" name="__codelineno-4-41"></a><span class="c1"># Explicit list of mutating tools</span>
-<a id="__codelineno-4-42" name="__codelineno-4-42"></a><span class="n">mutating_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
+<a id="__codelineno-4-38" name="__codelineno-4-38"></a><span class="c1"># Tools that need the user's approval (see "Tool approval" below)</span>
+<a id="__codelineno-4-39" name="__codelineno-4-39"></a><span class="k">[agent.permissions]</span>
+<a id="__codelineno-4-40" name="__codelineno-4-40"></a><span class="n">ask</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <p>For reusable system-prefix annotations, TTL behavior, and provider limitations,
 see <a href="../../core/providers/#prompt-cache-hints">Prompt Cache Hints</a>.</p>
@@ -2852,9 +2848,23 @@ dynamic client registration unless <code>client_id</code> is set, automatic refr
   <code>socket_path</code> or an <code>Authorization</code> header.</li>
 <li><strong>Login:</strong> use the <code>_querymt/auth/*</code> extension methods (<code>start</code>, <code>complete</code>,
   <code>status</code>, <code>logout</code>) with the provider id <code>mcp:&lt;server name&gt;</code>, for example
-  <code>mcp:linear</code>. Login flows are scoped to the client that started them. The
+  <code>mcp:linear</code>. Servers are offered from the agent configuration, every profile
+  (its <code>[[mcp]]</code> entries, quorum delegate <code>mcp</code> entries and <code>.agents/mcp.json</code>
+  servers) and the running profile runtimes, so a server declared only in a
+  profile can be logged into before any session uses it. A name declared with
+  different settings by several sources is refused with an <code>invalid_params</code>
+  error naming the sources; credentials are stored per name, so make the
+  declarations agree or rename one. Login flows are scoped to the client that started them. The
   loopback redirect URI is <code>http://127.0.0.1:&lt;redirect_port&gt;/callback</code>; the
   default port is <code>47821</code>. Register that URI when using a fixed <code>client_id</code>.</li>
+<li><strong>Strict scopes:</strong> authorization servers may grant more than was requested.
+  With <code>strict_scopes = true</code> (requires <code>scopes</code>), a login or refresh whose
+  token carries any scope beyond <code>scopes</code> (and <code>offline_access</code>) is not stored,
+  and stored credentials with a wider grant are not used to connect. The grant
+  is read from the token response <code>scope</code> and, for JWT access tokens, the
+  <code>scope</code>/<code>scp</code> claim. Example: <code>auth = { type = "oauth", scopes = ["mcp.read"], strict_scopes = true }</code>.</li>
+<li><strong><code>.agents/mcp.json</code>:</strong> an HTTP entry may carry the same <code>auth</code> object, e.g.
+  <code>"auth": {"type": "oauth", "scopes": ["read"]}</code>.</li>
 <li><strong>Storage:</strong> tokens are kept in the secret store under <code>mcp-oauth:&lt;server&gt;</code>,
   bound to the server URL, and never written to config, logs, events, or
   session history.</li>
@@ -2895,7 +2905,7 @@ dynamic client registration unless <code>client_id</code> is set, automatic refr
 <a id="__codelineno-11-8" name="__codelineno-11-8"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"filesystem.*"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="middleware-configuration">Middleware Configuration</h2>
-<p>Middleware extends agent behavior through a pluggable stack:</p>
+<p>Middleware extends agent behavior through a pluggable stack. Building an agent (single agent, quorum planner or delegate) fails when an entry has an unknown <code>type</code> or invalid configuration; an entry turned off by its own config (for example <code>enabled = false</code>) is skipped. The initial session mode is the <code>mode</code> key on <code>[agent]</code>, <code>[planner]</code> and <code>[[delegates]]</code>, not a middleware setting:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-12-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-12-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-12-3"> 3</a></span>
@@ -2934,47 +2944,45 @@ dynamic client registration unless <code>client_id</code> is set, automatic refr
 <span class="normal"><a href="#__codelineno-12-36">36</a></span>
 <span class="normal"><a href="#__codelineno-12-37">37</a></span>
 <span class="normal"><a href="#__codelineno-12-38">38</a></span>
-<span class="normal"><a href="#__codelineno-12-39">39</a></span>
-<span class="normal"><a href="#__codelineno-12-40">40</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a><span class="c1"># Agent mode middleware (build/plan/review modes)</span>
+<span class="normal"><a href="#__codelineno-12-39">39</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a><span class="c1"># Agent mode middleware (build/plan/review modes)</span>
 <a id="__codelineno-12-2" name="__codelineno-12-2"></a><span class="k">[[middleware]]</span>
 <a id="__codelineno-12-3" name="__codelineno-12-3"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
-<a id="__codelineno-12-4" name="__codelineno-12-4"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"build"</span>
-<a id="__codelineno-12-5" name="__codelineno-12-5"></a><span class="n">reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
-<a id="__codelineno-12-6" name="__codelineno-12-6"></a><span class="s2">You are in plan mode. Read-only access.</span>
-<a id="__codelineno-12-7" name="__codelineno-12-7"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
-<a id="__codelineno-12-8" name="__codelineno-12-8"></a><span class="n">review_reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
-<a id="__codelineno-12-9" name="__codelineno-12-9"></a><span class="s2">You are in review mode. Provide feedback only.</span>
-<a id="__codelineno-12-10" name="__codelineno-12-10"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
-<a id="__codelineno-12-11" name="__codelineno-12-11"></a>
-<a id="__codelineno-12-12" name="__codelineno-12-12"></a><span class="c1"># Limits middleware</span>
-<a id="__codelineno-12-13" name="__codelineno-12-13"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-12-14" name="__codelineno-12-14"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"limits"</span>
-<a id="__codelineno-12-15" name="__codelineno-12-15"></a><span class="n">max_steps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">200</span>
-<a id="__codelineno-12-16" name="__codelineno-12-16"></a><span class="n">max_turns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">50</span>
-<a id="__codelineno-12-17" name="__codelineno-12-17"></a>
-<a id="__codelineno-12-18" name="__codelineno-12-18"></a><span class="c1"># Context middleware (token management)</span>
-<a id="__codelineno-12-19" name="__codelineno-12-19"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-12-20" name="__codelineno-12-20"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"context"</span>
-<a id="__codelineno-12-21" name="__codelineno-12-21"></a><span class="n">warn_at_percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">80</span>
-<a id="__codelineno-12-22" name="__codelineno-12-22"></a><span class="n">compact_at_percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">90</span>
-<a id="__codelineno-12-23" name="__codelineno-12-23"></a><span class="n">fallback_max_tokens</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">128000</span>
-<a id="__codelineno-12-24" name="__codelineno-12-24"></a>
-<a id="__codelineno-12-25" name="__codelineno-12-25"></a><span class="c1"># Deduplication check</span>
-<a id="__codelineno-12-26" name="__codelineno-12-26"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-12-27" name="__codelineno-12-27"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"dedup_check"</span>
-<a id="__codelineno-12-28" name="__codelineno-12-28"></a><span class="n">threshold</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.85</span>
-<a id="__codelineno-12-29" name="__codelineno-12-29"></a><span class="n">min_lines</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span>
-<a id="__codelineno-12-30" name="__codelineno-12-30"></a>
-<a id="__codelineno-12-31" name="__codelineno-12-31"></a><span class="c1"># Parallel edit guard (on in "warn" mode by default; "deny" rejects redundant same-file edits)</span>
-<a id="__codelineno-12-32" name="__codelineno-12-32"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-12-33" name="__codelineno-12-33"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"parallel_edit_guard"</span>
-<a id="__codelineno-12-34" name="__codelineno-12-34"></a><span class="n">mode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"deny"</span>
-<a id="__codelineno-12-35" name="__codelineno-12-35"></a>
-<a id="__codelineno-12-36" name="__codelineno-12-36"></a><span class="c1"># Custom middleware (if registered)</span>
-<a id="__codelineno-12-37" name="__codelineno-12-37"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-12-38" name="__codelineno-12-38"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"custom_middleware"</span>
-<a id="__codelineno-12-39" name="__codelineno-12-39"></a><span class="n">option1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"value1"</span>
-<a id="__codelineno-12-40" name="__codelineno-12-40"></a><span class="n">option2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">42</span>
+<a id="__codelineno-12-4" name="__codelineno-12-4"></a><span class="n">reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
+<a id="__codelineno-12-5" name="__codelineno-12-5"></a><span class="s2">You are in plan mode. Read-only access.</span>
+<a id="__codelineno-12-6" name="__codelineno-12-6"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
+<a id="__codelineno-12-7" name="__codelineno-12-7"></a><span class="n">review_reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
+<a id="__codelineno-12-8" name="__codelineno-12-8"></a><span class="s2">You are in review mode. Provide feedback only.</span>
+<a id="__codelineno-12-9" name="__codelineno-12-9"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
+<a id="__codelineno-12-10" name="__codelineno-12-10"></a>
+<a id="__codelineno-12-11" name="__codelineno-12-11"></a><span class="c1"># Limits middleware</span>
+<a id="__codelineno-12-12" name="__codelineno-12-12"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-12-13" name="__codelineno-12-13"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"limits"</span>
+<a id="__codelineno-12-14" name="__codelineno-12-14"></a><span class="n">max_steps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">200</span>
+<a id="__codelineno-12-15" name="__codelineno-12-15"></a><span class="n">max_turns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">50</span>
+<a id="__codelineno-12-16" name="__codelineno-12-16"></a>
+<a id="__codelineno-12-17" name="__codelineno-12-17"></a><span class="c1"># Context middleware (token management)</span>
+<a id="__codelineno-12-18" name="__codelineno-12-18"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-12-19" name="__codelineno-12-19"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"context"</span>
+<a id="__codelineno-12-20" name="__codelineno-12-20"></a><span class="n">warn_at_percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">80</span>
+<a id="__codelineno-12-21" name="__codelineno-12-21"></a><span class="n">compact_at_percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">90</span>
+<a id="__codelineno-12-22" name="__codelineno-12-22"></a><span class="n">fallback_max_tokens</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">128000</span>
+<a id="__codelineno-12-23" name="__codelineno-12-23"></a>
+<a id="__codelineno-12-24" name="__codelineno-12-24"></a><span class="c1"># Deduplication check</span>
+<a id="__codelineno-12-25" name="__codelineno-12-25"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-12-26" name="__codelineno-12-26"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"dedup_check"</span>
+<a id="__codelineno-12-27" name="__codelineno-12-27"></a><span class="n">threshold</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.85</span>
+<a id="__codelineno-12-28" name="__codelineno-12-28"></a><span class="n">min_lines</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span>
+<a id="__codelineno-12-29" name="__codelineno-12-29"></a>
+<a id="__codelineno-12-30" name="__codelineno-12-30"></a><span class="c1"># Parallel edit guard (on in "warn" mode by default; "deny" rejects redundant same-file edits)</span>
+<a id="__codelineno-12-31" name="__codelineno-12-31"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-12-32" name="__codelineno-12-32"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"parallel_edit_guard"</span>
+<a id="__codelineno-12-33" name="__codelineno-12-33"></a><span class="n">mode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"deny"</span>
+<a id="__codelineno-12-34" name="__codelineno-12-34"></a>
+<a id="__codelineno-12-35" name="__codelineno-12-35"></a><span class="c1"># Custom middleware (if registered)</span>
+<a id="__codelineno-12-36" name="__codelineno-12-36"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-12-37" name="__codelineno-12-37"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"custom_middleware"</span>
+<a id="__codelineno-12-38" name="__codelineno-12-38"></a><span class="n">option1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"value1"</span>
+<a id="__codelineno-12-39" name="__codelineno-12-39"></a><span class="n">option2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">42</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="mesh-configuration">Mesh Configuration</h2>
 <p>Enable cross-machine collaboration:</p>
@@ -3295,12 +3303,12 @@ sessions database, so a separate <code>--db</code> gets separate leases.</p>
 <a id="__codelineno-20-7" name="__codelineno-20-7"></a><span class="k">[agent]</span>
 <a id="__codelineno-20-8" name="__codelineno-20-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
 <a id="__codelineno-20-9" name="__codelineno-20-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
-<a id="__codelineno-20-10" name="__codelineno-20-10"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">,</span><span class="w"> </span><span class="s2">"question"</span><span class="p">]</span>
-<a id="__codelineno-20-11" name="__codelineno-20-11"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"You are a code review specialist."</span>
-<a id="__codelineno-20-12" name="__codelineno-20-12"></a>
-<a id="__codelineno-20-13" name="__codelineno-20-13"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-20-14" name="__codelineno-20-14"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
-<a id="__codelineno-20-15" name="__codelineno-20-15"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"review"</span>
+<a id="__codelineno-20-10" name="__codelineno-20-10"></a><span class="n">mode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"review"</span>
+<a id="__codelineno-20-11" name="__codelineno-20-11"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">,</span><span class="w"> </span><span class="s2">"question"</span><span class="p">]</span>
+<a id="__codelineno-20-12" name="__codelineno-20-12"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"You are a code review specialist."</span>
+<a id="__codelineno-20-13" name="__codelineno-20-13"></a>
+<a id="__codelineno-20-14" name="__codelineno-20-14"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-20-15" name="__codelineno-20-15"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
 </code></pre></div></td></tr></table></div></p>
 <p>For complete profiles documentation, see <a href="../profiles/">Profiles Guide</a>.</p>
 <h2 id="slash-commands-configuration">Slash Commands Configuration</h2>
@@ -3599,15 +3607,51 @@ stays in place, and the placeholder is never executed.</p>
 <a id="__codelineno-29-22" name="__codelineno-29-22"></a><span class="w">    </span><span class="s2">"index"</span><span class="p">,</span><span class="w"> </span><span class="s2">"get_symbol"</span><span class="p">,</span><span class="w"> </span><span class="s2">"get_function"</span><span class="p">,</span><span class="w"> </span><span class="s2">"replace_symbol"</span><span class="p">,</span><span class="w"> </span><span class="s2">"find_symbol_references"</span>
 <a id="__codelineno-29-23" name="__codelineno-29-23"></a><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
-<h3 id="tool-permissions">Tool Permissions</h3>
-<p>Configure which tools are mutating:</p>
+<h3 id="tool-approval">Tool approval</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-30-1">1</a></span>
 <span class="normal"><a href="#__codelineno-30-2">2</a></span>
-<span class="normal"><a href="#__codelineno-30-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-30-1" name="__codelineno-30-1"></a><span class="k">[agent]</span>
-<a id="__codelineno-30-2" name="__codelineno-30-2"></a><span class="n">assume_mutating</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
-<a id="__codelineno-30-3" name="__codelineno-30-3"></a><span class="n">mutating_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"multiedit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"replace_symbol"</span><span class="p">]</span>
+<span class="normal"><a href="#__codelineno-30-3">3</a></span>
+<span class="normal"><a href="#__codelineno-30-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-30-1" name="__codelineno-30-1"></a><span class="k">[agent.permissions]</span>
+<a id="__codelineno-30-2" name="__codelineno-30-2"></a><span class="n">ask</span><span class="w">         </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"shell"</span><span class="p">]</span><span class="w">              </span><span class="c1"># prompt; "Allow for this session" is offered</span>
+<a id="__codelineno-30-3" name="__codelineno-30-3"></a><span class="n">always_ask</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"ibkr.place_order"</span><span class="p">]</span><span class="w">   </span><span class="c1"># prompt on every call, never remembered</span>
+<a id="__codelineno-30-4" name="__codelineno-30-4"></a><span class="n">timeout_sec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">120</span><span class="w">                    </span><span class="c1"># unanswered prompts are rejected; unset waits</span>
 </code></pre></div></td></tr></table></div>
-<p>A permission-required tool call that no cached choice, tool policy or hook decides waits for an explicit user answer, delivered as an ACP <code>session/request_permission</code> request. It is never auto-granted, including when no client is attached. Unattended runs (schedules, headless) must restrict <code>tools</code> / <code>mutating_tools</code> or add <code>permission_request</code> hooks, or they pause at the first unanswered permission. See <a href="../mesh/#session-interactions">Session Interactions</a> for the full lifecycle and the all-nodes-upgrade requirement (<code>RemoteNodeUpgradeRequired</code>).</p>
+<p>The same <code>[permissions]</code> table is accepted under <code>[planner]</code> and each <code>[[delegates]]</code>. Entries are tool selectors: <code>shell</code> (built-in or provider tool), <code>server.tool</code> (one MCP tool) or <code>server.*</code> (every tool of an MCP server). A bare name never matches an MCP tool. Loading fails when an MCP selector names a server that is not configured, or when <code>tools</code> is set and does not select a listed tool.</p>
+<p>Approval works the same for built-in, MCP and provider tools, and runs before the tool does:</p>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Prompt options</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tool matched by <code>ask</code></td>
+<td>Allow once, Allow for this session, Reject</td>
+</tr>
+<tr>
+<td>Tool matched by <code>always_ask</code> (wins over <code>ask</code>)</td>
+<td>Allow once, Reject</td>
+</tr>
+<tr>
+<td><code>pre_tool_use</code> hook returns <code>ask</code></td>
+<td>Allow once, Reject; the hook's reason is the prompt title</td>
+</tr>
+<tr>
+<td><code>pre_tool_use</code> hook returns <code>allow</code></td>
+<td>No prompt, even for a listed tool</td>
+</tr>
+<tr>
+<td>Tool that asks by default (<code>accept_delegation_result</code>), no configuration</td>
+<td>Allow once, Allow for this session, Reject; listing it in <code>always_ask</code> asks on every call; a <code>pre_tool_use</code> <code>allow</code> hook skips it</td>
+</tr>
+</tbody>
+</table>
+<p>"Allow for this session" covers later calls of the same server-qualified tool in that session only. It never applies to <code>always_ask</code> tools, hook asks or other sessions, and a rejection is never remembered. A denied call returns an error to the model that names the reason (rejected, timed out, run cancelled, task not active, or the <code>permission_request</code> hook's message) and says the tool was not run. A call whose task is not active is denied without a prompt.</p>
+<p><code>timeout_sec</code> applies to every prompt, including hook asks when both lists are empty. Unattended profiles (schedules, headless runs) must set it, or add <code>permission_request</code> hooks, otherwise they wait at the first prompt. A prompt that is not answered, or whose client is not attached, is never granted automatically. See <a href="../mesh/#session-interactions">Session Interactions</a> for the full lifecycle and the all-nodes-upgrade requirement (<code>RemoteNodeUpgradeRequired</code>).</p>
+<p>Snapshots need no per-tool list. A call is snapshotted when a snapshot policy other than <code>none</code> is enabled (<code>AgentBuilder</code> defaults to <code>diff</code>, Quorum to <code>none</code>), the session has a working directory, and the tool does not declare itself read-only. Read-only tools are the built-ins that only read or only change session and knowledge state (for example <code>read_tool</code>, <code>search_text</code>, <code>delegate</code>, <code>todowrite</code>, <code>skill</code>) and MCP tools with <code>readOnlyHint = true</code>. Every other built-in (<code>edit</code>, <code>shell</code>, <code>accept_delegation_result</code>, ...) and every MCP tool without the hint is treated as mutating. Calls that reach no registered tool (the LLM-client provider fallback) are not snapshotted. With the <code>diff</code> policy each session reuses its last workspace tree, so a call only re-hashes files whose size or modification time changed. A delegate running in its own worktree is snapshotted in that checkout, not in the planner's.</p>
+<p>The removed keys <code>assume_mutating</code>, <code>mutating_tools</code>, <code>confirm_tools</code> and <code>confirm_timeout_sec</code> are rejected as unknown fields; see the CHANGELOG for replacements.</p>
 <h2 id="scheduled-tasks-configuration">Scheduled Tasks Configuration</h2>
 <p>QueryMT supports scheduled tasks for autonomous recurring work. Schedules are created at runtime with the <code>querymt/schedules/create</code> ACP extension, not through static TOML configuration. The embedded dashboard discovers schedule capabilities through ACP.</p>
 <h3 id="schedule-types">Schedule Types</h3>

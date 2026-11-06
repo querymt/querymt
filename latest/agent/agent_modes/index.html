@@ -1568,17 +1568,6 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#tool-access" class="md-nav__link">
-    <span class="md-ellipsis">
-      <span class="md-typeset">
-        Tool Access
-      </span>
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
   <a href="#system-prompt-injection" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1590,10 +1579,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#permission-handling" class="md-nav__link">
+  <a href="#enforcement" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        Permission Handling
+        Enforcement
       </span>
     </span>
   </a>
@@ -1672,17 +1661,6 @@
     <span class="md-ellipsis">
       <span class="md-typeset">
         Custom Mode Reminders
-      </span>
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#mode-specific-tools" class="md-nav__link">
-    <span class="md-ellipsis">
-      <span class="md-typeset">
-        Mode-Specific Tools
       </span>
     </span>
   </a>
@@ -2546,13 +2524,16 @@ materializes current state instead of replaying every historical event:</p>
 <p>Replay applies the connection's capabilities after materialization, so
 unsupported Preview variants are never sent.</p>
 <h3 id="via-configuration">Via Configuration</h3>
-<p>Set default mode in configuration:</p>
+<p>Set the initial mode with the typed <code>mode</code> key on <code>[agent]</code>, <code>[planner]</code> or a <code>[[delegates]]</code> entry:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1">1</a></span>
 <span class="normal"><a href="#__codelineno-8-2">2</a></span>
-<span class="normal"><a href="#__codelineno-8-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
-<a id="__codelineno-8-3" name="__codelineno-8-3"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"plan"</span><span class="w">  </span><span class="c1"># "build", "plan", or "review"</span>
+<span class="normal"><a href="#__codelineno-8-3">3</a></span>
+<span class="normal"><a href="#__codelineno-8-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="k">[agent]</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4"></a><span class="n">mode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"plan"</span><span class="w">  </span><span class="c1"># "build" (default), "plan" or "review"; new sessions start in this mode.</span>
 </code></pre></div></td></tr></table></div>
+<p>An unknown value fails the config load with an error naming <code>mode</code>. The <code>agent_mode</code> middleware only configures reminders and rejects unknown keys, so a leftover <code>default = "plan"</code> there fails the build.</p>
 <h2 id="mode-transition-flow">Mode Transition Flow</h2>
 <pre class="mermaid"><code>flowchart LR
     B["Build Mode&lt;br/&gt;(default)"]
@@ -2563,78 +2544,15 @@ unsupported Preview variants are never sent.</p>
     P --&gt;|"Select Review"| R
     R --&gt;|"Select Build"| B</code></pre>
 <h2 id="mode-aware-behavior">Mode-Aware Behavior</h2>
-<h3 id="tool-access">Tool Access</h3>
-<table>
-<thead>
-<tr>
-<th>Tool</th>
-<th>Build</th>
-<th>Plan</th>
-<th>Review</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>read_tool</code></td>
-<td>✓</td>
-<td>✓</td>
-<td>✓</td>
-</tr>
-<tr>
-<td><code>edit</code></td>
-<td>✓</td>
-<td></td>
-<td></td>
-</tr>
-<tr>
-<td><code>write_file</code></td>
-<td>✓</td>
-<td></td>
-<td></td>
-</tr>
-<tr>
-<td><code>delete_file</code></td>
-<td>✓</td>
-<td></td>
-<td></td>
-</tr>
-<tr>
-<td><code>shell</code></td>
-<td>✓*</td>
-<td>✓ (read-only)</td>
-<td>✓ (read-only)</td>
-</tr>
-<tr>
-<td><code>glob</code></td>
-<td>✓</td>
-<td>✓</td>
-<td>✓</td>
-</tr>
-<tr>
-<td><code>search_text</code></td>
-<td>✓</td>
-<td>✓</td>
-<td>✓</td>
-</tr>
-<tr>
-<td><code>ls</code></td>
-<td>✓</td>
-<td>✓</td>
-<td>✓</td>
-</tr>
-</tbody>
-</table>
-<p>*Shell commands are restricted in Plan/Review mode</p>
+<p>Modes change what the agent is <em>told</em>, not what it is <em>allowed</em> to do.</p>
 <h3 id="system-prompt-injection">System Prompt Injection</h3>
-<p>When in Plan or Review mode, the <code>AgentModeMiddleware</code> injects a system reminder that:
-- Reminds the agent of its mode restrictions
-- Clarifies what actions are allowed
-- Provides guidance on the mode's purpose</p>
-<h3 id="permission-handling">Permission Handling</h3>
-<p>In Plan and Review modes:
-- Mutating tools are automatically denied
-- No permission prompts are shown (access is denied by design)
-- The agent receives clear feedback about mode restrictions</p>
+<p>In Plan and Review mode the <code>AgentModeMiddleware</code> injects the configured reminder before each model call. The reminder is the only effect of the mode on the model.</p>
+<h3 id="enforcement">Enforcement</h3>
+<p>Tools are not filtered or denied by mode. To restrict a mode, enforce it yourself:</p>
+<ul>
+<li>give a profile only the tools it needs, and</li>
+<li>use a <code>pre_tool_use</code> hook, which sees the mode as <code>permission_mode</code> (<code>default</code> = build, <code>plan</code> = plan, <code>accept_edits</code> = review) and can block the call. See <code>examples/confs/trading_desk.toml</code>.</li>
+</ul>
 <h2 id="use-cases">Use Cases</h2>
 <h3 id="development-workflow">Development Workflow</h3>
 <ol>
@@ -2731,34 +2649,14 @@ unsupported Preview variants are never sent.</p>
 <span class="normal"><a href="#__codelineno-9-5">5</a></span>
 <span class="normal"><a href="#__codelineno-9-6">6</a></span>
 <span class="normal"><a href="#__codelineno-9-7">7</a></span>
-<span class="normal"><a href="#__codelineno-9-8">8</a></span>
-<span class="normal"><a href="#__codelineno-9-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a><span class="k">[[middleware]]</span>
+<span class="normal"><a href="#__codelineno-9-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a><span class="k">[[middleware]]</span>
 <a id="__codelineno-9-2" name="__codelineno-9-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
-<a id="__codelineno-9-3" name="__codelineno-9-3"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"build"</span>
-<a id="__codelineno-9-4" name="__codelineno-9-4"></a><span class="n">reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
-<a id="__codelineno-9-5" name="__codelineno-9-5"></a><span class="s2">Custom plan mode reminder here.</span>
-<a id="__codelineno-9-6" name="__codelineno-9-6"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
-<a id="__codelineno-9-7" name="__codelineno-9-7"></a><span class="n">review_reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
-<a id="__codelineno-9-8" name="__codelineno-9-8"></a><span class="s2">Custom review mode reminder here.</span>
-<a id="__codelineno-9-9" name="__codelineno-9-9"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
-</code></pre></div></td></tr></table></div>
-<h3 id="mode-specific-tools">Mode-Specific Tools</h3>
-<p>Configure different tools per mode:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-10-1">1</a></span>
-<span class="normal"><a href="#__codelineno-10-2">2</a></span>
-<span class="normal"><a href="#__codelineno-10-3">3</a></span>
-<span class="normal"><a href="#__codelineno-10-4">4</a></span>
-<span class="normal"><a href="#__codelineno-10-5">5</a></span>
-<span class="normal"><a href="#__codelineno-10-6">6</a></span>
-<span class="normal"><a href="#__codelineno-10-7">7</a></span>
-<span class="normal"><a href="#__codelineno-10-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="c1"># Build mode tools (default)</span>
-<a id="__codelineno-10-2" name="__codelineno-10-2"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
-<a id="__codelineno-10-3" name="__codelineno-10-3"></a>
-<a id="__codelineno-10-4" name="__codelineno-10-4"></a><span class="c1"># Plan mode tools (automatically filtered)</span>
-<a id="__codelineno-10-5" name="__codelineno-10-5"></a><span class="c1"># Only read-only tools are available</span>
-<a id="__codelineno-10-6" name="__codelineno-10-6"></a>
-<a id="__codelineno-10-7" name="__codelineno-10-7"></a><span class="c1"># Review mode tools (automatically filtered)</span>
-<a id="__codelineno-10-8" name="__codelineno-10-8"></a><span class="c1"># Only read-only tools are available</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3"></a><span class="n">reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
+<a id="__codelineno-9-4" name="__codelineno-9-4"></a><span class="s2">Custom plan mode reminder here.</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
+<a id="__codelineno-9-6" name="__codelineno-9-6"></a><span class="n">review_reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
+<a id="__codelineno-9-7" name="__codelineno-9-7"></a><span class="s2">Custom review mode reminder here.</span>
+<a id="__codelineno-9-8" name="__codelineno-9-8"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="best-practices">Best Practices</h2>
 <h3 id="when-to-use-each-mode">When to Use Each Mode</h3>
@@ -2795,7 +2693,7 @@ unsupported Preview variants are never sent.</p>
 <li>Check that <code>AgentModeMiddleware</code> is in the middleware stack</li>
 <li>Verify the mode is actually set in the session configuration</li>
 <li>Check logs for mode-related warnings</li>
-<li>Ensure mutating tools are in the <code>mutating_tools</code> list</li>
+<li>Remember modes only inject reminders; enforce restrictions with <code>tools</code>, <code>[agent.permissions]</code> or hooks</li>
 </ol>
 <h3 id="mode-not-switching">Mode Not Switching</h3>
 <ol>
@@ -2806,8 +2704,8 @@ unsupported Preview variants are never sent.</p>
 </ol>
 <h3 id="permission-errors-in-build-mode">Permission Errors in Build Mode</h3>
 <ol>
-<li>Verify <code>assume_mutating</code> setting</li>
-<li>Check <code>mutating_tools</code> configuration</li>
+<li>Check <code>[agent.permissions]</code> (<code>ask</code> / <code>always_ask</code>) and the <code>permission_request</code> hooks</li>
+<li>Check that <code>tools</code> selects the tool</li>
 <li>Ensure tools are properly registered</li>
 <li>Check for tool-specific permission requirements</li>
 </ol>
