@@ -47,6 +47,17 @@ impl DiffPaths {
         }
     }
 
+    /// Fold `other` into `self`, keeping each list sorted and free of duplicates.
+    pub fn merge(&mut self, other: DiffPaths) {
+        self.added.extend(other.added);
+        self.modified.extend(other.modified);
+        self.removed.extend(other.removed);
+        for list in [&mut self.added, &mut self.modified, &mut self.removed] {
+            list.sort();
+            list.dedup();
+        }
+    }
+
     /// Get all files that were added or modified (useful for analysis)
     pub fn changed_files(&self) -> impl Iterator<Item = &PathBuf> {
         self.added.iter().chain(self.modified.iter())

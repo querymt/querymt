@@ -456,6 +456,9 @@ impl AgentBuilder {
     }
 
     pub async fn build(mut self) -> Result<Agent> {
+        if let Some(error) = self.tool_error.take() {
+            return Err(anyhow!("invalid `tools` selector: {error}"));
+        }
         let snapshot_policy = self.snapshot_policy;
         let cwd = if let Some(path) = self.cwd {
             Some(to_absolute_path(path)?)

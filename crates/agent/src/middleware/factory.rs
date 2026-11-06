@@ -23,6 +23,20 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Reads the optional `enabled` key of a middleware config.
+///
+/// A missing key means enabled; a present value must be a boolean, so a typo
+/// such as `enabled = "false"` fails the load instead of silently enabling.
+pub fn enabled_flag(config: &Value) -> Result<bool> {
+    match config.get("enabled") {
+        None => Ok(true),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(other) => Err(anyhow::anyhow!(
+            "middleware `enabled` must be a boolean, got {other}"
+        )),
+    }
+}
+
 /// Factory trait for creating middleware from config
 ///
 /// Implement this trait for each middleware type that should be configurable

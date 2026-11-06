@@ -44,6 +44,11 @@ impl Tool for TodoWriteTool {
         "todowrite"
     }
 
+    fn is_read_only(&self) -> bool {
+        // Touches session or knowledge state, never the workspace files.
+        true
+    }
+
     fn definition(&self) -> ChatTool {
         ChatTool {
             tool_type: "function".to_string(),

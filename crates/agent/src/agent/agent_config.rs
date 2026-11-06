@@ -293,7 +293,6 @@ impl AgentConfig {
     }
 
     /// Prepares a snapshot configuration if enabled.
-    #[allow(dead_code)]
     pub fn prepare_snapshot(
         &self,
         cwd: Option<&std::path::Path>,

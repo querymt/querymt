@@ -378,11 +378,7 @@ impl MiddlewareFactory for ParallelEditGuardFactory {
         config: &Value,
         agent_config: &crate::agent::agent_config::AgentConfig,
     ) -> AnyhowResult<Option<Arc<dyn MiddlewareDriver>>> {
-        let enabled = config
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        if !enabled {
+        if !crate::middleware::enabled_flag(config)? {
             return Ok(None);
         }
 
@@ -983,6 +979,15 @@ mod tests {
             let msg = err.to_string();
             assert!(msg.contains("mode"), "{msg}");
         }
+    }
+
+    #[tokio::test]
+    async fn factory_rejects_a_non_boolean_enabled() {
+        let err = run_factory(json!({"enabled": "false"}))
+            .await
+            .err()
+            .expect("non-boolean enabled must fail");
+        assert!(err.to_string().contains("enabled"), "{err}");
     }
 
     #[tokio::test]

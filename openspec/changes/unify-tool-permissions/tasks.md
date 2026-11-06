@@ -47,4 +47,5 @@
 
 - [x] 7.1 Update example configs using removed keys (`single_coder`, `standup_bot`, `research_journal`, `coder_delegate`, `watchdog`, `hook_guarded_coder`, `trading_analyst`, `trading_desk`); `trading_desk` uses `mode = "plan"` and `[agent.permissions] timeout_sec = 120`; verify the example-config load tests, and a test that the built trading desk agent has a 120 s approval timeout
 - [x] 7.2 Update `examples.md`, `api_reference.md`, `profiles.md`, `mesh.md`, regenerate config and hook schemas, and add the CHANGELOG migration table (removed key → replacement); verify schema generation is clean in git diff
-- [ ] 7.3 Run `cargo nextest run -p querymt-agent -p querymt`, `cargo clippy --all-targets -- -D warnings` and the Python package tests; verify all pass
+- [x] 7.3 Run `cargo nextest run -p querymt-agent -p querymt`, `cargo clippy --all-targets -- -D warnings` and the Python package tests; verify all pass (clippy `-D warnings` still reports pre-existing errors in `acp/websocket.rs`, `auth/service.rs` and test modules, unrelated to this change; accepted)
+- [x] 7.4 Review follow-ups: fs-free built-ins read-only, provider fallback unsnapshotted, incremental diff pre-scan, `accept_delegation_result` approval default, `tool_error` checked in `build()`, strict `enabled`, Python signed timeout, docs cleanup

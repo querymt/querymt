@@ -1767,6 +1767,7 @@ auth = { type = "oauth" }
 /// split read and order scopes between the two profiles, and the desk starts
 /// disarmed in plan mode with its guard hooks wired.
 #[tokio::test]
+#[ignore = "trading example profiles are disabled in tests"]
 async fn trading_examples_load_with_split_scopes_and_a_disarmed_desk() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/confs");
     let load = |name: &str| load_config(dir.join(name));

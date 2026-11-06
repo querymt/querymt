@@ -57,6 +57,23 @@ pub enum ApprovalNeed {
     EveryCall { reason: Option<String> },
 }
 
+impl ApprovalNeed {
+    /// The stricter of two needs: `EveryCall` over `Session` over `None`.
+    /// On a tie the receiver (and its reason) wins.
+    pub fn stricter(self, other: Self) -> Self {
+        let rank = |need: &Self| match need {
+            Self::None => 0,
+            Self::Session => 1,
+            Self::EveryCall { .. } => 2,
+        };
+        if rank(&other) > rank(&self) {
+            other
+        } else {
+            self
+        }
+    }
+}
+
 /// Runtime approval policy of an agent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Permissions {
@@ -135,6 +152,25 @@ impl Permissions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stricter_orders_every_call_over_session_over_none() {
+        let every = || ApprovalNeed::EveryCall { reason: None };
+        assert_eq!(
+            ApprovalNeed::None.stricter(ApprovalNeed::Session),
+            ApprovalNeed::Session
+        );
+        assert_eq!(
+            ApprovalNeed::Session.stricter(ApprovalNeed::None),
+            ApprovalNeed::Session
+        );
+        assert_eq!(ApprovalNeed::Session.stricter(every()), every());
+        assert_eq!(every().stricter(ApprovalNeed::Session), every());
+        assert_eq!(
+            ApprovalNeed::None.stricter(ApprovalNeed::None),
+            ApprovalNeed::None
+        );
+    }
 
     fn perms() -> Permissions {
         let cfg: PermissionsConfig = toml::from_str(

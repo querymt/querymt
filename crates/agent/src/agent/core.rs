@@ -225,6 +225,11 @@ pub struct SessionRuntime {
     pub pre_turn_snapshot_task: PreTurnSnapshotTask,
     /// Accumulated changed file paths across the entire turn (for end-of-turn dedup check)
     pub turn_diffs: ParkingMutex<crate::index::DiffPaths>,
+    /// Workspace tree after the last diff snapshot, keyed by root. Seeds the
+    /// next pre-call scan so unchanged files (same size and mtime) are not
+    /// re-hashed.
+    pub last_snapshot_tree:
+        ParkingMutex<Option<(std::path::PathBuf, Arc<crate::index::merkle::MerkleTree>)>>,
     /// Execution permit ensuring only one prompt runs at a time for this session.
     /// Uses a semaphore with capacity 1 to guarantee FIFO ordering of concurrent prompts.
     /// This prevents race conditions where user messages are inserted between
@@ -288,6 +293,7 @@ impl SessionRuntime {
             turn_snapshot: ParkingMutex::new(None),
             pre_turn_snapshot_task: ParkingMutex::new(None),
             turn_diffs: ParkingMutex::new(Default::default()),
+            last_snapshot_tree: ParkingMutex::new(None),
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             mutation_gate: Arc::new(OnceCell::new()),
             slash_registry: OnceCell::new(),

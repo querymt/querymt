@@ -93,7 +93,7 @@ pub struct QuorumSettings {
     /// - `"diff"`: Capture file diffs between snapshots.
     /// - `"metadata"`: Capture file metadata only.
     /// - absent / `null`: No snapshots.
-    #[serde(default = "default_snapshot_policy")]
+    #[serde(default)]
     #[schemars(extend("enum" = ["diff", "metadata"]))]
     pub snapshot_policy: Option<String>,
 
@@ -128,10 +128,6 @@ pub struct QuorumSettings {
 
 fn default_true() -> bool {
     true
-}
-
-fn default_snapshot_policy() -> Option<String> {
-    None
 }
 
 /// Planner agent configuration.

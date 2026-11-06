@@ -134,6 +134,13 @@ impl ToolTrait for AcceptDelegationResultTool {
         }
     }
 
+    fn default_approval(&self) -> crate::config::ApprovalNeed {
+        // Integration rewrites tracked files and advances the branch, so it
+        // asks once per session ("Allow for this session" is offered).
+        // `permissions.always_ask` makes it ask on every call instead.
+        crate::config::ApprovalNeed::Session
+    }
+
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[CapabilityRequirement::Filesystem]
     }

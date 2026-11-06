@@ -95,7 +95,10 @@ resolved during preparation from the registry and MCP snapshot. It yields the `T
 ### D7. Snapshots from declared effect
 - `Tool::is_read_only(&self) -> bool { false }`; overridden to `true` in read-only built-ins: `read_tool`, `index`, `glob`, `search_text`, `ls`, `mdq`, `get_function`, `get_symbol`, `find_symbol_references`, `language_query`, `web_fetch`, `browse`, `read_task`, `todoread`, `knowledge_query`, `knowledge_stats`, `knowledge_list_unconsolidated`, `session_history`, `question`.
 - `McpToolAdapter::is_read_only()` in `crates/querymt` returns `annotations.read_only_hint == Some(true)`.
-- `ToolTarget::is_read_only()`; `Provider` → false. `should_snapshot_tool`, `mutating_tools`, `assume_mutating` and `requires_permission_for_tool` are deleted.
+- Also read-only because they never touch workspace files: `delegate`, `skill`, `todowrite`, `create_task`, `update_task`, `complete_task`, `knowledge_ingest`, `knowledge_consolidate`, `use_remote_provider`, `route_delegation_to_peer`. `accept_delegation_result`, `shell` and the edit tools are not.
+- `ToolTarget::is_read_only()`; `Provider` → true (the agent never registers provider tools; the fallback only fails or reaches tools added to the LLM client).
+- `SessionRuntime::last_snapshot_tree` caches the post-call tree per root; the next diff pre-scan uses `scan_with_previous`.
+- `Tool::default_approval()` (default `None`) lets a tool demand approval itself; `accept_delegation_result` returns `Session` ("Allow for this session" offered; `always_ask` makes it every-call). The effective need is `permissions.need(..).stricter(default_approval)`; a `pre_tool_use` allow hook still skips it. `should_snapshot_tool`, `mutating_tools`, `assume_mutating` and `requires_permission_for_tool` are deleted.
 
 Trusting an MCP hint is acceptable here because a snapshot only enables undo; approval never depends on hints.
 

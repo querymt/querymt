@@ -109,10 +109,6 @@ pub(super) struct PreparedCall {
     pub approval: ApprovalNeed,
     /// Context contributed by pre-tool hooks, delivered with the call's result.
     pub hook_contexts: Vec<crate::hooks::HookContextContribution>,
-    /// The call's outer input was invalid (provider-marked, malformed or not an
-    /// object) and it was rejected before hooks. `args` is not meaningful then.
-    #[allow(dead_code)]
-    pub invalid_input: bool,
     pub disposition: Disposition,
     /// The call's `agent.tool.execute` span, shared by preparation and
     /// execution.
@@ -234,7 +230,6 @@ async fn prepare_tool_call_inner(
             target: ToolTarget::Provider,
             approval: ApprovalNeed::None,
             hook_contexts: Vec::new(),
-            invalid_input: true,
             disposition: Disposition::Rejected(Box::new(invalid_input_result(call))),
             span: Span::none(),
         });
@@ -259,7 +254,6 @@ async fn prepare_tool_call_inner(
             target: ToolTarget::Provider,
             approval: ApprovalNeed::None,
             hook_contexts: Vec::new(),
-            invalid_input: false,
             disposition: Disposition::Rejected(Box::new(result)),
             span: Span::none(),
         }
@@ -320,7 +314,8 @@ async fn prepare_tool_call_inner(
         }
         None => config
             .permissions
-            .need(target.tool_ref(&call.function.name)),
+            .need(target.tool_ref(&call.function.name))
+            .stricter(target.default_approval()),
     };
     let hook_contexts = hook_result.context_contributions;
 
@@ -383,7 +378,6 @@ async fn prepare_tool_call_inner(
         target,
         approval,
         hook_contexts,
-        invalid_input: false,
         disposition: Disposition::Ready,
         span: Span::none(),
     })
@@ -574,6 +568,8 @@ async fn execute_prepared_inner(
                 let changed_paths = post_tree.diff_paths(&pre_tree);
                 (post_tree, changed_paths)
             });
+            let root_hash = post_tree.root_hash;
+            *exec_ctx.runtime.last_snapshot_tree.lock() = Some((root, Arc::new(post_tree)));
             config.emit_event(
                 &exec_ctx.session_id,
                 AgentEventKind::SnapshotEnd {
@@ -581,7 +577,7 @@ async fn execute_prepared_inner(
                 },
             );
             Some(MessagePart::Snapshot {
-                root_hash: post_tree.root_hash,
+                root_hash,
                 changed_paths,
             })
         }
@@ -814,12 +810,22 @@ impl ToolTarget {
         }
     }
 
-    /// Provider tools are always treated as mutating.
+    /// Approval the tool itself demands (built-ins only).
+    fn default_approval(&self) -> ApprovalNeed {
+        match self {
+            Self::Builtin(tool) => tool.default_approval(),
+            _ => ApprovalNeed::None,
+        }
+    }
+
+    /// Whether the call needs no workspace snapshot. The provider fallback is
+    /// never registered by the agent (it only reaches tools added to the LLM
+    /// client directly), so it is not snapshotted.
     fn is_read_only(&self) -> bool {
         match self {
             Self::Builtin(tool) => tool.is_read_only(),
             Self::Mcp(adapter) => adapter.is_read_only(),
-            Self::Provider => false,
+            Self::Provider => true,
         }
     }
 
@@ -987,7 +993,19 @@ fn begin_snapshot(
                 );
                 match policy {
                     SnapshotPolicy::Diff => {
-                        let pre_tree = crate::index::merkle::MerkleTree::scan(root.as_path());
+                        // Seed with the previous post-call tree so only files whose
+                        // size or mtime changed since then are re-hashed.
+                        let previous = exec_ctx
+                            .runtime
+                            .last_snapshot_tree
+                            .lock()
+                            .as_ref()
+                            .filter(|(cached_root, _)| *cached_root == root)
+                            .map(|(_, tree)| Arc::clone(tree));
+                        let pre_tree = crate::index::merkle::MerkleTree::scan_with_previous(
+                            root.as_path(),
+                            previous.as_deref(),
+                        );
                         SnapshotState::Diff { pre_tree, root }
                     }
                     SnapshotPolicy::Metadata => SnapshotState::Metadata { root },
@@ -1947,30 +1965,12 @@ pub(super) async fn store_all_tool_results(
         if let Some(ref snapshot) = result.snapshot_part
             && let Some(paths) = snapshot.changed_paths()
         {
-            combined.added.extend(paths.added.iter().cloned());
-            combined.modified.extend(paths.modified.iter().cloned());
-            combined.removed.extend(paths.removed.iter().cloned());
+            combined.merge(paths.clone());
         }
     }
 
-    combined.added.sort();
-    combined.added.dedup();
-    combined.modified.sort();
-    combined.modified.dedup();
-    combined.removed.sort();
-    combined.removed.dedup();
-
     if !combined.is_empty() {
-        let mut diffs = exec_ctx.runtime.turn_diffs.lock();
-        diffs.added.extend(combined.added);
-        diffs.modified.extend(combined.modified);
-        diffs.removed.extend(combined.removed);
-        diffs.added.sort();
-        diffs.added.dedup();
-        diffs.modified.sort();
-        diffs.modified.dedup();
-        diffs.removed.sort();
-        diffs.removed.dedup();
+        exec_ctx.runtime.turn_diffs.lock().merge(combined);
     }
 
     if let Some(wait_condition) = WaitCondition::merge(wait_conditions) {
@@ -3156,6 +3156,8 @@ mod prepared_call_tests {
     struct Recorder {
         invocations: Arc<Mutex<Vec<Value>>>,
         read_only: bool,
+        /// Approval the tool itself demands (`Tool::default_approval`).
+        approval: ApprovalNeed,
     }
 
     #[async_trait::async_trait]
@@ -3184,6 +3186,9 @@ mod prepared_call_tests {
         }
         fn is_read_only(&self) -> bool {
             self.read_only
+        }
+        fn default_approval(&self) -> ApprovalNeed {
+            self.approval.clone()
         }
         fn arg_aliases(&self) -> &'static [ArgAlias] {
             ALIASES
@@ -3246,6 +3251,7 @@ mod prepared_call_tests {
             registry.add(Arc::new(Recorder {
                 invocations: self.invocations.clone(),
                 read_only: false,
+                approval: ApprovalNeed::None,
             }));
             let mut builder = AgentConfigBuilder::from_provider(
                 self.agent.storage.clone(),
@@ -3419,6 +3425,7 @@ mod prepared_call_tests {
         registry.add(Arc::new(Recorder {
             invocations: fx.invocations.clone(),
             read_only,
+            approval: ApprovalNeed::None,
         }));
         AgentConfigBuilder::from_provider(
             fx.agent.storage.clone(),
@@ -3460,6 +3467,214 @@ mod prepared_call_tests {
         let result = run_in_workspace(&fx, false).await;
         assert!(!result.is_error, "{}", text(&result));
         assert!(result.snapshot_part.is_some());
+    }
+
+    fn config_with_approval(
+        fx: &Fixture,
+        approval: ApprovalNeed,
+        hooks: Option<Hooks>,
+    ) -> crate::agent::agent_config::AgentConfig {
+        let mut registry = ToolRegistry::new();
+        registry.add(Arc::new(Recorder {
+            invocations: fx.invocations.clone(),
+            read_only: false,
+            approval,
+        }));
+        let mut builder = AgentConfigBuilder::from_provider(
+            fx.agent.storage.clone(),
+            fx.agent.config.provider.clone(),
+            fx.agent.storage.event_journal(),
+        )
+        .with_tool_registry(registry)
+        .with_permissions(
+            crate::config::Permissions::new().timeout(std::time::Duration::from_millis(50)),
+        );
+        if let Some(hooks) = hooks {
+            builder = builder.with_hooks(hooks);
+        }
+        builder.build()
+    }
+
+    #[tokio::test]
+    async fn tool_declared_approval_prompts_without_any_config() {
+        let fx = Fixture::new().await;
+        let config = config_with_approval(&fx, ApprovalNeed::EveryCall { reason: None }, None);
+
+        let result = run(
+            &fx,
+            &config,
+            json!({"file_path": "a.rs", "new_string": "y"}),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert!(
+            text(&result).contains("the tool was not run"),
+            "{}",
+            text(&result)
+        );
+        assert!(fx.invoked().is_empty(), "tool must not run unconfirmed");
+    }
+
+    /// Runs `rec_edit` once in `exec` under `config`.
+    async fn run_in(
+        config: &crate::agent::agent_config::AgentConfig,
+        exec: &crate::agent::execution_context::ExecutionContext,
+        id: &str,
+    ) -> ToolResult {
+        let call = mock_tool_call(id, "rec_edit", r#"{"file_path":"a.rs","new_string":"y"}"#);
+        execute_tool_call(config, &call, exec).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_default_approval_prompts_until_granted_for_the_session() {
+        let fx = Fixture::new().await;
+        let config = config_with_approval(&fx, ApprovalNeed::Session, None);
+        let exec = fx.agent.execution_context().await;
+
+        // No grant yet: the prompt is raised and (unanswered) times out.
+        let denied = run_in(&config, &exec, "c1").await;
+        assert!(denied.is_error, "{}", text(&denied));
+        assert!(fx.invoked().is_empty());
+
+        // "Allow for this session" is what records this grant.
+        exec.runtime
+            .session_grants
+            .lock()
+            .insert(ToolRef::builtin("rec_edit"));
+        let allowed = run_in(&config, &exec, "c2").await;
+        assert!(!allowed.is_error, "{}", text(&allowed));
+        assert_eq!(fx.invoked().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn always_ask_overrides_a_session_grant_of_a_session_default() {
+        let fx = Fixture::new().await;
+        let mut config = config_with_approval(&fx, ApprovalNeed::Session, None);
+        config.permissions = crate::config::Permissions::new()
+            .always_ask(["rec_edit".parse().unwrap()])
+            .timeout(std::time::Duration::from_millis(50));
+        let exec = fx.agent.execution_context().await;
+        exec.runtime
+            .session_grants
+            .lock()
+            .insert(ToolRef::builtin("rec_edit"));
+
+        let result = run_in(&config, &exec, "c1").await;
+
+        assert!(result.is_error, "every-call need ignores session grants");
+        assert!(fx.invoked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_allow_skips_the_tool_declared_approval() {
+        let fx = Fixture::new().await;
+        let hooks = fx.hooks(json!({"hook_specific_output": {
+            "hook_event_name": "pre_tool_use",
+            "permission_decision": "allow"
+        }}));
+        let config =
+            config_with_approval(&fx, ApprovalNeed::EveryCall { reason: None }, Some(hooks));
+
+        let result = run(
+            &fx,
+            &config,
+            json!({"file_path": "a.rs", "new_string": "y"}),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", text(&result));
+        assert_eq!(fx.invoked().len(), 1);
+    }
+
+    /// Snapshot of a tool call in a workspace whose only tool is a recorder.
+    async fn run_named_snapshot(
+        fx: &Fixture,
+        read_only: bool,
+        dir: &std::path::Path,
+    ) -> ToolResult {
+        let exec = fx.agent.execution_context_in(dir.to_path_buf()).await;
+        let config = snapshot_config(fx, read_only);
+        let call = mock_tool_call(
+            "call-1",
+            "rec_edit",
+            &json!({"file_path": "a.rs", "new_string": "y"}).to_string(),
+        );
+        execute_tool_call(&config, &call, &exec).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn diff_snapshot_reuses_the_previous_tree_and_reports_new_changes() {
+        let fx = Fixture::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "one").unwrap();
+        let exec = fx
+            .agent
+            .execution_context_in(dir.path().to_path_buf())
+            .await;
+        let mut registry = ToolRegistry::new();
+        registry.add(Arc::new(Recorder {
+            invocations: fx.invocations.clone(),
+            read_only: false,
+            approval: ApprovalNeed::None,
+        }));
+        let config = AgentConfigBuilder::from_provider(
+            fx.agent.storage.clone(),
+            fx.agent.config.provider.clone(),
+            fx.agent.storage.event_journal(),
+        )
+        .with_tool_registry(registry)
+        .with_snapshot_policy(SnapshotPolicy::Diff)
+        .build();
+        let call = |id: &str| {
+            mock_tool_call(
+                id,
+                "rec_edit",
+                &json!({"file_path": "a.rs", "new_string": "y"}).to_string(),
+            )
+        };
+
+        let first = execute_tool_call(&config, &call("c1"), &exec)
+            .await
+            .unwrap();
+        assert!(first.snapshot_part.is_some());
+        assert!(exec.runtime.last_snapshot_tree.lock().is_some());
+
+        // A change between calls is still reported by the next snapshot.
+        let before = exec
+            .runtime
+            .last_snapshot_tree
+            .lock()
+            .as_ref()
+            .map(|(_, tree)| tree.root_hash)
+            .unwrap();
+        std::fs::write(dir.path().join("b.rs"), "new file").unwrap();
+        let second = execute_tool_call(&config, &call("c2"), &exec)
+            .await
+            .unwrap();
+        assert!(second.snapshot_part.is_some());
+        let after = exec
+            .runtime
+            .last_snapshot_tree
+            .lock()
+            .as_ref()
+            .map(|(_, tree)| tree.root_hash)
+            .unwrap();
+        assert_ne!(before, after, "cached tree is refreshed after each call");
+    }
+
+    #[tokio::test]
+    async fn read_only_declaration_takes_no_snapshot_in_a_workspace() {
+        let fx = Fixture::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let result = run_named_snapshot(&fx, true, dir.path()).await;
+        assert!(result.snapshot_part.is_none());
+    }
+
+    #[test]
+    fn provider_fallback_and_missing_tools_take_no_snapshot() {
+        assert!(ToolTarget::Provider.is_read_only());
+        assert_eq!(ToolTarget::Provider.default_approval(), ApprovalNeed::None);
     }
 
     #[tokio::test]

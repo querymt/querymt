@@ -410,10 +410,21 @@ pub trait Tool: Send + Sync {
         self.definition()
     }
 
-    /// Whether the tool only reads state. Read-only tools take no snapshot.
-    /// Default: `false`, so a missing override only costs an extra snapshot.
+    /// Whether the tool leaves workspace files untouched (it only reads, or
+    /// only changes session / knowledge state). Such calls take no snapshot.
+    /// Default: `false`, so a missing override costs two workspace scans and
+    /// may trigger duplicate-code review and re-indexing of changed files.
     fn is_read_only(&self) -> bool {
         false
+    }
+
+    /// Approval the tool demands regardless of the agent's `permissions`
+    /// lists. The effective need is the stricter of this and the lists
+    /// (`always_ask` makes a `Session` default ask on every call). A
+    /// `pre_tool_use` hook that allows the call still skips the prompt.
+    /// Default: none.
+    fn default_approval(&self) -> crate::config::ApprovalNeed {
+        crate::config::ApprovalNeed::None
     }
 
     /// Capabilities this tool requires. Default: empty.

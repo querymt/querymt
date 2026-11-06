@@ -261,6 +261,7 @@ def test_invalid_arguments_raise_clear_errors(repo, tmp_path):
         ({"mode": "plna"}, "mode"),
         ({"ask": ["a.*.b"]}, "selector"),
         ({"approval_timeout_sec": 0}, "positive"),
+        ({"approval_timeout_sec": -5}, "positive"),
     ],
 )
 def test_invalid_approval_arguments_raise_value_error(kwargs, needle):

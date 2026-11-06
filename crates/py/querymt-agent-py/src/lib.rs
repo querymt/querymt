@@ -56,7 +56,7 @@ impl PyAgent {
         db: Option<String>,
         ask: Option<Vec<String>>,
         always_ask: Option<Vec<String>>,
-        approval_timeout_sec: Option<u64>,
+        approval_timeout_sec: Option<i64>,
         mode: Option<String>,
         max_steps: Option<usize>,
         max_prompt_bytes: Option<usize>,
@@ -437,14 +437,12 @@ fn querymt_agent(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// Translate `worktrees=` (`True`/`False`/`None` or a settings dict) into
-/// workspace settings. Unknown keys raise `ValueError`.
-/// Approval lists and timeout; a bad selector or a zero timeout raises
-/// `ValueError` at the call site.
+/// Approval lists and timeout; a bad selector or a non-positive timeout
+/// raises `ValueError` at the call site.
 fn parse_permissions(
     ask: Option<Vec<String>>,
     always_ask: Option<Vec<String>>,
-    timeout_sec: Option<u64>,
+    timeout_sec: Option<i64>,
 ) -> PyResult<Option<Permissions>> {
     if ask.is_none() && always_ask.is_none() && timeout_sec.is_none() {
         return Ok(None);
@@ -459,9 +457,11 @@ fn parse_permissions(
         .ask(specs(ask)?)
         .always_ask(specs(always_ask)?);
     if let Some(secs) = timeout_sec {
-        let secs = std::num::NonZeroU64::new(secs)
+        let secs = u64::try_from(secs)
+            .ok()
+            .filter(|secs| *secs > 0)
             .ok_or_else(|| PyValueError::new_err("approval_timeout_sec must be positive"))?;
-        permissions = permissions.timeout(std::time::Duration::from_secs(secs.get()));
+        permissions = permissions.timeout(std::time::Duration::from_secs(secs));
     }
     Ok(Some(permissions))
 }

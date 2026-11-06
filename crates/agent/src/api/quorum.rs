@@ -297,6 +297,21 @@ impl QuorumBuilder {
     }
 
     pub async fn build(mut self) -> Result<super::agent::Agent> {
+        if let Some(error) = self
+            .planner_config
+            .as_ref()
+            .and_then(|c| c.tool_error.as_ref())
+        {
+            return Err(anyhow!("planner: invalid `tools` selector: {error}"));
+        }
+        if let Some(delegate) = self.delegates.iter().find(|d| d.tool_error.is_some())
+            && let Some(error) = &delegate.tool_error
+        {
+            return Err(anyhow!(
+                "delegate '{}': invalid `tools` selector: {error}",
+                delegate.id
+            ));
+        }
         let cwd = self.cwd.clone().map(to_absolute_path).transpose()?;
         let dotagents_options = self.dotagents_options.take();
         let dotagents_strictness = dotagents_options
@@ -1457,6 +1472,31 @@ include_external = false
 "#
         );
         toml::from_str(&toml).expect("parse skill quorum config")
+    }
+
+    #[tokio::test]
+    async fn build_reports_a_malformed_planner_tool_selector() {
+        let err = QuorumBuilder::new()
+            .planner(|p| p.provider("openai", "gpt-4").tools(["github."]))
+            .build()
+            .await
+            .err()
+            .expect("malformed selector must fail the build");
+        assert!(err.to_string().contains("planner"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn build_reports_a_malformed_delegate_tool_selector() {
+        let err = QuorumBuilder::new()
+            .planner(|p| p.provider("openai", "gpt-4").tools(["delegate"]))
+            .delegate("coder", |d| {
+                d.provider("ollama", "model").tools(["github."])
+            })
+            .build()
+            .await
+            .err()
+            .expect("malformed selector must fail the build");
+        assert!(err.to_string().contains("delegate 'coder'"), "{err}");
     }
 
     #[test]

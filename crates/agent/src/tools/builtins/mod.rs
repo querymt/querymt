@@ -427,14 +427,22 @@ mod read_only_tests {
     use super::all_builtin_tools;
     use std::collections::BTreeSet;
 
-    /// Built-ins that only read state; everything else takes a snapshot.
+    /// Built-ins that never change workspace files (they read, or only touch
+    /// session / knowledge state); everything else takes a snapshot. The remote
+    /// tools `use_remote_provider` and `route_delegation_to_peer` are also
+    /// read-only but are registered outside `all_builtin_tools`.
     const READ_ONLY: &[&str] = &[
         "browse",
+        "complete_task",
+        "create_task",
+        "delegate",
         "find_symbol_references",
         "get_function",
         "get_symbol",
         "glob",
         "index",
+        "knowledge_consolidate",
+        "knowledge_ingest",
         "knowledge_list_unconsolidated",
         "knowledge_query",
         "knowledge_stats",
@@ -447,6 +455,8 @@ mod read_only_tests {
         "search_text",
         "session_history",
         "todoread",
+        "todowrite",
+        "update_task",
         "web_fetch",
     ];
 
@@ -462,6 +472,19 @@ mod read_only_tests {
     }
 
     #[test]
+    fn only_accept_delegation_result_demands_approval_by_default() {
+        use crate::config::ApprovalNeed;
+        for tool in all_builtin_tools() {
+            let expected = if tool.name() == "accept_delegation_result" {
+                ApprovalNeed::Session
+            } else {
+                ApprovalNeed::None
+            };
+            assert_eq!(tool.default_approval(), expected, "{}", tool.name());
+        }
+    }
+
+    #[test]
     fn mutating_builtins_are_not_read_only() {
         let tools = all_builtin_tools();
         for name in [
@@ -471,13 +494,7 @@ mod read_only_tests {
             "delete_file",
             "replace_symbol",
             "shell",
-            "create_task",
-            "update_task",
-            "complete_task",
-            "knowledge_ingest",
-            "knowledge_consolidate",
-            "delegate",
-            "todowrite",
+            "accept_delegation_result",
         ] {
             let tool = tools
                 .iter()

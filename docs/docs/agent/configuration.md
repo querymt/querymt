@@ -895,12 +895,13 @@ Approval works the same for built-in, MCP and provider tools, and runs before th
 | Tool matched by `always_ask` (wins over `ask`) | Allow once, Reject |
 | `pre_tool_use` hook returns `ask` | Allow once, Reject; the hook's reason is the prompt title |
 | `pre_tool_use` hook returns `allow` | No prompt, even for a listed tool |
+| Tool that asks by default (`accept_delegation_result`), no configuration | Allow once, Allow for this session, Reject; listing it in `always_ask` asks on every call; a `pre_tool_use` `allow` hook skips it |
 
 "Allow for this session" covers later calls of the same server-qualified tool in that session only. It never applies to `always_ask` tools, hook asks or other sessions, and a rejection is never remembered. A denied call returns an error to the model that names the reason (rejected, timed out, run cancelled, task not active, or the `permission_request` hook's message) and says the tool was not run. A call whose task is not active is denied without a prompt.
 
 `timeout_sec` applies to every prompt, including hook asks when both lists are empty. Unattended profiles (schedules, headless runs) must set it, or add `permission_request` hooks, otherwise they wait at the first prompt. A prompt that is not answered, or whose client is not attached, is never granted automatically. See [Session Interactions](mesh.md#session-interactions) for the full lifecycle and the all-nodes-upgrade requirement (`RemoteNodeUpgradeRequired`).
 
-Snapshots no longer need configuration: a call is snapshotted unless its tool declares itself read-only (built-in read-only tools, or an MCP tool with `readOnlyHint = true`). Provider tools are always snapshotted.
+Snapshots need no per-tool list. A call is snapshotted when a snapshot policy other than `none` is enabled (`AgentBuilder` defaults to `diff`, Quorum to `none`), the session has a working directory, and the tool does not declare itself read-only. Read-only tools are the built-ins that only read or only change session and knowledge state (for example `read_tool`, `search_text`, `delegate`, `todowrite`, `skill`) and MCP tools with `readOnlyHint = true`. Every other built-in (`edit`, `shell`, `accept_delegation_result`, ...) and every MCP tool without the hint is treated as mutating. Calls that reach no registered tool (the LLM-client provider fallback) are not snapshotted. With the `diff` policy each session reuses its last workspace tree, so a call only re-hashes files whose size or modification time changed. A delegate running in its own worktree is snapshotted in that checkout, not in the planner's.
 
 The removed keys `assume_mutating`, `mutating_tools`, `confirm_tools` and `confirm_timeout_sec` are rejected as unknown fields; see the CHANGELOG for replacements.
 

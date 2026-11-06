@@ -41,7 +41,7 @@ pub use dedup_check::{
 };
 pub use delegation::{DelegationConfig, DelegationContextMiddleware, DelegationMiddleware};
 pub use delegation_guard::DelegationGuardMiddleware;
-pub use factory::{MIDDLEWARE_REGISTRY, MiddlewareFactory, MiddlewareRegistry};
+pub use factory::{MIDDLEWARE_REGISTRY, MiddlewareFactory, MiddlewareRegistry, enabled_flag};
 pub use limits::{
     LimitsConfig, LimitsMiddleware, MaxStepsMiddleware, PriceLimitMiddleware, TurnLimitMiddleware,
 };

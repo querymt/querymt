@@ -29,6 +29,11 @@ impl ToolTrait for DelegateTool {
         "delegate"
     }
 
+    fn is_read_only(&self) -> bool {
+        // Touches session or knowledge state, never the workspace files.
+        true
+    }
+
     fn definition(&self) -> Tool {
         // Note: In the new architecture, we might not have access to the registry
         // at definition time to populate the enum. For now, we'll keep it simple.

@@ -412,7 +412,6 @@ auto = true
 
 [[middleware]]
 type = "agent_mode"
-default = "build"
 
 [[middleware]]
 type = "limits"
@@ -535,7 +534,6 @@ backend = "git"
 
 [[middleware]]
 type = "agent_mode"
-default = "build"
 
 [[middleware]]
 type = "limits"
@@ -728,7 +726,6 @@ backend = "git"
 
 [[middleware]]
 type = "agent_mode"
-default = "build"
 
 [[middleware]]
 type = "limits"
@@ -746,6 +743,7 @@ description = "Read-only code review specialist"
 tags = ["review", "read-only"]
 
 [agent]
+mode = "review"
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
 tools = [
@@ -763,7 +761,6 @@ Provide constructive feedback with specific suggestions."""
 
 [[middleware]]
 type = "agent_mode"
-default = "review"
 ```
 
 ### Example: Team Profiles in Version Control

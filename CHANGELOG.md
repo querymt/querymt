@@ -19,6 +19,15 @@
 
 ### Added
 
+- **`accept_delegation_result` asks by default** before it integrates a
+  delegate's result into the checkout, offering Allow once, Allow for this
+  session and Reject. List it in `permissions.always_ask` to ask on every call.
+  A `pre_tool_use` hook that allows the call skips the prompt; unattended
+  quorum profiles need `permissions.timeout_sec` or an allowing hook.
+- **Snapshots** skip built-ins that never touch workspace files (`delegate`,
+  `skill`, task, todo and knowledge tools) and the provider fallback, and the
+  diff policy reuses the previous workspace tree instead of re-hashing every
+  file before each call.
 - **Tool approval**: `[agent.permissions]` (also `[planner]` and
   `[[delegates]]`) with `ask`, `always_ask` and `timeout_sec`, and
   `permission_decision: "ask"` from `pre_tool_use` hooks, show one standard
