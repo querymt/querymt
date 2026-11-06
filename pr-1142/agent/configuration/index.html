@@ -3628,11 +3628,15 @@ stays in place, and the placeholder is never executed.</p>
 <td><code>pre_tool_use</code> hook returns <code>allow</code></td>
 <td>No prompt, even for a listed tool</td>
 </tr>
+<tr>
+<td>Tool that asks by default (<code>accept_delegation_result</code>), no configuration</td>
+<td>Allow once, Allow for this session, Reject; listing it in <code>always_ask</code> asks on every call; a <code>pre_tool_use</code> <code>allow</code> hook skips it</td>
+</tr>
 </tbody>
 </table>
 <p>"Allow for this session" covers later calls of the same server-qualified tool in that session only. It never applies to <code>always_ask</code> tools, hook asks or other sessions, and a rejection is never remembered. A denied call returns an error to the model that names the reason (rejected, timed out, run cancelled, task not active, or the <code>permission_request</code> hook's message) and says the tool was not run. A call whose task is not active is denied without a prompt.</p>
 <p><code>timeout_sec</code> applies to every prompt, including hook asks when both lists are empty. Unattended profiles (schedules, headless runs) must set it, or add <code>permission_request</code> hooks, otherwise they wait at the first prompt. A prompt that is not answered, or whose client is not attached, is never granted automatically. See <a href="../mesh/#session-interactions">Session Interactions</a> for the full lifecycle and the all-nodes-upgrade requirement (<code>RemoteNodeUpgradeRequired</code>).</p>
-<p>Snapshots no longer need configuration: a call is snapshotted unless its tool declares itself read-only (built-in read-only tools, or an MCP tool with <code>readOnlyHint = true</code>). Provider tools are always snapshotted.</p>
+<p>Snapshots need no per-tool list. A call is snapshotted when a snapshot policy other than <code>none</code> is enabled (<code>AgentBuilder</code> defaults to <code>diff</code>, Quorum to <code>none</code>), the session has a working directory, and the tool does not declare itself read-only. Read-only tools are the built-ins that only read or only change session and knowledge state (for example <code>read_tool</code>, <code>search_text</code>, <code>delegate</code>, <code>todowrite</code>, <code>skill</code>) and MCP tools with <code>readOnlyHint = true</code>. Every other built-in (<code>edit</code>, <code>shell</code>, <code>accept_delegation_result</code>, ...) and every MCP tool without the hint is treated as mutating. Calls that reach no registered tool (the LLM-client provider fallback) are not snapshotted. With the <code>diff</code> policy each session reuses its last workspace tree, so a call only re-hashes files whose size or modification time changed. A delegate running in its own worktree is snapshotted in that checkout, not in the planner's.</p>
 <p>The removed keys <code>assume_mutating</code>, <code>mutating_tools</code>, <code>confirm_tools</code> and <code>confirm_timeout_sec</code> are rejected as unknown fields; see the CHANGELOG for replacements.</p>
 <h2 id="scheduled-tasks-configuration">Scheduled Tasks Configuration</h2>
 <p>QueryMT supports scheduled tasks for autonomous recurring work. Schedules are created at runtime with the <code>querymt/schedules/create</code> ACP extension, not through static TOML configuration. The embedded dashboard discovers schedule capabilities through ACP.</p>
