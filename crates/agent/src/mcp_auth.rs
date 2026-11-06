@@ -127,6 +127,74 @@ mod store {
         }
     }
 
+    /// Low-cardinality class of an OAuth failure, for the `error.type` span
+    /// attribute and metric labels. Never contains server-provided text.
+    pub fn auth_error_type(error: &AuthError) -> &'static str {
+        let forbidden = |text: &str| text.contains("403");
+        match error {
+            AuthError::RegistrationFailed(m) if forbidden(m) => "registration_http_403",
+            AuthError::RegistrationFailed(_) => "registration",
+            AuthError::MetadataError(m) if forbidden(m) => "metadata_http_403",
+            AuthError::MetadataError(_)
+            | AuthError::NoAuthorizationSupport
+            | AuthError::PkceUnsupported
+            | AuthError::AuthorizationServerMismatch { .. } => "metadata",
+            AuthError::AuthorizationServerMissingIssuer { .. } => "missing_issuer",
+            AuthError::TokenExchangeFailed(_) | AuthError::OAuthError(_) => "token_exchange",
+            AuthError::CredentialStoreError(m) if m.contains("strict_scopes") => "scope_exceeded",
+            AuthError::CredentialStoreError(_) => "credential_store",
+            AuthError::HttpError(_) => "http",
+            AuthError::UrlError(_) => "url",
+            _ => "other",
+        }
+    }
+
+    /// `User-Agent` of every OAuth request (discovery, registration, token).
+    ///
+    /// Some authorization servers (IBKR) answer requests without one with
+    /// `403`, and rmcp's own client sends none.
+    fn user_agent() -> String {
+        format!("querymt-agent/{}", env!("QMT_BUILD_VERSION"))
+    }
+
+    /// rmcp's default OAuth HTTP client plus a `User-Agent` header.
+    ///
+    /// Like every custom client it leaves the check of the *resolved*
+    /// addresses of discovered hosts to the network; rmcp still checks the
+    /// host strings. Server URLs come from the user's own configuration.
+    struct UserAgentOAuthClient<C> {
+        inner: C,
+        user_agent: reqwest::header::HeaderValue,
+    }
+
+    impl<C: rmcp::transport::OAuthHttpClient> rmcp::transport::OAuthHttpClient
+        for UserAgentOAuthClient<C>
+    {
+        fn execute(
+            &self,
+            mut request: rmcp::transport::OAuthHttpRequest,
+        ) -> rmcp::transport::OAuthHttpClientFuture<'_> {
+            request
+                .request
+                .headers_mut()
+                .entry(reqwest::header::USER_AGENT)
+                .or_insert_with(|| self.user_agent.clone());
+            self.inner.execute(request)
+        }
+    }
+
+    /// The HTTP client for every OAuth operation of an MCP server: login
+    /// (`AuthorizationManager::new_with_oauth_http_client`) and the
+    /// connection's token refreshes.
+    pub fn oauth_http_client() -> Result<Arc<dyn rmcp::transport::OAuthHttpClient>, AuthError> {
+        let user_agent = reqwest::header::HeaderValue::from_str(&user_agent())
+            .map_err(|e| AuthError::InternalError(e.to_string()))?;
+        Ok(Arc::new(UserAgentOAuthClient {
+            inner: rmcp::transport::auth::default_oauth_http_client()?,
+            user_agent,
+        }))
+    }
+
     /// Scope always accepted on top of the configured ones: it only asks for
     /// a refresh token.
     const OFFLINE_ACCESS: &str = "offline_access";

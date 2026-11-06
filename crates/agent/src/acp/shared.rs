@@ -3556,6 +3556,7 @@ async fn available_commands_session_update<S: SendAgent>(
 async fn run_with_acp_span<T, F>(method: &str, params: &serde_json::Value, fut: F) -> T
 where
     F: Future<Output = T>,
+    T: AcpSpanOutcome,
 {
     use tracing::Instrument;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -3568,7 +3569,34 @@ where
         let _ = span.set_parent(parent_cx);
     }
 
-    fut.instrument(span).await
+    let output = fut.instrument(span.clone()).await;
+    output.record_on(&span);
+    output
+}
+
+/// What a handled ACP request tells its span when it finishes.
+trait AcpSpanOutcome {
+    fn record_on(&self, span: &tracing::Span);
+}
+
+impl AcpSpanOutcome for () {
+    fn record_on(&self, _span: &tracing::Span) {}
+}
+
+impl<T> AcpSpanOutcome for Result<T, Error> {
+    /// A failed request marks its span as an error with the JSON-RPC code as
+    /// `error.type` (`rpc.response.status_code` is the semantic-convention
+    /// name for the code itself). The message is not exported: it may carry
+    /// user-provided text.
+    fn record_on(&self, span: &tracing::Span) {
+        use opentelemetry::trace::Status;
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        if let Err(error) = self {
+            span.set_attribute("error.type", "rpc_error");
+            span.set_attribute("rpc.response.status_code", i64::from(i32::from(error.code)));
+            span.set_status(Status::error(""));
+        }
+    }
 }
 
 /// Map an ACP method string to a named tracing span.
@@ -6729,6 +6757,44 @@ mod tests {
 
             assert_eq!(spans.len(), 1);
             assert_eq!(spans[0].name, "acp.ext_method");
+        }
+
+        #[test]
+        fn run_with_acp_span_marks_failed_requests() {
+            let spans = with_test_spans(|| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let params = serde_json::json!({});
+                    let failed: Result<(), Error> =
+                        run_with_acp_span("querymt/auth/start", &params, async {
+                            Err(Error::internal_error().data("SECRET_ERROR"))
+                        })
+                        .await;
+                    assert!(failed.is_err());
+                    let ok: Result<(), Error> =
+                        run_with_acp_span("querymt/models", &params, async { Ok(()) }).await;
+                    assert!(ok.is_ok());
+                });
+            });
+
+            assert_eq!(spans.len(), 2);
+            let failed = &spans[0];
+            assert!(matches!(
+                failed.status,
+                opentelemetry::trace::Status::Error { .. }
+            ));
+            assert!(
+                failed
+                    .attributes
+                    .iter()
+                    .any(|a| a.key.as_str() == "error.type" && a.value.to_string() == "rpc_error")
+            );
+            // The error text is not exported.
+            assert!(!format!("{failed:?}").contains("SECRET_ERROR"));
+            assert!(matches!(
+                spans[1].status,
+                opentelemetry::trace::Status::Unset
+            ));
         }
 
         #[test]

@@ -377,9 +377,12 @@ async fn oauth_transport(
     )
     .with_auth_policy(auth)
     .for_connection();
-    // Private addresses are allowed for the discovered authorization server:
-    // internal MCP servers commonly sit behind an internal identity provider.
-    let mut manager = AuthorizationManager::new_allowing_private_addresses(url)
+    // The OAuth client sends a `User-Agent` (some authorization servers refuse
+    // requests without one) and, like `new_allowing_private_addresses`, lets
+    // the discovered authorization server be on a private address: internal MCP
+    // servers commonly sit behind an internal identity provider.
+    let http = crate::mcp_auth::oauth_http_client().map_err(|e| unavailable(e.to_string()))?;
+    let mut manager = AuthorizationManager::new_with_oauth_http_client(url, http)
         .await
         .map_err(|e| unavailable(e.to_string()))?;
     manager.set_credential_store(store);

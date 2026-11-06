@@ -220,9 +220,12 @@ pub enum AuthFlowError {
         sources: Vec<String>,
     },
     #[cfg(feature = "oauth")]
-    #[error("failed to start OAuth flow for MCP server {server}")]
+    #[error("failed to start OAuth flow for MCP server {server} ({step})")]
     McpAuthorization {
         server: String,
+        /// What was being done: `http client`, `metadata discovery` or
+        /// `client registration`.
+        step: &'static str,
         #[source]
         source: rmcp::transport::AuthError,
     },
@@ -232,6 +235,41 @@ pub enum AuthFlowError {
 }
 
 impl AuthFlowError {
+    /// Low-cardinality failure class for the `error.type` span attribute and
+    /// metric label.
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            Self::EmptyProvider => "empty_provider",
+            Self::UnknownMcpServer(_) => "unknown_server",
+            Self::ConflictingMcpServer { .. } => "conflicting_server",
+            #[cfg(feature = "oauth")]
+            Self::McpAuthorization { source, .. } => crate::mcp_auth::auth_error_type(source),
+            Self::Provider(_) => "provider",
+        }
+    }
+
+    /// A mistake in the request or configuration rather than a failure of the
+    /// agent or the authorization server.
+    pub fn is_user_error(&self) -> bool {
+        matches!(
+            self,
+            Self::EmptyProvider | Self::UnknownMcpServer(_) | Self::ConflictingMcpServer { .. }
+        )
+    }
+
+    /// Log the failure of `operation` once, with its whole cause chain:
+    /// `warn` for user mistakes, `error` otherwise (so it shows on the default
+    /// console and in exported logs). Never logs tokens or codes.
+    pub fn log(&self, operation: &'static str, provider: &str) {
+        let error = self.message_chain();
+        let error_type = self.error_type();
+        if self.is_user_error() {
+            tracing::warn!(operation, provider, error_type, %error, "auth request refused");
+        } else {
+            tracing::error!(operation, provider, error_type, %error, "auth request failed");
+        }
+    }
+
     /// The message with its whole source chain.
     pub fn message_chain(&self) -> String {
         let mut message = self.to_string();
@@ -247,15 +285,20 @@ impl AuthFlowError {
 
 impl From<AuthFlowError> for agent_client_protocol::Error {
     fn from(error: AuthFlowError) -> Self {
+        // The message itself carries the reason: clients show `message`, and
+        // `Error::internal_error()` alone would read just "Internal error".
         let message = error.message_chain();
-        let base = match error {
+        let code = match error {
             AuthFlowError::EmptyProvider
             | AuthFlowError::UnknownMcpServer(_)
-            | AuthFlowError::ConflictingMcpServer { .. } => Self::invalid_params(),
-            _ => Self::internal_error(),
+            | AuthFlowError::ConflictingMcpServer { .. } => {
+                agent_client_protocol::ErrorCode::InvalidParams
+            }
+            _ => agent_client_protocol::ErrorCode::InternalError,
         };
         // `error` is kept for clients that read the previous shape.
-        base.data(serde_json::json!({ "message": message, "error": message }))
+        Self::new(i32::from(code), message.clone())
+            .data(serde_json::json!({ "message": message, "error": message }))
     }
 }
 

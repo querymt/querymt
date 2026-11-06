@@ -41,7 +41,8 @@ impl LocalAgentHandle {
         let result = self
             .oauth_service
             .start_flow("acp", &parsed.provider)
-            .await?;
+            .await
+            .inspect_err(|error| error.log("start", &parsed.provider))?;
         ext_json_response(&result)
     }
 

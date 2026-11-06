@@ -98,6 +98,48 @@ struct DeclaredServer {
 /// Label of servers declared by the agent configuration itself.
 const AGENT_CONFIG_SOURCE: &str = "agent configuration";
 
+/// Span status, `error.type` and the login counter of MCP auth operations.
+mod telemetry {
+    use super::AuthFlowError;
+    use opentelemetry::trace::Status;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    /// Record how `operation` (`start`, `callback`, `logout`) ended on `span`
+    /// and count it in `querymt.auth.mcp.login{operation, outcome, error.type}`.
+    pub(super) fn record_outcome(
+        span: &tracing::Span,
+        operation: &'static str,
+        error: Option<&AuthFlowError>,
+    ) {
+        record(span, operation, error.map(AuthFlowError::error_type));
+    }
+
+    /// Same, for failures that are not an [`AuthFlowError`].
+    pub(super) fn record(
+        span: &tracing::Span,
+        operation: &'static str,
+        error_type: Option<&'static str>,
+    ) {
+        let mut attributes = vec![
+            opentelemetry::KeyValue::new("operation", operation),
+            opentelemetry::KeyValue::new(
+                "outcome",
+                if error_type.is_some() { "error" } else { "ok" },
+            ),
+        ];
+        if let Some(error_type) = error_type {
+            span.set_attribute("error.type", error_type);
+            span.set_status(Status::error(""));
+            attributes.push(opentelemetry::KeyValue::new("error.type", error_type));
+        }
+        opentelemetry::global::meter("querymt-agent")
+            .u64_counter("querymt.auth.mcp.login")
+            .with_description("MCP OAuth login operations by outcome")
+            .build()
+            .add(1, &attributes);
+    }
+}
+
 impl OAuthService {
     /// Every MCP server declaration the agent can start sessions with,
     /// labelled with its source.
@@ -205,16 +247,61 @@ impl OAuthService {
         out
     }
 
+    /// Begin an `mcp:` login.
+    ///
+    /// Traced as `auth.mcp.start` with child spans for discovery and
+    /// registration; a failure marks the span (`error.type`) and counts in
+    /// `querymt.auth.mcp.login`. Logging is left to the handler boundary.
     pub(super) async fn start_mcp_flow(
         &self,
         owner: &str,
         server: &str,
     ) -> Result<StartFlowResult, AuthFlowError> {
-        let cfg = self.mcp_server(server).await?;
+        use tracing::Instrument as _;
+        let span = tracing::info_span!(
+            "auth.mcp.start",
+            provider_id = %mcp_auth::provider_id(server),
+            server,
+            sources = tracing::field::Empty,
+            scopes_requested = tracing::field::Empty,
+        );
+        let result = self
+            .start_mcp_flow_inner(owner, server, &span)
+            .instrument(span.clone())
+            .await;
+        telemetry::record_outcome(&span, "start", result.as_ref().err());
+        result
+    }
+
+    async fn start_mcp_flow_inner(
+        &self,
+        owner: &str,
+        server: &str,
+        span: &tracing::Span,
+    ) -> Result<StartFlowResult, AuthFlowError> {
+        use tracing::Instrument as _;
+        let declared = self
+            .oauth_servers()
+            .await
+            .into_iter()
+            .find(|d| d.server.name == server)
+            .ok_or_else(|| AuthFlowError::UnknownMcpServer(server.to_string()))?;
+        span.record("sources", declared.sources.join(", ").as_str());
+        if declared.conflicting {
+            return Err(AuthFlowError::ConflictingMcpServer {
+                server: server.to_string(),
+                sources: declared.sources,
+            });
+        }
+        let cfg = declared.server;
+        span.record("scopes_requested", cfg.scopes().len() as u64);
         let provider = mcp_auth::provider_id(&cfg.name);
-        let fail = |source: AuthError| AuthFlowError::McpAuthorization {
-            server: server.to_string(),
-            source,
+        let fail = |step: &'static str| {
+            move |source: AuthError| AuthFlowError::McpAuthorization {
+                server: server.to_string(),
+                step,
+                source,
+            }
         };
         let redirect_uri = cfg.redirect_uri();
         let store = self.mcp_store(&cfg);
@@ -229,22 +316,33 @@ impl OAuthService {
             client_id = store.load().await.ok().flatten().map(|c| c.client_id);
         }
 
-        let mut manager = AuthorizationManager::new(cfg.url.as_str())
+        let http = mcp_auth::oauth_http_client().map_err(fail("http client"))?;
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(cfg.url.as_str(), http)
             .await
-            .map_err(fail)?;
+            .map_err(fail("metadata discovery"))?;
         manager.set_credential_store(store);
-        let resolution = manager.resolve_metadata().await.map_err(fail)?;
+        let resolution = manager
+            .resolve_metadata()
+            .instrument(tracing::info_span!("auth.mcp.discover", server))
+            .await
+            .map_err(fail("metadata discovery"))?;
         manager.set_metadata(resolution.metadata);
 
         let mut request = AuthorizationRequest::new(redirect_uri)
             .with_client_name("QueryMT")
             .with_scopes(cfg.scopes().to_vec());
+        let preregistered = client_id.is_some();
         if let Some(id) = client_id {
             request = request.with_preregistered_client(id);
         }
         let session = AuthorizationSession::new(manager, request)
+            .instrument(tracing::info_span!(
+                "auth.mcp.register",
+                server,
+                preregistered
+            ))
             .await
-            .map_err(|(_, e)| fail(e))?;
+            .map_err(|(_, e)| fail("client registration")(e))?;
         let authorization_url = session.get_authorization_url().to_string();
         let state = url::Url::parse(&authorization_url)
             .ok()
@@ -254,7 +352,7 @@ impl OAuthService {
                     .map(|(_, v)| v.into_owned())
             })
             .ok_or_else(|| {
-                fail(AuthError::InternalError(
+                fail("authorization request")(AuthError::InternalError(
                     "the authorization URL carries no state".to_string(),
                 ))
             })?;
@@ -292,6 +390,7 @@ impl OAuthService {
     /// the callback arrives. Shares the single listener slot with provider
     /// logins, so it replaces any pending listener the same way they do.
     async fn spawn_mcp_listener(&self, identity: FlowIdentity, port: u16, state: String) {
+        use tracing::Instrument as _;
         stop_listener(&self.listener_slot, &self.flows, true).await;
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
         let svc = self.clone();
@@ -307,24 +406,40 @@ impl OAuthService {
             // Hand over the RFC 9207 `iss` of the redirect: servers that
             // advertise `authorization_response_iss_parameter_supported`
             // (Linear) are refused without it.
-            match flow
+            let span = tracing::info_span!(
+                "auth.mcp.callback",
+                provider_id = %id.provider,
+                channel = "loopback"
+            );
+            let exchanged = flow
                 .session
                 .handle_callback_with_issuer(
                     &callback.code,
                     &callback.state,
                     callback.issuer.as_deref(),
                 )
-                .await
-            {
+                .instrument(span.clone())
+                .await;
+            match exchanged {
                 Ok(_) => {
+                    telemetry::record(&span, "callback", None);
                     svc.mcp_flows.lock().await.remove(&id);
                     let mut active = svc.listener_slot.lock().await;
                     if active.as_ref().is_some_and(|l| l.flow_id == id.flow_id) {
                         active.take();
                     }
-                    log::info!("MCP OAuth login completed for '{}'", id.provider);
+                    tracing::info!(provider_id = %id.provider, "MCP OAuth login completed");
                 }
-                Err(e) => log::warn!("MCP OAuth token exchange failed for '{}': {e}", id.provider),
+                Err(e) => {
+                    let error_type = mcp_auth::auth_error_type(&e);
+                    telemetry::record(&span, "callback", Some(error_type));
+                    tracing::error!(
+                        provider_id = %id.provider,
+                        error_type,
+                        error = %e,
+                        "MCP OAuth token exchange failed"
+                    );
+                }
             }
         });
         *self.listener_slot.lock().await = Some(ActiveOAuthCallbackListener {
@@ -346,6 +461,7 @@ impl OAuthService {
         flow_id: &str,
         response: &str,
     ) -> Option<CompleteFlowResult> {
+        use tracing::Instrument as _;
         let (identity, flow) = {
             let map = self.mcp_flows.lock().await;
             map.iter()
@@ -372,18 +488,29 @@ impl OAuthService {
                 "Authorization response is required".to_string(),
             ));
         }
-        let exchanged = if input.starts_with("http://") || input.starts_with("https://") {
-            flow.session.handle_callback_url(input).await
-        } else {
-            // A bare code carries no `iss`; servers that require it reject
-            // this, and the error then asks for the full callback URL.
-            let code = input.split('#').next().unwrap_or(input);
-            flow.session.handle_callback(code, &flow.state).await
-        };
+        let span = tracing::info_span!(
+            "auth.mcp.callback",
+            provider_id = %identity.provider,
+            channel = "paste"
+        );
+        let exchanged = async {
+            if input.starts_with("http://") || input.starts_with("https://") {
+                flow.session.handle_callback_url(input).await
+            } else {
+                // A bare code carries no `iss`; servers that require it reject
+                // this, and the error then asks for the full callback URL.
+                let code = input.split('#').next().unwrap_or(input);
+                flow.session.handle_callback(code, &flow.state).await
+            }
+        }
+        .instrument(span.clone())
+        .await;
         Some(match exchanged {
             Ok(_) => {
+                telemetry::record(&span, "callback", None);
                 self.mcp_flows.lock().await.remove(&identity);
                 stop_listener_for_flow(&self.listener_slot, &self.flows, flow_id, false).await;
+                tracing::info!(provider_id = %identity.provider, "MCP OAuth login completed");
                 result(
                     true,
                     format!("Successfully authenticated with {}", identity.provider),
@@ -392,47 +519,76 @@ impl OAuthService {
             Err(rmcp::transport::AuthError::AuthorizationServerMissingIssuer { .. })
                 if !input.starts_with("http") =>
             {
+                // The user pasted a bare code: ask again, not a server fault.
+                tracing::warn!(
+                    provider_id = %identity.provider,
+                    "pasted code lacks the `iss` this server requires"
+                );
                 result(
                     false,
                     "This server needs the full callback URL (it includes the `iss` parameter); paste the whole URL, not just the code"
                         .to_string(),
                 )
             }
-            Err(e) => result(false, format!("Token exchange failed: {e}")),
+            Err(e) => {
+                let error_type = mcp_auth::auth_error_type(&e);
+                telemetry::record(&span, "callback", Some(error_type));
+                tracing::error!(
+                    provider_id = %identity.provider,
+                    error_type,
+                    error = %e,
+                    "MCP OAuth token exchange failed"
+                );
+                result(false, format!("Token exchange failed: {e}"))
+            }
         })
     }
 
     pub(super) async fn logout_mcp(&self, owner: &str, server: &str) -> LogoutResult {
+        use tracing::Instrument as _;
         let provider = mcp_auth::provider_id(server);
-        let cfg = match self.mcp_server(server).await {
-            Ok(cfg) => cfg,
-            Err(error) => {
-                return LogoutResult {
-                    provider,
-                    success: false,
-                    message: error.to_string(),
-                };
-            }
-        };
-        match self.mcp_store(&cfg).clear().await {
-            Ok(()) => {
-                self.mcp_flows
-                    .lock()
-                    .await
-                    .retain(|k, _| !(k.owner == owner && k.provider == provider));
-                stop_listener_for_owner_provider(&self.listener_slot, owner, &provider).await;
-                LogoutResult {
-                    provider,
-                    success: true,
-                    message: format!("Disconnected from MCP server {server}"),
+        let span = tracing::info_span!("auth.mcp.logout", provider_id = %provider, server);
+        async {
+            let cfg = match self.mcp_server(server).await {
+                Ok(cfg) => cfg,
+                Err(error) => {
+                    error.log("logout", &provider);
+                    telemetry::record_outcome(&tracing::Span::current(), "logout", Some(&error));
+                    return LogoutResult {
+                        provider: provider.clone(),
+                        success: false,
+                        message: error.to_string(),
+                    };
+                }
+            };
+            match self.mcp_store(&cfg).clear().await {
+                Ok(()) => {
+                    self.mcp_flows
+                        .lock()
+                        .await
+                        .retain(|k, _| !(k.owner == owner && k.provider == provider));
+                    stop_listener_for_owner_provider(&self.listener_slot, owner, &provider).await;
+                    telemetry::record(&tracing::Span::current(), "logout", None);
+                    LogoutResult {
+                        provider: provider.clone(),
+                        success: true,
+                        message: format!("Disconnected from MCP server {server}"),
+                    }
+                }
+                Err(e) => {
+                    let error_type = mcp_auth::auth_error_type(&e);
+                    telemetry::record(&tracing::Span::current(), "logout", Some(error_type));
+                    tracing::error!(provider_id = %provider, error_type, error = %e, "removing MCP credentials failed");
+                    LogoutResult {
+                        provider: provider.clone(),
+                        success: false,
+                        message: format!("Failed to remove credentials: {e}"),
+                    }
                 }
             }
-            Err(e) => LogoutResult {
-                provider,
-                success: false,
-                message: format!("Failed to remove credentials: {e}"),
-            },
         }
+        .instrument(span)
+        .await
     }
 }
 
@@ -452,6 +608,24 @@ mod tests {
         registrations: parking_lot::Mutex<Vec<serde_json::Value>>,
         /// `scope` of token responses; omitted when `None`.
         token_scope: parking_lot::Mutex<Option<String>>,
+        /// Refuse every OAuth request with 403.
+        refuse: std::sync::atomic::AtomicBool,
+    }
+
+    /// Like IBKR: OAuth endpoints answer 403 to requests without a
+    /// `User-Agent` (or while `refuse` is set). The MCP endpoint is exempt.
+    async fn gatekeeper(
+        State(s): State<Arc<AuthServer>>,
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let exempt = request.uri().path() == "/mcp";
+        let has_agent = request.headers().contains_key("user-agent");
+        if !exempt && (!has_agent || s.refuse.load(std::sync::atomic::Ordering::SeqCst)) {
+            return axum::http::StatusCode::FORBIDDEN.into_response();
+        }
+        next.run(request).await
     }
 
     /// Minimal authorization server: metadata, dynamic registration, tokens.
@@ -529,6 +703,10 @@ mod tests {
             .route("/register", post(register))
             .route("/token", post(token))
             .route("/mcp", post(mcp))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                gatekeeper,
+            ))
             .with_state(state.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         state
@@ -1078,6 +1256,75 @@ mod tests {
         );
         let done = svc.complete_flow("acp", &started.flow_id, &redirect).await;
         assert!(done.success, "{done:?}");
+    }
+
+    #[tokio::test]
+    async fn refused_registration_reports_the_step_and_marks_the_span() {
+        use crate::test_utils::genai_trace::{attr, capture_info};
+        let auth = serve_auth_server().await;
+        auth.refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+        let backend = Arc::new(MemoryBackend::default());
+        let (svc, _) = service(&auth, &backend, free_port()).await;
+
+        let (result, spans) = capture_info(svc.start_flow("acp", "mcp:linear")).await;
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, AuthFlowError::McpAuthorization { step, .. } if *step == "client registration"),
+            "{err:?}"
+        );
+        // The UI-facing message names the server and the step, not just
+        // "Internal error".
+        let acp: agent_client_protocol::Error = err.into();
+        assert!(
+            acp.message.contains("linear")
+                && acp.message.contains("client registration")
+                && acp.message.contains("403"),
+            "{}",
+            acp.message
+        );
+        assert_eq!(
+            acp.code,
+            agent_client_protocol::Error::internal_error().code
+        );
+
+        let start = spans
+            .iter()
+            .find(|s| s.name == "auth.mcp.start")
+            .expect("auth.mcp.start span");
+        assert!(matches!(
+            start.status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
+        let error_type = attr(start, "error.type").expect("error.type").to_string();
+        assert_eq!(error_type, "registration_http_403");
+        assert_eq!(
+            attr(start, "provider_id").map(|v| v.to_string()).as_deref(),
+            Some("mcp:linear")
+        );
+        // Only classes and names are exported, never server text.
+        assert!(!format!("{spans:?}").contains(&auth.base));
+    }
+
+    #[tokio::test]
+    async fn unknown_server_is_a_user_error_with_a_readable_message() {
+        use crate::test_utils::genai_trace::{attr, capture_info};
+        let auth = serve_auth_server().await;
+        let backend = Arc::new(MemoryBackend::default());
+        let (svc, _) = service(&auth, &backend, free_port()).await;
+        let (result, spans) = capture_info(svc.start_flow("acp", "mcp:nope")).await;
+        let err = result.unwrap_err();
+        assert!(err.is_user_error());
+        let acp: agent_client_protocol::Error = err.into();
+        assert_eq!(acp.message, "unknown OAuth MCP server: nope");
+        assert_eq!(
+            acp.code,
+            agent_client_protocol::Error::invalid_params().code
+        );
+        let start = spans.iter().find(|s| s.name == "auth.mcp.start").unwrap();
+        assert_eq!(
+            attr(start, "error.type").map(|v| v.to_string()).as_deref(),
+            Some("unknown_server")
+        );
     }
 
     #[test]
