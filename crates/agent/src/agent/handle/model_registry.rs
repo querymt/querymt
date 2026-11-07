@@ -194,6 +194,43 @@ impl LocalAgentHandle {
         ))
     }
 
+    /// Structured prompt records for the prompts among `events` of a remote
+    /// session, fetched from the owner (attached and reachable before
+    /// `deadline`). Nothing is stored locally. Never fails: an unreachable
+    /// owner, an error or a timeout yields no records, leaving the prompts as
+    /// their `PromptReceived` text.
+    #[cfg(feature = "remote")]
+    pub(crate) async fn remote_prompt_records_for(
+        &self,
+        session_id: &str,
+        events: &[crate::events::AgentEvent],
+        deadline: tokio::time::Instant,
+    ) -> Vec<crate::session::load_snapshot::UserPromptRecord> {
+        let ids = crate::session::load_snapshot::prompt_message_ids(events);
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let session_ref = {
+            let registry = self.registry.lock().await;
+            registry.get(session_id).cloned()
+        };
+        // For a bookmarked session the registry entry is its owner attachment.
+        let Some(session_ref) = session_ref else {
+            return Vec::new();
+        };
+        match tokio::time::timeout_at(deadline, session_ref.get_user_prompts(Some(ids))).await {
+            Ok(Ok(fetched)) => fetched,
+            Ok(Err(error)) => {
+                tracing::warn!(session_id, %error, "failed to fetch prompt records from owner");
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::warn!(session_id, "fetching prompt records from owner timed out");
+                Vec::new()
+            }
+        }
+    }
+
     /// A snapshot served purely from the local copy when the owner cannot be
     /// reached at all; `None` when the requested window is not already local.
     #[cfg(feature = "remote")]
@@ -333,6 +370,22 @@ impl LocalAgentHandle {
             summary.usage.partial = true;
             snapshot.accounting.mark_untransferred_history();
         }
+        // Structured prompt blocks of the returned events, from the owner
+        // only while it is reachable. They are attached after the window is
+        // cut, so they never count toward its `maxBytes` budget.
+        if !stale {
+            let prompts = self
+                .remote_prompt_records_for(
+                    session_id,
+                    &snapshot.audit.events,
+                    deadline.max(tokio::time::Instant::now() + REMOTE_PROMPT_FETCH_MIN_BUDGET),
+                )
+                .await;
+            crate::session::load_snapshot::merge_prompt_records(
+                snapshot.user_prompts.get_or_insert_with(Vec::new),
+                prompts,
+            );
+        }
         if stale {
             match snapshot.history.as_mut() {
                 Some(history) => history.stale = Some(true),
@@ -353,6 +406,11 @@ impl LocalAgentHandle {
 
 #[cfg(feature = "remote")]
 const DEFAULT_REMOTE_TRANSFER_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Prompt records are small; even a load whose history budget is spent may
+/// spend this long fetching the window's missing prompt blocks.
+#[cfg(feature = "remote")]
+const REMOTE_PROMPT_FETCH_MIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Total budget for one load's remote history transfer, aligned with the
 /// 60 s history reply timeout; overridable for operators.

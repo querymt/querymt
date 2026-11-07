@@ -38,6 +38,10 @@ struct SessionHistoryResponse {
     events: Vec<AgentEvent>,
     history: HistoryInfo,
     truncated: Vec<TruncatedEntry>,
+    /// Structured prompt blocks for the prompts among `events` (remote
+    /// sessions; same shape as the load snapshot's `userPrompts`).
+    #[serde(rename = "userPrompts", skip_serializing_if = "Option::is_none")]
+    user_prompts: Option<Vec<crate::session::load_snapshot::UserPromptRecord>>,
 }
 
 #[typeshare]
@@ -206,10 +210,25 @@ impl LocalAgentHandle {
         if self.history_epoch_of(session_id, &source).await? != token_epoch {
             return Err(history_changed(session_id));
         }
+        #[cfg(feature = "remote")]
+        let user_prompts = match source.bookmark.as_ref() {
+            Some(_) => Some(
+                self.remote_prompt_records_for(
+                    session_id,
+                    &read.events,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                )
+                .await,
+            ),
+            None => None,
+        };
+        #[cfg(not(feature = "remote"))]
+        let user_prompts = None;
         ext_json_response(&SessionHistoryResponse {
             events: read.events,
             history: read.history,
             truncated: read.truncated,
+            user_prompts,
         })
     }
 

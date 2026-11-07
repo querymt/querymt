@@ -135,6 +135,11 @@ remote_msg_impl!(
 );
 remote_msg_impl!(messages::GetHistory, "querymt::GetHistory", REG_GET_HISTORY);
 remote_msg_impl!(
+    messages::GetUserPrompts,
+    "querymt::GetUserPrompts",
+    REG_GET_USER_PROMPTS
+);
+remote_msg_impl!(
     messages::GetEventStream,
     "querymt::GetEventStream",
     REG_GET_EVENT_STREAM

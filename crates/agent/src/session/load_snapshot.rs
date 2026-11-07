@@ -97,7 +97,57 @@ pub fn cursor_from_events(events: &[AgentEvent]) -> StreamCursor {
     cursor
 }
 
-fn user_prompt_records(messages: &[crate::model::AgentMessage]) -> Vec<UserPromptRecord> {
+/// Restrict prompt records to `ids` (`None` keeps all).
+pub(crate) fn filter_prompt_records(
+    records: Vec<UserPromptRecord>,
+    ids: Option<&[String]>,
+) -> Vec<UserPromptRecord> {
+    match ids {
+        None => records,
+        Some(ids) => records
+            .into_iter()
+            .filter(|record| ids.contains(&record.message_id))
+            .collect(),
+    }
+}
+
+/// Message ids of the prompts (`PromptReceived` with an id) among `events`,
+/// in event order, without duplicates.
+pub(crate) fn prompt_message_ids(events: &[AgentEvent]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for event in events {
+        if let crate::events::AgentEventKind::PromptReceived {
+            message_id: Some(id),
+            ..
+        } = &event.kind
+            && !ids.contains(id)
+        {
+            ids.push(id.clone());
+        }
+    }
+    ids
+}
+
+/// Add records whose message id is not present yet, keeping message order.
+pub(crate) fn merge_prompt_records(into: &mut Vec<UserPromptRecord>, more: Vec<UserPromptRecord>) {
+    let mut added = false;
+    for record in more {
+        if !into
+            .iter()
+            .any(|known| known.message_id == record.message_id)
+        {
+            into.push(record);
+            added = true;
+        }
+    }
+    if added {
+        into.sort_by_key(|record| record.message_order);
+    }
+}
+
+pub(crate) fn user_prompt_records(
+    messages: &[crate::model::AgentMessage],
+) -> Vec<UserPromptRecord> {
     messages
         .iter()
         .enumerate()

@@ -11,7 +11,8 @@ use querymt::{
     FunctionCall, ToolCall, Usage,
     chat::{
         ChatInputPart, ChatMessage, ChatMessagePart, ChatOutput, ChatOutputItem, ChatRole,
-        FinishReason, MediaSource, ReasoningEffort, StreamChunk, Tool, ToolChoice, ToolResultPart,
+        FinishReason, MediaKind, MediaPart, MediaSource, ReasoningEffort, StreamChunk, Tool,
+        ToolChoice, ToolResultPart,
     },
     error::{
         LLMError, ProviderErrorKind, ProviderFailure, extract_retry_after_from_json,
@@ -207,8 +208,21 @@ enum CodexToolOutputPart<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<&'a str>,
     },
+    #[serde(rename = "input_file")]
+    InputFile(CodexFileContent),
     #[serde(untagged)]
     Cached(qmt_openai::cache::CachedContent<qmt_openai::cache::CacheableContent<'a>>),
+}
+
+#[derive(Serialize, Debug)]
+struct CodexFileContent {
+    filename: String,
+    file_data: String,
+}
+
+enum CodexAttachment {
+    Image(String),
+    File(CodexFileContent),
 }
 
 #[derive(Serialize, Debug)]
@@ -222,9 +236,12 @@ enum CodexInputContent<'a> {
     OutputText { text: Cow<'a, str> },
     /// Inline image: `{ "type": "input_image", "image_url": "data:...;base64,..." }`
     // TODO: Add `detail` support once image detail is modeled in shared content/config.
-    // TODO: Support file IDs here so Codex can accept images, PDFs, and other uploaded files.
     #[serde(rename = "input_image")]
     InputImage { image_url: Cow<'a, str> },
+    // Inline file_data works on the Codex endpoint for messages and tool outputs.
+    // Provider file IDs need separate provenance/upload-lifecycle support.
+    #[serde(rename = "input_file")]
+    InputFile(CodexFileContent),
     #[serde(untagged)]
     Cached(qmt_openai::cache::CachedContent<qmt_openai::cache::CacheableContent<'a>>),
 }
@@ -557,7 +574,11 @@ fn mark_codex_boundary(items: &mut [CodexInputItem<'_>]) -> bool {
         Some(CodexInputItem::Message { content, .. }) => {
             if !matches!(
                 content.last(),
-                Some(CodexInputContent::InputText { .. } | CodexInputContent::InputImage { .. })
+                Some(
+                    CodexInputContent::InputText { .. }
+                        | CodexInputContent::InputImage { .. }
+                        | CodexInputContent::InputFile(_)
+                )
             ) {
                 return false;
             }
@@ -566,6 +587,11 @@ fn mark_codex_boundary(items: &mut [CodexInputItem<'_>]) -> bool {
                 CodexInputContent::InputImage { image_url } => Block::InputImage {
                     image_url,
                     detail: None,
+                },
+                CodexInputContent::InputFile(file) => Block::InputFile {
+                    filename: Some(Cow::Owned(file.filename)),
+                    file_data: Some(Cow::Owned(file.file_data)),
+                    file_url: None,
                 },
                 _ => unreachable!("checked ending"),
             };
@@ -589,6 +615,11 @@ fn mark_codex_boundary(items: &mut [CodexInputItem<'_>]) -> bool {
                 CodexToolOutputPart::InputImage { image_url, detail } => Block::InputImage {
                     image_url,
                     detail: detail.map(Cow::Borrowed),
+                },
+                CodexToolOutputPart::InputFile(file) => Block::InputFile {
+                    filename: Some(Cow::Owned(file.filename)),
+                    file_data: Some(Cow::Owned(file.file_data)),
+                    file_url: None,
                 },
                 CodexToolOutputPart::Cached(value) => {
                     parts.push(CodexToolOutputPart::Cached(value));
@@ -652,6 +683,94 @@ fn apply_codex_cache_hints(
         }
     }
     hints.finish(extra)
+}
+
+fn codex_image_url(media: &MediaPart) -> Option<String> {
+    if media.kind != MediaKind::Image
+        || media
+            .media_type()
+            .is_some_and(|mime| mime.type_() != "image")
+    {
+        return None;
+    }
+
+    match media.source() {
+        MediaSource::Inline { data } => Some(format!(
+            "data:{};base64,{}",
+            media.media_type()?,
+            STANDARD.encode(data)
+        )),
+        // DataUrl sources carry a validated MIME type, checked above.
+        MediaSource::DataUrl { url } => Some(url.clone()),
+        MediaSource::Url { url } => {
+            // An untyped remote image URL is valid, but must not bypass MIME
+            // validation by hiding a non-image data URL in the Url source form.
+            let parsed = Url::parse(url).ok()?;
+            matches!(parsed.scheme(), "http" | "https").then(|| url.clone())
+        }
+        MediaSource::ProviderFile { .. } => None,
+    }
+}
+
+fn codex_attachment(media: &MediaPart) -> Result<CodexAttachment, LLMError> {
+    let unsupported = || {
+        LLMError::InvalidRequest(format!(
+            "unsupported Codex attachment: kind={:?}, mime={:?}; expected an image or an \
+             inline/data-URL document",
+            media.kind,
+            media.media_type()
+        ))
+    };
+    match media.kind {
+        MediaKind::Image => codex_image_url(media)
+            .map(CodexAttachment::Image)
+            .ok_or_else(unsupported),
+        MediaKind::Document | MediaKind::Other => {
+            let mime = media.media_type().ok_or_else(unsupported)?;
+            if matches!(mime.type_(), "image" | "audio" | "video") {
+                return Err(unsupported());
+            }
+            let file_data = match media.source() {
+                MediaSource::Inline { data } => {
+                    format!("data:{mime};base64,{}", STANDARD.encode(data))
+                }
+                MediaSource::DataUrl { url } => url.clone(),
+                MediaSource::Url { .. } | MediaSource::ProviderFile { .. } => {
+                    return Err(LLMError::InvalidRequest(
+                        "Codex document attachments require inline bytes or a data URL; \
+                         remote file URLs and provider file references are not supported"
+                            .to_string(),
+                    ));
+                }
+            };
+            // ACP blob resources may omit filenames. Give known MIME types a
+            // matching extension rather than guessing a file type from the bytes.
+            let filename = match media
+                .filename
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+            {
+                Some(name) => name.to_string(),
+                None if mime.type_() == "application" && mime.subtype() == "pdf" => {
+                    "attachment.pdf".to_string()
+                }
+                None if mime.type_() == "text" && mime.subtype() == "plain" => {
+                    "attachment.txt".to_string()
+                }
+                None => {
+                    return Err(LLMError::InvalidRequest(
+                        "Codex document attachments require a filename for this MIME type"
+                            .to_string(),
+                    ));
+                }
+            };
+            Ok(CodexAttachment::File(CodexFileContent {
+                filename,
+                file_data,
+            }))
+        }
+        MediaKind::Audio | MediaKind::Video => Err(unsupported()),
+    }
 }
 
 fn codex_chat_body_json<C: CodexProviderConfig>(
@@ -729,23 +848,14 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
                     });
                 }
                 ChatInputPart::Text { .. } => {}
-                ChatInputPart::Attachment(media) => match media.source() {
-                    MediaSource::Inline { data } => {
-                        if let Some(media_type) = media.media_type() {
-                            let data_url =
-                                format!("data:{};base64,{}", media_type, STANDARD.encode(data));
-                            content_blocks.push(CodexInputContent::InputImage {
-                                image_url: Cow::Owned(data_url),
-                            });
-                        }
-                    }
-                    MediaSource::DataUrl { url } | MediaSource::Url { url } => {
-                        content_blocks.push(CodexInputContent::InputImage {
-                            image_url: Cow::Owned(url.clone()),
-                        });
-                    }
-                    MediaSource::ProviderFile { .. } => {}
-                },
+                ChatInputPart::Attachment(media) => {
+                    content_blocks.push(match codex_attachment(media)? {
+                        CodexAttachment::Image(image_url) => CodexInputContent::InputImage {
+                            image_url: Cow::Owned(image_url),
+                        },
+                        CodexAttachment::File(file) => CodexInputContent::InputFile(file),
+                    });
+                }
                 ChatInputPart::ToolResult(_) => {}
             }
         }
@@ -778,35 +888,13 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
                     }
                     ToolResultPart::Attachment(media) => {
                         has_non_text = true;
-                        match media.source() {
-                            MediaSource::Inline { data } => {
-                                let media_type = media
-                                    .media_type()
-                                    .map(ToString::to_string)
-                                    .unwrap_or_default();
-                                output_parts.push(CodexToolOutputPart::InputImage {
-                                    image_url: Cow::Owned(format!(
-                                        "data:{};base64,{}",
-                                        media_type,
-                                        STANDARD.encode(data)
-                                    )),
-                                    detail: None,
-                                });
-                            }
-                            MediaSource::DataUrl { url } | MediaSource::Url { url } => {
-                                output_parts.push(CodexToolOutputPart::InputImage {
-                                    image_url: Cow::Owned(url.clone()),
-                                    detail: None,
-                                });
-                            }
-                            MediaSource::ProviderFile { file_id, .. } => {
-                                output_parts.push(CodexToolOutputPart::InputText {
-                                    text: Cow::Owned(format!(
-                                        "[Provider tool output reference: {file_id}]"
-                                    )),
-                                });
-                            }
-                        }
+                        output_parts.push(match codex_attachment(media)? {
+                            CodexAttachment::Image(image_url) => CodexToolOutputPart::InputImage {
+                                image_url: Cow::Owned(image_url),
+                                detail: None,
+                            },
+                            CodexAttachment::File(file) => CodexToolOutputPart::InputFile(file),
+                        });
                     }
                 }
             }
@@ -2608,6 +2696,236 @@ mod tests {
             image_block["image_url"].as_str(),
             Some("https://example.com/img.png")
         );
+    }
+
+    #[test]
+    fn codex_image_data_url_is_preserved_in_messages_and_tool_results() {
+        use querymt::chat::{MediaKind, MediaPart, MediaSource, ToolResultPart};
+
+        let cfg = test_codex("test-token");
+        let url = "data:image/png;base64,iVBORw==";
+        let image = MediaPart::new(
+            MediaKind::Image,
+            None,
+            MediaSource::DataUrl { url: url.into() },
+        )
+        .unwrap();
+        let messages = [
+            ChatMessage::user().attachment(image.clone()).build(),
+            tool_result_msg(
+                "call-image",
+                vec![ToolResultPart::Attachment(Box::new(image))],
+            ),
+        ];
+        let body: Value = serde_json::from_slice(
+            &codex_chat_body_json(&cfg, &messages, None).expect("image data URL is supported"),
+        )
+        .unwrap();
+        let expected = serde_json::json!([{ "type": "input_image", "image_url": url }]);
+        assert_eq!(body["input"][0]["content"], expected);
+        assert_eq!(body["input"][1]["output"], expected);
+    }
+
+    #[test]
+    fn codex_pdf_user_attachment_is_replayed_as_input_file() {
+        use querymt::chat::{MediaKind, MediaPart, MediaSource};
+
+        let cfg = test_codex("test-token");
+        let pdf = MediaPart::new(
+            MediaKind::Document,
+            Some("application/pdf".parse().unwrap()),
+            MediaSource::Inline {
+                data: b"%PDF-1.4".to_vec(),
+            },
+        )
+        .unwrap()
+        .with_filename("report.pdf");
+        let messages = vec![
+            ChatMessage::user()
+                .text("read this")
+                .attachment(pdf)
+                .build(),
+            ChatMessage::assistant().text("reply").build(),
+            ChatMessage::user().text("follow up").build(),
+        ];
+
+        let body: Value = serde_json::from_slice(
+            &codex_chat_body_json(&cfg, &messages, None).expect("PDF history is supported"),
+        )
+        .unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(
+            input[0]["content"],
+            serde_json::json!([
+                { "type": "input_text", "text": "read this" },
+                { "type": "input_file", "filename": "report.pdf", "file_data": "data:application/pdf;base64,JVBERi0xLjQ=" }
+            ])
+        );
+        assert_eq!(input[2]["content"][0]["text"], "follow up");
+        assert!(!body.to_string().contains("image_url"));
+    }
+
+    #[test]
+    fn codex_unsupported_attachments_return_invalid_request_in_both_positions() {
+        use querymt::chat::{
+            ChatOutputProvenance, MediaKind, MediaPart, MediaSource, ToolResultPart,
+        };
+
+        let cfg = test_codex("test-token");
+        for (kind, mime, source) in [
+            (
+                MediaKind::Audio,
+                "audio/wav",
+                MediaSource::Inline { data: vec![0] },
+            ),
+            (
+                MediaKind::Video,
+                "video/mp4",
+                MediaSource::Inline { data: vec![0] },
+            ),
+            (
+                MediaKind::Other,
+                "application/octet-stream",
+                MediaSource::Inline { data: vec![0] },
+            ),
+            (
+                MediaKind::Document,
+                "application/pdf",
+                MediaSource::Url {
+                    url: "https://example.com/report.pdf".into(),
+                },
+            ),
+            (
+                MediaKind::Document,
+                "application/pdf",
+                MediaSource::ProviderFile {
+                    file_id: "file-pdf".into(),
+                    origin: ChatOutputProvenance {
+                        provider: "openai".into(),
+                        protocol: "responses".into(),
+                        model: "fixture".into(),
+                        endpoint: "https://api.openai.com/v1/responses".into(),
+                    },
+                },
+            ),
+            (
+                MediaKind::Image,
+                "application/pdf",
+                MediaSource::Inline {
+                    data: b"%PDF-1.4".to_vec(),
+                },
+            ),
+            (
+                MediaKind::Image,
+                "application/pdf",
+                MediaSource::DataUrl {
+                    url: "data:application/pdf;base64,JVBERi0xLjQ=".into(),
+                },
+            ),
+            (
+                MediaKind::Image,
+                "application/pdf",
+                MediaSource::Url {
+                    url: "https://example.com/report.pdf".into(),
+                },
+            ),
+            (
+                MediaKind::Image,
+                "image/png",
+                MediaSource::Url {
+                    url: "data:application/pdf;base64,JVBERi0xLjQ=".into(),
+                },
+            ),
+        ] {
+            let media = MediaPart::new(kind, Some(mime.parse().unwrap()), source).unwrap();
+            let user = ChatMessage::user()
+                .text("do not drop my attachment")
+                .attachment(media.clone())
+                .build();
+            let tool = tool_result_msg(
+                "call-file",
+                vec![ToolResultPart::Attachment(Box::new(media))],
+            );
+            for message in [user, tool] {
+                assert!(
+                    matches!(
+                        codex_chat_body_json(&cfg, &[message], None),
+                        Err(LLMError::InvalidRequest(_))
+                    ),
+                    "unsupported {kind:?} attachment with MIME {mime} must fail locally"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_pdf_data_url_uses_file_data_in_messages_and_tool_outputs() {
+        use querymt::chat::{MediaKind, MediaPart, MediaSource, ToolResultPart};
+
+        let cfg = test_codex("test-token");
+        let data_url = "data:application/pdf;base64,JVBERi0xLjQ=";
+        let pdf = MediaPart::new(
+            MediaKind::Document,
+            None,
+            MediaSource::DataUrl {
+                url: data_url.into(),
+            },
+        )
+        .unwrap();
+        let messages = [
+            ChatMessage::user().attachment(pdf.clone()).build(),
+            tool_result_msg(
+                "call-pdf",
+                vec![
+                    ToolResultPart::text("attached PDF"),
+                    ToolResultPart::Attachment(Box::new(pdf)),
+                ],
+            ),
+        ];
+        let body: Value = serde_json::from_slice(
+            &codex_chat_body_json(&cfg, &messages, None).expect("PDF tool output is supported"),
+        )
+        .unwrap();
+        let file = serde_json::json!({ "type": "input_file", "filename": "attachment.pdf", "file_data": data_url });
+        assert_eq!(body["input"][0]["content"], serde_json::json!([file]));
+        assert_eq!(
+            body["input"][1]["output"],
+            serde_json::json!([
+                { "type": "input_text", "text": "attached PDF" }, file
+            ])
+        );
+        assert!(!body.to_string().contains("image_url"));
+    }
+
+    #[test]
+    fn codex_other_file_preserves_filename_and_inline_data() {
+        use querymt::chat::{MediaKind, MediaPart, MediaSource, ToolResultPart};
+
+        let cfg = test_codex("test-token");
+        let file = MediaPart::new(
+            MediaKind::Other,
+            Some("text/plain".parse().unwrap()),
+            MediaSource::Inline {
+                data: b"notes".to_vec(),
+            },
+        )
+        .unwrap()
+        .with_filename("notes.txt");
+        let messages = [
+            ChatMessage::user().attachment(file.clone()).build(),
+            tool_result_msg(
+                "call-file",
+                vec![ToolResultPart::Attachment(Box::new(file))],
+            ),
+        ];
+        let body: Value =
+            serde_json::from_slice(&codex_chat_body_json(&cfg, &messages, None).unwrap()).unwrap();
+        let expected = serde_json::json!([{
+            "type": "input_file", "filename": "notes.txt", "file_data": "data:text/plain;base64,bm90ZXM="
+        }]);
+        assert_eq!(body["input"][0]["content"], expected);
+        assert_eq!(body["input"][1]["output"], expected);
     }
 
     #[test]

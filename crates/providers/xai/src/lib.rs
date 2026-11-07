@@ -17,9 +17,9 @@ use querymt::{
     auth::ApiKeyResolver,
     chat::{
         ChatCall, ChatCapabilities, ChatInputPart, ChatMessage, ChatMessagePart, ChatOutput,
-        ChatOutputItem, ChatReasoningPart, ChatRole, MediaSource, ReasoningEffort,
-        ReasoningPartKind, StreamChunk, StructuredOutputFormat, StructuredStreamEvent, Tool,
-        ToolChoice, ToolResultPart,
+        ChatOutputItem, ChatReasoningPart, ChatRole, MediaKind, MediaPart, MediaSource,
+        ReasoningEffort, ReasoningPartKind, StreamChunk, StructuredOutputFormat,
+        StructuredStreamEvent, Tool, ToolChoice, ToolResultPart,
         http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -609,9 +609,22 @@ enum XaiResponsesFunctionOutput {
 #[serde(tag = "type")]
 enum XaiResponsesToolOutputPart {
     #[serde(rename = "input_text")]
-    InputText { text: String },
+    Text { text: String },
     #[serde(rename = "input_image")]
-    InputImage { image_url: String },
+    Image { image_url: String },
+    #[serde(rename = "input_file")]
+    File(XaiResponsesFile),
+}
+
+#[derive(Serialize, Debug)]
+struct XaiResponsesFile {
+    filename: String,
+    file_data: String,
+}
+
+enum XaiAttachment {
+    Image(String),
+    File(XaiResponsesFile),
 }
 
 #[derive(Serialize, Debug)]
@@ -623,6 +636,8 @@ enum XaiResponsesInputContent {
     OutputText { text: String },
     #[serde(rename = "input_image")]
     InputImage { image_url: String },
+    #[serde(rename = "input_file")]
+    InputFile(XaiResponsesFile),
 }
 
 #[derive(Serialize, Debug)]
@@ -692,6 +707,89 @@ struct XaiResponsesReasoning {
     effort: &'static str,
 }
 
+fn xai_attachment(media: &MediaPart) -> Result<XaiAttachment, LLMError> {
+    let unsupported = || {
+        LLMError::InvalidRequest(format!(
+            "unsupported xAI attachment: kind={:?}, mime={:?}; expected an image or an \
+             inline/data-URL document",
+            media.kind,
+            media.media_type()
+        ))
+    };
+    match media.kind {
+        MediaKind::Image => {
+            if media
+                .media_type()
+                .is_some_and(|mime| mime.type_() != "image")
+            {
+                return Err(unsupported());
+            }
+            let image_url = match media.source() {
+                MediaSource::Inline { data } => format!(
+                    "data:{};base64,{}",
+                    media.media_type().ok_or_else(unsupported)?,
+                    STANDARD.encode(data)
+                ),
+                MediaSource::DataUrl { url } => url.clone(),
+                MediaSource::Url { url } => {
+                    let parsed = Url::parse(url).map_err(|_| unsupported())?;
+                    if !matches!(parsed.scheme(), "http" | "https") {
+                        return Err(unsupported());
+                    }
+                    url.clone()
+                }
+                MediaSource::ProviderFile { .. } => return Err(unsupported()),
+            };
+            Ok(XaiAttachment::Image(image_url))
+        }
+        MediaKind::Document | MediaKind::Other => {
+            let mime = media.media_type().ok_or_else(unsupported)?;
+            if matches!(mime.type_(), "image" | "audio" | "video") {
+                return Err(unsupported());
+            }
+            let file_data = match media.source() {
+                MediaSource::Inline { data } => {
+                    format!("data:{mime};base64,{}", STANDARD.encode(data))
+                }
+                MediaSource::DataUrl { url } => url.clone(),
+                MediaSource::Url { .. } | MediaSource::ProviderFile { .. } => {
+                    return Err(LLMError::InvalidRequest(
+                        "xAI document attachments require inline bytes or a data URL; \
+                         remote file URLs and provider file references are not supported"
+                            .to_string(),
+                    ));
+                }
+            };
+            // ACP blobs can omit a filename; use an extension matching the MIME
+            // type for PDFs/plain text, not a guessed format for arbitrary bytes.
+            let filename = match media
+                .filename
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+            {
+                Some(name) => name.to_string(),
+                None if mime.type_() == "application" && mime.subtype() == "pdf" => {
+                    "attachment.pdf".to_string()
+                }
+                None if mime.type_() == "text" && mime.subtype() == "plain" => {
+                    "attachment.txt".to_string()
+                }
+                None => {
+                    return Err(LLMError::InvalidRequest(
+                        "xAI document attachments require a filename for this MIME type"
+                            .to_string(),
+                    ));
+                }
+            };
+            Ok(XaiAttachment::File(XaiResponsesFile {
+                filename,
+                file_data,
+            }))
+        }
+        MediaKind::Audio | MediaKind::Video => Err(unsupported()),
+    }
+}
+
 fn to_xai_responses_input(
     messages: &[ChatMessage],
     model: &str,
@@ -744,27 +842,14 @@ fn to_xai_responses_input(
                     }
                 }
                 ChatInputPart::Text { .. } => {}
-                ChatInputPart::Attachment(media) => match media.source() {
-                    MediaSource::Inline { data } => {
-                        let media_type = media
-                            .media_type()
-                            .map(ToString::to_string)
-                            .unwrap_or_default();
-                        content_blocks.push(XaiResponsesInputContent::InputImage {
-                            image_url: format!(
-                                "data:{};base64,{}",
-                                media_type,
-                                STANDARD.encode(data)
-                            ),
-                        });
-                    }
-                    MediaSource::DataUrl { url } | MediaSource::Url { url } => {
-                        content_blocks.push(XaiResponsesInputContent::InputImage {
-                            image_url: url.clone(),
-                        });
-                    }
-                    MediaSource::ProviderFile { .. } => {}
-                },
+                ChatInputPart::Attachment(media) => {
+                    content_blocks.push(match xai_attachment(media)? {
+                        XaiAttachment::Image(image_url) => {
+                            XaiResponsesInputContent::InputImage { image_url }
+                        }
+                        XaiAttachment::File(file) => XaiResponsesInputContent::InputFile(file),
+                    });
+                }
                 ChatInputPart::ToolResult(_) => {}
             }
         }
@@ -788,37 +873,17 @@ fn to_xai_responses_input(
             for result_part in &result.parts {
                 match result_part {
                     ToolResultPart::Text { text } => {
-                        output_parts
-                            .push(XaiResponsesToolOutputPart::InputText { text: text.clone() });
+                        output_parts.push(XaiResponsesToolOutputPart::Text { text: text.clone() });
                         text_only_parts.push(text.clone());
                     }
                     ToolResultPart::Attachment(media) => {
                         has_non_text = true;
-                        match media.source() {
-                            MediaSource::Inline { data } => {
-                                let media_type = media
-                                    .media_type()
-                                    .map(ToString::to_string)
-                                    .unwrap_or_default();
-                                output_parts.push(XaiResponsesToolOutputPart::InputImage {
-                                    image_url: format!(
-                                        "data:{};base64,{}",
-                                        media_type,
-                                        STANDARD.encode(data)
-                                    ),
-                                });
+                        output_parts.push(match xai_attachment(media)? {
+                            XaiAttachment::Image(image_url) => {
+                                XaiResponsesToolOutputPart::Image { image_url }
                             }
-                            MediaSource::DataUrl { url } | MediaSource::Url { url } => {
-                                output_parts.push(XaiResponsesToolOutputPart::InputImage {
-                                    image_url: url.clone(),
-                                });
-                            }
-                            MediaSource::ProviderFile { file_id, .. } => {
-                                output_parts.push(XaiResponsesToolOutputPart::InputText {
-                                    text: format!("[Provider tool output reference: {file_id}]"),
-                                });
-                            }
-                        }
+                            XaiAttachment::File(file) => XaiResponsesToolOutputPart::File(file),
+                        });
                     }
                 }
             }
@@ -1486,14 +1551,6 @@ mod tests {
                         ),
                         ToolResultPart::attachment(
                             MediaPart::new(
-                                MediaKind::Audio,
-                                Some("audio/wav".parse().unwrap()),
-                                MediaSource::Inline { data: vec![4, 5] },
-                            )
-                            .unwrap(),
-                        ),
-                        ToolResultPart::attachment(
-                            MediaPart::new(
                                 MediaKind::Image,
                                 Some("image/png".parse().unwrap()),
                                 MediaSource::Inline {
@@ -1538,12 +1595,9 @@ mod tests {
             serde_json::json!([
                 {"type": "input_text", "text": "ordinary output"},
                 {
-                    "type": "input_image",
-                    "image_url": "data:application/pdf;base64,AQID"
-                },
-                {
-                    "type": "input_image",
-                    "image_url": "data:audio/wav;base64,BAU="
+                    "type": "input_file",
+                    "filename": "attachment.pdf",
+                    "file_data": "data:application/pdf;base64,AQID"
                 },
                 {"type": "input_image", "image_url": "data:image/png;base64,BgcI"}
             ])
@@ -1551,6 +1605,264 @@ mod tests {
         assert_eq!(outputs[1]["call_id"], "text-only");
         assert_eq!(outputs[1]["output"], "first line\nsecond line");
         assert!(outputs[1]["output"].is_string());
+    }
+
+    #[test]
+    fn responses_pdf_attachment_is_preserved_in_history_as_input_file() {
+        let mut xai = test_xai("xai-key");
+        xai.auth_type = Some(AuthType::OAuth);
+        let pdf = MediaPart::new(
+            MediaKind::Document,
+            Some("application/pdf".parse().unwrap()),
+            MediaSource::Inline {
+                data: b"%PDF-1.4".to_vec(),
+            },
+        )
+        .unwrap()
+        .with_filename("report.pdf");
+        let messages = [
+            ChatMessage::user()
+                .text("read this")
+                .attachment(pdf)
+                .build(),
+            ChatMessage::assistant().text("reply").build(),
+            ChatMessage::user().text("follow up").build(),
+        ];
+        let prepared = xai
+            .prepare_chat_request(&ChatCall::new(&messages), true)
+            .unwrap();
+        let body: Value = serde_json::from_slice(prepared.request.body()).unwrap();
+        assert_eq!(body["input"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            body["input"][0]["content"],
+            serde_json::json!([
+                {"type": "input_text", "text": "read this"},
+                {"type": "input_file", "filename": "report.pdf", "file_data": "data:application/pdf;base64,JVBERi0xLjQ="}
+            ])
+        );
+        assert_eq!(body["input"][2]["content"][0]["text"], "follow up");
+        assert!(!body.to_string().contains("image_url"));
+    }
+
+    #[test]
+    fn responses_files_preserve_data_urls_and_filenames_in_both_positions() {
+        let mut xai = test_xai("xai-key");
+        xai.auth_type = Some(AuthType::OAuth);
+        for (kind, mime, source, filename, expected_name, expected_data) in [
+            (
+                MediaKind::Document,
+                "application/pdf",
+                MediaSource::DataUrl {
+                    url: "data:application/pdf;base64,JVBERi0xLjQ=".into(),
+                },
+                None,
+                "attachment.pdf",
+                "data:application/pdf;base64,JVBERi0xLjQ=",
+            ),
+            (
+                MediaKind::Other,
+                "text/plain",
+                MediaSource::Inline {
+                    data: b"notes".to_vec(),
+                },
+                Some("notes.txt"),
+                "notes.txt",
+                "data:text/plain;base64,bm90ZXM=",
+            ),
+            (
+                MediaKind::Document,
+                "text/plain",
+                MediaSource::Inline {
+                    data: b"notes".to_vec(),
+                },
+                Some(" "),
+                "attachment.txt",
+                "data:text/plain;base64,bm90ZXM=",
+            ),
+            (
+                MediaKind::Other,
+                "application/pdf",
+                MediaSource::Inline {
+                    data: b"%PDF-1.4".to_vec(),
+                },
+                Some("resource.pdf"),
+                "resource.pdf",
+                "data:application/pdf;base64,JVBERi0xLjQ=",
+            ),
+        ] {
+            let mut media = MediaPart::new(kind, Some(mime.parse().unwrap()), source).unwrap();
+            media.filename = filename.map(str::to_string);
+            let messages = [
+                ChatMessage::user().attachment(media.clone()).build(),
+                ChatMessage::user()
+                    .tool_result(
+                        "call-file".into(),
+                        None,
+                        false,
+                        vec![ToolResultPart::attachment(media)],
+                    )
+                    .build(),
+            ];
+            let prepared = xai
+                .prepare_chat_request(&ChatCall::new(&messages), true)
+                .unwrap();
+            let body: Value = serde_json::from_slice(prepared.request.body()).unwrap();
+            let expected = serde_json::json!([{
+                "type": "input_file", "filename": expected_name, "file_data": expected_data
+            }]);
+            assert_eq!(body["input"][0]["content"], expected);
+            assert_eq!(body["input"][1]["output"], expected);
+            assert!(!body.to_string().contains("image_url"));
+        }
+    }
+
+    #[test]
+    fn responses_images_remain_input_images_in_both_positions() {
+        let xai = test_xai("xai-key");
+        for (mime, source, expected_url) in [
+            (
+                Some("image/png"),
+                MediaSource::Inline {
+                    data: vec![1, 2, 3],
+                },
+                "data:image/png;base64,AQID",
+            ),
+            (
+                None,
+                MediaSource::DataUrl {
+                    url: "data:image/png;base64,AQID".into(),
+                },
+                "data:image/png;base64,AQID",
+            ),
+            (
+                None,
+                MediaSource::Url {
+                    url: "https://example.test/image.png".into(),
+                },
+                "https://example.test/image.png",
+            ),
+        ] {
+            let image = MediaPart::new(
+                MediaKind::Image,
+                mime.map(|mime| mime.parse().unwrap()),
+                source,
+            )
+            .unwrap();
+            let messages = [
+                ChatMessage::user().attachment(image.clone()).build(),
+                ChatMessage::user()
+                    .tool_result(
+                        "call-image".into(),
+                        None,
+                        false,
+                        vec![ToolResultPart::attachment(image)],
+                    )
+                    .build(),
+            ];
+            let prepared = xai
+                .prepare_chat_request(&ChatCall::new(&messages), true)
+                .unwrap();
+            let body: Value = serde_json::from_slice(prepared.request.body()).unwrap();
+            let expected = serde_json::json!([{"type": "input_image", "image_url": expected_url}]);
+            assert_eq!(body["input"][0]["content"], expected);
+            assert_eq!(body["input"][1]["output"], expected);
+        }
+    }
+
+    #[test]
+    fn responses_unsupported_attachments_fail_explicitly_in_both_positions() {
+        let xai = test_xai("xai-key");
+        for (kind, mime, source) in [
+            (
+                MediaKind::Audio,
+                "audio/wav",
+                MediaSource::Inline { data: vec![0] },
+            ),
+            (
+                MediaKind::Video,
+                "video/mp4",
+                MediaSource::Inline { data: vec![0] },
+            ),
+            (
+                MediaKind::Other,
+                "application/octet-stream",
+                MediaSource::Inline { data: vec![0] },
+            ),
+            (
+                MediaKind::Document,
+                "application/pdf",
+                MediaSource::Url {
+                    url: "https://example.test/report.pdf".into(),
+                },
+            ),
+            (
+                MediaKind::Document,
+                "application/pdf",
+                MediaSource::ProviderFile {
+                    file_id: "file-pdf".into(),
+                    origin: querymt::chat::ChatOutputProvenance {
+                        provider: "xai".into(),
+                        protocol: "responses".into(),
+                        model: "grok-test".into(),
+                        endpoint: Xai::responses_endpoint(),
+                    },
+                },
+            ),
+            (
+                MediaKind::Image,
+                "application/pdf",
+                MediaSource::Inline { data: vec![0] },
+            ),
+            (
+                MediaKind::Image,
+                "application/pdf",
+                MediaSource::DataUrl {
+                    url: "data:application/pdf;base64,AA==".into(),
+                },
+            ),
+            (
+                MediaKind::Image,
+                "application/pdf",
+                MediaSource::Url {
+                    url: "https://example.test/report.pdf".into(),
+                },
+            ),
+            (
+                MediaKind::Image,
+                "image/png",
+                MediaSource::Url {
+                    url: "data:application/pdf;base64,AA==".into(),
+                },
+            ),
+            (
+                MediaKind::Document,
+                "audio/wav",
+                MediaSource::Inline { data: vec![0] },
+            ),
+        ] {
+            let media = MediaPart::new(kind, Some(mime.parse().unwrap()), source).unwrap();
+            let user = ChatMessage::user()
+                .text("do not omit my attachment")
+                .attachment(media.clone())
+                .build();
+            let tool = ChatMessage::user()
+                .tool_result(
+                    "call-file".into(),
+                    None,
+                    false,
+                    vec![ToolResultPart::attachment(media)],
+                )
+                .build();
+            for message in [user, tool] {
+                assert!(
+                    matches!(
+                        xai.prepare_chat_request(&ChatCall::new(&[message]), true),
+                        Err(LLMError::InvalidRequest(_))
+                    ),
+                    "unsupported {kind:?} with {mime} must fail locally"
+                );
+            }
+        }
     }
 
     #[test]
