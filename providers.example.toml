@@ -68,20 +68,20 @@ path = "oci://ghcr.io/querymt/xai:latest"
 [[providers]]
 name = "llama-cpp"
 path = "oci://ghcr.io/querymt/llama-cpp:latest"
-# GPU variants: latest-metal  latest-vulkan  latest-cuda12.8
+# GPU variants: latest-metal  latest-vulkan  latest-cuda12.9
 [providers.config]
 model = "/path/to/model.gguf"
 
 [[providers]]
 name = "izwi"
 path = "oci://ghcr.io/querymt/izwi:latest"
-# GPU variants: latest-metal  latest-accelerate  latest-cuda12.8-sm{80,86,87,89,120}
+# GPU variants: latest-metal  latest-accelerate  latest-cuda12.9-sm{80,86,87,89,120}
 [providers.config]
 model = "/path/to/model"
 
 [[providers]]
 name = "mrs"
 path = "oci://ghcr.io/querymt/mrs:latest"
-# GPU variants: latest-metal  latest-accelerate  latest-cuda12.8-sm{80,86,87,89,120}
+# GPU variants: latest-metal  latest-accelerate  latest-cuda12.9-sm{80,86,87,89,120}
 [providers.config]
 model = "/path/to/model"

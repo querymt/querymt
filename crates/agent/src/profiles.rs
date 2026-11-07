@@ -1817,7 +1817,7 @@ provider_mode = "locked"
 artifact = "oci://ghcr.io/querymt/llama-cpp@sha256:35b306b544905162426a5a6f23f6676a0fe2f846fd7bc82e394c5fa83f01b45f"
 factory = "llama_cpp"
 kind = "native"
-features = ["cuda12.8"]
+features = ["cuda12.9"]
 
 [agent]
 provider = "llama_cpp"

@@ -523,10 +523,10 @@ mod tests {
     fn scalar_feature_contract_rejects_multiple_configured_features() {
         assert_eq!(expected_scalar_feature(&[]).expect("empty features"), None);
         assert_eq!(
-            expected_scalar_feature(&["cuda12.8".to_string()]).expect("single feature"),
-            Some("cuda12.8")
+            expected_scalar_feature(&["cuda12.9".to_string()]).expect("single feature"),
+            Some("cuda12.9")
         );
-        let error = expected_scalar_feature(&["cuda12.8".to_string(), "dflash2".to_string()])
+        let error = expected_scalar_feature(&["cuda12.9".to_string(), "dflash2".to_string()])
             .expect_err("multiple features must be rejected");
         assert!(error.contains("one scalar feature tag"));
     }

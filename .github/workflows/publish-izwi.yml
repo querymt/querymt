@@ -47,41 +47,41 @@ jobs:
           - os: linux
             arch: amd64
             target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             features: "cuda flash-attn"
-            feature_tag: cuda12.8-sm80
+            feature_tag: cuda12.9-sm80
             needs_cuda: "true"
-            cuda_version: "12.8"
+            cuda_version: "12.9"
             extra_env: '{"CUDA_COMPUTE_CAP":"80"}'
 
           - os: linux
             arch: amd64
             target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             features: "cuda flash-attn"
-            feature_tag: cuda12.8-sm86
+            feature_tag: cuda12.9-sm86
             needs_cuda: "true"
-            cuda_version: "12.8"
+            cuda_version: "12.9"
             extra_env: '{"CUDA_COMPUTE_CAP":"86"}'
 
           - os: linux
             arch: amd64
             target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             features: "cuda flash-attn"
-            feature_tag: cuda12.8-sm89
+            feature_tag: cuda12.9-sm89
             needs_cuda: "true"
-            cuda_version: "12.8"
+            cuda_version: "12.9"
             extra_env: '{"CUDA_COMPUTE_CAP":"89"}'
 
           - os: linux
             arch: amd64
             target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             features: "cuda flash-attn"
-            feature_tag: cuda12.8-sm120
+            feature_tag: cuda12.9-sm120
             needs_cuda: "true"
-            cuda_version: "12.8"
+            cuda_version: "12.9"
             extra_env: '{"CUDA_COMPUTE_CAP":"120"}'
 
           # ── Linux CUDA (aarch64) ────────────────────────────────────────
@@ -90,9 +90,9 @@ jobs:
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             features: "cuda flash-attn"
-            feature_tag: cuda12.8-sm87
+            feature_tag: cuda12.9-sm87
             needs_cuda: "true"
-            cuda_version: "12.8"
+            cuda_version: "12.9"
             extra_env: '{"CUDA_COMPUTE_CAP":"87"}'
 
           # ── macOS ───────────────────────────────────────────────────────
@@ -140,15 +140,15 @@ jobs:
           - os: windows
             arch: amd64
             target: x86_64-pc-windows-msvc
-            # windows-latest now ships VS 2026 (v18), which CUDA 12.8
+            # windows-latest now ships VS 2026 (v18), which CUDA 12.9
             # rejects during NVCC host compiler checks. Pin windows-2022
             # (VS 17) for the CUDA build; the default Windows build stays
             # on windows-latest.
             runner: windows-2022
             features: "cuda flash-attn"
-            feature_tag: cuda12.8-sm80
+            feature_tag: cuda12.9-sm80
             needs_cuda: "true"
-            cuda_version: "12.8"
+            cuda_version: "12.9"
             extra_env: '{"CUDA_COMPUTE_CAP":"80"}'
 
     steps:
@@ -165,7 +165,7 @@ jobs:
           features: ${{ matrix.features }}
           feature_tag: ${{ matrix.feature_tag }}
           needs_cuda: ${{ matrix.needs_cuda }}
-          cuda_version: ${{ matrix.cuda_version || '12.8' }}
+          cuda_version: ${{ matrix.cuda_version || '12.9' }}
           extra_env: ${{ matrix.extra_env || '{}' }}
 
       # izwi-core is a pure Rust dependency — no provider-specific
