@@ -770,7 +770,11 @@ async fn run_completion_guard_case(
 }
 
 /// Stop hook that always asks for another step; the configured cap bounds it.
-async fn run_stop_hook_cap_case(max_stop_hook_continuations: Option<u8>, expected_requests: usize) {
+/// Returns how many "cap reached" stop notices were published.
+async fn run_stop_hook_cap_case(
+    max_stop_hook_continuations: Option<u32>,
+    expected_requests: usize,
+) -> usize {
     // A provider tool keeps the request on the `chat_with_tools` path.
     let mut harness =
         TestHarness::new_with_tools(vec![], None, vec![provider_tool("update_task")]).await;
@@ -812,8 +816,26 @@ async fn run_stop_hook_cap_case(max_stop_hook_continuations: Option<u8>, expecte
         .expect_chat_with_tools()
         .returning(|_, _| Ok(MockChatResponse::text_only("done").into()))
         .times(expected_requests);
+    let mut events = harness.config.subscribe_events();
 
     assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    let mut cap_notices = 0;
+    while let Ok(Ok(envelope)) =
+        tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+    {
+        if let AgentEventKind::HookNotice {
+            event_name,
+            is_error: true,
+            message,
+        } = envelope.kind()
+            && event_name == "stop"
+            && message.contains("max_stop_hook_continuations")
+        {
+            cap_notices += 1;
+        }
+    }
+    cap_notices
 }
 
 /// A token-limit stop that middleware does not recover reaches Stop hooks
@@ -866,17 +888,18 @@ async fn stop_hook_can_continue_after_unrecovered_token_limit_stop() {
 
 #[tokio::test]
 async fn stop_hook_continues_once_by_default() {
-    run_stop_hook_cap_case(None, 2).await;
+    // The hook keeps asking, so the default cap of 1 is hit and the user is told.
+    assert_eq!(run_stop_hook_cap_case(None, 2).await, 1);
 }
 
 #[tokio::test]
 async fn stop_hook_continuations_follow_configured_cap() {
-    run_stop_hook_cap_case(Some(3), 4).await;
+    assert_eq!(run_stop_hook_cap_case(Some(3), 4).await, 1);
 }
 
 #[tokio::test]
 async fn stop_hook_is_advisory_when_cap_is_zero() {
-    run_stop_hook_cap_case(Some(0), 1).await;
+    assert_eq!(run_stop_hook_cap_case(Some(0), 1).await, 1);
 }
 
 #[tokio::test]

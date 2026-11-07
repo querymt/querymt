@@ -121,6 +121,32 @@ fn warn_incomplete_budget(
     );
 }
 
+/// Tell the user that a Stop hook asked to continue but the per-turn cap was
+/// reached, so the turn ends even though the hook wanted more work.
+fn emit_stop_hook_cap_notice(
+    config: &crate::agent::agent_config::AgentConfig,
+    exec_ctx: &ExecutionContext,
+    stop_reason: &str,
+    max: u32,
+) {
+    warn!(
+        "Session {}: stop hook requested more than {} continuation(s) ({}); ignoring",
+        exec_ctx.session_id, max, stop_reason
+    );
+    config.emit_event(
+        &exec_ctx.session_id,
+        AgentEventKind::HookNotice {
+            event_name: "stop".to_string(),
+            message: format!(
+                "A stop hook asked to continue ({stop_reason}) but the limit of {max} stop-hook \
+                 continuation(s) per turn was reached; ending the turn. Raise \
+                 `execution.max_stop_hook_continuations` for longer runs."
+            ),
+            is_error: true,
+        },
+    );
+}
+
 /// Run the configured Stop hooks for the end of this turn and publish their
 /// notices. `stop_reason` tells hooks why the turn is ending.
 async fn run_stop_hook(
@@ -434,7 +460,10 @@ pub(crate) async fn execute_cycle_state_machine(
         context: initial_context.clone(),
     };
     let mut event_rx = config.event_sink.fanout().subscribe();
-    let mut stop_hook_continuations = 0u8;
+    // Stop-hook continuations this turn, counted per stop reason so token-limit
+    // cut-offs do not use up the budget for normal end-of-turn continuations.
+    let mut stop_hook_continuations = 0u32;
+    let mut token_limit_stop_hook_continuations = 0u32;
     let mut task_completion_guard_continuations = 0u8;
     // Times middleware has turned a stop into a continuation this turn.
     let mut stop_recoveries = 0u8;
@@ -785,9 +814,11 @@ pub(crate) async fn execute_cycle_state_machine(
                             let max_stop_hook_continuations =
                                 config.execution_policy.max_stop_hook_continuations;
                             if stop_hook_continuations >= max_stop_hook_continuations {
-                                warn!(
-                                    "Session {}: stop hook requested more than {} continuation(s); ignoring",
-                                    exec_ctx.session_id, max_stop_hook_continuations
+                                emit_stop_hook_cap_notice(
+                                    config,
+                                    exec_ctx,
+                                    "EndTurn",
+                                    max_stop_hook_continuations,
                                 );
                             } else {
                                 stop_hook_continuations += 1;
@@ -939,13 +970,10 @@ pub(crate) async fn execute_cycle_state_machine(
                     let stop_hook = run_stop_hook(config, exec_ctx, "ModelTokenLimit").await?;
                     if stop_hook.should_continue {
                         let max = config.execution_policy.max_stop_hook_continuations;
-                        if stop_hook_continuations >= max {
-                            warn!(
-                                "Session {}: stop hook requested more than {} continuation(s) after a token-limit stop; ignoring",
-                                exec_ctx.session_id, max
-                            );
+                        if token_limit_stop_hook_continuations >= max {
+                            emit_stop_hook_cap_notice(config, exec_ctx, "ModelTokenLimit", max);
                         } else {
-                            stop_hook_continuations += 1;
+                            token_limit_stop_hook_continuations += 1;
                             let message = format_stop_hook_continuation_message(
                                 stop_hook.stop_reason.or(stop_hook.block_reason),
                                 &stop_hook.additional_contexts,

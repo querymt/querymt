@@ -2,8 +2,9 @@
 # score.sh <change> ["note"] - run the change's x-score command and record a round.
 #
 # Reads x-score from openspec/changes/<change>/.openspec.yaml, appends a row to
-# openspec/changes/<change>/rounds.tsv, snapshots every new best as
-# refs/spec-scored/<change>/best, and prints score, best, budget and task progress.
+# openspec/changes/<change>/rounds.tsv, snapshots every round (incl. untracked files) as
+# refs/spec-scored/<change>/round-<n> (the commit column holds the snapshot id) and every
+# new best as refs/spec-scored/<change>/best, and prints score, best, budget and task progress.
 # Exit 0 = scored, 1 = metric failed (the round still counts), 2 = usage/config error.
 set -u
 . "$(dirname "$0")/lib.sh"
@@ -37,7 +38,12 @@ fi
 now=$(date +%s)
 set -- $(ss_best "$log" "$direction"); prev_rounds=$3
 round=$((prev_rounds + 1))
-commit=$(git rev-parse --short HEAD 2>/dev/null || echo -)
+
+# Snapshot the full working tree (incl. untracked files) for EVERY round, so any round
+# can be restored: git checkout refs/spec-scored/<change>/round-<n> -- .
+snap=$(ss_snapshot "refs/spec-scored/$change/round-$round" "spec-scored $change round $round: score=$score $note")
+if [ -n "$snap" ]; then commit=$(git rev-parse --short "$snap" 2>/dev/null || echo -)
+else commit=$(git rev-parse --short HEAD 2>/dev/null || echo -); fi
 printf '%s\t%s\t%s\t%s\t%s\n' "$round" "$now" "$score" "$commit" "$note" >> "$log"
 
 set -- $(ss_best "$log" "$direction")
@@ -50,7 +56,6 @@ status="no improvement"
 [ "$round" -eq 1 ] && status="baseline"
 if [ "$best_round" = "$round" ]; then
   [ "$round" -gt 1 ] && status="NEW BEST"
-  snap=$(git stash create 2>/dev/null)
   [ -n "$snap" ] || snap=$(git rev-parse HEAD 2>/dev/null)
   [ -n "$snap" ] && git update-ref "$ref" "$snap" 2>/dev/null
 fi
@@ -65,6 +70,6 @@ if [ -n "$target" ]; then
   echo "target: $target ($direction) - $t"
 fi
 echo "tasks: $done_tasks/$total_tasks done"
-echo "restore best: git checkout $ref -- . ':(exclude)$dir'   (git add new files before scoring so snapshots include them)"
+echo "restore best: git checkout $ref -- . ':(exclude)$dir'   (any round: refs/spec-scored/$change/round-<n>; snapshot = $commit)"
 [ "$score" = FAIL ] && exit 1
 exit 0

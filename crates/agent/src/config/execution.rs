@@ -255,9 +255,9 @@ fn default_max_stop_recoveries() -> u8 {
 }
 
 /// Default cap on Stop-hook continuations per turn.
-pub const DEFAULT_MAX_STOP_HOOK_CONTINUATIONS: u8 = 1;
+pub const DEFAULT_MAX_STOP_HOOK_CONTINUATIONS: u32 = 1;
 
-fn default_max_stop_hook_continuations() -> u8 {
+fn default_max_stop_hook_continuations() -> u32 {
     DEFAULT_MAX_STOP_HOOK_CONTINUATIONS
 }
 
@@ -569,7 +569,7 @@ pub struct ExecutionPolicy {
     /// Maximum times a Stop hook may turn the end of a turn into another agent
     /// step within one turn (default: 1). `0` makes Stop hooks advisory only.
     #[serde(default = "default_max_stop_hook_continuations")]
-    pub max_stop_hook_continuations: u8,
+    pub max_stop_hook_continuations: u32,
 }
 
 impl Default for ExecutionPolicy {
@@ -597,7 +597,7 @@ pub struct RuntimeExecutionPolicy {
     pub rate_limit: RateLimitConfig,
     pub task_completion_guard: bool,
     pub max_stop_recoveries: u8,
-    pub max_stop_hook_continuations: u8,
+    pub max_stop_hook_continuations: u32,
 }
 
 impl Default for RuntimeExecutionPolicy {
