@@ -4,6 +4,14 @@
 
 ### Behavior changes
 
+- **Selecting the profile's model keeps the profile's `[agent.parameters]`**
+  (`max_tokens`, `n_ctx`, `enable_thinking`, sampling, ...). Previously any
+  model selection, including mesh clients re-selecting the profile's own
+  model, rebound the session to a configuration without them. Other models
+  still start without the profile's parameters. Re-selecting the model, provider
+  and node a session is already bound to is now a no-op, so a configuration set
+  with `set_llm_config` survives automatic re-selection. Existing sessions are
+  not repaired.
 - **`agent_mode` / `plan_mode` `default`** is now applied: sessions start in the
   configured mode (it was ignored and every session started in `build`). The
   planners in `coder_agent`, `coder_delegate` and `learning_pair` now really

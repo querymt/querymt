@@ -334,6 +334,23 @@ impl SessionProvider {
         &self.initial_config
     }
 
+    /// Base parameters for a model selection.
+    ///
+    /// Selecting exactly the profile's provider and model keeps the profile's
+    /// parameters; any other selection starts from an empty configuration so
+    /// model-specific settings (for example `n_ctx`) do not leak across models.
+    /// Callers layer the session's system prompt and reasoning effort on top.
+    pub fn selection_params(&self, provider: &str, model: &str) -> LLMParams {
+        let is_profile_model = self.initial_config.provider.as_deref() == Some(provider)
+            && self.initial_config.model.as_deref() == Some(model);
+        let base = if is_profile_model {
+            self.initial_config.clone()
+        } else {
+            LLMParams::new()
+        };
+        base.provider(provider).model(model)
+    }
+
     pub async fn build_provider_for_session(
         &self,
         session_id: &str,
@@ -1774,6 +1791,64 @@ pub mod tests {
             SessionError::ProviderError(LLMError::InvalidRequest(message))
                 if message == "bad provider config"
         ));
+    }
+
+    async fn provider_with_profile(profile: LLMParams) -> SessionProvider {
+        use crate::session::sqlite_storage::SqliteStorage;
+
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("connect test storage"),
+        );
+        SessionProvider::new(Arc::new(PluginRegistry::empty()), storage, profile)
+    }
+
+    fn llama_profile() -> LLMParams {
+        LLMParams::new()
+            .provider("llama_cpp")
+            .model("M")
+            .max_tokens(16_384)
+            .parameter("n_ctx", 32_768)
+            .parameter("enable_thinking", false)
+    }
+
+    #[tokio::test]
+    async fn selection_params_keeps_profile_parameters_for_profile_model() {
+        let provider = provider_with_profile(llama_profile()).await;
+
+        let params = provider.selection_params("llama_cpp", "M");
+
+        assert_eq!(params, llama_profile());
+        assert_eq!(params.max_tokens, Some(16_384));
+        let custom = params.custom.expect("custom parameters are carried");
+        assert_eq!(custom.get("n_ctx"), Some(&serde_json::json!(32_768)));
+        assert_eq!(
+            custom.get("enable_thinking"),
+            Some(&serde_json::json!(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn selection_params_drops_profile_parameters_for_other_model() {
+        let provider = provider_with_profile(llama_profile()).await;
+
+        let params = provider.selection_params("llama_cpp", "N");
+
+        assert_eq!(params, LLMParams::new().provider("llama_cpp").model("N"));
+        assert!(
+            params.custom.is_none(),
+            "n_ctx must not leak to other models"
+        );
+    }
+
+    #[tokio::test]
+    async fn selection_params_drops_profile_parameters_for_other_provider() {
+        let provider = provider_with_profile(llama_profile()).await;
+
+        let params = provider.selection_params("openai", "M");
+
+        assert_eq!(params, LLMParams::new().provider("openai").model("M"));
     }
 
     #[cfg(feature = "remote")]
