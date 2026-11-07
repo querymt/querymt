@@ -1,32 +1,92 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+context: |
+  QueryMT is a Rust 2024 Cargo workspace on the stable toolchain (rust-toolchain.toml; provider plugins also target wasm32-wasip1).
+  AGENTS.md holds the repository rules. This context adds what plans and implementations most often get wrong.
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  Packages (names for -p):
+  - querymt (crates/querymt): core LLM, provider, plugin-host and MCP library. Almost everything depends on it.
+  - querymt-agent (crates/agent): agent runtime, ACP, SQLite sessions, tools, hooks, middleware, optional dashboard. Depends on querymt, querymt-remote, querymt-utils, querymt-provider-common.
+  - querymt-remote (mesh, remote providers), querymt-utils (shared utils, OAuth, secret store), querymt-service-client (service OAuth/API client).
+  - querymt-cli (crates/cli, the qmt binary), querymt-py and querymt-agent-py (crates/py, PyO3), querymt-mobile-ffi (over querymt-agent).
+  - qmt-<name> (crates/providers/<name>): providers. Many build on qmt-openai, which is also a dev-dependency of querymt-agent and querymt-remote.
+  Use `cargo tree -i <package> --workspace --depth 1` to find downstream packages before choosing validation scope.
 
-# Per-operation guidance (optional)
-# Add advisory guidance for how apply and archive work should be conducted.
-# This is separate from artifact rules above.
-# Example:
-#   operations:
-#     apply:
-#       guidance:
-#         - Keep test summaries concise
-#     archive:
-#       guidance:
-#         - Summarize the archive outcome before finishing
+  Tests:
+  - Run tests with cargo-nextest, not `cargo test`. CI runs `cargo llvm-cov nextest`, and .config/nextest.toml timeouts only apply under nextest.
+      cargo nextest run -p <package> [--features <f>] [<name-substring>]
+      cargo nextest run -p <package> -E 'test(/regex/)'
+    Translations from libtest: `-- --ignored` -> `--run-ignored only`, `-- --nocapture` -> `--no-capture`.
+  - nextest does not run doctests. When doc examples change, also run `cargo test -p <package> --doc`.
+  - nextest fails when a filter matches no tests. Fix the filter; never drop it.
+  - nextest is not in the Nix devShell. If `cargo nextest --version` fails, tell the user (`cargo install cargo-nextest --locked`), then fall back to `cargo test` with the same scope and record the fallback.
+  - Never run `cargo nextest run --workspace`, or `--all-features` on querymt-agent. Default-feature (extism) provider test builds can fail to link, and native providers are expensive.
+
+  Features (mirror .github/workflows):
+  - querymt-agent CI features: dashboard,oauth,zbus-secret-service,systemd-credentials,remote. Mesh code needs remote. The zbus/systemd features only take effect on Linux, so those paths stay unverified on macOS; say so.
+  - dashboard builds need QMT_UI_DIST pointing at the minimal fixture from test-agent.yml, outside target/. Without it build.rs downloads the UI from GitHub.
+  - querymt and querymt-remote CI use --all-features.
+  - Providers default to the extism (wasm plugin) feature. Test them with --no-default-features --features native. qmt-mrs tests download models; skip them unless the change targets mrs.
+  - Python crates need PYO3_PYTHON pointing at Python 3.10 or newer (abi3-py310).
+  - querymt-remote network-timing tests can flake when several packages share one nextest run. Rerun them alone before blaming the change.
+
+  Agent configuration (crates/agent/src/config):
+  - TOML/JSON via serde, with schemars JsonSchema. Most structs use deny_unknown_fields, so an unknown key is a load error, not a warning.
+  - A new key needs an explicit default, a JsonSchema entry, parse tests in config/tests.rs (default, valid value, rejected value) and docs in docs/docs/agent/configuration.md.
+  - crates/agent/examples/confs/*.toml are embedded and tested; single_coder.toml is the default qmtcode profile.
+
+  Contracts:
+  - Session DB migrations (crates/agent/src/session/sqlite_storage/migrations.rs) are forward-only. Never edit a released migration; append one. legacy_baseline_upgrade_matches_fresh_install guards this.
+  - Changing the Extism host/plugin interface means bumping ITEM_AWARE_CHAT_CONTRACT_VERSION or PREPARED_CHAT_CONTRACT_VERSION and checking `cargo build -p qmt-<name> --release --target wasm32-wasip1`.
+  - #[typeshare] types and ACP payloads are consumed by querymt-desktop. Changes need a reported UI follow-up, not UI work here.
+  - Any behaviour change to config, hooks, middleware, tools or ACP is marked **BREAKING** in the proposal and gets an entry under "Unreleased" in CHANGELOG.md.
+  - Per AGENTS.md, do not add compatibility layers or keep legacy behaviour unless the user asks for it; flag the need instead.
+
+  Diagrams:
+  - Draw diagrams (flows, sequences, state machines, architecture) as ```mermaid code blocks, never as ASCII art or box drawings. This applies to OpenSpec artifacts and to docs/docs pages, which render mermaid (docs/mkdocs.yml).
+
+rules:
+  proposal:
+    - Include a short Non-goals section after What Changes, listing related work this change deliberately leaves out.
+    - In Impact, list affected Cargo packages by package name and the feature flags whose code changes.
+    - Call out every change to public Rust API, TOML/JSON config, hook or middleware behaviour, ACP or provider wire shapes, the Extism plugin contract, the session DB schema, Python bindings or typeshare types, and mark breaking ones **BREAKING**.
+    - Name any required querymt-desktop UI follow-up instead of planning UI work.
+    - Use skip_specs only for refactor, tooling, dependency or docs changes with no behavior change.
+  specs:
+    - Describe observable behavior (tool calls, ACP updates, config keys, wire payloads, persisted state), not Rust types, modules or file paths.
+    - For every config key, state its full TOML path, type, default, limits or units, and what happens on an invalid value.
+    - Give every scenario a unique, descriptive name within its capability. Tasks and tests refer to scenarios by that name.
+  design:
+    - Cite the existing code the change builds on as file path plus symbol (for example crates/agent/src/config/single.rs SingleAgentConfig). Add a line number only as a hint; symbols survive edits, line numbers do not.
+    - Name the crates, modules and cfg(feature) paths that change, and which special builds are affected (wasm32-wasip1 provider plugins, Python, mobile-ffi).
+    - For new dependencies, state workspace vs crate-local, default-features and feature gating, and confirm provider crates still build for wasm32-wasip1.
+    - For persistence changes, describe the new forward-only migration and how existing databases upgrade.
+    - When a flow, sequence or state change is easier to show than to describe, add a mermaid diagram (sequenceDiagram, flowchart or stateDiagram-v2), not ASCII art.
+  tasks:
+    - Every task that implements or tests behavior names the spec scenarios it covers as <capability> / <Scenario name> and the test that proves them. Setup and dependency tasks name none.
+    - Every scenario in the change's delta specs is covered by at least one task. A scenario that cannot be tested automatically says how it is verified instead.
+    - Name scenario tests after the scenario in snake_case, so cargo nextest run -p <package> -E 'test(/<name>/)' selects them. Tests assert the THEN outcome through the production code path.
+    - Verify with cargo nextest run -p <package>, exact features and a test filter. Never write bare cargo test, except cargo test --doc for doctests.
+    - Use each affected package's CI feature set and fixtures (QMT_UI_DIST for dashboard, --no-default-features --features native for providers).
+    - Per package, order checks as cargo check, focused nextest, cargo fmt -p <package> -- --check, then cargo clippy --all-targets with CI features and -D warnings.
+    - New config keys get default, accepted-value and rejected-value parse tests and a docs update. Add or extend an example profile in crates/agent/examples/confs only when it demonstrates a user-facing setting, together with a test that loads it.
+    - The final group covers downstream packages (from cargo tree -i) and openspec validate <change> --strict. No workspace-wide runs and no --all-features on querymt-agent.
+    - Do not plan tests that download models, call paid providers or need live credentials unless the change requires them. Such tests are ignored and gated by an env var, like the QMT_RUN_LIVE_* tests.
+  objective:
+    - The x-score command uses cargo nextest run with the package, features and filter pinned.
+
+operations:
+  apply:
+    guidance:
+      - Before the first test run, check cargo nextest --version once. If it is missing, tell the user, fall back to cargo test with the same scope and note the fallback in tasks.md.
+      - Run verification that tasks write as cargo test through nextest instead (cargo test -p X F -> cargo nextest run -p X F; -- --ignored -> --run-ignored only; -- --nocapture -> --no-capture). Keep cargo test --doc for doctests.
+      - Before ticking a task, run the focused nextest filter for the scenarios it names. Run the full package suite at the end of each task group, not after every task.
+      - Write scenario tests so they would fail without the change (check the THEN assertion, not only that the code runs). Do not change a scenario to match the implementation; propose a spec update instead.
+      - Use the Nix devShell when available, keep checks package-scoped, and reuse the existing target dir. Do not rebuild every provider or example after each edit.
+      - Tick a verification task only after its command ran and passed. Record the exact commands, features and pass/fail/skip counts under the task in tasks.md.
+      - If a failure looks unrelated, confirm it on HEAD without discarding local work (for example in a separate git worktree) and report it. Do not weaken tests or add blanket lint allows.
+  archive:
+    guidance:
+      - Run openspec validate <change> --strict before archiving.
+      - Summarize what shipped, any unchecked tasks, and any delta-spec scenario without a passing test. Ask before archiving if either list is non-empty.
+      - Confirm tasks.md records nextest results (or the noted fallback) for every affected package, and that breaking changes have a CHANGELOG.md Unreleased entry.

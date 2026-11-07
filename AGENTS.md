@@ -46,10 +46,13 @@
 - Start with package-scoped checks; replace `<package>` and `<test_filter>`:
   ```sh
   cargo check -p <package>
-  cargo test -p <package> <test_filter>
+  cargo nextest run -p <package> <test_filter>
   cargo fmt -p <package> -- --check
   cargo clippy -p <package> --all-targets -- -D warnings
   ```
+  Use `cargo nextest run`, not `cargo test`. nextest skips doctests, so run
+  `cargo test -p <package> --doc` when doc examples change. If cargo-nextest is
+  not installed, say so and fall back to `cargo test` with the same scope.
 - Expand validation to affected consumers and feature combinations. Consult the
   relevant `.github/workflows/` file for CI commands/features and `.config/nextest.toml`
   for test timeouts.
@@ -77,3 +80,6 @@
 - SQLite schema changes (`crates/agent/src/session/schema.rs`) need a new migration in
   `crates/agent/src/session/sqlite_storage/migrations.rs`; `init_schema` only covers fresh
   installs. Never edit a released migration. The schema drift test enforces this.
+- Draw diagrams (flows, sequences, state machines, architecture) as ` ```mermaid `
+  code blocks, never as ASCII art or box drawings. This applies to docs, OpenSpec
+  artifacts and Markdown in general; `docs/mkdocs.yml` renders mermaid.

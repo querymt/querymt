@@ -4,7 +4,7 @@ Agent half of `speed-up-session-loading`. The desktop half (windowed-load UI, ra
 
 ## 0. Baseline and coordination
 
-- [ ] 0.1 Extend the agent load logs (`agent/load_telemetry.rs`) to record snapshot bytes, snapshot events and mesh requests/events per load and attach. Record the agent-side baseline for a local session and for a remote session with about 5,000 events on a throttled link in `baseline.md`.
+- [ ] 0.1 Extend the agent load logs (`agent/load_telemetry.rs`) to record snapshot bytes, snapshot events and mesh requests/events per load and attach. Record the agent-side baseline for a local session and for a remote session with about 5,000 events on a throttled link in `baseline.md`. Scenarios: none (baseline measurement).
 - [x] 0.2 Review the specs `remote-stream-relay`, `acp-session-updates`, `llm-cost-accounting` and `session-interactions` and carry MODIFIED deltas for any requirement D2-D4 changes (this change's `specs/acp-session-updates` and `specs/llm-cost-accounting`). Verify with `openspec validate speed-up-session-loading --strict`.
 
 ## 1. Chunked event transfer
@@ -48,10 +48,10 @@ Agent half of `speed-up-session-loading`. The desktop half (windowed-load UI, ra
 
 ## 5. Integration and verification
 
-- [ ] 5.1 Run the agent side of the mixed-version matrix: new agent with old owner, old agent with new owner, stdio/non-snapshot client, mobile client, and an old agent rolled back onto a journal with uncovered gaps. Verify that load, attach and history succeed in each, and record results in `baseline.md`. (New desktop with old agent and old desktop with new agent are covered in the desktop change.)
-- [ ] 5.2 Re-measure the 0.1 agent-side scenarios. Verify that each remote event crosses the mesh once across load and attach, and a reopen transfers only new events; record results in `baseline.md`.
-- [ ] 5.3 Add tests asserting the new `llm-cost-accounting` scenarios (chunked delivery, resync after undo).
-- [ ] 5.4 Run `cargo test -p querymt-agent --features remote`.
+- [ ] 5.1 Run the agent side of the mixed-version matrix: new agent with old owner, old agent with new owner, stdio/non-snapshot client, mobile client, and an old agent rolled back onto a journal with uncovered gaps. Verify that load, attach and history succeed in each, and record results in `baseline.md`. (New desktop with old agent and old desktop with new agent are covered in the desktop change.) Scenarios: `remote-session-sync` / Owner on an older version, Second open from the same older owner, Undo on an older owner; `session-history-loading` / Client without a window request, Client that receives history as session updates, Capabilities advertised.
+- [ ] 5.2 Re-measure the 0.1 agent-side scenarios. Verify that each remote event crosses the mesh once across load and attach, and a reopen transfers only new events; record results in `baseline.md`. Scenarios: `remote-session-sync` / First open of a remote session, Reopening after new activity, Reopening without new activity, Reopening while still attached.
+- [ ] 5.3 Add tests asserting the new `llm-cost-accounting` scenarios (chunked delivery, resync after undo), named after the scenarios in snake_case. Verify with `cargo nextest run -p querymt-agent --features remote -E 'test(/settlement_arrives_in_a_history_chunk|local_copy_replaced_after/)'`. Scenarios: `llm-cost-accounting` / Settlement arrives in a history chunk and over the live relay, Local copy replaced after the owner's undo.
+- [ ] 5.4 Run `cargo nextest run -p querymt-agent --features remote`. Verify: all pass. Scenarios: all scenarios of sections 1-4 and 5.3 (integration run).
 
 ## Workflow follow-up
 

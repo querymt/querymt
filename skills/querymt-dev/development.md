@@ -39,10 +39,12 @@ Run the commands below from the repository root inside that environment.
 3. From this repository root, use scoped commands, adapting package/features:
    ```sh
    cargo check -p querymt-agent
-   cargo test -p querymt-agent --lib TEST_FILTER
+   cargo nextest run -p querymt-agent --lib TEST_FILTER
    cargo fmt --all -- --check
    ```
-   Replace `TEST_FILTER` with the actual test/module and verify tests ran. Required
+   Replace `TEST_FILTER` with the actual test/module and verify tests ran. Use
+   nextest rather than `cargo test`; run `cargo test -p <package> --doc` only for
+   doctests, and fall back to `cargo test` only if cargo-nextest is missing. Required
    mesh tests need `--features remote`; required reduced-feature tests need their
    real flags. Run `cargo check` after Rust edits and before formatting. No Rust
    build is needed merely to edit this skill or other prose.
