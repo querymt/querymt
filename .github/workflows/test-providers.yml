@@ -32,6 +32,7 @@ jobs:
       kimi-code:    ${{ steps.filter.outputs.kimi-code }}
       ollama:       ${{ steps.filter.outputs.ollama }}
       openai:       ${{ steps.filter.outputs.openai }}
+      zai:          ${{ steps.filter.outputs.zai }}
       # querymt / shared changes should re-test every provider
       shared:       ${{ steps.filter.outputs.shared }}
 
@@ -53,6 +54,9 @@ jobs:
             ollama:
               - 'crates/providers/ollama/**'
             openai:
+              - 'crates/providers/openai/**'
+            zai:
+              - 'crates/providers/zai/**'
               - 'crates/providers/openai/**'
             shared:
               - 'crates/querymt/**'
@@ -97,6 +101,11 @@ jobs:
             package: qmt-openai
             features: native
             changed: ${{ needs.detect-changes.outputs.openai }}
+
+          - provider: zai
+            package: qmt-zai
+            features: native
+            changed: ${{ needs.detect-changes.outputs.zai }}
 
     steps:
       - name: Checkout code

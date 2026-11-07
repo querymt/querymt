@@ -196,8 +196,10 @@ impl EmbeddingProvider for LLMProviderFromHTTP {
     async fn embed(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
         self.ensure_credential_fresh().await?;
         let req = self.inner.embed_request(&inputs)?;
-        // call_outbound already classifies non-success statuses.
-        let resp = call_outbound(req).await?;
+        let resp = call_outbound_raw(req).await?;
+        if !resp.status().is_success() {
+            return Err(self.inner.classify_embed_error(&resp));
+        }
         self.inner.parse_embed(resp)
     }
 }

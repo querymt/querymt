@@ -1173,9 +1173,25 @@ pub fn openai_embed_request<C: OpenAIProviderConfig>(
 }
 
 pub fn openai_parse_embed<C: OpenAIProviderConfig>(
-    _cfg: &C,
+    cfg: &C,
     resp: Response<Vec<u8>>,
 ) -> Result<Vec<Vec<f32>>, LLMError> {
+    openai_parse_embed_with(cfg, resp, None)
+}
+
+pub fn openai_parse_embed_with<C: OpenAIProviderConfig>(
+    _cfg: &C,
+    resp: Response<Vec<u8>>,
+    provider_classifier: Option<OpenAIErrorClassifier>,
+) -> Result<Vec<Vec<f32>>, LLMError> {
+    if provider_classifier.is_some()
+        && serde_json::from_slice::<Value>(resp.body())
+            .ok()
+            .and_then(|envelope| envelope.get("error").cloned())
+            .is_some()
+    {
+        return Err(classify_openai_http_error_with(&resp, provider_classifier));
+    }
     let json_resp: OpenAIEmbeddingResponse = serde_json::from_slice(resp.body())?;
     let embeddings = json_resp.data.into_iter().map(|d| d.embedding).collect();
     Ok(embeddings)
