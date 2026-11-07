@@ -254,6 +254,13 @@ fn default_max_stop_recoveries() -> u8 {
     DEFAULT_MAX_STOP_RECOVERIES
 }
 
+/// Default cap on Stop-hook continuations per turn.
+pub const DEFAULT_MAX_STOP_HOOK_CONTINUATIONS: u8 = 1;
+
+fn default_max_stop_hook_continuations() -> u8 {
+    DEFAULT_MAX_STOP_HOOK_CONTINUATIONS
+}
+
 /// Configuration for rate limit retry behavior
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -559,6 +566,10 @@ pub struct ExecutionPolicy {
     /// turn before the stop is published (default: 5).
     #[serde(default = "default_max_stop_recoveries")]
     pub max_stop_recoveries: u8,
+    /// Maximum times a Stop hook may turn the end of a turn into another agent
+    /// step within one turn (default: 1). `0` makes Stop hooks advisory only.
+    #[serde(default = "default_max_stop_hook_continuations")]
+    pub max_stop_hook_continuations: u8,
 }
 
 impl Default for ExecutionPolicy {
@@ -571,6 +582,7 @@ impl Default for ExecutionPolicy {
             rate_limit: RateLimitConfig::default(),
             task_completion_guard: default_task_completion_guard(),
             max_stop_recoveries: DEFAULT_MAX_STOP_RECOVERIES,
+            max_stop_hook_continuations: DEFAULT_MAX_STOP_HOOK_CONTINUATIONS,
         }
     }
 }
@@ -585,6 +597,7 @@ pub struct RuntimeExecutionPolicy {
     pub rate_limit: RateLimitConfig,
     pub task_completion_guard: bool,
     pub max_stop_recoveries: u8,
+    pub max_stop_hook_continuations: u8,
 }
 
 impl Default for RuntimeExecutionPolicy {
@@ -596,6 +609,7 @@ impl Default for RuntimeExecutionPolicy {
             rate_limit: RateLimitConfig::default(),
             task_completion_guard: default_task_completion_guard(),
             max_stop_recoveries: DEFAULT_MAX_STOP_RECOVERIES,
+            max_stop_hook_continuations: DEFAULT_MAX_STOP_HOOK_CONTINUATIONS,
         }
     }
 }
@@ -609,6 +623,7 @@ impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
             rate_limit: ep.rate_limit.clone(),
             task_completion_guard: ep.task_completion_guard,
             max_stop_recoveries: ep.max_stop_recoveries,
+            max_stop_hook_continuations: ep.max_stop_hook_continuations,
         }
     }
 }
@@ -644,6 +659,25 @@ mod tests {
         let policy: ExecutionPolicy =
             serde_json::from_value(json!({"max_stop_recoveries": 2})).unwrap();
         assert_eq!(RuntimeExecutionPolicy::from(&policy).max_stop_recoveries, 2);
+    }
+
+    #[test]
+    fn max_stop_hook_continuations_defaults_to_one_and_is_configurable() {
+        assert_eq!(ExecutionPolicy::default().max_stop_hook_continuations, 1);
+        assert_eq!(
+            RuntimeExecutionPolicy::default().max_stop_hook_continuations,
+            1
+        );
+
+        let omitted: ExecutionPolicy = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(omitted.max_stop_hook_continuations, 1);
+
+        let policy: ExecutionPolicy =
+            serde_json::from_value(json!({"max_stop_hook_continuations": 50})).unwrap();
+        assert_eq!(
+            RuntimeExecutionPolicy::from(&policy).max_stop_hook_continuations,
+            50
+        );
     }
 
     #[test]

@@ -769,6 +769,68 @@ async fn run_completion_guard_case(
     assert_eq!(harness.run().await, CycleOutcome::Completed);
 }
 
+/// Stop hook that always asks for another step; the configured cap bounds it.
+async fn run_stop_hook_cap_case(max_stop_hook_continuations: Option<u8>, expected_requests: usize) {
+    // A provider tool keeps the request on the `chat_with_tools` path.
+    let mut harness =
+        TestHarness::new_with_tools(vec![], None, vec![provider_tool("update_task")]).await;
+    let output = json!({
+        "decision": "block",
+        "reason": "budget remains",
+        "hook_specific_output": {"hook_event_name": "stop", "additional_context": "keep going"}
+    });
+    let hooks = crate::hooks::Hooks::new(
+        serde_json::from_value::<crate::hooks::HooksConfig>(json!({
+            "enabled": true,
+            "stop": [{"hooks": [{
+                "type": "command",
+                "command": format!("cat >/dev/null; printf '%s' '{output}'"),
+                "timeout_sec": 5
+            }]}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut policy = harness.config.execution_policy.clone();
+    if let Some(max) = max_stop_hook_continuations {
+        policy.max_stop_hook_continuations = max;
+    }
+    harness.config = Arc::new(
+        crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+            harness.config.storage.clone(),
+            harness.config.provider.clone(),
+            harness.config.event_sink.journal().clone(),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly)
+        .with_execution_policy(policy)
+        .with_hooks(hooks)
+        .build(),
+    );
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .returning(|_, _| Ok(MockChatResponse::text_only("done").into()))
+        .times(expected_requests);
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+}
+
+#[tokio::test]
+async fn stop_hook_continues_once_by_default() {
+    run_stop_hook_cap_case(None, 2).await;
+}
+
+#[tokio::test]
+async fn stop_hook_continuations_follow_configured_cap() {
+    run_stop_hook_cap_case(Some(3), 4).await;
+}
+
+#[tokio::test]
+async fn stop_hook_is_advisory_when_cap_is_zero() {
+    run_stop_hook_cap_case(Some(0), 1).await;
+}
+
 #[tokio::test]
 async fn completion_guard_continues_exactly_once_in_execution_flow() {
     run_completion_guard_case(

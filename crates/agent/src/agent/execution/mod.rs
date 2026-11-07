@@ -11,8 +11,6 @@
 //! - `llm_retry` — LLM retry logic with rate limit handling
 //! - `maintenance` — Pruning and AI compaction
 
-const MAX_STOP_HOOK_CONTINUATIONS_PER_TURN: u8 = 1;
-
 fn format_stop_hook_continuation_message(
     reason: Option<String>,
     additional_contexts: &[String],
@@ -773,10 +771,12 @@ pub(crate) async fn execute_cycle_state_machine(
                             );
                         }
                         if stop_hook.should_continue {
-                            if stop_hook_continuations >= MAX_STOP_HOOK_CONTINUATIONS_PER_TURN {
+                            let max_stop_hook_continuations =
+                                config.execution_policy.max_stop_hook_continuations;
+                            if stop_hook_continuations >= max_stop_hook_continuations {
                                 warn!(
                                     "Session {}: stop hook requested more than {} continuation(s); ignoring",
-                                    exec_ctx.session_id, MAX_STOP_HOOK_CONTINUATIONS_PER_TURN
+                                    exec_ctx.session_id, max_stop_hook_continuations
                                 );
                             } else {
                                 stop_hook_continuations += 1;
