@@ -432,8 +432,11 @@ Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models,
 | `flash_attention` | string | `"auto"` \| `"enabled"` \| `"disabled"` |
 | `kv_cache_type_k` | string | KV cache key quantization: `"f16"`, `"q8_0"`, `"q4_0"` |
 | `kv_cache_type_v` | string | KV cache value quantization: `"f16"`, `"q8_0"`, `"q4_0"` |
-| `max_tokens` | integer | Maximum tokens to generate (default: 256) |
+| `max_tokens` | integer | Maximum tokens to generate (default: 256). A per-request `max_tokens` override takes precedence |
 | `temperature` | float | Sampling temperature. `0` = greedy |
+| `enable_thinking` | bool | Render the chat template with reasoning enabled (default: `true`) |
+| `reasoning_effort` | string | `"low"` \| `"medium"` \| `"high"` \| `"max"`; applied only when the chat template exposes `reasoning_effort`. A per-request override takes precedence |
+| `thinking_budget` | integer | Maximum reasoning tokens per reply. When spent, the provider closes the reasoning block so the model must answer. Unset = unbounded; not applied with `speculative` decoding |
 | `mmproj_path` | string | Path to multimodal projection file (vision models only) |
 
 For vision model configuration and the full option reference see the [llama-cpp provider README](https://github.com/querymt/querymt/blob/main/crates/providers/llama-cpp/README.md).

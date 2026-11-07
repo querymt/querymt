@@ -236,6 +236,74 @@ impl ThinkingStreamParser {
     }
 }
 
+/// Enforces `thinking_budget`: counts tokens generated inside a reasoning
+/// block and says when the block has to be closed.
+#[derive(Debug)]
+pub(crate) struct ThinkingBudget {
+    budget: u32,
+    used: u32,
+    in_thinking: bool,
+    tail: String,
+    reasoning_format: ReasoningFormat,
+}
+
+impl ThinkingBudget {
+    /// Bytes of recent output kept to find markers split across tokens.
+    const TAIL_BYTES: usize = 64;
+
+    /// `None` when no budget is configured.
+    pub(crate) fn new(budget: Option<u32>, result: &ChatTemplateResult) -> Option<Self> {
+        budget.map(|budget| {
+            Self::with_state(budget, result.reasoning_format, result.starts_in_thinking)
+        })
+    }
+
+    fn with_state(budget: u32, reasoning_format: ReasoningFormat, in_thinking: bool) -> Self {
+        Self {
+            budget,
+            used: 0,
+            in_thinking,
+            tail: String::new(),
+            reasoning_format,
+        }
+    }
+
+    /// Observe the text of one generated token. Returns the text to insert
+    /// when the budget is spent while the model is still reasoning.
+    pub(crate) fn observe(&mut self, piece: &str) -> Option<&'static str> {
+        self.tail.push_str(piece);
+        if self.tail.len() > Self::TAIL_BYTES {
+            let mut cut = self.tail.len() - Self::TAIL_BYTES;
+            while !self.tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.tail.drain(..cut);
+        }
+        if !self.in_thinking {
+            if self.tail.contains(self.reasoning_format.open_tag()) {
+                self.in_thinking = true;
+                self.tail.clear();
+            }
+            return None;
+        }
+        if self.tail.contains(self.reasoning_format.close_tag()) {
+            self.in_thinking = false;
+            self.tail.clear();
+            return None;
+        }
+        self.used = self.used.saturating_add(1);
+        if self.used < self.budget {
+            return None;
+        }
+        self.in_thinking = false;
+        self.tail.clear();
+        Some(match self.reasoning_format {
+            ReasoningFormat::ThinkTags => "\n</think>\n\n",
+            ReasoningFormat::GemmaChannel { .. } => "<channel|>",
+        })
+    }
+}
+
 fn safe_emit_len(buffer: &str, marker: &str, is_partial: bool) -> usize {
     if !is_partial {
         return buffer.len();
@@ -271,6 +339,34 @@ mod tests {
         }
         deltas.extend(state.finish());
         deltas
+    }
+
+    fn observe_all(budget: &mut ThinkingBudget, pieces: &[&str]) -> Vec<Option<&'static str>> {
+        pieces.iter().map(|piece| budget.observe(piece)).collect()
+    }
+
+    #[test]
+    fn thinking_budget_closes_reasoning_once_spent() {
+        let mut budget = ThinkingBudget::with_state(3, ReasoningFormat::ThinkTags, true);
+        assert_eq!(
+            observe_all(&mut budget, &["a", "b", "c", "answer"]),
+            [None, None, Some("\n</think>\n\n"), None],
+            "closed exactly once, at the budget"
+        );
+    }
+
+    #[test]
+    fn thinking_budget_ignores_reasoning_closed_in_time_and_counts_reopened_blocks() {
+        let mut budget = ThinkingBudget::with_state(3, ReasoningFormat::ThinkTags, false);
+        // Not reasoning yet; a split open tag starts the block.
+        assert_eq!(observe_all(&mut budget, &["hi", "<th", "ink>"]), [None; 3]);
+        // Closed before the budget: nothing is forced.
+        assert_eq!(observe_all(&mut budget, &["x", "</think>", "y"]), [None; 3]);
+        // A second block shares the per-reply budget (1 token used so far).
+        assert_eq!(
+            observe_all(&mut budget, &["<think>", "p", "q"]),
+            [None, None, Some("\n</think>\n\n")]
+        );
     }
 
     #[test]

@@ -176,6 +176,7 @@ pub(crate) fn generate_streaming_with_tools(
     let mut generated_text = String::new();
     let mut termination = GenerationTermination::MaxTokens;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut thinking_budget = crate::common_chat::ThinkingBudget::new(cfg.thinking_budget, result);
 
     while state.n_cur < state.n_len_total {
         if tx.is_closed() {
@@ -247,6 +248,26 @@ pub(crate) fn generate_streaming_with_tools(
             .ctx
             .decode(&mut batch)
             .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+
+        if let Some(forced) = thinking_budget.as_mut().and_then(|b| b.observe(&chunk))
+            && let Some(added) = crate::generation::force_text(
+                model,
+                &mut state.ctx,
+                &mut batch,
+                &mut sampler,
+                forced,
+                &mut state.n_cur,
+                state.n_len_total,
+            )?
+        {
+            generated_text.push_str(forced);
+            output_tokens += added;
+            for delta in stream_state.update(forced, true) {
+                if let ParsedDelta::Thinking(thinking) = delta {
+                    let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Thinking(thinking)));
+                }
+            }
+        }
     }
 
     for stop in &result.additional_stops {

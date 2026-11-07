@@ -1,5 +1,5 @@
 use querymt::chat::ReasoningEffort;
-use querymt::chat::StructuredOutputFormat;
+use querymt::chat::{GenerationOptions, StructuredOutputFormat};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +92,14 @@ pub struct LlamaCppConfig {
     /// `None` leaves the behavior to the chat template, while explicit true or
     /// false maps to the compatibility variables used by llama.cpp templates.
     pub preserve_reasoning: Option<bool>,
+    /// Maximum tokens the model may spend inside a reasoning block per reply.
+    ///
+    /// When the budget is spent and the model is still reasoning, the provider
+    /// inserts the end-of-reasoning marker so the model has to answer. This
+    /// stops runaway reasoning from consuming the whole `max_tokens` cap.
+    /// `None` (default) leaves reasoning unbounded. Not applied with
+    /// `speculative` decoding.
+    pub thinking_budget: Option<u32>,
     /// Flash attention policy. Enables flash attention for faster inference
     /// and is required for KV cache quantization. Supported on Metal (Apple
     /// Silicon) and CUDA backends.
@@ -221,6 +229,20 @@ impl SpeculativeConfig {
     }
 }
 
+impl LlamaCppConfig {
+    /// This config with a request's per-call overrides applied.
+    pub(crate) fn with_overrides(&self, options: GenerationOptions) -> Self {
+        let mut cfg = self.clone();
+        if let Some(max_tokens) = options.max_tokens {
+            cfg.max_tokens = Some(max_tokens);
+        }
+        if let Some(effort) = options.reasoning_effort {
+            cfg.reasoning_effort = Some(effort);
+        }
+        cfg
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LlamaCppLogMode {
@@ -253,6 +275,27 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(config.system, ["legacy", "stable"]);
+    }
+
+    #[test]
+    fn request_overrides_replace_configured_cap_and_effort() {
+        use querymt::chat::{GenerationOptions, ReasoningEffort};
+        let config: super::LlamaCppConfig = serde_json::from_value(serde_json::json!({
+            "model": "test.gguf", "max_tokens": 100, "reasoning_effort": "high"
+        }))
+        .unwrap();
+
+        let unchanged = config.with_overrides(GenerationOptions::NONE);
+        assert_eq!(unchanged.max_tokens, Some(100));
+        assert_eq!(unchanged.reasoning_effort, Some(ReasoningEffort::High));
+
+        let overridden = config.with_overrides(
+            GenerationOptions::NONE
+                .with_max_tokens(4096)
+                .with_reasoning_effort(ReasoningEffort::Low),
+        );
+        assert_eq!(overridden.max_tokens, Some(4096));
+        assert_eq!(overridden.reasoning_effort, Some(ReasoningEffort::Low));
     }
 
     fn config(n_max: u32, n_min: u32, p_min: f32) -> SpeculativeConfig {

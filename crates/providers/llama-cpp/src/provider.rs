@@ -326,12 +326,15 @@ impl LlamaCppProvider {
 #[async_trait]
 impl ChatProvider for LlamaCppProvider {
     fn capabilities(&self) -> ChatCapabilities {
-        ChatCapabilities::NONE.with_streaming(true)
+        ChatCapabilities::NONE
+            .with_streaming(true)
+            .with_options(querymt::chat::GenerationOptionSupport::ALL)
     }
 
     async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
         let (messages, tools) = (call.messages, call.tools);
-        let max_tokens = self.cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        let cfg = self.cfg.with_overrides(call.options);
+        let max_tokens = cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
         // Extract media from messages (empty vec if none)
         let media = crate::multimodal::extract_media(messages);
@@ -367,16 +370,11 @@ impl ChatProvider for LlamaCppProvider {
         // If tools are provided and not empty, use tool-aware generation
         if let Some(tools) = tools {
             if !tools.is_empty() {
-                let template_result = apply_template_with_tools(
-                    &self.model,
-                    &self.cfg,
-                    messages,
-                    tools,
-                    media_marker,
-                )?;
+                let template_result =
+                    apply_template_with_tools(&self.model, &cfg, messages, tools, media_marker)?;
                 let generated = generate_with_tools(
                     &self.model,
-                    &self.cfg,
+                    &cfg,
                     self.mtp_model.as_ref(),
                     &template_result,
                     max_tokens,
@@ -403,12 +401,12 @@ impl ChatProvider for LlamaCppProvider {
 
         // Structured output: use OAI-compat template so the schema is converted
         // to a GBNF grammar that constrains sampling to valid JSON.
-        if self.cfg.json_schema.is_some() {
+        if cfg.json_schema.is_some() {
             let template_result =
-                apply_template_for_thinking(&self.model, &self.cfg, messages, media_marker)?;
+                apply_template_for_thinking(&self.model, &cfg, messages, media_marker)?;
             let generated = generate_with_tools(
                 &self.model,
-                &self.cfg,
+                &cfg,
                 self.mtp_model.as_ref(),
                 &template_result,
                 max_tokens,
@@ -430,13 +428,12 @@ impl ChatProvider for LlamaCppProvider {
         }
 
         // Standard generation (with or without images)
-        let (prompt, used_chat_template) =
-            build_prompt(&self.model, &self.cfg, messages, media_marker)?;
+        let (prompt, used_chat_template) = build_prompt(&self.model, &cfg, messages, media_marker)?;
 
         // Call unified generate() with optional multimodal params
         let mut generated = generate(
             &self.model,
-            &self.cfg,
+            &cfg,
             self.mtp_model.as_ref(),
             &prompt,
             max_tokens,
@@ -448,12 +445,12 @@ impl ChatProvider for LlamaCppProvider {
         if generated.text.trim().is_empty()
             && generated.termination == crate::response::GenerationTermination::Eog
         {
-            if used_chat_template && self.cfg.use_chat_template.is_none() {
+            if used_chat_template && cfg.use_chat_template.is_none() {
                 let (fallback_prompt, _) =
-                    build_prompt_with(&self.model, &self.cfg, messages, false, media_marker)?;
+                    build_prompt_with(&self.model, &cfg, messages, false, media_marker)?;
                 generated = generate(
                     &self.model,
-                    &self.cfg,
+                    &cfg,
                     self.mtp_model.as_ref(),
                     &fallback_prompt,
                     max_tokens,
@@ -466,10 +463,10 @@ impl ChatProvider for LlamaCppProvider {
         if generated.text.trim().is_empty()
             && generated.termination == crate::response::GenerationTermination::Eog
         {
-            let raw_prompt = build_raw_prompt(&self.cfg, messages)?;
+            let raw_prompt = build_raw_prompt(&cfg, messages)?;
             generated = generate(
                 &self.model,
-                &self.cfg,
+                &cfg,
                 self.mtp_model.as_ref(),
                 &raw_prompt,
                 max_tokens,
@@ -498,7 +495,8 @@ impl ChatProvider for LlamaCppProvider {
 
     async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
         let (messages, tools) = (call.messages, call.tools);
-        let max_tokens = self.cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        let cfg = self.cfg.with_overrides(call.options);
+        let max_tokens = cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
         let (tx, rx) = mpsc::unbounded();
 
         // Extract media from messages
@@ -532,14 +530,9 @@ impl ChatProvider for LlamaCppProvider {
         // If tools are provided and not empty, use tool-aware streaming
         if let Some(tools) = tools {
             if !tools.is_empty() {
-                let template_result = apply_template_with_tools(
-                    &self.model,
-                    &self.cfg,
-                    messages,
-                    tools,
-                    media_marker,
-                )?;
-                let cfg = self.cfg.clone();
+                let template_result =
+                    apply_template_with_tools(&self.model, &cfg, messages, tools, media_marker)?;
+                let cfg = cfg.clone();
                 let model = Arc::clone(&self.model);
                 let mtp_model = self.mtp_model.clone();
                 let multimodal = if bitmaps.is_empty() {
@@ -581,8 +574,8 @@ impl ChatProvider for LlamaCppProvider {
         // Template failures are surfaced instead of silently degrading to raw
         // streaming, which would leak <think> tags to the UI.
         let thinking_template =
-            apply_template_for_thinking(&self.model, &self.cfg, messages, media_marker)?;
-        let cfg = self.cfg.clone();
+            apply_template_for_thinking(&self.model, &cfg, messages, media_marker)?;
+        let cfg = cfg.clone();
         let model = Arc::clone(&self.model);
         let mtp_model = self.mtp_model.clone();
         let multimodal = if bitmaps.is_empty() {
@@ -692,6 +685,7 @@ mod tests {
             enable_thinking: None,
             reasoning_effort: None,
             preserve_reasoning: None,
+            thinking_budget: None,
             flash_attention: None,
             kv_cache_type_k: None,
             kv_cache_type_v: None,

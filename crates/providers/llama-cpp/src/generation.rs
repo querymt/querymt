@@ -174,6 +174,40 @@ mod decoding_tests {
     }
 }
 
+/// Feed `text` into the context as if the model had generated it, so the next
+/// sampled token continues after it. Returns the number of tokens added, or
+/// `None` when they would not fit in the remaining output budget.
+pub(crate) fn force_text(
+    model: &LlamaModel,
+    ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
+    batch: &mut LlamaBatch,
+    sampler: &mut llama_cpp_2::sampling::LlamaSampler,
+    text: &str,
+    n_cur: &mut i32,
+    n_len_total: i32,
+) -> Result<Option<u32>, LLMError> {
+    let tokens = model.vocab().tokenize(text.as_bytes(), false, true);
+    if tokens.is_empty() || *n_cur + tokens.len() as i32 >= n_len_total {
+        return Ok(None);
+    }
+    batch.clear();
+    let last = tokens.len() - 1;
+    for (index, token) in tokens.iter().enumerate() {
+        batch
+            .add(*token, *n_cur, &[0], index == last)
+            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+        *n_cur += 1;
+        sampler.accept(*token);
+    }
+    ctx.decode(batch)
+        .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+    log::debug!(
+        "thinking_budget spent; forced end of reasoning ({} tokens)",
+        tokens.len()
+    );
+    Ok(Some(tokens.len() as u32))
+}
+
 fn preserved_token_set(
     model: &Arc<LlamaModel>,
     result: Option<&ChatTemplateResult>,
@@ -759,6 +793,7 @@ pub(crate) fn generate_streaming_with_thinking(
     let mut termination = GenerationTermination::MaxTokens;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let preserved = preserved_token_set(model, Some(result));
+    let mut thinking_budget = crate::common_chat::ThinkingBudget::new(cfg.thinking_budget, result);
 
     while n_cur < n_len_total {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
@@ -803,6 +838,29 @@ pub(crate) fn generate_streaming_with_thinking(
 
         ctx.decode(&mut batch)
             .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+
+        if let Some(forced) = thinking_budget.as_mut().and_then(|b| b.observe(&chunk))
+            && let Some(added) = force_text(
+                model,
+                &mut ctx,
+                &mut batch,
+                &mut sampler,
+                forced,
+                &mut n_cur,
+                n_len_total,
+            )?
+        {
+            output_tokens += added;
+            for delta in stream_state.update(forced, true) {
+                let stream_chunk = match delta {
+                    ParsedDelta::Content(content) => querymt::chat::StreamChunk::Text(content),
+                    ParsedDelta::Thinking(thinking) => {
+                        querymt::chat::StreamChunk::Thinking(thinking)
+                    }
+                };
+                let _ = tx.unbounded_send(Ok(stream_chunk));
+            }
+        }
     }
 
     for delta in stream_state.finish() {

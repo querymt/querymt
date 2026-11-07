@@ -119,6 +119,7 @@ async fn run(
         enable_thinking: None,
         reasoning_effort: None,
         preserve_reasoning: None,
+        thinking_budget: None,
         flash_attention: None,
         kv_cache_type_k: None,
         kv_cache_type_v: None,

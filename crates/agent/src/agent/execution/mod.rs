@@ -121,6 +121,40 @@ fn warn_incomplete_budget(
     );
 }
 
+/// Run the configured Stop hooks for the end of this turn and publish their
+/// notices. `stop_reason` tells hooks why the turn is ending.
+async fn run_stop_hook(
+    config: &crate::agent::agent_config::AgentConfig,
+    exec_ctx: &ExecutionContext,
+    stop_reason: &str,
+) -> anyhow::Result<crate::hooks::StopResult> {
+    let stop_hook = config
+        .hooks
+        .run_stop(StopRequest {
+            session_id: exec_ctx.session_id.clone(),
+            turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+            model: exec_ctx
+                .llm_config()
+                .map(|cfg| cfg.model.clone())
+                .unwrap_or_default(),
+            permission_mode: exec_ctx.permission_mode().to_string(),
+            stop_reason: stop_reason.to_string(),
+        })
+        .await?;
+    for notice in &stop_hook.notices {
+        config.emit_event(
+            &exec_ctx.session_id,
+            AgentEventKind::HookNotice {
+                event_name: notice.event_name.clone(),
+                message: notice.message.clone(),
+                is_error: notice.is_error,
+            },
+        );
+    }
+    Ok(stop_hook)
+}
+
 fn render_run_objective(exec_ctx: &ExecutionContext) -> String {
     exec_ctx
         .run_objective
@@ -746,30 +780,7 @@ pub(crate) async fn execute_cycle_state_machine(
                     } => {
                         debug!("State machine reached Complete state");
 
-                        let stop_hook = config
-                            .hooks
-                            .run_stop(StopRequest {
-                                session_id: exec_ctx.session_id.clone(),
-                                turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
-                                cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
-                                model: exec_ctx
-                                    .llm_config()
-                                    .map(|cfg| cfg.model.clone())
-                                    .unwrap_or_default(),
-                                permission_mode: exec_ctx.permission_mode().to_string(),
-                                stop_reason: "EndTurn".to_string(),
-                            })
-                            .await?;
-                        for notice in stop_hook.notices {
-                            config.emit_event(
-                                &exec_ctx.session_id,
-                                AgentEventKind::HookNotice {
-                                    event_name: notice.event_name,
-                                    message: notice.message,
-                                    is_error: notice.is_error,
-                                },
-                            );
-                        }
+                        let stop_hook = run_stop_hook(config, exec_ctx, "EndTurn").await?;
                         if stop_hook.should_continue {
                             let max_stop_hook_continuations =
                                 config.execution_policy.max_stop_hook_continuations;
@@ -917,6 +928,35 @@ pub(crate) async fn execute_cycle_state_machine(
                         }
                     }
                 }
+                // A token-limit stop that middleware could not recover still
+                // gives Stop hooks a say, so unattended loops can carry on.
+                if let ExecutionState::Stopped {
+                    stop_type: StopType::ModelTokenLimit,
+                    context: Some(ref stopped_context),
+                    ..
+                } = state
+                {
+                    let stop_hook = run_stop_hook(config, exec_ctx, "ModelTokenLimit").await?;
+                    if stop_hook.should_continue {
+                        let max = config.execution_policy.max_stop_hook_continuations;
+                        if stop_hook_continuations >= max {
+                            warn!(
+                                "Session {}: stop hook requested more than {} continuation(s) after a token-limit stop; ignoring",
+                                exec_ctx.session_id, max
+                            );
+                        } else {
+                            stop_hook_continuations += 1;
+                            let message = format_stop_hook_continuation_message(
+                                stop_hook.stop_reason.or(stop_hook.block_reason),
+                                &stop_hook.additional_contexts,
+                            );
+                            let next = Arc::new(stopped_context.inject_message(message));
+                            state = ExecutionState::BeforeLlmCall { context: next };
+                            continue;
+                        }
+                    }
+                }
+
                 let ExecutionState::Stopped {
                     ref message,
                     stop_type,

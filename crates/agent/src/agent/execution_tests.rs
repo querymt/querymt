@@ -816,6 +816,54 @@ async fn run_stop_hook_cap_case(max_stop_hook_continuations: Option<u8>, expecte
     assert_eq!(harness.run().await, CycleOutcome::Completed);
 }
 
+/// A token-limit stop that middleware does not recover reaches Stop hooks
+/// with `stop_reason = "ModelTokenLimit"`; a blocking hook continues the run.
+#[tokio::test]
+async fn stop_hook_can_continue_after_unrecovered_token_limit_stop() {
+    let mut harness =
+        TestHarness::new_with_tools(vec![], None, vec![provider_tool("update_task")]).await;
+    let block = json!({
+        "decision": "block",
+        "reason": "budget remains",
+        "hook_specific_output": {"hook_event_name": "stop", "additional_context": "continue"}
+    });
+    // Blocks only token-limit stops, so the normal end of turn completes.
+    let command = format!(
+        "if grep -q '\"stop_reason\":\"ModelTokenLimit\"'; then printf '%s' '{block}'; else printf '{{}}'; fi"
+    );
+    let hooks = crate::hooks::Hooks::new(
+        serde_json::from_value::<crate::hooks::HooksConfig>(json!({
+            "enabled": true,
+            "stop": [{"hooks": [{"type": "command", "command": command, "timeout_sec": 5}]}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut policy = harness.config.execution_policy.clone();
+    // Middleware is never asked to recover, so the stop reaches the hook.
+    policy.max_stop_recoveries = 0;
+    harness.config = Arc::new(
+        crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+            harness.config.storage.clone(),
+            harness.config.provider.clone(),
+            harness.config.event_sink.journal().clone(),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly)
+        .with_execution_policy(policy)
+        .with_middleware(StopThenRecover::new(1))
+        .with_hooks(hooks)
+        .build(),
+    );
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .returning(|_, _| Ok(MockChatResponse::text_only("done").into()))
+        .times(1);
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+}
+
 #[tokio::test]
 async fn stop_hook_continues_once_by_default() {
     run_stop_hook_cap_case(None, 2).await;
