@@ -258,6 +258,22 @@ impl ThinkingBudget {
         })
     }
 
+    /// Text inserted to close a reasoning block in `reasoning_format`.
+    pub(crate) fn close_marker(reasoning_format: ReasoningFormat) -> &'static str {
+        match reasoning_format {
+            ReasoningFormat::ThinkTags => "\n</think>\n\n",
+            ReasoningFormat::GemmaChannel { .. } => "<channel|>",
+        }
+    }
+
+    /// Cap `budget` so that, once it is spent, the `marker_tokens` closing
+    /// tokens plus at least one answer token still fit in `max_tokens`.
+    /// Returns `None` when `max_tokens` is too small to ever fit them.
+    pub(crate) fn cap_budget(budget: u32, max_tokens: u32, marker_tokens: u32) -> Option<u32> {
+        let capacity = max_tokens.checked_sub(marker_tokens.saturating_add(1))?;
+        (capacity > 0).then(|| budget.min(capacity))
+    }
+
     /// Create a budget tracker with an explicit initial reasoning state.
     fn with_state(budget: u32, reasoning_format: ReasoningFormat, in_thinking: bool) -> Self {
         Self {
@@ -298,13 +314,13 @@ impl ThinkingBudget {
         }
         self.in_thinking = false;
         self.tail.clear();
-        Some(match self.reasoning_format {
-            ReasoningFormat::ThinkTags => "\n</think>\n\n",
-            ReasoningFormat::GemmaChannel { .. } => "<channel|>",
-        })
+        Some(Self::close_marker(self.reasoning_format))
     }
 }
 
+/// Number of leading bytes of `buffer` that can be emitted now. While the
+/// stream is partial, a trailing prefix of `marker` is held back in case the
+/// next chunk completes it.
 fn safe_emit_len(buffer: &str, marker: &str, is_partial: bool) -> usize {
     if !is_partial {
         return buffer.len();
@@ -313,6 +329,8 @@ fn safe_emit_len(buffer: &str, marker: &str, is_partial: bool) -> usize {
     buffer.len().saturating_sub(keep)
 }
 
+/// Length of the longest proper prefix of `marker` that `buffer` ends with,
+/// considering only char boundaries of `marker`.
 fn longest_suffix_prefix_len(buffer: &str, marker: &str) -> usize {
     let max = buffer.len().min(marker.len().saturating_sub(1));
     marker
@@ -368,6 +386,20 @@ mod tests {
             observe_all(&mut budget, &["<think>", "p", "q"]),
             [None, None, Some("\n</think>\n\n")]
         );
+    }
+
+    #[test]
+    fn thinking_budget_cap_reserves_marker_and_answer_token() {
+        // Budget at or above max_tokens is reduced to leave room.
+        assert_eq!(ThinkingBudget::cap_budget(100, 10, 3), Some(6));
+        assert_eq!(ThinkingBudget::cap_budget(10, 10, 3), Some(6));
+        // Budget just below max_tokens is also reduced.
+        assert_eq!(ThinkingBudget::cap_budget(9, 10, 3), Some(6));
+        // A budget that already fits is kept.
+        assert_eq!(ThinkingBudget::cap_budget(4, 10, 3), Some(4));
+        // No room for marker plus an answer token: no budget.
+        assert_eq!(ThinkingBudget::cap_budget(4, 4, 3), None);
+        assert_eq!(ThinkingBudget::cap_budget(4, 2, 3), None);
     }
 
     #[test]

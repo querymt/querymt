@@ -176,13 +176,39 @@ mod decoding_tests {
     }
 }
 
+/// Build the thinking-budget tracker for one generation, capping the budget so
+/// that the closing marker and at least one answer token always fit within
+/// `max_tokens`. Returns `None` when no budget applies or none can fit.
+pub(crate) fn thinking_budget_for(
+    model: &LlamaModel,
+    budget: Option<u32>,
+    result: &ChatTemplateResult,
+    max_tokens: u32,
+) -> Option<crate::common_chat::ThinkingBudget> {
+    use crate::common_chat::ThinkingBudget;
+    let budget = budget?;
+    let marker = ThinkingBudget::close_marker(result.reasoning_format);
+    let marker_tokens = model.vocab().tokenize(marker.as_bytes(), false, true).len();
+    let marker_tokens = u32::try_from(marker_tokens).unwrap_or(u32::MAX);
+    let capped = ThinkingBudget::cap_budget(budget, max_tokens, marker_tokens)?;
+    if capped < budget {
+        log::debug!(
+            "thinking_budget capped from {budget} to {capped} to fit max_tokens={max_tokens}"
+        );
+    }
+    ThinkingBudget::new(Some(capped), result)
+}
+
 /// Feed `text` into the context as if the model had generated it, so the next
-/// sampled token continues after it. Returns the number of tokens added, or
-/// `None` when they would not fit in the remaining output budget.
+/// sampled token continues after it. Tokens are decoded in chunks of at most
+/// `n_batch`. Returns the number of tokens added, or `None` when they would
+/// not fit in the remaining output budget.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn force_text(
     model: &LlamaModel,
     ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
     batch: &mut LlamaBatch,
+    n_batch: usize,
     sampler: &mut llama_cpp_2::sampling::LlamaSampler,
     text: &str,
     n_cur: &mut i32,
@@ -192,17 +218,21 @@ pub(crate) fn force_text(
     if tokens.is_empty() || *n_cur + tokens.len() as i32 >= n_len_total {
         return Ok(None);
     }
-    batch.clear();
     let last = tokens.len() - 1;
-    for (index, token) in tokens.iter().enumerate() {
-        batch
-            .add(*token, *n_cur, &[0], index == last)
+    let mut index = 0;
+    for chunk in tokens.chunks(n_batch.max(1)) {
+        batch.clear();
+        for token in chunk {
+            batch
+                .add(*token, *n_cur, &[0], index == last)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+            *n_cur += 1;
+            index += 1;
+            sampler.accept(*token);
+        }
+        ctx.decode(batch)
             .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-        *n_cur += 1;
-        sampler.accept(*token);
     }
-    ctx.decode(batch)
-        .map_err(|e| LLMError::ProviderError(e.to_string()))?;
     log::debug!(
         "thinking_budget spent; forced end of reasoning ({} tokens)",
         tokens.len()
@@ -799,7 +829,8 @@ pub(crate) fn generate_streaming_with_thinking(
     let mut termination = GenerationTermination::MaxTokens;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let preserved = preserved_token_set(model, Some(result));
-    let mut thinking_budget = crate::common_chat::ThinkingBudget::new(cfg.thinking_budget, result);
+    let mut thinking_budget =
+        thinking_budget_for(model, cfg.effective_thinking_budget(), result, max_tokens);
 
     while n_cur < n_len_total {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
@@ -850,6 +881,7 @@ pub(crate) fn generate_streaming_with_thinking(
                 model,
                 &mut ctx,
                 &mut batch,
+                n_batch,
                 &mut sampler,
                 forced,
                 &mut n_cur,

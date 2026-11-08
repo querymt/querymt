@@ -127,8 +127,12 @@ pub(crate) fn generate_with_tools(
     let mut first_token_logged = false;
     let mut eog_hit = false;
     let mut termination = GenerationTermination::MaxTokens;
-    let mut thinking_budget =
-        crate::common_chat::ThinkingBudget::new(cfg.effective_thinking_budget(), result);
+    let mut thinking_budget = crate::generation::thinking_budget_for(
+        model,
+        cfg.effective_thinking_budget(),
+        result,
+        max_tokens,
+    );
 
     log::debug!(
         "generate_with_tools: sampler built, has_grammar={}, input_tokens={}, max_tokens={}",
@@ -187,6 +191,7 @@ pub(crate) fn generate_with_tools(
                 model,
                 &mut state.ctx,
                 &mut batch,
+                state.n_batch,
                 &mut sampler,
                 forced,
                 &mut state.n_cur,

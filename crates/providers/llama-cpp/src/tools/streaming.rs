@@ -174,8 +174,12 @@ pub(crate) fn generate_streaming_with_tools(
     let mut generated_text = String::new();
     let mut termination = GenerationTermination::MaxTokens;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut thinking_budget =
-        crate::common_chat::ThinkingBudget::new(cfg.effective_thinking_budget(), result);
+    let mut thinking_budget = crate::generation::thinking_budget_for(
+        model,
+        cfg.effective_thinking_budget(),
+        result,
+        max_tokens,
+    );
 
     while state.n_cur < state.n_len_total {
         if tx.is_closed() {
@@ -253,6 +257,7 @@ pub(crate) fn generate_streaming_with_tools(
                 model,
                 &mut state.ctx,
                 &mut batch,
+                state.n_batch,
                 &mut sampler,
                 forced,
                 &mut state.n_cur,
