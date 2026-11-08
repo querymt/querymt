@@ -163,35 +163,35 @@ Each native provider is published with multiple OCI tags corresponding to differ
 | `latest-metal` | macOS Metal GPU | macOS (x86_64, arm64) |
 | `latest-accelerate` | macOS Accelerate framework | macOS (x86_64, arm64) — izwi, mrs only |
 | `latest-vulkan` | Vulkan GPU | Linux (x86_64, arm64), Windows (x86_64) — llama-cpp only |
-| `latest-cuda12.8` | NVIDIA CUDA 12.8 | Linux (x86_64, arm64), Windows (x86_64) — llama-cpp only |
+| `latest-cuda12.9` | NVIDIA CUDA 12.9 | Linux (x86_64, arm64), Windows (x86_64) — llama-cpp only |
 | `latest-rocm7.2` | AMD ROCm 7.2 | Linux x86_64 only - llama-cpp only; GPU runtime validation pending |
-| `latest-cuda12.8-sm80` | NVIDIA CUDA SM 80 | Linux x86_64 — izwi, mrs only |
-| `latest-cuda12.8-sm86` | NVIDIA CUDA SM 86 | Linux x86_64 — izwi, mrs only |
-| `latest-cuda12.8-sm87` | NVIDIA CUDA SM 87 (Jetson Orin) | Linux arm64 — izwi, mrs only |
-| `latest-cuda12.8-sm89` | NVIDIA CUDA SM 89 | Linux x86_64 — izwi, mrs only |
-| `latest-cuda12.8-sm120` | NVIDIA CUDA SM 120 | Linux x86_64 — izwi, mrs only |
+| `latest-cuda12.9-sm80` | NVIDIA CUDA SM 80 | Linux x86_64 — izwi, mrs only |
+| `latest-cuda12.9-sm86` | NVIDIA CUDA SM 86 | Linux x86_64 — izwi, mrs only |
+| `latest-cuda12.9-sm87` | NVIDIA CUDA SM 87 (Jetson Orin) | Linux arm64 — izwi, mrs only |
+| `latest-cuda12.9-sm89` | NVIDIA CUDA SM 89 | Linux x86_64 — izwi, mrs only |
+| `latest-cuda12.9-sm120` | NVIDIA CUDA SM 120 | Linux x86_64 — izwi, mrs only |
 
-Version-pinned variants follow the same pattern with the crate version prepended: `0.1.0-metal`, `0.1.0-cuda12.8-sm89`, etc.
+Version-pinned variants follow the same pattern with the crate version prepended: `0.1.0-metal`, `0.1.0-cuda12.9-sm89`, etc.
 
 !!! note "llama-cpp CUDA vs. izwi/mrs CUDA"
-    `llama-cpp` uses a single combined `cuda12.8` build that covers all NVIDIA GPUs via JIT compilation at runtime — no SM selection needed. `izwi` and `mrs` compile Flash Attention kernels ahead of time, which requires a specific SM architecture to be selected at build time.
+    `llama-cpp` uses a single combined `cuda12.9` build that covers all NVIDIA GPUs via JIT compilation at runtime — no SM selection needed. `izwi` and `mrs` compile Flash Attention kernels ahead of time, which requires a specific SM architecture to be selected at build time.
 
 ### NVIDIA GPU to SM architecture
 
-Use this table to find the correct `cuda12.8-smXX` suffix for your GPU.
+Use this table to find the correct `cuda12.9-smXX` suffix for your GPU.
 
 | GPU | Architecture | SM | Tag suffix |
 |---|---|---|---|
-| RTX 3050 / 3060 / 3070 / 3080 / 3090 | Ampere | 86 | `cuda12.8-sm86` |
-| RTX 3050 Ti (laptop) | Ampere | 86 | `cuda12.8-sm86` |
-| A10 / A40 | Ampere | 86 | `cuda12.8-sm86` |
-| A30 / A100 | Ampere | 80 | `cuda12.8-sm80` |
-| RTX 4060 / 4070 / 4070 Ti / 4080 / 4090 | Ada Lovelace | 89 | `cuda12.8-sm89` |
-| RTX 4060 Ti / 4070 Super / 4080 Super | Ada Lovelace | 89 | `cuda12.8-sm89` |
-| L4 / L40 / L40S | Ada Lovelace | 89 | `cuda12.8-sm89` |
-| RTX 5070 / 5070 Ti / 5080 / 5090 | Blackwell | 120 | `cuda12.8-sm120` |
-| B100 / B200 / GB200 | Blackwell | 120 | `cuda12.8-sm120` |
-| Jetson AGX Orin / Orin NX / Orin Nano | Ampere (aarch64) | 87 | `cuda12.8-sm87` |
+| RTX 3050 / 3060 / 3070 / 3080 / 3090 | Ampere | 86 | `cuda12.9-sm86` |
+| RTX 3050 Ti (laptop) | Ampere | 86 | `cuda12.9-sm86` |
+| A10 / A40 | Ampere | 86 | `cuda12.9-sm86` |
+| A30 / A100 | Ampere | 80 | `cuda12.9-sm80` |
+| RTX 4060 / 4070 / 4070 Ti / 4080 / 4090 | Ada Lovelace | 89 | `cuda12.9-sm89` |
+| RTX 4060 Ti / 4070 Super / 4080 Super | Ada Lovelace | 89 | `cuda12.9-sm89` |
+| L4 / L40 / L40S | Ada Lovelace | 89 | `cuda12.9-sm89` |
+| RTX 5070 / 5070 Ti / 5080 / 5090 | Blackwell | 120 | `cuda12.9-sm120` |
+| B100 / B200 / GB200 | Blackwell | 120 | `cuda12.9-sm120` |
+| Jetson AGX Orin / Orin NX / Orin Nano | Ampere (aarch64) | 87 | `cuda12.9-sm87` |
 
 !!! tip "Not sure which SM your GPU is?"
     Run `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` to print your GPU's compute capability (e.g. `8.9` = SM 89).
@@ -217,22 +217,32 @@ The process also needs permission to access the AMD GPU (`/dev/kfd` and the appr
 
 ### Choosing a feature tag
 
-```
-What OS are you on?
-├── macOS Apple Silicon (M1/M2/M3/M4)  → latest-metal
-├── macOS Intel
-│   ├── izwi / mrs                     → latest-accelerate
-│   └── llama-cpp                      → latest-default
-├── Linux
-│   ├── NVIDIA GPU
-│   │   ├── llama-cpp                  → latest-cuda12.8
-│   │   └── izwi / mrs                 → latest-cuda12.8-sm{XX}  (see table above)
-│   ├── AMD GPU + ROCm 7.2 (x86_64)     → latest-rocm7.2 (llama-cpp; validation pending)
-│   ├── Other AMD / Intel GPU          → latest-vulkan  (llama-cpp only)
-│   └── CPU only                       → latest  (or latest-default)
-└── Windows
-    ├── NVIDIA GPU                     → latest-cuda12.8  (llama-cpp only)
-    └── CPU only                       → latest
+```mermaid
+flowchart TD
+    os{"What OS are you on?"}
+    os --> mac_arm["macOS Apple Silicon (M1/M2/M3/M4)"]
+    os --> mac_intel["macOS Intel"]
+    os --> linux["Linux"]
+    os --> windows["Windows"]
+
+    mac_arm --> t_metal["latest-metal"]
+    mac_intel -->|izwi / mrs| t_accel["latest-accelerate"]
+    mac_intel -->|llama-cpp| t_default["latest-default"]
+
+    linux --> l_nv["NVIDIA GPU"]
+    linux --> l_rocm["AMD GPU + ROCm 7.2 (x86_64)"]
+    linux --> l_other["Other AMD / Intel GPU"]
+    linux --> l_cpu["CPU only"]
+    l_nv -->|llama-cpp| t_cuda["latest-cuda12.9"]
+    l_nv -->|izwi / mrs| t_sm["latest-cuda12.9-sm{XX} (see table above)"]
+    l_rocm --> t_rocm["latest-rocm7.2 (llama-cpp; validation pending)"]
+    l_other --> t_vulkan["latest-vulkan (llama-cpp only)"]
+    l_cpu --> t_cpu["latest (or latest-default)"]
+
+    windows --> w_nv["NVIDIA GPU"]
+    windows --> w_cpu["CPU only"]
+    w_nv --> t_wcuda["latest-cuda12.9 (llama-cpp only)"]
+    w_cpu --> t_wcpu["latest"]
 ```
 
 ---
@@ -336,7 +346,7 @@ Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models,
 
 **Supported platforms:**
 
-| OS | Architecture | CPU | Metal | Accelerate | Vulkan | CUDA 12.8 | ROCm 7.2 |
+| OS | Architecture | CPU | Metal | Accelerate | Vulkan | CUDA 12.9 | ROCm 7.2 |
 |---|---|:---:|:---:|:---:|:---:|:---:|:---:|
 | Linux | x86_64 | ✓ | — | — | ✓ | ✓ | Build only* |
 | Linux | arm64 | ✓ | — | — | ✓ | ✓ | — |
@@ -376,7 +386,7 @@ Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models,
     ```toml
     [[providers]]
     name = "llama-cpp"
-    path = "oci://ghcr.io/querymt/llama-cpp:latest-cuda12.8"
+    path = "oci://ghcr.io/querymt/llama-cpp:latest-cuda12.9"
 
     [providers.config]
     model = "/path/to/model.gguf"
@@ -413,7 +423,7 @@ Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models,
     ```toml
     [[providers]]
     name = "llama-cpp"
-    path = "oci://ghcr.io/querymt/llama-cpp:latest-cuda12.8"
+    path = "oci://ghcr.io/querymt/llama-cpp:latest-cuda12.9"
 
     [providers.config]
     model = "/path/to/model.gguf"
@@ -432,8 +442,11 @@ Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models,
 | `flash_attention` | string | `"auto"` \| `"enabled"` \| `"disabled"` |
 | `kv_cache_type_k` | string | KV cache key quantization: `"f16"`, `"q8_0"`, `"q4_0"` |
 | `kv_cache_type_v` | string | KV cache value quantization: `"f16"`, `"q8_0"`, `"q4_0"` |
-| `max_tokens` | integer | Maximum tokens to generate (default: 256) |
+| `max_tokens` | integer | Maximum tokens to generate (default: 256). A per-request `max_tokens` override takes precedence |
 | `temperature` | float | Sampling temperature. `0` = greedy |
+| `enable_thinking` | bool | Render the chat template with reasoning enabled (default: `true`) |
+| `reasoning_effort` | string | `"low"` \| `"medium"` \| `"high"` \| `"max"`; applied only when the chat template exposes `reasoning_effort`. A per-request override takes precedence |
+| `thinking_budget` | integer | Maximum reasoning tokens per reply. When spent, the provider closes the reasoning block so the model must answer. The budget is reduced to fit within `max_tokens` (leaving room for the closing marker and at least one answer token), so with the default cap of 256 a budget of 4,096 allows fewer than 256 reasoning tokens; it is disabled when the cap cannot fit the marker plus one answer token. Unset = unbounded; not applied with `speculative` decoding, with schema-constrained output (`json_schema`), or to plain non-streaming chat calls |
 | `mmproj_path` | string | Path to multimodal projection file (vision models only) |
 
 For vision model configuration and the full option reference see the [llama-cpp provider README](https://github.com/querymt/querymt/blob/main/crates/providers/llama-cpp/README.md).
@@ -446,7 +459,7 @@ Wraps [izwi-core](https://github.com/agentem-ai/izwi). Efficient local inference
 
 **Supported platforms:**
 
-| OS | Architecture | CPU | Metal | Accelerate | CUDA 12.8 |
+| OS | Architecture | CPU | Metal | Accelerate | CUDA 12.9 |
 |---|---|:---:|:---:|:---:|:---:|
 | Linux | x86_64 | ✓ | — | — | SM 80, 86, 89, 120 (+ Flash Attn) |
 | Linux | arm64 | ✓ | — | — | SM 87 (+ Flash Attn) |
@@ -491,7 +504,7 @@ Wraps [izwi-core](https://github.com/agentem-ai/izwi). Efficient local inference
     # SM 86: RTX 3060, 3070, 3080, 3090, A10, A40
     [[providers]]
     name = "izwi"
-    path = "oci://ghcr.io/querymt/izwi:latest-cuda12.8-sm86"
+    path = "oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm86"
 
     [providers.config]
     model = "/path/to/model"
@@ -502,7 +515,7 @@ Wraps [izwi-core](https://github.com/agentem-ai/izwi). Efficient local inference
     # SM 89: RTX 4060, 4070, 4080, 4090, L4, L40, L40S
     [[providers]]
     name = "izwi"
-    path = "oci://ghcr.io/querymt/izwi:latest-cuda12.8-sm89"
+    path = "oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm89"
 
     [providers.config]
     model = "/path/to/model"
@@ -513,7 +526,7 @@ Wraps [izwi-core](https://github.com/agentem-ai/izwi). Efficient local inference
     # SM 80: A30, A100
     [[providers]]
     name = "izwi"
-    path = "oci://ghcr.io/querymt/izwi:latest-cuda12.8-sm80"
+    path = "oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm80"
 
     [providers.config]
     model = "/path/to/model"
@@ -524,7 +537,7 @@ Wraps [izwi-core](https://github.com/agentem-ai/izwi). Efficient local inference
     # SM 120: RTX 5070, 5080, 5090, B100, B200
     [[providers]]
     name = "izwi"
-    path = "oci://ghcr.io/querymt/izwi:latest-cuda12.8-sm120"
+    path = "oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm120"
 
     [providers.config]
     model = "/path/to/model"
@@ -535,7 +548,7 @@ Wraps [izwi-core](https://github.com/agentem-ai/izwi). Efficient local inference
     # SM 87: Jetson AGX Orin, Orin NX, Orin Nano
     [[providers]]
     name = "izwi"
-    path = "oci://ghcr.io/querymt/izwi:latest-cuda12.8-sm87"
+    path = "oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm87"
 
     [providers.config]
     model = "/path/to/model"
@@ -549,7 +562,7 @@ Wraps [mistral.rs](https://github.com/EricLBuehler/mistral.rs). High-performance
 
 **Supported platforms:**
 
-| OS | Architecture | CPU | Metal | Accelerate | CUDA 12.8 |
+| OS | Architecture | CPU | Metal | Accelerate | CUDA 12.9 |
 |---|---|:---:|:---:|:---:|:---:|
 | Linux | x86_64 | ✓ | — | — | SM 80, 86, 89, 120 (+ Flash Attn + cuDNN) |
 | Linux | arm64 | ✓ | — | — | SM 87 (+ cuDNN, no Flash Attn) |
@@ -595,7 +608,7 @@ Wraps [mistral.rs](https://github.com/EricLBuehler/mistral.rs). High-performance
     # SM 86: RTX 3060, 3070, 3080, 3090, A10, A40
     [[providers]]
     name = "mrs"
-    path = "oci://ghcr.io/querymt/mrs:latest-cuda12.8-sm86"
+    path = "oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm86"
 
     [providers.config]
     model = "/path/to/model"
@@ -606,7 +619,7 @@ Wraps [mistral.rs](https://github.com/EricLBuehler/mistral.rs). High-performance
     # SM 89: RTX 4060, 4070, 4080, 4090, L4, L40, L40S
     [[providers]]
     name = "mrs"
-    path = "oci://ghcr.io/querymt/mrs:latest-cuda12.8-sm89"
+    path = "oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm89"
 
     [providers.config]
     model = "/path/to/model"
@@ -617,7 +630,7 @@ Wraps [mistral.rs](https://github.com/EricLBuehler/mistral.rs). High-performance
     # SM 80: A30, A100
     [[providers]]
     name = "mrs"
-    path = "oci://ghcr.io/querymt/mrs:latest-cuda12.8-sm80"
+    path = "oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm80"
 
     [providers.config]
     model = "/path/to/model"
@@ -628,7 +641,7 @@ Wraps [mistral.rs](https://github.com/EricLBuehler/mistral.rs). High-performance
     # SM 120: RTX 5070, 5080, 5090, B100, B200
     [[providers]]
     name = "mrs"
-    path = "oci://ghcr.io/querymt/mrs:latest-cuda12.8-sm120"
+    path = "oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm120"
 
     [providers.config]
     model = "/path/to/model"
@@ -640,7 +653,7 @@ Wraps [mistral.rs](https://github.com/EricLBuehler/mistral.rs). High-performance
     # Note: cuDNN included; Flash Attention not available on aarch64
     [[providers]]
     name = "mrs"
-    path = "oci://ghcr.io/querymt/mrs:latest-cuda12.8-sm87"
+    path = "oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm87"
 
     [providers.config]
     model = "/path/to/model"
@@ -698,7 +711,7 @@ flash_attention = "auto"
 # llama-cpp: single CUDA build, all SM supported at runtime
 [[providers]]
 name = "llama-cpp"
-path = "oci://ghcr.io/querymt/llama-cpp:latest-cuda12.8"
+path = "oci://ghcr.io/querymt/llama-cpp:latest-cuda12.9"
 
 [providers.config]
 model = "/path/to/model.gguf"
@@ -709,7 +722,7 @@ flash_attention = "enabled"
 # izwi: SM 89 for RTX 4060/4070/4080/4090
 [[providers]]
 name = "izwi"
-path = "oci://ghcr.io/querymt/izwi:latest-cuda12.8-sm89"
+path = "oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm89"
 
 [providers.config]
 model = "/path/to/model"
@@ -717,7 +730,7 @@ model = "/path/to/model"
 # mrs: SM 89 for RTX 4060/4070/4080/4090
 [[providers]]
 name = "mrs"
-path = "oci://ghcr.io/querymt/mrs:latest-cuda12.8-sm89"
+path = "oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm89"
 
 [providers.config]
 model = "/path/to/model"

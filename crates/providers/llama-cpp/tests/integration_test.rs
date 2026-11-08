@@ -44,6 +44,7 @@ fn test_config_serialization() {
         enable_thinking: Some(true),
         reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
         preserve_reasoning: Some(true),
+        thinking_budget: None,
         flash_attention: None,
         kv_cache_type_k: Some("q4_0".to_string()),
         kv_cache_type_v: Some("q4_0".to_string()),

@@ -236,6 +236,91 @@ impl ThinkingStreamParser {
     }
 }
 
+/// Enforces `thinking_budget`: counts tokens generated inside a reasoning
+/// block and says when the block has to be closed.
+#[derive(Debug)]
+pub(crate) struct ThinkingBudget {
+    budget: u32,
+    used: u32,
+    in_thinking: bool,
+    tail: String,
+    reasoning_format: ReasoningFormat,
+}
+
+impl ThinkingBudget {
+    /// Bytes of recent output kept to find markers split across tokens.
+    const TAIL_BYTES: usize = 64;
+
+    /// `None` when no budget is configured.
+    pub(crate) fn new(budget: Option<u32>, result: &ChatTemplateResult) -> Option<Self> {
+        budget.map(|budget| {
+            Self::with_state(budget, result.reasoning_format, result.starts_in_thinking)
+        })
+    }
+
+    /// Text inserted to close a reasoning block in `reasoning_format`.
+    pub(crate) fn close_marker(reasoning_format: ReasoningFormat) -> &'static str {
+        match reasoning_format {
+            ReasoningFormat::ThinkTags => "\n</think>\n\n",
+            ReasoningFormat::GemmaChannel { .. } => "<channel|>",
+        }
+    }
+
+    /// Cap `budget` so that, once it is spent, the `marker_tokens` closing
+    /// tokens plus at least one answer token still fit in `max_tokens`.
+    /// Returns `None` when `max_tokens` is too small to ever fit them.
+    pub(crate) fn cap_budget(budget: u32, max_tokens: u32, marker_tokens: u32) -> Option<u32> {
+        let capacity = max_tokens.checked_sub(marker_tokens.saturating_add(1))?;
+        (capacity > 0).then(|| budget.min(capacity))
+    }
+
+    /// Create a budget tracker with an explicit initial reasoning state.
+    fn with_state(budget: u32, reasoning_format: ReasoningFormat, in_thinking: bool) -> Self {
+        Self {
+            budget,
+            used: 0,
+            in_thinking,
+            tail: String::new(),
+            reasoning_format,
+        }
+    }
+
+    /// Observe the text of one generated token. Returns the text to insert
+    /// when the budget is spent while the model is still reasoning.
+    pub(crate) fn observe(&mut self, piece: &str) -> Option<&'static str> {
+        self.tail.push_str(piece);
+        if self.tail.len() > Self::TAIL_BYTES {
+            let mut cut = self.tail.len() - Self::TAIL_BYTES;
+            while !self.tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.tail.drain(..cut);
+        }
+        if !self.in_thinking {
+            if self.tail.contains(self.reasoning_format.open_tag()) {
+                self.in_thinking = true;
+                self.tail.clear();
+            }
+            return None;
+        }
+        if self.tail.contains(self.reasoning_format.close_tag()) {
+            self.in_thinking = false;
+            self.tail.clear();
+            return None;
+        }
+        self.used = self.used.saturating_add(1);
+        if self.used < self.budget {
+            return None;
+        }
+        self.in_thinking = false;
+        self.tail.clear();
+        Some(Self::close_marker(self.reasoning_format))
+    }
+}
+
+/// Number of leading bytes of `buffer` that can be emitted now. While the
+/// stream is partial, a trailing prefix of `marker` is held back in case the
+/// next chunk completes it.
 fn safe_emit_len(buffer: &str, marker: &str, is_partial: bool) -> usize {
     if !is_partial {
         return buffer.len();
@@ -244,6 +329,8 @@ fn safe_emit_len(buffer: &str, marker: &str, is_partial: bool) -> usize {
     buffer.len().saturating_sub(keep)
 }
 
+/// Length of the longest proper prefix of `marker` that `buffer` ends with,
+/// considering only char boundaries of `marker`.
 fn longest_suffix_prefix_len(buffer: &str, marker: &str) -> usize {
     let max = buffer.len().min(marker.len().saturating_sub(1));
     marker
@@ -271,6 +358,48 @@ mod tests {
         }
         deltas.extend(state.finish());
         deltas
+    }
+
+    fn observe_all(budget: &mut ThinkingBudget, pieces: &[&str]) -> Vec<Option<&'static str>> {
+        pieces.iter().map(|piece| budget.observe(piece)).collect()
+    }
+
+    #[test]
+    fn thinking_budget_closes_reasoning_once_spent() {
+        let mut budget = ThinkingBudget::with_state(3, ReasoningFormat::ThinkTags, true);
+        assert_eq!(
+            observe_all(&mut budget, &["a", "b", "c", "answer"]),
+            [None, None, Some("\n</think>\n\n"), None],
+            "closed exactly once, at the budget"
+        );
+    }
+
+    #[test]
+    fn thinking_budget_ignores_reasoning_closed_in_time_and_counts_reopened_blocks() {
+        let mut budget = ThinkingBudget::with_state(3, ReasoningFormat::ThinkTags, false);
+        // Not reasoning yet; a split open tag starts the block.
+        assert_eq!(observe_all(&mut budget, &["hi", "<th", "ink>"]), [None; 3]);
+        // Closed before the budget: nothing is forced.
+        assert_eq!(observe_all(&mut budget, &["x", "</think>", "y"]), [None; 3]);
+        // A second block shares the per-reply budget (1 token used so far).
+        assert_eq!(
+            observe_all(&mut budget, &["<think>", "p", "q"]),
+            [None, None, Some("\n</think>\n\n")]
+        );
+    }
+
+    #[test]
+    fn thinking_budget_cap_reserves_marker_and_answer_token() {
+        // Budget at or above max_tokens is reduced to leave room.
+        assert_eq!(ThinkingBudget::cap_budget(100, 10, 3), Some(6));
+        assert_eq!(ThinkingBudget::cap_budget(10, 10, 3), Some(6));
+        // Budget just below max_tokens is also reduced.
+        assert_eq!(ThinkingBudget::cap_budget(9, 10, 3), Some(6));
+        // A budget that already fits is kept.
+        assert_eq!(ThinkingBudget::cap_budget(4, 10, 3), Some(4));
+        // No room for marker plus an answer token: no budget.
+        assert_eq!(ThinkingBudget::cap_budget(4, 4, 3), None);
+        assert_eq!(ThinkingBudget::cap_budget(4, 2, 3), None);
     }
 
     #[test]

@@ -940,17 +940,11 @@ impl Message<SetProvider> for SessionActor {
         msg: SetProvider,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let system_prompt = self.get_session_system_prompt().await;
-        let mut config = querymt::LLMParams::new()
-            .provider(&msg.provider)
-            .model(&msg.model);
-        for prompt_part in system_prompt {
-            config = config.system(prompt_part);
-        }
-        let model_id = format!("{}/{}", msg.provider, msg.model);
-        self.transition_model_with_config(model_id, None, config)
-            .await
-            .map(|_| ())
+        let selection = crate::agent::session_control::SessionModelSelection {
+            model_id: format!("{}/{}", msg.provider, msg.model),
+            provider_node_id: None,
+        };
+        self.transition_model(selection).await.map(|_| ())
     }
 }
 
@@ -1146,7 +1140,9 @@ impl SessionActor {
                 params,
             } => {
                 let mut params = params.as_ref().clone();
-                if rebased {
+                // After a conflict, only fill in the effort the caller left unset;
+                // an explicitly supplied effort is preserved.
+                if rebased && params.reasoning_effort.is_none() {
                     params.reasoning_effort = previous.reasoning_effort;
                 }
                 self.apply_model_binding(
@@ -1216,10 +1212,19 @@ impl SessionActor {
     ) -> Result<SessionControlTransition, AgentError> {
         let (provider, model) =
             parse_transport_model_id(&selection.model_id, &previous.effective_model.provider);
-        let mut params = querymt::LLMParams::new().provider(&provider).model(&model);
-        for prompt_part in self.get_session_system_prompt().await {
-            params = params.system(prompt_part);
+        if self.is_current_binding(
+            &previous.effective_model,
+            &provider,
+            &model,
+            selection.provider_node_id.as_deref(),
+        ) {
+            return Ok(SessionControlTransition {
+                current: previous.clone(),
+                previous,
+            });
         }
+        let mut params = self.config.provider.selection_params(&provider, &model);
+        params.system = self.get_session_system_prompt().await;
         params.reasoning_effort = previous.reasoning_effort;
         self.apply_model_binding(
             previous,
@@ -1228,6 +1233,36 @@ impl SessionActor {
             params,
         )
         .await
+    }
+
+    /// Whether `node` designates this node: no node, `local`, or our own peer id.
+    fn is_local_node(&self, node: Option<&str>) -> bool {
+        let Some(node) = node else {
+            return true;
+        };
+        if node == "local" {
+            return true;
+        }
+        #[cfg(feature = "remote")]
+        if let Some(mesh) = &self.mesh {
+            return mesh.peer_id().to_string() == node;
+        }
+        false
+    }
+
+    /// Whether a selection names the provider, model and node `current` is bound to.
+    fn is_current_binding(
+        &self,
+        current: &SessionModelBinding,
+        provider: &str,
+        model: &str,
+        node: Option<&str>,
+    ) -> bool {
+        let current_node = current.provider_node_id.as_deref();
+        current.provider == provider
+            && current.model == model
+            && (current_node == node
+                || (self.is_local_node(current_node) && self.is_local_node(node)))
     }
 
     async fn apply_model_binding(
@@ -6569,5 +6604,279 @@ mod tests {
         let result = summarize_intent_candidate(&cjk).unwrap();
         assert!(result.len() <= 240);
         assert!(result.is_char_boundary(result.len()));
+    }
+
+    // ── Model selection keeps the profile's parameters ───────────────────
+
+    /// Provider factory that records every configuration it builds a provider from.
+    struct CapturingFactory {
+        provider: SharedLlmProvider,
+        captured: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl querymt::plugin::LLMProviderFactory for CapturingFactory {
+        fn name(&self) -> &str {
+            "capture"
+        }
+
+        fn config_schema(&self) -> String {
+            r#"{"properties":{"model":{},"max_tokens":{},"enable_thinking":{},"n_ctx":{}}}"#.into()
+        }
+
+        fn from_config(&self, cfg: &str) -> Result<Box<dyn querymt::LLMProvider>, LLMError> {
+            let value = serde_json::from_str(cfg)?;
+            self.captured.lock().expect("captured lock").push(value);
+            Ok(Box::new(self.provider.clone()))
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _cfg: &str,
+        ) -> querymt::plugin::Fut<'a, Result<Vec<String>, LLMError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn profile_params() -> LLMParams {
+        LLMParams::new()
+            .provider("capture")
+            .model("M")
+            .max_tokens(16_384)
+            .parameter("enable_thinking", false)
+            .parameter("n_ctx", 32_768)
+    }
+
+    /// Session actor over real storage, so config deduplication is exercised.
+    struct SelectionFixture {
+        config: Arc<AgentConfig>,
+        actor_ref: kameo::actor::ActorRef<SessionActor>,
+        session_id: String,
+        captured: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl SelectionFixture {
+        async fn new() -> Self {
+            Self::build(|actor| actor).await
+        }
+
+        async fn build(customize: impl FnOnce(SessionActor) -> SessionActor) -> Self {
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let registry = querymt::plugin::host::PluginRegistry::empty();
+            registry.register_static(Arc::new(CapturingFactory {
+                provider: SharedLlmProvider {
+                    inner: Arc::new(Mutex::new(MockLlmProvider::new())),
+                    tools: vec![].into_boxed_slice(),
+                },
+                captured: captured.clone(),
+            }));
+            let storage = Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                    .await
+                    .expect("create storage"),
+            );
+            let config = Arc::new(
+                AgentConfigBuilder::new(Arc::new(registry), storage.clone(), profile_params())
+                    .with_tool_policy(ToolPolicy::ProviderOnly)
+                    .build(),
+            );
+            let session = storage
+                .session_store()
+                .create_session(None, None, None, None)
+                .await
+                .expect("create session");
+            let runtime = SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            );
+            let actor = customize(SessionActor::new(
+                config.clone(),
+                session.public_id.clone(),
+                runtime,
+            ));
+            Self {
+                config,
+                actor_ref: SessionActor::spawn(actor),
+                session_id: session.public_id,
+                captured,
+            }
+        }
+
+        async fn select_on(
+            &self,
+            model_id: &str,
+            provider_node_id: Option<&str>,
+        ) -> SessionControlTransition {
+            self.actor_ref
+                .ask(SetSessionModel {
+                    selection: crate::agent::session_control::SessionModelSelection {
+                        model_id: model_id.to_string(),
+                        provider_node_id: provider_node_id.map(str::to_string),
+                    },
+                })
+                .await
+                .expect("select model")
+        }
+
+        async fn select(&self, model_id: &str) -> SessionControlTransition {
+            self.select_on(model_id, None).await
+        }
+
+        async fn control(&self) -> SessionControlState {
+            self.actor_ref
+                .ask(GetSessionControl)
+                .await
+                .expect("session control")
+        }
+
+        /// Stored parameters of the session's currently bound configuration.
+        async fn stored_params(&self) -> LLMParams {
+            let id = self.control().await.effective_model.llm_config_id;
+            let row = self
+                .config
+                .provider
+                .history_store()
+                .get_llm_config(id)
+                .await
+                .expect("load config")
+                .expect("config row");
+            row.params
+                .map(|value| serde_json::from_value(value).expect("parse params"))
+                .unwrap_or_default()
+        }
+    }
+
+    fn assert_profile_params(params: &LLMParams) {
+        assert_eq!(params.max_tokens, Some(16_384));
+        let custom = params.custom.as_ref().expect("custom parameters");
+        assert_eq!(custom["enable_thinking"], serde_json::json!(false));
+        assert_eq!(custom["n_ctx"], serde_json::json!(32_768));
+    }
+
+    fn drain_provider_changes(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+    ) -> usize {
+        let mut changes = 0;
+        while let Ok(envelope) = rx.try_recv() {
+            if matches!(envelope.kind(), AgentEventKind::ProviderChanged { .. }) {
+                changes += 1;
+            }
+        }
+        changes
+    }
+
+    #[tokio::test]
+    async fn selecting_profile_model_restores_profile_parameters_and_first_use_config() {
+        let f = SelectionFixture::new().await;
+        let first_use = f.control().await.effective_model.llm_config_id;
+
+        let away = f.select("capture/N").await;
+        assert_ne!(away.current.effective_model.llm_config_id, first_use);
+        let other = f.stored_params().await;
+        assert_eq!(other.max_tokens, None);
+        assert!(
+            other.custom.is_none_or(|custom| custom.is_empty()),
+            "other models inherit no profile keys"
+        );
+
+        let back = f.select("capture/M").await;
+        assert_eq!(back.current.effective_model.llm_config_id, first_use);
+        assert_profile_params(&f.stored_params().await);
+    }
+
+    #[tokio::test]
+    async fn set_provider_message_uses_selection_semantics() {
+        let f = SelectionFixture::new().await;
+        let first_use = f.control().await.effective_model.llm_config_id;
+        f.select("capture/N").await;
+
+        f.actor_ref
+            .ask(SetProvider {
+                provider: "capture".into(),
+                model: "M".into(),
+            })
+            .await
+            .expect("set provider");
+
+        let control = f.control().await;
+        assert_eq!(control.effective_model.llm_config_id, first_use);
+        assert_profile_params(&f.stored_params().await);
+    }
+
+    #[tokio::test]
+    async fn reselecting_current_binding_is_noop_for_every_local_node_spelling() {
+        let f = SelectionFixture::new().await;
+        let before = f.control().await;
+        let mut rx = f.config.event_sink.fanout().subscribe();
+
+        for node in [None, Some("local")] {
+            let transition = f.select_on("capture/M", node).await;
+            assert_eq!(transition.previous, before);
+            assert_eq!(transition.current, before);
+        }
+
+        assert_eq!(f.control().await, before, "binding and revision unchanged");
+        assert_eq!(drain_provider_changes(&mut rx), 0);
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn reselecting_current_binding_is_noop_for_own_peer_id() {
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let own_id = mesh.peer_id().to_string();
+        let f = SelectionFixture::build(|actor| actor.with_mesh(Some(mesh.clone()))).await;
+        let before = f.control().await;
+        let mut rx = f.config.event_sink.fanout().subscribe();
+
+        let transition = f.select_on("capture/M", Some(&own_id)).await;
+
+        assert_eq!(transition.current, before);
+        assert_eq!(drain_provider_changes(&mut rx), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_llm_config_survives_reselecting_the_same_model() {
+        let f = SelectionFixture::new().await;
+        f.actor_ref
+            .ask(SetLlmConfig {
+                config: LLMParams::new()
+                    .provider("capture")
+                    .model("M")
+                    .max_tokens(4096),
+                provider_node_id: None,
+            })
+            .await
+            .expect("set llm config");
+        let before = f.control().await;
+
+        let transition = f.select("capture/M").await;
+
+        assert_eq!(transition.current, before);
+        let params = f.stored_params().await;
+        assert_eq!(params.max_tokens, Some(4096));
+        assert!(
+            params.custom.is_none_or(|custom| custom.is_empty()),
+            "the profile is not merged in"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_is_built_with_profile_parameters_after_model_selection() {
+        let f = SelectionFixture::new().await;
+        f.select("capture/N").await;
+        f.select("capture/M").await;
+
+        f.config
+            .provider
+            .build_provider_for_session(&f.session_id)
+            .await
+            .expect("build provider");
+
+        let captured = f.captured.lock().expect("captured lock");
+        let built = captured.last().expect("provider was built");
+        assert_eq!(built["model"], "M");
+        assert_eq!(built["max_tokens"], 16_384);
+        assert_eq!(built["enable_thinking"], false);
+        assert_eq!(built["n_ctx"], 32_768);
     }
 }

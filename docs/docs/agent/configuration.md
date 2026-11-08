@@ -115,6 +115,7 @@ see [Prompt Cache Hints](../core/providers.md#prompt-cache-hints).
 
 ```toml
 [agent.execution]
+max_stop_hook_continuations = 1   # Stop-hook continuations allowed per turn (0 = advisory only)
 
 # Tool output truncation (Layer 1)
 [agent.execution.tool_output]

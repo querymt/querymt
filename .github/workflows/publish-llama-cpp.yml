@@ -63,11 +63,11 @@ jobs:
           - os: linux
             arch: amd64
             target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             features: cuda
-            feature_tag: cuda12.8
+            feature_tag: cuda12.9
             needs_cuda: "true"
-            cuda_version: "12.8"
+            cuda_version: "12.9"
             extra_env: '{"CMAKE_POSITION_INDEPENDENT_CODE":"ON"}'
 
           - os: linux
@@ -75,9 +75,9 @@ jobs:
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             features: cuda
-            feature_tag: cuda12.8
+            feature_tag: cuda12.9
             needs_cuda: "true"
-            cuda_version: "12.8"
+            cuda_version: "12.9"
             extra_env: '{"CMAKE_POSITION_INDEPENDENT_CODE":"ON"}'
 
           # Linux ROCm: match llama.cpp's Linux Docker SDK and fat-build targets.
@@ -135,16 +135,16 @@ jobs:
             arch: amd64
             target: x86_64-pc-windows-msvc
             # windows-latest now ships VS 2026 (v18), whose Visual Studio
-            # Integration CUDA 12.8 does not declare, causing CMake's
+            # Integration CUDA 12.9 does not declare, causing CMake's
             # enable_language(CUDA) under the VS generator to fail with
             # "No CUDA toolset found". Pin windows-2022 (VS 17) for the CUDA
             # build; the default (non-CUDA) Windows build stays on
             # windows-latest.
             runner: windows-2022
             features: cuda
-            feature_tag: cuda12.8
+            feature_tag: cuda12.9
             needs_cuda: "true"
-            cuda_version: "12.8"
+            cuda_version: "12.9"
 
     steps:
       - name: Check out code
@@ -169,7 +169,7 @@ jobs:
           features: ${{ matrix.features }}
           feature_tag: ${{ matrix.feature_tag }}
           needs_cuda: ${{ matrix.needs_cuda }}
-          cuda_version: ${{ matrix.cuda_version || '12.8' }}
+          cuda_version: ${{ matrix.cuda_version || '12.9' }}
           extra_env: ${{ matrix.extra_env || '{}' }}
 
       # ── llama-cpp-specific build dependencies ───────────────────────────

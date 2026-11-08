@@ -28,8 +28,7 @@ pub(crate) fn generate_with_tools(
 ) -> Result<GeneratedText, LLMError> {
     if cfg.speculative.is_some() && bitmaps.is_empty() {
         let params = SamplingParams::from_config(cfg, temperature);
-        let sampler = if let Some(schema) = cfg.json_schema.as_ref().and_then(|s| s.schema.as_ref())
-        {
+        let sampler = if let Some(schema) = cfg.structured_schema() {
             build_structured_sampler(model, schema, &params)?
         } else {
             build_tool_sampler(model, result, &params)?
@@ -117,8 +116,7 @@ pub(crate) fn generate_with_tools(
     }
 
     let params = SamplingParams::from_config(cfg, temperature);
-    let mut sampler = if let Some(schema) = cfg.json_schema.as_ref().and_then(|s| s.schema.as_ref())
-    {
+    let mut sampler = if let Some(schema) = cfg.structured_schema() {
         build_structured_sampler(model, schema, &params)?
     } else {
         build_tool_sampler(model, result, &params)?
@@ -129,6 +127,12 @@ pub(crate) fn generate_with_tools(
     let mut first_token_logged = false;
     let mut eog_hit = false;
     let mut termination = GenerationTermination::MaxTokens;
+    let mut thinking_budget = crate::generation::thinking_budget_for(
+        model,
+        cfg.effective_thinking_budget(),
+        result,
+        max_tokens,
+    );
 
     log::debug!(
         "generate_with_tools: sampler built, has_grammar={}, input_tokens={}, max_tokens={}",
@@ -181,6 +185,22 @@ pub(crate) fn generate_with_tools(
             .ctx
             .decode(&mut batch)
             .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+
+        if let Some(forced) = thinking_budget.as_mut().and_then(|b| b.observe(&chunk))
+            && let Some(added) = crate::generation::force_text(
+                model,
+                &mut state.ctx,
+                &mut batch,
+                state.n_batch,
+                &mut sampler,
+                forced,
+                &mut state.n_cur,
+                state.n_len_total,
+            )?
+        {
+            output.push_str(forced);
+            output_tokens += added;
+        }
     }
 
     // Trim matched stop sequences

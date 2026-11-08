@@ -769,6 +769,139 @@ async fn run_completion_guard_case(
     assert_eq!(harness.run().await, CycleOutcome::Completed);
 }
 
+/// Stop hook that always asks for another step; the configured cap bounds it.
+/// Returns how many "cap reached" stop notices were published.
+async fn run_stop_hook_cap_case(
+    max_stop_hook_continuations: Option<u32>,
+    expected_requests: usize,
+) -> usize {
+    // A provider tool keeps the request on the `chat_with_tools` path.
+    let mut harness =
+        TestHarness::new_with_tools(vec![], None, vec![provider_tool("update_task")]).await;
+    let output = json!({
+        "decision": "block",
+        "reason": "budget remains",
+        "hook_specific_output": {"hook_event_name": "stop", "additional_context": "keep going"}
+    });
+    let hooks = crate::hooks::Hooks::new(
+        serde_json::from_value::<crate::hooks::HooksConfig>(json!({
+            "enabled": true,
+            "stop": [{"hooks": [{
+                "type": "command",
+                "command": format!("cat >/dev/null; printf '%s' '{output}'"),
+                "timeout_sec": 5
+            }]}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut policy = harness.config.execution_policy.clone();
+    if let Some(max) = max_stop_hook_continuations {
+        policy.max_stop_hook_continuations = max;
+    }
+    harness.config = Arc::new(
+        crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+            harness.config.storage.clone(),
+            harness.config.provider.clone(),
+            harness.config.event_sink.journal().clone(),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly)
+        .with_execution_policy(policy)
+        .with_hooks(hooks)
+        .build(),
+    );
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .returning(|_, _| Ok(MockChatResponse::text_only("done").into()))
+        .times(expected_requests);
+    let mut events = harness.config.subscribe_events();
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    let mut cap_notices = 0;
+    while let Ok(Ok(envelope)) =
+        tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+    {
+        if let AgentEventKind::HookNotice {
+            event_name,
+            is_error: true,
+            message,
+        } = envelope.kind()
+            && event_name == "stop"
+            && message.contains("max_stop_hook_continuations")
+        {
+            cap_notices += 1;
+        }
+    }
+    cap_notices
+}
+
+/// A token-limit stop that middleware does not recover reaches Stop hooks
+/// with `stop_reason = "ModelTokenLimit"`; a blocking hook continues the run.
+#[tokio::test]
+async fn stop_hook_can_continue_after_unrecovered_token_limit_stop() {
+    let mut harness =
+        TestHarness::new_with_tools(vec![], None, vec![provider_tool("update_task")]).await;
+    let block = json!({
+        "decision": "block",
+        "reason": "budget remains",
+        "hook_specific_output": {"hook_event_name": "stop", "additional_context": "continue"}
+    });
+    // Blocks only token-limit stops, so the normal end of turn completes.
+    let command = format!(
+        "if grep -q '\"stop_reason\":\"ModelTokenLimit\"'; then printf '%s' '{block}'; else printf '{{}}'; fi"
+    );
+    let hooks = crate::hooks::Hooks::new(
+        serde_json::from_value::<crate::hooks::HooksConfig>(json!({
+            "enabled": true,
+            "stop": [{"hooks": [{"type": "command", "command": command, "timeout_sec": 5}]}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut policy = harness.config.execution_policy.clone();
+    // Middleware is never asked to recover, so the stop reaches the hook.
+    policy.max_stop_recoveries = 0;
+    harness.config = Arc::new(
+        crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+            harness.config.storage.clone(),
+            harness.config.provider.clone(),
+            harness.config.event_sink.journal().clone(),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly)
+        .with_execution_policy(policy)
+        .with_middleware(StopThenRecover::new(1))
+        .with_hooks(hooks)
+        .build(),
+    );
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .returning(|_, _| Ok(MockChatResponse::text_only("done").into()))
+        .times(1);
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+}
+
+#[tokio::test]
+async fn stop_hook_continues_once_by_default() {
+    // The hook keeps asking, so the default cap of 1 is hit and the user is told.
+    assert_eq!(run_stop_hook_cap_case(None, 2).await, 1);
+}
+
+#[tokio::test]
+async fn stop_hook_continuations_follow_configured_cap() {
+    assert_eq!(run_stop_hook_cap_case(Some(3), 4).await, 1);
+}
+
+#[tokio::test]
+async fn stop_hook_is_advisory_when_cap_is_zero() {
+    assert_eq!(run_stop_hook_cap_case(Some(0), 1).await, 1);
+}
+
 #[tokio::test]
 async fn completion_guard_continues_exactly_once_in_execution_flow() {
     run_completion_guard_case(

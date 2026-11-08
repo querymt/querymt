@@ -19,60 +19,28 @@ impl LocalAgentHandle {
         }
     }
 
-    /// Switch provider and model for a session (simple form)
+    /// Switch provider and model for a session (simple form).
+    ///
+    /// This is a model selection, not a configuration override: the session
+    /// actor keeps the session's system prompt and reasoning effort, seeds the
+    /// profile's parameters when the profile's own model is selected, and
+    /// leaves a session already bound to this model untouched.
     pub async fn set_provider(
         &self,
         session_id: &str,
         provider: &str,
         model: &str,
     ) -> Result<(), Error> {
-        // Preserve the system prompt when switching models
-        let system_prompt = self.get_session_system_prompt(session_id).await;
-
-        let mut config = LLMParams::new().provider(provider).model(model);
-
-        // Add system prompt to config
-        for prompt_part in system_prompt {
-            config = config.system(prompt_part);
-        }
-
-        self.set_llm_config(session_id, config).await
-    }
-
-    /// Helper method to extract system prompt from current session config
-    async fn get_session_system_prompt(
-        &self,
-        session_id: &str,
-    ) -> Vec<querymt::params::SystemPrompt> {
-        // Try to get the current session's LLM config
-        if let Ok(Some(current_config)) = self
-            .config
-            .provider
-            .history_store()
-            .get_session_llm_config(session_id)
+        let session_ref = self.session_ref_for_agent_session(session_id).await?;
+        let selection = crate::agent::session_control::SessionModelSelection {
+            model_id: format!("{provider}/{model}"),
+            provider_node_id: None,
+        };
+        session_ref
+            .set_session_model(selection)
             .await
-        {
-            // Try to extract system prompt from params JSON
-            if let Some(params) = &current_config.params
-                && let Some(system_array) = params.get("system").and_then(|v| v.as_array())
-            {
-                // Parse the array of strings
-                let mut system_parts = Vec::new();
-                for item in system_array {
-                    if let Ok(part) =
-                        serde_json::from_value::<querymt::params::SystemPrompt>(item.clone())
-                    {
-                        system_parts.push(part);
-                    }
-                }
-                if !system_parts.is_empty() {
-                    return system_parts;
-                }
-            }
-        }
-
-        // Fall back to initial_config system prompt
-        self.config.provider.initial_config().system.clone()
+            .map(|_| ())
+            .map_err(Error::from)
     }
 
     /// Switch provider configuration for a session (advanced form).

@@ -22,7 +22,7 @@ inputs:
     required: false
     default: ""
   feature_tag:
-    description: OCI tag suffix (e.g. default, metal, cuda12.8-sm80)
+    description: OCI tag suffix (e.g. default, metal, cuda12.9-sm80)
     required: true
   github_token:
     description: GitHub token for GHCR authentication
