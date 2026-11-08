@@ -16,18 +16,18 @@ Before a run stop is published, the agent SHALL give middleware the chance to re
 ## ADDED Requirements
 
 ### Requirement: Stop hooks can continue after an unrecovered token-limit stop
-When a model-token-limit stop is not recovered by middleware, the agent SHALL run Stop hooks with stop reason `ModelTokenLimit` before publishing it. A hook that blocks SHALL continue the turn with its reason injected as a runtime reminder. These continuations SHALL count toward the same per-turn Stop-hook continuation cap as end-of-turn continuations.
+When a model-token-limit stop is not recovered by middleware, the agent SHALL run Stop hooks with stop reason `ModelTokenLimit` before publishing it. A hook that blocks SHALL continue the turn with its reason injected as a runtime reminder. Token-limit continuations SHALL be counted separately from end-of-turn continuations, both bounded by `[agent.execution] max_stop_hook_continuations` (integer, default 1; `0` = advisory).
 
 #### Scenario: Hook continues the run
 - **WHEN** a token-limit stop is not recovered and a Stop hook blocks
 - **THEN** no stop event is emitted and the run continues with the next model request
 
 #### Scenario: Cap reached
-- **WHEN** Stop hooks have already used the continuation cap in the turn
+- **WHEN** token-limit Stop-hook continuations have already used the cap in the turn
 - **THEN** the token-limit stop is published
 
 ### Requirement: Local providers can bound reasoning per reply
-A local provider with a configured reasoning budget SHALL close an open reasoning block once that many tokens were generated inside reasoning in one reply, so the remaining output cap is used for the answer. Without a budget, reasoning SHALL be unbounded.
+A local provider with a configured reasoning budget SHALL close an open reasoning block once that many tokens were generated inside reasoning in one reply, so the remaining output cap is used for the answer. The budget is the llama.cpp provider's `thinking_budget` option in `[providers.config]` (integer; unset = unbounded, not applied with `speculative` decoding). Without a budget, reasoning SHALL be unbounded.
 
 #### Scenario: Budget spent while reasoning
 - **WHEN** the reasoning budget is 4,096 and the model is still reasoning after 4,096 reasoning tokens

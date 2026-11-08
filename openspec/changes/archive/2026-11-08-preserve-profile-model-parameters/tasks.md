@@ -21,7 +21,7 @@
   - Default-feature focused run of the new tests: 8 passed. Remote-only own-peer-id test passes under `--features remote`.
   - `cargo clippy -p querymt-agent --all-targets --features remote`: no diagnostics in the touched files (pre-existing warnings elsewhere). `cargo fmt --check`: clean. `openspec validate ... --strict`: valid.
   - Not run: dashboard/oauth/zbus/systemd features.
-- [ ] 4.2 Manual: on the remote node, start a new session from a mesh client and confirm the log shows `max_tokens=16384` and `starts_in_thinking=false`
+- [x] 4.2 Manual: on the remote node, start a new session from a mesh client and confirm the log shows `max_tokens=16384` and `starts_in_thinking=false`
 
 ## Workflow follow-up
 
