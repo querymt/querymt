@@ -11,7 +11,8 @@ Before a run stop is published, the agent SHALL give middleware the chance to re
 
 #### Scenario: Guard reached
 - **WHEN** middleware has already continued the maximum number of times in the turn
-- **THEN** the stop is published
+- **THEN** a model-token-limit stop is first offered to Stop hooks, and a blocking hook continues the run as in "Stop hooks can continue after an unrecovered token-limit stop"
+- **AND** any other stop is published unchanged
 
 ## ADDED Requirements
 
@@ -27,7 +28,7 @@ When a model-token-limit stop is not recovered by middleware, the agent SHALL ru
 - **THEN** the token-limit stop is published
 
 ### Requirement: Local providers can bound reasoning per reply
-A local provider with a configured reasoning budget SHALL close an open reasoning block once that many tokens were generated inside reasoning in one reply, so the remaining output cap is used for the answer. The budget is the llama.cpp provider's `thinking_budget` option in `[providers.config]` (integer; unset = unbounded, not applied with `speculative` decoding). Without a budget, reasoning SHALL be unbounded.
+A local provider with a configured reasoning budget SHALL close an open reasoning block once that many tokens were generated inside reasoning in one reply, so the remaining output cap is used for the answer. The budget is the llama.cpp provider's `thinking_budget` option in `[providers.config]` (integer; unset = unbounded; not applied with `speculative` decoding, when `json_schema` constrains the output, or to plain non-streaming `chat()` calls that use `generate()`). Without a budget, reasoning SHALL be unbounded.
 
 #### Scenario: Budget spent while reasoning
 - **WHEN** the reasoning budget is 4,096 and the model is still reasoning after 4,096 reasoning tokens

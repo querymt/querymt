@@ -41,9 +41,12 @@ round=$((prev_rounds + 1))
 
 # Snapshot the full working tree (incl. untracked files) for EVERY round, so any round
 # can be restored: git checkout refs/spec-scored/<change>/round-<n> -- .
-snap=$(ss_snapshot "refs/spec-scored/$change/round-$round" "spec-scored $change round $round: score=$score $note")
-if [ -n "$snap" ]; then commit=$(git rev-parse --short "$snap" 2>/dev/null || echo -)
-else commit=$(git rev-parse --short HEAD 2>/dev/null || echo -); fi
+# A failed snapshot is fatal: never record a round without its own snapshot.
+if ! snap=$(ss_snapshot "refs/spec-scored/$change/round-$round" "spec-scored $change round $round: score=$score $note") || [ -z "$snap" ]; then
+  echo "round $round: snapshot failed; round not recorded" >&2
+  exit 2
+fi
+commit=$(git rev-parse --short "$snap" 2>/dev/null || echo -)
 printf '%s\t%s\t%s\t%s\t%s\n' "$round" "$now" "$score" "$commit" "$note" >> "$log"
 
 set -- $(ss_best "$log" "$direction")
@@ -56,8 +59,7 @@ status="no improvement"
 [ "$round" -eq 1 ] && status="baseline"
 if [ "$best_round" = "$round" ]; then
   [ "$round" -gt 1 ] && status="NEW BEST"
-  [ -n "$snap" ] || snap=$(git rev-parse HEAD 2>/dev/null)
-  [ -n "$snap" ] && git update-ref "$ref" "$snap" 2>/dev/null
+  git update-ref "$ref" "$snap" 2>/dev/null
 fi
 
 if [ "$score" = FAIL ]; then

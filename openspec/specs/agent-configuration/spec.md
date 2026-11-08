@@ -44,10 +44,10 @@ Building a single agent, quorum planner or quorum delegate SHALL fail when a con
 - **THEN** both builds fail with the same error
 
 ### Requirement: Selecting the profile's model keeps the profile's parameters
-When a model selection names the profile's provider and model exactly, the configuration stored for the session SHALL be the profile's configuration, with the session's system prompt and reasoning effort. A selection of any other provider or model SHALL NOT include the profile's parameters. This SHALL hold whether the model is selected locally or by a mesh client.
+When a model selection changes the session's provider/model binding to the profile's provider and model exactly, the configuration stored for the session SHALL be the profile's configuration, with the session's system prompt and reasoning effort. A selection that changes the binding to any other provider or model SHALL NOT include the profile's parameters. Re-selecting the current binding SHALL preserve the session's configuration overrides such as `max_tokens` (see "Re-selecting the current model is a no-op"). This SHALL hold whether the model is selected locally or by a mesh client.
 
 #### Scenario: Selecting the profile's model keeps its parameters
-- **WHEN** a profile sets `max_tokens = 16384` and `enable_thinking = false` for `llama_cpp` model `M`, and a client selects `llama_cpp/M` for a session
+- **WHEN** a profile sets `max_tokens = 16384` and `enable_thinking = false` for `llama_cpp` model `M`, and a client selects `llama_cpp/M` for a session bound to another model or to none
 - **THEN** the session's stored configuration contains `max_tokens = 16384` and `enable_thinking = false`
 - **AND** the provider for that session is built with those values
 
@@ -71,7 +71,7 @@ A model selection that names the provider, model and provider node the session i
 - **THEN** the session keeps `max_tokens = 4096`
 
 ### Requirement: Explicit configuration takes precedence
-A configuration set through `set_llm_config` SHALL be stored as given, without merging the profile's parameters. Parameters it omits SHALL fall back to built-in model defaults, not to the profile.
+A configuration set through `set_llm_config` SHALL be stored as given, without merging the profile's parameters into the stored configuration. When the provider is built, parameters the stored configuration omits SHALL resolve first from the provider's static configuration and then from built-in model defaults, not from the profile.
 
 #### Scenario: Explicit configuration overrides the profile
 - **WHEN** the profile sets `max_tokens = 16384` and `set_llm_config` stores `max_tokens = 4096` for the profile's model
