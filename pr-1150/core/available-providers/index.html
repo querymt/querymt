@@ -2886,7 +2886,7 @@
 <tr>
 <td><code>thinking_budget</code></td>
 <td>integer</td>
-<td>Maximum reasoning tokens per reply. When spent, the provider closes the reasoning block so the model must answer. Unset = unbounded; not applied with <code>speculative</code> decoding</td>
+<td>Maximum reasoning tokens per reply. When spent, the provider closes the reasoning block so the model must answer. Unset = unbounded; not applied with <code>speculative</code> decoding, with schema-constrained output (<code>json_schema</code>), or to plain non-streaming chat calls</td>
 </tr>
 <tr>
 <td><code>mmproj_path</code></td>
