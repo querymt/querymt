@@ -2886,7 +2886,7 @@
 <tr>
 <td><code>thinking_budget</code></td>
 <td>integer</td>
-<td>Maximum reasoning tokens per reply. When spent, the provider closes the reasoning block so the model must answer. Unset = unbounded; not applied with <code>speculative</code> decoding, with schema-constrained output (<code>json_schema</code>), or to plain non-streaming chat calls</td>
+<td>Maximum reasoning tokens per reply. When spent, the provider closes the reasoning block so the model must answer. The budget is reduced to fit within <code>max_tokens</code> (leaving room for the closing marker and at least one answer token), so with the default cap of 256 a budget of 4,096 allows fewer than 256 reasoning tokens; it is disabled when the cap cannot fit the marker plus one answer token. Unset = unbounded; not applied with <code>speculative</code> decoding, with schema-constrained output (<code>json_schema</code>), or to plain non-streaming chat calls</td>
 </tr>
 <tr>
 <td><code>mmproj_path</code></td>
