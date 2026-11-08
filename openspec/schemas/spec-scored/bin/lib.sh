@@ -1,7 +1,7 @@
 # Shared helpers for the spec-scored schema scripts. Source, do not execute.
 # Requires: POSIX sh, awk, git.
 
-SS_NUM_RE='^[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?$'
+SS_NUM_RE='^[-+]?[0-9]*[.]?[0-9]+([eE][-+]?[0-9]+)?$'
 
 # Repository root, physical path (falls back to the current directory outside git).
 ss_root() {

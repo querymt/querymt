@@ -98,7 +98,9 @@ pub struct LlamaCppConfig {
     /// inserts the end-of-reasoning marker so the model has to answer. This
     /// stops runaway reasoning from consuming the whole `max_tokens` cap.
     /// `None` (default) leaves reasoning unbounded. Not applied with
-    /// `speculative` decoding.
+    /// `speculative` decoding, when `json_schema` constrains the output, or to
+    /// plain non-streaming `chat()` calls that use `generate()` (including
+    /// fallback prompts).
     pub thinking_budget: Option<u32>,
     /// Flash attention policy. Enables flash attention for faster inference
     /// and is required for KV cache quantization. Supported on Metal (Apple
@@ -230,6 +232,22 @@ impl SpeculativeConfig {
 }
 
 impl LlamaCppConfig {
+    /// The JSON schema constraining the output, when structured output is on.
+    pub(crate) fn structured_schema(&self) -> Option<&serde_json::Value> {
+        self.json_schema.as_ref().and_then(|s| s.schema.as_ref())
+    }
+
+    /// The reasoning budget to enforce. A schema-constrained grammar is always
+    /// active and would reject the forced end-of-reasoning marker, so no budget
+    /// is applied when structured output is on.
+    pub(crate) fn effective_thinking_budget(&self) -> Option<u32> {
+        if self.structured_schema().is_some() {
+            None
+        } else {
+            self.thinking_budget
+        }
+    }
+
     /// This config with a request's per-call overrides applied.
     pub(crate) fn with_overrides(&self, options: GenerationOptions) -> Self {
         let mut cfg = self.clone();
@@ -296,6 +314,37 @@ mod tests {
         );
         assert_eq!(overridden.max_tokens, Some(4096));
         assert_eq!(overridden.reasoning_effort, Some(ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn structured_schema_disables_thinking_budget() {
+        let plain: super::LlamaCppConfig = serde_json::from_value(serde_json::json!({
+            "model": "test.gguf", "thinking_budget": 128
+        }))
+        .unwrap();
+        assert!(plain.structured_schema().is_none());
+        assert_eq!(plain.effective_thinking_budget(), Some(128));
+
+        let structured: super::LlamaCppConfig = serde_json::from_value(serde_json::json!({
+            "model": "test.gguf",
+            "thinking_budget": 128,
+            "json_schema": {
+                "name": "out",
+                "schema": {"type": "object"},
+                "strict": true
+            }
+        }))
+        .unwrap();
+        assert!(structured.structured_schema().is_some());
+        assert_eq!(structured.effective_thinking_budget(), None);
+
+        let schemaless: super::LlamaCppConfig = serde_json::from_value(serde_json::json!({
+            "model": "test.gguf",
+            "thinking_budget": 128,
+            "json_schema": {"name": "out", "schema": null, "strict": null}
+        }))
+        .unwrap();
+        assert_eq!(schemaless.effective_thinking_budget(), Some(128));
     }
 
     fn config(n_max: u32, n_min: u32, p_min: f32) -> SpeculativeConfig {

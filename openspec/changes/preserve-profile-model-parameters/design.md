@@ -4,7 +4,7 @@
 
 - The profile's `[agent.parameters]` reach `SessionProvider::initial_config` (`LLMParams`, typed fields plus `custom`).
 - First use (`SessionActor::load_control_state_from_store`) stores the full `initial_config` via `create_or_get_llm_config`, which deduplicates identical configurations to one `llm_configs` row.
-- Three selection paths rebuild the configuration from `LLMParams::new().provider().model()` plus system prompt (and effort): `SessionActor::apply_model_selection`, the `SetProvider` handler, and `LocalAgentHandle::set_provider`. None checks whether the selection changes anything, so re-selecting the current model rebinds the session to a stripped row.
+- Before this change, three selection paths rebuilt the configuration from `LLMParams::new().provider().model()` plus system prompt (and effort): `SessionActor::apply_model_selection`, the `SetProvider` handler, and `LocalAgentHandle::set_provider`. None checked whether the selection changed anything, so re-selecting the current model rebound the session to a stripped row.
 - `SetLlmConfig` stores its configuration as given. `commit_reasoning_effort` re-reads the stored row and only changes the effort, so it preserves stored parameters.
 - `resolve_provider_config` (`Runtime`) applies stored params, then `ModelDefaults` for missing keys. It is correct once the stored row is complete.
 - Observed on a remote node: sessions bound to config 277 (system only) ran with `max_tokens=256` and thinking on, while config 281/282 (full profile) existed.
@@ -25,7 +25,7 @@
 ## Decisions
 
 ### D1. One selection constructor seeded from the profile
-Add `SessionProvider::selection_params(provider, model) -> LLMParams`: a clone of `initial_config` when `provider`/`model` equal `initial_config.provider`/`.model` exactly, otherwise `LLMParams::new()`; then `.provider(provider).model(model)`. Callers set system prompt and reasoning effort on the result as they do today. Use it in `apply_model_selection`, `SetProvider` and `LocalAgentHandle::set_provider`.
+Add `SessionProvider::selection_params(provider, model) -> LLMParams`: a clone of `initial_config` when `provider`/`model` equal `initial_config.provider`/`.model` exactly, otherwise `LLMParams::new()`; then `.provider(provider).model(model)`. Callers set system prompt and reasoning effort on the result as they do today. Use it in `apply_model_selection`, which `SetProvider` (via `transition_model`) and `LocalAgentHandle::set_provider` (via `set_session_model`) both reach.
 
 *Why:* cloning the profile and overwriting identity, system and effort avoids maintaining a list of excluded keys. Exact provider+model matching keeps GGUF-specific settings such as `n_ctx`/`model_path` off other models. When system and effort equal the first-use values, the result is byte-identical to the first-use row and deduplicates to it. *Alternative:* runtime layering in `resolve_provider_config` — rejected: a second source of truth, makes profile keys impossible to unset per session, and makes old sessions drift with profile edits.
 
@@ -35,7 +35,7 @@ In `apply_model_selection`, after parsing `(provider, model)` with `parse_transp
 *Why:* mesh clients send a selection for the already-bound model; without this, D1 would re-seed from the profile and drop an explicit `set_llm_config` override. Switching to another model and back still re-seeds from the profile, which is the intended reset. *Alternative:* relying on dedupe alone — insufficient when the session's row differs from the profile (override, or legacy incomplete row).
 
 ### D3. `set_llm_config` stays the explicit override
-No change. Its configuration is stored as given; omitting a profile key lets `ModelDefaults` apply. `SetProvider`/`set_provider` are selections, not overrides: they use D1, and since they bypass `apply_model_selection` (they go through `transition_model_with_config`), the D2 unchanged-binding check is applied on their path too.
+No change. Its configuration is stored as given; omitting a profile key lets `ModelDefaults` apply. `SetProvider` and `LocalAgentHandle::set_provider` are selections, not overrides: `SetProvider` builds a `SessionModelSelection` and calls `transition_model`, and `set_provider` builds one and calls `set_session_model`. Both reach `apply_model_selection`, so D1 (profile seeding) and the D2 unchanged-binding check apply through this shared path.
 
 ## Risks / Trade-offs
 

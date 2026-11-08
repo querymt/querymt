@@ -111,6 +111,8 @@ pub(crate) fn decode_token_piece(
     decode_piece(decoder, &bytes)
 }
 
+/// Decode raw token bytes to text, buffering incomplete UTF-8 sequences in
+/// `decoder` and replacing malformed bytes with U+FFFD.
 pub(crate) fn decode_piece(
     decoder: &mut encoding_rs::Decoder,
     bytes: &[u8],
@@ -208,6 +210,8 @@ pub(crate) fn force_text(
     Ok(Some(tokens.len() as u32))
 }
 
+/// Tokenize the template's preserved tokens and keep those that map to a
+/// single token, so they are rendered even when they are special tokens.
 fn preserved_token_set(
     model: &Arc<LlamaModel>,
     result: Option<&ChatTemplateResult>,
@@ -224,6 +228,8 @@ fn preserved_token_set(
     preserved
 }
 
+/// Generate a complete (non-streaming) completion for `prompt`, using MTP
+/// speculative decoding when configured and no images are attached.
 pub(crate) fn generate(
     model: &Arc<LlamaModel>,
     cfg: &LlamaCppConfig,

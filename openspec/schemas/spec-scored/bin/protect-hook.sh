@@ -62,6 +62,19 @@ protected_match() {  # $1 repo-relative path; prints the matching pattern
 case "$tool" in
   shell)
     cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // ""')
+    # Strict allowlist: the plain scorer call `[sh] <path>/score.sh <active change> ["note"]`
+    # with a single-line, fully quoted note and no other shell syntax.
+    scorer_re='^[[:space:]]*(sh[[:space:]]+)?(\./)?openspec/schemas/spec-scored/bin/score\.sh[[:space:]]+[A-Za-z0-9._-]+([[:space:]]+("[^"`$\\]*"|'"'"'[^'"'"']*'"'"'|[A-Za-z0-9._-]+))?[[:space:]]*$'
+    case "$cmd" in
+      *'
+'*) ;;
+      *)
+        if printf '%s' "$cmd" | grep -Eq "$scorer_re"; then
+          arg=$(printf '%s' "$cmd" | sed -E 's#^[[:space:]]*(sh[[:space:]]+)?(\./)?openspec/schemas/spec-scored/bin/score\.sh[[:space:]]+([A-Za-z0-9._-]+).*#\3#')
+          [ "$arg" = "$change" ] && allow
+        fi
+        ;;
+    esac
     printf '%s' "$cmd" | grep -Eq '(>|\btee\b|sed[[:space:]]+-i|\brm\b|\bmv\b|\bcp\b|\btruncate\b|\bchmod\b|git[[:space:]]+(checkout|restore))' || allow
     printf '%s\n' "$patterns" | while IFS= read -r pat; do
       lit=$(printf '%s' "$pat" | sed 's/\*.*$//')

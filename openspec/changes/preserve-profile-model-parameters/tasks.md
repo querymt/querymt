@@ -3,11 +3,11 @@
 ## 1. Selection constructor
 
 - [x] 1.1 Add `SessionProvider::selection_params(provider, model) -> LLMParams` (clone of `initial_config` on exact provider+model match, else `LLMParams::new()`, then identity set); unit tests in `session/provider.rs` for match, other model, other provider, and that `custom` (e.g. `n_ctx`) is carried only on match
-- [x] 1.2 Use it in `SessionActor::apply_model_selection`, the `SetProvider` handler and `LocalAgentHandle::set_provider`, keeping system prompt and reasoning effort handling; session-actor tests: selecting the profile's model stores the profile's `max_tokens` and reuses the first-use `llm_config_id`; selecting another model stores none; switching away and back restores them
+- [x] 1.2 Use it in `SessionActor::apply_model_selection` (reached by the `SetProvider` handler and `LocalAgentHandle::set_provider`), keeping system prompt and reasoning effort handling; session-actor tests: selecting the profile's model stores the profile's `max_tokens` and reuses the first-use `llm_config_id`; selecting another model stores none; switching away and back restores them
 
 ## 2. Idempotent selection
 
-- [x] 2.1 In `apply_model_selection` (and the `SetProvider` path), return without committing when provider, model and normalised provider node equal the current binding; tests for node given as `None`, `"local"` and own peer id, asserting no `ProviderChanged` event
+- [x] 2.1 In `apply_model_selection` (shared by `set_session_model`, `SetProvider` and `set_provider`), return without committing when provider, model and normalised provider node equal the current binding; tests for node given as `None`, `"local"` and own peer id, asserting no `ProviderChanged` event
 - [x] 2.2 Test that a `set_llm_config` override (`max_tokens = 4096`) survives a subsequent `set_session_model` for the same model
 
 ## 3. End to end

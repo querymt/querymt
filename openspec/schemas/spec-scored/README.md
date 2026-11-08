@@ -2,15 +2,21 @@
 
 `spec-driven` plus a measurable objective and a scored apply loop.
 
-```
-proposal ──┬─> specs ──┐
-           ├─> design ─┼─> tasks ──> [apply: scored rounds] ──> results
-           └─> objective ┘
+```mermaid
+flowchart LR
+    proposal --> specs
+    proposal --> design
+    proposal --> objective
+    specs --> tasks
+    design --> tasks
+    objective --> tasks
+    tasks --> apply["apply: scored rounds"]
+    apply --> results
 ```
 
 - `objective.md` defines one numeric metric. The matching `x-score` block goes in
   the change's `.openspec.yaml` (OpenSpec ignores `x-` keys; `validate --strict` passes).
-- Apply runs `bin/score.sh <change> "<note>"` after each task/change. Rounds are
+- Apply runs `sh openspec/schemas/spec-scored/bin/score.sh <change> "<note>"` (from the repo root) after each task/change. Rounds are
   logged to `openspec/changes/<change>/rounds.tsv`. Every round (tracked, modified and
   untracked files) is snapshotted as `refs/spec-scored/<change>/round-<n>`, and its id is
   the `commit` column; every new best is also `refs/spec-scored/<change>/best`. Snapshots

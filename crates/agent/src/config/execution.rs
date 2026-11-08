@@ -257,6 +257,7 @@ fn default_max_stop_recoveries() -> u8 {
 /// Default cap on Stop-hook continuations per turn.
 pub const DEFAULT_MAX_STOP_HOOK_CONTINUATIONS: u32 = 1;
 
+/// Serde default for `max_stop_hook_continuations`.
 fn default_max_stop_hook_continuations() -> u32 {
     DEFAULT_MAX_STOP_HOOK_CONTINUATIONS
 }

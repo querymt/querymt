@@ -217,22 +217,32 @@ The process also needs permission to access the AMD GPU (`/dev/kfd` and the appr
 
 ### Choosing a feature tag
 
-```
-What OS are you on?
-├── macOS Apple Silicon (M1/M2/M3/M4)  → latest-metal
-├── macOS Intel
-│   ├── izwi / mrs                     → latest-accelerate
-│   └── llama-cpp                      → latest-default
-├── Linux
-│   ├── NVIDIA GPU
-│   │   ├── llama-cpp                  → latest-cuda12.9
-│   │   └── izwi / mrs                 → latest-cuda12.9-sm{XX}  (see table above)
-│   ├── AMD GPU + ROCm 7.2 (x86_64)     → latest-rocm7.2 (llama-cpp; validation pending)
-│   ├── Other AMD / Intel GPU          → latest-vulkan  (llama-cpp only)
-│   └── CPU only                       → latest  (or latest-default)
-└── Windows
-    ├── NVIDIA GPU                     → latest-cuda12.9  (llama-cpp only)
-    └── CPU only                       → latest
+```mermaid
+flowchart TD
+    os{"What OS are you on?"}
+    os --> mac_arm["macOS Apple Silicon (M1/M2/M3/M4)"]
+    os --> mac_intel["macOS Intel"]
+    os --> linux["Linux"]
+    os --> windows["Windows"]
+
+    mac_arm --> t_metal["latest-metal"]
+    mac_intel -->|izwi / mrs| t_accel["latest-accelerate"]
+    mac_intel -->|llama-cpp| t_default["latest-default"]
+
+    linux --> l_nv["NVIDIA GPU"]
+    linux --> l_rocm["AMD GPU + ROCm 7.2 (x86_64)"]
+    linux --> l_other["Other AMD / Intel GPU"]
+    linux --> l_cpu["CPU only"]
+    l_nv -->|llama-cpp| t_cuda["latest-cuda12.9"]
+    l_nv -->|izwi / mrs| t_sm["latest-cuda12.9-sm{XX} (see table above)"]
+    l_rocm --> t_rocm["latest-rocm7.2 (llama-cpp; validation pending)"]
+    l_other --> t_vulkan["latest-vulkan (llama-cpp only)"]
+    l_cpu --> t_cpu["latest (or latest-default)"]
+
+    windows --> w_nv["NVIDIA GPU"]
+    windows --> w_cpu["CPU only"]
+    w_nv --> t_wcuda["latest-cuda12.9 (llama-cpp only)"]
+    w_cpu --> t_wcpu["latest"]
 ```
 
 ---

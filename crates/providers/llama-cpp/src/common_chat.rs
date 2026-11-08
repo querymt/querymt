@@ -258,6 +258,7 @@ impl ThinkingBudget {
         })
     }
 
+    /// Create a budget tracker with an explicit initial reasoning state.
     fn with_state(budget: u32, reasoning_format: ReasoningFormat, in_thinking: bool) -> Self {
         Self {
             budget,

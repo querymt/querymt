@@ -28,8 +28,7 @@ pub(crate) fn generate_with_tools(
 ) -> Result<GeneratedText, LLMError> {
     if cfg.speculative.is_some() && bitmaps.is_empty() {
         let params = SamplingParams::from_config(cfg, temperature);
-        let sampler = if let Some(schema) = cfg.json_schema.as_ref().and_then(|s| s.schema.as_ref())
-        {
+        let sampler = if let Some(schema) = cfg.structured_schema() {
             build_structured_sampler(model, schema, &params)?
         } else {
             build_tool_sampler(model, result, &params)?
@@ -117,8 +116,7 @@ pub(crate) fn generate_with_tools(
     }
 
     let params = SamplingParams::from_config(cfg, temperature);
-    let mut sampler = if let Some(schema) = cfg.json_schema.as_ref().and_then(|s| s.schema.as_ref())
-    {
+    let mut sampler = if let Some(schema) = cfg.structured_schema() {
         build_structured_sampler(model, schema, &params)?
     } else {
         build_tool_sampler(model, result, &params)?
@@ -129,7 +127,8 @@ pub(crate) fn generate_with_tools(
     let mut first_token_logged = false;
     let mut eog_hit = false;
     let mut termination = GenerationTermination::MaxTokens;
-    let mut thinking_budget = crate::common_chat::ThinkingBudget::new(cfg.thinking_budget, result);
+    let mut thinking_budget =
+        crate::common_chat::ThinkingBudget::new(cfg.effective_thinking_budget(), result);
 
     log::debug!(
         "generate_with_tools: sampler built, has_grammar={}, input_tokens={}, max_tokens={}",
