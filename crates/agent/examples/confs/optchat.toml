@@ -1,0 +1,33 @@
+# Experimental single-agent OptChat trial. Use a separate --db path.
+# See crates/agent/src/optchat/README.md for limits, costs, storage and removal.
+[profile]
+id = "optchat-trial"
+name = "OptChat Trial"
+description = "Experimental session-local tree memory (backend only)"
+tags = ["experimental", "memory"]
+
+[agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+assume_mutating = false
+mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
+tools = [
+  "read_tool", "index", "glob", "search_text", "ls", "get_function", "get_symbol",
+  "find_symbol_references", "edit", "multiedit", "replace_symbol", "write_file",
+  "shell", "question", "todowrite", "todoread", "browse", "skill",
+]
+system = "You are QueryMT, a software engineering assistant. Use tools to verify facts, preserve user work, and report actual outcomes and remaining limitations."
+
+[agent.memory]
+enabled = true
+strategy = "optchat"
+scope = "session"
+directory = "${QMT_OPTCHAT_MEMORY_DIR:-/tmp/querymt-optchat-trial/memory}"
+
+# Without this optional section, summaries use the session's current model.
+# [agent.memory.compactor]
+# provider = "anthropic"
+# model = "claude-sonnet-4-5-20250929"
+
+[agent.execution.snapshot]
+backend = "git"
