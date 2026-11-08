@@ -1140,7 +1140,9 @@ impl SessionActor {
                 params,
             } => {
                 let mut params = params.as_ref().clone();
-                if rebased {
+                // After a conflict, only fill in the effort the caller left unset;
+                // an explicitly supplied effort is preserved.
+                if rebased && params.reasoning_effort.is_none() {
                     params.reasoning_effort = previous.reasoning_effort;
                 }
                 self.apply_model_binding(

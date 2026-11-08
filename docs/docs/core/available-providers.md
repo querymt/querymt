@@ -446,7 +446,7 @@ Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models,
 | `temperature` | float | Sampling temperature. `0` = greedy |
 | `enable_thinking` | bool | Render the chat template with reasoning enabled (default: `true`) |
 | `reasoning_effort` | string | `"low"` \| `"medium"` \| `"high"` \| `"max"`; applied only when the chat template exposes `reasoning_effort`. A per-request override takes precedence |
-| `thinking_budget` | integer | Maximum reasoning tokens per reply. When spent, the provider closes the reasoning block so the model must answer. Unset = unbounded; not applied with `speculative` decoding, with schema-constrained output (`json_schema`), or to plain non-streaming chat calls |
+| `thinking_budget` | integer | Maximum reasoning tokens per reply. When spent, the provider closes the reasoning block so the model must answer. The budget is reduced to fit within `max_tokens` (leaving room for the closing marker and at least one answer token), so with the default cap of 256 a budget of 4,096 allows fewer than 256 reasoning tokens; it is disabled when the cap cannot fit the marker plus one answer token. Unset = unbounded; not applied with `speculative` decoding, with schema-constrained output (`json_schema`), or to plain non-streaming chat calls |
 | `mmproj_path` | string | Path to multimodal projection file (vision models only) |
 
 For vision model configuration and the full option reference see the [llama-cpp provider README](https://github.com/querymt/querymt/blob/main/crates/providers/llama-cpp/README.md).

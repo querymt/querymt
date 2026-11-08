@@ -41,7 +41,7 @@ Before a run stop is published, the agent SHALL give middleware the chance to re
 
 #### Scenario: Guard reached
 - **WHEN** middleware has already continued the maximum number of times in the turn
-- **THEN** a model-token-limit stop is first offered to Stop hooks, and a blocking hook continues the run as in "Stop hooks can continue after an unrecovered token-limit stop"
+- **THEN** a model-token-limit stop is first offered to Stop hooks, and a blocking hook continues the run as in "Stop hooks can continue after an unrecovered token-limit stop" only when `max_stop_hook_continuations` is neither zero nor exhausted for the turn; otherwise the stop is published
 - **AND** any other stop is published unchanged
 
 ### Requirement: Stop hooks can continue after an unrecovered token-limit stop
@@ -56,7 +56,7 @@ When a model-token-limit stop is not recovered by middleware, the agent SHALL ru
 - **THEN** the token-limit stop is published
 
 ### Requirement: Local providers can bound reasoning per reply
-A local provider with a configured reasoning budget SHALL close an open reasoning block once that many tokens were generated inside reasoning in one reply, so the remaining output cap is used for the answer. The budget is the llama.cpp provider's `thinking_budget` option in `[providers.config]` (integer; unset = unbounded; not applied with `speculative` decoding, when `json_schema` constrains the output, or to plain non-streaming `chat()` calls that use `generate()`). Without a budget, reasoning SHALL be unbounded.
+A local provider with a configured reasoning budget SHALL close an open reasoning block once that many tokens were generated inside reasoning in one reply, so the remaining output cap is used for the answer. The budget is the llama.cpp provider's `thinking_budget` option in `[providers.config]` (integer; unset = unbounded; not applied with `speculative` decoding, when `json_schema` constrains the output, or to plain non-streaming `chat()` calls that use `generate()`). The effective budget is reduced to fit within the output cap, leaving room for the end-of-reasoning marker and at least one answer token, so a configured budget of 4,096 does not guarantee 4,096 reasoning tokens (with the default output cap of 256 it allows fewer than 256); when the cap cannot fit the marker and one answer token, the budget is disabled. Without a budget, reasoning SHALL be unbounded.
 
 #### Scenario: Budget spent while reasoning
 - **WHEN** the reasoning budget is 4,096 and the model is still reasoning after 4,096 reasoning tokens

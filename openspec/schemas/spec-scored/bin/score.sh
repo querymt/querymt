@@ -40,7 +40,8 @@ set -- $(ss_best "$log" "$direction"); prev_rounds=$3
 round=$((prev_rounds + 1))
 
 # Snapshot the full working tree (incl. untracked files) for EVERY round, so any round
-# can be restored: git checkout refs/spec-scored/<change>/round-<n> -- .
+# can be restored: git checkout refs/spec-scored/<change>/round-<n> -- . ':(exclude)openspec/changes/<change>'
+# (the change folder is excluded so rounds.tsv keeps every round).
 # A failed snapshot is fatal: never record a round without its own snapshot.
 if ! snap=$(ss_snapshot "refs/spec-scored/$change/round-$round" "spec-scored $change round $round: score=$score $note") || [ -z "$snap" ]; then
   echo "round $round: snapshot failed; round not recorded" >&2
@@ -57,9 +58,13 @@ set -- $(ss_tasks "$dir/tasks.md"); done_tasks=$1; total_tasks=$2
 ref="refs/spec-scored/$change/best"
 status="no improvement"
 [ "$round" -eq 1 ] && status="baseline"
-if [ "$best_round" = "$round" ]; then
-  [ "$round" -gt 1 ] && status="NEW BEST"
-  git update-ref "$ref" "$snap" 2>/dev/null
+[ "$best_round" = "$round" ] && [ "$round" -gt 1 ] && status="NEW BEST"
+# Point the best ref at the best round's own snapshot on every run, so a failed update
+# is repaired by the next scoring run and the ref never silently disagrees with rounds.tsv.
+ref_failed=0
+if [ "$best_round" -gt 0 ] && ! git update-ref "$ref" "refs/spec-scored/$change/round-$best_round"; then
+  echo "round $round: failed to point $ref at round $best_round; the best ref is stale or missing (rerun scoring to repair it)" >&2
+  ref_failed=1
 fi
 
 if [ "$score" = FAIL ]; then
@@ -72,6 +77,7 @@ if [ -n "$target" ]; then
   echo "target: $target ($direction) - $t"
 fi
 echo "tasks: $done_tasks/$total_tasks done"
-echo "restore best: git checkout $ref -- . ':(exclude)$dir'   (any round: refs/spec-scored/$change/round-<n>; snapshot = $commit)"
+echo "restore best: git checkout $ref -- . ':(exclude)$dir'   (any round: git checkout refs/spec-scored/$change/round-<n> -- . ':(exclude)$dir'; snapshot = $commit)"
+[ "$ref_failed" -eq 1 ] && exit 2
 [ "$score" = FAIL ] && exit 1
 exit 0

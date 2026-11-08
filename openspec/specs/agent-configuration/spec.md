@@ -71,7 +71,7 @@ A model selection that names the provider, model and provider node the session i
 - **THEN** the session keeps `max_tokens = 4096`
 
 ### Requirement: Explicit configuration takes precedence
-A configuration set through `set_llm_config` SHALL be stored as given, without merging the profile's parameters into the stored configuration. When the provider is built, parameters the stored configuration omits SHALL resolve first from the provider's static configuration and then from built-in model defaults, not from the profile.
+A configuration set through `set_llm_config` SHALL be stored as given, without merging the profile's parameters into the stored configuration. When the provider is built, parameters the stored configuration omits SHALL resolve first from the provider's static configuration, then from built-in model defaults, and finally from the provider implementation's own defaults, not from the profile.
 
 #### Scenario: Explicit configuration overrides the profile
 - **WHEN** the profile sets `max_tokens = 16384` and `set_llm_config` stores `max_tokens = 4096` for the profile's model
