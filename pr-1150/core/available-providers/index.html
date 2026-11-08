@@ -2479,36 +2479,31 @@
 <p>The OCI artifact contains the provider library only, <strong>not</strong> ROCm or GPU drivers. Use Ubuntu 24.04 or a compatible environment with the ROCm 7.2.1 HIP runtime, hipBLAS, and rocBLAS (including its GPU kernel data) installed. Follow <a href="https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.2.1/install/install-methods/package-manager/package-manager-ubuntu.html">AMD's ROCm 7.2.1 installation instructions</a> and check the GPU/driver requirements for your hardware. The dynamic linker must be able to resolve <code>libamdhip64.so</code>, <code>libhipblas.so</code>, <code>librocblas.so</code>, and their dependencies. Nonstandard installations, including NixOS, require an environment providing those libraries; the downloaded artifact is not self-contained.</p>
 <p>The process also needs permission to access the AMD GPU (<code>/dev/kfd</code> and the appropriate <code>/dev/dri</code> render node). GPUs outside the compiled list can use <code>latest-vulkan</code> or a source build with a custom target list. This initial ROCm variant is not published for Windows or Linux arm64.</p>
 <h3 id="choosing-a-feature-tag">Choosing a feature tag</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-14-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-14-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-14-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-14-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-14-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-14-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-14-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-14-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-14-10">10</a></span>
-<span class="normal"><a href="#__codelineno-14-11">11</a></span>
-<span class="normal"><a href="#__codelineno-14-12">12</a></span>
-<span class="normal"><a href="#__codelineno-14-13">13</a></span>
-<span class="normal"><a href="#__codelineno-14-14">14</a></span>
-<span class="normal"><a href="#__codelineno-14-15">15</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a>What OS are you on?
-<a id="__codelineno-14-2" name="__codelineno-14-2"></a>├── macOS Apple Silicon (M1/M2/M3/M4)  → latest-metal
-<a id="__codelineno-14-3" name="__codelineno-14-3"></a>├── macOS Intel
-<a id="__codelineno-14-4" name="__codelineno-14-4"></a>│   ├── izwi / mrs                     → latest-accelerate
-<a id="__codelineno-14-5" name="__codelineno-14-5"></a>│   └── llama-cpp                      → latest-default
-<a id="__codelineno-14-6" name="__codelineno-14-6"></a>├── Linux
-<a id="__codelineno-14-7" name="__codelineno-14-7"></a>│   ├── NVIDIA GPU
-<a id="__codelineno-14-8" name="__codelineno-14-8"></a>│   │   ├── llama-cpp                  → latest-cuda12.9
-<a id="__codelineno-14-9" name="__codelineno-14-9"></a>│   │   └── izwi / mrs                 → latest-cuda12.9-sm{XX}  (see table above)
-<a id="__codelineno-14-10" name="__codelineno-14-10"></a>│   ├── AMD GPU + ROCm 7.2 (x86_64)     → latest-rocm7.2 (llama-cpp; validation pending)
-<a id="__codelineno-14-11" name="__codelineno-14-11"></a>│   ├── Other AMD / Intel GPU          → latest-vulkan  (llama-cpp only)
-<a id="__codelineno-14-12" name="__codelineno-14-12"></a>│   └── CPU only                       → latest  (or latest-default)
-<a id="__codelineno-14-13" name="__codelineno-14-13"></a>└── Windows
-<a id="__codelineno-14-14" name="__codelineno-14-14"></a>    ├── NVIDIA GPU                     → latest-cuda12.9  (llama-cpp only)
-<a id="__codelineno-14-15" name="__codelineno-14-15"></a>    └── CPU only                       → latest
-</code></pre></div></td></tr></table></div>
+<pre class="mermaid"><code>flowchart TD
+    os{"What OS are you on?"}
+    os --&gt; mac_arm["macOS Apple Silicon (M1/M2/M3/M4)"]
+    os --&gt; mac_intel["macOS Intel"]
+    os --&gt; linux["Linux"]
+    os --&gt; windows["Windows"]
+
+    mac_arm --&gt; t_metal["latest-metal"]
+    mac_intel --&gt;|izwi / mrs| t_accel["latest-accelerate"]
+    mac_intel --&gt;|llama-cpp| t_default["latest-default"]
+
+    linux --&gt; l_nv["NVIDIA GPU"]
+    linux --&gt; l_rocm["AMD GPU + ROCm 7.2 (x86_64)"]
+    linux --&gt; l_other["Other AMD / Intel GPU"]
+    linux --&gt; l_cpu["CPU only"]
+    l_nv --&gt;|llama-cpp| t_cuda["latest-cuda12.9"]
+    l_nv --&gt;|izwi / mrs| t_sm["latest-cuda12.9-sm{XX} (see table above)"]
+    l_rocm --&gt; t_rocm["latest-rocm7.2 (llama-cpp; validation pending)"]
+    l_other --&gt; t_vulkan["latest-vulkan (llama-cpp only)"]
+    l_cpu --&gt; t_cpu["latest (or latest-default)"]
+
+    windows --&gt; w_nv["NVIDIA GPU"]
+    windows --&gt; w_cpu["CPU only"]
+    w_nv --&gt; t_wcuda["latest-cuda12.9 (llama-cpp only)"]
+    w_cpu --&gt; t_wcpu["latest"]</code></pre>
 <hr />
 <h2 id="provider-reference">Provider reference</h2>
 <h3 id="anthropic">anthropic</h3>
@@ -2573,9 +2568,9 @@
 <p>Each thinking block becomes its own reasoning item with its own signature. Signed blocks are replayed unchanged, even when their text is empty (the default <code>display: "omitted"</code> on Opus 4.7+ and Claude 5). <code>redacted_thinking</code> blocks are kept and replayed with their opaque data. <code>output_tokens_details.thinking_tokens</code> is reported as <code>reasoning_tokens</code> and subtracted from the inclusive <code>output_tokens</code>, so ordinary output and reasoning never overlap. Streaming usage ends with the final <code>message_delta</code> values: the provisional output count in <code>message_start</code> is not emitted as ordinary output, fields a later event omits (input, cache) keep their earlier values, and an explicit zero replaces them. Cache writes keep the returned <code>cache_creation</code> five-minute and one-hour counts as a breakdown of the aggregate <code>cache_creation_input_tokens</code> (never added on top); with no breakdown the tiers stay absent rather than assumed. Stop reasons map as: <code>end_turn</code>/<code>stop_sequence</code> to stop, <code>tool_use</code> to tool calls, <code>max_tokens</code>/<code>model_context_window_exceeded</code> to length, <code>refusal</code> to content filter, <code>pause_turn</code> to other.</p>
 <h4 id="adaptive_thinking-override"><code>adaptive_thinking</code> override</h4>
 <p>An optional provider config field overrides the class derived from the model ID:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-15-1">1</a></span>
-<span class="normal"><a href="#__codelineno-15-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a><span class="k">[providers.anthropic]</span>
-<a id="__codelineno-15-2" name="__codelineno-15-2"></a><span class="n">adaptive_thinking</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="w">   </span><span class="c1"># force opt-in adaptive thinking</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span>
+<span class="normal"><a href="#__codelineno-14-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a><span class="k">[providers.anthropic]</span>
+<a id="__codelineno-14-2" name="__codelineno-14-2"></a><span class="n">adaptive_thinking</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="w">   </span><span class="c1"># force opt-in adaptive thinking</span>
 </code></pre></div></td></tr></table></div>
 <ul>
 <li><code>true</code> sends adaptive thinking explicitly. This is the right choice for a proxy or custom model ID that can't be parsed but fronts an adaptive model.</li>
@@ -2584,9 +2579,9 @@
 <p>The sampling and forced-tool-choice rules always use the parsed model ID and ignore this override.</p>
 <h4 id="strict-tool-use-strict_tools">Strict tool use (<code>strict_tools</code>)</h4>
 <p>Strict tool use makes the API enforce a tool's input schema during sampling. One optional provider setting controls it:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-16-1">1</a></span>
-<span class="normal"><a href="#__codelineno-16-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a><span class="k">[providers.anthropic]</span>
-<a id="__codelineno-16-2" name="__codelineno-16-2"></a><span class="n">strict_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"multiedit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"replace_symbol"</span><span class="p">]</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-15-1">1</a></span>
+<span class="normal"><a href="#__codelineno-15-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a><span class="k">[providers.anthropic]</span>
+<a id="__codelineno-15-2" name="__codelineno-15-2"></a><span class="n">strict_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"multiedit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"replace_symbol"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <p>A tool is eligible when its definition sets <code>strict: true</code> or its unprefixed name is in <code>strict_tools</code> (names are matched before the OAuth <code>mcp_</code> prefix is applied). The provider itself has no default list: when <code>strict_tools</code> is unset or empty, no tool is selected by name, but tools whose definitions explicitly set <code>strict: true</code> stay eligible. The QueryMT agent fills in <code>["edit", "multiedit", "replace_symbol"]</code> for Anthropic when you have not set <code>strict_tools</code>; set <code>strict_tools = []</code> to turn that off. Builtin tool definitions never set <code>strict</code>, so OpenAI Responses behaviour is unchanged.</p>
 <p>Eligible tools are sent with <code>"strict": true</code> only when every check passes:</p>
@@ -2715,6 +2710,24 @@
 <div class="tabbed-set tabbed-alternate" data-tabs="2:6"><input checked="checked" id="__tabbed_2_1" name="__tabbed_2" type="radio" /><input id="__tabbed_2_2" name="__tabbed_2" type="radio" /><input id="__tabbed_2_3" name="__tabbed_2" type="radio" /><input id="__tabbed_2_4" name="__tabbed_2" type="radio" /><input id="__tabbed_2_5" name="__tabbed_2" type="radio" /><input id="__tabbed_2_6" name="__tabbed_2" type="radio" /><div class="tabbed-labels"><label for="__tabbed_2_1">macOS (Metal)</label><label for="__tabbed_2_2">Linux / Windows (CPU)</label><label for="__tabbed_2_3">Linux (CUDA)</label><label for="__tabbed_2_4">Linux (ROCm, x86_64)</label><label for="__tabbed_2_5">Linux (Vulkan)</label><label for="__tabbed_2_6">Windows (CUDA)</label></div>
 <div class="tabbed-content">
 <div class="tabbed-block">
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-16-1">1</a></span>
+<span class="normal"><a href="#__codelineno-16-2">2</a></span>
+<span class="normal"><a href="#__codelineno-16-3">3</a></span>
+<span class="normal"><a href="#__codelineno-16-4">4</a></span>
+<span class="normal"><a href="#__codelineno-16-5">5</a></span>
+<span class="normal"><a href="#__codelineno-16-6">6</a></span>
+<span class="normal"><a href="#__codelineno-16-7">7</a></span>
+<span class="normal"><a href="#__codelineno-16-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-16-2" name="__codelineno-16-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"llama-cpp"</span>
+<a id="__codelineno-16-3" name="__codelineno-16-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-metal"</span>
+<a id="__codelineno-16-4" name="__codelineno-16-4"></a>
+<a id="__codelineno-16-5" name="__codelineno-16-5"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-16-6" name="__codelineno-16-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model.gguf"</span>
+<a id="__codelineno-16-7" name="__codelineno-16-7"></a><span class="n">n_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4096</span>
+<a id="__codelineno-16-8" name="__codelineno-16-8"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">99</span>
+</code></pre></div></td></tr></table></div>
+</div>
+<div class="tabbed-block">
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-17-1">1</a></span>
 <span class="normal"><a href="#__codelineno-17-2">2</a></span>
 <span class="normal"><a href="#__codelineno-17-3">3</a></span>
@@ -2724,12 +2737,12 @@
 <span class="normal"><a href="#__codelineno-17-7">7</a></span>
 <span class="normal"><a href="#__codelineno-17-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-17-2" name="__codelineno-17-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"llama-cpp"</span>
-<a id="__codelineno-17-3" name="__codelineno-17-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-metal"</span>
+<a id="__codelineno-17-3" name="__codelineno-17-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest"</span>
 <a id="__codelineno-17-4" name="__codelineno-17-4"></a>
 <a id="__codelineno-17-5" name="__codelineno-17-5"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-17-6" name="__codelineno-17-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model.gguf"</span>
 <a id="__codelineno-17-7" name="__codelineno-17-7"></a><span class="n">n_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4096</span>
-<a id="__codelineno-17-8" name="__codelineno-17-8"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">99</span>
+<a id="__codelineno-17-8" name="__codelineno-17-8"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span>
 </code></pre></div></td></tr></table></div>
 </div>
 <div class="tabbed-block">
@@ -2740,14 +2753,16 @@
 <span class="normal"><a href="#__codelineno-18-5">5</a></span>
 <span class="normal"><a href="#__codelineno-18-6">6</a></span>
 <span class="normal"><a href="#__codelineno-18-7">7</a></span>
-<span class="normal"><a href="#__codelineno-18-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1"></a><span class="k">[[providers]]</span>
+<span class="normal"><a href="#__codelineno-18-8">8</a></span>
+<span class="normal"><a href="#__codelineno-18-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-18-2" name="__codelineno-18-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"llama-cpp"</span>
-<a id="__codelineno-18-3" name="__codelineno-18-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest"</span>
+<a id="__codelineno-18-3" name="__codelineno-18-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-cuda12.9"</span>
 <a id="__codelineno-18-4" name="__codelineno-18-4"></a>
 <a id="__codelineno-18-5" name="__codelineno-18-5"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-18-6" name="__codelineno-18-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model.gguf"</span>
 <a id="__codelineno-18-7" name="__codelineno-18-7"></a><span class="n">n_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4096</span>
-<a id="__codelineno-18-8" name="__codelineno-18-8"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span>
+<a id="__codelineno-18-8" name="__codelineno-18-8"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">99</span>
+<a id="__codelineno-18-9" name="__codelineno-18-9"></a><span class="n">flash_attention</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"enabled"</span>
 </code></pre></div></td></tr></table></div>
 </div>
 <div class="tabbed-block">
@@ -2758,16 +2773,14 @@
 <span class="normal"><a href="#__codelineno-19-5">5</a></span>
 <span class="normal"><a href="#__codelineno-19-6">6</a></span>
 <span class="normal"><a href="#__codelineno-19-7">7</a></span>
-<span class="normal"><a href="#__codelineno-19-8">8</a></span>
-<span class="normal"><a href="#__codelineno-19-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1"></a><span class="k">[[providers]]</span>
+<span class="normal"><a href="#__codelineno-19-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-19-2" name="__codelineno-19-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"llama-cpp"</span>
-<a id="__codelineno-19-3" name="__codelineno-19-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-cuda12.9"</span>
+<a id="__codelineno-19-3" name="__codelineno-19-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-rocm7.2"</span>
 <a id="__codelineno-19-4" name="__codelineno-19-4"></a>
 <a id="__codelineno-19-5" name="__codelineno-19-5"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-19-6" name="__codelineno-19-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model.gguf"</span>
 <a id="__codelineno-19-7" name="__codelineno-19-7"></a><span class="n">n_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4096</span>
 <a id="__codelineno-19-8" name="__codelineno-19-8"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">99</span>
-<a id="__codelineno-19-9" name="__codelineno-19-9"></a><span class="n">flash_attention</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"enabled"</span>
 </code></pre></div></td></tr></table></div>
 </div>
 <div class="tabbed-block">
@@ -2780,7 +2793,7 @@
 <span class="normal"><a href="#__codelineno-20-7">7</a></span>
 <span class="normal"><a href="#__codelineno-20-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-20-1" name="__codelineno-20-1"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-20-2" name="__codelineno-20-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"llama-cpp"</span>
-<a id="__codelineno-20-3" name="__codelineno-20-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-rocm7.2"</span>
+<a id="__codelineno-20-3" name="__codelineno-20-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-vulkan"</span>
 <a id="__codelineno-20-4" name="__codelineno-20-4"></a>
 <a id="__codelineno-20-5" name="__codelineno-20-5"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-20-6" name="__codelineno-20-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model.gguf"</span>
@@ -2796,34 +2809,16 @@
 <span class="normal"><a href="#__codelineno-21-5">5</a></span>
 <span class="normal"><a href="#__codelineno-21-6">6</a></span>
 <span class="normal"><a href="#__codelineno-21-7">7</a></span>
-<span class="normal"><a href="#__codelineno-21-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-21-1" name="__codelineno-21-1"></a><span class="k">[[providers]]</span>
+<span class="normal"><a href="#__codelineno-21-8">8</a></span>
+<span class="normal"><a href="#__codelineno-21-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-21-1" name="__codelineno-21-1"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-21-2" name="__codelineno-21-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"llama-cpp"</span>
-<a id="__codelineno-21-3" name="__codelineno-21-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-vulkan"</span>
+<a id="__codelineno-21-3" name="__codelineno-21-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-cuda12.9"</span>
 <a id="__codelineno-21-4" name="__codelineno-21-4"></a>
 <a id="__codelineno-21-5" name="__codelineno-21-5"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-21-6" name="__codelineno-21-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model.gguf"</span>
 <a id="__codelineno-21-7" name="__codelineno-21-7"></a><span class="n">n_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4096</span>
 <a id="__codelineno-21-8" name="__codelineno-21-8"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">99</span>
-</code></pre></div></td></tr></table></div>
-</div>
-<div class="tabbed-block">
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-22-1">1</a></span>
-<span class="normal"><a href="#__codelineno-22-2">2</a></span>
-<span class="normal"><a href="#__codelineno-22-3">3</a></span>
-<span class="normal"><a href="#__codelineno-22-4">4</a></span>
-<span class="normal"><a href="#__codelineno-22-5">5</a></span>
-<span class="normal"><a href="#__codelineno-22-6">6</a></span>
-<span class="normal"><a href="#__codelineno-22-7">7</a></span>
-<span class="normal"><a href="#__codelineno-22-8">8</a></span>
-<span class="normal"><a href="#__codelineno-22-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-22-1" name="__codelineno-22-1"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-22-2" name="__codelineno-22-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"llama-cpp"</span>
-<a id="__codelineno-22-3" name="__codelineno-22-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-cuda12.9"</span>
-<a id="__codelineno-22-4" name="__codelineno-22-4"></a>
-<a id="__codelineno-22-5" name="__codelineno-22-5"></a><span class="k">[providers.config]</span>
-<a id="__codelineno-22-6" name="__codelineno-22-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model.gguf"</span>
-<a id="__codelineno-22-7" name="__codelineno-22-7"></a><span class="n">n_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4096</span>
-<a id="__codelineno-22-8" name="__codelineno-22-8"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">99</span>
-<a id="__codelineno-22-9" name="__codelineno-22-9"></a><span class="n">flash_attention</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"enabled"</span>
+<a id="__codelineno-21-9" name="__codelineno-21-9"></a><span class="n">flash_attention</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"enabled"</span>
 </code></pre></div></td></tr></table></div>
 </div>
 </div>
@@ -2963,6 +2958,20 @@
 <div class="tabbed-set tabbed-alternate" data-tabs="3:8"><input checked="checked" id="__tabbed_3_1" name="__tabbed_3" type="radio" /><input id="__tabbed_3_2" name="__tabbed_3" type="radio" /><input id="__tabbed_3_3" name="__tabbed_3" type="radio" /><input id="__tabbed_3_4" name="__tabbed_3" type="radio" /><input id="__tabbed_3_5" name="__tabbed_3" type="radio" /><input id="__tabbed_3_6" name="__tabbed_3" type="radio" /><input id="__tabbed_3_7" name="__tabbed_3" type="radio" /><input id="__tabbed_3_8" name="__tabbed_3" type="radio" /><div class="tabbed-labels"><label for="__tabbed_3_1">macOS (Metal)</label><label for="__tabbed_3_2">macOS (Accelerate)</label><label for="__tabbed_3_3">Linux / Windows (CPU)</label><label for="__tabbed_3_4">Linux (CUDA — RTX 30xx / A10 / A40)</label><label for="__tabbed_3_5">Linux (CUDA — RTX 40xx / L4 / L40)</label><label for="__tabbed_3_6">Linux (CUDA — A100)</label><label for="__tabbed_3_7">Linux (CUDA — RTX 50xx / Blackwell)</label><label for="__tabbed_3_8">Linux arm64 (CUDA — Jetson Orin)</label></div>
 <div class="tabbed-content">
 <div class="tabbed-block">
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-22-1">1</a></span>
+<span class="normal"><a href="#__codelineno-22-2">2</a></span>
+<span class="normal"><a href="#__codelineno-22-3">3</a></span>
+<span class="normal"><a href="#__codelineno-22-4">4</a></span>
+<span class="normal"><a href="#__codelineno-22-5">5</a></span>
+<span class="normal"><a href="#__codelineno-22-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-22-1" name="__codelineno-22-1"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-22-2" name="__codelineno-22-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"izwi"</span>
+<a id="__codelineno-22-3" name="__codelineno-22-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-metal"</span>
+<a id="__codelineno-22-4" name="__codelineno-22-4"></a>
+<a id="__codelineno-22-5" name="__codelineno-22-5"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-22-6" name="__codelineno-22-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
+</code></pre></div></td></tr></table></div>
+</div>
+<div class="tabbed-block">
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-23-1">1</a></span>
 <span class="normal"><a href="#__codelineno-23-2">2</a></span>
 <span class="normal"><a href="#__codelineno-23-3">3</a></span>
@@ -2970,7 +2979,7 @@
 <span class="normal"><a href="#__codelineno-23-5">5</a></span>
 <span class="normal"><a href="#__codelineno-23-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-23-1" name="__codelineno-23-1"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-23-2" name="__codelineno-23-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"izwi"</span>
-<a id="__codelineno-23-3" name="__codelineno-23-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-metal"</span>
+<a id="__codelineno-23-3" name="__codelineno-23-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-accelerate"</span>
 <a id="__codelineno-23-4" name="__codelineno-23-4"></a>
 <a id="__codelineno-23-5" name="__codelineno-23-5"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-23-6" name="__codelineno-23-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
@@ -2984,7 +2993,7 @@
 <span class="normal"><a href="#__codelineno-24-5">5</a></span>
 <span class="normal"><a href="#__codelineno-24-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-24-1" name="__codelineno-24-1"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-24-2" name="__codelineno-24-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"izwi"</span>
-<a id="__codelineno-24-3" name="__codelineno-24-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-accelerate"</span>
+<a id="__codelineno-24-3" name="__codelineno-24-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest"</span>
 <a id="__codelineno-24-4" name="__codelineno-24-4"></a>
 <a id="__codelineno-24-5" name="__codelineno-24-5"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-24-6" name="__codelineno-24-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
@@ -2996,12 +3005,14 @@
 <span class="normal"><a href="#__codelineno-25-3">3</a></span>
 <span class="normal"><a href="#__codelineno-25-4">4</a></span>
 <span class="normal"><a href="#__codelineno-25-5">5</a></span>
-<span class="normal"><a href="#__codelineno-25-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-25-1" name="__codelineno-25-1"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-25-2" name="__codelineno-25-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"izwi"</span>
-<a id="__codelineno-25-3" name="__codelineno-25-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest"</span>
-<a id="__codelineno-25-4" name="__codelineno-25-4"></a>
-<a id="__codelineno-25-5" name="__codelineno-25-5"></a><span class="k">[providers.config]</span>
-<a id="__codelineno-25-6" name="__codelineno-25-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
+<span class="normal"><a href="#__codelineno-25-6">6</a></span>
+<span class="normal"><a href="#__codelineno-25-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-25-1" name="__codelineno-25-1"></a><span class="c1"># SM 86: RTX 3060, 3070, 3080, 3090, A10, A40</span>
+<a id="__codelineno-25-2" name="__codelineno-25-2"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-25-3" name="__codelineno-25-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"izwi"</span>
+<a id="__codelineno-25-4" name="__codelineno-25-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm86"</span>
+<a id="__codelineno-25-5" name="__codelineno-25-5"></a>
+<a id="__codelineno-25-6" name="__codelineno-25-6"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-25-7" name="__codelineno-25-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
 </code></pre></div></td></tr></table></div>
 </div>
 <div class="tabbed-block">
@@ -3011,10 +3022,10 @@
 <span class="normal"><a href="#__codelineno-26-4">4</a></span>
 <span class="normal"><a href="#__codelineno-26-5">5</a></span>
 <span class="normal"><a href="#__codelineno-26-6">6</a></span>
-<span class="normal"><a href="#__codelineno-26-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-26-1" name="__codelineno-26-1"></a><span class="c1"># SM 86: RTX 3060, 3070, 3080, 3090, A10, A40</span>
+<span class="normal"><a href="#__codelineno-26-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-26-1" name="__codelineno-26-1"></a><span class="c1"># SM 89: RTX 4060, 4070, 4080, 4090, L4, L40, L40S</span>
 <a id="__codelineno-26-2" name="__codelineno-26-2"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-26-3" name="__codelineno-26-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"izwi"</span>
-<a id="__codelineno-26-4" name="__codelineno-26-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm86"</span>
+<a id="__codelineno-26-4" name="__codelineno-26-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm89"</span>
 <a id="__codelineno-26-5" name="__codelineno-26-5"></a>
 <a id="__codelineno-26-6" name="__codelineno-26-6"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-26-7" name="__codelineno-26-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
@@ -3027,10 +3038,10 @@
 <span class="normal"><a href="#__codelineno-27-4">4</a></span>
 <span class="normal"><a href="#__codelineno-27-5">5</a></span>
 <span class="normal"><a href="#__codelineno-27-6">6</a></span>
-<span class="normal"><a href="#__codelineno-27-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-27-1" name="__codelineno-27-1"></a><span class="c1"># SM 89: RTX 4060, 4070, 4080, 4090, L4, L40, L40S</span>
+<span class="normal"><a href="#__codelineno-27-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-27-1" name="__codelineno-27-1"></a><span class="c1"># SM 80: A30, A100</span>
 <a id="__codelineno-27-2" name="__codelineno-27-2"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-27-3" name="__codelineno-27-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"izwi"</span>
-<a id="__codelineno-27-4" name="__codelineno-27-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm89"</span>
+<a id="__codelineno-27-4" name="__codelineno-27-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm80"</span>
 <a id="__codelineno-27-5" name="__codelineno-27-5"></a>
 <a id="__codelineno-27-6" name="__codelineno-27-6"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-27-7" name="__codelineno-27-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
@@ -3043,10 +3054,10 @@
 <span class="normal"><a href="#__codelineno-28-4">4</a></span>
 <span class="normal"><a href="#__codelineno-28-5">5</a></span>
 <span class="normal"><a href="#__codelineno-28-6">6</a></span>
-<span class="normal"><a href="#__codelineno-28-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-28-1" name="__codelineno-28-1"></a><span class="c1"># SM 80: A30, A100</span>
+<span class="normal"><a href="#__codelineno-28-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-28-1" name="__codelineno-28-1"></a><span class="c1"># SM 120: RTX 5070, 5080, 5090, B100, B200</span>
 <a id="__codelineno-28-2" name="__codelineno-28-2"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-28-3" name="__codelineno-28-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"izwi"</span>
-<a id="__codelineno-28-4" name="__codelineno-28-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm80"</span>
+<a id="__codelineno-28-4" name="__codelineno-28-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm120"</span>
 <a id="__codelineno-28-5" name="__codelineno-28-5"></a>
 <a id="__codelineno-28-6" name="__codelineno-28-6"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-28-7" name="__codelineno-28-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
@@ -3059,29 +3070,13 @@
 <span class="normal"><a href="#__codelineno-29-4">4</a></span>
 <span class="normal"><a href="#__codelineno-29-5">5</a></span>
 <span class="normal"><a href="#__codelineno-29-6">6</a></span>
-<span class="normal"><a href="#__codelineno-29-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-29-1" name="__codelineno-29-1"></a><span class="c1"># SM 120: RTX 5070, 5080, 5090, B100, B200</span>
+<span class="normal"><a href="#__codelineno-29-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-29-1" name="__codelineno-29-1"></a><span class="c1"># SM 87: Jetson AGX Orin, Orin NX, Orin Nano</span>
 <a id="__codelineno-29-2" name="__codelineno-29-2"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-29-3" name="__codelineno-29-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"izwi"</span>
-<a id="__codelineno-29-4" name="__codelineno-29-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm120"</span>
+<a id="__codelineno-29-4" name="__codelineno-29-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm87"</span>
 <a id="__codelineno-29-5" name="__codelineno-29-5"></a>
 <a id="__codelineno-29-6" name="__codelineno-29-6"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-29-7" name="__codelineno-29-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
-</code></pre></div></td></tr></table></div>
-</div>
-<div class="tabbed-block">
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-30-1">1</a></span>
-<span class="normal"><a href="#__codelineno-30-2">2</a></span>
-<span class="normal"><a href="#__codelineno-30-3">3</a></span>
-<span class="normal"><a href="#__codelineno-30-4">4</a></span>
-<span class="normal"><a href="#__codelineno-30-5">5</a></span>
-<span class="normal"><a href="#__codelineno-30-6">6</a></span>
-<span class="normal"><a href="#__codelineno-30-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-30-1" name="__codelineno-30-1"></a><span class="c1"># SM 87: Jetson AGX Orin, Orin NX, Orin Nano</span>
-<a id="__codelineno-30-2" name="__codelineno-30-2"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-30-3" name="__codelineno-30-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"izwi"</span>
-<a id="__codelineno-30-4" name="__codelineno-30-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm87"</span>
-<a id="__codelineno-30-5" name="__codelineno-30-5"></a>
-<a id="__codelineno-30-6" name="__codelineno-30-6"></a><span class="k">[providers.config]</span>
-<a id="__codelineno-30-7" name="__codelineno-30-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
 </code></pre></div></td></tr></table></div>
 </div>
 </div>
@@ -3156,6 +3151,20 @@
 <div class="tabbed-set tabbed-alternate" data-tabs="4:8"><input checked="checked" id="__tabbed_4_1" name="__tabbed_4" type="radio" /><input id="__tabbed_4_2" name="__tabbed_4" type="radio" /><input id="__tabbed_4_3" name="__tabbed_4" type="radio" /><input id="__tabbed_4_4" name="__tabbed_4" type="radio" /><input id="__tabbed_4_5" name="__tabbed_4" type="radio" /><input id="__tabbed_4_6" name="__tabbed_4" type="radio" /><input id="__tabbed_4_7" name="__tabbed_4" type="radio" /><input id="__tabbed_4_8" name="__tabbed_4" type="radio" /><div class="tabbed-labels"><label for="__tabbed_4_1">macOS (Metal)</label><label for="__tabbed_4_2">macOS (Accelerate)</label><label for="__tabbed_4_3">Linux / Windows (CPU)</label><label for="__tabbed_4_4">Linux (CUDA — RTX 30xx / A10 / A40)</label><label for="__tabbed_4_5">Linux (CUDA — RTX 40xx / L4 / L40)</label><label for="__tabbed_4_6">Linux (CUDA — A100)</label><label for="__tabbed_4_7">Linux (CUDA — RTX 50xx / Blackwell)</label><label for="__tabbed_4_8">Linux arm64 (CUDA — Jetson Orin)</label></div>
 <div class="tabbed-content">
 <div class="tabbed-block">
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-30-1">1</a></span>
+<span class="normal"><a href="#__codelineno-30-2">2</a></span>
+<span class="normal"><a href="#__codelineno-30-3">3</a></span>
+<span class="normal"><a href="#__codelineno-30-4">4</a></span>
+<span class="normal"><a href="#__codelineno-30-5">5</a></span>
+<span class="normal"><a href="#__codelineno-30-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-30-1" name="__codelineno-30-1"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-30-2" name="__codelineno-30-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
+<a id="__codelineno-30-3" name="__codelineno-30-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-metal"</span>
+<a id="__codelineno-30-4" name="__codelineno-30-4"></a>
+<a id="__codelineno-30-5" name="__codelineno-30-5"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-30-6" name="__codelineno-30-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
+</code></pre></div></td></tr></table></div>
+</div>
+<div class="tabbed-block">
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-31-1">1</a></span>
 <span class="normal"><a href="#__codelineno-31-2">2</a></span>
 <span class="normal"><a href="#__codelineno-31-3">3</a></span>
@@ -3163,7 +3172,7 @@
 <span class="normal"><a href="#__codelineno-31-5">5</a></span>
 <span class="normal"><a href="#__codelineno-31-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-31-1" name="__codelineno-31-1"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-31-2" name="__codelineno-31-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
-<a id="__codelineno-31-3" name="__codelineno-31-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-metal"</span>
+<a id="__codelineno-31-3" name="__codelineno-31-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-accelerate"</span>
 <a id="__codelineno-31-4" name="__codelineno-31-4"></a>
 <a id="__codelineno-31-5" name="__codelineno-31-5"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-31-6" name="__codelineno-31-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
@@ -3177,7 +3186,7 @@
 <span class="normal"><a href="#__codelineno-32-5">5</a></span>
 <span class="normal"><a href="#__codelineno-32-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-32-1" name="__codelineno-32-1"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-32-2" name="__codelineno-32-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
-<a id="__codelineno-32-3" name="__codelineno-32-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-accelerate"</span>
+<a id="__codelineno-32-3" name="__codelineno-32-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest"</span>
 <a id="__codelineno-32-4" name="__codelineno-32-4"></a>
 <a id="__codelineno-32-5" name="__codelineno-32-5"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-32-6" name="__codelineno-32-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
@@ -3189,12 +3198,14 @@
 <span class="normal"><a href="#__codelineno-33-3">3</a></span>
 <span class="normal"><a href="#__codelineno-33-4">4</a></span>
 <span class="normal"><a href="#__codelineno-33-5">5</a></span>
-<span class="normal"><a href="#__codelineno-33-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-33-1" name="__codelineno-33-1"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-33-2" name="__codelineno-33-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
-<a id="__codelineno-33-3" name="__codelineno-33-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest"</span>
-<a id="__codelineno-33-4" name="__codelineno-33-4"></a>
-<a id="__codelineno-33-5" name="__codelineno-33-5"></a><span class="k">[providers.config]</span>
-<a id="__codelineno-33-6" name="__codelineno-33-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
+<span class="normal"><a href="#__codelineno-33-6">6</a></span>
+<span class="normal"><a href="#__codelineno-33-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-33-1" name="__codelineno-33-1"></a><span class="c1"># SM 86: RTX 3060, 3070, 3080, 3090, A10, A40</span>
+<a id="__codelineno-33-2" name="__codelineno-33-2"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-33-3" name="__codelineno-33-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
+<a id="__codelineno-33-4" name="__codelineno-33-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm86"</span>
+<a id="__codelineno-33-5" name="__codelineno-33-5"></a>
+<a id="__codelineno-33-6" name="__codelineno-33-6"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-33-7" name="__codelineno-33-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
 </code></pre></div></td></tr></table></div>
 </div>
 <div class="tabbed-block">
@@ -3204,10 +3215,10 @@
 <span class="normal"><a href="#__codelineno-34-4">4</a></span>
 <span class="normal"><a href="#__codelineno-34-5">5</a></span>
 <span class="normal"><a href="#__codelineno-34-6">6</a></span>
-<span class="normal"><a href="#__codelineno-34-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-34-1" name="__codelineno-34-1"></a><span class="c1"># SM 86: RTX 3060, 3070, 3080, 3090, A10, A40</span>
+<span class="normal"><a href="#__codelineno-34-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-34-1" name="__codelineno-34-1"></a><span class="c1"># SM 89: RTX 4060, 4070, 4080, 4090, L4, L40, L40S</span>
 <a id="__codelineno-34-2" name="__codelineno-34-2"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-34-3" name="__codelineno-34-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
-<a id="__codelineno-34-4" name="__codelineno-34-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm86"</span>
+<a id="__codelineno-34-4" name="__codelineno-34-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm89"</span>
 <a id="__codelineno-34-5" name="__codelineno-34-5"></a>
 <a id="__codelineno-34-6" name="__codelineno-34-6"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-34-7" name="__codelineno-34-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
@@ -3220,10 +3231,10 @@
 <span class="normal"><a href="#__codelineno-35-4">4</a></span>
 <span class="normal"><a href="#__codelineno-35-5">5</a></span>
 <span class="normal"><a href="#__codelineno-35-6">6</a></span>
-<span class="normal"><a href="#__codelineno-35-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-35-1" name="__codelineno-35-1"></a><span class="c1"># SM 89: RTX 4060, 4070, 4080, 4090, L4, L40, L40S</span>
+<span class="normal"><a href="#__codelineno-35-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-35-1" name="__codelineno-35-1"></a><span class="c1"># SM 80: A30, A100</span>
 <a id="__codelineno-35-2" name="__codelineno-35-2"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-35-3" name="__codelineno-35-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
-<a id="__codelineno-35-4" name="__codelineno-35-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm89"</span>
+<a id="__codelineno-35-4" name="__codelineno-35-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm80"</span>
 <a id="__codelineno-35-5" name="__codelineno-35-5"></a>
 <a id="__codelineno-35-6" name="__codelineno-35-6"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-35-7" name="__codelineno-35-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
@@ -3236,10 +3247,10 @@
 <span class="normal"><a href="#__codelineno-36-4">4</a></span>
 <span class="normal"><a href="#__codelineno-36-5">5</a></span>
 <span class="normal"><a href="#__codelineno-36-6">6</a></span>
-<span class="normal"><a href="#__codelineno-36-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-36-1" name="__codelineno-36-1"></a><span class="c1"># SM 80: A30, A100</span>
+<span class="normal"><a href="#__codelineno-36-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-36-1" name="__codelineno-36-1"></a><span class="c1"># SM 120: RTX 5070, 5080, 5090, B100, B200</span>
 <a id="__codelineno-36-2" name="__codelineno-36-2"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-36-3" name="__codelineno-36-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
-<a id="__codelineno-36-4" name="__codelineno-36-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm80"</span>
+<a id="__codelineno-36-4" name="__codelineno-36-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm120"</span>
 <a id="__codelineno-36-5" name="__codelineno-36-5"></a>
 <a id="__codelineno-36-6" name="__codelineno-36-6"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-36-7" name="__codelineno-36-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
@@ -3252,31 +3263,15 @@
 <span class="normal"><a href="#__codelineno-37-4">4</a></span>
 <span class="normal"><a href="#__codelineno-37-5">5</a></span>
 <span class="normal"><a href="#__codelineno-37-6">6</a></span>
-<span class="normal"><a href="#__codelineno-37-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-37-1" name="__codelineno-37-1"></a><span class="c1"># SM 120: RTX 5070, 5080, 5090, B100, B200</span>
-<a id="__codelineno-37-2" name="__codelineno-37-2"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-37-3" name="__codelineno-37-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
-<a id="__codelineno-37-4" name="__codelineno-37-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm120"</span>
-<a id="__codelineno-37-5" name="__codelineno-37-5"></a>
-<a id="__codelineno-37-6" name="__codelineno-37-6"></a><span class="k">[providers.config]</span>
-<a id="__codelineno-37-7" name="__codelineno-37-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
-</code></pre></div></td></tr></table></div>
-</div>
-<div class="tabbed-block">
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-38-1">1</a></span>
-<span class="normal"><a href="#__codelineno-38-2">2</a></span>
-<span class="normal"><a href="#__codelineno-38-3">3</a></span>
-<span class="normal"><a href="#__codelineno-38-4">4</a></span>
-<span class="normal"><a href="#__codelineno-38-5">5</a></span>
-<span class="normal"><a href="#__codelineno-38-6">6</a></span>
-<span class="normal"><a href="#__codelineno-38-7">7</a></span>
-<span class="normal"><a href="#__codelineno-38-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-38-1" name="__codelineno-38-1"></a><span class="c1"># SM 87: Jetson AGX Orin, Orin NX, Orin Nano</span>
-<a id="__codelineno-38-2" name="__codelineno-38-2"></a><span class="c1"># Note: cuDNN included; Flash Attention not available on aarch64</span>
-<a id="__codelineno-38-3" name="__codelineno-38-3"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-38-4" name="__codelineno-38-4"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
-<a id="__codelineno-38-5" name="__codelineno-38-5"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm87"</span>
-<a id="__codelineno-38-6" name="__codelineno-38-6"></a>
-<a id="__codelineno-38-7" name="__codelineno-38-7"></a><span class="k">[providers.config]</span>
-<a id="__codelineno-38-8" name="__codelineno-38-8"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
+<span class="normal"><a href="#__codelineno-37-7">7</a></span>
+<span class="normal"><a href="#__codelineno-37-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-37-1" name="__codelineno-37-1"></a><span class="c1"># SM 87: Jetson AGX Orin, Orin NX, Orin Nano</span>
+<a id="__codelineno-37-2" name="__codelineno-37-2"></a><span class="c1"># Note: cuDNN included; Flash Attention not available on aarch64</span>
+<a id="__codelineno-37-3" name="__codelineno-37-3"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-37-4" name="__codelineno-37-4"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
+<a id="__codelineno-37-5" name="__codelineno-37-5"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm87"</span>
+<a id="__codelineno-37-6" name="__codelineno-37-6"></a>
+<a id="__codelineno-37-7" name="__codelineno-37-7"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-37-8" name="__codelineno-37-8"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
 </code></pre></div></td></tr></table></div>
 </div>
 </div>
@@ -3286,6 +3281,29 @@
 <p>Drop one of these into <code>~/.qmt/providers.toml</code> and adjust paths as needed.</p>
 <h3 id="cloud-apis-only">Cloud APIs only</h3>
 <p>No config needed — <code>repo.query.mt</code> handles this automatically on first run. If you want explicit control:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-38-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-38-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-38-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-38-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-38-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-38-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-38-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-38-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-38-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-38-10">10</a></span>
+<span class="normal"><a href="#__codelineno-38-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-38-1" name="__codelineno-38-1"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-38-2" name="__codelineno-38-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"openai"</span>
+<a id="__codelineno-38-3" name="__codelineno-38-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/openai:latest"</span>
+<a id="__codelineno-38-4" name="__codelineno-38-4"></a>
+<a id="__codelineno-38-5" name="__codelineno-38-5"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-38-6" name="__codelineno-38-6"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-38-7" name="__codelineno-38-7"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/anthropic:latest"</span>
+<a id="__codelineno-38-8" name="__codelineno-38-8"></a>
+<a id="__codelineno-38-9" name="__codelineno-38-9"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-38-10" name="__codelineno-38-10"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"google"</span>
+<a id="__codelineno-38-11" name="__codelineno-38-11"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/google:latest"</span>
+</code></pre></div></td></tr></table></div>
+<h3 id="cloud-local-llama-cpp-on-macos-apple-silicon">Cloud + local llama-cpp on macOS Apple Silicon</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-39-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-39-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-39-3"> 3</a></span>
@@ -3296,7 +3314,13 @@
 <span class="normal"><a href="#__codelineno-39-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-39-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-39-10">10</a></span>
-<span class="normal"><a href="#__codelineno-39-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-39-1" name="__codelineno-39-1"></a><span class="k">[[providers]]</span>
+<span class="normal"><a href="#__codelineno-39-11">11</a></span>
+<span class="normal"><a href="#__codelineno-39-12">12</a></span>
+<span class="normal"><a href="#__codelineno-39-13">13</a></span>
+<span class="normal"><a href="#__codelineno-39-14">14</a></span>
+<span class="normal"><a href="#__codelineno-39-15">15</a></span>
+<span class="normal"><a href="#__codelineno-39-16">16</a></span>
+<span class="normal"><a href="#__codelineno-39-17">17</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-39-1" name="__codelineno-39-1"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-39-2" name="__codelineno-39-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"openai"</span>
 <a id="__codelineno-39-3" name="__codelineno-39-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/openai:latest"</span>
 <a id="__codelineno-39-4" name="__codelineno-39-4"></a>
@@ -3305,10 +3329,16 @@
 <a id="__codelineno-39-7" name="__codelineno-39-7"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/anthropic:latest"</span>
 <a id="__codelineno-39-8" name="__codelineno-39-8"></a>
 <a id="__codelineno-39-9" name="__codelineno-39-9"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-39-10" name="__codelineno-39-10"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"google"</span>
-<a id="__codelineno-39-11" name="__codelineno-39-11"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/google:latest"</span>
+<a id="__codelineno-39-10" name="__codelineno-39-10"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"llama-cpp"</span>
+<a id="__codelineno-39-11" name="__codelineno-39-11"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-metal"</span>
+<a id="__codelineno-39-12" name="__codelineno-39-12"></a>
+<a id="__codelineno-39-13" name="__codelineno-39-13"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-39-14" name="__codelineno-39-14"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model.gguf"</span>
+<a id="__codelineno-39-15" name="__codelineno-39-15"></a><span class="n">n_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8192</span>
+<a id="__codelineno-39-16" name="__codelineno-39-16"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">99</span>
+<a id="__codelineno-39-17" name="__codelineno-39-17"></a><span class="n">flash_attention</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"auto"</span>
 </code></pre></div></td></tr></table></div>
-<h3 id="cloud-local-llama-cpp-on-macos-apple-silicon">Cloud + local llama-cpp on macOS Apple Silicon</h3>
+<h3 id="fully-local-on-linux-with-nvidia-rtx-40-series">Fully local on Linux with NVIDIA RTX 40-series</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-40-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-40-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-40-3"> 3</a></span>
@@ -3325,25 +3355,43 @@
 <span class="normal"><a href="#__codelineno-40-14">14</a></span>
 <span class="normal"><a href="#__codelineno-40-15">15</a></span>
 <span class="normal"><a href="#__codelineno-40-16">16</a></span>
-<span class="normal"><a href="#__codelineno-40-17">17</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-40-1" name="__codelineno-40-1"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-40-2" name="__codelineno-40-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"openai"</span>
-<a id="__codelineno-40-3" name="__codelineno-40-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/openai:latest"</span>
-<a id="__codelineno-40-4" name="__codelineno-40-4"></a>
-<a id="__codelineno-40-5" name="__codelineno-40-5"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-40-6" name="__codelineno-40-6"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
-<a id="__codelineno-40-7" name="__codelineno-40-7"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/anthropic:latest"</span>
-<a id="__codelineno-40-8" name="__codelineno-40-8"></a>
-<a id="__codelineno-40-9" name="__codelineno-40-9"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-40-10" name="__codelineno-40-10"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"llama-cpp"</span>
-<a id="__codelineno-40-11" name="__codelineno-40-11"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-metal"</span>
-<a id="__codelineno-40-12" name="__codelineno-40-12"></a>
-<a id="__codelineno-40-13" name="__codelineno-40-13"></a><span class="k">[providers.config]</span>
-<a id="__codelineno-40-14" name="__codelineno-40-14"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model.gguf"</span>
-<a id="__codelineno-40-15" name="__codelineno-40-15"></a><span class="n">n_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8192</span>
-<a id="__codelineno-40-16" name="__codelineno-40-16"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">99</span>
-<a id="__codelineno-40-17" name="__codelineno-40-17"></a><span class="n">flash_attention</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"auto"</span>
+<span class="normal"><a href="#__codelineno-40-17">17</a></span>
+<span class="normal"><a href="#__codelineno-40-18">18</a></span>
+<span class="normal"><a href="#__codelineno-40-19">19</a></span>
+<span class="normal"><a href="#__codelineno-40-20">20</a></span>
+<span class="normal"><a href="#__codelineno-40-21">21</a></span>
+<span class="normal"><a href="#__codelineno-40-22">22</a></span>
+<span class="normal"><a href="#__codelineno-40-23">23</a></span>
+<span class="normal"><a href="#__codelineno-40-24">24</a></span>
+<span class="normal"><a href="#__codelineno-40-25">25</a></span>
+<span class="normal"><a href="#__codelineno-40-26">26</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-40-1" name="__codelineno-40-1"></a><span class="c1"># llama-cpp: single CUDA build, all SM supported at runtime</span>
+<a id="__codelineno-40-2" name="__codelineno-40-2"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-40-3" name="__codelineno-40-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"llama-cpp"</span>
+<a id="__codelineno-40-4" name="__codelineno-40-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-cuda12.9"</span>
+<a id="__codelineno-40-5" name="__codelineno-40-5"></a>
+<a id="__codelineno-40-6" name="__codelineno-40-6"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-40-7" name="__codelineno-40-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model.gguf"</span>
+<a id="__codelineno-40-8" name="__codelineno-40-8"></a><span class="n">n_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8192</span>
+<a id="__codelineno-40-9" name="__codelineno-40-9"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">99</span>
+<a id="__codelineno-40-10" name="__codelineno-40-10"></a><span class="n">flash_attention</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"enabled"</span>
+<a id="__codelineno-40-11" name="__codelineno-40-11"></a>
+<a id="__codelineno-40-12" name="__codelineno-40-12"></a><span class="c1"># izwi: SM 89 for RTX 4060/4070/4080/4090</span>
+<a id="__codelineno-40-13" name="__codelineno-40-13"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-40-14" name="__codelineno-40-14"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"izwi"</span>
+<a id="__codelineno-40-15" name="__codelineno-40-15"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm89"</span>
+<a id="__codelineno-40-16" name="__codelineno-40-16"></a>
+<a id="__codelineno-40-17" name="__codelineno-40-17"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-40-18" name="__codelineno-40-18"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
+<a id="__codelineno-40-19" name="__codelineno-40-19"></a>
+<a id="__codelineno-40-20" name="__codelineno-40-20"></a><span class="c1"># mrs: SM 89 for RTX 4060/4070/4080/4090</span>
+<a id="__codelineno-40-21" name="__codelineno-40-21"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-40-22" name="__codelineno-40-22"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
+<a id="__codelineno-40-23" name="__codelineno-40-23"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm89"</span>
+<a id="__codelineno-40-24" name="__codelineno-40-24"></a>
+<a id="__codelineno-40-25" name="__codelineno-40-25"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-40-26" name="__codelineno-40-26"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
 </code></pre></div></td></tr></table></div>
-<h3 id="fully-local-on-linux-with-nvidia-rtx-40-series">Fully local on Linux with NVIDIA RTX 40-series</h3>
+<h3 id="fully-local-on-macos-apple-silicon">Fully local on macOS Apple Silicon</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-41-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-41-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-41-3"> 3</a></span>
@@ -3365,38 +3413,30 @@
 <span class="normal"><a href="#__codelineno-41-19">19</a></span>
 <span class="normal"><a href="#__codelineno-41-20">20</a></span>
 <span class="normal"><a href="#__codelineno-41-21">21</a></span>
-<span class="normal"><a href="#__codelineno-41-22">22</a></span>
-<span class="normal"><a href="#__codelineno-41-23">23</a></span>
-<span class="normal"><a href="#__codelineno-41-24">24</a></span>
-<span class="normal"><a href="#__codelineno-41-25">25</a></span>
-<span class="normal"><a href="#__codelineno-41-26">26</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-41-1" name="__codelineno-41-1"></a><span class="c1"># llama-cpp: single CUDA build, all SM supported at runtime</span>
-<a id="__codelineno-41-2" name="__codelineno-41-2"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-41-3" name="__codelineno-41-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"llama-cpp"</span>
-<a id="__codelineno-41-4" name="__codelineno-41-4"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-cuda12.9"</span>
-<a id="__codelineno-41-5" name="__codelineno-41-5"></a>
-<a id="__codelineno-41-6" name="__codelineno-41-6"></a><span class="k">[providers.config]</span>
-<a id="__codelineno-41-7" name="__codelineno-41-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model.gguf"</span>
-<a id="__codelineno-41-8" name="__codelineno-41-8"></a><span class="n">n_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8192</span>
-<a id="__codelineno-41-9" name="__codelineno-41-9"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">99</span>
-<a id="__codelineno-41-10" name="__codelineno-41-10"></a><span class="n">flash_attention</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"enabled"</span>
-<a id="__codelineno-41-11" name="__codelineno-41-11"></a>
-<a id="__codelineno-41-12" name="__codelineno-41-12"></a><span class="c1"># izwi: SM 89 for RTX 4060/4070/4080/4090</span>
-<a id="__codelineno-41-13" name="__codelineno-41-13"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-41-14" name="__codelineno-41-14"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"izwi"</span>
-<a id="__codelineno-41-15" name="__codelineno-41-15"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-cuda12.9-sm89"</span>
+<span class="normal"><a href="#__codelineno-41-22">22</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-41-1" name="__codelineno-41-1"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-41-2" name="__codelineno-41-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"llama-cpp"</span>
+<a id="__codelineno-41-3" name="__codelineno-41-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-metal"</span>
+<a id="__codelineno-41-4" name="__codelineno-41-4"></a>
+<a id="__codelineno-41-5" name="__codelineno-41-5"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-41-6" name="__codelineno-41-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model.gguf"</span>
+<a id="__codelineno-41-7" name="__codelineno-41-7"></a><span class="n">n_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8192</span>
+<a id="__codelineno-41-8" name="__codelineno-41-8"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">99</span>
+<a id="__codelineno-41-9" name="__codelineno-41-9"></a>
+<a id="__codelineno-41-10" name="__codelineno-41-10"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-41-11" name="__codelineno-41-11"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"izwi"</span>
+<a id="__codelineno-41-12" name="__codelineno-41-12"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-metal"</span>
+<a id="__codelineno-41-13" name="__codelineno-41-13"></a>
+<a id="__codelineno-41-14" name="__codelineno-41-14"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-41-15" name="__codelineno-41-15"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
 <a id="__codelineno-41-16" name="__codelineno-41-16"></a>
-<a id="__codelineno-41-17" name="__codelineno-41-17"></a><span class="k">[providers.config]</span>
-<a id="__codelineno-41-18" name="__codelineno-41-18"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
-<a id="__codelineno-41-19" name="__codelineno-41-19"></a>
-<a id="__codelineno-41-20" name="__codelineno-41-20"></a><span class="c1"># mrs: SM 89 for RTX 4060/4070/4080/4090</span>
-<a id="__codelineno-41-21" name="__codelineno-41-21"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-41-22" name="__codelineno-41-22"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
-<a id="__codelineno-41-23" name="__codelineno-41-23"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-cuda12.9-sm89"</span>
-<a id="__codelineno-41-24" name="__codelineno-41-24"></a>
-<a id="__codelineno-41-25" name="__codelineno-41-25"></a><span class="k">[providers.config]</span>
-<a id="__codelineno-41-26" name="__codelineno-41-26"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
+<a id="__codelineno-41-17" name="__codelineno-41-17"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-41-18" name="__codelineno-41-18"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
+<a id="__codelineno-41-19" name="__codelineno-41-19"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-metal"</span>
+<a id="__codelineno-41-20" name="__codelineno-41-20"></a>
+<a id="__codelineno-41-21" name="__codelineno-41-21"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-41-22" name="__codelineno-41-22"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
 </code></pre></div></td></tr></table></div>
-<h3 id="fully-local-on-macos-apple-silicon">Fully local on macOS Apple Silicon</h3>
+<h3 id="fully-local-on-linux-cpu-only">Fully local on Linux (CPU only)</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-42-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-42-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-42-3"> 3</a></span>
@@ -3411,66 +3451,21 @@
 <span class="normal"><a href="#__codelineno-42-12">12</a></span>
 <span class="normal"><a href="#__codelineno-42-13">13</a></span>
 <span class="normal"><a href="#__codelineno-42-14">14</a></span>
-<span class="normal"><a href="#__codelineno-42-15">15</a></span>
-<span class="normal"><a href="#__codelineno-42-16">16</a></span>
-<span class="normal"><a href="#__codelineno-42-17">17</a></span>
-<span class="normal"><a href="#__codelineno-42-18">18</a></span>
-<span class="normal"><a href="#__codelineno-42-19">19</a></span>
-<span class="normal"><a href="#__codelineno-42-20">20</a></span>
-<span class="normal"><a href="#__codelineno-42-21">21</a></span>
-<span class="normal"><a href="#__codelineno-42-22">22</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-42-1" name="__codelineno-42-1"></a><span class="k">[[providers]]</span>
+<span class="normal"><a href="#__codelineno-42-15">15</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-42-1" name="__codelineno-42-1"></a><span class="k">[[providers]]</span>
 <a id="__codelineno-42-2" name="__codelineno-42-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"llama-cpp"</span>
-<a id="__codelineno-42-3" name="__codelineno-42-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest-metal"</span>
+<a id="__codelineno-42-3" name="__codelineno-42-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest"</span>
 <a id="__codelineno-42-4" name="__codelineno-42-4"></a>
 <a id="__codelineno-42-5" name="__codelineno-42-5"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-42-6" name="__codelineno-42-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model.gguf"</span>
-<a id="__codelineno-42-7" name="__codelineno-42-7"></a><span class="n">n_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8192</span>
-<a id="__codelineno-42-8" name="__codelineno-42-8"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">99</span>
+<a id="__codelineno-42-7" name="__codelineno-42-7"></a><span class="n">n_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4096</span>
+<a id="__codelineno-42-8" name="__codelineno-42-8"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span>
 <a id="__codelineno-42-9" name="__codelineno-42-9"></a>
 <a id="__codelineno-42-10" name="__codelineno-42-10"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-42-11" name="__codelineno-42-11"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"izwi"</span>
-<a id="__codelineno-42-12" name="__codelineno-42-12"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/izwi:latest-metal"</span>
+<a id="__codelineno-42-11" name="__codelineno-42-11"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
+<a id="__codelineno-42-12" name="__codelineno-42-12"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest"</span>
 <a id="__codelineno-42-13" name="__codelineno-42-13"></a>
 <a id="__codelineno-42-14" name="__codelineno-42-14"></a><span class="k">[providers.config]</span>
 <a id="__codelineno-42-15" name="__codelineno-42-15"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
-<a id="__codelineno-42-16" name="__codelineno-42-16"></a>
-<a id="__codelineno-42-17" name="__codelineno-42-17"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-42-18" name="__codelineno-42-18"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
-<a id="__codelineno-42-19" name="__codelineno-42-19"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest-metal"</span>
-<a id="__codelineno-42-20" name="__codelineno-42-20"></a>
-<a id="__codelineno-42-21" name="__codelineno-42-21"></a><span class="k">[providers.config]</span>
-<a id="__codelineno-42-22" name="__codelineno-42-22"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
-</code></pre></div></td></tr></table></div>
-<h3 id="fully-local-on-linux-cpu-only">Fully local on Linux (CPU only)</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-43-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-43-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-43-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-43-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-43-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-43-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-43-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-43-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-43-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-43-10">10</a></span>
-<span class="normal"><a href="#__codelineno-43-11">11</a></span>
-<span class="normal"><a href="#__codelineno-43-12">12</a></span>
-<span class="normal"><a href="#__codelineno-43-13">13</a></span>
-<span class="normal"><a href="#__codelineno-43-14">14</a></span>
-<span class="normal"><a href="#__codelineno-43-15">15</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-43-1" name="__codelineno-43-1"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-43-2" name="__codelineno-43-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"llama-cpp"</span>
-<a id="__codelineno-43-3" name="__codelineno-43-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/llama-cpp:latest"</span>
-<a id="__codelineno-43-4" name="__codelineno-43-4"></a>
-<a id="__codelineno-43-5" name="__codelineno-43-5"></a><span class="k">[providers.config]</span>
-<a id="__codelineno-43-6" name="__codelineno-43-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model.gguf"</span>
-<a id="__codelineno-43-7" name="__codelineno-43-7"></a><span class="n">n_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4096</span>
-<a id="__codelineno-43-8" name="__codelineno-43-8"></a><span class="n">n_gpu_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span>
-<a id="__codelineno-43-9" name="__codelineno-43-9"></a>
-<a id="__codelineno-43-10" name="__codelineno-43-10"></a><span class="k">[[providers]]</span>
-<a id="__codelineno-43-11" name="__codelineno-43-11"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mrs"</span>
-<a id="__codelineno-43-12" name="__codelineno-43-12"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"oci://ghcr.io/querymt/mrs:latest"</span>
-<a id="__codelineno-43-13" name="__codelineno-43-13"></a>
-<a id="__codelineno-43-14" name="__codelineno-43-14"></a><span class="k">[providers.config]</span>
-<a id="__codelineno-43-15" name="__codelineno-43-15"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/model"</span>
 </code></pre></div></td></tr></table></div>
 <hr />
 <h2 id="further-reading">Further reading</h2>
