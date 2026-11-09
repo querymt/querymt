@@ -138,6 +138,27 @@ pub(super) async fn run_pruning(
     Ok(())
 }
 
+/// Hook trigger for compaction started by the context-threshold middleware.
+const TRIGGER_CONTEXT_THRESHOLD: &str = "context_threshold";
+/// Hook trigger for compaction requested by the user (`/compact`).
+pub(crate) const TRIGGER_MANUAL: &str = "manual";
+
+/// How a compaction attempt ended without an error.
+pub(crate) enum CompactionOutcome {
+    /// A summary boundary was stored. Carries the new effective history and
+    /// its estimated token count.
+    Completed {
+        messages: Vec<crate::model::AgentMessage>,
+        context_tokens: usize,
+    },
+    /// A pre-compaction hook blocked the compaction.
+    Blocked { message: String },
+    /// The cycle budget refused the paid compaction request.
+    PriceLimit { message: String },
+    /// The session has no history to compact.
+    NothingToCompact,
+}
+
 /// Run AI-powered compaction on the conversation history.
 ///
 /// This generates a summary of old messages and injects it into the conversation,
@@ -148,12 +169,99 @@ pub(super) async fn run_ai_compaction(
     exec_ctx: &mut ExecutionContext,
     current_state: &ExecutionState,
 ) -> Result<ExecutionState, anyhow::Error> {
+    let outcome = compact_history(config, exec_ctx, TRIGGER_CONTEXT_THRESHOLD, None).await?;
+    let (filtered_messages, new_context_tokens) = match outcome {
+        CompactionOutcome::Completed {
+            messages,
+            context_tokens,
+        } => (messages, context_tokens),
+        CompactionOutcome::Blocked { message } => {
+            return Ok(ExecutionState::Stopped {
+                message: message.into(),
+                stop_type: StopType::ContextThreshold,
+                context: current_state.context().cloned(),
+            });
+        }
+        CompactionOutcome::PriceLimit { message } => {
+            return Ok(ExecutionState::Stopped {
+                message: message.into(),
+                stop_type: StopType::PriceLimit,
+                context: current_state.context().cloned(),
+            });
+        }
+        CompactionOutcome::NothingToCompact => {
+            return Err(anyhow::anyhow!("No history available for compaction"));
+        }
+    };
+    let prompt_limit = exec_ctx
+        .execution_config()
+        .and_then(|cfg| cfg.max_prompt_bytes);
+
+    // Convert AgentMessages to ChatMessages for the ConversationContext
+    let chat_messages: Vec<querymt::chat::ChatMessage> = filtered_messages
+        .iter()
+        .map(|message| message.to_chat_message_with_max_prompt_bytes(prompt_limit))
+        .collect::<Result<_, _>>()
+        .map_err(|error| anyhow::anyhow!("Invalid prompt content after compaction: {error}"))?;
+
+    debug!(
+        "Post-compaction context tokens updated: {} -> {} (filtered {} messages)",
+        current_state
+            .context()
+            .map(|c| c.stats.context_tokens)
+            .unwrap_or(0),
+        new_context_tokens,
+        filtered_messages.len()
+    );
+
+    let new_context = if let Some(ctx) = current_state.context() {
+        let mut new_stats = crate::middleware::AgentStats::clone(&ctx.stats);
+        new_stats.context_tokens = new_context_tokens;
+
+        Arc::new(
+            crate::middleware::ConversationContext::new(
+                ctx.session_id.clone(),
+                Arc::from(chat_messages.into_boxed_slice()),
+                Arc::new(new_stats),
+                ctx.provider.clone(),
+                ctx.model.clone(),
+            )
+            .with_session_mode(ctx.session_mode)
+            .with_profile(ctx.profile.clone()),
+        )
+    } else {
+        return Err(anyhow::anyhow!("No context available for compaction"));
+    };
+
+    exec_ctx.compaction_summaries =
+        genai::compaction_summaries(&filtered_messages, &new_context.messages);
+    Ok(ExecutionState::BeforeLlmCall {
+        context: new_context,
+    })
+}
+
+/// Summarize the effective history and store the summary boundary.
+///
+/// Shared by automatic (context threshold) and manual (`/compact`)
+/// compaction. Emits the full compaction event lifecycle, runs the
+/// pre/post-compaction hooks with `trigger`, and records the paid request
+/// against the initiating cycle. `instructions` are optional user focus
+/// instructions added to the summary prompt.
+pub(crate) async fn compact_history(
+    config: &AgentConfig,
+    exec_ctx: &mut ExecutionContext,
+    trigger: &str,
+    instructions: Option<&str>,
+) -> Result<CompactionOutcome, anyhow::Error> {
     let session_id = &exec_ctx.session_id;
     let messages = exec_ctx
         .session_handle
         .get_effective_agent_history()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get agent history: {}", e))?;
+    if messages.is_empty() {
+        return Ok(CompactionOutcome::NothingToCompact);
+    }
 
     let prompt_limit = exec_ctx
         .execution_config()
@@ -199,7 +307,7 @@ pub(super) async fn run_ai_compaction(
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: model_name.clone(),
             permission_mode: exec_ctx.permission_mode().to_string(),
-            trigger: "context_threshold".to_string(),
+            trigger: trigger.to_string(),
             token_estimate: token_estimate_u32,
             message_count,
             messages: messages
@@ -229,11 +337,7 @@ pub(super) async fn run_ai_compaction(
                 pre_hook.additional_contexts.join("\n\n")
             );
         }
-        return Ok(ExecutionState::Stopped {
-            message: reason.into(),
-            stop_type: StopType::ContextThreshold,
-            context: current_state.context().cloned(),
-        });
+        return Ok(CompactionOutcome::Blocked { message: reason });
     }
 
     // The compaction identity is fixed before the start event so every
@@ -296,7 +400,7 @@ pub(super) async fn run_ai_compaction(
         };
         match config
             .compaction
-            .process(
+            .process_with_instructions(
                 &messages,
                 llm_provider,
                 model,
@@ -305,6 +409,7 @@ pub(super) async fn run_ai_compaction(
                     .execution_config()
                     .and_then(|cfg| cfg.max_prompt_bytes),
                 &ledger,
+                instructions,
             )
             .await
         {
@@ -319,10 +424,8 @@ pub(super) async fn run_ai_compaction(
                         "compaction not dispatched: price limit reached: ${spent:.4} >= ${cap:.2}"
                     );
                     emit_compaction_failure(config, session_id, &compaction_id, &reason).await;
-                    return Ok(ExecutionState::Stopped {
-                        message: format!("Price limit reached: ${spent:.4} >= ${cap:.2}").into(),
-                        stop_type: StopType::PriceLimit,
-                        context: current_state.context().cloned(),
+                    return Ok(CompactionOutcome::PriceLimit {
+                        message: format!("Price limit reached: ${spent:.4} >= ${cap:.2}"),
                     });
                 }
                 let error = anyhow::anyhow!("Compaction failed: {}", error);
@@ -347,7 +450,7 @@ pub(super) async fn run_ai_compaction(
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: model_name,
             permission_mode: exec_ctx.permission_mode().to_string(),
-            trigger: "context_threshold".to_string(),
+            trigger: trigger.to_string(),
             summary: result.summary.clone(),
             original_token_count: u32_from_usize(
                 result.original_token_count,
@@ -458,46 +561,9 @@ pub(super) async fn run_ai_compaction(
     )
     .await;
 
-    // Convert AgentMessages to ChatMessages for the ConversationContext
-    let chat_messages: Vec<querymt::chat::ChatMessage> = filtered_messages
-        .iter()
-        .map(|message| message.to_chat_message_with_max_prompt_bytes(prompt_limit))
-        .collect::<Result<_, _>>()
-        .map_err(|error| anyhow::anyhow!("Invalid prompt content after compaction: {error}"))?;
-
-    debug!(
-        "Post-compaction context tokens updated: {} -> {} (filtered {} messages)",
-        current_state
-            .context()
-            .map(|c| c.stats.context_tokens)
-            .unwrap_or(0),
-        new_context_tokens,
-        filtered_messages.len()
-    );
-
-    let new_context = if let Some(ctx) = current_state.context() {
-        let mut new_stats = crate::middleware::AgentStats::clone(&ctx.stats);
-        new_stats.context_tokens = new_context_tokens;
-
-        Arc::new(
-            crate::middleware::ConversationContext::new(
-                ctx.session_id.clone(),
-                Arc::from(chat_messages.into_boxed_slice()),
-                Arc::new(new_stats),
-                ctx.provider.clone(),
-                ctx.model.clone(),
-            )
-            .with_session_mode(ctx.session_mode)
-            .with_profile(ctx.profile.clone()),
-        )
-    } else {
-        return Err(anyhow::anyhow!("No context available for compaction"));
-    };
-
-    exec_ctx.compaction_summaries =
-        genai::compaction_summaries(&filtered_messages, &new_context.messages);
-    Ok(ExecutionState::BeforeLlmCall {
-        context: new_context,
+    Ok(CompactionOutcome::Completed {
+        messages: filtered_messages,
+        context_tokens: new_context_tokens,
     })
 }
 

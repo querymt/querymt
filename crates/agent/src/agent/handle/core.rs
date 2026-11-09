@@ -182,6 +182,13 @@ impl LocalAgentHandle {
                 .unwrap_or(registry),
         };
         let mut update = crate::slash_commands::acp::registry_to_acp_update(&registry);
+        // Built-ins take priority over user commands of the same name.
+        update
+            .available_commands
+            .retain(|cmd| cmd.name != crate::slash_commands::builtin::COMPACT_COMMAND);
+        update
+            .available_commands
+            .push(crate::slash_commands::builtin::compact_available_command());
         if self.config.workspace_service().is_some() {
             update
                 .available_commands

@@ -2970,6 +2970,70 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         exec_ctx.state.active_task = Some(task.clone());
     }
 
+    // 3b. Native `/compact [instructions]`: compact now, no model turn.
+    // Built-ins are matched before registry expansion so they take priority
+    // over user-defined commands of the same name.
+    if let Some(command) = crate::slash_commands::builtin::native_compact_command(&req.prompt) {
+        log::info!("Session {}: manual compaction requested", session_id);
+        let outcome = crate::agent::execution::compact_history(
+            &config,
+            &mut exec_ctx,
+            crate::agent::execution::TRIGGER_MANUAL,
+            command.instructions.as_deref(),
+        )
+        .await;
+        return match outcome {
+            Ok(crate::agent::execution::CompactionOutcome::Completed { .. }) => Ok(
+                PromptRun::finished(PromptResponse::new(StopReason::EndTurn)),
+            ),
+            Ok(crate::agent::execution::CompactionOutcome::Blocked { message }) => {
+                config.emit_event(
+                    &session_id,
+                    AgentEventKind::HookNotice {
+                        event_name: "PreCompaction".to_string(),
+                        message,
+                        is_error: false,
+                    },
+                );
+                Ok(PromptRun::finished(PromptResponse::new(
+                    StopReason::EndTurn,
+                )))
+            }
+            Ok(crate::agent::execution::CompactionOutcome::PriceLimit { message }) => {
+                Ok(PromptRun {
+                    response: PromptResponse::new(StopReason::from(
+                        crate::events::StopType::PriceLimit,
+                    )),
+                    stop: Some((crate::events::StopType::PriceLimit, message)),
+                })
+            }
+            Ok(crate::agent::execution::CompactionOutcome::NothingToCompact) => {
+                config.emit_event(
+                    &session_id,
+                    AgentEventKind::HookNotice {
+                        event_name: "Compact".to_string(),
+                        message: "Nothing to compact: the conversation is empty".to_string(),
+                        is_error: false,
+                    },
+                );
+                Ok(PromptRun::finished(PromptResponse::new(
+                    StopReason::EndTurn,
+                )))
+            }
+            Err(error) => {
+                let message = error.to_string();
+                config.emit_event(
+                    &session_id,
+                    AgentEventKind::Error {
+                        message: message.clone(),
+                    },
+                );
+                Err(provider_failure_from_execution_error(&error, &exec_ctx)
+                    .unwrap_or(AgentError::Internal(message)))
+            }
+        };
+    }
+
     // 4. Slash command expansion (before storing user messages)
     let mut req = req;
     // Managed sessions expand against the registry resolved from their

@@ -41,6 +41,7 @@ fn format_stop_hook_continuation_message(
 
 mod llm_retry;
 mod maintenance;
+pub(crate) use maintenance::{CompactionOutcome, TRIGGER_MANUAL, compact_history};
 mod progress_sink;
 mod tool_calls;
 mod transitions;
