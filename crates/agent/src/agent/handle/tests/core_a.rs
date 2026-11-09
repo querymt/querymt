@@ -1759,7 +1759,7 @@ paths = ["{}"]
         .expect("unbound session uses this handle's registry");
     assert_eq!(
         advertised_command_names(&unbound),
-        vec!["/root".to_string()]
+        vec!["/root".to_string(), "/compact".to_string()]
     );
 
     profiles
@@ -1771,7 +1771,10 @@ paths = ["{}"]
         .slash_command_catalog("bound")
         .await
         .expect("bound session uses the profile registry");
-    assert_eq!(advertised_command_names(&bound), vec!["/docs".to_string()]);
+    assert_eq!(
+        advertised_command_names(&bound),
+        vec!["/docs".to_string(), "/compact".to_string()]
+    );
 
     profiles
         .set_session_binding(

@@ -28,9 +28,11 @@
 //! - [`registry`] — merge, deduplicate, and expose command lookup
 //! - [`expander`] — detect `/name args` in user text and expand into prompts
 //! - [`script`] — future script execution interface (not active yet)
+//! - [`builtin`] — natively handled commands (`/compact`), which take priority over user commands
 //! - [`acp`] — convert registry entries to ACP `AvailableCommandsUpdate`
 
 pub mod acp;
+pub mod builtin;
 pub mod discovery;
 pub mod expander;
 pub mod parser;

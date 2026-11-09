@@ -7053,9 +7053,16 @@ mod tests {
                     .any(|event| event["kind"]["data"]["content"] == "late assistant reply")
             );
             // No historical notifications: the client hydrates from the snapshot.
+            // The command catalog advertisement (always includes `/compact`) is
+            // not history.
+            let replayed: Vec<_> = snapshot_capable
+                .notifications
+                .iter()
+                .filter(|n| n["params"]["update"]["sessionUpdate"] != "available_commands_update")
+                .collect();
             assert!(
-                snapshot_capable.notifications.is_empty(),
-                "snapshot-capable load must not emit historical replay"
+                replayed.is_empty(),
+                "snapshot-capable load must not emit historical replay: {replayed:?}"
             );
             // Replay is still ordered before the response for clients that need it.
             assert!(snapshot_capable.notify_before_response);

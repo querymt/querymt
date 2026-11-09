@@ -34,6 +34,16 @@ This brief will replace the conversation history. Write it for the work that rem
 
 If needed output was cleared or truncated, name the `session_history` call_id or a narrow command to retrieve it. Do not invent observations."#;
 
+/// The compaction prompt, extended with the user's focus instructions when given.
+pub(crate) fn compaction_prompt(instructions: Option<&str>) -> String {
+    match instructions.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(focus) => format!(
+            "{COMPACTION_PROMPT}\n\nThe user asked for this summary to follow these additional instructions. Honor them while still covering the sections above:\n<user_focus>\n{focus}\n</user_focus>"
+        ),
+        None => COMPACTION_PROMPT.to_string(),
+    }
+}
+
 /// Upper bound on the verbatim user prompts carried across a compaction.
 const ORIGINAL_TASK_MAX_BYTES: usize = 16 * 1024;
 /// Most recent user prompts carried across a compaction.
@@ -167,11 +177,41 @@ impl SessionCompaction {
         max_prompt_bytes: Option<usize>,
         ledger: &DispatchLedger,
     ) -> Result<CompactionResult> {
+        self.process_with_instructions(
+            messages,
+            provider,
+            model,
+            retry_config,
+            max_prompt_bytes,
+            ledger,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::process`], with optional user-provided focus instructions
+    /// (for example from `/compact focus on the API changes`) added to the
+    /// compaction prompt.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn process_with_instructions(
+        &self,
+        messages: &[AgentMessage],
+        provider: Arc<dyn querymt::chat::ChatProvider>,
+        model: &str,
+        retry_config: &RetryConfig,
+        max_prompt_bytes: Option<usize>,
+        ledger: &DispatchLedger,
+        instructions: Option<&str>,
+    ) -> Result<CompactionResult> {
         // Estimate original token count
         let original_token_count = self.estimate_messages_tokens(messages, max_prompt_bytes);
 
         // Build the compaction request
-        let chat_messages = self.build_compaction_messages(messages, max_prompt_bytes)?;
+        let chat_messages = self.build_compaction_messages_with_instructions(
+            messages,
+            max_prompt_bytes,
+            instructions,
+        )?;
 
         // Call LLM with retry logic
         let summary = self
@@ -204,10 +244,20 @@ impl SessionCompaction {
     }
 
     /// Build chat messages for compaction request
+    #[cfg_attr(not(test), allow(dead_code))]
     fn build_compaction_messages(
         &self,
         messages: &[AgentMessage],
         max_prompt_bytes: Option<usize>,
+    ) -> Result<Vec<querymt::chat::ChatMessage>> {
+        self.build_compaction_messages_with_instructions(messages, max_prompt_bytes, None)
+    }
+
+    fn build_compaction_messages_with_instructions(
+        &self,
+        messages: &[AgentMessage],
+        max_prompt_bytes: Option<usize>,
+        instructions: Option<&str>,
     ) -> Result<Vec<querymt::chat::ChatMessage>> {
         let mut chat_messages: Vec<querymt::chat::ChatMessage> = messages
             .iter()
@@ -217,7 +267,7 @@ impl SessionCompaction {
         // Add the compaction prompt as a user message
         chat_messages.push(
             querymt::chat::ChatMessage::user()
-                .text(COMPACTION_PROMPT)
+                .text(compaction_prompt(instructions))
                 .build(),
         );
 
@@ -2169,6 +2219,33 @@ mod tests {
             tokens > 500,
             "Long conversation should have significant token count"
         );
+    }
+
+    #[test]
+    fn test_compaction_prompt_without_instructions_is_unchanged() {
+        assert_eq!(compaction_prompt(None), COMPACTION_PROMPT);
+        assert_eq!(compaction_prompt(Some("   \n")), COMPACTION_PROMPT);
+    }
+
+    #[test]
+    fn test_compaction_prompt_includes_user_focus() {
+        let prompt = compaction_prompt(Some("  focus on the API changes  "));
+        assert!(prompt.starts_with(COMPACTION_PROMPT));
+        assert!(prompt.contains("<user_focus>\nfocus on the API changes\n</user_focus>"));
+    }
+
+    #[test]
+    fn test_build_compaction_messages_with_instructions_carries_focus() {
+        let messages = MessageFixture::simple_conversation("s1");
+        let chat = SessionCompaction::new()
+            .build_compaction_messages_with_instructions(
+                &messages,
+                None,
+                Some("ignore the test refactoring"),
+            )
+            .unwrap();
+        let last = chat.last().unwrap();
+        assert!(last.text().contains("ignore the test refactoring"));
     }
 
     #[test]
