@@ -25,6 +25,26 @@
   (`server.tool`); hook input gained `mcp_server`; hook commands get
   `QMT_PROFILE_DIR`.
 
+### Fixed
+
+- **llama.cpp tool calls could not contain `<` in string arguments.** The tool
+  grammar for Qwen-function models (Qwen3.5/3.6/3.8, AREX-2) and FunctionGemma
+  forbade `<` inside every string parameter, so `write_file`/`edit` content such
+  as `row[j] < best_d` came out corrupted (the sampler picked another token).
+  String values now accept anything except the exact closing sequence
+  (`</parameter>` / `<escape>`).
+- **llama.cpp tool-call parsing keeps string arguments verbatim.** Declared
+  string parameters are no longer coerced through JSON (`123`, `true`, a JSON
+  file body), only the template's one newline on each side is removed
+  (indentation and trailing newlines are kept), and values containing
+  `</function>`, `</tool_call>` or `[TOOL_CALLS]` no longer end the call early.
+  FunctionGemma values with commas or braces and Gemma 4 strings containing `"`
+  now round-trip; a parameter of an unknown schema type no longer breaks the
+  whole grammar.
+- **llama.cpp usage reports `reasoning_tokens`.** Thinking tokens (including a
+  thinking-budget close marker) were counted in `output_tokens` with
+  `reasoning_tokens` always 0; they are now split out.
+
 ### Added
 
 - **`accept_delegation_result` asks by default** before it integrates a

@@ -66,6 +66,9 @@ pub(crate) struct ChatTemplateResult {
     pub additional_stops: Vec<String>,
     pub starts_in_thinking: bool,
     pub reasoning_format: ReasoningFormat,
+    /// Tool schemas the prompt was rendered with; the parser uses them to
+    /// keep string parameters verbatim.
+    pub tools: Vec<querymt::chat::Tool>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +85,11 @@ pub(crate) struct GrammarTrigger {
 }
 
 impl ChatTemplateResult {
+    /// Counter that splits output tokens into reasoning and answer tokens.
+    pub(crate) fn reasoning_counter(&self) -> ReasoningTokenCounter {
+        ReasoningTokenCounter::new(self.reasoning_format, self.starts_in_thinking)
+    }
+
     pub(crate) fn streaming_state(&self) -> ChatStreamingState {
         ChatStreamingState::new(self.reasoning_format, self.starts_in_thinking)
     }
@@ -236,6 +244,74 @@ impl ThinkingStreamParser {
     }
 }
 
+/// Counts how many generated tokens belong to reasoning blocks, so usage can
+/// report them as `reasoning_tokens` instead of lumping them into
+/// `output_tokens`. Tokens that open or close a block count as reasoning.
+#[derive(Debug)]
+pub(crate) struct ReasoningTokenCounter {
+    in_thinking: bool,
+    tail: String,
+    reasoning: u32,
+    reasoning_format: ReasoningFormat,
+}
+
+impl ReasoningTokenCounter {
+    const TAIL_BYTES: usize = 64;
+
+    /// Create a counter, optionally starting inside a reasoning block.
+    pub(crate) fn new(reasoning_format: ReasoningFormat, starts_in_thinking: bool) -> Self {
+        Self {
+            in_thinking: starts_in_thinking,
+            tail: String::new(),
+            reasoning: 0,
+            reasoning_format,
+        }
+    }
+
+    /// Observe the text of one generated token.
+    pub(crate) fn observe(&mut self, piece: &str) {
+        self.tail.push_str(piece);
+        if self.tail.len() > Self::TAIL_BYTES {
+            let mut cut = self.tail.len() - Self::TAIL_BYTES;
+            while !self.tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.tail.drain(..cut);
+        }
+        let marker = if self.in_thinking {
+            self.reasoning_format.close_tag()
+        } else {
+            self.reasoning_format.open_tag()
+        };
+        let counts = self.in_thinking;
+        if self.tail.contains(marker) {
+            self.in_thinking = !self.in_thinking;
+            self.tail.clear();
+            // The marker token itself belongs to the reasoning block.
+            self.reasoning += 1;
+        } else if counts {
+            self.reasoning += 1;
+        }
+    }
+
+    /// Text injected by the thinking budget (always closes the block);
+    /// `tokens` is how many tokens it took.
+    pub(crate) fn observe_forced(&mut self, text: &str, tokens: u32) {
+        self.reasoning = self.reasoning.saturating_add(tokens);
+        if text.contains(self.reasoning_format.close_tag()) {
+            self.in_thinking = false;
+            self.tail.clear();
+        }
+    }
+
+    /// Split `output_tokens` (which includes reasoning) into
+    /// `(output_tokens, reasoning_tokens)` with no overlap.
+    pub(crate) fn split(&self, output_tokens: u32) -> (u32, u32) {
+        let reasoning = self.reasoning.min(output_tokens);
+        (output_tokens - reasoning, reasoning)
+    }
+}
+
 /// Enforces `thinking_budget`: counts tokens generated inside a reasoning
 /// block and says when the block has to be closed.
 #[derive(Debug)]
@@ -340,6 +416,89 @@ fn longest_suffix_prefix_len(buffer: &str, marker: &str) -> usize {
         .rev()
         .find(|&len| buffer.ends_with(&marker[..len]))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod reasoning_counter_tests {
+    use super::*;
+
+    /// Feed one token per piece and return the `(reasoning, output)` split.
+    fn count(format: ReasoningFormat, starts: bool, pieces: &[&str]) -> (u32, u32) {
+        let mut counter = ReasoningTokenCounter::new(format, starts);
+        for piece in pieces {
+            counter.observe(piece);
+        }
+        counter.split(pieces.len() as u32)
+    }
+
+    #[test]
+    fn counts_open_block_started_by_prompt() {
+        // 3 thinking tokens, the closing tag, then 2 answer tokens.
+        let (out, reasoning) = count(
+            ReasoningFormat::ThinkTags,
+            true,
+            &["a", "b", "c", "</think>", "x", "y"],
+        );
+        assert_eq!((out, reasoning), (2, 4));
+    }
+
+    #[test]
+    fn counts_block_opened_by_model() {
+        let (out, reasoning) = count(
+            ReasoningFormat::ThinkTags,
+            false,
+            &["<think>", "a", "b", "</think>", "x"],
+        );
+        assert_eq!((out, reasoning), (1, 4));
+    }
+
+    #[test]
+    fn handles_markers_split_across_tokens() {
+        let (out, reasoning) = count(
+            ReasoningFormat::ThinkTags,
+            true,
+            &["a", "</", "think", ">", "x"],
+        );
+        // `</`, `think` and `>` are part of the closing marker.
+        assert_eq!((out, reasoning), (1, 4));
+    }
+
+    #[test]
+    fn no_reasoning_means_everything_is_output() {
+        assert_eq!(
+            count(ReasoningFormat::ThinkTags, false, &["a", "b", "c"]),
+            (3, 0)
+        );
+    }
+
+    #[test]
+    fn gemma_channel_markers() {
+        let (out, reasoning) = count(
+            ReasoningFormat::GemmaChannel {
+                implicit_leading_reasoning_prefix: false,
+            },
+            false,
+            &["<|channel>", "thought", "x", "<channel|>", "ok"],
+        );
+        assert_eq!((out, reasoning), (1, 4));
+    }
+
+    #[test]
+    fn forced_close_counts_tokens_and_ends_block() {
+        let mut counter = ReasoningTokenCounter::new(ReasoningFormat::ThinkTags, true);
+        counter.observe("a");
+        counter.observe_forced("\n</think>\n\n", 4);
+        counter.observe("answer");
+        assert_eq!(counter.split(6), (1, 5));
+    }
+
+    #[test]
+    fn split_never_exceeds_output_tokens() {
+        let mut counter = ReasoningTokenCounter::new(ReasoningFormat::ThinkTags, true);
+        counter.observe_forced("</think>", 10);
+        let (out, reasoning) = counter.split(3);
+        assert_eq!(out + reasoning, 3);
+    }
 }
 
 #[cfg(test)]

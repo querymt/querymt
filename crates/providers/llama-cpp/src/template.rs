@@ -293,6 +293,7 @@ fn render_template(
         additional_stops: known_stop_sequences(),
         starts_in_thinking,
         reasoning_format,
+        tools: tools.map(<[Tool]>::to_vec).unwrap_or_default(),
     })
 }
 

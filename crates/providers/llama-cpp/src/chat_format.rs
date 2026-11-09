@@ -1,4 +1,5 @@
 use crate::common_chat::{GrammarTrigger, ReasoningFormat, ToolGrammar};
+use crate::gbnf::{ExclusionDfa, gbnf_literal};
 use querymt::chat::Tool;
 use querymt::{FunctionCall, ToolCall};
 use serde_json::{Map, Value};
@@ -72,10 +73,21 @@ pub(crate) fn parse_assistant_format_with_state(
     reasoning_format: ReasoningFormat,
     starts_in_thinking: bool,
 ) -> ParsedFormat {
+    parse_assistant_format_with_tools(text, reasoning_format, starts_in_thinking, &[])
+}
+
+/// Like [`parse_assistant_format_with_state`], but uses the tool schemas so
+/// that string parameters are returned exactly as the model wrote them.
+pub(crate) fn parse_assistant_format_with_tools(
+    text: &str,
+    reasoning_format: ReasoningFormat,
+    starts_in_thinking: bool,
+    tools: &[Tool],
+) -> ParsedFormat {
     let (thinking, without_thinking) =
         extract_reasoning_blocks(text, reasoning_format, starts_in_thinking);
-    let calls = extract_tool_calls(&without_thinking);
-    let content = strip_tool_blocks(&without_thinking).trim().to_string();
+    let (calls, remaining) = extract_tool_calls(&without_thinking, tools);
+    let content = strip_tool_blocks(&remaining).trim().to_string();
 
     ParsedFormat {
         content,
@@ -174,15 +186,30 @@ fn extract_reasoning_blocks(
     (thinking, output)
 }
 
-fn extract_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+/// Returns the parsed calls and the text with Qwen function-call blocks
+/// removed. Those blocks are located structurally, so tool arguments that
+/// themselves contain markers such as `</tool_call>` or `[TOOL_CALLS]` neither
+/// end the call early nor leak into the other extractors.
+fn extract_tool_calls(text: &str, tools: &[Tool]) -> (Option<Vec<ToolCall>>, String) {
+    let spans = scan_qwen_function_calls(text, tools);
+    let mut remaining = String::with_capacity(text.len());
+    let mut qwen_calls = Vec::new();
+    let mut cursor = 0;
+    for span in spans {
+        remaining.push_str(&text[cursor..span.start]);
+        cursor = span.end;
+        qwen_calls.extend(span.call);
+    }
+    remaining.push_str(&text[cursor..]);
+
     let mut calls = Vec::new();
-    calls.extend(extract_qwen_json_tool_calls(text));
-    calls.extend(extract_qwen_function_tool_calls(text));
-    calls.extend(extract_ministral_tool_calls(text));
-    calls.extend(extract_lfm2_tool_calls(text));
-    calls.extend(extract_function_gemma_tool_calls(text));
-    calls.extend(extract_gemma4_tool_calls(text));
-    (!calls.is_empty()).then_some(calls)
+    calls.extend(extract_qwen_json_tool_calls(&remaining));
+    calls.extend(qwen_calls);
+    calls.extend(extract_ministral_tool_calls(&remaining));
+    calls.extend(extract_lfm2_tool_calls(&remaining));
+    calls.extend(extract_function_gemma_tool_calls(&remaining, tools));
+    calls.extend(extract_gemma4_tool_calls(&remaining));
+    ((!calls.is_empty()).then_some(calls), remaining)
 }
 
 fn tool_names_rule(tools: &[Tool]) -> Option<String> {
@@ -228,10 +255,13 @@ json-member ::= json-string ws ":" ws json-value
 json-object ::= "{{" ws (json-member (ws "," ws json-member)*)? ws "}}"
 json-value ::= json-object | json-array | json-string | json-number | "true" | "false" | "null"
 identifier ::= [A-Za-z_][A-Za-z0-9_-]*
-value-text ::= [^<]*
 ws ::= [ \t\n\r]*
+{value_text_rules}
 {tool_specific_rules}"#,
             tool_rules = tool_rules.root_alternation,
+            // String values may contain anything (including `<`) except the
+            // exact closing tag that follows them.
+            value_text_rules = ExclusionDfa::new("</parameter>").rules("value-text"),
             tool_specific_rules = tool_rules.rules,
         ),
         root: "root",
@@ -276,16 +306,17 @@ identifier ::= [A-Za-z_][A-Za-z0-9_-]*
 
 fn function_gemma_tool_grammar(tools: &[Tool]) -> Option<ToolGrammar> {
     let names = tool_names_rule(tools)?;
+    // Escaped values may contain anything except the closing `<escape>`.
+    let value_text_rules = ExclusionDfa::new("<escape>").rules("value-text");
     Some(ToolGrammar {
         grammar: format!(
             r#"root ::= gemma-fn-call+
 gemma-fn-call ::= "<start_function_call>" "call:" tool-name "{{" ws (gemma-param ("," ws gemma-param)*)? ws "}}" "<end_function_call>" ws
 gemma-param ::= identifier ws ":" ws "<escape>" value-text "<escape>"
 identifier ::= [A-Za-z_][A-Za-z0-9_-]*
-value-text ::= [^<]*
 tool-name ::= {names}
 ws ::= [ \t\n\r]*
-"#
+{value_text_rules}"#
         ),
         root: "root",
         lazy: true,
@@ -295,6 +326,9 @@ ws ::= [ \t\n\r]*
 
 fn gemma4_tool_grammar(tools: &[Tool]) -> Option<ToolGrammar> {
     let names = tool_names_rule(tools)?;
+    // Strings are delimited by `<|"|>` and carry raw text: no JSON escaping,
+    // and a plain `"` is fine. Only the closing delimiter is excluded.
+    let text_rules = ExclusionDfa::new("<|\"|>").rules("gemma4-text");
     Some(ToolGrammar {
         grammar: format!(
             r#"root ::= gemma4-call+
@@ -303,14 +337,12 @@ gemma4-object ::= "{{" ws (gemma4-member ("," ws gemma4-member)*)? ws "}}"
 gemma4-member ::= identifier ws ":" ws gemma4-value
 gemma4-array ::= "[" ws (gemma4-value ("," ws gemma4-value)*)? ws "]"
 gemma4-value ::= gemma4-object | gemma4-array | gemma4-string | number | "true" | "false" | "null"
-gemma4-string ::= "<|\"|>" characters "<|\"|>"
+gemma4-string ::= "<|\"|>" gemma4-text "<|\"|>"
 identifier ::= [A-Za-z_][A-Za-z0-9_-]*
 tool-name ::= {names}
-characters ::= ([^"\\] | "\\" escape)*
-escape ::= ["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
 number ::= "-"? ([0-9] | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
 ws ::= [ \t\n\r]*
-"#,
+{text_rules}"#,
         ),
         root: "root",
         lazy: true,
@@ -381,7 +413,56 @@ fn required_params(schema: &Value) -> HashSet<&str> {
         .unwrap_or_default()
 }
 
-fn parameter_value_expr(schema: &Value, rule_name: &str) -> String {
+/// Declared JSON-schema types, whether `type` is a single string or an array.
+fn schema_types(schema: &Value) -> impl Iterator<Item = &str> {
+    let ty = schema.get("type");
+    ty.and_then(Value::as_str).into_iter().chain(
+        ty.and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+    )
+}
+
+/// True when the schema allows a string, i.e. the value must reach the tool
+/// verbatim instead of being coerced through JSON.
+fn is_text_param(schema: &Value) -> bool {
+    schema_types(schema).any(|t| t == "string")
+}
+
+/// Value for a text parameter: the raw text, except a literal `null` when
+/// the schema explicitly allows `"null"`.
+fn text_param_value(raw: &str, schema: &Value) -> Value {
+    if raw == "null" && schema_types(schema).any(|t| t == "null") {
+        Value::Null
+    } else {
+        Value::String(raw.to_string())
+    }
+}
+
+/// Look up the JSON schema of parameter `param` of tool `tool`, if declared.
+fn param_schema<'a>(tools: &'a [Tool], tool: &str, param: &str) -> Option<&'a Value> {
+    tools
+        .iter()
+        .find(|t| t.function.name == tool)?
+        .function
+        .parameters
+        .get("properties")?
+        .get(param)
+}
+
+/// Convert the raw text of a parameter into a JSON value. Declared strings
+/// stay exactly as written; everything else is parsed as JSON when possible.
+fn coerce_param_value(raw: &str, schema: Option<&Value>) -> Value {
+    if let Some(schema) = schema.filter(|s| is_text_param(s)) {
+        return text_param_value(raw, schema);
+    }
+    let trimmed = raw.trim();
+    serde_json::from_str(trimmed).unwrap_or_else(|_| Value::String(trimmed.to_string()))
+}
+
+/// GBNF expression matching a parameter value of the given schema type.
+fn parameter_value_expr(schema: &Value, _rule_name: &str) -> String {
     match schema.get("type").and_then(|value| value.as_str()) {
         Some("string") | None => {
             if let Some(values) = schema.get("enum").and_then(|value| value.as_array()) {
@@ -401,7 +482,9 @@ fn parameter_value_expr(schema: &Value, rule_name: &str) -> String {
         Some("null") => "\"null\"".to_string(),
         Some("array") => "json-array".to_string(),
         Some("object") => "json-object".to_string(),
-        Some(_) => rule_name.to_string(),
+        // Unknown type: accept any text rather than emitting a rule that
+        // refers to itself (which llama.cpp rejects for the whole request).
+        Some(_) => "value-text".to_string(),
     }
 }
 
@@ -431,23 +514,6 @@ fn word_trigger(value: &str) -> Vec<GrammarTrigger> {
     }]
 }
 
-fn gbnf_literal(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            other => out.push(other),
-        }
-    }
-    out.push('"');
-    out
-}
-
 fn extract_qwen_json_tool_calls(text: &str) -> Vec<ToolCall> {
     extract_tag_bodies(text, "<tool_call>", "</tool_call>")
         .into_iter()
@@ -469,11 +535,116 @@ fn parse_json_tool_call(raw: &str) -> Option<ToolCall> {
     })
 }
 
-fn extract_qwen_function_tool_calls(text: &str) -> Vec<ToolCall> {
-    extract_tag_bodies(text, "<tool_call>", "</tool_call>")
-        .into_iter()
-        .filter_map(parse_function_tool_call)
-        .collect()
+/// A `<tool_call><function=..>` block located in the text. `call` is `None`
+/// when the block is incomplete (e.g. generation hit the token limit); the
+/// span then runs to the end of the text so it is dropped from the content.
+struct QwenSpan {
+    start: usize,
+    end: usize,
+    call: Option<ToolCall>,
+}
+
+/// Return the first offset at or after `pos` that is not whitespace.
+fn skip_ws(text: &str, pos: usize) -> usize {
+    let rest = &text[pos..];
+    pos + (rest.len() - rest.trim_start().len())
+}
+
+/// Find every `<tool_call><function=..>` block and the span it occupies.
+fn scan_qwen_function_calls(text: &str, tools: &[Tool]) -> Vec<QwenSpan> {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+    let mut spans = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = text[pos..].find(OPEN) {
+        let start = pos + rel;
+        let body_start = start + OPEN.len();
+        let fn_start = skip_ws(text, body_start);
+        if !text[fn_start..].starts_with("<function=") {
+            // JSON-style call (or something else); not ours.
+            pos = body_start;
+            continue;
+        }
+        let parsed = parse_function_block(text, fn_start, tools).and_then(|(call, fn_end)| {
+            let close_at = skip_ws(text, fn_end);
+            text[close_at..]
+                .starts_with(CLOSE)
+                .then_some((call, close_at + CLOSE.len()))
+        });
+        match parsed {
+            Some((call, end)) => {
+                spans.push(QwenSpan {
+                    start,
+                    end,
+                    call: Some(call),
+                });
+                pos = end;
+            }
+            None => {
+                spans.push(QwenSpan {
+                    start,
+                    end: text.len(),
+                    call: None,
+                });
+                break;
+            }
+        }
+    }
+    spans
+}
+
+/// Remove the single newline the chat template puts on each side of a value.
+fn strip_value_padding(raw: &str) -> &str {
+    let raw = raw
+        .strip_prefix("\r\n")
+        .or_else(|| raw.strip_prefix('\n'))
+        .unwrap_or(raw);
+    raw.strip_suffix("\r\n")
+        .or_else(|| raw.strip_suffix('\n'))
+        .unwrap_or(raw)
+}
+
+/// Parse `<function=NAME> <parameter=K>\nV\n</parameter>.. </function>`
+/// starting at `fn_start`. Returns the call and the offset just past the
+/// block. Parameters are consumed sequentially, so a value is never searched
+/// for markers like `</function>`.
+fn parse_function_block(text: &str, fn_start: usize, tools: &[Tool]) -> Option<(ToolCall, usize)> {
+    let name_start = fn_start + "<function=".len();
+    let name_end = text[name_start..].find('>')? + name_start;
+    let name = text[name_start..name_end].trim().to_string();
+    let mut cursor = name_end + 1;
+    let mut arguments = Map::new();
+    loop {
+        let at = skip_ws(text, cursor);
+        if text[at..].starts_with("<parameter=") {
+            let key_start = at + "<parameter=".len();
+            let key_end = text[key_start..].find('>')? + key_start;
+            let key = text[key_start..key_end].trim().to_string();
+            let value_start = key_end + 1;
+            let value_end = text[value_start..].find("</parameter>")? + value_start;
+            let raw = strip_value_padding(&text[value_start..value_end]);
+            let value = coerce_param_value(raw, param_schema(tools, &name, &key));
+            arguments.insert(key, value);
+            cursor = value_end + "</parameter>".len();
+        } else if text[at..].starts_with("</function>") {
+            cursor = at + "</function>".len();
+            break;
+        } else {
+            // Tolerate a missing `</function>`; the caller checks `</tool_call>`.
+            break;
+        }
+    }
+    Some((
+        ToolCall {
+            id: stable_tool_call_id(&name, &text[fn_start..cursor]),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name,
+                arguments: Value::Object(arguments).to_string(),
+            },
+        },
+        cursor,
+    ))
 }
 
 fn extract_ministral_tool_calls(text: &str) -> Vec<ToolCall> {
@@ -548,101 +719,125 @@ fn parse_lfm2_call(raw: &str) -> Option<ToolCall> {
     })
 }
 
-fn extract_function_gemma_tool_calls(text: &str) -> Vec<ToolCall> {
-    extract_tag_bodies(text, "<start_function_call>", "<end_function_call>")
-        .into_iter()
-        .filter_map(parse_gemma_call_body)
-        .collect()
-}
-
-fn parse_gemma_call_body(body: &str) -> Option<ToolCall> {
-    let body = body.trim();
-    let rest = body.strip_prefix("call:")?;
-    let open = rest.find('{')?;
-    let close = rest.rfind('}')?;
-    let name = rest[..open].trim().to_string();
-    let args_body = &rest[open + 1..close];
-    let mut arguments = Map::new();
-    for segment in split_top_level(args_body, ',') {
-        let Some((key, value)) = split_first_top_level(segment.trim(), ':') else {
+/// Extract complete `<start_function_call>..<end_function_call>` calls.
+fn extract_function_gemma_tool_calls(text: &str, tools: &[Tool]) -> Vec<ToolCall> {
+    const OPEN: &str = "<start_function_call>";
+    const CLOSE: &str = "<end_function_call>";
+    let mut calls = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = text[pos..].find(OPEN) {
+        let body_start = pos + rel + OPEN.len();
+        let Some((call, end)) = parse_gemma_call_body(text, body_start, tools) else {
+            pos = body_start;
             continue;
         };
-        let value = value
-            .trim()
-            .strip_prefix("<escape>")
-            .and_then(|v| v.strip_suffix("<escape>"))
-            .unwrap_or_else(|| value.trim());
-        arguments.insert(key.trim().to_string(), parse_pythonish_value(value));
+        let close_at = skip_ws(text, end);
+        if !text[close_at..].starts_with(CLOSE) {
+            pos = body_start;
+            continue;
+        }
+        calls.push(call);
+        pos = close_at + CLOSE.len();
     }
-    Some(ToolCall {
-        id: stable_tool_call_id(&name, body),
-        call_type: "function".to_string(),
-        function: FunctionCall {
-            name,
-            arguments: Value::Object(arguments).to_string(),
+    calls
+}
+
+/// Parse `call:NAME{key:<escape>VALUE<escape>,..}` starting at `start`.
+/// Escaped values are consumed up to the next `<escape>`, so commas, braces
+/// and colons inside them are preserved. Returns the call and the offset just
+/// past the closing `}`.
+fn parse_gemma_call_body(text: &str, start: usize, tools: &[Tool]) -> Option<(ToolCall, usize)> {
+    const ESC: &str = "<escape>";
+    let at = skip_ws(text, start);
+    let after_call = text[at..].strip_prefix("call:")?;
+    let name_start = text.len() - after_call.len();
+    let open = text[name_start..].find('{')? + name_start;
+    let name = text[name_start..open].trim().to_string();
+    let mut cursor = open + 1;
+    let mut arguments = Map::new();
+    loop {
+        cursor = skip_ws(text, cursor);
+        if text[cursor..].starts_with(',') {
+            cursor += 1;
+            continue;
+        }
+        if text[cursor..].starts_with('}') {
+            cursor += 1;
+            break;
+        }
+        let colon = text[cursor..].find(':')? + cursor;
+        let key = text[cursor..colon].trim().to_string();
+        cursor = skip_ws(text, colon + 1);
+        let schema = param_schema(tools, &name, &key);
+        let value = if text[cursor..].starts_with(ESC) {
+            let value_start = cursor + ESC.len();
+            let value_end = text[value_start..].find(ESC)? + value_start;
+            cursor = value_end + ESC.len();
+            let raw = &text[value_start..value_end];
+            if let Some(schema) = schema.filter(|s| is_text_param(s)) {
+                text_param_value(raw, schema)
+            } else {
+                parse_pythonish_value(raw.trim())
+            }
+        } else {
+            let end = text[cursor..]
+                .find([',', '}'])
+                .map_or(text.len(), |i| i + cursor);
+            let raw = text[cursor..end].trim();
+            cursor = end;
+            parse_pythonish_value(raw)
+        };
+        arguments.insert(key, value);
+    }
+    Some((
+        ToolCall {
+            id: stable_tool_call_id(&name, &text[at..cursor]),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name,
+                arguments: Value::Object(arguments).to_string(),
+            },
         },
-    })
+        cursor,
+    ))
 }
 
 fn extract_gemma4_tool_calls(text: &str) -> Vec<ToolCall> {
-    extract_tag_bodies(text, "<|tool_call>", "<tool_call|>")
-        .into_iter()
-        .filter_map(|body| {
-            let rest = body.trim().strip_prefix("call:")?;
-            let open = rest.find('{')?;
-            let close = rest.rfind('}')?;
-            let name = rest[..open].trim().to_string();
-            let args = parse_gemma4_object(&rest[open..=close])?;
-            Some(ToolCall {
-                id: stable_tool_call_id(&name, body),
-                call_type: "function".to_string(),
-                function: FunctionCall {
-                    name,
-                    arguments: args.to_string(),
-                },
-            })
-        })
-        .collect()
-}
-
-fn parse_function_tool_call(body: &str) -> Option<ToolCall> {
-    let function_start = body.find("<function=")?;
-    let name_start = function_start + "<function=".len();
-    let name_end = body[name_start..].find('>')? + name_start;
-    let name = body[name_start..name_end].trim().to_string();
-    let after_name = &body[name_end + 1..];
-    let function_end = after_name.find("</function>").unwrap_or(after_name.len());
-    let function_body = &after_name[..function_end];
-
-    let mut arguments = Map::new();
-    let mut rest = function_body;
-    while let Some(param_start) = rest.find("<parameter=") {
-        let key_start = param_start + "<parameter=".len();
-        let Some(key_end_rel) = rest[key_start..].find('>') else {
-            break;
+    const OPEN: &str = "<|tool_call>";
+    const CLOSE: &str = "<tool_call|>";
+    let mut calls = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = text[pos..].find(OPEN) {
+        let body_start = pos + rel + OPEN.len();
+        pos = body_start;
+        let at = skip_ws(text, body_start);
+        let Some(rest) = text[at..].strip_prefix("call:") else {
+            continue;
         };
-        let key_end = key_start + key_end_rel;
-        let key = rest[key_start..key_end].trim().to_string();
-        let value_start = key_end + 1;
-        let Some(value_end_rel) = rest[value_start..].find("</parameter>") else {
-            break;
+        let name_start = text.len() - rest.len();
+        let Some(open) = text[name_start..].find('{').map(|i| i + name_start) else {
+            continue;
         };
-        let value_end = value_start + value_end_rel;
-        let raw_value = rest[value_start..value_end].trim_matches('\n').trim();
-        let value = serde_json::from_str::<Value>(raw_value)
-            .unwrap_or_else(|_| Value::String(raw_value.to_string()));
-        arguments.insert(key, value);
-        rest = &rest[value_end + "</parameter>".len()..];
+        let name = text[name_start..open].trim().to_string();
+        let mut cursor = open;
+        let Some(args) = parse_gemma4_object_at(text, &mut cursor) else {
+            continue;
+        };
+        let close_at = skip_ws(text, cursor);
+        if !text[close_at..].starts_with(CLOSE) {
+            continue;
+        }
+        calls.push(ToolCall {
+            id: stable_tool_call_id(&name, &text[at..cursor]),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name,
+                arguments: args.to_string(),
+            },
+        });
+        pos = close_at + CLOSE.len();
     }
-
-    Some(ToolCall {
-        id: stable_tool_call_id(&name, body),
-        call_type: "function".to_string(),
-        function: FunctionCall {
-            name,
-            arguments: Value::Object(arguments).to_string(),
-        },
-    })
+    calls
 }
 
 fn strip_tool_blocks(text: &str) -> String {
@@ -770,44 +965,64 @@ fn parse_pythonish_value(raw: &str) -> Value {
     }
 }
 
-fn parse_gemma4_object(raw: &str) -> Option<Value> {
-    let raw = raw.trim();
-    let inner = raw.strip_prefix('{')?.strip_suffix('}')?;
-    let mut map = Map::new();
-    for segment in split_top_level(inner, ',') {
-        let segment = segment.trim();
-        if segment.is_empty() {
-            continue;
-        }
-        let Some((key, value)) = split_first_top_level(segment, ':') else {
-            continue;
-        };
-        map.insert(key.trim().to_string(), parse_gemma4_value(value.trim()));
+/// Parse a Gemma 4 object starting at `*pos` (which must point at `{`).
+/// Strings are `<|"|>raw text<|"|>` and are read up to the closing
+/// delimiter, so commas, braces and quotes inside them are preserved.
+fn parse_gemma4_object_at(text: &str, pos: &mut usize) -> Option<Value> {
+    if !text[*pos..].starts_with('{') {
+        return None;
     }
-    Some(Value::Object(map))
+    *pos += 1;
+    let mut map = Map::new();
+    loop {
+        *pos = skip_ws(text, *pos);
+        if text[*pos..].starts_with(',') {
+            *pos += 1;
+        } else if text[*pos..].starts_with('}') {
+            *pos += 1;
+            return Some(Value::Object(map));
+        } else {
+            let colon = text[*pos..].find(':')? + *pos;
+            let key = text[*pos..colon].trim().trim_matches('"').to_string();
+            *pos = colon + 1;
+            map.insert(key, parse_gemma4_value_at(text, pos)?);
+        }
+    }
 }
 
-fn parse_gemma4_value(raw: &str) -> Value {
-    if let Some(value) = raw
-        .strip_prefix("<|\"|>")
-        .and_then(|v| v.strip_suffix("<|\"|>"))
-    {
-        return Value::String(value.to_string());
+/// Parse one Gemma 4 argument value at `pos`, advancing `pos` past it.
+fn parse_gemma4_value_at(text: &str, pos: &mut usize) -> Option<Value> {
+    const Q: &str = "<|\"|>";
+    *pos = skip_ws(text, *pos);
+    let rest = &text[*pos..];
+    if rest.starts_with(Q) {
+        let start = *pos + Q.len();
+        let end = text[start..].find(Q)? + start;
+        *pos = end + Q.len();
+        return Some(Value::String(text[start..end].to_string()));
     }
-    if raw.starts_with('{') && raw.ends_with('}') {
-        return parse_gemma4_object(raw).unwrap_or_else(|| Value::String(raw.to_string()));
+    if rest.starts_with('{') {
+        return parse_gemma4_object_at(text, pos);
     }
-    if raw.starts_with('[') && raw.ends_with(']') {
-        let inner = &raw[1..raw.len() - 1];
-        return Value::Array(
-            split_top_level(inner, ',')
-                .into_iter()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| parse_gemma4_value(s.trim()))
-                .collect(),
-        );
+    if rest.starts_with('[') {
+        *pos += 1;
+        let mut items = Vec::new();
+        loop {
+            *pos = skip_ws(text, *pos);
+            if text[*pos..].starts_with(',') {
+                *pos += 1;
+            } else if text[*pos..].starts_with(']') {
+                *pos += 1;
+                return Some(Value::Array(items));
+            } else {
+                items.push(parse_gemma4_value_at(text, pos)?);
+            }
+        }
     }
-    parse_pythonish_value(raw)
+    let end = rest.find([',', '}', ']']).map_or(text.len(), |i| i + *pos);
+    let raw = text[*pos..end].trim();
+    *pos = end;
+    (!raw.is_empty()).then(|| parse_pythonish_value(raw))
 }
 
 fn json_arguments_to_string(value: &Value) -> String {
@@ -956,6 +1171,215 @@ mod tests {
         );
         assert_eq!(parsed.thinking.as_deref(), Some("consider options"));
         assert_eq!(parsed.content, "Final");
+    }
+
+    /// `write_file` tool with string, integer and unknown-typed parameters.
+    fn write_file_tool() -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: querymt::chat::FunctionTool {
+                name: "write_file".to_string(),
+                description: "Write a file".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                        "mode": {"type": "integer"},
+                        "weird": {"type": "frobnicate"}
+                    },
+                    "required": ["path", "content"]
+                }),
+                strict: None,
+            },
+        }
+    }
+
+    /// Parse `text` against [`write_file_tool`] and return its tool calls.
+    fn parse_with_tools(text: &str) -> Vec<ToolCall> {
+        parse_assistant_format_with_tools(
+            text,
+            ReasoningFormat::ThinkTags,
+            false,
+            &[write_file_tool()],
+        )
+        .tool_calls
+        .unwrap_or_default()
+    }
+
+    /// Render a Qwen `<function=write_file>` call with the given content.
+    fn qwen_call(content: &str) -> String {
+        format!(
+            "<tool_call>\n<function=write_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=content>\n{content}\n</parameter>\n</function>\n</tool_call>"
+        )
+    }
+
+    #[test]
+    fn qwen_and_gemma_grammars_allow_lt_in_string_values() {
+        let tool = write_file_tool();
+        let qwen = ToolFormat::QwenFunction
+            .grammar(std::slice::from_ref(&tool))
+            .unwrap();
+        assert!(!qwen.grammar.contains("[^<]*"), "{}", qwen.grammar);
+        assert!(qwen.grammar.contains("value-text-0 ::="));
+        let gemma = ToolFormat::FunctionGemma.grammar(&[tool]).unwrap();
+        assert!(!gemma.grammar.contains("[^<]*"), "{}", gemma.grammar);
+        assert!(gemma.grammar.contains("value-text-0 ::="));
+    }
+
+    #[test]
+    fn unknown_parameter_type_does_not_produce_self_referential_rule() {
+        let grammar = ToolFormat::QwenFunction
+            .grammar(&[write_file_tool()])
+            .unwrap()
+            .grammar;
+        assert!(
+            grammar.contains("qwen-fn-0-weird-value ::= value-text\n"),
+            "{grammar}"
+        );
+    }
+
+    #[test]
+    fn gemma4_grammar_allows_plain_quotes_in_strings() {
+        let grammar = ToolFormat::Gemma4
+            .grammar(&[write_file_tool()])
+            .unwrap()
+            .grammar;
+        assert!(grammar.contains("gemma4-text-0 ::="), "{grammar}");
+        assert!(!grammar.contains("characters"), "{grammar}");
+    }
+
+    #[test]
+    fn qwen_function_keeps_string_values_verbatim() {
+        let content = "def f(row, best_d):\n    if row[j] < best_d:\n        return x <= y\n";
+        let calls = parse_with_tools(&qwen_call(content));
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["path"], "a.py");
+        assert_eq!(args["content"], content);
+    }
+
+    #[test]
+    fn qwen_function_does_not_coerce_string_params_to_json() {
+        for literal in ["123", "true", "null", r#"{"a": 1}"#, r#""quoted""#] {
+            let calls = parse_with_tools(&qwen_call(literal));
+            let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+            assert_eq!(args["content"], literal, "literal {literal:?}");
+        }
+    }
+
+    #[test]
+    fn qwen_function_preserves_indentation_and_trailing_newline() {
+        // The template adds exactly one `\n` on each side; the rest is content.
+        let calls = parse_with_tools(&qwen_call("    indented\n\n"));
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["content"], "    indented\n\n");
+    }
+
+    #[test]
+    fn qwen_function_value_may_contain_markers_and_html() {
+        let content = "<div>a</div>\n</function>\n</tool_call>\n[TOOL_CALLS]x[ARGS]{}";
+        let parsed = parse_assistant_format_with_tools(
+            &qwen_call(content),
+            ReasoningFormat::ThinkTags,
+            false,
+            &[write_file_tool()],
+        );
+        let calls = parsed.tool_calls.unwrap();
+        assert_eq!(calls.len(), 1);
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["content"], content);
+        assert!(parsed.content.is_empty(), "{:?}", parsed.content);
+    }
+
+    #[test]
+    fn qwen_function_still_coerces_typed_params() {
+        let text = "<tool_call>\n<function=write_file>\n<parameter=path>\na\n</parameter>\n<parameter=content>\nx\n</parameter>\n<parameter=mode>\n420\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_with_tools(text);
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["mode"], 420);
+    }
+
+    #[test]
+    fn qwen_function_incomplete_call_is_dropped_from_content() {
+        let text = "Sure.\n<tool_call>\n<function=write_file>\n<parameter=content>\nif a <";
+        let parsed = parse_assistant_format_with_tools(
+            text,
+            ReasoningFormat::ThinkTags,
+            false,
+            &[write_file_tool()],
+        );
+        assert!(parsed.tool_calls.is_none());
+        assert_eq!(parsed.content, "Sure.");
+    }
+
+    #[test]
+    fn type_arrays_containing_string_stay_verbatim() {
+        let nullable = serde_json::json!({"type": ["string", "null"]});
+        assert_eq!(coerce_param_value("42", Some(&nullable)), "42");
+        assert_eq!(coerce_param_value(" true \n", Some(&nullable)), " true \n");
+        assert_eq!(coerce_param_value("null", Some(&nullable)), Value::Null);
+        let plain = serde_json::json!({"type": "string"});
+        assert_eq!(coerce_param_value("null", Some(&plain)), "null");
+        let untyped = serde_json::json!({});
+        assert_eq!(coerce_param_value("null", Some(&untyped)), Value::Null);
+        assert_eq!(coerce_param_value("42", Some(&untyped)), 42);
+    }
+
+    #[test]
+    fn function_gemma_keeps_nullable_string_verbatim() {
+        let tool = Tool {
+            tool_type: "function".to_string(),
+            function: querymt::chat::FunctionTool {
+                name: "note".to_string(),
+                description: "Take a note".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"text": {"type": ["string", "null"]}}
+                }),
+                strict: None,
+            },
+        };
+        let parse = |value: &str| -> Value {
+            let text = format!(
+                "<start_function_call>call:note{{text:<escape>{value}<escape>}}<end_function_call>"
+            );
+            let calls = parse_assistant_format_with_tools(
+                &text,
+                ReasoningFormat::ThinkTags,
+                false,
+                std::slice::from_ref(&tool),
+            )
+            .tool_calls
+            .unwrap();
+            serde_json::from_str::<Value>(&calls[0].function.arguments).unwrap()["text"].clone()
+        };
+        assert_eq!(parse(" 123 "), " 123 ");
+        assert_eq!(parse("null"), Value::Null);
+    }
+
+    #[test]
+    fn function_gemma_values_keep_commas_braces_and_lt() {
+        let text = "<start_function_call>call:write_file{path:<escape>a.py<escape>,content:<escape>if a < b, c: {d}<escape>}<end_function_call>";
+        let calls = parse_with_tools(text);
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["path"], "a.py");
+        assert_eq!(args["content"], "if a < b, c: {d}");
+    }
+
+    #[test]
+    fn gemma4_strings_keep_quotes_commas_and_braces() {
+        let text = "<|tool_call>call:write_file{path:<|\"|>a.py<|\"|>,content:<|\"|>print(\"hi, {x}\")<|\"|>,mode:420}<tool_call|>";
+        let parsed = parse_assistant_format_with_state(
+            text,
+            ReasoningFormat::GemmaChannel {
+                implicit_leading_reasoning_prefix: false,
+            },
+            false,
+        );
+        let calls = parsed.tool_calls.unwrap();
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["content"], "print(\"hi, {x}\")");
+        assert_eq!(args["mode"], 420);
     }
 
     #[test]
