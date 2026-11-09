@@ -266,3 +266,179 @@ pub(crate) fn build_fallback_sampler(seed: u32) -> LlamaSampler {
         LlamaSampler::dist(seed),
     ])
 }
+
+#[cfg(all(test, feature = "common"))]
+mod grammar_tests {
+    //! Run the tool grammar through llama.cpp itself, using a vocab-only GGUF
+    //! (tokenizer only, no weights, ~6 MB) so no real model is needed.
+
+    use super::*;
+    use crate::chat_format::ToolFormat;
+    use crate::common_chat::ReasoningFormat;
+    use llama_cpp_2::model::params::LlamaModelParams;
+    use llama_cpp_2::token::LlamaToken;
+    use llama_cpp_2::token::data::LlamaTokenData;
+    use llama_cpp_2::token::data_array::LlamaTokenDataArray;
+    use querymt::chat::{FunctionTool, Tool};
+    use std::path::PathBuf;
+
+    const VOCAB_URL: &str =
+        "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/models/ggml-vocab-qwen35.gguf";
+
+    /// `QMT_LLAMA_VOCAB_GGUF` overrides the location; otherwise the file is
+    /// downloaded once into the temp dir.
+    fn vocab_path() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os("QMT_LLAMA_VOCAB_GGUF") {
+            return Some(PathBuf::from(path));
+        }
+        let dir = std::env::temp_dir().join("qmt-llama-vocab");
+        let path = dir.join("ggml-vocab-qwen35.gguf");
+        if path.metadata().is_ok_and(|m| m.len() > 1_000_000) {
+            return Some(path);
+        }
+        std::fs::create_dir_all(&dir).ok()?;
+        let tmp = path.with_extension("part");
+        let ok = std::process::Command::new("curl")
+            .args(["-fsSL", "--retry", "3", "-o"])
+            .arg(&tmp)
+            .arg(VOCAB_URL)
+            .status()
+            .is_ok_and(|s| s.success());
+        (ok && std::fs::rename(&tmp, &path).is_ok()).then_some(path)
+    }
+
+    fn write_file_tool() -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionTool {
+                name: "write_file".to_string(),
+                description: "Write a file".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "content"]
+                }),
+                strict: None,
+            },
+        }
+    }
+
+    fn template_result(grammar: crate::common_chat::ToolGrammar) -> ChatTemplateResult {
+        ChatTemplateResult {
+            prompt: String::new(),
+            grammar: Some(grammar),
+            preserved_tokens: Vec::new(),
+            additional_stops: Vec::new(),
+            starts_in_thinking: false,
+            reasoning_format: ReasoningFormat::ThinkTags,
+            tools: vec![write_file_tool()],
+        }
+    }
+
+    /// Feed `prefix` through the sampler, then report which of `probe`'s
+    /// tokens the grammar still allows next.
+    fn allowed_after(
+        model: &Arc<LlamaModel>,
+        grammar: crate::common_chat::ToolGrammar,
+        prefix: &str,
+        probe: &str,
+    ) -> Vec<(LlamaToken, bool)> {
+        let result = template_result(grammar);
+        let cfg: LlamaCppConfig =
+            serde_json::from_value(serde_json::json!({ "model": "vocab-only" })).unwrap();
+        let params = SamplingParams::from_config(&cfg, None);
+        let mut sampler = build_tool_sampler(model, &result, &params).expect("sampler");
+        for token in model.vocab().tokenize(prefix.as_bytes(), false, true) {
+            sampler.accept(token);
+        }
+        let mut candidates = LlamaTokenDataArray::from_iter(
+            (0..model.n_vocab()).map(|id| LlamaTokenData::new(LlamaToken(id), 0.0, 0.0)),
+            false,
+        );
+        sampler.apply(&mut candidates);
+        let probes = model.vocab().tokenize(probe.as_bytes(), false, true);
+        probes
+            .into_iter()
+            .map(|token| {
+                let logit = candidates.data[token.0 as usize].logit();
+                (token, logit.is_finite())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grammar_does_not_mask_lt_inside_string_values() {
+        let Some(path) = vocab_path() else {
+            eprintln!("SKIPPED: vocab-only GGUF unavailable (offline?); set QMT_LLAMA_VOCAB_GGUF");
+            return;
+        };
+        let backend = crate::backend::llama_backend().expect("backend");
+        let model = Arc::new(
+            LlamaModel::load_from_file(
+                &backend,
+                &path,
+                &LlamaModelParams::default().with_vocab_only(true),
+            )
+            .expect("load vocab-only gguf"),
+        );
+
+        let prefix = "<tool_call>\n<function=write_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=content>\nif row[j]";
+        let probe = " <";
+        let tool = write_file_tool();
+
+        // Fixed grammar: ` <` must stay available mid-value.
+        let fixed = ToolFormat::QwenFunction
+            .grammar(std::slice::from_ref(&tool))
+            .unwrap();
+        let allowed = allowed_after(&model, fixed.clone(), prefix, probe);
+        assert!(!allowed.is_empty(), "probe tokenized to nothing");
+        assert!(
+            allowed.iter().all(|(_, ok)| *ok),
+            "`<` was masked by the fixed grammar: {allowed:?}"
+        );
+
+        // Negative control: the old `[^<]*` rule masks it. If this ever stops
+        // failing, the test is no longer proving anything.
+        let mut old = fixed;
+        old.grammar = old
+            .grammar
+            .lines()
+            .filter(|line| !line.starts_with("value-text"))
+            .chain(std::iter::once("value-text ::= [^<]*"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let allowed = allowed_after(&model, old, prefix, probe);
+        assert!(
+            allowed.iter().any(|(_, ok)| !*ok),
+            "old grammar unexpectedly allowed `<`: {allowed:?}"
+        );
+    }
+
+    #[test]
+    fn grammar_still_closes_the_parameter() {
+        let Some(path) = vocab_path() else {
+            eprintln!("SKIPPED: vocab-only GGUF unavailable (offline?); set QMT_LLAMA_VOCAB_GGUF");
+            return;
+        };
+        let backend = crate::backend::llama_backend().expect("backend");
+        let model = Arc::new(
+            LlamaModel::load_from_file(
+                &backend,
+                &path,
+                &LlamaModelParams::default().with_vocab_only(true),
+            )
+            .expect("load vocab-only gguf"),
+        );
+        let grammar = ToolFormat::QwenFunction
+            .grammar(&[write_file_tool()])
+            .unwrap();
+        // After `</parameter` only `>` may follow: the terminator cannot be
+        // broken into something else, and `</parameter>` itself is accepted.
+        let prefix = "<tool_call>\n<function=write_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=content>\nx\n</parameter";
+        let allowed = allowed_after(&model, grammar, prefix, ">");
+        assert!(allowed.iter().all(|(_, ok)| *ok), "{allowed:?}");
+    }
+}

@@ -1,4 +1,4 @@
-use crate::chat_format::parse_assistant_format_with_state;
+use crate::chat_format::parse_assistant_format_with_tools;
 use crate::common_chat::ChatTemplateResult;
 use crate::config::LlamaCppConfig;
 use crate::generation::decode_token_piece;
@@ -34,6 +34,7 @@ pub(crate) fn generate_with_tools(
             build_tool_sampler(model, result, &params)?
         };
         let mut output = String::new();
+        let mut reasoning = result.reasoning_counter();
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut preserved = HashSet::new();
         for value in &result.preserved_tokens {
@@ -52,6 +53,7 @@ pub(crate) fn generate_with_tools(
             Some(sampler),
             |token| {
                 let piece = decode_token_piece(model, &mut decoder, &preserved, token)?;
+                reasoning.observe(&piece);
                 output.push_str(&piece);
                 Ok(result
                     .additional_stops
@@ -66,14 +68,15 @@ pub(crate) fn generate_with_tools(
                 break;
             }
         }
+        let (output_tokens, reasoning_tokens) = reasoning.split(stats.output_tokens);
         return Ok(GeneratedText {
             text: output,
             usage: Usage {
                 input_tokens: stats.input_tokens,
-                output_tokens: stats.output_tokens,
+                output_tokens,
                 cache_read: 0,
                 cache_write: 0,
-                reasoning_tokens: 0,
+                reasoning_tokens,
                 cache_write_tiers: None,
             },
             termination: stats.termination,
@@ -122,6 +125,7 @@ pub(crate) fn generate_with_tools(
         build_tool_sampler(model, result, &params)?
     };
     let mut output_tokens = 0u32;
+    let mut reasoning = result.reasoning_counter();
     let mut output = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut first_token_logged = false;
@@ -180,6 +184,7 @@ pub(crate) fn generate_with_tools(
             .map_err(|e| LLMError::ProviderError(e.to_string()))?;
         state.n_cur += 1;
         output_tokens += 1;
+        reasoning.observe(&chunk);
 
         state
             .ctx
@@ -200,6 +205,7 @@ pub(crate) fn generate_with_tools(
         {
             output.push_str(forced);
             output_tokens += added;
+            reasoning.observe_forced(forced, added);
         }
     }
 
@@ -227,6 +233,7 @@ pub(crate) fn generate_with_tools(
         tail
     );
 
+    let (output_tokens, reasoning_tokens) = reasoning.split(output_tokens);
     Ok(GeneratedText {
         text: output,
         usage: Usage {
@@ -234,7 +241,7 @@ pub(crate) fn generate_with_tools(
             output_tokens,
             cache_read: 0,
             cache_write: 0,
-            reasoning_tokens: 0,
+            reasoning_tokens,
             cache_write_tiers: None,
         },
         termination,
@@ -259,7 +266,12 @@ pub(crate) fn parse_tool_response(
     log::debug!("Parsing tool response: text_len={}", text.len());
     log::debug!("Raw generated text: {}", text);
 
-    extract_parsed_response(text, result.reasoning_format, result.starts_in_thinking)
+    extract_parsed_response(
+        text,
+        result.reasoning_format,
+        result.starts_in_thinking,
+        &result.tools,
+    )
 }
 
 /// Extract content, thinking, tool calls and finish reason from a parsed
@@ -271,6 +283,7 @@ fn extract_parsed_response(
     text: &str,
     reasoning_format: crate::common_chat::ReasoningFormat,
     starts_in_thinking: bool,
+    tools: &[querymt::chat::Tool],
 ) -> Result<
     (
         String,
@@ -280,7 +293,8 @@ fn extract_parsed_response(
     ),
     LLMError,
 > {
-    let parsed = parse_assistant_format_with_state(text, reasoning_format, starts_in_thinking);
+    let parsed =
+        parse_assistant_format_with_tools(text, reasoning_format, starts_in_thinking, tools);
     let finish_reason = if parsed.tool_calls.is_some() {
         querymt::chat::FinishReason::ToolCalls
     } else {
@@ -318,6 +332,7 @@ mod tests {
             "Here is my answer.",
             crate::common_chat::ReasoningFormat::ThinkTags,
             false,
+            &[],
         )
         .unwrap();
 
@@ -331,9 +346,13 @@ mod tests {
     fn parses_thinking_and_qwen_tool_call() {
         let input = r#"<think>Need a file search.</think>
 <tool_call>{"name":"glob","arguments":{"pattern":"**/*.rs"}}</tool_call>"#;
-        let (content, thinking, tool_calls, finish_reason) =
-            extract_parsed_response(input, crate::common_chat::ReasoningFormat::ThinkTags, false)
-                .unwrap();
+        let (content, thinking, tool_calls, finish_reason) = extract_parsed_response(
+            input,
+            crate::common_chat::ReasoningFormat::ThinkTags,
+            false,
+            &[],
+        )
+        .unwrap();
 
         assert!(content.is_empty());
         assert_eq!(thinking.as_deref(), Some("Need a file search."));
@@ -348,9 +367,13 @@ mod tests {
     #[test]
     fn parses_qwen_function_tool_call() {
         let input = "<tool_call>\n<function=get_weather>\n<parameter=city>\nCopenhagen\n</parameter>\n</function>\n</tool_call>";
-        let (_, _, tool_calls, finish_reason) =
-            extract_parsed_response(input, crate::common_chat::ReasoningFormat::ThinkTags, false)
-                .unwrap();
+        let (_, _, tool_calls, finish_reason) = extract_parsed_response(
+            input,
+            crate::common_chat::ReasoningFormat::ThinkTags,
+            false,
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(finish_reason, FinishReason::ToolCalls);
         let calls = tool_calls.expect("tool_calls should be Some");
@@ -362,9 +385,13 @@ mod tests {
     #[test]
     fn parses_open_prompt_thinking_then_tool_call() {
         let input = "Thinking Process:\n1. analyze\n</think><tool_call>{\"name\":\"glob\",\"arguments\":{\"pattern\":\"**/*.rs\"}}</tool_call>";
-        let (content, thinking, tool_calls, finish_reason) =
-            extract_parsed_response(input, crate::common_chat::ReasoningFormat::ThinkTags, true)
-                .unwrap();
+        let (content, thinking, tool_calls, finish_reason) = extract_parsed_response(
+            input,
+            crate::common_chat::ReasoningFormat::ThinkTags,
+            true,
+            &[],
+        )
+        .unwrap();
 
         assert!(content.is_empty());
         assert_eq!(thinking.as_deref(), Some("Thinking Process:\n1. analyze"));
@@ -381,6 +408,7 @@ mod tests {
                 implicit_leading_reasoning_prefix: false,
             },
             false,
+            &[],
         )
         .unwrap();
 

@@ -46,6 +46,7 @@ pub(crate) fn generate_streaming_with_tools(
             }
         }
         let mut stream_state = result.streaming_state();
+        let mut reasoning = result.reasoning_counter();
         let stats = crate::mtp::run_mtp(
             model,
             mtp_model,
@@ -60,6 +61,7 @@ pub(crate) fn generate_streaming_with_tools(
                 }
 
                 let piece = decode_token_piece(model, &mut decoder, &preserved, token)?;
+                reasoning.observe(&piece);
                 text.push_str(&piece);
                 let stop_now = result
                     .additional_stops
@@ -77,14 +79,15 @@ pub(crate) fn generate_streaming_with_tools(
                 Ok(stop_now.then_some(GenerationTermination::StopSequence))
             },
         )?;
+        let (mtp_output, mtp_reasoning) = reasoning.split(stats.output_tokens);
         if stats.termination == GenerationTermination::ConsumerClosed {
             return Ok((
                 Usage {
                     input_tokens: stats.input_tokens,
-                    output_tokens: stats.output_tokens,
+                    output_tokens: mtp_output,
                     cache_read: 0,
                     cache_write: 0,
-                    reasoning_tokens: 0,
+                    reasoning_tokens: mtp_reasoning,
                     cache_write_tiers: None,
                 },
                 stats.termination,
@@ -117,11 +120,10 @@ pub(crate) fn generate_streaming_with_tools(
         return Ok((
             Usage {
                 input_tokens: stats.input_tokens,
-                output_tokens: stats.output_tokens,
-
+                output_tokens: mtp_output,
                 cache_read: 0,
                 cache_write: 0,
-                reasoning_tokens: 0,
+                reasoning_tokens: mtp_reasoning,
                 cache_write_tiers: None,
             },
             stats.termination,
@@ -171,6 +173,7 @@ pub(crate) fn generate_streaming_with_tools(
         build_tool_sampler(model, result, &params)?
     };
     let mut output_tokens = 0u32;
+    let mut reasoning = result.reasoning_counter();
     let mut generated_text = String::new();
     let mut termination = GenerationTermination::MaxTokens;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
@@ -183,13 +186,14 @@ pub(crate) fn generate_streaming_with_tools(
 
     while state.n_cur < state.n_len_total {
         if tx.is_closed() {
+            let (output_tokens, reasoning_tokens) = reasoning.split(output_tokens);
             return Ok((
                 Usage {
                     input_tokens: state.input_tokens,
                     output_tokens,
                     cache_read: 0,
                     cache_write: 0,
-                    reasoning_tokens: 0,
+                    reasoning_tokens,
                     cache_write_tiers: None,
                 },
                 GenerationTermination::ConsumerClosed,
@@ -219,13 +223,14 @@ pub(crate) fn generate_streaming_with_tools(
                     .unbounded_send(Ok(querymt::chat::StreamChunk::Thinking(thinking)))
                     .is_err()
                 {
+                    let (output_tokens, reasoning_tokens) = reasoning.split(output_tokens);
                     return Ok((
                         Usage {
                             input_tokens: state.input_tokens,
                             output_tokens,
                             cache_read: 0,
                             cache_write: 0,
-                            reasoning_tokens: 0,
+                            reasoning_tokens,
                             cache_write_tiers: None,
                         },
                         GenerationTermination::ConsumerClosed,
@@ -246,6 +251,7 @@ pub(crate) fn generate_streaming_with_tools(
             .map_err(|e| LLMError::ProviderError(e.to_string()))?;
         state.n_cur += 1;
         output_tokens += 1;
+        reasoning.observe(&chunk);
 
         state
             .ctx
@@ -266,6 +272,7 @@ pub(crate) fn generate_streaming_with_tools(
         {
             generated_text.push_str(forced);
             output_tokens += added;
+            reasoning.observe_forced(forced, added);
             for delta in stream_state.update(forced, true) {
                 if let ParsedDelta::Thinking(thinking) = delta {
                     let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Thinking(thinking)));
@@ -288,13 +295,14 @@ pub(crate) fn generate_streaming_with_tools(
                 .unbounded_send(Ok(querymt::chat::StreamChunk::Thinking(thinking)))
                 .is_err()
             {
+                let (output_tokens, reasoning_tokens) = reasoning.split(output_tokens);
                 return Ok((
                     Usage {
                         input_tokens: state.input_tokens,
                         output_tokens,
                         cache_read: 0,
                         cache_write: 0,
-                        reasoning_tokens: 0,
+                        reasoning_tokens,
                         cache_write_tiers: None,
                     },
                     GenerationTermination::ConsumerClosed,
@@ -304,6 +312,7 @@ pub(crate) fn generate_streaming_with_tools(
         }
     }
 
+    let (output_tokens, reasoning_tokens) = reasoning.split(output_tokens);
     if tx.is_closed() {
         return Ok((
             Usage {
@@ -311,7 +320,7 @@ pub(crate) fn generate_streaming_with_tools(
                 output_tokens,
                 cache_read: 0,
                 cache_write: 0,
-                reasoning_tokens: 0,
+                reasoning_tokens,
                 cache_write_tiers: None,
             },
             GenerationTermination::ConsumerClosed,
@@ -347,7 +356,7 @@ pub(crate) fn generate_streaming_with_tools(
             output_tokens,
             cache_read: 0,
             cache_write: 0,
-            reasoning_tokens: 0,
+            reasoning_tokens,
             cache_write_tiers: None,
         },
         termination,

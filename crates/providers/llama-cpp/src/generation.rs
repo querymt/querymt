@@ -589,6 +589,7 @@ pub(crate) fn generate_streaming_with_thinking(
 ) -> Result<(Usage, GenerationTermination), LLMError> {
     if cfg.speculative.is_some() && bitmaps.is_empty() {
         let mut stream_state = result.streaming_state();
+        let mut reasoning = result.reasoning_counter();
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let preserved = preserved_token_set(model, Some(result));
         let stats = crate::mtp::run_mtp(
@@ -601,6 +602,7 @@ pub(crate) fn generate_streaming_with_thinking(
             None,
             |token| {
                 let piece = decode_token_piece(model, &mut decoder, &preserved, token)?;
+                reasoning.observe(&piece);
                 for delta in stream_state.update(&piece, true) {
                     let chunk = match delta {
                         ParsedDelta::Content(v) => querymt::chat::StreamChunk::Text(v),
@@ -620,13 +622,14 @@ pub(crate) fn generate_streaming_with_thinking(
             };
             let _ = tx.unbounded_send(Ok(chunk));
         }
+        let (output_tokens, reasoning_tokens) = reasoning.split(stats.output_tokens);
         return Ok((
             Usage {
                 input_tokens: stats.input_tokens,
-                output_tokens: stats.output_tokens,
+                output_tokens,
                 cache_read: 0,
                 cache_write: 0,
-                reasoning_tokens: 0,
+                reasoning_tokens,
                 cache_write_tiers: None,
             },
             stats.termination,
@@ -826,6 +829,7 @@ pub(crate) fn generate_streaming_with_thinking(
     let mut n_cur = n_past;
     let n_len_total = n_past + max_tokens as i32;
     let mut output_tokens = 0u32;
+    let mut reasoning = result.reasoning_counter();
     let mut termination = GenerationTermination::MaxTokens;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let preserved = preserved_token_set(model, Some(result));
@@ -852,13 +856,14 @@ pub(crate) fn generate_streaming_with_thinking(
                 ParsedDelta::Thinking(thinking) => querymt::chat::StreamChunk::Thinking(thinking),
             };
             if tx.unbounded_send(Ok(stream_chunk)).is_err() {
+                let (output_tokens, reasoning_tokens) = reasoning.split(output_tokens);
                 return Ok((
                     Usage {
                         input_tokens: input_tokens as u32,
                         output_tokens,
                         cache_read: 0,
                         cache_write: 0,
-                        reasoning_tokens: 0,
+                        reasoning_tokens,
                         cache_write_tiers: None,
                     },
                     GenerationTermination::ConsumerClosed,
@@ -872,6 +877,7 @@ pub(crate) fn generate_streaming_with_thinking(
             .map_err(|e| LLMError::ProviderError(e.to_string()))?;
         n_cur += 1;
         output_tokens += 1;
+        reasoning.observe(&chunk);
 
         ctx.decode(&mut batch)
             .map_err(|e| LLMError::ProviderError(e.to_string()))?;
@@ -889,6 +895,7 @@ pub(crate) fn generate_streaming_with_thinking(
             )?
         {
             output_tokens += added;
+            reasoning.observe_forced(forced, added);
             for delta in stream_state.update(forced, true) {
                 let stream_chunk = match delta {
                     ParsedDelta::Content(content) => querymt::chat::StreamChunk::Text(content),
@@ -911,13 +918,14 @@ pub(crate) fn generate_streaming_with_thinking(
         }
     }
 
+    let (output_tokens, reasoning_tokens) = reasoning.split(output_tokens);
     Ok((
         Usage {
             input_tokens: input_tokens as u32,
             output_tokens,
             cache_read: 0,
             cache_write: 0,
-            reasoning_tokens: 0,
+            reasoning_tokens,
             cache_write_tiers: None,
         },
         termination,

@@ -3,6 +3,7 @@ mod chat_format;
 mod common_chat;
 mod config;
 mod context;
+mod gbnf;
 mod generation;
 mod memory;
 mod messages;
