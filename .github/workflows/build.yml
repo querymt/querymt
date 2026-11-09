@@ -99,24 +99,24 @@ jobs:
             cargo_features: oauth,dashboard,zbus-secret-service,systemd-credentials,remote
 
           # ─── macOS ─────────────────────────────────────────────────────────
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
             binary: qmt
             bin_name: qmt
             archive_ext: tar.gz
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             binary: qmt
             bin_name: qmt
             archive_ext: tar.gz
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
             binary: qmtcode
             bin_name: qmtcode
             archive_ext: tar.gz
             cargo_package: querymt-agent
             cargo_features: oauth,dashboard,remote
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             binary: qmtcode
             bin_name: qmtcode
