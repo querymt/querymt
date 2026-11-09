@@ -413,12 +413,34 @@ fn required_params(schema: &Value) -> HashSet<&str> {
         .unwrap_or_default()
 }
 
-/// True when the schema declares a plain string, i.e. the value must reach
-/// the tool verbatim instead of being coerced through JSON.
-fn is_text_param(schema: &Value) -> bool {
-    schema.get("type").and_then(Value::as_str) == Some("string")
+/// Declared JSON-schema types, whether `type` is a single string or an array.
+fn schema_types(schema: &Value) -> impl Iterator<Item = &str> {
+    let ty = schema.get("type");
+    ty.and_then(Value::as_str).into_iter().chain(
+        ty.and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+    )
 }
 
+/// True when the schema allows a string, i.e. the value must reach the tool
+/// verbatim instead of being coerced through JSON.
+fn is_text_param(schema: &Value) -> bool {
+    schema_types(schema).any(|t| t == "string")
+}
+
+/// Value for a text parameter: the raw text, except a literal `null` when
+/// the schema explicitly allows `"null"`.
+fn text_param_value(raw: &str, schema: &Value) -> Value {
+    if raw == "null" && schema_types(schema).any(|t| t == "null") {
+        Value::Null
+    } else {
+        Value::String(raw.to_string())
+    }
+}
+
+/// Look up the JSON schema of parameter `param` of tool `tool`, if declared.
 fn param_schema<'a>(tools: &'a [Tool], tool: &str, param: &str) -> Option<&'a Value> {
     tools
         .iter()
@@ -432,13 +454,14 @@ fn param_schema<'a>(tools: &'a [Tool], tool: &str, param: &str) -> Option<&'a Va
 /// Convert the raw text of a parameter into a JSON value. Declared strings
 /// stay exactly as written; everything else is parsed as JSON when possible.
 fn coerce_param_value(raw: &str, schema: Option<&Value>) -> Value {
-    if schema.is_some_and(is_text_param) {
-        return Value::String(raw.to_string());
+    if let Some(schema) = schema.filter(|s| is_text_param(s)) {
+        return text_param_value(raw, schema);
     }
     let trimmed = raw.trim();
     serde_json::from_str(trimmed).unwrap_or_else(|_| Value::String(trimmed.to_string()))
 }
 
+/// GBNF expression matching a parameter value of the given schema type.
 fn parameter_value_expr(schema: &Value, _rule_name: &str) -> String {
     match schema.get("type").and_then(|value| value.as_str()) {
         Some("string") | None => {
@@ -521,11 +544,13 @@ struct QwenSpan {
     call: Option<ToolCall>,
 }
 
+/// Return the first offset at or after `pos` that is not whitespace.
 fn skip_ws(text: &str, pos: usize) -> usize {
     let rest = &text[pos..];
     pos + (rest.len() - rest.trim_start().len())
 }
 
+/// Find every `<tool_call><function=..>` block and the span it occupies.
 fn scan_qwen_function_calls(text: &str, tools: &[Tool]) -> Vec<QwenSpan> {
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
@@ -694,6 +719,7 @@ fn parse_lfm2_call(raw: &str) -> Option<ToolCall> {
     })
 }
 
+/// Extract complete `<start_function_call>..<end_function_call>` calls.
 fn extract_function_gemma_tool_calls(text: &str, tools: &[Tool]) -> Vec<ToolCall> {
     const OPEN: &str = "<start_function_call>";
     const CLOSE: &str = "<end_function_call>";
@@ -748,8 +774,8 @@ fn parse_gemma_call_body(text: &str, start: usize, tools: &[Tool]) -> Option<(To
             let value_end = text[value_start..].find(ESC)? + value_start;
             cursor = value_end + ESC.len();
             let raw = &text[value_start..value_end];
-            if schema.is_some_and(is_text_param) {
-                Value::String(raw.to_string())
+            if let Some(schema) = schema.filter(|s| is_text_param(s)) {
+                text_param_value(raw, schema)
             } else {
                 parse_pythonish_value(raw.trim())
             }
@@ -964,6 +990,7 @@ fn parse_gemma4_object_at(text: &str, pos: &mut usize) -> Option<Value> {
     }
 }
 
+/// Parse one Gemma 4 argument value at `pos`, advancing `pos` past it.
 fn parse_gemma4_value_at(text: &str, pos: &mut usize) -> Option<Value> {
     const Q: &str = "<|\"|>";
     *pos = skip_ws(text, *pos);
@@ -1146,6 +1173,7 @@ mod tests {
         assert_eq!(parsed.content, "Final");
     }
 
+    /// `write_file` tool with string, integer and unknown-typed parameters.
     fn write_file_tool() -> Tool {
         Tool {
             tool_type: "function".to_string(),
@@ -1167,6 +1195,7 @@ mod tests {
         }
     }
 
+    /// Parse `text` against [`write_file_tool`] and return its tool calls.
     fn parse_with_tools(text: &str) -> Vec<ToolCall> {
         parse_assistant_format_with_tools(
             text,
@@ -1178,6 +1207,7 @@ mod tests {
         .unwrap_or_default()
     }
 
+    /// Render a Qwen `<function=write_file>` call with the given content.
     fn qwen_call(content: &str) -> String {
         format!(
             "<tool_call>\n<function=write_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=content>\n{content}\n</parameter>\n</function>\n</tool_call>"
@@ -1280,6 +1310,51 @@ mod tests {
         );
         assert!(parsed.tool_calls.is_none());
         assert_eq!(parsed.content, "Sure.");
+    }
+
+    #[test]
+    fn type_arrays_containing_string_stay_verbatim() {
+        let nullable = serde_json::json!({"type": ["string", "null"]});
+        assert_eq!(coerce_param_value("42", Some(&nullable)), "42");
+        assert_eq!(coerce_param_value(" true \n", Some(&nullable)), " true \n");
+        assert_eq!(coerce_param_value("null", Some(&nullable)), Value::Null);
+        let plain = serde_json::json!({"type": "string"});
+        assert_eq!(coerce_param_value("null", Some(&plain)), "null");
+        let untyped = serde_json::json!({});
+        assert_eq!(coerce_param_value("null", Some(&untyped)), Value::Null);
+        assert_eq!(coerce_param_value("42", Some(&untyped)), 42);
+    }
+
+    #[test]
+    fn function_gemma_keeps_nullable_string_verbatim() {
+        let tool = Tool {
+            tool_type: "function".to_string(),
+            function: querymt::chat::FunctionTool {
+                name: "note".to_string(),
+                description: "Take a note".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"text": {"type": ["string", "null"]}}
+                }),
+                strict: None,
+            },
+        };
+        let parse = |value: &str| -> Value {
+            let text = format!(
+                "<start_function_call>call:note{{text:<escape>{value}<escape>}}<end_function_call>"
+            );
+            let calls = parse_assistant_format_with_tools(
+                &text,
+                ReasoningFormat::ThinkTags,
+                false,
+                std::slice::from_ref(&tool),
+            )
+            .tool_calls
+            .unwrap();
+            serde_json::from_str::<Value>(&calls[0].function.arguments).unwrap()["text"].clone()
+        };
+        assert_eq!(parse(" 123 "), " 123 ");
+        assert_eq!(parse("null"), Value::Null);
     }
 
     #[test]

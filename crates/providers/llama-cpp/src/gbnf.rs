@@ -47,6 +47,7 @@ pub(crate) struct ExclusionDfa {
 }
 
 impl ExclusionDfa {
+    /// Build the automaton for text that never contains `terminator`.
     pub(crate) fn new(terminator: &str) -> Self {
         let terminator: Vec<char> = terminator.chars().collect();
         assert!(!terminator.is_empty(), "terminator must not be empty");
@@ -59,6 +60,7 @@ impl ExclusionDfa {
         }
     }
 
+    /// State reached once the full terminator has been read (rejecting).
     fn dead_state(&self) -> usize {
         self.terminator.len()
     }

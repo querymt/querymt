@@ -85,6 +85,7 @@ pub(crate) struct GrammarTrigger {
 }
 
 impl ChatTemplateResult {
+    /// Counter that splits output tokens into reasoning and answer tokens.
     pub(crate) fn reasoning_counter(&self) -> ReasoningTokenCounter {
         ReasoningTokenCounter::new(self.reasoning_format, self.starts_in_thinking)
     }
@@ -257,6 +258,7 @@ pub(crate) struct ReasoningTokenCounter {
 impl ReasoningTokenCounter {
     const TAIL_BYTES: usize = 64;
 
+    /// Create a counter, optionally starting inside a reasoning block.
     pub(crate) fn new(reasoning_format: ReasoningFormat, starts_in_thinking: bool) -> Self {
         Self {
             in_thinking: starts_in_thinking,
@@ -420,6 +422,7 @@ fn longest_suffix_prefix_len(buffer: &str, marker: &str) -> usize {
 mod reasoning_counter_tests {
     use super::*;
 
+    /// Feed one token per piece and return the `(reasoning, output)` split.
     fn count(format: ReasoningFormat, starts: bool, pieces: &[&str]) -> (u32, u32) {
         let mut counter = ReasoningTokenCounter::new(format, starts);
         for piece in pieces {

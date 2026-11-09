@@ -282,8 +282,8 @@ mod grammar_tests {
     use querymt::chat::{FunctionTool, Tool};
     use std::path::PathBuf;
 
-    const VOCAB_URL: &str =
-        "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/models/ggml-vocab-qwen35.gguf";
+    /// Pinned to the llama.cpp commit that added the vocab file.
+    const VOCAB_URL: &str = "https://raw.githubusercontent.com/ggml-org/llama.cpp/42532afff43910e619a650c1704525b3acbbec5a/models/ggml-vocab-qwen35.gguf";
 
     /// `QMT_LLAMA_VOCAB_GGUF` overrides the location; otherwise the file is
     /// downloaded once into the temp dir.
@@ -297,16 +297,36 @@ mod grammar_tests {
             return Some(path);
         }
         std::fs::create_dir_all(&dir).ok()?;
-        let tmp = path.with_extension("part");
+        // Unique per process and thread so concurrent test runs never share it.
+        let thread: String = format!("{:?}", std::thread::current().id())
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect();
+        let tmp = dir.join(format!(
+            "ggml-vocab-qwen35.gguf.{}.{thread}.part",
+            std::process::id()
+        ));
         let ok = std::process::Command::new("curl")
             .args(["-fsSL", "--retry", "3", "-o"])
             .arg(&tmp)
             .arg(VOCAB_URL)
             .status()
             .is_ok_and(|s| s.success());
-        (ok && std::fs::rename(&tmp, &path).is_ok()).then_some(path)
+        if !ok {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+        if std::fs::rename(&tmp, &path).is_ok() {
+            return Some(path);
+        }
+        // Another runner may have finished first; accept its file.
+        let _ = std::fs::remove_file(&tmp);
+        path.metadata()
+            .is_ok_and(|m| m.len() > 1_000_000)
+            .then_some(path)
     }
 
+    /// `write_file` tool with string `path` and `content` parameters.
     fn write_file_tool() -> Tool {
         Tool {
             tool_type: "function".to_string(),
@@ -326,6 +346,7 @@ mod grammar_tests {
         }
     }
 
+    /// Wrap a tool grammar in an otherwise empty template result.
     fn template_result(grammar: crate::common_chat::ToolGrammar) -> ChatTemplateResult {
         ChatTemplateResult {
             prompt: String::new(),
