@@ -173,13 +173,14 @@ pub struct LlamaCppConfig {
     pub json_schema: Option<StructuredOutputFormat>,
     /// Engine that enforces tool-call grammars.
     ///
-    /// `gbnf` (default) uses llama.cpp's GBNF grammar. `llguidance` compiles
-    /// the tool grammar to an llguidance (Lark) grammar, whose token masks
-    /// are computed from a token trie; it is used for the Qwen XML-function
-    /// (`<function=..>`) and Ministral formats and falls back to `gbnf` for
-    /// the others. Both are applied by rejection sampling: the grammar checks
-    /// the sampled token and is applied to the whole vocabulary only when
-    /// that token is rejected.
+    /// `llguidance` (default) compiles the tool grammar to an llguidance
+    /// (Lark) grammar, whose token masks are computed from a token trie and
+    /// which follows the tools' parameter schemas. It falls back to the
+    /// `gbnf` grammar when it cannot be built or fails mid-request, and in
+    /// builds without llguidance. `gbnf` uses llama.cpp's GBNF grammar.
+    /// Both are applied by rejection sampling: the grammar checks the
+    /// sampled token and is applied to the whole vocabulary only when that
+    /// token is rejected.
     pub grammar_backend: Option<GrammarBackend>,
 }
 
@@ -188,9 +189,9 @@ pub struct LlamaCppConfig {
 #[serde(rename_all = "snake_case")]
 pub enum GrammarBackend {
     /// llama.cpp GBNF grammar sampler.
-    #[default]
     Gbnf,
     /// llguidance token-trie matcher.
+    #[default]
     Llguidance,
 }
 
@@ -304,7 +305,23 @@ pub enum FlashAttentionPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::{SpeculativeConfig, SpeculativeType};
+    use super::{GrammarBackend, SpeculativeConfig, SpeculativeType};
+
+    #[test]
+    fn grammar_backend_rejects_unknown_value() {
+        let err = serde_json::from_value::<super::LlamaCppConfig>(serde_json::json!({
+            "model": "test.gguf", "grammar_backend": "fast"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("fast") && err.contains("llguidance"), "{err}");
+        let ok: super::LlamaCppConfig = serde_json::from_value(serde_json::json!({
+            "model": "test.gguf", "grammar_backend": "gbnf"
+        }))
+        .unwrap();
+        assert_eq!(ok.grammar_backend, Some(GrammarBackend::Gbnf));
+        assert_eq!(GrammarBackend::default(), GrammarBackend::Llguidance);
+    }
 
     #[test]
     fn portable_instruction_hints_preserve_text_for_local_models() {

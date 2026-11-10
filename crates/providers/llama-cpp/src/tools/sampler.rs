@@ -93,9 +93,36 @@ enum Constraint {
     /// A llama.cpp sampler that masks logits (GBNF, or llguidance for
     /// structured output).
     Sampler(LlamaSampler),
-    /// Lazy llguidance tool grammar.
+    /// Lazy llguidance tool grammar, with what is needed to continue on
+    /// GBNF if the matcher fails.
     #[cfg(feature = "common")]
-    Llg(Box<crate::tools::llg::LlgToolGrammar>),
+    Llg(Box<LlgState>),
+    /// No constraint left (llguidance failed and GBNF could not be built).
+    #[cfg(feature = "common")]
+    Open,
+}
+
+/// An llguidance tool grammar plus its GBNF equivalent (design D5).
+#[cfg(feature = "common")]
+struct LlgState {
+    grammar: crate::tools::llg::LlgToolGrammar,
+    gbnf: crate::common_chat::ToolGrammar,
+    model: Arc<LlamaModel>,
+    /// Every token accepted so far, replayed into GBNF on a switch.
+    accepted: Vec<LlamaToken>,
+}
+
+#[cfg(feature = "common")]
+impl LlgState {
+    /// Build the GBNF sampler and replay the accepted tokens into it, which
+    /// re-runs its lazy trigger.
+    fn into_gbnf(self) -> Result<LlamaSampler, LLMError> {
+        let mut sampler = build_gbnf_sampler(&self.model, &self.gbnf)?;
+        for token in &self.accepted {
+            sampler.accept(*token);
+        }
+        Ok(sampler)
+    }
 }
 
 impl Constraint {
@@ -110,15 +137,53 @@ impl Constraint {
                 probe.data.first().is_some_and(|d| d.logit().is_finite())
             }
             #[cfg(feature = "common")]
-            Self::Llg(grammar) => grammar.allows(token),
+            Self::Llg(state) => {
+                let allowed = state.grammar.allows(token);
+                if self.recover() {
+                    return self.allows(token, probe);
+                }
+                allowed
+            }
+            #[cfg(feature = "common")]
+            Self::Open => true,
         }
+    }
+
+    /// If the llguidance matcher failed, continue on GBNF (or, should that
+    /// fail too, unconstrained). Logged once; returns whether it switched.
+    #[cfg(feature = "common")]
+    fn recover(&mut self) -> bool {
+        let Self::Llg(state) = self else {
+            return false;
+        };
+        let Some(error) = state.grammar.failure().map(str::to_owned) else {
+            return false;
+        };
+        let Self::Llg(state) = std::mem::replace(self, Self::Open) else {
+            unreachable!("checked above");
+        };
+        crate::tools::llg::note_fallback(format_args!(
+            "llguidance tool grammar failed ({error}); continuing with GBNF"
+        ));
+        match state.into_gbnf() {
+            Ok(sampler) => *self = Self::Sampler(sampler),
+            Err(error) => log::error!("GBNF fallback failed ({error}); output is unconstrained"),
+        }
+        true
     }
 
     fn apply(&mut self, cur: &mut LlamaTokenDataArray) {
         match self {
             Self::Sampler(grammar) => grammar.apply(cur),
             #[cfg(feature = "common")]
-            Self::Llg(grammar) => grammar.apply(cur),
+            Self::Llg(state) => {
+                state.grammar.apply(cur);
+                if self.recover() {
+                    self.apply(cur);
+                }
+            }
+            #[cfg(feature = "common")]
+            Self::Open => {}
         }
     }
 
@@ -126,7 +191,13 @@ impl Constraint {
         match self {
             Self::Sampler(grammar) => grammar.accept(token),
             #[cfg(feature = "common")]
-            Self::Llg(grammar) => grammar.accept(token),
+            Self::Llg(state) => {
+                state.accepted.push(token);
+                state.grammar.accept(token);
+                self.recover();
+            }
+            #[cfg(feature = "common")]
+            Self::Open => {}
         }
     }
 }
@@ -242,6 +313,23 @@ impl ConstrainedSampler {
         }
     }
 
+    /// Grammar tier in use, `None` when not llguidance (tests).
+    #[cfg(all(test, feature = "common"))]
+    pub(crate) fn llg_tier(&self) -> Option<crate::tools::llg::Tier> {
+        match self.constraint.as_ref() {
+            Some(Constraint::Llg(state)) => Some(state.grammar.tier()),
+            _ => None,
+        }
+    }
+
+    /// Simulate an llguidance matcher error (tests).
+    #[cfg(all(test, feature = "common"))]
+    pub(crate) fn inject_llg_error(&mut self) {
+        if let Some(Constraint::Llg(state)) = self.constraint.as_mut() {
+            state.grammar.inject_error();
+        }
+    }
+
     /// Whole-vocabulary masks computed by `sample_logits` (tests).
     #[cfg(test)]
     pub(crate) fn full_masks(&self) -> u32 {
@@ -291,8 +379,14 @@ pub(crate) fn build_tool_sampler(
         match crate::tools::llg::LlgToolGrammar::build(model, tool_grammar, &result.tools) {
             Ok(Some(grammar)) => {
                 log::debug!("build_tool_sampler: using llguidance tool grammar");
+                let state = LlgState {
+                    grammar,
+                    gbnf: tool_grammar.clone(),
+                    model: Arc::clone(model),
+                    accepted: Vec::new(),
+                };
                 return Ok(ConstrainedSampler::new(
-                    Some(Constraint::Llg(Box::new(grammar))),
+                    Some(Constraint::Llg(Box::new(state))),
                     chain,
                 ));
             }
@@ -300,9 +394,9 @@ pub(crate) fn build_tool_sampler(
                 "build_tool_sampler: no llguidance port for {:?}; using GBNF",
                 tool_grammar.format
             ),
-            Err(error) => {
-                log::warn!("build_tool_sampler: llguidance grammar failed ({error}); using GBNF")
-            }
+            Err(error) => crate::tools::llg::note_fallback(format_args!(
+                "llguidance tool grammar unavailable ({error}); using GBNF"
+            )),
         }
     }
     #[cfg(not(feature = "common"))]
@@ -739,6 +833,127 @@ mod grammar_tests {
         // Unconstrained position: the favourite wins without a full mask.
         let mut sampler = sampler_after(&model, grammar, CONTENT_PREFIX, GrammarBackend::Gbnf);
         assert_eq!(sampler.sample_logits(&logits), bad);
+    }
+
+    /// Sampler for a config JSON, resolving the engine the way the
+    /// generation paths do.
+    fn sampler_for_config(
+        model: &Arc<LlamaModel>,
+        config: serde_json::Value,
+    ) -> ConstrainedSampler {
+        let mut config = config;
+        config["model"] = "vocab-only".into();
+        let cfg: LlamaCppConfig = serde_json::from_value(config).unwrap();
+        let grammar = ToolFormat::QwenFunction
+            .grammar(&[write_file_tool()])
+            .unwrap();
+        build_tool_sampler(
+            model,
+            &template_result(grammar),
+            &SamplingParams::from_config(&cfg, None),
+            cfg.grammar_backend.unwrap_or_default(),
+        )
+        .expect("sampler")
+    }
+
+    #[test]
+    fn grammar_backend_defaults_to_llguidance() {
+        let Some(model) = vocab_model() else { return };
+        let sampler = sampler_for_config(&model, serde_json::json!({}));
+        assert!(sampler.uses_llguidance());
+    }
+
+    #[test]
+    fn grammar_backend_gbnf_selects_gbnf() {
+        let Some(model) = vocab_model() else { return };
+        let sampler = sampler_for_config(&model, serde_json::json!({"grammar_backend": "gbnf"}));
+        assert!(!sampler.uses_llguidance());
+    }
+
+    fn tool_with_options_schema(options: serde_json::Value) -> Tool {
+        let mut tool = write_file_tool();
+        tool.function.parameters["properties"]["options"] = options;
+        tool
+    }
+
+    #[test]
+    fn uncompilable_schema_falls_back_to_generic_grammar() {
+        use crate::tools::llg::Tier;
+        let Some(model) = vocab_model() else { return };
+        let build = |options: serde_json::Value| {
+            let tool = tool_with_options_schema(options);
+            let grammar = ToolFormat::QwenFunction
+                .grammar(std::slice::from_ref(&tool))
+                .unwrap();
+            let mut result = template_result(grammar);
+            result.tools = vec![tool];
+            let cfg: LlamaCppConfig =
+                serde_json::from_value(serde_json::json!({ "model": "vocab-only" })).unwrap();
+            build_tool_sampler(
+                &model,
+                &result,
+                &SamplingParams::from_config(&cfg, None),
+                GrammarBackend::Llguidance,
+            )
+            .expect("request path succeeds")
+        };
+
+        // Control: a compilable object schema stays on the schema tier.
+        let before = fallbacks();
+        let sampler =
+            build(serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}}));
+        assert_eq!(sampler.llg_tier(), Some(Tier::Schema));
+        assert_eq!(fallbacks() - before, 0);
+
+        // An unresolvable `$ref` cannot be compiled.
+        let before = fallbacks();
+        let sampler = build(serde_json::json!({"type": "object", "$ref": "#/definitions/missing"}));
+        assert_eq!(sampler.llg_tier(), Some(Tier::Generic));
+        assert_eq!(fallbacks() - before, 1);
+    }
+
+    fn fallbacks() -> u32 {
+        crate::tools::llg::test_hooks::FALLBACKS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn matcher_error_switches_to_gbnf() {
+        let Some(model) = vocab_model() else { return };
+        let grammar = ToolFormat::QwenFunction
+            .grammar(&[write_file_tool()])
+            .unwrap();
+        let before = fallbacks();
+        let mut sampler = sampler_after(&model, grammar, "<tool_call>", GrammarBackend::Llguidance);
+        assert!(sampler.uses_llguidance());
+        sampler.inject_llg_error();
+        // `s` is forbidden right after the trigger. Only a GBNF sampler that
+        // replayed `<tool_call>` knows that.
+        let bad = model.vocab().tokenize(b"s", false, true)[0];
+        assert!(!sampler.allows(bad), "constraint was dropped");
+        assert!(!sampler.uses_llguidance());
+        assert_eq!(fallbacks() - before, 1);
+        // The switch happens once; further use logs nothing more.
+        let newline = model.vocab().tokenize(b"\n", false, true)[0];
+        assert!(sampler.allows(newline));
+        sampler.accept(newline);
+        assert_eq!(fallbacks() - before, 1);
+    }
+
+    #[test]
+    fn llguidance_build_failure_uses_gbnf() {
+        let Some(model) = vocab_model() else { return };
+        let before = fallbacks();
+        crate::tools::llg::test_hooks::FORCE_BUILD_ERROR.with(|f| f.set(true));
+        let mut sampler = sampler_for_config(&model, serde_json::json!({}));
+        crate::tools::llg::test_hooks::FORCE_BUILD_ERROR.with(|f| f.set(false));
+        assert!(!sampler.uses_llguidance());
+        assert_eq!(fallbacks() - before, 1);
+        // The request path works: the GBNF grammar constrains it.
+        for token in model.vocab().tokenize(b"<tool_call>", false, true) {
+            sampler.accept(token);
+        }
+        let bad = model.vocab().tokenize(b"s", false, true)[0];
+        assert!(!sampler.allows(bad));
     }
 
     /// Logits where `favourite` beats `runner_up`, which beats everything else.

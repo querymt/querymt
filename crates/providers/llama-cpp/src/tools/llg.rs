@@ -42,6 +42,27 @@ const GRAMMAR_CACHE: usize = 8;
 
 static ENVS: Mutex<Vec<ModelEnv>> = Mutex::new(Vec::new());
 
+/// Log a fallback from llguidance (to a coarser grammar or to GBNF). Each
+/// fallback happens at most once per request.
+pub(crate) fn note_fallback(message: std::fmt::Arguments<'_>) {
+    log::warn!("{message}");
+    #[cfg(test)]
+    test_hooks::FALLBACKS.with(|count| count.set(count.get() + 1));
+}
+
+/// Per-thread switches and counters for tests.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Fallback messages logged on this thread.
+        pub(crate) static FALLBACKS: Cell<u32> = const { Cell::new(0) };
+        /// Make `LlgToolGrammar::build` fail.
+        pub(crate) static FORCE_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
+    }
+}
+
 fn with_env<T>(model: &Arc<LlamaModel>, f: impl FnOnce(&mut ModelEnv) -> T) -> Result<T, String> {
     let mut envs = ENVS.lock().unwrap_or_else(|e| e.into_inner());
     envs.retain(|env| env.model.strong_count() > 0);
@@ -86,15 +107,28 @@ impl ModelEnv {
     }
 }
 
+/// How closely a grammar follows the tools' JSON schemas (design D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tier {
+    /// Parameter names, types, enums and required parameters follow the
+    /// schema, including nested array and object schemas.
+    Schema,
+    /// Call structure and tool names only: the language of the GBNF grammar.
+    Generic,
+}
+
 /// Lazy tool-call constraint backed by llguidance.
 pub(crate) struct LlgToolGrammar {
+    tier: Tier,
     template: Matcher,
     tok_env: TokEnv,
     trigger: Vec<u8>,
     /// Recent output bytes while waiting for the trigger.
     tail: Vec<u8>,
     active: Option<Matcher>,
-    failed: bool,
+    /// First matcher error; once set the matcher is no longer used and the
+    /// owner is expected to switch engines.
+    error: Option<String>,
 }
 
 impl LlgToolGrammar {
@@ -105,6 +139,10 @@ impl LlgToolGrammar {
         grammar: &ToolGrammar,
         tools: &[Tool],
     ) -> Result<Option<Self>, String> {
+        #[cfg(test)]
+        if test_hooks::FORCE_BUILD_ERROR.with(std::cell::Cell::get) {
+            return Err("llguidance build forced to fail by a test".into());
+        }
         if !grammar.lazy || grammar.triggers.len() != 1 {
             return Ok(None);
         }
@@ -127,33 +165,63 @@ impl LlgToolGrammar {
                     _ => literal,
                 }
             };
-            let lark = match grammar.format {
-                ToolFormat::QwenFunction => qwen_function_lark(tools, &tag),
-                ToolFormat::Ministral3 => ministral_lark(tools, &tag),
+            let generate = |tier| match grammar.format {
+                ToolFormat::QwenFunction => qwen_function_lark(tools, &tag, tier),
+                ToolFormat::Ministral3 => ministral_lark(tools, &tag, tier),
                 _ => None,
             };
-            let Some(lark) = lark else {
+            let Some(schema_lark) = generate(Tier::Schema) else {
                 return Ok(None);
             };
-            let template = env.matcher(&lark)?;
+            let (template, tier) = match env.matcher(&schema_lark) {
+                Ok(matcher) => (matcher, Tier::Schema),
+                Err(error) => {
+                    // Retrying an identical grammar cannot succeed.
+                    let Some(generic) = generate(Tier::Generic).filter(|g| *g != schema_lark)
+                    else {
+                        return Err(error);
+                    };
+                    note_fallback(format_args!(
+                        "llguidance schema grammar failed ({error}); using the generic grammar"
+                    ));
+                    (env.matcher(&generic)?, Tier::Generic)
+                }
+            };
             Ok(Some(Self {
+                tier,
                 template,
                 tok_env,
                 trigger,
                 tail: Vec::new(),
                 active: None,
-                failed: false,
+                error: None,
             }))
         })?
     }
 
+    /// Which grammar tier is enforced.
+    #[cfg(test)]
+    pub(crate) fn tier(&self) -> Tier {
+        self.tier
+    }
+
     fn fail(&mut self, error: impl std::fmt::Display) {
-        log::warn!("llguidance tool grammar disabled for this generation: {error}");
-        self.failed = true;
+        self.error.get_or_insert_with(|| error.to_string());
+    }
+
+    /// The matcher error that disabled this grammar, if any.
+    pub(crate) fn failure(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Simulate a matcher error (tests).
+    #[cfg(test)]
+    pub(crate) fn inject_error(&mut self) {
+        self.fail("error injected by a test");
     }
 
     fn live(&mut self) -> Option<&mut Matcher> {
-        if self.failed {
+        if self.error.is_some() {
             None
         } else {
             self.active.as_mut()
@@ -192,7 +260,7 @@ impl LlgToolGrammar {
     }
 
     pub(crate) fn accept(&mut self, token: LlamaToken) {
-        if self.failed {
+        if self.error.is_some() {
             return;
         }
         match self.active.as_mut() {
@@ -288,7 +356,11 @@ const JSON_NUMBER: &str = r"/-?([0-9]|[1-9][0-9]*)(\.[0-9]+)?([eE][+\-]?[0-9]+)?
 /// String values are a lazy rule that ends at the first `\n</parameter>\n`
 /// and may not contain `</parameter>` at all, exactly like the GBNF
 /// `value-text` exclusion.
-pub(crate) fn qwen_function_lark(tools: &[Tool], tag: &dyn Fn(&str) -> String) -> Option<String> {
+pub(crate) fn qwen_function_lark(
+    tools: &[Tool],
+    tag: &dyn Fn(&str) -> String,
+    tier: Tier,
+) -> Option<String> {
     if tools.is_empty() {
         return None;
     }
@@ -321,7 +393,7 @@ pub(crate) fn qwen_function_lark(tools: &[Tool], tag: &dyn Fn(&str) -> String) -
             for (j, (name, param_schema)) in props.iter().enumerate() {
                 let rule = format!("f{i}_p{j}");
                 let open = lark_string(&format!("<parameter={name}>\n"));
-                let body = match value_expr(param_schema) {
+                let body = match value_expr(param_schema, tier) {
                     None => format!("{open} text_value"),
                     Some(expr) => format!("{open} {expr} {close}"),
                 };
@@ -344,9 +416,24 @@ pub(crate) fn qwen_function_lark(tools: &[Tool], tag: &dyn Fn(&str) -> String) -
     Some(out)
 }
 
+/// `%json` expression for `schema`, compiled leniently: `oneOf` is treated
+/// as `anyOf` and unsupported keywords are ignored. The options travel in
+/// the schema itself (`x-guidance`), as `%json` has no option syntax.
+fn json_schema_expr(schema: &Value) -> String {
+    let mut schema = schema.clone();
+    if let Some(object) = schema.as_object_mut() {
+        object.insert(
+            "x-guidance".into(),
+            serde_json::json!({"coerce_one_of": true, "lenient": true}),
+        );
+    }
+    format!("%json {schema}")
+}
+
 /// Lark expression for a non-text parameter value, or `None` for free text.
-/// Same type mapping as `parameter_value_expr` in `chat_format`.
-fn value_expr(schema: &Value) -> Option<String> {
+/// Same type mapping as `parameter_value_expr` in `chat_format`; the schema
+/// tier additionally enforces the schema of array and object values.
+fn value_expr(schema: &Value, tier: Tier) -> Option<String> {
     match schema.get("type").and_then(Value::as_str) {
         Some("string") | None => {
             let literals = schema
@@ -365,33 +452,64 @@ fn value_expr(schema: &Value) -> Option<String> {
         Some("integer") | Some("number") => Some("NUMBER".to_string()),
         Some("boolean") => Some("(\"true\" | \"false\")".to_string()),
         Some("null") => Some("\"null\"".to_string()),
-        Some("array") => Some("%json {\"type\": \"array\"}".to_string()),
-        Some("object") => Some("%json {\"type\": \"object\"}".to_string()),
+        Some(kind @ ("array" | "object")) => Some(match tier {
+            Tier::Schema => json_schema_expr(schema),
+            Tier::Generic => format!("%json {{\"type\": \"{kind}\"}}"),
+        }),
         Some(_) => None,
     }
 }
 
 /// Lark for what follows `[TOOL_CALLS]` in the Ministral format:
-/// `tool-name "[ARGS]" object ws`, one or more calls.
-pub(crate) fn ministral_lark(tools: &[Tool], tag: &dyn Fn(&str) -> String) -> Option<String> {
+/// `tool-name "[ARGS]" object ws`, one or more calls. The schema tier
+/// constrains each tool's arguments to its own parameter schema.
+pub(crate) fn ministral_lark(
+    tools: &[Tool],
+    tag: &dyn Fn(&str) -> String,
+    tier: Tier,
+) -> Option<String> {
     if tools.is_empty() {
         return None;
     }
-    let names = tools
-        .iter()
-        .map(|tool| lark_string(&tool.function.name))
-        .collect::<Vec<_>>()
-        .join(" | ");
-    Some(format!(
-        "start: call (open_t call)*\n\
-         open_t: {open}\n\
-         call: name args_t %json {{\"type\": \"object\"}} WS?\n\
-         name: {names}\n\
-         args_t: {args}\n\
-         WS: /[ \\t\\n\\r]+/\n",
-        open = tag("[TOOL_CALLS]"),
-        args = tag("[ARGS]"),
-    ))
+    let mut out = String::new();
+    let _ = writeln!(out, "start: call (open_t call)*");
+    let _ = writeln!(out, "open_t: {}", tag("[TOOL_CALLS]"));
+    let _ = writeln!(out, "args_t: {}", tag("[ARGS]"));
+    let _ = writeln!(out, "WS: /[ \\t\\n\\r]+/");
+    match tier {
+        Tier::Generic => {
+            let names = tools
+                .iter()
+                .map(|tool| lark_string(&tool.function.name))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let _ = writeln!(out, "call: name args_t %json {{\"type\": \"object\"}} WS?");
+            let _ = writeln!(out, "name: {names}");
+        }
+        Tier::Schema => {
+            let alts = (0..tools.len())
+                .map(|i| format!("c{i}"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let _ = writeln!(out, "call: {alts}");
+            for (i, tool) in tools.iter().enumerate() {
+                let mut schema = tool.function.parameters.clone();
+                match schema.as_object_mut() {
+                    Some(object) => {
+                        object.entry("type").or_insert_with(|| "object".into());
+                    }
+                    None => schema = serde_json::json!({"type": "object"}),
+                }
+                let _ = writeln!(
+                    out,
+                    "c{i}: {} args_t {} WS?",
+                    lark_string(&tool.function.name),
+                    json_schema_expr(&schema)
+                );
+            }
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -458,7 +576,7 @@ mod tests {
     }
 
     fn qwen() -> String {
-        qwen_function_lark(&tools(), &|t| lark_string(t)).unwrap()
+        qwen_function_lark(&tools(), &|t| lark_string(t), Tier::Schema).unwrap()
     }
 
     const CALL_HEAD: &str =
@@ -507,13 +625,26 @@ mod tests {
 
     #[test]
     fn ministral_grammar_compiles_and_matches() {
-        let lark = ministral_lark(&tools(), &|t| lark_string(t)).unwrap();
+        let lark = ministral_lark(&tools(), &|t| lark_string(t), Tier::Schema).unwrap();
         assert!(full_match(&lark, "glob[ARGS]{\"pattern\": \"*.rs\"}"));
         assert!(full_match(
             &lark,
-            "glob[ARGS]{\"pattern\": \"*\"}[TOOL_CALLS]write_file[ARGS]{}"
+            "glob[ARGS]{\"pattern\": \"*\"}[TOOL_CALLS]write_file[ARGS]{\"path\": \"a\", \"content\": \"b\"}"
         ));
         assert!(!full_match(&lark, "nope[ARGS]{}"));
+        // Schema tier: required parameters, types and enums are enforced.
+        assert!(!full_match(&lark, "write_file[ARGS]{}"));
+        assert!(!full_match(
+            &lark,
+            "glob[ARGS]{\"pattern\": \"*\", \"limit\": \"ten\"}"
+        ));
+        assert!(!full_match(
+            &lark,
+            "glob[ARGS]{\"pattern\": \"*\", \"mode\": \"slow\"}"
+        ));
+        // Generic tier accepts any object.
+        let generic = ministral_lark(&tools(), &|t| lark_string(t), Tier::Generic).unwrap();
+        assert!(full_match(&generic, "write_file[ARGS]{}"));
     }
 
     #[test]
