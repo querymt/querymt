@@ -26,6 +26,11 @@ pub struct RemoteSessionInfo {
     pub profile_id: Option<String>,
     pub profile_label: Option<String>,
     pub model_id: Option<String>,
+    /// Owner-reported runtime state: `idle`, `running`, `waiting`,
+    /// `cancel_requested`, `active` (live, status unavailable) or `persisted`
+    /// (not loaded on the owner).
+    #[serde(default)]
+    pub runtime_state: Option<String>,
 }
 
 #[typeshare]
@@ -152,6 +157,7 @@ fn remote_snapshot_to_info(
         profile_id: session.profile_id,
         profile_label: session.profile_label,
         model_id: None,
+        runtime_state: session.runtime_state,
     }
 }
 
@@ -382,5 +388,38 @@ pub async fn dismiss_remote_session(
         let _ = agent;
         let _ = request;
         Err(Error::method_not_found())
+    }
+}
+
+#[cfg(all(test, feature = "remote"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_snapshot_info_carries_owner_runtime_state() {
+        let info = remote_snapshot_to_info(
+            "node-1",
+            crate::agent::remote::RemoteSessionSnapshot {
+                session_id: "s-1".into(),
+                actor_id: 7,
+                cwd: None,
+                created_at: 0,
+                updated_at: None,
+                title: None,
+                profile_id: None,
+                profile_label: None,
+                peer_label: "lstr".into(),
+                runtime_state: Some("idle".into()),
+                parent_session_id: None,
+                fork_origin: None,
+            },
+        );
+        assert_eq!(info.runtime_state.as_deref(), Some("idle"));
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["runtime_state"], "idle");
+        // Older owners omit the field.
+        let legacy: RemoteSessionInfo =
+            serde_json::from_value(serde_json::json!({"id": "s", "node_id": "n"})).unwrap();
+        assert!(legacy.runtime_state.is_none());
     }
 }
