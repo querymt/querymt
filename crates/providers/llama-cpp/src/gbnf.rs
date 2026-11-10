@@ -302,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_rules_match_substring_exclusion_exhaustively() {
+    fn value_cannot_contain_its_terminator() {
         for terminator in ["</parameter>", "<escape>", "<|\"|>", "aab", "abab", "a"] {
             let rules = ExclusionDfa::new(terminator).rules("t");
             let mut alphabet: Vec<char> = terminator.chars().collect();
@@ -324,7 +324,7 @@ mod tests {
     /// so the alternative count is the cost. State 0, where a value spends
     /// almost all its time, must branch like the old `[^<]*`.
     #[test]
-    fn collapsed_rules_stay_narrow() {
+    fn gbnf_text_values_stay_narrow() {
         let rules = ExclusionDfa::new("</parameter>").rules("v");
         let state0 = rules.lines().nth(1).unwrap();
         assert_eq!(state0, "v-0 ::= [^\\x3C] v-0 | \"<\" v-1 | \"\"", "{rules}");

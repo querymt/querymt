@@ -477,56 +477,11 @@ mod grammar_tests {
     use super::*;
     use crate::chat_format::ToolFormat;
     use crate::common_chat::ReasoningFormat;
-    use llama_cpp_2::model::params::LlamaModelParams;
+    use crate::test_vocab::{self, Vocab};
     use llama_cpp_2::token::LlamaToken;
     use llama_cpp_2::token::data::LlamaTokenData;
     use llama_cpp_2::token::data_array::LlamaTokenDataArray;
     use querymt::chat::{FunctionTool, Tool};
-    use std::path::PathBuf;
-
-    /// Pinned to the llama.cpp commit that added the vocab file.
-    const VOCAB_URL: &str = "https://raw.githubusercontent.com/ggml-org/llama.cpp/42532afff43910e619a650c1704525b3acbbec5a/models/ggml-vocab-qwen35.gguf";
-
-    /// `QMT_LLAMA_VOCAB_GGUF` overrides the location; otherwise the file is
-    /// downloaded once into the temp dir.
-    fn vocab_path() -> Option<PathBuf> {
-        if let Some(path) = std::env::var_os("QMT_LLAMA_VOCAB_GGUF") {
-            return Some(PathBuf::from(path));
-        }
-        let dir = std::env::temp_dir().join("qmt-llama-vocab");
-        let path = dir.join("ggml-vocab-qwen35.gguf");
-        if path.metadata().is_ok_and(|m| m.len() > 1_000_000) {
-            return Some(path);
-        }
-        std::fs::create_dir_all(&dir).ok()?;
-        // Unique per process and thread so concurrent test runs never share it.
-        let thread: String = format!("{:?}", std::thread::current().id())
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .collect();
-        let tmp = dir.join(format!(
-            "ggml-vocab-qwen35.gguf.{}.{thread}.part",
-            std::process::id()
-        ));
-        let ok = std::process::Command::new("curl")
-            .args(["-fsSL", "--retry", "3", "-o"])
-            .arg(&tmp)
-            .arg(VOCAB_URL)
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
-            let _ = std::fs::remove_file(&tmp);
-            return None;
-        }
-        if std::fs::rename(&tmp, &path).is_ok() {
-            return Some(path);
-        }
-        // Another runner may have finished first; accept its file.
-        let _ = std::fs::remove_file(&tmp);
-        path.metadata()
-            .is_ok_and(|m| m.len() > 1_000_000)
-            .then_some(path)
-    }
 
     /// `write_file` tool with string `path` and `content` parameters.
     fn write_file_tool() -> Tool {
@@ -617,20 +572,8 @@ mod grammar_tests {
     }
 
     #[test]
-    fn grammar_does_not_mask_lt_inside_string_values() {
-        let Some(path) = vocab_path() else {
-            eprintln!("SKIPPED: vocab-only GGUF unavailable (offline?); set QMT_LLAMA_VOCAB_GGUF");
-            return;
-        };
-        let backend = crate::backend::llama_backend().expect("backend");
-        let model = Arc::new(
-            LlamaModel::load_from_file(
-                &backend,
-                &path,
-                &LlamaModelParams::default().with_vocab_only(true),
-            )
-            .expect("load vocab-only gguf"),
-        );
+    fn value_accepts_less_than_and_markup() {
+        let Some(model) = vocab_model() else { return };
 
         let prefix = "<tool_call>\n<function=write_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=content>\nif row[j]";
         let probe = " <";
@@ -666,19 +609,7 @@ mod grammar_tests {
 
     #[test]
     fn grammar_still_closes_the_parameter() {
-        let Some(path) = vocab_path() else {
-            eprintln!("SKIPPED: vocab-only GGUF unavailable (offline?); set QMT_LLAMA_VOCAB_GGUF");
-            return;
-        };
-        let backend = crate::backend::llama_backend().expect("backend");
-        let model = Arc::new(
-            LlamaModel::load_from_file(
-                &backend,
-                &path,
-                &LlamaModelParams::default().with_vocab_only(true),
-            )
-            .expect("load vocab-only gguf"),
-        );
+        let Some(model) = vocab_model() else { return };
         let grammar = ToolFormat::QwenFunction
             .grammar(&[write_file_tool()])
             .unwrap();
@@ -690,26 +621,14 @@ mod grammar_tests {
     }
 
     fn vocab_model() -> Option<Arc<LlamaModel>> {
-        let Some(path) = vocab_path() else {
-            eprintln!("SKIPPED: vocab-only GGUF unavailable (offline?); set QMT_LLAMA_VOCAB_GGUF");
-            return None;
-        };
-        let backend = crate::backend::llama_backend().expect("backend");
-        Some(Arc::new(
-            LlamaModel::load_from_file(
-                &backend,
-                &path,
-                &LlamaModelParams::default().with_vocab_only(true),
-            )
-            .expect("load vocab-only gguf"),
-        ))
+        test_vocab::vocab_model(Vocab::Qwen35)
     }
 
     const CONTENT_PREFIX: &str = "<tool_call>\n<function=write_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=content>\nif row[j]";
 
     /// The llguidance port must keep the `<` fix and still close parameters.
     #[test]
-    fn llguidance_backend_matches_gbnf_on_lt_and_close() {
+    fn multi_token_trigger_activates_the_grammar() {
         let Some(model) = vocab_model() else { return };
         let grammar = ToolFormat::QwenFunction
             .grammar(&[write_file_tool()])
@@ -779,7 +698,7 @@ mod grammar_tests {
 
     /// Rejection sampling picks exactly what grammar-first greedy would.
     #[test]
-    fn rejection_sampling_matches_grammar_first() {
+    fn rejected_favourite_is_resampled_from_allowed_tokens() {
         let Some(model) = vocab_model() else { return };
         let grammar = ToolFormat::QwenFunction
             .grammar(&[write_file_tool()])

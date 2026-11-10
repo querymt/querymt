@@ -465,7 +465,7 @@ mod tests {
         "\n<function=write_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=content>\n";
 
     #[test]
-    fn qwen_function_accepts_lt_in_values() {
+    fn value_accepts_less_than_and_markup() {
         let lark = qwen();
         for content in [
             "if row[j] < best_d:\n    pass",
@@ -481,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen_function_rejects_terminator_inside_value() {
+    fn value_cannot_contain_its_terminator() {
         let lark = qwen();
         let text = format!("{CALL_HEAD}x</parameter>y\n</parameter>\n</function>\n</tool_call>");
         assert!(!full_match(&lark, &text));

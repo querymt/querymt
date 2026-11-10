@@ -12,6 +12,8 @@ mod multimodal;
 mod provider;
 mod response;
 mod template;
+#[cfg(all(test, feature = "common"))]
+mod test_vocab;
 mod tools;
 
 pub use config::{GrammarBackend, LlamaCppConfig, SpeculativeConfig, SpeculativeType};
