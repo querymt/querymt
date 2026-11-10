@@ -90,7 +90,7 @@ When a tool set's schemas cannot be compiled into an llguidance grammar, the pro
 
 #### Scenario: Generic grammar matches GBNF language
 - **WHEN** the generic llguidance grammar and the GBNF grammar for the same format and tools are applied at the same position over a real vocabulary
-- **THEN** they allow the same set of tokens, except byte tokens that are not complete UTF-8 on their own
+- **THEN** they allow the same set of tokens, except two classes that are not differences in the language: byte tokens that are not complete UTF-8 on their own, and control/special tokens (for example `<|im_start|>`), whose spelling GBNF accepts as text inside a value while llguidance never lets a text lexeme consume a special token
 
 ### Requirement: GBNF fallback when llguidance is unavailable or fails
 When llguidance cannot build a grammar for a request, or reports an error during generation, the provider SHALL enforce the GBNF grammar for the rest of that request instead of generating unconstrained. The fallback SHALL be logged once per request. Builds without llguidance SHALL use GBNF.
