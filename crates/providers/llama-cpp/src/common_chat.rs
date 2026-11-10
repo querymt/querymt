@@ -77,6 +77,9 @@ pub(crate) struct ToolGrammar {
     pub root: &'static str,
     pub lazy: bool,
     pub triggers: Vec<GrammarTrigger>,
+    /// Format the grammar was built for; the llguidance backend uses it to
+    /// build an equivalent Lark grammar from the same tools.
+    pub format: crate::chat_format::ToolFormat,
 }
 
 #[derive(Debug, Clone)]

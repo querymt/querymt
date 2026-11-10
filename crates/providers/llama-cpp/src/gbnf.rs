@@ -91,7 +91,55 @@ impl ExclusionDfa {
 
     /// Render the automaton as GBNF. `name` is the entry rule; the
     /// per-state rules are `{name}-0 ..`.
+    /// Transitions out of `state` in collapsed form: the characters that
+    /// must be excluded from the "back to state 0" class (every character
+    /// whose transition is not to state 0, including the one that completes
+    /// the terminator), and the explicit `(char, next_state)` edges for the
+    /// characters that lead to a live state other than 0.
+    ///
+    /// Characters going back to state 0 are folded into the negated class,
+    /// so each state has at most `1 + |edges|` alternatives. For a
+    /// terminator starting with a character that does not repeat (`<`,
+    /// `[`, ...) that is two or three alternatives per state, the same shape
+    /// as the old `[^<]*`. llama.cpp's grammar engine forks one stack per
+    /// alternative per character, so this directly bounds its cost.
+    pub(crate) fn transitions(&self, state: usize) -> (Vec<char>, Vec<(char, usize)>) {
+        let mut excluded = Vec::new();
+        let mut edges = Vec::new();
+        for &ch in &self.alphabet {
+            let next = self.next(state, ch);
+            if next == 0 {
+                continue;
+            }
+            excluded.push(ch);
+            if next != self.dead_state() {
+                edges.push((ch, next));
+            }
+        }
+        (excluded, edges)
+    }
+
+    /// Render the automaton as GBNF. `name` is the entry rule; the
+    /// per-state rules are `{name}-0 ..`.
     pub(crate) fn rules(&self, name: &str) -> String {
+        let mut out = format!("{name} ::= {name}-0\n");
+        for state in 0..self.dead_state() {
+            let (excluded, edges) = self.transitions(state);
+            let class: String = excluded.iter().copied().map(class_member).collect();
+            let _ = write!(out, "{name}-{state} ::= [^{class}] {name}-0");
+            for (ch, next) in edges {
+                let _ = write!(out, " | {} {name}-{next}", gbnf_literal(&ch.to_string()));
+            }
+            out.push_str(" | \"\"\n");
+        }
+        out
+    }
+
+    /// The pre-collapse rendering (one literal alternative per alphabet
+    /// character in every state). Same language, many more parse stacks;
+    /// kept only to benchmark against.
+    #[cfg(test)]
+    pub(crate) fn rules_uncollapsed(&self, name: &str) -> String {
         let class: String = self.alphabet.iter().copied().map(class_member).collect();
         let mut out = format!("{name} ::= {name}-0\n");
         for state in 0..self.dead_state() {
@@ -175,7 +223,7 @@ mod tests {
         assert_eq!(
             rules,
             "t ::= t-0\n\
-             t-0 ::= [^ab] t-0 | \"a\" t-1 | \"b\" t-0 | \"\"\n\
+             t-0 ::= [^a] t-0 | \"a\" t-1 | \"\"\n\
              t-1 ::= [^ab] t-0 | \"a\" t-1 | \"\"\n"
         );
     }
@@ -183,7 +231,106 @@ mod tests {
     #[test]
     fn escapes_class_members() {
         let rules = ExclusionDfa::new("<|\"|>").rules("q");
-        assert!(rules.contains("[^\\x22\\x3C\\x3E\\x7C]"), "{rules}");
-        assert!(rules.contains("\"\\\"\""), "{rules}");
+        // State 2 (`<|` seen): `"` advances, `<` restarts, the rest go home.
+        assert!(rules.contains("q-2 ::= [^\\x22\\x3C] q-0"), "{rules}");
+        assert!(rules.contains("\"\\\"\" q-3"), "{rules}");
+    }
+
+    /// Interpret rendered rules the way a GBNF engine would: each state's
+    /// first alternative is `[^class] -> 0`, then literal edges. Checks the
+    /// emitted grammar itself, not just `next()`.
+    fn rendered_accepts(rules: &str, name: &str, text: &str) -> bool {
+        use std::collections::HashMap;
+        type State = (Vec<char>, Vec<(char, usize)>);
+        let mut table: HashMap<usize, State> = HashMap::new();
+        for line in rules.lines().skip(1) {
+            let (lhs, rhs) = line.split_once(" ::= ").unwrap();
+            let state: usize = lhs
+                .strip_prefix(&format!("{name}-"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let alts: Vec<&str> = rhs.split(" | ").collect();
+            let class = alts[0]
+                .strip_prefix("[^")
+                .and_then(|s| s.strip_suffix(&format!("] {name}-0")))
+                .unwrap();
+            let mut excluded = Vec::new();
+            let mut rest = class;
+            while !rest.is_empty() {
+                if let Some(hex) = rest.strip_prefix("\\x") {
+                    excluded.push(char::from(u8::from_str_radix(&hex[..2], 16).unwrap()));
+                    rest = &hex[2..];
+                } else {
+                    let ch = rest.chars().next().unwrap();
+                    excluded.push(ch);
+                    rest = &rest[ch.len_utf8()..];
+                }
+            }
+            let mut edges = Vec::new();
+            for alt in &alts[1..] {
+                if *alt == "\"\"" {
+                    continue;
+                }
+                let (lit, target) = alt.rsplit_once(' ').unwrap();
+                let lit = lit
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .unwrap()
+                    .replace("\\\"", "\"");
+                let target: usize = target
+                    .strip_prefix(&format!("{name}-"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                edges.push((lit.chars().next().unwrap(), target));
+            }
+            table.insert(state, (excluded, edges));
+        }
+        let mut state = 0;
+        for ch in text.chars() {
+            let (excluded, edges) = &table[&state];
+            state = if !excluded.contains(&ch) {
+                0
+            } else if let Some((_, next)) = edges.iter().find(|(c, _)| *c == ch) {
+                *next
+            } else {
+                return false;
+            };
+        }
+        true
+    }
+
+    #[test]
+    fn value_cannot_contain_its_terminator() {
+        for terminator in ["</parameter>", "<escape>", "<|\"|>", "aab", "abab", "a"] {
+            let rules = ExclusionDfa::new(terminator).rules("t");
+            let mut alphabet: Vec<char> = terminator.chars().collect();
+            alphabet.sort_unstable();
+            alphabet.dedup();
+            alphabet.push('x');
+            let max_len = if alphabet.len() > 6 { 5 } else { 8 };
+            for text in all_strings(&alphabet, max_len) {
+                assert_eq!(
+                    rendered_accepts(&rules, "t", &text),
+                    !text.contains(terminator),
+                    "terminator={terminator:?} text={text:?}\n{rules}"
+                );
+            }
+        }
+    }
+
+    /// llama.cpp forks one parse stack per alternative at every character,
+    /// so the alternative count is the cost. State 0, where a value spends
+    /// almost all its time, must branch like the old `[^<]*`.
+    #[test]
+    fn gbnf_text_values_stay_narrow() {
+        let rules = ExclusionDfa::new("</parameter>").rules("v");
+        let state0 = rules.lines().nth(1).unwrap();
+        assert_eq!(state0, "v-0 ::= [^\\x3C] v-0 | \"<\" v-1 | \"\"", "{rules}");
+        for line in rules.lines().skip(1) {
+            // class, at most the next char and a restart on `<`, and "".
+            assert!(line.split(" | ").count() <= 4, "{line}");
+        }
     }
 }

@@ -4,6 +4,27 @@
 
 ### Behavior changes
 
+- **BREAKING: llama.cpp tool-call grammars use llguidance by default, and tool
+  arguments are schema-aware in every format.** New provider parameter
+  `grammar_backend` (`llguidance` | `gbnf`, default `llguidance`; set it in
+  `[agent.parameters]` or llama-cpp provider parameters). Parameter names, value
+  types, enums and required parameters now follow the tool's JSON schema in all
+  six formats (Qwen3 JSON, Qwen XML-function, Ministral, LFM2, FunctionGemma,
+  Gemma 4); before, only Qwen XML-function did, and the others accepted any JSON
+  object or keyword list. Undeclared parameters are allowed only when the schema
+  allows additional properties. An uncompilable schema falls back to a
+  structure-only llguidance grammar, and a build or mid-request llguidance failure
+  falls back to GBNF for the rest of the request (logged once). Set
+  `grammar_backend = "gbnf"` for the previous engine.
+- **llama.cpp grammars are enforced by rejection sampling**: the sampled token is
+  checked and the whole vocabulary is masked only when it is rejected, also for
+  speculative (MTP) decoding and thinking-budget forced tokens. Sampling with a
+  fixed `seed` can produce different output than before, because a rejected draw
+  consumes one extra random number.
+- **llama.cpp tool calls are much faster.** A tool-call string value cost about
+  0.5 s of CPU per token with GBNF on a 150k vocabulary, which left GPUs idle on
+  long `write_file`/`edit` calls. llguidance needs about 0.3 ms, and GBNF text
+  values are narrowed so each state has at most four alternatives (13 ms).
 - **Selecting the profile's model keeps the profile's `[agent.parameters]`**
   (`max_tokens`, `n_ctx`, `enable_thinking`, sampling, ...). Previously any
   model selection, including mesh clients re-selecting the profile's own
@@ -27,6 +48,9 @@
 
 ### Fixed
 
+- **llama.cpp Qwen3 (JSON tool-call format) calls were dropped.** The tool
+  grammar forced the tool name without JSON quotes (`"name": glob`), which the
+  parser cannot read. The name is now a JSON string.
 - **llama.cpp tool calls could not contain `<` in string arguments.** The tool
   grammar for Qwen-function models (Qwen3.5/3.6/3.8, AREX-2) and FunctionGemma
   forbade `<` inside every string parameter, so `write_file`/`edit` content such
@@ -67,6 +91,10 @@
 
 ### Breaking
 
+- **`qmt_llama_cpp::LlamaCppConfig` has a new public field
+  `grammar_backend: Option<GrammarBackend>`**; struct literals must add it
+  (`None` keeps the default). `qmt_llama_cpp::GrammarBackend` is a new exported
+  enum.
 - **Tool permission keys removed** (unknown-field errors that name the key):
 
   | Removed | Replacement |

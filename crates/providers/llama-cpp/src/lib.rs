@@ -12,9 +12,11 @@ mod multimodal;
 mod provider;
 mod response;
 mod template;
+#[cfg(all(test, feature = "common"))]
+mod test_vocab;
 mod tools;
 
-pub use config::{LlamaCppConfig, SpeculativeConfig, SpeculativeType};
+pub use config::{GrammarBackend, LlamaCppConfig, SpeculativeConfig, SpeculativeType};
 use provider::LlamaCppProvider;
 
 /// Create a provider directly from a config struct (useful for testing and embedding).

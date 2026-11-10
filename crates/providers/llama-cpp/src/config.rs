@@ -171,6 +171,28 @@ pub struct LlamaCppConfig {
     /// The schema is forwarded to the chat template engine via
     /// `OpenAIChatTemplateParams::json_schema`.
     pub json_schema: Option<StructuredOutputFormat>,
+    /// Engine that enforces tool-call grammars.
+    ///
+    /// `llguidance` (default) compiles the tool grammar to an llguidance
+    /// (Lark) grammar, whose token masks are computed from a token trie and
+    /// which follows the tools' parameter schemas. It falls back to the
+    /// `gbnf` grammar when it cannot be built or fails mid-request, and in
+    /// builds without llguidance. `gbnf` uses llama.cpp's GBNF grammar.
+    /// Both are applied by rejection sampling: the grammar checks the
+    /// sampled token and is applied to the whole vocabulary only when that
+    /// token is rejected.
+    pub grammar_backend: Option<GrammarBackend>,
+}
+
+/// Grammar engine for tool calls. See [`LlamaCppConfig::grammar_backend`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GrammarBackend {
+    /// llama.cpp GBNF grammar sampler.
+    Gbnf,
+    /// llguidance token-trie matcher.
+    #[default]
+    Llguidance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -283,7 +305,23 @@ pub enum FlashAttentionPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::{SpeculativeConfig, SpeculativeType};
+    use super::{GrammarBackend, SpeculativeConfig, SpeculativeType};
+
+    #[test]
+    fn grammar_backend_rejects_unknown_value() {
+        let err = serde_json::from_value::<super::LlamaCppConfig>(serde_json::json!({
+            "model": "test.gguf", "grammar_backend": "fast"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("fast") && err.contains("llguidance"), "{err}");
+        let ok: super::LlamaCppConfig = serde_json::from_value(serde_json::json!({
+            "model": "test.gguf", "grammar_backend": "gbnf"
+        }))
+        .unwrap();
+        assert_eq!(ok.grammar_backend, Some(GrammarBackend::Gbnf));
+        assert_eq!(GrammarBackend::default(), GrammarBackend::Llguidance);
+    }
 
     #[test]
     fn portable_instruction_hints_preserve_text_for_local_models() {

@@ -223,7 +223,17 @@ fn tool_names_rule(tools: &[Tool]) -> Option<String> {
 }
 
 fn qwen3_tool_grammar(tools: &[Tool]) -> Option<ToolGrammar> {
-    let names = tool_names_rule(tools)?;
+    // The name is a JSON string in `{"name": "glob", ...}`.
+    let names = (!tools.is_empty()).then(|| {
+        tools
+            .iter()
+            .map(|tool| {
+                let json = serde_json::to_string(&tool.function.name).unwrap_or_default();
+                gbnf_literal(&json)
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    })?;
     Some(ToolGrammar {
         grammar: format!(
             r#"root ::= qwen-tool-call+
@@ -236,6 +246,7 @@ tool-name ::= {names}
         root: "root",
         lazy: true,
         triggers: word_trigger("<tool_call>"),
+        format: ToolFormat::Qwen3,
     })
 }
 
@@ -267,6 +278,7 @@ ws ::= [ \t\n\r]*
         root: "root",
         lazy: true,
         triggers: word_trigger("<tool_call>"),
+        format: ToolFormat::QwenFunction,
     })
 }
 
@@ -283,6 +295,7 @@ tool-name ::= {names}
         root: "root",
         lazy: true,
         triggers: word_trigger("[TOOL_CALLS]"),
+        format: ToolFormat::Ministral3,
     })
 }
 
@@ -301,6 +314,7 @@ identifier ::= [A-Za-z_][A-Za-z0-9_-]*
         root: "root",
         lazy: true,
         triggers: word_trigger("<|tool_call_start|>"),
+        format: ToolFormat::Lfm2,
     })
 }
 
@@ -321,6 +335,7 @@ ws ::= [ \t\n\r]*
         root: "root",
         lazy: true,
         triggers: word_trigger("<start_function_call>"),
+        format: ToolFormat::FunctionGemma,
     })
 }
 
@@ -347,6 +362,7 @@ ws ::= [ \t\n\r]*
         root: "root",
         lazy: true,
         triggers: word_trigger("<|tool_call>"),
+        format: ToolFormat::Gemma4,
     })
 }
 
@@ -405,7 +421,7 @@ fn qwen_function_tool_rules(tools: &[Tool]) -> Option<ToolRuleSet> {
     })
 }
 
-fn required_params(schema: &Value) -> HashSet<&str> {
+pub(crate) fn required_params(schema: &Value) -> HashSet<&str> {
     schema
         .get("required")
         .and_then(|value| value.as_array())
@@ -1083,7 +1099,7 @@ mod tests {
         let grammar = ToolFormat::Qwen3.grammar(&[tool.clone()]).unwrap();
         assert!(grammar.lazy);
         assert!(grammar.grammar.contains("<tool_call>"));
-        assert!(grammar.grammar.contains("\"glob\""));
+        assert!(grammar.grammar.contains(r#"\"glob\""#));
         assert_eq!(grammar.triggers[0].value, "<tool_call>");
         assert!(!grammar.grammar.contains(r"\-"));
 

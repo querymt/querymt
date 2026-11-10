@@ -209,7 +209,7 @@ pub(crate) fn force_text(
     ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
     batch: &mut LlamaBatch,
     n_batch: usize,
-    sampler: &mut llama_cpp_2::sampling::LlamaSampler,
+    sampler: &mut impl crate::tools::sampler::AcceptToken,
     text: &str,
     n_cur: &mut i32,
     n_len_total: i32,
@@ -228,7 +228,7 @@ pub(crate) fn force_text(
                 .map_err(|e| LLMError::ProviderError(e.to_string()))?;
             *n_cur += 1;
             index += 1;
-            sampler.accept(*token);
+            sampler.accept_token(*token);
         }
         ctx.decode(batch)
             .map_err(|e| LLMError::ProviderError(e.to_string()))?;

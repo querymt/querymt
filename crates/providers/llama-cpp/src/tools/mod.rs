@@ -1,4 +1,8 @@
 pub(crate) mod generation;
+#[cfg(feature = "common")]
+pub(crate) mod lark;
+#[cfg(feature = "common")]
+pub(crate) mod llg;
 pub(crate) mod prefill;
 pub(crate) mod sampler;
 pub(crate) mod streaming;

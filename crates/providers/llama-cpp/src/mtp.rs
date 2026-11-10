@@ -2,12 +2,11 @@ use crate::backend::llama_backend;
 use crate::config::LlamaCppConfig;
 use crate::context::{apply_context_params, resolve_n_batch, resolve_n_ubatch};
 use crate::response::GenerationTermination;
-use crate::tools::sampler::{SamplingParams, build_standard_sampler};
+use crate::tools::sampler::{ConstrainedSampler, SamplingParams, build_standard_sampler};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{LlamaContextParams, LlamaContextType};
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::LlamaModel;
-use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::speculative::MtpSpeculative;
 use llama_cpp_2::token::LlamaToken;
 use querymt::error::LLMError;
@@ -82,7 +81,7 @@ pub(crate) fn run_mtp(
     prompt: &str,
     max_tokens: u32,
     temperature: Option<f32>,
-    sampler: Option<LlamaSampler>,
+    sampler: Option<ConstrainedSampler>,
     mut on_token: impl FnMut(LlamaToken) -> Result<Option<GenerationTermination>, LLMError>,
 ) -> Result<MtpRunStats, LLMError> {
     let speculative_cfg = cfg
@@ -179,7 +178,10 @@ pub(crate) fn run_mtp(
         .map_err(|e| LLMError::ProviderError(format!("MTP begin failed: {e}")))?;
 
     let mut sampler = sampler.unwrap_or_else(|| {
-        build_standard_sampler(model, &SamplingParams::from_config(cfg, temperature))
+        ConstrainedSampler::unconstrained(build_standard_sampler(
+            model,
+            &SamplingParams::from_config(cfg, temperature),
+        ))
     });
     let mut committed_prefix = tokens;
     let mut pending_position = committed_prefix.len() as i32;

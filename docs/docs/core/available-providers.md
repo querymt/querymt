@@ -448,6 +448,41 @@ Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models,
 | `reasoning_effort` | string | `"low"` \| `"medium"` \| `"high"` \| `"max"`; applied only when the chat template exposes `reasoning_effort`. A per-request override takes precedence |
 | `thinking_budget` | integer | Maximum reasoning tokens per reply. When spent, the provider closes the reasoning block so the model must answer. The budget is reduced to fit within `max_tokens` (leaving room for the closing marker and at least one answer token), so with the default cap of 256 a budget of 4,096 allows fewer than 256 reasoning tokens; it is disabled when the cap cannot fit the marker plus one answer token. Unset = unbounded; not applied with `speculative` decoding, with schema-constrained output (`json_schema`), or to plain non-streaming chat calls |
 | `mmproj_path` | string | Path to multimodal projection file (vision models only) |
+| `grammar_backend` | string | `"llguidance"` (default) \| `"gbnf"`. Engine that enforces tool-call grammars; see [Tool-call grammars](#tool-call-grammars) |
+
+#### Tool-call grammars
+
+While a local model writes a tool call, its output is constrained by a grammar so that the call names a declared tool and can be parsed. The grammar only applies after the format's trigger (`<tool_call>`, `[TOOL_CALLS]`, `<|tool_call>`, ...); text and reasoning before it are unconstrained. All six formats the provider detects are covered: Qwen3 JSON, Qwen XML-function, Ministral, LFM2, FunctionGemma and Gemma 4.
+
+Set the engine with `grammar_backend`, in llama-cpp provider parameters or in an agent profile:
+
+```toml
+[agent.parameters]
+grammar_backend = "llguidance"   # default; "gbnf" selects llama.cpp's GBNF grammar
+```
+
+Any other value fails provider configuration with an error naming `grammar_backend`.
+
+- **`llguidance`** computes token masks from a token trie (about 0.3 ms per token with a 150k vocabulary, against 13 ms to 0.5 s for GBNF inside a long string value). It is schema-aware in every format: parameter names, value types, enums and required parameters follow the tool's JSON schema, and undeclared parameters are allowed only when the schema permits additional properties. Values nested inside Gemma 4 objects and arrays are checked for structure only.
+- **`gbnf`** is the previous engine. It checks call structure, and parameter schemas only for the Qwen XML-function format.
+
+Both engines are applied by rejection sampling: the sampled token is checked against the grammar, and the whole vocabulary is masked only when that token is rejected. This holds for streaming, non-streaming, structured output, speculative (MTP) decoding and tokens forced by `thinking_budget`.
+
+```mermaid
+flowchart TD
+  A[request with tools] --> B{grammar_backend}
+  B -- gbnf --> G[GBNF grammar]
+  B -- llguidance --> C[schema grammar]
+  C -- schema does not compile --> D[generic grammar: structure and tool names only]
+  D -- cannot be built --> G
+  C -- matcher error during generation --> G
+  D -- matcher error during generation --> G
+```
+
+Fallbacks are logged once per request. A mid-request failure switches to GBNF for the rest of that request instead of generating unconstrained. Builds without llguidance use GBNF.
+
+!!! note
+    A schema-aware grammar forces the most likely *allowed* token when the model wants something the schema forbids, which can produce a valid but wrong call. The tool schema is the contract. Because rejection sampling consumes an extra random number when a draw is rejected, runs with a fixed `seed` may produce different output than before.
 
 For vision model configuration and the full option reference see the [llama-cpp provider README](https://github.com/querymt/querymt/blob/main/crates/providers/llama-cpp/README.md).
 
