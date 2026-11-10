@@ -378,7 +378,10 @@ pub(crate) fn build_tool_sampler(
     if backend == GrammarBackend::Llguidance {
         match crate::tools::llg::LlgToolGrammar::build(model, tool_grammar, &result.tools) {
             Ok(Some(grammar)) => {
-                log::debug!("build_tool_sampler: using llguidance tool grammar");
+                log::debug!(
+                    "build_tool_sampler: using llguidance tool grammar ({:?} tier)",
+                    grammar.tier()
+                );
                 let state = LlgState {
                     grammar,
                     gbnf: tool_grammar.clone(),
@@ -868,6 +871,59 @@ mod grammar_tests {
         let Some(model) = vocab_model() else { return };
         let sampler = sampler_for_config(&model, serde_json::json!({"grammar_backend": "gbnf"}));
         assert!(!sampler.uses_llguidance());
+    }
+
+    /// Tokenizer of a real model that uses `format` (design D7).
+    fn vocab_for(format: ToolFormat) -> Vocab {
+        match format {
+            ToolFormat::Qwen3 | ToolFormat::QwenFunction | ToolFormat::Ministral3 => Vocab::Qwen35,
+            ToolFormat::Gemma4 => Vocab::Gemma4,
+            ToolFormat::Lfm2 => Vocab::Lfm2,
+            ToolFormat::FunctionGemma => Vocab::FunctionGemma,
+        }
+    }
+
+    const ALL_FORMATS: [ToolFormat; 6] = [
+        ToolFormat::Qwen3,
+        ToolFormat::QwenFunction,
+        ToolFormat::Ministral3,
+        ToolFormat::Lfm2,
+        ToolFormat::FunctionGemma,
+        ToolFormat::Gemma4,
+    ];
+
+    /// Llguidance sampler for `format`'s grammar over `tools`.
+    fn llg_sampler(
+        model: &Arc<LlamaModel>,
+        format: ToolFormat,
+        tools: &[Tool],
+    ) -> ConstrainedSampler {
+        let mut result = template_result(format.grammar(tools).unwrap());
+        result.tools = tools.to_vec();
+        let cfg: LlamaCppConfig =
+            serde_json::from_value(serde_json::json!({ "model": "vocab-only" })).unwrap();
+        build_tool_sampler(
+            model,
+            &result,
+            &SamplingParams::from_config(&cfg, None),
+            GrammarBackend::Llguidance,
+        )
+        .expect("sampler")
+    }
+
+    #[test]
+    fn every_detected_format_compiles_under_llguidance() {
+        use crate::tools::llg::Tier;
+        let tools = [write_file_tool()];
+        for format in ALL_FORMATS {
+            let Some(model) = test_vocab::vocab_model(vocab_for(format)) else {
+                continue;
+            };
+            let before = fallbacks();
+            let sampler = llg_sampler(&model, format, &tools);
+            assert_eq!(sampler.llg_tier(), Some(Tier::Schema), "{format:?}");
+            assert_eq!(fallbacks() - before, 0, "{format:?}: a fallback was logged");
+        }
     }
 
     fn tool_with_options_schema(options: serde_json::Value) -> Tool {

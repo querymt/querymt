@@ -223,7 +223,17 @@ fn tool_names_rule(tools: &[Tool]) -> Option<String> {
 }
 
 fn qwen3_tool_grammar(tools: &[Tool]) -> Option<ToolGrammar> {
-    let names = tool_names_rule(tools)?;
+    // The name is a JSON string in `{"name": "glob", ...}`.
+    let names = (!tools.is_empty()).then(|| {
+        tools
+            .iter()
+            .map(|tool| {
+                let json = serde_json::to_string(&tool.function.name).unwrap_or_default();
+                gbnf_literal(&json)
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    })?;
     Some(ToolGrammar {
         grammar: format!(
             r#"root ::= qwen-tool-call+
@@ -1089,7 +1099,7 @@ mod tests {
         let grammar = ToolFormat::Qwen3.grammar(&[tool.clone()]).unwrap();
         assert!(grammar.lazy);
         assert!(grammar.grammar.contains("<tool_call>"));
-        assert!(grammar.grammar.contains("\"glob\""));
+        assert!(grammar.grammar.contains(r#"\"glob\""#));
         assert_eq!(grammar.triggers[0].value, "<tool_call>");
         assert!(!grammar.grammar.contains(r"\-"));
 

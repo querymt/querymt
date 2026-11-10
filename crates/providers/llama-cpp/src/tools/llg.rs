@@ -12,9 +12,11 @@
 //! then starts a matcher whose grammar describes what follows the trigger.
 //! The trigger may be one special token or several ordinary ones; bytes of
 //! the triggering token that follow the trigger are fed to the matcher.
-//! Formats without a Lark port fall back to GBNF.
+//! The Lark text itself is generated in [`super::lark`].
 
-use crate::chat_format::{ToolFormat, required_params};
+pub(crate) use super::lark::Tier;
+use super::lark::{self, Delim};
+use crate::chat_format::ToolFormat;
 use crate::common_chat::ToolGrammar;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::sampling::LlamaSampler;
@@ -23,8 +25,6 @@ use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use llguidance::api::TopLevelGrammar;
 use llguidance::{Matcher, ParserFactory};
 use querymt::chat::Tool;
-use serde_json::Value;
-use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, Weak};
 use toktrie::TokEnv;
 
@@ -48,19 +48,6 @@ pub(crate) fn note_fallback(message: std::fmt::Arguments<'_>) {
     log::warn!("{message}");
     #[cfg(test)]
     test_hooks::FALLBACKS.with(|count| count.set(count.get() + 1));
-}
-
-/// Per-thread switches and counters for tests.
-#[cfg(test)]
-pub(crate) mod test_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        /// Fallback messages logged on this thread.
-        pub(crate) static FALLBACKS: Cell<u32> = const { Cell::new(0) };
-        /// Make `LlgToolGrammar::build` fail.
-        pub(crate) static FORCE_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
-    }
 }
 
 fn with_env<T>(model: &Arc<LlamaModel>, f: impl FnOnce(&mut ModelEnv) -> T) -> Result<T, String> {
@@ -107,16 +94,6 @@ impl ModelEnv {
     }
 }
 
-/// How closely a grammar follows the tools' JSON schemas (design D1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Tier {
-    /// Parameter names, types, enums and required parameters follow the
-    /// schema, including nested array and object schemas.
-    Schema,
-    /// Call structure and tool names only: the language of the GBNF grammar.
-    Generic,
-}
-
 /// Lazy tool-call constraint backed by llguidance.
 pub(crate) struct LlgToolGrammar {
     tier: Tier,
@@ -152,23 +129,25 @@ impl LlgToolGrammar {
         }
         with_env(model, |env| {
             let tok_env = env.factory.tok_env().clone();
-            let tag = |text: &str| -> String {
-                let literal = lark_string(text);
+            let tag = |text: &str| -> Delim {
                 match model
                     .vocab()
                     .tokenize(text.as_bytes(), false, true)
                     .as_slice()
                 {
                     [token] if tok_env.tok_trie().is_special_token(token.0 as u32) => {
-                        format!("(<[{}]> | {literal})", token.0)
+                        Delim::special(token.0 as u32, text)
                     }
-                    _ => literal,
+                    _ => Delim::literal(text),
                 }
             };
             let generate = |tier| match grammar.format {
-                ToolFormat::QwenFunction => qwen_function_lark(tools, &tag, tier),
-                ToolFormat::Ministral3 => ministral_lark(tools, &tag, tier),
-                _ => None,
+                ToolFormat::Qwen3 => lark::qwen3_lark(tools, &tag, tier),
+                ToolFormat::QwenFunction => lark::qwen_function_lark(tools, &tag, tier),
+                ToolFormat::Ministral3 => lark::ministral_lark(tools, &tag, tier),
+                ToolFormat::Lfm2 => lark::lfm2_lark(tools, &tag, tier),
+                ToolFormat::FunctionGemma => lark::function_gemma_lark(tools, &tag, tier),
+                ToolFormat::Gemma4 => lark::gemma4_lark(tools, &tag, tier),
             };
             let Some(schema_lark) = generate(Tier::Schema) else {
                 return Ok(None);
@@ -200,7 +179,6 @@ impl LlgToolGrammar {
     }
 
     /// Which grammar tier is enforced.
-    #[cfg(test)]
     pub(crate) fn tier(&self) -> Tier {
         self.tier
     }
@@ -309,350 +287,15 @@ impl LlgToolGrammar {
     }
 }
 
-/// Lark string literal (JSON string syntax).
-fn lark_string(text: &str) -> String {
-    serde_json::to_string(text).expect("string serializes")
-}
-
-/// Escape `text` for use inside a Lark `/regex/`.
-fn lark_regex_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
-            | '/' | '-' | '&' | '~' | '#' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-/// Terminal matching any text that does not contain `terminator`; the
-/// same language as [`crate::gbnf::ExclusionDfa`], as one regex lexeme.
-fn exclusion_terminal(name: &str, terminator: &str) -> String {
-    format!(
-        "{name}: /(?s:.*)/ & ~/(?s:.*){}(?s:.*)/\n",
-        lark_regex_escape(terminator)
-    )
-}
-
-const JSON_NUMBER: &str = r"/-?([0-9]|[1-9][0-9]*)(\.[0-9]+)?([eE][+\-]?[0-9]+)?/";
-
-/// Lark for what follows `<tool_call>` in the Qwen XML-function format.
-/// Mirrors `qwen_function_tool_grammar` rule for rule:
-///
-/// ```text
-/// toolcall ::= "<tool_call>\n" tool-alt "</tool_call>"   (one or more)
-/// call     ::= "<function=NAME>\n" param* "</function>\n"
-/// param    ::= "<parameter=K>\n" value "\n</parameter>\n"
-/// ```
-///
-/// String values are a lazy rule that ends at the first `\n</parameter>\n`
-/// and may not contain `</parameter>` at all, exactly like the GBNF
-/// `value-text` exclusion.
-pub(crate) fn qwen_function_lark(
-    tools: &[Tool],
-    tag: &dyn Fn(&str) -> String,
-    tier: Tier,
-) -> Option<String> {
-    if tools.is_empty() {
-        return None;
-    }
-    let mut out = String::new();
-    let alts = (0..tools.len())
-        .map(|i| format!("f{i}"))
-        .collect::<Vec<_>>()
-        .join(" | ");
-    let _ = writeln!(
-        out,
-        "start: \"\\n\" alt close_t (open_t \"\\n\" alt close_t)*"
-    );
-    let _ = writeln!(out, "open_t: {}", tag("<tool_call>"));
-    let _ = writeln!(out, "close_t: {}", tag("</tool_call>"));
-    let _ = writeln!(out, "alt: {alts}");
-    let _ = writeln!(
-        out,
-        "text_value[suffix={}]: TEXT_VALUE",
-        lark_string("\n</parameter>\n")
-    );
-    out.push_str(&exclusion_terminal("TEXT_VALUE", "</parameter>"));
-    let _ = writeln!(out, "NUMBER: {JSON_NUMBER}");
-
-    let close = lark_string("\n</parameter>\n");
-    for (i, tool) in tools.iter().enumerate() {
-        let schema = &tool.function.parameters;
-        let required = required_params(schema);
-        let mut refs = Vec::new();
-        if let Some(props) = schema.get("properties").and_then(Value::as_object) {
-            for (j, (name, param_schema)) in props.iter().enumerate() {
-                let rule = format!("f{i}_p{j}");
-                let open = lark_string(&format!("<parameter={name}>\n"));
-                let body = match value_expr(param_schema, tier) {
-                    None => format!("{open} text_value"),
-                    Some(expr) => format!("{open} {expr} {close}"),
-                };
-                let _ = writeln!(out, "{rule}: {body}");
-                refs.push(if required.contains(name.as_str()) {
-                    rule
-                } else {
-                    format!("{rule}?")
-                });
-            }
-        }
-        let _ = writeln!(
-            out,
-            "f{i}: {} {} {}",
-            lark_string(&format!("<function={}>\n", tool.function.name)),
-            refs.join(" "),
-            lark_string("</function>\n"),
-        );
-    }
-    Some(out)
-}
-
-/// `%json` expression for `schema`, compiled leniently: `oneOf` is treated
-/// as `anyOf` and unsupported keywords are ignored. The options travel in
-/// the schema itself (`x-guidance`), as `%json` has no option syntax.
-fn json_schema_expr(schema: &Value) -> String {
-    let mut schema = schema.clone();
-    if let Some(object) = schema.as_object_mut() {
-        object.insert(
-            "x-guidance".into(),
-            serde_json::json!({"coerce_one_of": true, "lenient": true}),
-        );
-    }
-    format!("%json {schema}")
-}
-
-/// Lark expression for a non-text parameter value, or `None` for free text.
-/// Same type mapping as `parameter_value_expr` in `chat_format`; the schema
-/// tier additionally enforces the schema of array and object values.
-fn value_expr(schema: &Value, tier: Tier) -> Option<String> {
-    match schema.get("type").and_then(Value::as_str) {
-        Some("string") | None => {
-            let literals = schema
-                .get("enum")
-                .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(lark_string)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            (!literals.is_empty()).then(|| format!("({})", literals.join(" | ")))
-        }
-        Some("integer") | Some("number") => Some("NUMBER".to_string()),
-        Some("boolean") => Some("(\"true\" | \"false\")".to_string()),
-        Some("null") => Some("\"null\"".to_string()),
-        Some(kind @ ("array" | "object")) => Some(match tier {
-            Tier::Schema => json_schema_expr(schema),
-            Tier::Generic => format!("%json {{\"type\": \"{kind}\"}}"),
-        }),
-        Some(_) => None,
-    }
-}
-
-/// Lark for what follows `[TOOL_CALLS]` in the Ministral format:
-/// `tool-name "[ARGS]" object ws`, one or more calls. The schema tier
-/// constrains each tool's arguments to its own parameter schema.
-pub(crate) fn ministral_lark(
-    tools: &[Tool],
-    tag: &dyn Fn(&str) -> String,
-    tier: Tier,
-) -> Option<String> {
-    if tools.is_empty() {
-        return None;
-    }
-    let mut out = String::new();
-    let _ = writeln!(out, "start: call (open_t call)*");
-    let _ = writeln!(out, "open_t: {}", tag("[TOOL_CALLS]"));
-    let _ = writeln!(out, "args_t: {}", tag("[ARGS]"));
-    let _ = writeln!(out, "WS: /[ \\t\\n\\r]+/");
-    match tier {
-        Tier::Generic => {
-            let names = tools
-                .iter()
-                .map(|tool| lark_string(&tool.function.name))
-                .collect::<Vec<_>>()
-                .join(" | ");
-            let _ = writeln!(out, "call: name args_t %json {{\"type\": \"object\"}} WS?");
-            let _ = writeln!(out, "name: {names}");
-        }
-        Tier::Schema => {
-            let alts = (0..tools.len())
-                .map(|i| format!("c{i}"))
-                .collect::<Vec<_>>()
-                .join(" | ");
-            let _ = writeln!(out, "call: {alts}");
-            for (i, tool) in tools.iter().enumerate() {
-                let mut schema = tool.function.parameters.clone();
-                match schema.as_object_mut() {
-                    Some(object) => {
-                        object.entry("type").or_insert_with(|| "object".into());
-                    }
-                    None => schema = serde_json::json!({"type": "object"}),
-                }
-                let _ = writeln!(
-                    out,
-                    "c{i}: {} args_t {} WS?",
-                    lark_string(&tool.function.name),
-                    json_schema_expr(&schema)
-                );
-            }
-        }
-    }
-    Some(out)
-}
-
+/// Per-thread switches and counters for tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use querymt::chat::FunctionTool;
-    use toktrie::ApproximateTokEnv;
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
 
-    fn tool(name: &str, parameters: Value) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: FunctionTool {
-                name: name.to_string(),
-                description: String::new(),
-                parameters,
-                strict: None,
-            },
-        }
-    }
-
-    fn tools() -> Vec<Tool> {
-        vec![
-            tool(
-                "write_file",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-                    "required": ["path", "content"]
-                }),
-            ),
-            tool(
-                "glob",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "pattern": {"type": "string"},
-                        "limit": {"type": "integer"},
-                        "hidden": {"type": "boolean"},
-                        "mode": {"type": "string", "enum": ["fast", "full"]}
-                    },
-                    "required": ["pattern"]
-                }),
-            ),
-        ]
-    }
-
-    /// Matcher over a byte-level vocabulary: every byte is one token, so
-    /// strings can be fed directly.
-    fn matcher(lark: &str) -> Matcher {
-        let env = ApproximateTokEnv::single_byte_env();
-        let mut factory = ParserFactory::new_simple(&env).unwrap();
-        factory.quiet();
-        let m = Matcher::new(factory.create_parser(TopLevelGrammar::from_lark(lark.to_string())));
-        assert!(m.get_error().is_none(), "{:?}\n{lark}", m.get_error());
-        m
-    }
-
-    /// True when the whole text is accepted and the grammar can end there.
-    fn full_match(lark: &str, text: &str) -> bool {
-        let mut m = matcher(lark);
-        let bytes: Vec<u32> = text.bytes().map(u32::from).collect();
-        let n = m.try_consume_tokens(&bytes).unwrap_or(0);
-        n == bytes.len() && m.is_accepting().unwrap_or(false)
-    }
-
-    fn qwen() -> String {
-        qwen_function_lark(&tools(), &|t| lark_string(t), Tier::Schema).unwrap()
-    }
-
-    const CALL_HEAD: &str =
-        "\n<function=write_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=content>\n";
-
-    #[test]
-    fn value_accepts_less_than_and_markup() {
-        let lark = qwen();
-        for content in [
-            "if row[j] < best_d:\n    pass",
-            "a <= b and c<d",
-            "<div></div>",
-            "</param",
-            "x\n</parameter",
-            "",
-        ] {
-            let text = format!("{CALL_HEAD}{content}\n</parameter>\n</function>\n</tool_call>");
-            assert!(full_match(&lark, &text), "{content:?}\n{lark}");
-        }
-    }
-
-    #[test]
-    fn value_cannot_contain_its_terminator() {
-        let lark = qwen();
-        let text = format!("{CALL_HEAD}x</parameter>y\n</parameter>\n</function>\n</tool_call>");
-        assert!(!full_match(&lark, &text));
-    }
-
-    #[test]
-    fn qwen_function_enforces_schema_and_required_params() {
-        let lark = qwen();
-        let ok = "\n<function=glob>\n<parameter=pattern>\n*.rs\n</parameter>\n<parameter=limit>\n10\n</parameter>\n<parameter=mode>\nfast\n</parameter>\n</function>\n</tool_call>";
-        assert!(full_match(&lark, ok));
-        // Wrong type, unknown enum value, missing required param, unknown tool.
-        for bad in [
-            ok.replace("\n10\n", "\nten\n"),
-            ok.replace("\nfast\n", "\nslow\n"),
-            "\n<function=glob>\n</function>\n</tool_call>".to_string(),
-            "\n<function=nope>\n</function>\n</tool_call>".to_string(),
-        ] {
-            assert!(!full_match(&lark, &bad), "{bad:?}");
-        }
-        // Several calls in a row.
-        assert!(full_match(&lark, &format!("{ok}<tool_call>{ok}")));
-    }
-
-    #[test]
-    fn ministral_grammar_compiles_and_matches() {
-        let lark = ministral_lark(&tools(), &|t| lark_string(t), Tier::Schema).unwrap();
-        assert!(full_match(&lark, "glob[ARGS]{\"pattern\": \"*.rs\"}"));
-        assert!(full_match(
-            &lark,
-            "glob[ARGS]{\"pattern\": \"*\"}[TOOL_CALLS]write_file[ARGS]{\"path\": \"a\", \"content\": \"b\"}"
-        ));
-        assert!(!full_match(&lark, "nope[ARGS]{}"));
-        // Schema tier: required parameters, types and enums are enforced.
-        assert!(!full_match(&lark, "write_file[ARGS]{}"));
-        assert!(!full_match(
-            &lark,
-            "glob[ARGS]{\"pattern\": \"*\", \"limit\": \"ten\"}"
-        ));
-        assert!(!full_match(
-            &lark,
-            "glob[ARGS]{\"pattern\": \"*\", \"mode\": \"slow\"}"
-        ));
-        // Generic tier accepts any object.
-        let generic = ministral_lark(&tools(), &|t| lark_string(t), Tier::Generic).unwrap();
-        assert!(full_match(&generic, "write_file[ARGS]{}"));
-    }
-
-    #[test]
-    fn regex_escape_covers_terminators() {
-        for terminator in ["</parameter>", "<escape>", "<|\"|>", "a.b*c"] {
-            let lark = format!("start: X\n{}", exclusion_terminal("X", terminator));
-            assert!(full_match(&lark, "plain text"), "{lark}");
-            assert!(!full_match(&lark, &format!("a{terminator}b")), "{lark}");
-        }
+    thread_local! {
+        /// Fallback messages logged on this thread.
+        pub(crate) static FALLBACKS: Cell<u32> = const { Cell::new(0) };
+        /// Make `LlgToolGrammar::build` fail.
+        pub(crate) static FORCE_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
     }
 }
