@@ -58,6 +58,18 @@ String parameter values delimited by a terminator (`</parameter>` in Qwen XML-fu
 - **WHEN** a Gemma 4 string value is being generated and the model emits the special token `<|"|>`
 - **THEN** the grammar accepts it as the end of the string
 
+#### Scenario: Control tokens are not value text
+- **WHEN** a string value is being generated under llguidance and the model emits a control token that renders as empty text (for example `<|im_start|>`, `<eos>`, `<turn|>`) that is not the value's terminator
+- **THEN** the grammar does not allow it inside the value, while ordinary text is allowed; GBNF, which matches a control token's spelling as text, is not required to reject it
+
+#### Scenario: End of turn is allowed after a complete call
+- **WHEN** a complete tool call has been generated in any of the six formats under either engine
+- **THEN** an end-of-generation token (`<|im_end|>`, `<eos>`, ...) is allowed, and it is not allowed right after the trigger
+
+#### Scenario: Qwen3 JSON tool name is a JSON string
+- **WHEN** a Qwen3 JSON tool call `{"name": "write_file", "arguments": {...}}` is generated under either engine
+- **THEN** the quoted name is accepted and parses to the call, and an unquoted name (`"name": write_file`) is rejected
+
 ### Requirement: Schema-aware tool arguments
 When a tool set's schemas compile, the llguidance grammar SHALL restrict each call to a declared tool name and its arguments to that tool's JSON schema: declared parameter names, value types, enum members and required parameters. Undeclared parameters SHALL be allowed only when the schema permits additional properties. This SHALL apply in every format.
 
@@ -90,7 +102,7 @@ When a tool set's schemas cannot be compiled into an llguidance grammar, the pro
 
 #### Scenario: Generic grammar matches GBNF language
 - **WHEN** the generic llguidance grammar and the GBNF grammar for the same format and tools are applied at the same position over a real vocabulary
-- **THEN** they allow the same set of tokens, except two classes that are not differences in the language: byte tokens that are not complete UTF-8 on their own, and control/special tokens (for example `<|im_start|>`), whose spelling GBNF accepts as text inside a value while llguidance never lets a text lexeme consume a special token
+- **THEN** they allow the same set of tokens, compared over ordinary-text tokens: tokens whose text is non-empty, standalone UTF-8 and not a control token. Control tokens (for example `<|im_start|>`) are covered by the "Control tokens are not value text" scenario instead, and byte tokens that are not complete UTF-8 on their own are not compared because llguidance tracks partial UTF-8 across tokens while llama.cpp rejects them
 
 ### Requirement: GBNF fallback when llguidance is unavailable or fails
 When llguidance cannot build a grammar for a request, or reports an error during generation, the provider SHALL enforce the GBNF grammar for the rest of that request instead of generating unconstrained. The fallback SHALL be logged once per request. Builds without llguidance SHALL use GBNF.

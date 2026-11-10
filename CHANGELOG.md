@@ -48,6 +48,9 @@
 
 ### Fixed
 
+- **llama.cpp Qwen3 (JSON tool-call format) calls were dropped.** The tool
+  grammar forced the tool name without JSON quotes (`"name": glob`), which the
+  parser cannot read. The name is now a JSON string.
 - **llama.cpp tool calls could not contain `<` in string arguments.** The tool
   grammar for Qwen-function models (Qwen3.5/3.6/3.8, AREX-2) and FunctionGemma
   forbade `<` inside every string parameter, so `write_file`/`edit` content such

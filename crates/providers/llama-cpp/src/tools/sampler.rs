@@ -1187,6 +1187,164 @@ mod grammar_tests {
         }
     }
 
+    /// One complete call per format, starting with the trigger.
+    const COMPLETE_CALLS: [(ToolFormat, &str); 6] = [
+        (
+            ToolFormat::Qwen3,
+            "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.py\", \"content\": \"x\"}}\n</tool_call>",
+        ),
+        (
+            ToolFormat::QwenFunction,
+            "<tool_call>\n<function=write_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=content>\nx\n</parameter>\n</function>\n</tool_call>",
+        ),
+        (
+            ToolFormat::Ministral3,
+            "[TOOL_CALLS]write_file[ARGS]{\"path\": \"a\", \"content\": \"x\"}",
+        ),
+        (
+            ToolFormat::Lfm2,
+            "<|tool_call_start|>[write_file(path=\"a\", content=\"x\")]<|tool_call_end|>",
+        ),
+        (
+            ToolFormat::FunctionGemma,
+            "<start_function_call>call:write_file{path:<escape>a<escape>,content:<escape>x<escape>}<end_function_call>",
+        ),
+        (
+            ToolFormat::Gemma4,
+            "<|tool_call>call:write_file{path:<|\"|>a<|\"|>,content:<|\"|>x<|\"|>}<tool_call|>",
+        ),
+    ];
+
+    /// Feed `text` token by token to a fresh sampler. `Err` carries the
+    /// index and text of the first token the grammar rejected.
+    fn replay(
+        model: &Arc<LlamaModel>,
+        format: ToolFormat,
+        backend: GrammarBackend,
+        text: &str,
+    ) -> Result<ConstrainedSampler, (usize, String)> {
+        let grammar = format.grammar(&[write_file_tool()]).unwrap();
+        let mut sampler = sampler_after(model, grammar, "", backend);
+        for (i, token) in model
+            .vocab()
+            .tokenize(text.as_bytes(), false, true)
+            .into_iter()
+            .enumerate()
+        {
+            if !sampler.allows(token) {
+                let piece = model.vocab().token_to_piece(token, true, None);
+                return Err((i, String::from_utf8_lossy(&piece).into_owned()));
+            }
+            sampler.accept(token);
+        }
+        Ok(sampler)
+    }
+
+    /// Whether some end-of-generation token (`<|im_end|>`, ...) is allowed.
+    fn end_of_turn_allowed(model: &LlamaModel, sampler: &mut ConstrainedSampler) -> bool {
+        (0..model.n_vocab())
+            .map(LlamaToken)
+            .filter(|token| model.vocab().is_eog(*token))
+            .any(|token| sampler.allows(token))
+    }
+
+    #[test]
+    fn qwen3_json_tool_name_must_be_a_json_string() {
+        let Some(model) = test_vocab::vocab_model(Vocab::Qwen35) else {
+            return;
+        };
+        let tools = [write_file_tool()];
+        let (_, call) = COMPLETE_CALLS[0];
+        // The provider parses what the grammar lets through.
+        let parsed = crate::chat_format::parse_assistant_format_with_tools(
+            call,
+            ReasoningFormat::ThinkTags,
+            false,
+            &tools,
+        );
+        assert_eq!(
+            parsed.tool_calls.expect("parses")[0].function.name,
+            "write_file"
+        );
+
+        let unquoted = call.replace("\"name\": \"write_file\"", "\"name\": write_file");
+        assert_ne!(unquoted, call);
+        for backend in BACKENDS {
+            replay(&model, ToolFormat::Qwen3, backend, call)
+                .unwrap_or_else(|(i, piece)| panic!("{backend:?} rejects token {i} {piece:?}"));
+            let rejected = replay(&model, ToolFormat::Qwen3, backend, &unquoted)
+                .err()
+                .unwrap_or_else(|| panic!("{backend:?} accepted an unquoted tool name"));
+            assert!(
+                rejected.1.trim_start().starts_with('w'),
+                "{backend:?}: {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn end_of_turn_is_allowed_after_a_complete_call() {
+        for (format, call) in COMPLETE_CALLS {
+            let Some(model) = test_vocab::vocab_model(vocab_for(format)) else {
+                continue;
+            };
+            for backend in BACKENDS {
+                let mut sampler =
+                    replay(&model, format, backend, call).unwrap_or_else(|(i, piece)| {
+                        panic!("{format:?} {backend:?} rejects token {i} {piece:?}")
+                    });
+                assert!(
+                    end_of_turn_allowed(&model, &mut sampler),
+                    "{format:?} {backend:?}: no end-of-turn token after a complete call"
+                );
+                // Not in the middle of a call.
+                let trigger = format.grammar(&[write_file_tool()]).unwrap().triggers[0]
+                    .value
+                    .clone();
+                let mut open = replay(&model, format, backend, &trigger).unwrap();
+                assert!(
+                    !end_of_turn_allowed(&model, &mut open),
+                    "{format:?} {backend:?}: end of turn allowed right after {trigger:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn special_token_is_not_value_text() {
+        // (format, prefix inside a string value, a control token that is not
+        // the value's terminator). llguidance treats a token as special when
+        // its piece is empty without the `special` flag, which holds for turn
+        // and end-of-sequence tokens; Gemma's tool-call delimiters render as
+        // plain text and are ordinary value text for it.
+        let cases = [
+            (ToolFormat::QwenFunction, CONTENT_PREFIX, "<|im_start|>"),
+            (
+                ToolFormat::Gemma4,
+                "<|tool_call>call:write_file{path:<|\"|>a.py",
+                "<turn|>",
+            ),
+            (
+                ToolFormat::FunctionGemma,
+                "<start_function_call>call:write_file{path:<escape>a.py",
+                "<eos>",
+            ),
+        ];
+        for (format, prefix, special) in cases {
+            let Some(model) = test_vocab::vocab_model(vocab_for(format)) else {
+                continue;
+            };
+            let grammar = format.grammar(&[write_file_tool()]).unwrap();
+            let (special, text) = (token(&model, special), token(&model, "x"));
+            let mut sampler = sampler_after(&model, grammar, prefix, GrammarBackend::Llguidance);
+            assert!(sampler.allows(text), "{format:?}: ordinary text");
+            assert!(
+                !sampler.allows(special),
+                "{format:?}: special token in a value"
+            );
+        }
+    }
+
     fn tool_with_options_schema(options: serde_json::Value) -> Tool {
         let mut tool = write_file_tool();
         tool.function.parameters["properties"]["options"] = options;
