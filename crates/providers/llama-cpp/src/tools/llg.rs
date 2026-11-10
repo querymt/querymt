@@ -149,11 +149,19 @@ impl LlgToolGrammar {
                 ToolFormat::FunctionGemma => lark::function_gemma_lark(tools, &tag, tier),
                 ToolFormat::Gemma4 => lark::gemma4_lark(tools, &tag, tier),
             };
-            let Some(schema_lark) = generate(Tier::Schema) else {
+            #[cfg(test)]
+            let first = if test_hooks::FORCE_GENERIC.with(std::cell::Cell::get) {
+                Tier::Generic
+            } else {
+                Tier::Schema
+            };
+            #[cfg(not(test))]
+            let first = Tier::Schema;
+            let Some(schema_lark) = generate(first) else {
                 return Ok(None);
             };
             let (template, tier) = match env.matcher(&schema_lark) {
-                Ok(matcher) => (matcher, Tier::Schema),
+                Ok(matcher) => (matcher, first),
                 Err(error) => {
                     // Retrying an identical grammar cannot succeed.
                     let Some(generic) = generate(Tier::Generic).filter(|g| *g != schema_lark)
@@ -295,6 +303,8 @@ pub(crate) mod test_hooks {
     thread_local! {
         /// Fallback messages logged on this thread.
         pub(crate) static FALLBACKS: Cell<u32> = const { Cell::new(0) };
+        /// Build the generic tier even when the schema tier compiles.
+        pub(crate) static FORCE_GENERIC: Cell<bool> = const { Cell::new(false) };
         /// Make `LlgToolGrammar::build` fail.
         pub(crate) static FORCE_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
     }

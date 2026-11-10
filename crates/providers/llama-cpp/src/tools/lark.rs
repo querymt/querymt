@@ -96,6 +96,25 @@ NUMBER: /-?([0-9]|[1-9][0-9]*)(\.[0-9]+)?([eE][+\-]?[0-9]+)?/
 IDENT: /[A-Za-z_][A-Za-z0-9_\-]*/
 ";
 
+/// JSON rules for the generic tier, the same language as `json_gbnf_rules`
+/// in `chat_format`. They are not `%json`: that follows the JSON spec and
+/// forbids raw control characters in strings, which the GBNF rule
+/// `[^"\\]` accepts.
+const GENERIC_JSON: &str = r#"JSTRING: /"([^"\\]|\\(["\\\/bfnrt]|u[0-9a-fA-F]{4}))*"/
+jvalue: jobject | jarray | JSTRING | NUMBER | "true" | "false" | "null"
+jobject: "{" WS? (jmember (WS? "," WS? jmember)*)? WS? "}"
+jmember: JSTRING WS? ":" WS? jvalue
+jarray: "[" WS? (jvalue (WS? "," WS? jvalue)*)? WS? "]"
+"#;
+
+/// Terminals, plus the GBNF-equivalent JSON rules for the generic tier.
+fn push_terminals(out: &mut String, tier: Tier, json: bool) {
+    out.push_str(TERMINALS);
+    if json && tier == Tier::Generic {
+        out.push_str(GENERIC_JSON);
+    }
+}
+
 /// Rule `name` for text that ends with `close`, containing `exclude` nowhere.
 ///
 /// A special-token terminator is a separate item after the text lexeme. An
@@ -359,7 +378,7 @@ pub(crate) fn qwen_function_lark(tools: &[Tool], tag: Tag<'_>, tier: Tier) -> Op
         &Delim::literal("\n</parameter>\n"),
         "\n</parameter>\n",
     );
-    out.push_str(TERMINALS);
+    push_terminals(&mut out, tier, true);
 
     for (i, tool) in tools.iter().enumerate() {
         let schema = &tool.function.parameters;
@@ -375,11 +394,11 @@ pub(crate) fn qwen_function_lark(tools: &[Tool], tag: Tag<'_>, tier: Tier) -> Op
                     Kind::Null => Some("\"null\"".to_string()),
                     Kind::Array => Some(match tier {
                         Tier::Schema => json_schema_expr(d.schema),
-                        Tier::Generic => "%json {\"type\": \"array\"}".to_string(),
+                        Tier::Generic => "jarray".to_string(),
                     }),
                     Kind::Object => Some(match tier {
                         Tier::Schema => json_schema_expr(d.schema),
-                        Tier::Generic => "%json {\"type\": \"object\"}".to_string(),
+                        Tier::Generic => "jobject".to_string(),
                     }),
                 };
                 Param {
@@ -418,10 +437,10 @@ pub(crate) fn ministral_lark(tools: &[Tool], tag: Tag<'_>, tier: Tier) -> Option
     let _ = writeln!(out, "start: call (open_t call)*");
     let _ = writeln!(out, "open_t: {}", tag("[TOOL_CALLS]").expr);
     let _ = writeln!(out, "args_t: {}", tag("[ARGS]").expr);
-    out.push_str(TERMINALS);
+    push_terminals(&mut out, tier, true);
     match tier {
         Tier::Generic => {
-            let _ = writeln!(out, "call: name args_t %json {{\"type\": \"object\"}} WS?");
+            let _ = writeln!(out, "call: name args_t jobject WS?");
             let _ = writeln!(out, "name: {}", name_alternatives(tools));
         }
         Tier::Schema => {
@@ -449,7 +468,7 @@ pub(crate) fn qwen3_lark(tools: &[Tool], tag: Tag<'_>, tier: Tier) -> Option<Str
     let _ = writeln!(out, "start: call (open_t call)*");
     let _ = writeln!(out, "open_t: {}", tag("<tool_call>").expr);
     let _ = writeln!(out, "close_t: {}", tag("</tool_call>").expr);
-    out.push_str(TERMINALS);
+    push_terminals(&mut out, tier, true);
     let name_key = lark_string("\"name\"");
     let args_key = lark_string("\"arguments\"");
     let _ = writeln!(out, "head: WS? \"{{\" WS? {name_key} WS? \":\" WS?");
@@ -463,10 +482,7 @@ pub(crate) fn qwen3_lark(tools: &[Tool], tag: Tag<'_>, tier: Tier) -> Option<Str
                 .map(|tool| quoted(&tool.function.name))
                 .collect::<Vec<_>>()
                 .join(" | ");
-            let _ = writeln!(
-                out,
-                "call: head name mid %json {{\"type\": \"object\"}} tail"
-            );
+            let _ = writeln!(out, "call: head name mid jobject tail");
             let _ = writeln!(out, "name: {names}");
         }
         Tier::Schema => {
@@ -493,12 +509,12 @@ pub(crate) fn lfm2_lark(tools: &[Tool], tag: Tag<'_>, tier: Tier) -> Option<Stri
     let mut out = String::new();
     let _ = writeln!(out, "start: \"[\" call (\",\" WS? call)* \"]\" end_t WS?");
     let _ = writeln!(out, "end_t: {}", tag("<|tool_call_end|>").expr);
-    out.push_str(TERMINALS);
+    push_terminals(&mut out, tier, true);
     match tier {
         Tier::Generic => {
             let _ = writeln!(out, "call: name \"(\" WS? kwargs? WS? \")\"");
             let _ = writeln!(out, "kwargs: kwarg (\",\" WS? kwarg)*");
-            let _ = writeln!(out, "kwarg: IDENT WS? \"=\" WS? %json {{}}");
+            let _ = writeln!(out, "kwarg: IDENT WS? \"=\" WS? jvalue");
             let _ = writeln!(out, "name: {}", name_alternatives(tools));
         }
         Tier::Schema => {
@@ -552,7 +568,7 @@ pub(crate) fn function_gemma_lark(tools: &[Tool], tag: Tag<'_>, tier: Tier) -> O
     let _ = writeln!(out, "end_t: {}", tag("<end_function_call>").expr);
     let _ = writeln!(out, "esc_t: {}", escape.expr);
     text_rule(&mut out, "esc_text", "<escape>", &escape, "<escape>");
-    out.push_str(TERMINALS);
+    push_terminals(&mut out, tier, false);
     let text_member = "WS? \":\" WS? esc_t esc_text";
     match tier {
         Tier::Generic => {
@@ -629,7 +645,7 @@ pub(crate) fn gemma4_lark(tools: &[Tool], tag: Tag<'_>, tier: Tier) -> Option<St
     let _ = writeln!(out, "end_t: {}", tag("<tool_call|>").expr);
     let _ = writeln!(out, "q_t: {}", quote.expr);
     text_rule(&mut out, "gtext", QUOTE, &quote, QUOTE);
-    out.push_str(TERMINALS);
+    push_terminals(&mut out, tier, false);
     out.push_str(
         "gvalue: gobject | garray | gstring | NUMBER | \"true\" | \"false\" | \"null\"\n\
          gstring: q_t gtext\n\

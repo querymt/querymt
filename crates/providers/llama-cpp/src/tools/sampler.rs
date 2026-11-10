@@ -926,6 +926,267 @@ mod grammar_tests {
         }
     }
 
+    /// Sampler for `prefix` on the generic llguidance tier.
+    fn generic_llg_sampler(
+        model: &Arc<LlamaModel>,
+        format: ToolFormat,
+        prefix: &str,
+    ) -> ConstrainedSampler {
+        use crate::tools::llg::{Tier, test_hooks::FORCE_GENERIC};
+        FORCE_GENERIC.with(|f| f.set(true));
+        let sampler = sampler_after(
+            model,
+            format.grammar(&[write_file_tool()]).unwrap(),
+            prefix,
+            GrammarBackend::Llguidance,
+        );
+        FORCE_GENERIC.with(|f| f.set(false));
+        assert_eq!(sampler.llg_tier(), Some(Tier::Generic), "{format:?}");
+        sampler
+    }
+
+    /// Tokens the two samplers disagree on, as `(id, text)`. Two classes
+    /// are left out, neither a difference in the grammar's language:
+    /// byte tokens that are not UTF-8 on their own (llama.cpp rejects them
+    /// outright, llguidance tracks partial UTF-8 across tokens), and
+    /// control tokens such as `<|im_start|>` (GBNF matches their spelling
+    /// inside text, llguidance keeps special tokens out of text lexemes;
+    /// they render as an empty piece without `special`).
+    fn differing_tokens(
+        model: &LlamaModel,
+        a: &mut ConstrainedSampler,
+        b: &mut ConstrainedSampler,
+    ) -> Vec<(LlamaToken, String)> {
+        let (mut x, mut y) = (full_vocab(model), full_vocab(model));
+        a.mask(&mut x);
+        b.mask(&mut y);
+        let vocab = model.vocab();
+        x.data
+            .iter()
+            .zip(&y.data)
+            .filter(|(p, q)| p.logit().is_finite() != q.logit().is_finite())
+            .filter_map(|(p, _)| {
+                let piece = vocab.token_to_piece(p.id(), false, None);
+                (!piece.is_empty() && !piece.contains(&0) && std::str::from_utf8(&piece).is_ok())
+                    .then(|| (p.id(), String::from_utf8_lossy(&piece).into_owned()))
+            })
+            .collect()
+    }
+
+    /// Positions (text fed after the start of the call) where GBNF and the
+    /// generic grammar are compared, per format: right after the trigger,
+    /// inside the call head, and inside a value.
+    const PARITY: [(ToolFormat, &[&str]); 6] = [
+        (
+            ToolFormat::Qwen3,
+            &[
+                "<tool_call>",
+                "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.py\", \"content\": \"x < y",
+                "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.py\", \"content\": \"x\"}",
+            ],
+        ),
+        (
+            ToolFormat::QwenFunction,
+            &[
+                "<tool_call>",
+                "<tool_call>\n<function=write_file>\n",
+                CONTENT_PREFIX,
+                "<tool_call>\n<function=write_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=content>\nx\n</parameter",
+            ],
+        ),
+        (
+            ToolFormat::Ministral3,
+            &[
+                "[TOOL_CALLS]",
+                "[TOOL_CALLS]write_file[ARGS]",
+                "[TOOL_CALLS]write_file[ARGS]{\"path\": \"a\", \"content\": \"x < y",
+            ],
+        ),
+        (
+            ToolFormat::Lfm2,
+            &[
+                "<|tool_call_start|>",
+                "<|tool_call_start|>[write_file(",
+                "<|tool_call_start|>[write_file(path=\"a\", content=\"x < y",
+            ],
+        ),
+        (
+            ToolFormat::FunctionGemma,
+            &[
+                "<start_function_call>",
+                "<start_function_call>call:write_file{",
+                "<start_function_call>call:write_file{path:<escape>a<escape>,content:<escape>x < y",
+            ],
+        ),
+        (
+            ToolFormat::Gemma4,
+            &[
+                "<|tool_call>",
+                "<|tool_call>call:write_file{",
+                "<|tool_call>call:write_file{path:<|\"|>a<|\"|>,content:<|\"|>x < y",
+            ],
+        ),
+    ];
+
+    #[test]
+    fn generic_grammar_matches_gbnf_language() {
+        for (format, positions) in PARITY {
+            let Some(model) = test_vocab::vocab_model(vocab_for(format)) else {
+                continue;
+            };
+            let grammar = format.grammar(&[write_file_tool()]).unwrap();
+            for prefix in positions {
+                let mut gbnf = sampler_after(&model, grammar.clone(), prefix, GrammarBackend::Gbnf);
+                let mut llg = generic_llg_sampler(&model, format, prefix);
+                let differ = differing_tokens(&model, &mut gbnf, &mut llg);
+                assert!(
+                    differ.is_empty(),
+                    "{format:?} after {prefix:?}: {} tokens differ: {:?}",
+                    differ.len(),
+                    &differ[..differ.len().min(20)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_format_is_checked_on_its_models_tokenizer() {
+        for format in ALL_FORMATS {
+            let positions = PARITY
+                .iter()
+                .find(|(f, _)| *f == format)
+                .map_or(&[][..], |(_, p)| p);
+            assert!(
+                positions.len() >= 3,
+                "{format:?} has no real-tokenizer check"
+            );
+            // The checks run on the tokenizer of a model that uses the format.
+            let expected = match format {
+                ToolFormat::Qwen3 | ToolFormat::QwenFunction | ToolFormat::Ministral3 => {
+                    Vocab::Qwen35
+                }
+                ToolFormat::Gemma4 => Vocab::Gemma4,
+                ToolFormat::Lfm2 => Vocab::Lfm2,
+                ToolFormat::FunctionGemma => Vocab::FunctionGemma,
+            };
+            assert_eq!(vocab_for(format), expected, "{format:?}");
+        }
+        assert_eq!(PARITY.len(), ALL_FORMATS.len());
+    }
+
+    const BACKENDS: [GrammarBackend; 2] = [GrammarBackend::Gbnf, GrammarBackend::Llguidance];
+
+    fn token(model: &LlamaModel, text: &str) -> LlamaToken {
+        let tokens = model.vocab().tokenize(text.as_bytes(), false, true);
+        assert_eq!(
+            tokens.len(),
+            1,
+            "{text:?} is not a single token: {tokens:?}"
+        );
+        tokens[0]
+    }
+
+    #[test]
+    fn special_token_trigger_activates_the_grammar() {
+        for (format, trigger) in [
+            (ToolFormat::Gemma4, "<|tool_call>"),
+            (ToolFormat::Lfm2, "<|tool_call_start|>"),
+            (ToolFormat::FunctionGemma, "<start_function_call>"),
+        ] {
+            let Some(model) = test_vocab::vocab_model(vocab_for(format)) else {
+                continue;
+            };
+            let grammar = format.grammar(&[write_file_tool()]).unwrap();
+            // Every format starts its call with a fixed character, so a
+            // letter that is not that character must be rejected.
+            let (bad, good) = (token(&model, "x"), token(&model, "c"));
+            let (bad, good) = if format == ToolFormat::Lfm2 {
+                (bad, token(&model, "["))
+            } else {
+                (bad, good)
+            };
+            token(&model, trigger);
+            for backend in BACKENDS {
+                let mut before = sampler_after(&model, grammar.clone(), "Hello ", backend);
+                assert!(
+                    before.allows(bad),
+                    "{format:?} {backend:?}: active before the trigger"
+                );
+                let mut after = sampler_after(&model, grammar.clone(), trigger, backend);
+                assert!(
+                    !after.allows(bad),
+                    "{format:?} {backend:?}: not active after {trigger}"
+                );
+                assert!(after.allows(good), "{format:?} {backend:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn special_token_terminator_closes_the_value() {
+        for (format, prefix, terminator) in [
+            (
+                ToolFormat::Gemma4,
+                "<|tool_call>call:write_file{path:<|\"|>a.py",
+                "<|\"|>",
+            ),
+            (
+                ToolFormat::FunctionGemma,
+                "<start_function_call>call:write_file{path:<escape>a.py",
+                "<escape>",
+            ),
+        ] {
+            let Some(model) = test_vocab::vocab_model(vocab_for(format)) else {
+                continue;
+            };
+            let grammar = format.grammar(&[write_file_tool()]).unwrap();
+            let (close, comma, letter) = (
+                token(&model, terminator),
+                token(&model, ","),
+                token(&model, "x"),
+            );
+            for backend in BACKENDS {
+                let mut sampler = sampler_after(&model, grammar.clone(), prefix, backend);
+                assert!(sampler.allows(letter), "{format:?} {backend:?}: value text");
+                assert!(
+                    sampler.allows(close),
+                    "{format:?} {backend:?}: terminator rejected"
+                );
+                sampler.accept(close);
+                assert!(
+                    sampler.allows(comma),
+                    "{format:?} {backend:?}: value not closed"
+                );
+                assert!(
+                    !sampler.allows(letter),
+                    "{format:?} {backend:?}: text after the value"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_before_the_trigger_is_unconstrained() {
+        let prose = "Some prose with < and { braces, call:foo and the word function ";
+        for format in ALL_FORMATS {
+            let Some(model) = test_vocab::vocab_model(vocab_for(format)) else {
+                continue;
+            };
+            let grammar = format.grammar(&[write_file_tool()]).unwrap();
+            for backend in BACKENDS {
+                let mut sampler = sampler_after(&model, grammar.clone(), prose, backend);
+                let mut candidates = full_vocab(&model);
+                sampler.mask(&mut candidates);
+                let masked = candidates
+                    .data
+                    .iter()
+                    .filter(|d| !d.logit().is_finite())
+                    .count();
+                assert_eq!(masked, 0, "{format:?} {backend:?}: {masked} tokens masked");
+            }
+        }
+    }
+
     fn tool_with_options_schema(options: serde_json::Value) -> Tool {
         let mut tool = write_file_tool();
         tool.function.parameters["properties"]["options"] = options;
