@@ -178,16 +178,19 @@ impl TaskRepository for SqliteTaskRepository {
                 |row| row.get(0)
             ).optional()?;
 
-            let internal_id = internal_id.ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
+            let Some(internal_id) = internal_id else {
+                return Ok(None);
+            };
 
             let mut stmt = conn.prepare(
                 "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, completion_evidence, completed_at, created_at, updated_at FROM tasks WHERE session_id = ? ORDER BY created_at ASC",
             )?;
             let tasks_iter = stmt.query_map(params![internal_id], map_task_row)?;
 
-            tasks_iter.collect::<Result<Vec<_>, _>>()
+            tasks_iter.collect::<Result<Vec<_>, _>>().map(Some)
         })
-        .await
+        .await?
+        .ok_or_else(|| SessionError::SessionNotFound(session_id.to_string()))
     }
 
     async fn update_task_status(&self, task_id: &str, status: TaskStatus) -> SessionResult<()> {

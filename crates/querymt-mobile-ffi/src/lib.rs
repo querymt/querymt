@@ -318,7 +318,7 @@ async fn inject_session_load_snapshot(
     }
     let snapshot = querymt_agent::session::load_session_snapshot(agent, view_store, session_id)
         .await
-        .map_err(|e| AcpError::internal_error().data(e.to_string()))?;
+        .map_err(|e| AcpError::from(querymt_agent::AgentError::from(e)))?;
 
     let event_count = snapshot.audit.events.len();
     log::info!(
@@ -354,6 +354,17 @@ async fn ensure_remote_attach_snapshot(
         return Err(AcpError::internal_error().data("remote attach returned non-object response"));
     };
 
+    // `remote/createSession` with `attach: false` only created the session on
+    // its owner; nothing is attached here, so there is no snapshot to build.
+    if result_obj
+        .get("attached")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        log::info!("ffi remote create without attach: session_id={session_id}");
+        return Ok(());
+    }
+
     if result_obj.contains_key("snapshot") {
         log::info!(
             "ffi remote attach snapshot preserved: session_id={}",
@@ -364,7 +375,7 @@ async fn ensure_remote_attach_snapshot(
 
     let snapshot = querymt_agent::session::load_session_snapshot(agent, view_store, session_id)
         .await
-        .map_err(|e| AcpError::internal_error().data(e.to_string()))?;
+        .map_err(|e| AcpError::from(querymt_agent::AgentError::from(e)))?;
     let event_count = snapshot.audit.events.len();
     log::info!(
         "ffi remote attach fallback snapshot injected: session_id={}, events={}",
@@ -1579,6 +1590,49 @@ mod tests {
             "FFI remote load must not replace owner truth with an empty viewer journal"
         );
         assert_eq!(loaded["_meta"]["nodeId"], "owner");
+        state::remove_agent(agent_handle).unwrap();
+    }
+
+    /// `remote/createSession` with `attach: false` returns a session that exists
+    /// only on its owner host. The hook must not build a viewer-local snapshot
+    /// (it used to fail with "Database error: Query returned no rows").
+    #[tokio::test]
+    async fn remote_create_without_attach_skips_local_snapshot() {
+        let agent_handle = make_ffi_test_agent().await;
+        let (agent, view) = state::with_agent_read(agent_handle, |record| {
+            Ok((record.agent.handle(), record.view_store.clone().unwrap()))
+        })
+        .unwrap();
+        let hooks = MobileAcpSessionHooks { view_store: view };
+        let mut created = serde_json::json!({
+            "session_id": "remote-only",
+            "node_id": "owner",
+            "attached": false,
+            "config_options": [],
+        });
+        let expected = created.clone();
+        querymt_agent::acp::shared::AcpSessionHooks::on_remote_session_attached(
+            &hooks,
+            agent.as_ref(),
+            "remote-only",
+            &mut created,
+        )
+        .await
+        .expect("create without attach must succeed");
+        assert_eq!(created, expected, "no snapshot may be injected");
+
+        // An attached response for a session unknown locally reports a typed
+        // not-found error instead of a raw database error.
+        let mut attached = serde_json::json!({"session_id": "remote-only", "attached": true});
+        let error = querymt_agent::acp::shared::AcpSessionHooks::on_remote_session_attached(
+            &hooks,
+            agent.as_ref(),
+            "remote-only",
+            &mut attached,
+        )
+        .await
+        .expect_err("unknown session has no local snapshot");
+        assert_eq!(i32::from(error.code), -32002, "{error:?}");
         state::remove_agent(agent_handle).unwrap();
     }
 
