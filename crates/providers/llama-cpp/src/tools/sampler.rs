@@ -1436,10 +1436,15 @@ mod grammar_tests {
     }
 
     /// Per-token grammar cost inside a long string value. Run with
-    /// `cargo test --release -p qmt-llama-cpp grammar_cost -- --ignored --nocapture`.
+    /// `QMT_RUN_GRAMMAR_BENCH=1 cargo nextest run --release -p qmt-llama-cpp
+    /// --run-ignored only --no-capture -E 'test(/llguidance_value_tokens/)'`.
     #[test]
-    #[ignore]
-    fn grammar_cost_benchmark() {
+    #[ignore = "benchmark: set QMT_RUN_GRAMMAR_BENCH=1 and use --run-ignored"]
+    fn llguidance_value_tokens_stay_under_one_millisecond() {
+        if std::env::var_os("QMT_RUN_GRAMMAR_BENCH").is_none() {
+            eprintln!("SKIPPED: set QMT_RUN_GRAMMAR_BENCH=1 to run the grammar benchmark");
+            return;
+        }
         let Some(model) = vocab_model() else { return };
         let base = ToolFormat::QwenFunction
             .grammar(&[write_file_tool()])
@@ -1479,13 +1484,37 @@ mod grammar_tests {
         // must accept the same body for the comparison to be fair.
         let body = "def tour_length(tour, d):\n    total = 0.0\n    for i in range(len(tour)):\n        a = tour[i]\n        b = tour[(i + 1) % len(tour)]\n        total += d[a][b]\n    return total\n\n\ndef two_opt(tour, d):\n    improved = True\n    while improved:\n        improved = False\n        for i in range(1, len(tour) - 2):\n            for j in range(i + 1, len(tour)):\n                if j - i == 1:\n                    continue\n                delta = d[tour[i - 1]][tour[j - 1]] + d[tour[i]][tour[j % len(tour)]]\n                if delta >= 0:\n                    continue\n                tour[i:j] = reversed(tour[i:j])\n                improved = True\n    return tour\n";
         let tokens = model.vocab().tokenize(body.as_bytes(), false, true);
+        let prefix = "<tool_call>\n<function=write_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=content>\n";
+        // The first llguidance build on a model walks the whole vocabulary
+        // to make the token trie; later builds reuse it (design D6).
+        let started = std::time::Instant::now();
+        drop(sampler_after(
+            &model,
+            base.clone(),
+            prefix,
+            GrammarBackend::Llguidance,
+        ));
+        let first = started.elapsed();
+        let started = std::time::Instant::now();
+        drop(sampler_after(
+            &model,
+            base.clone(),
+            prefix,
+            GrammarBackend::Llguidance,
+        ));
+        eprintln!(
+            "llguidance first build (token trie) {:.1} ms, cached build {:.2} ms",
+            first.as_secs_f64() * 1e3,
+            started.elapsed().as_secs_f64() * 1e3
+        );
+        eprintln!(
+            "{} body tokens, vocabulary {}",
+            tokens.len(),
+            model.n_vocab()
+        );
+        let mut llg_mean = None;
         for (name, grammar, backend) in variants {
-            let mut sampler = sampler_after(
-                &model,
-                grammar,
-                "<tool_call>\n<function=write_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=content>\n",
-                backend,
-            );
+            let mut sampler = sampler_after(&model, grammar, prefix, backend);
             let (mut full, mut check) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
             for &token in &tokens {
                 let mut cands = full_vocab(&model);
@@ -1499,11 +1528,22 @@ mod grammar_tests {
                 sampler.accept(token);
             }
             let n = tokens.len() as u32;
+            if backend == GrammarBackend::Llguidance {
+                assert!(sampler.uses_llguidance());
+                llg_mean = Some((full + check) / n);
+            }
             eprintln!(
                 "{name:32} full-vocab mask {:>9.3} ms/token   single-token check {:>8.1} us/token",
                 (full / n).as_secs_f64() * 1e3,
                 (check / n).as_secs_f64() * 1e6
             );
         }
+        // Mask plus check per token: more than a request pays, since the
+        // mask is only computed for rejected tokens.
+        let mean = llg_mean.expect("llguidance variant ran");
+        assert!(
+            mean < std::time::Duration::from_millis(1),
+            "llguidance mean {mean:?} per token is not under 1 ms"
+        );
     }
 }

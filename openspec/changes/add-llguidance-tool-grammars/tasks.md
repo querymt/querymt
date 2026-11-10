@@ -85,21 +85,32 @@ Package for every command: `qmt-llama-cpp`. Features: `--no-default-features --f
 
 ## 6. Overhead benchmark
 
-- [ ] 6.1 Convert `grammar_cost_benchmark` into the scenario test local-tool-call-grammars / Llguidance value tokens stay under one millisecond (`llguidance_value_tokens_stay_under_one_millisecond`):
+- [x] 6.1 Convert `grammar_cost_benchmark` into the scenario test local-tool-call-grammars / Llguidance value tokens stay under one millisecond (`llguidance_value_tokens_stay_under_one_millisecond`):
   - keep it `#[ignore]` and gated by `QMT_RUN_GRAMMAR_BENCH=1`;
   - assert the llguidance mean is below 1 ms;
   - also print the one-time token-trie build time.
 
   Verify with `QMT_RUN_GRAMMAR_BENCH=1 cargo nextest run --release -p qmt-llama-cpp $F --run-ignored only --no-capture -E 'test(/llguidance_value_tokens/)'` and record the table in this task.
+  - Result: 1 passed (98 s, dominated by the uncollapsed GBNF variant). Release build, Apple M4 Pro, qwen35 vocab (151,936 tokens), 184 body tokens in a `write_file` value:
+
+    | Grammar | Whole-vocab mask | Single-token check |
+    |---|---|---|
+    | GBNF `[^<]*` (pre-fix, lossy) | 10.046 ms | 4.0 us |
+    | GBNF exclusion, uncollapsed | 507.691 ms | 49.0 us |
+    | GBNF exclusion, collapsed | 13.249 ms | 6.6 us |
+    | llguidance | 0.278 ms | 0.3 us |
+
+    llguidance token-trie build: 241.4 ms first time per model, 0.10 ms when cached. The test asserts mask plus check below 1 ms per token and is `#[ignore]`, gated by `QMT_RUN_GRAMMAR_BENCH`.
 
 ## 7. Docs and changelog
 
-- [ ] 7.1 Document `grammar_backend` in `docs/docs/core/available-providers.md` (llama-cpp section): TOML path, values, default, fallback behaviour, schema-aware arguments.
-- [ ] 7.2 Add CHANGELOG.md "Unreleased" entries:
+- [x] 7.1 Document `grammar_backend` in `docs/docs/core/available-providers.md` (llama-cpp section): TOML path, values, default, fallback behaviour, schema-aware arguments.
+- [x] 7.2 Add CHANGELOG.md "Unreleased" entries:
   - **BREAKING:** llguidance default and schema-aware arguments in all formats.
   - **BREAKING:** new `LlamaCppConfig::grammar_backend` field.
   - Seeded output changes under rejection sampling.
   - Tool-call speed-up.
+  - Result: `docs/docs/core/available-providers.md` (option row, "Tool-call grammars" section with mermaid fallback chart) and `CHANGELOG.md` (two Behavior-changes entries, one Breaking entry for the new `LlamaCppConfig` field).
 
 ## 8. Integration checks
 
@@ -110,7 +121,10 @@ Package for every command: `qmt-llama-cpp`. Features: `--no-default-features --f
   4. `cargo clippy -p qmt-llama-cpp $F --all-targets -- -D warnings`
 
   Record the counts. `cargo tree -i qmt-llama-cpp --workspace --depth 1` lists no dependents, so there is no downstream run.
-- [ ] 8.2 Run `openspec validate add-llguidance-tool-grammars --strict` and verify that it passes.
+  - **Not ticked: step 4 fails on code outside this change.** Results with `$F` = `--no-default-features --features native`: (1) `cargo check ... --all-targets` passes; (2) `cargo nextest run`: 151 passed, 3 skipped (the opt-in live MTP test, the opt-in Hugging Face download test, the opt-in benchmark); (3) `cargo fmt -p qmt-llama-cpp -- --check` clean; (4) `cargo clippy ... --all-targets -- -D warnings`: 41 errors. The same 41 errors occur on the base commit `c88260e9` in a separate worktree (collapsible `if`, `map_or`, too-many-arguments, needless auto-deref and similar in `generation.rs`, `provider.rs`, `messages.rs`, `chat_format.rs`, `tools/*.rs`, `sampler.rs:54`). No clippy finding points into the new files (`tools/lark.rs`, `test_vocab.rs`) or the new code in `llg.rs`. No blanket `allow` was added. Needs a decision: fix the 41 existing lints in this change, or accept them as pre-existing and tick 8.1.
+  - `cargo tree -i qmt-llama-cpp --workspace --depth 1`: no dependents.
+- [x] 8.2 Run `openspec validate add-llguidance-tool-grammars --strict` and verify that it passes.
+  - Result: `Change 'add-llguidance-tool-grammars' is valid`.
 
 ## Workflow follow-up
 
