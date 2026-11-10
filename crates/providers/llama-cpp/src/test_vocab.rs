@@ -11,6 +11,8 @@
 //!   rewritten with tensor count 0. llama.cpp loads that with `vocab_only`.
 //!
 //! The cache is `$TMPDIR/qmt-llama-vocab`, or `QMT_LLAMA_VOCAB_DIR`.
+//! Downloads are opt-in: without `QMT_LLAMA_VOCAB_DOWNLOAD=1` only the
+//! cache is used and tests that need a missing vocabulary skip.
 //! Network trouble yields [`VocabError::Unavailable`] (tests skip); a pinned
 //! file whose metadata no longer parses or fits yields
 //! [`VocabError::PinnedFileChanged`] (tests fail).
@@ -376,8 +378,67 @@ pub(crate) fn kv_section_end(buf: &[u8]) -> Result<Section, String> {
     }
 }
 
-/// Load `vocab`, fetching it when missing. `None` (with a message on
-/// stderr) when it cannot be fetched; panics when a pinned file changed.
+/// Hugging Face model with bundled MTP layers (`qwen35.nextn_predict_layers = 1`).
+pub(crate) const MTP_MODEL: HfFile = HfFile {
+    repo: "unsloth/Qwen3.5-0.8B-MTP-GGUF",
+    rev: "cf8a611f6ed2c2060046219a19f12cd3d5ecd67c",
+    file: "Qwen3.5-0.8B-Q4_0.gguf",
+};
+
+/// Whole model file (521 MB for [`MTP_MODEL`]), cached next to the vocabularies.
+pub(crate) fn ensure_full_model(hf: &HfFile) -> Result<PathBuf, VocabError> {
+    let dir = cache_dir();
+    let path = dir.join(format!("{}--{}", &hf.rev[..12], hf.file));
+    if path.metadata().is_ok_and(|m| m.len() > 0) {
+        return Ok(path);
+    }
+    let unavailable = |e: String| VocabError::Unavailable(format!("{hf}: {e}"));
+    if !download_enabled() {
+        return Err(unavailable(
+            "not cached and downloads are opt-in (set QMT_LLAMA_VOCAB_DOWNLOAD=1)".into(),
+        ));
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| unavailable(e.to_string()))?;
+    let part = path.with_extension(format!("{}.part", std::process::id()));
+    let url = format!(
+        "{}/{}/resolve/{}/{}",
+        Hosts::PINNED.hugging_face,
+        hf.repo,
+        hf.rev,
+        hf.file
+    );
+    let status = std::process::Command::new("curl")
+        .args(["-fSL", "--retry", "3", "--connect-timeout", "15", "-o"])
+        .arg(&part)
+        .arg(&url)
+        .status()
+        .map_err(|e| unavailable(format!("cannot run curl: {e}")))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&part);
+        return Err(unavailable(format!("curl {status}")));
+    }
+    std::fs::rename(&part, &path).map_err(|e| unavailable(e.to_string()))?;
+    Ok(path)
+}
+
+/// Whether tests may download vocabularies (`QMT_LLAMA_VOCAB_DOWNLOAD`).
+pub(crate) fn download_enabled() -> bool {
+    std::env::var_os("QMT_LLAMA_VOCAB_DOWNLOAD").is_some_and(|v| v != "0")
+}
+
+/// [`curl`] when downloads are enabled, otherwise an error that makes
+/// [`ensure`] report the vocabulary as unavailable.
+fn opt_in_curl(url: &str, len: Option<u64>) -> Result<Vec<u8>, String> {
+    if download_enabled() {
+        curl(url, len)
+    } else {
+        Err("not cached and downloads are opt-in (set QMT_LLAMA_VOCAB_DOWNLOAD=1)".into())
+    }
+}
+
+/// Load `vocab` from the cache, downloading it only when opted in. `None`
+/// (with a message on stderr) when it is unavailable; panics when a pinned
+/// file changed.
 pub(crate) fn vocab_model(vocab: Vocab) -> Option<Arc<LlamaModel>> {
     let source = vocab.source();
     let path = match ensure(
@@ -385,7 +446,7 @@ pub(crate) fn vocab_model(vocab: Vocab) -> Option<Arc<LlamaModel>> {
         &cache_dir(),
         Hosts::PINNED,
         Limits::PINNED,
-        &mut curl,
+        &mut opt_in_curl,
     ) {
         Ok(path) => path,
         Err(VocabError::Unavailable(why)) => {
@@ -580,7 +641,9 @@ mod tests {
         assert!(message.contains("LFM2-350M-GGUF"), "{message}");
     }
 
+    /// Hits the network: `QMT_LLAMA_VOCAB_DOWNLOAD=1 cargo nextest run ... --run-ignored only`.
     #[test]
+    #[ignore = "downloads from Hugging Face; opt in with --run-ignored"]
     fn hugging_face_tokenizers_are_fetched_at_the_pinned_revision() {
         let cache = TempDir::new("cache");
         let source = Vocab::Lfm2.source();

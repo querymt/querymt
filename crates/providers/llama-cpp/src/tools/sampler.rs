@@ -84,6 +84,9 @@ pub(crate) struct ConstrainedSampler {
     cur: LlamaTokenDataArray,
     /// Reused one-entry buffer for the single-token grammar check.
     probe: LlamaTokenDataArray,
+    /// Whole-vocabulary masks computed so far (tests).
+    #[cfg(test)]
+    full_masks: u32,
 }
 
 enum Constraint {
@@ -174,6 +177,8 @@ impl ConstrainedSampler {
             chain,
             cur: LlamaTokenDataArray::new(Vec::new(), false),
             probe: LlamaTokenDataArray::new(Vec::with_capacity(1), false),
+            #[cfg(test)]
+            full_masks: 0,
         }
     }
 
@@ -193,11 +198,14 @@ impl ConstrainedSampler {
 
     /// Choose a token from raw logits without accepting it.
     pub(crate) fn sample_logits(&mut self, logits: &[f32]) -> LlamaToken {
+        #[cfg(test)]
+        let full_masks = &mut self.full_masks;
         let Self {
             constraint,
             chain,
             cur,
             probe,
+            ..
         } = self;
         fill_candidates(cur, logits);
         chain.apply(cur);
@@ -207,6 +215,10 @@ impl ConstrainedSampler {
         };
         if constraint.allows(token, probe) {
             return token;
+        }
+        #[cfg(test)]
+        {
+            *full_masks += 1;
         }
         fill_candidates(cur, logits);
         constraint.apply(cur);
@@ -228,6 +240,12 @@ impl ConstrainedSampler {
         if let Some(constraint) = self.constraint.as_mut() {
             constraint.apply(candidates);
         }
+    }
+
+    /// Whole-vocabulary masks computed by `sample_logits` (tests).
+    #[cfg(test)]
+    pub(crate) fn full_masks(&self) -> u32 {
+        self.full_masks
     }
 
     /// Whether the llguidance backend is in use (tests).
@@ -721,6 +739,168 @@ mod grammar_tests {
         // Unconstrained position: the favourite wins without a full mask.
         let mut sampler = sampler_after(&model, grammar, CONTENT_PREFIX, GrammarBackend::Gbnf);
         assert_eq!(sampler.sample_logits(&logits), bad);
+    }
+
+    /// Logits where `favourite` beats `runner_up`, which beats everything else.
+    fn two_peak_logits(
+        model: &LlamaModel,
+        favourite: LlamaToken,
+        runner_up: LlamaToken,
+    ) -> Vec<f32> {
+        let mut logits = vec![0.0f32; model.n_vocab() as usize];
+        logits[favourite.0 as usize] = 10.0;
+        logits[runner_up.0 as usize] = 5.0;
+        logits
+    }
+
+    #[test]
+    fn allowed_favourite_is_kept_without_full_mask() {
+        let Some(model) = vocab_model() else { return };
+        let grammar = ToolFormat::QwenFunction
+            .grammar(&[write_file_tool()])
+            .unwrap();
+        let tokens = |text: &str| model.vocab().tokenize(text.as_bytes(), false, true);
+        let favourite = tokens("s")[0];
+        let runner_up = tokens("t")[0];
+        let logits = two_peak_logits(&model, favourite, runner_up);
+        for backend in [GrammarBackend::Gbnf, GrammarBackend::Llguidance] {
+            // Inside a value every text token is allowed.
+            let mut sampler = sampler_after(&model, grammar.clone(), CONTENT_PREFIX, backend);
+            assert_eq!(sampler.sample_logits(&logits), favourite, "{backend:?}");
+            assert_eq!(sampler.full_masks(), 0, "{backend:?}: mask was computed");
+
+            // Control: right after the trigger `s` is forbidden, so the
+            // counter must see exactly one full mask.
+            let mut sampler = sampler_after(&model, grammar.clone(), "<tool_call>", backend);
+            assert_ne!(sampler.sample_logits(&logits), favourite, "{backend:?}");
+            assert_eq!(sampler.full_masks(), 1, "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn forced_end_of_reasoning_keeps_grammar_state() {
+        let Some(model) = vocab_model() else { return };
+        let grammar = ToolFormat::QwenFunction
+            .grammar(&[write_file_tool()])
+            .unwrap();
+        let tokens = |text: &str| model.vocab().tokenize(text.as_bytes(), false, true);
+        let bad = tokens("s")[0];
+        let newline = tokens("\n")[0];
+        for backend in [GrammarBackend::Gbnf, GrammarBackend::Llguidance] {
+            let result = template_result(grammar.clone());
+            let cfg: LlamaCppConfig =
+                serde_json::from_value(serde_json::json!({ "model": "vocab-only" })).unwrap();
+            let params = SamplingParams::from_config(&cfg, None);
+            let mut sampler =
+                build_tool_sampler(&model, &result, &params, backend).expect("sampler");
+            // `force_text` hands every forced token to `accept_token`.
+            for token in tokens("</think>\n") {
+                sampler.accept_token(token);
+            }
+            assert!(sampler.allows(bad), "{backend:?}: grammar active too early");
+            for token in tokens("<tool_call>") {
+                sampler.accept_token(token);
+            }
+            assert!(!sampler.allows(bad), "{backend:?}: grammar not active");
+            assert!(sampler.allows(newline), "{backend:?}");
+        }
+    }
+
+    /// Speculative (MTP) decoding on a real MTP model, with tools. Needs a
+    /// 521 MB model, so it only runs with `QMT_RUN_LIVE_LLAMA_MTP=1` (plus
+    /// `QMT_LLAMA_VOCAB_DOWNLOAD=1` unless the model is already cached).
+    #[test]
+    #[ignore = "live: set QMT_RUN_LIVE_LLAMA_MTP=1 and use --run-ignored"]
+    fn speculative_decoding_respects_the_tool_grammar() {
+        use crate::provider::LlamaCppProvider;
+        use crate::test_vocab::{MTP_MODEL, VocabError, ensure_full_model};
+        use querymt::chat::ChatMessage;
+
+        if std::env::var_os("QMT_RUN_LIVE_LLAMA_MTP").is_none() {
+            eprintln!("SKIPPED: set QMT_RUN_LIVE_LLAMA_MTP=1 to run the live MTP check");
+            return;
+        }
+        let path = match ensure_full_model(&MTP_MODEL) {
+            Ok(path) => path,
+            Err(VocabError::Unavailable(why)) => {
+                eprintln!("SKIPPED: MTP model unavailable: {why}");
+                return;
+            }
+            Err(changed) => panic!("{changed}"),
+        };
+        let cfg: LlamaCppConfig = serde_json::from_value(serde_json::json!({
+            "model": path,
+            "max_tokens": 160,
+            "temperature": 0.0,
+            "enable_thinking": false,
+            "speculative": { "type": "mtp" },
+        }))
+        .unwrap();
+        let provider = LlamaCppProvider::new(cfg).expect("load MTP model");
+        let model = &provider.model;
+        let layers = model
+            .meta_val_str("general.architecture")
+            .and_then(|arch| model.meta_val_str(&format!("{arch}.nextn_predict_layers")))
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        assert!(layers > 0, "pinned model has no bundled MTP layers");
+
+        let tools = [write_file_tool()];
+        let messages = [ChatMessage::user()
+            .text("Create the file hello.py containing a Python hello world program.")
+            .build()];
+        for backend in [GrammarBackend::Gbnf, GrammarBackend::Llguidance] {
+            let mut cfg = provider.cfg.clone();
+            cfg.grammar_backend = Some(backend);
+            let result =
+                crate::template::apply_template_with_tools(model, &cfg, &messages, &tools, None)
+                    .expect("template");
+            assert!(result.grammar.is_some(), "{backend:?}: no tool grammar");
+            let generated = crate::tools::generate_with_tools(
+                model,
+                &cfg,
+                provider.mtp_model.as_ref(),
+                &result,
+                160,
+                None,
+                None,
+                &[],
+            )
+            .expect("generate");
+
+            // Replay what was delivered through a fresh grammar: after the
+            // trigger every token must have been allowed.
+            let params = SamplingParams::from_config(&cfg, None);
+            let mut sampler =
+                build_tool_sampler(model, &result, &params, backend).expect("sampler");
+            assert_eq!(
+                sampler.uses_llguidance(),
+                backend == GrammarBackend::Llguidance
+            );
+            for token in model
+                .vocab()
+                .tokenize(generated.text.as_bytes(), false, true)
+            {
+                assert!(
+                    sampler.allows(token),
+                    "{backend:?}: delivered token {token:?} violates the grammar in {:?}",
+                    generated.text
+                );
+                sampler.accept(token);
+            }
+
+            let (_, _, calls, _) =
+                crate::tools::parse_tool_response(&result, &generated.text).expect("parse");
+            let calls = calls
+                .unwrap_or_else(|| panic!("{backend:?}: no tool call in {:?}", generated.text));
+            assert_eq!(calls[0].function.name, "write_file", "{backend:?}");
+            let args: serde_json::Value =
+                serde_json::from_str(&calls[0].function.arguments).expect("arguments are JSON");
+            for key in ["path", "content"] {
+                assert!(args[key].is_string(), "{backend:?}: {key} in {args}");
+            }
+        }
     }
 
     /// Per-token grammar cost inside a long string value. Run with
