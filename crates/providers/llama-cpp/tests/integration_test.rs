@@ -57,6 +57,7 @@ fn test_config_serialization() {
         speculative: None,
         backend_sampling: None,
         json_schema: None,
+        grammar_backend: None,
     };
 
     let json = serde_json::to_string(&config).expect("Failed to serialize config");

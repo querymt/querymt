@@ -697,6 +697,7 @@ mod tests {
             speculative: None,
             backend_sampling: None,
             json_schema: None,
+            grammar_backend: None,
         }
     }
 

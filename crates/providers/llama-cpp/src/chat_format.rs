@@ -236,6 +236,7 @@ tool-name ::= {names}
         root: "root",
         lazy: true,
         triggers: word_trigger("<tool_call>"),
+        format: ToolFormat::Qwen3,
     })
 }
 
@@ -267,6 +268,7 @@ ws ::= [ \t\n\r]*
         root: "root",
         lazy: true,
         triggers: word_trigger("<tool_call>"),
+        format: ToolFormat::QwenFunction,
     })
 }
 
@@ -283,6 +285,7 @@ tool-name ::= {names}
         root: "root",
         lazy: true,
         triggers: word_trigger("[TOOL_CALLS]"),
+        format: ToolFormat::Ministral3,
     })
 }
 
@@ -301,6 +304,7 @@ identifier ::= [A-Za-z_][A-Za-z0-9_-]*
         root: "root",
         lazy: true,
         triggers: word_trigger("<|tool_call_start|>"),
+        format: ToolFormat::Lfm2,
     })
 }
 
@@ -321,6 +325,7 @@ ws ::= [ \t\n\r]*
         root: "root",
         lazy: true,
         triggers: word_trigger("<start_function_call>"),
+        format: ToolFormat::FunctionGemma,
     })
 }
 
@@ -347,6 +352,7 @@ ws ::= [ \t\n\r]*
         root: "root",
         lazy: true,
         triggers: word_trigger("<|tool_call>"),
+        format: ToolFormat::Gemma4,
     })
 }
 
@@ -405,7 +411,7 @@ fn qwen_function_tool_rules(tools: &[Tool]) -> Option<ToolRuleSet> {
     })
 }
 
-fn required_params(schema: &Value) -> HashSet<&str> {
+pub(crate) fn required_params(schema: &Value) -> HashSet<&str> {
     schema
         .get("required")
         .and_then(|value| value.as_array())

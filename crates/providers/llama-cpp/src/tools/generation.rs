@@ -31,7 +31,12 @@ pub(crate) fn generate_with_tools(
         let sampler = if let Some(schema) = cfg.structured_schema() {
             build_structured_sampler(model, schema, &params)?
         } else {
-            build_tool_sampler(model, result, &params)?
+            build_tool_sampler(
+                model,
+                result,
+                &params,
+                cfg.grammar_backend.unwrap_or_default(),
+            )?
         };
         let mut output = String::new();
         let mut reasoning = result.reasoning_counter();
@@ -122,7 +127,12 @@ pub(crate) fn generate_with_tools(
     let mut sampler = if let Some(schema) = cfg.structured_schema() {
         build_structured_sampler(model, schema, &params)?
     } else {
-        build_tool_sampler(model, result, &params)?
+        build_tool_sampler(
+            model,
+            result,
+            &params,
+            cfg.grammar_backend.unwrap_or_default(),
+        )?
     };
     let mut output_tokens = 0u32;
     let mut reasoning = result.reasoning_counter();

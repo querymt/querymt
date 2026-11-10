@@ -130,6 +130,7 @@ async fn run(
         speculative: None,
         backend_sampling: None,
         json_schema: None,
+        grammar_backend: None,
     };
 
     println!("Loading model: {}", args.model);

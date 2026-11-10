@@ -564,6 +564,7 @@ mod tests {
             speculative: None,
             backend_sampling: None,
             json_schema: None,
+            grammar_backend: None,
         };
 
         // Case: multiple top-level images + tool result with nested images

@@ -34,7 +34,12 @@ pub(crate) fn generate_streaming_with_tools(
         let sampler = if let Some(schema) = cfg.structured_schema() {
             build_structured_sampler(model, schema, &params)?
         } else {
-            build_tool_sampler(model, result, &params)?
+            build_tool_sampler(
+                model,
+                result,
+                &params,
+                cfg.grammar_backend.unwrap_or_default(),
+            )?
         };
         let mut text = String::new();
         let mut decoder = encoding_rs::UTF_8.new_decoder();
@@ -170,7 +175,12 @@ pub(crate) fn generate_streaming_with_tools(
     let mut sampler = if let Some(schema) = cfg.structured_schema() {
         build_structured_sampler(model, schema, &params)?
     } else {
-        build_tool_sampler(model, result, &params)?
+        build_tool_sampler(
+            model,
+            result,
+            &params,
+            cfg.grammar_backend.unwrap_or_default(),
+        )?
     };
     let mut output_tokens = 0u32;
     let mut reasoning = result.reasoning_counter();

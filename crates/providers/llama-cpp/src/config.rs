@@ -171,6 +171,27 @@ pub struct LlamaCppConfig {
     /// The schema is forwarded to the chat template engine via
     /// `OpenAIChatTemplateParams::json_schema`.
     pub json_schema: Option<StructuredOutputFormat>,
+    /// Engine that enforces tool-call grammars.
+    ///
+    /// `gbnf` (default) uses llama.cpp's GBNF grammar. `llguidance` compiles
+    /// the tool grammar to an llguidance (Lark) grammar, whose token masks
+    /// are computed from a token trie; it is used for the Qwen XML-function
+    /// (`<function=..>`) and Ministral formats and falls back to `gbnf` for
+    /// the others. Both are applied by rejection sampling: the grammar checks
+    /// the sampled token and is applied to the whole vocabulary only when
+    /// that token is rejected.
+    pub grammar_backend: Option<GrammarBackend>,
+}
+
+/// Grammar engine for tool calls. See [`LlamaCppConfig::grammar_backend`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GrammarBackend {
+    /// llama.cpp GBNF grammar sampler.
+    #[default]
+    Gbnf,
+    /// llguidance token-trie matcher.
+    Llguidance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
