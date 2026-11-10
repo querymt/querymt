@@ -3464,10 +3464,19 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                     .await?;
                                 }
 
-                                if let (Some(hooks), Some(local_agent)) = (
-                                    context.session_hooks.as_ref(),
-                                    agent.as_any().downcast_ref::<AgentHandle>(),
-                                ) && let Err(error) = hooks
+                                // `createSession` with `attach: false` returns a session that
+                                // exists only on the owner host; there is nothing attached to
+                                // post-process until the client attaches it.
+                                let attached = !(normalize_querymt_ext_method(ext_method)
+                                    == "querymt/remote/createSession"
+                                    && value.get("attached").and_then(serde_json::Value::as_bool)
+                                        == Some(false));
+                                if attached
+                                    && let (Some(hooks), Some(local_agent)) = (
+                                        context.session_hooks.as_ref(),
+                                        agent.as_any().downcast_ref::<AgentHandle>(),
+                                    )
+                                    && let Err(error) = hooks
                                     .on_remote_session_attached(
                                         local_agent,
                                         &session_id,
@@ -4850,10 +4859,15 @@ mod tests {
                 return Err(Error::invalid_params().data("rejected extension request"));
             }
             let response = if req.method.as_ref() == "querymt/remote/createSession" {
+                // Mirror the real handler: `attach` defaults to true.
+                let attach = serde_json::from_str::<serde_json::Value>(req.params.get())
+                    .ok()
+                    .and_then(|params| params.get("attach").and_then(serde_json::Value::as_bool))
+                    .unwrap_or(true);
                 serde_json::json!({
                     "session_id": "s-remote-created",
                     "node_id": "n-1",
-                    "attached": false,
+                    "attached": attach,
                     "config_options": []
                 })
             } else {
@@ -5341,6 +5355,58 @@ mod tests {
                 "conn-other".to_string()
             ]))
         );
+    }
+
+    /// `createSession` with `attach: false` must return the host's session id
+    /// without running the remote-attach hook: the session exists only on the
+    /// owner, so a local snapshot fallback would fail with "no rows".
+    #[tokio::test]
+    async fn remote_create_without_attach_skips_remote_attach_hook() {
+        let local_fixture = crate::test_utils::TestAgent::new().await;
+        let agent = CancelTestAgent {
+            cancelled_session: Arc::new(Mutex::new(None)),
+            prompt_started: None,
+            release_prompt: None,
+            cancel_seen: None,
+            local_handle: Some(local_fixture.handle),
+            reject_ext_method: false,
+            ext_method_control: None,
+        };
+        let session_owners = SessionOwnerMap::default();
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let context = RpcDispatchContext {
+            session_hooks: Some(Arc::new(RejectPostAttachmentHooks {
+                session_load: false,
+                remote_session: true,
+            })),
+            session_bridge: None,
+            elicitation_recovery: None,
+            translator: None,
+            session_load: None,
+            delivery: None,
+        };
+
+        let output = handle_rpc_message_with_context(
+            &agent,
+            &session_owners,
+            &pending_elicitations,
+            "conn-create",
+            RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                method: "querymt/remote/createSession".to_string(),
+                params: serde_json::json!({"node_id": "n-1", "attach": false}),
+                id: Some(serde_json::json!(1)),
+            },
+            context,
+        )
+        .await;
+
+        let response = output.response.expect("request should produce response");
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.expect("create result");
+        assert_eq!(result["session_id"], "s-remote-created");
+        assert_eq!(result["attached"], false);
+        assert!(result.get("snapshot").is_none());
     }
 
     #[tokio::test]
