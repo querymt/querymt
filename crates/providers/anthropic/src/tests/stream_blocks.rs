@@ -100,6 +100,39 @@ fn max_tokens_marks_a_valid_object_block_that_was_still_open() {
     ));
 }
 
+/// Parse a non-streaming response holding one complete `tool_use` block.
+fn non_streaming_tool_response(stop_reason: &str) -> querymt::chat::ChatOutput {
+    crate::tests::support::parse_response(serde_json::json!({
+        "content": [
+            {"type": "tool_use", "id": "t1", "name": "edit", "input": {"file_path": "a.rs"}}
+        ],
+        "stop_reason": stop_reason,
+        "usage": null
+    }))
+}
+
+#[test]
+fn non_streaming_max_tokens_is_incomplete_and_invalidates_trailing_tool_call() {
+    let output = non_streaming_tool_response("max_tokens");
+    assert_eq!(output.status, Some(ChatOutputStatus::Incomplete));
+    assert_eq!(output.finish_reason, Some(FinishReason::Length));
+    let calls: Vec<_> = output.function_calls().collect();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].is_marked_invalid());
+    assert!(output.executable_tool_calls().is_none());
+}
+
+#[test]
+fn non_streaming_tool_use_stop_stays_completed_and_valid() {
+    let output = non_streaming_tool_response("tool_use");
+    assert_eq!(output.status, Some(ChatOutputStatus::Completed));
+    assert_eq!(output.finish_reason, Some(FinishReason::ToolCalls));
+    let calls: Vec<_> = output.function_calls().collect();
+    assert_eq!(calls.len(), 1);
+    assert!(!calls[0].is_marked_invalid());
+    assert!(output.executable_tool_calls().is_some());
+}
+
 #[test]
 fn max_tokens_flushes_every_open_block_in_index_order_once() {
     let chunks = run(vec![

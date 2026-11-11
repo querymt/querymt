@@ -6,6 +6,7 @@ use querymt::Usage;
 use querymt::chat::{
     ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOutput, ChatOutputItem,
     ChatOutputStatus, ChatReasoningItem, ChatReasoningPart, ChatRole, FinishReason,
+    INVALID_INPUT_EXTENSION,
 };
 use serde_json::Value;
 
@@ -151,9 +152,21 @@ impl From<AnthropicCompleteResponse> for ChatOutput {
             response.stop_details.as_ref(),
         );
 
+        // A length cutoff leaves the response incomplete; a trailing tool call
+        // may carry truncated arguments, so it must never be executed.
+        let length = finish_reason == FinishReason::Length;
+        if length && let Some(ChatOutputItem::FunctionCall(call)) = items.last_mut() {
+            call.extensions
+                .insert(INVALID_INPUT_EXTENSION.to_string(), Value::Bool(true));
+        }
+
         ChatOutput {
             items,
-            status: Some(ChatOutputStatus::Completed),
+            status: Some(if length {
+                ChatOutputStatus::Incomplete
+            } else {
+                ChatOutputStatus::Completed
+            }),
             usage: response.usage.map(Usage::from),
             finish_reason: Some(finish_reason),
             ..ChatOutput::default()

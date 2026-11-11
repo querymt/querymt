@@ -84,11 +84,15 @@ impl HTTPChatProvider for Anthropic {
 
 impl HTTPCompletionProvider for Anthropic {
     fn complete_request(&self, _req: &CompletionRequest) -> Result<Request<Vec<u8>>, LLMError> {
-        unimplemented!()
+        Err(LLMError::ProviderError(
+            "Completion not supported".to_string(),
+        ))
     }
 
     fn parse_complete(&self, _resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
-        unimplemented!()
+        Err(LLMError::ProviderError(
+            "Completion not supported".to_string(),
+        ))
     }
 }
 

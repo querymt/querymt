@@ -1,10 +1,13 @@
 //! Unit tests: replay.
 
 use crate::response::redacted_reasoning_item;
-use crate::tests::support::{CAPTURED_WARNINGS, CaptureLogger, replay_assistant_content};
+use crate::tests::support::{
+    CAPTURED_WARNINGS, CaptureLogger, anthropic_for, body_of, replay_assistant_content,
+};
 use querymt::chat::{
-    ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOutput, ChatOutputItem,
-    ChatReasoningItem, ChatReasoningPart, ChatRole,
+    CacheHint, ChatFunctionCallItem, ChatMessage, ChatMessageItem, ChatMessagePart, ChatOutput,
+    ChatOutputItem, ChatReasoningItem, ChatReasoningPart, ChatRole, MediaKind, MediaPart,
+    MediaSource,
 };
 use serde_json::Value;
 
@@ -130,6 +133,132 @@ fn replay_keeps_multiple_blocks_in_order_and_skips_unsigned() {
     assert_eq!(thinking[0]["thinking"], "one");
     assert_eq!(thinking[1]["signature"], "S2");
     assert_eq!(thinking[1]["thinking"], "two");
+}
+
+/// Assistant message output item holding one text part.
+fn text_message_output(text: &str) -> ChatOutputItem {
+    crate::response::text_message_item(text.to_string())
+}
+
+#[test]
+fn replay_does_not_duplicate_reasoning_as_text_and_keeps_order() {
+    let content = replay_assistant_content(vec![
+        reasoning_item("one", Some("S1")),
+        reasoning_item("unsigned", None),
+        text_message_output("progress"),
+        call_item("toolu_1"),
+    ]);
+    let shape: Vec<(&str, Option<&str>)> = content
+        .iter()
+        .map(|c| {
+            (
+                c["type"].as_str().unwrap(),
+                c["text"].as_str().or(c["thinking"].as_str()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            ("thinking", Some("one")),
+            ("text", Some("progress")),
+            ("tool_use", None),
+        ]
+    );
+}
+
+#[test]
+fn thinking_only_assistant_turn_never_carries_cache_control() {
+    let output = ChatOutput {
+        items: vec![reasoning_item("t", Some("S"))],
+        ..ChatOutput::default()
+    };
+    let mut assistant = ChatMessage::from_assistant_output(output);
+    assistant.cache = Some(CacheHint::Ephemeral { ttl_seconds: None });
+    let messages = vec![ChatMessage::user().text("go").build(), assistant];
+    let a = anthropic_for("claude-sonnet-5-5", None, 32_000);
+    let b = body_of(&a, &messages);
+    let content = b["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "thinking");
+    assert!(content[0].get("cache_control").is_none());
+}
+
+#[test]
+fn cache_control_skips_trailing_thinking_for_earlier_block() {
+    let output = ChatOutput {
+        items: vec![
+            text_message_output("progress"),
+            reasoning_item("t", Some("S")),
+        ],
+        ..ChatOutput::default()
+    };
+    let mut assistant = ChatMessage::from_assistant_output(output);
+    assistant.cache = Some(CacheHint::Ephemeral { ttl_seconds: None });
+    let messages = vec![ChatMessage::user().text("go").build(), assistant];
+    let a = anthropic_for("claude-sonnet-5-5", None, 32_000);
+    let b = body_of(&a, &messages);
+    let content = b["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "text");
+    assert!(content[0].get("cache_control").is_some());
+    assert_eq!(content[1]["type"], "thinking");
+    assert!(content[1].get("cache_control").is_none());
+}
+
+/// Wire content blocks of a cache-hinted user message holding one image.
+fn user_image_content(media: MediaPart) -> Vec<Value> {
+    let message = ChatMessage::user()
+        .attachment(media)
+        .cache(CacheHint::Ephemeral { ttl_seconds: None })
+        .build();
+    let a = anthropic_for("claude-sonnet-5-5", None, 32_000);
+    let b = body_of(&a, &[message]);
+    b["messages"][0]["content"].as_array().unwrap().clone()
+}
+
+#[test]
+fn image_url_uses_url_source_and_keeps_cache_control() {
+    let media = MediaPart::new(
+        MediaKind::Image,
+        None,
+        MediaSource::Url {
+            url: "https://example.com/a.png".into(),
+        },
+    )
+    .unwrap();
+    let content = user_image_content(media);
+    assert_eq!(content[0]["type"], "image");
+    assert_eq!(content[0]["source"]["type"], "url");
+    assert_eq!(content[0]["source"]["url"], "https://example.com/a.png");
+    assert!(content[0].get("cache_control").is_some());
+}
+
+#[test]
+fn base64_data_url_image_becomes_base64_source() {
+    let media = MediaPart::new(
+        MediaKind::Image,
+        None,
+        MediaSource::DataUrl {
+            url: "data:image/png;base64,iVBORw0KGgo=".into(),
+        },
+    )
+    .unwrap();
+    let content = user_image_content(media);
+    assert_eq!(content[0]["type"], "image");
+    assert_eq!(content[0]["source"]["type"], "base64");
+    assert_eq!(content[0]["source"]["media_type"], "image/png");
+    assert_eq!(content[0]["source"]["data"], "iVBORw0KGgo=");
+    assert!(content[0].get("cache_control").is_some());
+}
+
+#[test]
+fn completion_is_reported_as_unsupported_not_a_panic() {
+    use querymt::completion::CompletionRequest;
+    use querymt::completion::http::HTTPCompletionProvider;
+    let a = anthropic_for("claude-sonnet-5-5", None, 32_000);
+    let req = CompletionRequest::builder("hi").build();
+    assert!(a.complete_request(&req).is_err());
+    let resp = http::Response::builder().body(Vec::new()).unwrap();
+    assert!(a.parse_complete(resp).is_err());
 }
 
 #[test]

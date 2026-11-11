@@ -62,13 +62,6 @@ pub(crate) enum MessageContent {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControlEphemeral>,
     },
-    ImageUrl {
-        #[serde(rename = "type")]
-        content_type: &'static str, // "image_url"
-        image_url: ImageUrlContent,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControlEphemeral>,
-    },
     Document {
         #[serde(rename = "type")]
         content_type: &'static str, // "document"
@@ -81,8 +74,6 @@ pub(crate) enum MessageContent {
         content_type: &'static str, // "thinking"
         thinking: String,
         signature: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControlEphemeral>,
     },
     RedactedThinking {
         #[serde(rename = "type")]
@@ -127,47 +118,27 @@ pub(crate) enum ToolResultContent {
 }
 
 impl MessageContent {
-    pub(crate) fn set_cache_control(&mut self, cc: CacheControlEphemeral) {
-        match self {
-            MessageContent::Text { cache_control, .. }
-            | MessageContent::Image { cache_control, .. }
-            | MessageContent::ImageUrl { cache_control, .. }
-            | MessageContent::Document { cache_control, .. }
-            | MessageContent::Thinking { cache_control, .. }
-            | MessageContent::ToolUse { cache_control, .. }
-            | MessageContent::ToolResult { cache_control, .. } => {
-                *cache_control = Some(cc);
-            }
-            // `redacted_thinking` blocks accept no cache_control.
-            MessageContent::RedactedThinking { .. } => {}
-        }
-    }
-
     /// The block's `cache_control` slot, or `None` for blocks that cannot
-    /// carry one (`redacted_thinking`).
+    /// carry one: Anthropic rejects markers on `thinking` and
+    /// `redacted_thinking` blocks.
     pub(crate) fn cache_control_mut(&mut self) -> Option<&mut Option<CacheControlEphemeral>> {
         match self {
             MessageContent::Text { cache_control, .. }
             | MessageContent::Image { cache_control, .. }
-            | MessageContent::ImageUrl { cache_control, .. }
             | MessageContent::Document { cache_control, .. }
-            | MessageContent::Thinking { cache_control, .. }
             | MessageContent::ToolUse { cache_control, .. }
             | MessageContent::ToolResult { cache_control, .. } => Some(cache_control),
-            MessageContent::RedactedThinking { .. } => None,
+            MessageContent::Thinking { .. } | MessageContent::RedactedThinking { .. } => None,
         }
     }
 }
 
+/// Source of an image or document block: inline base64 data or a URL.
 #[derive(Serialize, Debug)]
-pub(crate) struct ImageUrlContent {
-    pub(crate) url: String,
-}
-
-#[derive(Serialize, Debug)]
-pub(crate) struct ImageSource {
-    #[serde(rename = "type")]
-    pub(crate) source_type: &'static str,
-    pub(crate) media_type: String,
-    pub(crate) data: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ImageSource {
+    /// Base64-encoded bytes with their MIME type.
+    Base64 { media_type: String, data: String },
+    /// A remotely fetched resource.
+    Url { url: String },
 }

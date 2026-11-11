@@ -5,16 +5,15 @@ use crate::cache_breakpoints::{MAX_CACHE_BREAKPOINTS, normalize_cache_breakpoint
 use crate::config::Anthropic;
 use crate::model::ThinkingClass;
 use crate::wire::request::{
-    AnthropicCompleteRequest, AnthropicMessage, ImageSource, ImageUrlContent, MessageContent,
-    ToolResultContent,
+    AnthropicCompleteRequest, AnthropicMessage, ImageSource, MessageContent, ToolResultContent,
 };
 use crate::wire::system::{AnthropicSystemPrompt, cache_control_from_hint};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use http::header::CONTENT_TYPE;
 use http::{Method, Request};
 use querymt::chat::{
-    ChatInputPart, ChatMessage, ChatOutputItem, ChatRole, MediaKind, MediaPart, MediaSource, Tool,
-    ToolChoice, ToolResultPart,
+    ChatInputPart, ChatMessage, ChatMessagePart, ChatOutputItem, ChatRole, MediaKind, MediaPart,
+    MediaSource, Tool, ToolChoice, ToolResultPart,
 };
 use querymt::error::LLMError;
 use serde_json::Value;
@@ -42,29 +41,42 @@ pub(crate) fn replay_tool_input(call: &querymt::chat::ChatFunctionCallItem) -> V
 
 /// Convert a canonical attachment into an Anthropic message content block.
 ///
-/// Unsupported sources (provider file references) return `None` rather than
-/// fabricating content.
+/// Images become `image` blocks: URLs use a `url` source and base64 data URLs
+/// are unpacked into a `base64` source. Unsupported sources (provider file
+/// references, non-base64 data URLs) return `None` rather than fabricating
+/// content.
 pub(crate) fn attachment_to_message_content(media: &MediaPart) -> Option<MessageContent> {
     match (&media.kind, media.source()) {
         (MediaKind::Image, MediaSource::Inline { data }) => {
             let media_type = media.media_type()?.to_string();
             Some(MessageContent::Image {
                 content_type: "image",
-                source: ImageSource {
-                    source_type: "base64",
+                source: ImageSource::Base64 {
                     media_type,
                     data: BASE64.encode(data),
                 },
                 cache_control: None,
             })
         }
-        (MediaKind::Image, MediaSource::DataUrl { url } | MediaSource::Url { url }) => {
-            Some(MessageContent::ImageUrl {
-                content_type: "image_url",
-                image_url: ImageUrlContent { url: url.clone() },
+        (MediaKind::Image, MediaSource::DataUrl { url }) => {
+            let (metadata, data) = url.strip_prefix("data:")?.split_once(',')?;
+            if !metadata.ends_with(";base64") {
+                return None;
+            }
+            Some(MessageContent::Image {
+                content_type: "image",
+                source: ImageSource::Base64 {
+                    media_type: media.media_type()?.to_string(),
+                    data: data.to_string(),
+                },
                 cache_control: None,
             })
         }
+        (MediaKind::Image, MediaSource::Url { url }) => Some(MessageContent::Image {
+            content_type: "image",
+            source: ImageSource::Url { url: url.clone() },
+            cache_control: None,
+        }),
         (MediaKind::Document, MediaSource::Inline { data }) => {
             let media_type = media
                 .media_type()
@@ -72,8 +84,7 @@ pub(crate) fn attachment_to_message_content(media: &MediaPart) -> Option<Message
                 .unwrap_or_else(|| "application/pdf".to_string());
             Some(MessageContent::Document {
                 content_type: "document",
-                source: ImageSource {
-                    source_type: "base64",
+                source: ImageSource::Base64 {
                     media_type,
                     data: BASE64.encode(data),
                 },
@@ -95,8 +106,7 @@ pub(crate) fn tool_result_content(part: &ToolResultPart) -> Option<ToolResultCon
             MediaSource::Inline { data } if media.kind == MediaKind::Image => {
                 Some(ToolResultContent::Image {
                     content_type: "image",
-                    source: ImageSource {
-                        source_type: "base64",
+                    source: ImageSource::Base64 {
                         media_type: media.media_type()?.to_string(),
                         data: BASE64.encode(data),
                     },
@@ -160,7 +170,6 @@ impl Anthropic {
                                         content_type: "thinking",
                                         thinking: text,
                                         signature: signature.clone(),
-                                        cache_control: None,
                                     });
                                 }
                             }
@@ -174,12 +183,51 @@ impl Anthropic {
                                     cache_control: None,
                                 });
                             }
-                            _ => {}
+                            // Emitted in place so text keeps its position
+                            // relative to thinking and tool calls.
+                            ChatOutputItem::Message(message) => {
+                                for part in &message.parts {
+                                    match part {
+                                        ChatMessagePart::Text { text, .. } if !text.is_empty() => {
+                                            content.push(MessageContent::Text {
+                                                content_type: "text",
+                                                text: text.clone(),
+                                                cache_control: None,
+                                            });
+                                        }
+                                        ChatMessagePart::Refusal { refusal, .. }
+                                            if !refusal.is_empty() =>
+                                        {
+                                            content.push(MessageContent::Text {
+                                                content_type: "text",
+                                                text: refusal.clone(),
+                                                cache_control: None,
+                                            });
+                                        }
+                                        ChatMessagePart::Media(media) => {
+                                            if let Some(block) =
+                                                attachment_to_message_content(media)
+                                            {
+                                                content.push(block);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            ChatOutputItem::Opaque(_) => {}
                         }
                     }
                 }
 
-                for part in m.portable_input_parts() {
+                // Output turns were fully replayed above; projecting them to
+                // portable parts would duplicate reasoning text and text blocks.
+                let input_parts = if m.output().is_some() {
+                    Vec::new()
+                } else {
+                    m.portable_input_parts()
+                };
+                for part in input_parts {
                     match part {
                         ChatInputPart::Text { text } => {
                             // Avoid Anthropic API error: "text content blocks must be non-empty"
@@ -215,11 +263,15 @@ impl Anthropic {
                     }
                 }
 
-                // Apply cache_control to the last content block if present
+                // Apply cache_control to the last block that can carry one
+                // (thinking blocks cannot), or omit it.
                 if let Some(cache_hint) = &m.cache
-                    && let Some(last) = content.last_mut()
+                    && let Some(slot) = content
+                        .iter_mut()
+                        .rev()
+                        .find_map(MessageContent::cache_control_mut)
                 {
-                    last.set_cache_control(cache_control_from_hint(cache_hint));
+                    *slot = Some(cache_control_from_hint(cache_hint));
                 }
 
                 AnthropicMessage {

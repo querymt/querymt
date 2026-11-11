@@ -174,6 +174,7 @@ defaults are agent policy.
 Anthropic accepts at most four cache breakpoints per request. If more are requested,
 the provider keeps the most useful ones and drops the rest with a warning; see
 [Prompt cache breakpoints](available-providers.md#prompt-cache-breakpoints).
+
 Responses currently defaults to `30m`, not unlimited session retention. Codex's
 unsupported translation remains disabled, so annotations do not guarantee reuse.
 
