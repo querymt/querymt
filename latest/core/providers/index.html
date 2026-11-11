@@ -2041,11 +2041,18 @@ legacy strings and string arrays remain supported. For example, in an agent conf
 <a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <p>In the agent runtime, plain system strings and <code>{ file = "..." }</code> entries receive
-provider-default cache hints for Anthropic, Codex, and OpenAI Responses. Explicit
-hints/TTLs are preserved. Each instruction section is a prefix boundary, so a
-changing later section does not remove the earlier stable boundary. The standalone
-provider/CLI API still requires explicit hints; these defaults are agent policy.
-Responses currently defaults to <code>30m</code>, not unlimited session retention. Codex's
+provider-default cache hints for Anthropic, Codex, and OpenAI Responses, but only on
+the <strong>first and last</strong> section (a single section gets one hint). Sections in between
+are still cached, because the last section's prefix covers them; they just have no
+reuse boundary of their own. To keep a boundary on a middle section, give it an
+explicit <code>cache</code> hint. Explicit hints/TTLs (including <code>cache = null</code>) and native
+<code>cache_control</code> are preserved at every position. The agent also hints the last two
+messages. The standalone provider/CLI API still requires explicit hints; these
+defaults are agent policy.</p>
+<p>Anthropic accepts at most four cache breakpoints per request. If more are requested,
+the provider keeps the most useful ones and drops the rest with a warning; see
+<a href="../available-providers/#prompt-cache-breakpoints">Prompt cache breakpoints</a>.</p>
+<p>Responses currently defaults to <code>30m</code>, not unlimited session retention. Codex's
 unsupported translation remains disabled, so annotations do not guarantee reuse.</p>
 <p>Programmatic callers can pass <code>querymt::params::SystemPrompt::with_cache(text, hint)</code>
 to <code>.system(...)</code>. File references are resolved by the agent, not provider plugins.

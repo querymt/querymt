@@ -851,6 +851,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#prompt-cache-breakpoints" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Prompt cache breakpoints
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#adaptive_thinking-override" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -2583,6 +2594,17 @@
 </ul>
 <h4 id="thinking-replay-usage-and-stop-reasons">Thinking replay, usage and stop reasons</h4>
 <p>Each thinking block becomes its own reasoning item with its own signature. Signed blocks are replayed unchanged, even when their text is empty (the default <code>display: "omitted"</code> on Opus 4.7+ and Claude 5). <code>redacted_thinking</code> blocks are kept and replayed with their opaque data. <code>output_tokens_details.thinking_tokens</code> is reported as <code>reasoning_tokens</code> and subtracted from the inclusive <code>output_tokens</code>, so ordinary output and reasoning never overlap. Streaming usage ends with the final <code>message_delta</code> values: the provisional output count in <code>message_start</code> is not emitted as ordinary output, fields a later event omits (input, cache) keep their earlier values, and an explicit zero replaces them. Cache writes keep the returned <code>cache_creation</code> five-minute and one-hour counts as a breakdown of the aggregate <code>cache_creation_input_tokens</code> (never added on top); with no breakdown the tiers stay absent rather than assumed. Stop reasons map as: <code>end_turn</code>/<code>stop_sequence</code> to stop, <code>tool_use</code> to tool calls, <code>max_tokens</code>/<code>model_context_window_exceeded</code> to length, <code>refusal</code> to content filter, <code>pause_turn</code> to other.</p>
+<h4 id="prompt-cache-breakpoints">Prompt cache breakpoints</h4>
+<p>Anthropic accepts at most four <code>cache_control</code> breakpoints per request and rejects a request with more. The provider counts the markers that are actually on the wire (portable <code>cache</code> hints and native <code>cache_control</code> alike; a hint on a block that cannot carry a marker, such as <code>redacted_thinking</code>, costs nothing) and, when there are more than four, keeps in this order:</p>
+<ol>
+<li>the last marked system block;</li>
+<li>the last marked message block, then the second-to-last;</li>
+<li>the first marked system block;</li>
+<li>remaining message markers, newest first;</li>
+<li>remaining system markers, last first.</li>
+</ol>
+<p>All other markers are removed and one warning reports how many were dropped. OAuth identity and billing blocks carry no marker, so they never change which system block is "first" or "last".</p>
+<p>Breakpoint lifetimes must not increase in request order (a <code>1h</code> breakpoint may not follow a <code>5m</code> one). After excess markers are dropped, an earlier marker with a shorter or default lifetime is raised to the longest lifetime that follows it. A <code>1h</code> cache write costs more than a <code>5m</code> one, so a raised marker is billed at the <code>1h</code> rate.</p>
 <h4 id="adaptive_thinking-override"><code>adaptive_thinking</code> override</h4>
 <p>An optional provider config field overrides the class derived from the model ID:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span>
