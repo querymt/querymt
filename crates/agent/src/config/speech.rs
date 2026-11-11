@@ -28,7 +28,30 @@ use super::*;
 /// model = "Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit"
 /// operation = "synthesis"
 /// voice_description = "A warm female voice, mid-30s, slight British accent"
+///
+/// [[speech.profiles]]
+/// id = "xai-stt"
+/// provider = "xai"
+/// model = "grok-voice-transcribe-2.0"
+///
+/// [[speech.profiles]]
+/// id = "xai-tts"
+/// provider = "xai"
+/// model = "" # Server-selected model; no model field in xAI TTS requests.
+/// operation = "synthesis"
+/// voice = "eve"
+///
+/// [[speech.profiles]]
+/// id = "codex-stt"
+/// provider = "codex"
+/// model = "" # ChatGPT dictation selects the model and detects language.
 /// ```
+///
+/// xAI uses the configured API key or OAuth credentials for both operations.
+/// Codex transcription uses ChatGPT OAuth and the private backend dictation API;
+/// it does not switch to the public OpenAI API. Codex synthesis is unsupported.
+/// Codex expects finalized audio files: use MP3 or finalize streaming WAV headers
+/// before uploading them (for example, WAV output from xAI TTS).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpeechConfig {
@@ -68,7 +91,8 @@ pub struct SpeechProfile {
     pub id: String,
     /// Provider name from `providers.toml` (e.g. `"izwi"`, `"openai"`).
     pub provider: String,
-    /// Model identifier passed to the provider.
+    /// Model identifier passed to the provider. Use an empty string for xAI
+    /// synthesis and Codex transcription, which select their models server-side.
     pub model: String,
     /// Defaults to transcription when omitted.
     #[serde(default)]

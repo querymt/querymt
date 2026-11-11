@@ -1006,6 +1006,42 @@ pub fn codex_chat_request<C: CodexProviderConfig>(
         .body(json_body)?)
 }
 
+/// ChatGPT dictation uses a file-only request and selects the model/language
+/// server-side. It does not fall back to the separately billed public API.
+pub fn codex_stt_request<C: CodexProviderConfig>(
+    cfg: &C,
+    req: &querymt::stt::SttRequest,
+) -> Result<Request<Vec<u8>>, LLMError> {
+    // /backend-api/transcribe is a sibling of the Codex API base directory.
+    let url = cfg
+        .base_url()
+        .join("../transcribe")
+        .map_err(|error| LLMError::HttpError(error.to_string()))?;
+    let token = cfg.api_key();
+    let account_id = chatgpt_account_id(&token)?;
+    let mut form = qmt_openai::api::MultipartForm::new("qmt-codex-stt-boundary");
+    form.file(
+        "file",
+        req.filename.as_deref().unwrap_or("audio.wav"),
+        req.mime_type.as_deref().unwrap_or("audio/wav"),
+        &req.audio,
+    )?;
+    Ok(Request::builder()
+        .method(Method::POST)
+        .uri(url.to_string())
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .header("ChatGPT-Account-ID", account_id)
+        .header(
+            "User-Agent",
+            format!(
+                "codex_cli_rs/{}",
+                cfg.client_version().unwrap_or(env!("CARGO_PKG_VERSION"))
+            ),
+        )
+        .header(CONTENT_TYPE, form.content_type())
+        .body(form.finish())?)
+}
+
 fn to_codex_tools(tools: &[Tool]) -> Vec<CodexTool<'_>> {
     tools
         .iter()
@@ -2088,6 +2124,68 @@ mod tests {
         });
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.to_string().as_bytes());
         format!("eyJ.{}.sig", payload_b64)
+    }
+
+    #[test]
+    fn transcription_uses_chatgpt_backend_and_resolved_account() {
+        use querymt::{HTTPLLMProvider, auth::static_key, stt::SttRequest};
+        let mut cfg = test_codex("stale");
+        let token = test_oauth_token("account-123");
+        cfg.key_resolver = Some(static_key(&token));
+        cfg.base_url = Url::parse("https://gateway.invalid/backend-api/codex/").unwrap();
+        let request = cfg
+            .stt_request(
+                &SttRequest::new()
+                    .audio(vec![0, 255, 1])
+                    .filename("clip.webm")
+                    .mime_type("audio/webm")
+                    .model("server-selects-model"),
+            )
+            .unwrap();
+        assert_eq!(
+            request.uri(),
+            "https://gateway.invalid/backend-api/transcribe"
+        );
+        assert_eq!(request.headers()[AUTHORIZATION], format!("Bearer {token}"));
+        assert_eq!(request.headers()["ChatGPT-Account-ID"], "account-123");
+        let body = String::from_utf8_lossy(request.body());
+        assert!(body.contains("clip.webm") && body.contains("audio/webm"));
+        assert!(!body.contains("name=\"model\""));
+        assert!(!body.contains("name=\"language\""));
+        assert!(request.body().windows(3).any(|bytes| bytes == [0, 255, 1]));
+        assert!(matches!(
+            cfg.stt_request(&SttRequest::new().filename("bad\r\nfile")),
+            Err(LLMError::InvalidRequest(_))
+        ));
+        cfg.key_resolver = None;
+        assert!(matches!(
+            cfg.stt_request(&SttRequest::default()),
+            Err(LLMError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn transcription_parses_text_and_preserves_backend_errors() {
+        use querymt::HTTPLLMProvider;
+        let cfg = test_codex("unused-for-parsing");
+        let response = cfg
+            .parse_stt(Response::new(br#"{"text":"hello"}"#.to_vec()))
+            .unwrap();
+        assert_eq!(response.text, "hello");
+        assert_eq!(response.language, None);
+        assert!(
+            cfg.parse_stt(Response::new(br#"{"unexpected":"shape"}"#.to_vec()))
+                .is_err()
+        );
+        assert!(
+            cfg.parse_stt(
+                Response::builder()
+                    .status(401)
+                    .body(b"unauthorized".to_vec())
+                    .unwrap()
+            )
+            .is_err()
+        );
     }
 
     #[test]

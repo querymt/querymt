@@ -834,21 +834,21 @@ struct OpenAITtsRequestBody<'a> {
     speed: Option<f32>,
 }
 
-// TODO: Move outside and make shared with others?
-struct MultipartForm {
+/// Buffered multipart encoder shared by HTTP speech providers, including WASM.
+pub struct MultipartForm {
     boundary: &'static str,
     body: Vec<u8>,
 }
 
 impl MultipartForm {
-    fn new(boundary: &'static str) -> Self {
+    pub fn new(boundary: &'static str) -> Self {
         Self {
             boundary,
             body: Vec::new(),
         }
     }
 
-    fn content_type(&self) -> String {
+    pub fn content_type(&self) -> String {
         format!("multipart/form-data; boundary={}", self.boundary)
     }
 
@@ -881,7 +881,7 @@ impl MultipartForm {
         self.write_str("\r\n");
     }
 
-    fn text(&mut self, name: &str, value: &str) -> Result<(), LLMError> {
+    pub fn text(&mut self, name: &str, value: &str) -> Result<(), LLMError> {
         Self::validate_token(name)?;
 
         self.begin_part();
@@ -893,7 +893,7 @@ impl MultipartForm {
         Ok(())
     }
 
-    fn file(
+    pub fn file(
         &mut self,
         field_name: &str,
         filename: &str,
@@ -915,7 +915,7 @@ impl MultipartForm {
         Ok(())
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    pub fn finish(mut self) -> Vec<u8> {
         self.write_str("--");
         self.write_str(self.boundary);
         self.write_str("--\r\n");
