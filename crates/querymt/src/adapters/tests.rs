@@ -170,6 +170,25 @@ fn set_key_resolver_forwards_to_inner_provider() {
 }
 
 #[tokio::test]
+async fn speech_errors_preserve_kind_and_release_provider() {
+    let mut adapter = LLMProviderFromHTTP::new(Box::new(DummyHttpProvider { resolver: None }));
+    for error in [
+        adapter
+            .transcribe(&stt::SttRequest::default())
+            .await
+            .unwrap_err(),
+        adapter
+            .speech(&tts::TtsRequest::default())
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(matches!(error, LLMError::NotImplemented(_)));
+    }
+    adapter.set_key_resolver(static_key("updated-token"));
+    assert_eq!(adapter.key_resolver().unwrap().current(), "updated-token");
+}
+
+#[tokio::test]
 async fn ensure_credential_fresh_resolves_before_request_building() {
     let resolver = Arc::new(CountingResolver::new());
     let inner: Box<dyn HTTPLLMProvider> = Box::new(ResolveAwareHttpProvider {

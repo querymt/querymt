@@ -243,6 +243,18 @@ pub struct ExtismCompleteRequest<C> {
 }
 
 #[derive(Deserialize, Serialize)]
+pub struct ExtismSttParseRequest<C> {
+    pub cfg: C,
+    pub resp: SerializableHttpResponse,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ExtismTtsParseRequest<C> {
+    pub cfg: C,
+    pub resp: SerializableHttpResponse,
+}
+
+#[derive(Deserialize, Serialize)]
 pub struct ExtismSttRequest<C> {
     pub cfg: C,
     pub audio_base64: String,

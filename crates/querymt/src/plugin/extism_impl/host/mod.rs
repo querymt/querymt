@@ -20,9 +20,10 @@ use crate::{
             ExtismChatPrepareRequest, ExtismChatRequest, ExtismChatResponse,
             ExtismChatStreamParserRequest, ExtismCompleteParseRequest, ExtismEmbedParseRequest,
             ExtismEmbedRequest, ExtismListModelsParseRequest, ExtismListModelsRequest,
-            ExtismPreparedChatRequest, ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest,
-            ExtismTtsResponse, ExtismVoiceConfig, ITEM_AWARE_CHAT_CONTRACT_VERSION,
-            PREPARED_CHAT_CONTRACT_VERSION, SerializableHttpRequest, SerializableHttpResponse,
+            ExtismPreparedChatRequest, ExtismSttParseRequest, ExtismSttRequest, ExtismSttResponse,
+            ExtismTtsParseRequest, ExtismTtsRequest, ExtismTtsResponse, ExtismVoiceConfig,
+            ITEM_AWARE_CHAT_CONTRACT_VERSION, PREPARED_CHAT_CONTRACT_VERSION,
+            SerializableHttpRequest, SerializableHttpResponse,
             messages_require_item_aware_contract,
         },
     },
@@ -1237,6 +1238,92 @@ impl HTTPEmbeddingProvider for ExtismProvider {
 }
 
 impl HTTPLLMProvider for ExtismProvider {
+    fn stt_request(&self, req: &stt::SttRequest) -> Result<http::Request<Vec<u8>>, LLMError> {
+        let cfg = self.effective_config()?;
+        self.call_short_blocking("stt_request", |plug| {
+            if !plug.function_exists("stt_request") {
+                return Err(LLMError::NotImplemented(
+                    "STT request/parse exports are missing; rebuild the provider plugin".into(),
+                ));
+            }
+            let out: Json<SerializableHttpRequest> = plug
+                .call_get_error_code(
+                    "stt_request",
+                    Json(ExtismSttRequest {
+                        cfg,
+                        audio_base64: BASE64.encode(&req.audio),
+                        filename: req.filename.clone(),
+                        mime_type: req.mime_type.clone(),
+                        model: req.model.clone(),
+                        language: req.language.clone(),
+                    }),
+                )
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok(out.0.req)
+        })
+    }
+
+    fn parse_stt(&self, resp: http::Response<Vec<u8>>) -> Result<stt::SttResponse, LLMError> {
+        let cfg = self.effective_config()?;
+        self.call_short_blocking("parse_stt_response", |plug| {
+            let out: Json<stt::SttResponse> = plug
+                .call_get_error_code(
+                    "parse_stt_response",
+                    Json(ExtismSttParseRequest {
+                        cfg,
+                        resp: SerializableHttpResponse { resp },
+                    }),
+                )
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok(out.0)
+        })
+    }
+
+    fn tts_request(&self, req: &tts::TtsRequest) -> Result<http::Request<Vec<u8>>, LLMError> {
+        let cfg = self.effective_config()?;
+        self.call_short_blocking("tts_request", |plug| {
+            if !plug.function_exists("tts_request") {
+                return Err(LLMError::NotImplemented(
+                    "TTS request/parse exports are missing; rebuild the provider plugin".into(),
+                ));
+            }
+            let out: Json<SerializableHttpRequest> = plug
+                .call_get_error_code(
+                    "tts_request",
+                    Json(ExtismTtsRequest {
+                        cfg,
+                        text: req.text.clone(),
+                        model: req.model.clone(),
+                        voice_config: req
+                            .voice_config
+                            .as_ref()
+                            .map(ExtismVoiceConfig::from_voice_config),
+                        format: req.format.clone(),
+                        speed: req.speed,
+                        language: req.language.clone(),
+                    }),
+                )
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok(out.0.req)
+        })
+    }
+
+    fn parse_tts(&self, resp: http::Response<Vec<u8>>) -> Result<tts::TtsResponse, LLMError> {
+        let cfg = self.effective_config()?;
+        self.call_short_blocking("parse_tts_response", |plug| {
+            let out: Json<ExtismTtsResponse> = plug
+                .call_get_error_code(
+                    "parse_tts_response",
+                    Json(ExtismTtsParseRequest {
+                        cfg,
+                        resp: SerializableHttpResponse { resp },
+                    }),
+                )
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            out.0.into_tts_response()
+        })
+    }
+
     fn tools(&self) -> Option<&[Tool]> {
         None
     }
@@ -1458,6 +1545,116 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn http_model_listing_wasi_multi_thread() {
         check_http_model_listing_wasi().await;
+    }
+
+    fn speech_factory(stt_request: &str, tts_request: &str) -> ExtismFactory {
+        ExtismFactory {
+            plugin: Arc::new(Mutex::new(wat_plugin(&[
+                ("from_config", "{}"),
+                ("prepare_chat_request", "{}"),
+                ("parse_chat_response", "{}"),
+                ("list_models_request", "{}"),
+                ("parse_list_models_response", "[]"),
+                ("stt_request", stt_request),
+                ("tts_request", tts_request),
+                (
+                    "parse_stt_response",
+                    r#"{"text":"speech test","language":"en"}"#,
+                ),
+                (
+                    "parse_tts_response",
+                    r#"{"audio_base64":"AAH/","mime_type":"audio/wav"}"#,
+                ),
+            ]))),
+            name: "speech-test".into(),
+            user_data: None,
+            allowed_hosts: vec!["127.0.0.1".into()],
+        }
+    }
+
+    async fn check_http_speech_wasi() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for path in ["/audio/speech", "/audio/transcriptions"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0; 4096];
+                let mut received = 0;
+                while !buffer[..received]
+                    .windows(4)
+                    .any(|part| part == b"\r\n\r\n")
+                {
+                    assert!(received < buffer.len());
+                    let read = socket.read(&mut buffer[received..]).await.unwrap();
+                    assert!(read > 0);
+                    received += read;
+                }
+                assert!(
+                    String::from_utf8_lossy(&buffer[..received])
+                        .starts_with(&format!("POST {path} "))
+                );
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let request = |path| {
+            serde_json::to_string(&SerializableHttpRequest {
+                req: http::Request::builder()
+                    .method("POST")
+                    .uri(format!("http://{addr}{path}"))
+                    .body(Vec::new())
+                    .unwrap(),
+            })
+            .unwrap()
+        };
+        // Exercise factory selection and the outer HTTP adapter, not only ExtismProvider.
+        let factory = speech_factory(&request("/audio/transcriptions"), &request("/audio/speech"));
+        let provider = tokio::task::spawn_blocking(move || {
+            LLMProviderFactory::from_config(&factory, "{}").unwrap()
+        })
+        .await
+        .unwrap();
+        let audio = provider
+            .speech(&tts::TtsRequest::new().text("speech test"))
+            .await
+            .unwrap();
+        assert_eq!(audio.audio, [0, 1, 255]);
+        assert_eq!(audio.mime_type.as_deref(), Some("audio/wav"));
+        let text = provider
+            .transcribe(&stt::SttRequest::new().audio(audio.audio))
+            .await
+            .unwrap();
+        assert_eq!(text.text, "speech test");
+        assert_eq!(text.language.as_deref(), Some("en"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_speech_wasi_current_thread() {
+        check_http_speech_wasi().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_speech_wasi_multi_thread() {
+        check_http_speech_wasi().await;
+    }
+
+    #[test]
+    fn http_speech_missing_exports_asks_for_plugin_rebuild() {
+        let provider = provider_over(wat_plugin(&[]));
+        for error in [
+            HTTPLLMProvider::stt_request(&provider, &stt::SttRequest::default()).unwrap_err(),
+            HTTPLLMProvider::tts_request(&provider, &tts::TtsRequest::default()).unwrap_err(),
+        ] {
+            assert!(matches!(error, LLMError::NotImplemented(_)));
+            assert!(error.to_string().contains("rebuild the provider plugin"));
+        }
     }
 
     #[test]
