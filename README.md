@@ -122,54 +122,20 @@ macOS Silicon users who download the `qmtcode` release binary need to clear the 
 xattr -dr com.apple.quarantine qmtcode
 ```
 
-## Release channels and versioning
+## Release channels
 
-`qmt` and `qmtcode` ship on two channels. Both report a semver `--version`, and
-version order always matches code order.
+| Channel | Release | `--version` |
+|---------|---------|-------------|
+| stable  | `vX.Y.Z` tag | `X.Y.Z` |
+| nightly | rolling `nightly` prerelease | `<base>-nightly.<UTC YYYYMMDDHHMMSS>` |
 
-| Channel | Release | Version | Asset names |
-|---------|---------|---------|-------------|
-| stable  | `vX.Y.Z` tag, latest release | `X.Y.Z` | `qmtcode-vX.Y.Z-<target>.*` |
-| nightly | rolling `nightly` prerelease | `<base>-nightly.<UTC YYYYMMDDHHMMSS>` | `qmtcode-nightly-<target>.*` |
+`<base>` is the workspace version, or the next patch if `v<workspace version>` is already tagged. A nightly sorts above the stable it follows and below the next one.
 
-**Nightly version.** `<base>` is `[workspace.package].version` from `Cargo.toml`,
-unless the stable tag `v<that version>` already exists, in which case it is the
-next patch. A nightly therefore sorts above the stable it follows and below the
-next stable (`0.5.2` < `0.6.0-nightly.20261105111147` < `0.6.0`), and later
-nightlies sort above earlier ones. The commit SHA is not part of the version; it
-is in the release notes and `release.json`. The version is computed by
-`scripts/release/nightly-version.sh`.
+Every release also publishes a `release.json` (`version`, `channel`, `commit`, `published_at`).
 
-**`release.json`.** Every stable and nightly release uploads a `release.json`
-asset: `{ "version", "channel", "commit", "published_at" }`. Consumers such as
-querymt-desktop read the version and full commit SHA from it instead of parsing
-asset names or notes. It is available at
-`releases/latest/download/release.json` and `releases/download/nightly/release.json`.
+A `vX.Y.Z` tag must match the workspace version. If it is not below the published nightly, its commit must also contain the nightly's commit, otherwise the release fails.
 
-**Stable gate.** A `vX.Y.Z` tag fails the Release workflow before anything is
-built or published when:
-
-- the tag does not equal the workspace version, or
-- `X.Y.Z` is at least the published nightly's base version and the tag commit does
-  not contain the nightly's commit (`git merge-base --is-ancestor`).
-
-The second rule stops a stable with a higher version but older code, and
-therefore fewer database migrations, from being offered to users running the
-nightly. Patch releases on an older line (`v0.5.3` while the nightly is
-`0.6.0-nightly.*`) sort below the nightly and pass. If the gate fails, tag a
-commit that contains the nightly's commit. The nightly's `release.json` must
-exist; if the published nightly predates it, run the Nightly workflow once and
-re-run the release.
-
-**Nightly publishing.** The rolling release is replaced through a
-`nightly-staging` draft: assets are uploaded to the draft first, then the old
-`nightly` release and tag are deleted and the draft is published as `nightly`. A
-failed upload leaves the previous nightly in place. After publishing, a
-`qmtcode-nightly` dispatch with `querymt_sha` and `querymt_version` is sent to
-querymt-desktop.
-
-The helper scripts and their tests live in `scripts/release/`
-(`scripts/release/test-release-scripts.sh`).
+Helper scripts and their tests are in `scripts/release/`.
 
 ## Documentation
 
