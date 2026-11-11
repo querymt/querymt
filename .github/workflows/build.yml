@@ -4,7 +4,11 @@ on:
   workflow_call:
     inputs:
       version_name:
-        description: 'Version identifier (e.g., v1.0.0 or nightly-abc1234)'
+        description: 'Asset label used in artifact names (e.g., v1.0.0 or nightly)'
+        required: true
+        type: string
+      qmt_version:
+        description: 'Version embedded in the binaries as QMT_VERSION (e.g., v1.0.0 or 0.6.0-nightly.20261105111147)'
         required: true
         type: string
       is_nightly:
@@ -200,7 +204,7 @@ jobs:
       - name: Build qmt with Cargo
         if: matrix.binary == 'qmt'
         env:
-          QMT_VERSION: ${{ inputs.version_name }}
+          QMT_VERSION: ${{ inputs.qmt_version }}
           RUSTFLAGS: ${{ matrix.rust_flags || '' }}
         run: cargo build --release --bin qmt --features "${{ matrix.cargo_features }}" --target ${{ matrix.target }}
 
@@ -208,7 +212,7 @@ jobs:
       - name: Build qmtcode with Cargo
         if: matrix.binary == 'qmtcode'
         env:
-          QMT_VERSION: ${{ inputs.version_name }}
+          QMT_VERSION: ${{ inputs.qmt_version }}
           QMT_UI_DIST: ${{ format('{0}/dashboard-ui', github.workspace) }}
           RUSTFLAGS: ${{ matrix.rust_flags || '' }}
         run: cargo build --release -p ${{ matrix.cargo_package }} --example qmtcode --features "${{ matrix.cargo_features }}" --target ${{ matrix.target }}

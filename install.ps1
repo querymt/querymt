@@ -48,7 +48,7 @@ function Get-AssetUrl([string]$Binary) {
     $repo = Get-RepoForBinary -Binary $Binary
     $release = Get-Release -Repo $repo
     if ($Channel -eq "nightly") {
-        $regex = "^$Binary-nightly-.*-$Target\.zip$"
+        $regex = "^$Binary-nightly(-.*)?-$Target\.zip$"
     } else {
         $regex = "^$Binary-.*-$Target\.zip$"
     }

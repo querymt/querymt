@@ -149,7 +149,7 @@ asset_url_for() {
     urls="$(printf '%s' "$json" | grep -o '"browser_download_url":[[:space:]]*"[^"]*"' | sed 's/^"browser_download_url":[[:space:]]*"//; s/"$//')"
 
     if [ "$CHANNEL" = "nightly" ]; then
-        pattern="/${binary}-nightly-[^/]*-${TARGET}\.${EXT}$"
+        pattern="/${binary}-nightly(-[^/]*)?-${TARGET}\.${EXT}$"
     else
         pattern="/${binary}-[^/]*-${TARGET}\.${EXT}$"
     fi

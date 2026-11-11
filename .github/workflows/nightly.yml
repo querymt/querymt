@@ -17,6 +17,7 @@ jobs:
       has_changes: ${{ steps.check.outputs.has_changes }}
       last_commit: ${{ steps.check.outputs.last_commit }}
       version_name: ${{ steps.version.outputs.name }}
+      qmt_version: ${{ steps.version.outputs.qmt_version }}
       dashboard_revision: ${{ steps.desktop.outputs.sha }}
     steps:
       - name: Checkout repository
@@ -61,10 +62,25 @@ jobs:
 
           echo "last_commit=$LAST_NIGHTLY_SHA" >> "$GITHUB_OUTPUT"
 
+      # <base>-nightly.<UTC YYYYMMDDHHMMSS>: sortable semver. The timestamp is
+      # taken once here and passed to every matrix job, so all binaries of one
+      # nightly report the same version. `version_name` stays a plain asset
+      # label so the rolling release URL and asset names are stable.
+      - name: Test release scripts
+        run: scripts/release/test-release-scripts.sh
+
       - name: Generate version string
         id: version
         shell: bash
-        run: echo "name=nightly-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          WORKSPACE_VERSION=$(scripts/release/workspace-version.sh Cargo.toml)
+          TIMESTAMP=$(date -u +%Y%m%d%H%M%S)
+          QMT_VERSION=$(git ls-remote --tags origin \
+            | scripts/release/nightly-version.sh "$WORKSPACE_VERSION" "$TIMESTAMP")
+          echo "Nightly version: $QMT_VERSION"
+          echo "name=nightly" >> "$GITHUB_OUTPUT"
+          echo "qmt_version=$QMT_VERSION" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build Nightly Binaries
@@ -73,6 +89,7 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       version_name: ${{ needs.check-changes.outputs.version_name }}
+      qmt_version: ${{ needs.check-changes.outputs.qmt_version }}
       is_nightly: true
       dashboard_revision: ${{ needs.check-changes.outputs.dashboard_revision }}
 
@@ -83,6 +100,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Runs replace the same rolling `nightly` release; never overlap.
+    concurrency:
+      group: nightly-release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      QMT_VERSION: ${{ needs.check-changes.outputs.qmt_version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -95,30 +120,88 @@ jobs:
           pattern: 'qmt*-*'
           merge-multiple: true
 
-      # Delete the existing nightly tag and release to ensure fresh artifacts
-      # and updated source archives on each run.
-      - name: Delete existing nightly release
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
+      # Machine-readable manifest: consumers read the version and commit from
+      # here instead of parsing asset names or release notes.
+      - name: Write release.json
         run: |
-          gh release delete nightly --yes --cleanup-tag || true
+          scripts/release/write-release-json.sh \
+            "$QMT_VERSION" nightly "${{ github.sha }}" artifacts/release.json
+          cat artifacts/release.json
 
-      - name: Create Nightly Release
+      # The rolling release is replaced in three steps so the time without a
+      # `nightly` release is a few seconds instead of the whole upload:
+      #   1. upload everything to a draft release under a staging tag
+      #      (drafts are invisible to the public and create no git tag),
+      #   2. delete the previous `nightly` release and tag,
+      #   3. retag the draft as `nightly` at this commit and publish it.
+      # If the upload fails, the previous nightly is left untouched.
+      - name: Create staging draft release
+        id: draft
         env:
-          GH_TOKEN: ${{ github.token }}
+          DASHBOARD_REVISION: ${{ needs.check-changes.outputs.dashboard_revision }}
         run: |
-          gh release create nightly \
-            --title "Nightly Build" \
-            --notes "**This is a pre-release build from the \`main\` branch.**
+          set -euo pipefail
+
+          # Remove drafts left behind by an earlier failed run.
+          for id in $(gh api "repos/${GH_REPO}/releases" --paginate \
+            --jq '.[] | select(.draft and .tag_name == "nightly-staging") | .id'); do
+            gh api -X DELETE "repos/${GH_REPO}/releases/${id}"
+          done
+
+          # The `Dashboard UI: <sha>` line is parsed by the next run's check-changes.
+          cat > notes.md <<EOF
+          **This is a pre-release build from the \`main\` branch.**
 
           It is not intended for production use.
 
+          Version: \`${QMT_VERSION}\`
           Commit: \`${{ github.sha }}\`
-          Dashboard UI: \`${{ needs.check-changes.outputs.dashboard_revision }}\`" \
+          Dashboard UI: \`${DASHBOARD_REVISION}\`
+          EOF
+
+          gh release create nightly-staging \
+            --draft \
+            --title "Nightly Build (${QMT_VERSION})" \
+            --notes-file notes.md \
             --prerelease \
             --target "${{ github.sha }}" \
             artifacts/*
+
+          ID=$(gh api "repos/${GH_REPO}/releases" --paginate \
+            --jq '.[] | select(.draft and .tag_name == "nightly-staging") | .id')
+          test -n "$ID"
+          test "$(wc -l <<<"$ID")" -eq 1
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Delete previous nightly release
+        run: |
+          set -euo pipefail
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release delete nightly --yes --cleanup-tag
+          fi
+          # A leftover tag without a release would stop the publish below from
+          # creating the tag at the new commit.
+          if gh api "repos/${GH_REPO}/git/ref/tags/nightly" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/${GH_REPO}/git/refs/tags/nightly"
+          fi
+
+      - name: Publish nightly release
+        env:
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+        run: |
+          set -euo pipefail
+          gh api -X PATCH "repos/${GH_REPO}/releases/${RELEASE_ID}" \
+            -f tag_name=nightly \
+            -f target_commitish="${{ github.sha }}" \
+            -F draft=false \
+            -F prerelease=true
+
+          # The tag must now point at this commit; check-changes relies on it.
+          TAG_SHA=$(gh api "repos/${GH_REPO}/git/ref/tags/nightly" --jq '.object.sha')
+          if [ "$TAG_SHA" != "${{ github.sha }}" ]; then
+            echo "::error::nightly tag points at ${TAG_SHA}, expected ${{ github.sha }}"
+            exit 1
+          fi
 
       # Tell querymt-desktop that a fresh nightly qmtcode release exists so it
       # can build its own nightly against it. GITHUB_TOKEN cannot dispatch
@@ -134,4 +217,5 @@ jobs:
           fi
           gh api repos/querymt/querymt-desktop/dispatches \
             -f event_type=qmtcode-nightly \
-            -f "client_payload[querymt_sha]=${{ github.sha }}"
+            -f "client_payload[querymt_sha]=${{ github.sha }}" \
+            -f "client_payload[querymt_version]=${QMT_VERSION}"

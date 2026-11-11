@@ -25,12 +25,72 @@ jobs:
           test -n "$revision"
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
+  # Stable gate. Fails before anything is built or published when:
+  #   - the tag does not match the workspace version, or
+  #   - the tag version sorts above the published nightly and the tag commit
+  #     does not contain the nightly's commit (a "future stable" with older
+  #     code than the nightly users already run).
+  # Patch releases on an older line (v0.5.3 while the nightly is
+  # 0.6.0-nightly.*) sort below the nightly and pass.
+  gate:
+    name: Stable release gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      qmt_version: ${{ steps.version.outputs.qmt_version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # merge-base needs the full history
+
+      - name: Test release scripts
+        run: scripts/release/test-release-scripts.sh
+
+      - name: Resolve version
+        id: version
+        run: echo "qmt_version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch published nightly manifest
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          if ! gh release view nightly >/dev/null 2>&1; then
+            echo "No published nightly release"
+            echo none > nightly-release.json.path
+            exit 0
+          fi
+          # A nightly published before release.json existed cannot be checked.
+          # Fail rather than guess; the next nightly run publishes the manifest.
+          if ! gh release download nightly --pattern release.json --output nightly-release.json; then
+            echo "::error::The published nightly has no release.json. Run the Nightly workflow once, then re-run this release."
+            exit 1
+          fi
+          echo nightly-release.json > nightly-release.json.path
+
+      - name: Check tag against workspace version and nightly
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          scripts/release/stable-gate.sh \
+            "$GITHUB_REF_NAME" \
+            "$(scripts/release/workspace-version.sh Cargo.toml)" \
+            "$GITHUB_SHA" \
+            "$(cat nightly-release.json.path)"
+
   build:
     name: Build Release Binaries
-    needs: resolve-ui
+    needs: [resolve-ui, gate]
     uses: ./.github/workflows/build.yml
     with:
+      # Stable passes vX.Y.Z for both: the asset label keeps the v, and
+      # build.rs strips it so `--version` reports X.Y.Z.
       version_name: ${{ github.ref_name }}
+      qmt_version: ${{ needs.gate.outputs.qmt_version }}
       is_nightly: false
       dashboard_revision: ${{ needs.resolve-ui.outputs.revision }}
 
@@ -41,6 +101,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
       - name: Download all build artifacts
         uses: actions/download-artifact@v8
         with:
@@ -48,6 +111,14 @@ jobs:
           # Match qmt-* and qmtcode-*, but not the internal dashboard-ui artifact.
           pattern: 'qmt*-*'
           merge-multiple: true
+
+      # Machine-readable manifest: consumers read the version and commit from
+      # here instead of parsing asset names or release notes.
+      - name: Write release.json
+        run: |
+          scripts/release/write-release-json.sh \
+            "${GITHUB_REF_NAME#v}" stable "$GITHUB_SHA" artifacts/release.json
+          cat artifacts/release.json
 
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v3
