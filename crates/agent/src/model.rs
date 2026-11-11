@@ -16,7 +16,8 @@ pub const MAX_IMAGES_PER_PROMPT: usize = 8;
 pub const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_TOTAL_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
-const SUPPORTED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
+pub(crate) const SUPPORTED_IMAGE_MIME_TYPES: &[&str] =
+    &["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum PromptContentError {
@@ -185,6 +186,13 @@ pub fn convert_prompt_blocks(
                 }
                 _ => converted.push(ChatInputPart::text("[Unsupported embedded resource]")),
             },
+            ContentBlock::ResourceLink(link) if file_link_path(&link.uri).is_some() => {
+                let path = file_link_path(&link.uri).unwrap_or_else(|| link.uri.clone());
+                converted.push(ChatInputPart::text(limit_text(
+                    &format!("[File reference: {path}]"),
+                    &mut remaining_text_bytes,
+                )));
+            }
             ContentBlock::ResourceLink(link) => {
                 let mut media = MediaPart::new(
                     MediaKind::Other,
@@ -212,6 +220,67 @@ pub fn convert_prompt_blocks(
     }
 
     Ok(converted)
+}
+
+/// Local path of a `file://` URI, or `None` for any other scheme or an
+/// unparsable URI. A file URI that does not map to a local path (for example a
+/// non-local host) still counts as a file link and renders as its raw URI.
+pub(crate) fn file_link_path(uri: &str) -> Option<String> {
+    let url = url::Url::parse(uri).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    Some(
+        url.to_file_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|()| uri.to_owned()),
+    )
+}
+
+/// Model input for one mention snapshot. An image degrades to a textual
+/// reference when the target model cannot take images.
+fn mention_input_part(content: &MentionContent, target: Option<&OutputTarget>) -> ChatInputPart {
+    let supports_images = target.is_none_or(|target| {
+        crate::model_info::supports_image_input(
+            crate::model_info::get_model_info(&target.provider, &target.model).as_ref(),
+        )
+    });
+    mention_input_part_for(content, supports_images)
+}
+
+fn mention_input_part_for(content: &MentionContent, supports_images: bool) -> ChatInputPart {
+    let MentionContent::Image {
+        path,
+        mime_type,
+        data,
+    } = content
+    else {
+        return ChatInputPart::text(content.render_text());
+    };
+    if supports_images
+        && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data)
+        && let Ok(media_type) = mime_type.parse::<MediaType>()
+        && let Ok(mut media) = MediaPart::new(
+            MediaKind::Image,
+            Some(media_type),
+            MediaSource::Inline { data: bytes },
+        )
+    {
+        media.filename = Some(path.clone());
+        return ChatInputPart::attachment(media);
+    }
+    let reason = if supports_images {
+        "image could not be decoded"
+    } else {
+        "the selected model does not support images"
+    };
+    ChatInputPart::text(
+        MentionContent::Unresolved {
+            path: path.clone(),
+            reason: reason.to_owned(),
+        }
+        .render_text(),
+    )
 }
 
 /// Build a validated inline attachment input part.
@@ -307,7 +376,7 @@ fn decode_attachment(index: usize, encoded: &str) -> Result<Vec<u8>, PromptConte
         })
 }
 
-fn validate_attachment_size(
+pub(crate) fn validate_attachment_size(
     index: usize,
     bytes: usize,
     total_attachment_bytes: &mut usize,
@@ -330,7 +399,7 @@ fn validate_attachment_size(
     Ok(())
 }
 
-fn validate_image(
+pub(crate) fn validate_image(
     index: usize,
     mime_type: &str,
     image_count: &mut usize,
@@ -529,6 +598,41 @@ where
     Ok(item)
 }
 
+/// Captured content of a mentioned file or directory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MentionContent {
+    /// File content or directory listing, already bounded.
+    Text { path: String, text: String },
+    /// Image snapshot; `data` is base64.
+    Image {
+        path: String,
+        mime_type: String,
+        data: String,
+    },
+    /// The link could not be read; the model only sees a reference.
+    Unresolved { path: String, reason: String },
+}
+
+impl MentionContent {
+    /// Text the model sees for this mention. Images render as a textual
+    /// reference; use this where no image can be attached (estimates, models
+    /// without image support).
+    pub fn render_text(&self) -> String {
+        match self {
+            Self::Text { path, text } => format!("[Mentioned file: {path}]\n{text}"),
+            Self::Image {
+                path, mime_type, ..
+            } => {
+                format!("[Mentioned file: {path}] ({mime_type} image not attached)")
+            }
+            Self::Unresolved { path, reason } => {
+                format!("[Mentioned file: {path}] (not read: {reason})")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data")]
 pub enum MessagePart {
@@ -543,6 +647,12 @@ pub enum MessagePart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_input_id: Option<String>,
         blocks: Vec<ContentBlock>,
+    },
+    /// Snapshot of a `file://` `resource_link` mention, captured when the
+    /// input was accepted. Model-only: never replayed to clients.
+    MentionContext {
+        uri: String,
+        content: MentionContent,
     },
     Reasoning {
         /// Authoritative canonical reasoning for this turn.
@@ -635,6 +745,7 @@ impl MessagePart {
             MessagePart::Text { .. } => "text",
             MessagePart::Prompt { .. } => "prompt",
             MessagePart::Steering { .. } => "steering",
+            MessagePart::MentionContext { .. } => "mention_context",
             MessagePart::Reasoning { .. } => "reasoning",
             MessagePart::StepStart { .. } => "step_start",
             MessagePart::StepFinish { .. } => "step_finish",
@@ -787,6 +898,9 @@ impl AgentMessage {
                 }
                 MessagePart::Prompt { blocks } | MessagePart::Steering { blocks, .. } => {
                     input_parts.extend(convert_prompt_blocks(blocks, max_prompt_bytes)?);
+                }
+                MessagePart::MentionContext { content, .. } => {
+                    input_parts.push(mention_input_part(content, target));
                 }
                 MessagePart::Reasoning { item, .. } => {
                     let mut item = item.clone();
@@ -1081,6 +1195,108 @@ mod tests {
             source_provider: None,
             source_model: None,
         }
+    }
+
+    fn link_block(uri: &str) -> ContentBlock {
+        ContentBlock::ResourceLink(crate::acp::protocol::ResourceLink::new("n", uri))
+    }
+
+    fn user_message(parts: Vec<MessagePart>) -> AgentMessage {
+        AgentMessage {
+            parts,
+            ..prompt_message(Vec::new())
+        }
+    }
+
+    fn input_text(message: &AgentMessage) -> String {
+        format!("{:?}", message.to_chat_message().expect("convertible"))
+    }
+
+    #[test]
+    fn file_link_becomes_text_reference_not_url_attachment() {
+        let parts = super::convert_prompt_blocks(&[link_block("file:///repo/a.ts")], None)
+            .expect("converts");
+        let rendered = format!("{parts:?}");
+        assert!(
+            rendered.contains("[File reference: /repo/a.ts]"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Url"), "{rendered}");
+    }
+
+    #[test]
+    fn non_file_links_keep_url_attachment_handling() {
+        let parts = super::convert_prompt_blocks(&[link_block("https://example.com/a")], None)
+            .expect("converts");
+        assert!(format!("{parts:?}").contains("Url"));
+        let parts =
+            super::convert_prompt_blocks(&[link_block("attachment:///x")], None).expect("converts");
+        assert!(format!("{parts:?}").contains("Url"));
+    }
+
+    #[test]
+    fn rebuilt_context_keeps_submitted_snapshot_and_original_blocks() {
+        let message = user_message(vec![
+            MessagePart::Prompt {
+                blocks: vec![link_block("file:///repo/a.ts")],
+            },
+            MessagePart::MentionContext {
+                uri: "file:///repo/a.ts".into(),
+                content: super::MentionContent::Text {
+                    path: "/repo/a.ts".into(),
+                    text: "SNAPSHOT-AT-SUBMIT".into(),
+                },
+            },
+        ]);
+        // Rebuilding any number of times never re-reads the file.
+        for _ in 0..2 {
+            let text = input_text(&message);
+            assert!(text.contains("[Mentioned file: /repo/a.ts]"));
+            assert!(text.contains("SNAPSHOT-AT-SUBMIT"));
+        }
+        // Replay (client-facing) sees only the original link, never content.
+        let MessagePart::Prompt { blocks } = &message.parts[0] else {
+            panic!("prompt part first");
+        };
+        assert!(matches!(blocks[0], ContentBlock::ResourceLink(_)));
+        assert!(!format!("{blocks:?}").contains("SNAPSHOT-AT-SUBMIT"));
+    }
+
+    #[test]
+    fn mention_context_part_round_trips_through_serde() {
+        let part = MessagePart::MentionContext {
+            uri: "file:///a".into(),
+            content: super::MentionContent::Unresolved {
+                path: "/a".into(),
+                reason: "not found".into(),
+            },
+        };
+        let json = serde_json::to_string(&part).unwrap();
+        assert_eq!(serde_json::from_str::<MessagePart>(&json).unwrap(), part);
+        assert_eq!(part.type_name(), "mention_context");
+    }
+
+    #[test]
+    fn image_snapshot_for_text_only_model_becomes_reference() {
+        use super::MentionContent;
+        let image = MentionContent::Image {
+            path: "/repo/p.png".into(),
+            mime_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]),
+        };
+        // Unknown target: assumed image-capable, so an attachment is sent.
+        let attached = super::mention_input_part(&image, None);
+        assert!(format!("{attached:?}").contains("Inline"));
+        // `render_text` is the no-image form used for estimates.
+        assert!(image.render_text().contains("image not attached"));
+        // A text-only model gets a textual reference with a reason instead.
+        let degraded = format!("{:?}", super::mention_input_part_for(&image, false));
+        assert!(
+            degraded.contains("[Mentioned file: /repo/p.png]"),
+            "{degraded}"
+        );
+        assert!(degraded.contains("does not support images"), "{degraded}");
+        assert!(!degraded.contains("Inline"), "{degraded}");
     }
 
     fn image(data: &[u8], mime_type: &str) -> ContentBlock {

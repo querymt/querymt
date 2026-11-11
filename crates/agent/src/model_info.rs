@@ -318,3 +318,16 @@ mod tests {
         assert!(matches!(source, ModelInfoSource::FromSession));
     }
 }
+
+/// Whether a model accepts image input. Unknown models are assumed to.
+pub fn supports_image_input(info: Option<&ModelInfo>) -> bool {
+    info.is_none_or(|info| {
+        info.capabilities.attachment
+            || info
+                .capabilities
+                .modalities
+                .input
+                .iter()
+                .any(|modality| modality == "image")
+    })
+}

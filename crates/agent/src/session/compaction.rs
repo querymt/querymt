@@ -586,6 +586,9 @@ impl SessionCompaction {
                         MessagePart::Prompt { blocks } => self
                             .estimator
                             .estimate(&render_prompt_for_llm(blocks, max_prompt_bytes)),
+                        MessagePart::MentionContext { content, .. } => {
+                            self.estimator.estimate(&content.render_text())
+                        }
                         MessagePart::ToolResult { content, .. } => {
                             let text: String = content
                                 .iter()
@@ -2175,6 +2178,34 @@ mod tests {
 
         let tokens = fixture.service.estimate_messages_tokens(&messages, None);
         assert!(tokens > 0, "Should count tokens for text messages");
+    }
+
+    #[test]
+    fn test_estimate_messages_tokens_grows_with_mention_size() {
+        let fixture = CompactionFixture::new();
+        let mention = |len: usize| AgentMessage {
+            id: "m".into(),
+            session_id: "s1".into(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::MentionContext {
+                uri: "file:///a".into(),
+                content: crate::model::MentionContent::Text {
+                    path: "/a".into(),
+                    text: "word ".repeat(len),
+                },
+            }],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        let small = fixture
+            .service
+            .estimate_messages_tokens(&[mention(10)], None);
+        let large = fixture
+            .service
+            .estimate_messages_tokens(&[mention(10_000)], None);
+        assert!(large > small * 10, "small={small} large={large}");
     }
 
     #[test]

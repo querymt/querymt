@@ -97,6 +97,8 @@ pub struct SteeringInput {
     pub input_id: String,
     pub client_input_id: Option<String>,
     pub blocks: Vec<ContentBlock>,
+    /// Mention snapshots captured when the input was accepted.
+    pub mentions: Vec<crate::model::MessagePart>,
     pub accepted_at_ms: u64,
 }
 
@@ -133,6 +135,17 @@ impl SteeringInbox {
         client_input_id: Option<String>,
         blocks: Vec<ContentBlock>,
     ) -> Result<usize, TurnControlError> {
+        self.push_with_mentions(input_id, client_input_id, blocks, Vec::new())
+            .await
+    }
+
+    pub async fn push_with_mentions(
+        &self,
+        input_id: String,
+        client_input_id: Option<String>,
+        blocks: Vec<ContentBlock>,
+        mentions: Vec<crate::model::MessagePart>,
+    ) -> Result<usize, TurnControlError> {
         let bytes = serde_json::to_vec(&blocks)
             .map(|value| value.len())
             .unwrap_or(usize::MAX);
@@ -164,6 +177,7 @@ impl SteeringInbox {
             input_id,
             client_input_id,
             blocks,
+            mentions,
             accepted_at_ms: now_ms(),
         });
         let position = state.pending.len();

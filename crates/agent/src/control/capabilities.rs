@@ -121,6 +121,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/schedules/delete".to_string(),
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_LIST_PENDING_METHOD.to_string(),
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_ATTACH_METHOD.to_string(),
+        crate::workspace_files::WORKSPACE_FILES_METHOD.to_string(),
     ];
 
     if agent.supports_session_lifecycle_contract() {
@@ -182,6 +183,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         crate::acp::shared::QMT_NOTIFICATION_INPUT_STATE.to_string(),
         crate::acp::shared::QMT_NOTIFICATION_RUNTIME_CHANGED.to_string(),
         crate::acp::shared::QMT_NOTIFICATION_MCP_AUTH_REQUIRED.to_string(),
+        crate::acp::shared::QMT_NOTIFICATION_WORKSPACE_INDEX_READY.to_string(),
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_AUTHORITY_NOTIFICATION
             .to_string(),
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_VALIDATION_FAILED_NOTIFICATION

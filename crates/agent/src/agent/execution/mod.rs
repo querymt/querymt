@@ -232,6 +232,7 @@ pub(crate) async fn apply_pending_steering(
     let mut messages = context.messages.to_vec();
     for input in pending {
         let blocks = input.blocks;
+        let mentions = input.mentions;
         let display = crate::agent::utils::render_prompt_for_display(&blocks);
         let message_id = uuid::Uuid::new_v4().to_string();
         let client_prompt_id = input.client_input_id.clone();
@@ -243,7 +244,10 @@ pub(crate) async fn apply_pending_steering(
                 run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
                 client_input_id: client_prompt_id.clone(),
                 blocks: blocks.clone(),
-            }],
+            }]
+            .into_iter()
+            .chain(mentions)
+            .collect(),
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
             source_provider: None,

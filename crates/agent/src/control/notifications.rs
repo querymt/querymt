@@ -37,6 +37,15 @@ pub struct SchedulesChangedNotification {
     pub schedule: Option<crate::control::schedules::ScheduleInfo>,
 }
 
+/// The workspace index of a session finished building; open `not_ready`
+/// file lists should re-query.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceIndexReadyNotification {
+    pub session_id: String,
+    pub workspace_root: String,
+}
+
 pub const SESSION_INPUT_STATE_VERSION: u32 = 1;
 
 #[typeshare]

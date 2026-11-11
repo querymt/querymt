@@ -1383,4 +1383,75 @@ mod session_actor_ref_remote_tests {
         let m2 = cloned.get_mode().await.expect("clone get_mode");
         assert_eq!(m1, m2, "original and clone should return the same mode");
     }
+
+    // ── E.13 ─────────────────────────────────────────────────────────────────
+
+    /// A remote session's index (with its cwd) travels over the mesh and is
+    /// scoped and ranked on the relay side.
+    #[tokio::test]
+    async fn test_remote_file_index_carries_cwd_and_ranks_relay_side() {
+        use crate::index::{FileIndexConfig, FunctionIndexConfig, WorkspaceIndexActor};
+
+        let f = AgentConfigFixture::new().await;
+        let mesh = get_test_mesh().await;
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("crates/agent/src")).unwrap();
+        std::fs::write(root.join("crates/agent/src/model.rs"), "").unwrap();
+        std::fs::write(root.join("README.md"), "").unwrap();
+        let cwd = root.join("crates/agent");
+
+        let runtime = SessionRuntime::new(
+            Some(cwd.clone()),
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let workspace = WorkspaceIndexActor::create(
+            root.clone(),
+            FileIndexConfig::default(),
+            FunctionIndexConfig::default(),
+        )
+        .await
+        .expect("workspace index");
+        assert!(runtime.workspace_handle.set(workspace).is_ok());
+
+        let session_id = format!("s-e13-{}", uuid::Uuid::now_v7());
+        let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime)
+            .with_mesh(Some(mesh.clone()));
+        let local_ref = SessionActor::spawn(actor);
+        let dht_name = crate::agent::remote::scope::scoped_session(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &session_id,
+        );
+        mesh.register_actor(local_ref.clone(), dht_name.clone())
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let remote_ref = kameo::actor::RemoteActorRef::<SessionActor>::lookup(&*dht_name)
+            .await
+            .expect("DHT lookup")
+            .expect("session registered");
+        let session_ref = SessionActorRef::Remote {
+            actor_ref: remote_ref,
+            peer_label: "e13".to_string(),
+            remote_node_id: None,
+        };
+
+        let index = session_ref.get_file_index().await.expect("remote index");
+        assert_eq!(
+            index.cwd.as_deref(),
+            Some(cwd.display().to_string().as_str())
+        );
+
+        let response = crate::workspace_files::query_index(
+            &index.workspace_root,
+            index.cwd.as_deref(),
+            &index.files,
+            "model",
+            10,
+        );
+        assert_eq!(response.entries[0].path, "src/model.rs");
+        assert!(response.entries.iter().all(|e| e.path != "README.md"));
+        assert!(response.entries[0].uri.starts_with("file://"));
+    }
 }

@@ -1625,13 +1625,26 @@ impl SessionMaterializer {
                 let manager_actor = self.config.workspace_manager_actor.clone();
                 let runtime_clone = prepared.runtime.clone();
                 let cwd_owned = cwd_path.clone();
+                let config = self.config.clone();
+                let ready_session_id = prepared.session_id.clone();
                 tokio::spawn(async move {
                     let root = crate::index::resolve_workspace_root(&cwd_owned);
                     match crate::index::get_or_create_workspace_with_timeout(&manager_actor, root)
                         .await
                     {
                         Ok(handle) => {
+                            let workspace_root = handle
+                                .file_index()
+                                .map(|index| index.root.display().to_string());
                             let _ = runtime_clone.workspace_handle.set(handle);
+                            if let Some(workspace_root) = workspace_root {
+                                config.emit_event(
+                                    &ready_session_id,
+                                    crate::events::AgentEventKind::WorkspaceIndexReady {
+                                        workspace_root,
+                                    },
+                                );
+                            }
                         }
                         Err(e) => log::warn!("Failed to initialize workspace index: {}", e),
                     }

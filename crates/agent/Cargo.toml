@@ -112,6 +112,10 @@ gix-error = "0.5"
 dirs.workspace = true
 # Windows-safe canonicalize (avoids \\?\ UNC prefixes) for tool path identity
 dunce = "1"
+# Fuzzy ranking for workspace file mentions (pre-1.0: pin the minor).
+frizbee = "~0.13.0"
+# Cross-OS path handling for remote workspace paths.
+typed-path = "0.13"
 
 # OAuth support (optional, feature-gated) - now provided by querymt-utils
 
@@ -210,4 +214,8 @@ harness = false
 
 [[bench]]
 name = "event_emit"
+harness = false
+
+[[bench]]
+name = "workspace_files_rank"
 harness = false

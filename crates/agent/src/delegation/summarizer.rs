@@ -449,6 +449,9 @@ impl DelegationSummarizer {
                         MessagePart::Prompt { blocks } => self
                             .estimator
                             .estimate(&render_prompt_for_llm(blocks, None)),
+                        MessagePart::MentionContext { content, .. } => {
+                            self.estimator.estimate(&content.render_text())
+                        }
                         MessagePart::ToolResult { content, .. } => {
                             let text: String = content
                                 .iter()
