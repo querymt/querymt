@@ -4,6 +4,18 @@
 
 ### Behavior changes
 
+- **BREAKING: default system cache hints cover only the first and last section,
+  and the Anthropic provider enforces its cache breakpoint limits.** For
+  Anthropic, Codex and OpenAI Responses the agent no longer adds a default `cache`
+  hint to middle system sections; add an explicit `cache` hint to keep a boundary
+  there (explicit hints and `cache_control` are never changed). The Anthropic
+  provider now sends at most four `cache_control` markers per request, keeping the
+  last system block, the last two messages, the first system block, then older
+  messages and remaining system blocks, and logs one warning with the number
+  dropped. It also raises an earlier marker's lifetime to the longest one that
+  follows it (a `1h` marker no longer follows a `5m` one), so such a raised marker
+  is billed at the `1h` write rate. Requests that previously failed with a 400 for
+  too many breakpoints now succeed.
 - **BREAKING: llama.cpp tool-call grammars use llguidance by default, and tool
   arguments are schema-aware in every format.** New provider parameter
   `grammar_backend` (`llguidance` | `gbnf`, default `llguidance`; set it in

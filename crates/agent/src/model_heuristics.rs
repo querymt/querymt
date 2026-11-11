@@ -163,8 +163,12 @@ impl ModelDefaults {
         }
     }
 
-    /// Default each configured instruction section to provider-default lifetime.
-    /// Explicit hints (including null) and native controls always take precedence.
+    /// Default the first and last configured instruction sections to the
+    /// provider-default lifetime. The last section's prefix already covers the
+    /// ones in between, and Anthropic allows only four breakpoints per request,
+    /// so middle sections get no default boundary of their own.
+    /// Explicit hints (including null) and native controls always take
+    /// precedence, at every position.
     fn apply_system_cache_defaults(&self, obj: &mut serde_json::Map<String, Value>) {
         let Some(system) = obj.get("system") else {
             return;
@@ -175,18 +179,25 @@ impl ModelDefaults {
             Value::Object(_) => vec![system.clone()],
             _ => return,
         };
+        let last = parts.len().saturating_sub(1);
         let parts = parts
             .into_iter()
-            .map(|part| match part {
-                Value::String(text) => json!({"text": text, "cache": {"ephemeral": {}}}),
-                Value::Object(mut part) => {
-                    // Explicit legacy provider controls remain an escape hatch.
-                    if !part.contains_key("cache_control") {
-                        part.entry("cache").or_insert(json!({"ephemeral": {}}));
+            .enumerate()
+            .map(|(index, part)| {
+                let is_boundary = index == 0 || index == last;
+                match part {
+                    Value::String(text) if is_boundary => {
+                        json!({"text": text, "cache": {"ephemeral": {}}})
                     }
-                    Value::Object(part)
+                    Value::Object(mut part) if is_boundary => {
+                        // Explicit legacy provider controls remain an escape hatch.
+                        if !part.contains_key("cache_control") {
+                            part.entry("cache").or_insert(json!({"ephemeral": {}}));
+                        }
+                        Value::Object(part)
+                    }
+                    other => other,
                 }
-                other => other,
             })
             .collect();
         obj.insert("system".into(), Value::Array(parts));
@@ -957,6 +968,65 @@ mod tests {
     }
 
     #[test]
+    fn single_section_gets_one_default_hint() {
+        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
+        let mut config = json!({"system": "Only section"});
+        defaults.apply_to(&mut config, "session");
+        let sections: Vec<querymt::params::SystemPrompt> =
+            serde_json::from_value(config["system"].clone()).unwrap();
+        assert_eq!(sections.len(), 1);
+        assert!(sections[0].cache().is_some());
+    }
+
+    #[test]
+    fn four_sections_get_two_default_hints() {
+        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
+        let mut config = json!({"system": ["one", "two", {"text": "three"}, "four"]});
+        defaults.apply_to(&mut config, "session");
+        let sections: Vec<querymt::params::SystemPrompt> =
+            serde_json::from_value(config["system"].clone()).unwrap();
+        let hinted: Vec<bool> = sections.iter().map(|s| s.cache().is_some()).collect();
+        assert_eq!(hinted, [true, false, false, true]);
+    }
+
+    #[test]
+    fn providers_without_cache_defaults_are_untouched() {
+        let defaults = ModelDefaults::for_model("openai", "gpt-4o", None);
+        let original = json!({"model": "gpt-4o", "system": ["one", "two", "three"]});
+        let mut config = original.clone();
+        defaults.apply_to(&mut config, "session");
+        assert_eq!(config["system"], original["system"]);
+    }
+
+    #[test]
+    fn explicit_middle_hint_is_kept() {
+        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
+        let middle = json!({"text": "two", "cache": {"ephemeral": {"ttl_seconds": 1800}}});
+        let mut config = json!({"system": ["one", middle.clone(), "three"]});
+        defaults.apply_to(&mut config, "session");
+        assert_eq!(config["system"][1], middle);
+        assert_eq!(
+            config["system"][0],
+            json!({"text": "one", "cache": {"ephemeral": {}}})
+        );
+        assert_eq!(
+            config["system"][2],
+            json!({"text": "three", "cache": {"ephemeral": {}}})
+        );
+    }
+
+    #[test]
+    fn explicit_null_opts_the_last_section_out() {
+        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
+        let mut config = json!({"system": ["one", {"text": "two", "cache": null}]});
+        defaults.apply_to(&mut config, "session");
+        let sections: Vec<querymt::params::SystemPrompt> =
+            serde_json::from_value(config["system"].clone()).unwrap();
+        assert!(sections[0].cache().is_some());
+        assert!(sections[1].cache().is_none());
+    }
+
+    #[test]
     fn anthropic_defaults_preserve_portable_instruction_hints() {
         let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219", None);
         let instruction = json!({"text": "stable", "cache": {"ephemeral": {"ttl_seconds": 1800}}});
@@ -1015,10 +1085,8 @@ mod tests {
                 config["system"][0],
                 json!({"text": "file contents", "cache": {"ephemeral": {}}})
             );
-            assert_eq!(
-                config["system"][1],
-                json!({"text": "later instructions", "cache": {"ephemeral": {}}})
-            );
+            // Middle sections get no default boundary of their own.
+            assert_eq!(config["system"][1], json!("later instructions"));
             assert_eq!(config["system"][2], explicit);
             let original = config.clone();
             defaults.apply_to(&mut config, "session");

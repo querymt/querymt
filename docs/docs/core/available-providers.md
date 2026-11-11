@@ -293,6 +293,20 @@ A forced `tool_choice` is `any` or a named tool.
 
 Each thinking block becomes its own reasoning item with its own signature. Signed blocks are replayed unchanged, even when their text is empty (the default `display: "omitted"` on Opus 4.7+ and Claude 5). `redacted_thinking` blocks are kept and replayed with their opaque data. `output_tokens_details.thinking_tokens` is reported as `reasoning_tokens` and subtracted from the inclusive `output_tokens`, so ordinary output and reasoning never overlap. Streaming usage ends with the final `message_delta` values: the provisional output count in `message_start` is not emitted as ordinary output, fields a later event omits (input, cache) keep their earlier values, and an explicit zero replaces them. Cache writes keep the returned `cache_creation` five-minute and one-hour counts as a breakdown of the aggregate `cache_creation_input_tokens` (never added on top); with no breakdown the tiers stay absent rather than assumed. Stop reasons map as: `end_turn`/`stop_sequence` to stop, `tool_use` to tool calls, `max_tokens`/`model_context_window_exceeded` to length, `refusal` to content filter, `pause_turn` to other.
 
+#### Prompt cache breakpoints
+
+Anthropic accepts at most four `cache_control` breakpoints per request and rejects a request with more. The provider counts the markers that are actually on the wire (portable `cache` hints and native `cache_control` alike; a hint on a block that cannot carry a marker, such as `redacted_thinking`, costs nothing) and, when there are more than four, keeps in this order:
+
+1. the last marked system block;
+2. the last marked message block, then the second-to-last;
+3. the first marked system block;
+4. remaining message markers, newest first;
+5. remaining system markers, last first.
+
+All other markers are removed and one warning reports how many were dropped. OAuth identity and billing blocks carry no marker, so they never change which system block is "first" or "last".
+
+Breakpoint lifetimes must not increase in request order (a `1h` breakpoint may not follow a `5m` one). After excess markers are dropped, an earlier marker with a shorter or default lifetime is raised to the longest lifetime that follows it. A `1h` cache write costs more than a `5m` one, so a raised marker is billed at the `1h` rate.
+
 #### `adaptive_thinking` override
 
 An optional provider config field overrides the class derived from the model ID:

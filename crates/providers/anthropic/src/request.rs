@@ -1,6 +1,7 @@
 //! Building the Anthropic chat request from canonical messages.
 
 use crate::auth::{oauth_billing_header, oauth_text_block};
+use crate::cache_breakpoints::{MAX_CACHE_BREAKPOINTS, normalize_cache_breakpoints};
 use crate::config::Anthropic;
 use crate::model::ThinkingClass;
 use crate::wire::request::{
@@ -119,7 +120,7 @@ impl Anthropic {
         }
         self.declared_tool_names(tools)?;
 
-        let anthropic_messages: Vec<AnthropicMessage> = messages
+        let mut anthropic_messages: Vec<AnthropicMessage> = messages
             .iter()
             .map(|m| {
                 let mut content: Vec<MessageContent> = Vec::new();
@@ -307,6 +308,17 @@ impl Anthropic {
                     );
                 }
             }
+        }
+
+        // Runs on the final wire blocks, so OAuth identity blocks and hints
+        // that placed no marker are already accounted for.
+        let dropped =
+            normalize_cache_breakpoints(sanitized_system.as_mut(), &mut anthropic_messages);
+        if dropped > 0 {
+            log::warn!(
+                target: "qmt_anthropic",
+                "dropped {dropped} cache breakpoint(s) to stay within Anthropic's limit of {MAX_CACHE_BREAKPOINTS}"
+            );
         }
 
         let req_body = AnthropicCompleteRequest {

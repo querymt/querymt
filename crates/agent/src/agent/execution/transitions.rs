@@ -5493,7 +5493,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_breakpoints_five_messages_only_last_two_cached() {
+    fn last_two_messages_are_hinted() {
         let msgs: Vec<ChatMessage> = (0..5)
             .map(|i| make_message(ChatRole::User, &format!("msg-{i}")))
             .collect();
@@ -5504,6 +5504,28 @@ mod tests {
         }
         assert!(result[3].cache.is_some(), "msg-3 should be cached");
         assert!(result[4].cache.is_some(), "msg-4 should be cached");
+    }
+
+    #[test]
+    fn existing_history_hints_are_kept() {
+        let hint = CacheHint::Ephemeral {
+            ttl_seconds: Some(1800),
+        };
+        let mut msgs: Vec<ChatMessage> = (0..5)
+            .map(|i| make_message(ChatRole::User, &format!("msg-{i}")))
+            .collect();
+        msgs[1].cache = Some(hint.clone());
+
+        let result = apply_cache_breakpoints(&msgs);
+        let hinted: Vec<bool> = result.iter().map(|m| m.cache.is_some()).collect();
+        assert_eq!(hinted, [false, true, false, true, true]);
+        assert_eq!(result[1].cache, Some(hint));
+
+        // Applying twice yields the same request as applying once.
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::to_value(apply_cache_breakpoints(&result)).unwrap()
+        );
     }
 
     #[test]

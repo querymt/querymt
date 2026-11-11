@@ -3,6 +3,7 @@
 mod support;
 
 mod auth;
+mod cache_breakpoints;
 mod config;
 mod error;
 mod replay;

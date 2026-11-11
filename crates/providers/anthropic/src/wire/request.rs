@@ -142,6 +142,21 @@ impl MessageContent {
             MessageContent::RedactedThinking { .. } => {}
         }
     }
+
+    /// The block's `cache_control` slot, or `None` for blocks that cannot
+    /// carry one (`redacted_thinking`).
+    pub(crate) fn cache_control_mut(&mut self) -> Option<&mut Option<CacheControlEphemeral>> {
+        match self {
+            MessageContent::Text { cache_control, .. }
+            | MessageContent::Image { cache_control, .. }
+            | MessageContent::ImageUrl { cache_control, .. }
+            | MessageContent::Document { cache_control, .. }
+            | MessageContent::Thinking { cache_control, .. }
+            | MessageContent::ToolUse { cache_control, .. }
+            | MessageContent::ToolResult { cache_control, .. } => Some(cache_control),
+            MessageContent::RedactedThinking { .. } => None,
+        }
+    }
 }
 
 #[derive(Serialize, Debug)]

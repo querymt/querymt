@@ -162,10 +162,18 @@ system = [
 ```
 
 In the agent runtime, plain system strings and `{ file = "..." }` entries receive
-provider-default cache hints for Anthropic, Codex, and OpenAI Responses. Explicit
-hints/TTLs are preserved. Each instruction section is a prefix boundary, so a
-changing later section does not remove the earlier stable boundary. The standalone
-provider/CLI API still requires explicit hints; these defaults are agent policy.
+provider-default cache hints for Anthropic, Codex, and OpenAI Responses, but only on
+the **first and last** section (a single section gets one hint). Sections in between
+are still cached, because the last section's prefix covers them; they just have no
+reuse boundary of their own. To keep a boundary on a middle section, give it an
+explicit `cache` hint. Explicit hints/TTLs (including `cache = null`) and native
+`cache_control` are preserved at every position. The agent also hints the last two
+messages. The standalone provider/CLI API still requires explicit hints; these
+defaults are agent policy.
+
+Anthropic accepts at most four cache breakpoints per request. If more are requested,
+the provider keeps the most useful ones and drops the rest with a warning; see
+[Prompt cache breakpoints](available-providers.md#prompt-cache-breakpoints).
 Responses currently defaults to `30m`, not unlimited session retention. Codex's
 unsupported translation remains disabled, so annotations do not guarantee reuse.
 

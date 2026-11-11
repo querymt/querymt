@@ -1309,3 +1309,40 @@ async fn model_preset_provider_availability_is_validated() {
         .await
         .expect("available provider validates");
 }
+
+#[test]
+fn dotagents_sections_count_as_system_sections() {
+    let source = |name: &str| DotagentsSource::singleton(DotagentsLayer::Workspace, name);
+    let mut manifest = DotagentsManifest::empty();
+    manifest.system_prompt = Some(DotagentsPrompt {
+        metadata: Default::default(),
+        body: "protocol system".to_string(),
+        source: source("system-prompt.md"),
+        fingerprint: "system".to_string(),
+    });
+    manifest.agents_md = Some(DotagentsPrompt {
+        metadata: Default::default(),
+        body: "protocol instructions".to_string(),
+        source: source("agents.md"),
+        fingerprint: "agents".to_string(),
+    });
+
+    let mut params = querymt::LLMParams::new().system("agent system file");
+    compose_prompt(&mut params, &manifest);
+    assert_eq!(params.system.len(), 3);
+
+    let mut config = serde_json::to_value(&params).unwrap();
+    crate::model_heuristics::ModelDefaults::for_model(
+        "anthropic",
+        "claude-3-7-sonnet-20250219",
+        None,
+    )
+    .apply_to(&mut config, "session");
+
+    let sections: Vec<querymt::params::SystemPrompt> =
+        serde_json::from_value(config["system"].clone()).unwrap();
+    let hinted: Vec<bool> = sections.iter().map(|s| s.cache().is_some()).collect();
+    assert_eq!(hinted, [true, false, true]);
+    assert_eq!(sections[0].text(), "agent system file");
+    assert_eq!(sections[2].text(), "protocol instructions");
+}
