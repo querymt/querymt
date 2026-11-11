@@ -451,6 +451,9 @@ impl AgentConfig {
 
     pub async fn invalidate_provider_cache(&self) {
         self.provider.clear_provider_cache().await;
+        if let Some(speech) = &self.speech_service {
+            speech.clear_provider_cache();
+        }
     }
 }
 

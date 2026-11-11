@@ -16,6 +16,12 @@ pub(crate) enum ProviderConfigMode<'a> {
         api_key_override: Option<&'a str>,
         session_id: &'a str,
     },
+    /// Non-chat calls share credentials but must not inherit chat model defaults.
+    Speech {
+        model: &'a str,
+        params: Option<&'a Value>,
+        api_key_override: Option<&'a str>,
+    },
     CatalogListing,
 }
 
@@ -30,6 +36,78 @@ pub(crate) struct ResolvedProviderConfig {
     pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
     pub pruned_keys: Vec<String>,
     pub use_oauth_resolver: bool,
+}
+
+impl ResolvedProviderConfig {
+    pub(crate) fn build_provider(
+        &self,
+        binding: &ProviderBinding,
+    ) -> Result<std::sync::Arc<dyn querymt::LLMProvider>, LLMError> {
+        let factory = &binding.factory;
+        if !self.pruned_keys.is_empty() {
+            const MAX_KEYS_TO_LOG: usize = 50;
+            let shown = self.pruned_keys.len().min(MAX_KEYS_TO_LOG);
+            let suffix = if self.pruned_keys.len() > shown {
+                format!(" (+{} more)", self.pruned_keys.len() - shown)
+            } else {
+                String::new()
+            };
+
+            log::warn!(
+                "Pruned unsupported config keys for provider '{}': {}{}",
+                binding.logical_name,
+                self.pruned_keys[..shown].join(", "),
+                suffix
+            );
+        }
+        let _use_oauth_resolver = self.use_oauth_resolver;
+
+        // If OAuth was used, attach a resolver so expired tokens are refreshed
+        // transparently on each request.
+        //
+        // We try the generic LLMProviderFactory path first: Extism providers
+        // handle HTTP internally and accept set_key_resolver directly on the
+        // LLMProvider. For native HTTP providers the generic path wraps the
+        // inner HTTP provider in Arc before we can set the resolver, so we
+        // fall back to the HTTPLLMProviderFactory path to set it on the inner
+        // provider before wrapping.
+        #[cfg(feature = "oauth")]
+        if _use_oauth_resolver {
+            let initial_key = self
+                .builder_config
+                .get("api_key")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let resolver = std::sync::Arc::new(crate::auth::OAuthKeyResolver::new(
+                &binding.logical_name,
+                initial_key,
+            ));
+            // Generic path — works for Extism providers that implement set_key_resolver.
+            let mut provider = factory.from_config(&self.pruned_config_str)?;
+            provider.set_key_resolver(resolver.clone());
+            if provider.key_resolver().is_some() {
+                return Ok(std::sync::Arc::from(provider));
+            }
+            // Fallback for native HTTP providers: set the resolver on the inner
+            // HTTPLLMProvider before it gets wrapped in Arc by the adapter.
+            if let Some(http_factory) = factory.as_http() {
+                let mut inner = http_factory.from_config(&self.pruned_config_str)?;
+                inner.set_key_resolver(resolver);
+                return Ok(std::sync::Arc::new(
+                    querymt::adapters::LLMProviderFromHTTP::new(inner),
+                ));
+            }
+            // Neither path attached a resolver — return the provider as-is.
+            log::warn!(
+                "OAuthKeyResolver could not be attached for provider '{}'",
+                binding.logical_name
+            );
+            return Ok(std::sync::Arc::from(provider));
+        }
+        Ok(std::sync::Arc::from(
+            factory.from_config(&self.pruned_config_str)?,
+        ))
+    }
 }
 
 fn active_provider_matches(initial_config: &LLMParams, provider_name: &str) -> bool {
@@ -106,7 +184,12 @@ pub(crate) async fn resolve_provider_config(
             model,
             params,
             api_key_override,
-            session_id,
+            ..
+        }
+        | ProviderConfigMode::Speech {
+            model,
+            params,
+            api_key_override,
         } => {
             builder.set("model", model.into());
 
@@ -114,15 +197,17 @@ pub(crate) async fn resolve_provider_config(
                 builder.merge_value(params_value, ConfigOverrideMode::Overwrite);
             }
 
-            // Only parse the models.dev cache when it can change the caps.
-            let model_info = ModelDefaults::wants_model_info(provider_name, builder.value())
-                .then(|| crate::model_info::get_model_info(provider_name, model))
-                .flatten();
-            let defaults = ModelDefaults::for_model(provider_name, model, model_info.as_ref());
-            // Resolve caps before applying defaults so an explicit `max_tokens`
-            // is recognised as its own ceiling.
-            output_caps = defaults.output_caps(builder.value());
-            defaults.apply_to(builder.value_mut(), session_id);
+            if let ProviderConfigMode::Runtime { session_id, .. } = mode {
+                // Only parse the models.dev cache when it can change the caps.
+                let model_info = ModelDefaults::wants_model_info(provider_name, builder.value())
+                    .then(|| crate::model_info::get_model_info(provider_name, model))
+                    .flatten();
+                let defaults = ModelDefaults::for_model(provider_name, model, model_info.as_ref());
+                // Resolve caps before applying defaults so an explicit `max_tokens`
+                // is recognised as its own ceiling.
+                output_caps = defaults.output_caps(builder.value());
+                defaults.apply_to(builder.value_mut(), session_id);
+            }
 
             if let Some(http_factory) = factory.as_http() {
                 let env_var_name = http_factory.api_key_name();
@@ -261,7 +346,10 @@ mod tests {
     #[cfg(test)]
     use std::sync::Arc;
 
-    struct DummyHttpProvider;
+    #[derive(Default)]
+    struct DummyHttpProvider {
+        resolver: Option<Arc<dyn querymt::auth::ApiKeyResolver>>,
+    }
 
     impl querymt::chat::http::HTTPChatProvider for DummyHttpProvider {
         fn prepare_chat_request(
@@ -311,6 +399,12 @@ mod tests {
         fn tools(&self) -> Option<&[Tool]> {
             None
         }
+        fn key_resolver(&self) -> Option<&Arc<dyn querymt::auth::ApiKeyResolver>> {
+            self.resolver.as_ref()
+        }
+        fn set_key_resolver(&mut self, resolver: Arc<dyn querymt::auth::ApiKeyResolver>) {
+            self.resolver = Some(resolver);
+        }
     }
 
     struct DummyFactory {
@@ -343,7 +437,7 @@ mod tests {
         }
 
         fn from_config(&self, _cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
-            Ok(Box::new(DummyHttpProvider))
+            Ok(Box::new(DummyHttpProvider::default()))
         }
     }
 
@@ -545,6 +639,67 @@ mod tests {
         .await;
         assert!(attr(&spans[0], "gen_ai.request.reasoning.level").is_none());
         assert_private(&spans);
+    }
+
+    #[tokio::test]
+    async fn speech_mode_preserves_overrides_without_chat_defaults() {
+        let registry = registry_with_provider(
+            "[[providers]]\nname='xiaomi'\npath='dummy'\n[providers.config]\napi_key='static'\nbase_url='https://static.invalid/'\n",
+        );
+        let factory = adapted_factory(
+            Some("UNUSED_SPEECH_KEY"),
+            r#"{"properties":{"api_key":{},"model":{},"base_url":{},"max_tokens":{}}}"#,
+        );
+        let binding = binding(&registry, factory);
+        let params = serde_json::json!({"base_url":"https://speech.invalid/"});
+        let resolved = resolve_provider_config(
+            &binding,
+            &LLMParams::default(),
+            ProviderConfigMode::Speech {
+                model: "tts-1",
+                params: Some(&params),
+                api_key_override: Some("override"),
+            },
+        )
+        .await
+        .unwrap();
+        let config: Value = serde_json::from_str(&resolved.pruned_config_str).unwrap();
+        assert_eq!(config["model"], "tts-1");
+        assert_eq!(config["api_key"], "override");
+        assert_eq!(config["base_url"], "https://speech.invalid/");
+        assert!(config.get("max_tokens").is_none());
+        assert!(resolved.output_caps.is_none());
+    }
+
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn speech_provider_attaches_oauth_refresh_when_supported() {
+        let binding = ProviderBinding {
+            logical_name: "openai".into(),
+            factory: adapted_factory(
+                Some("UNUSED_SPEECH_KEY"),
+                r#"{"properties":{"api_key":{},"model":{}}}"#,
+            ),
+            static_config: serde_json::json!({"api_key":"test"}),
+            implementation_id: None,
+        };
+        let mut resolved = resolve_provider_config(
+            &binding,
+            &LLMParams::default(),
+            ProviderConfigMode::Speech {
+                model: "tts-1",
+                params: None,
+                api_key_override: None,
+            },
+        )
+        .await
+        .unwrap();
+        resolved.use_oauth_resolver = true;
+        let provider = resolved.build_provider(&binding).unwrap();
+        assert_eq!(
+            provider.key_resolver().expect("refresh resolver").current(),
+            "test"
+        );
     }
 
     #[tokio::test]

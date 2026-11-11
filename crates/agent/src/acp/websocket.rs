@@ -228,7 +228,11 @@ impl EmbeddedAcpConnection {
                 let session_load = self.session_load.clone();
                 let session_hooks = self.session_hooks.clone();
                 tokio::spawn(async move {
-                    dispatch_rpc_message_with_context(
+                    let speech_request = request
+                        .method
+                        .trim_start_matches('_')
+                        .starts_with("querymt/speech/");
+                    let dispatch = dispatch_rpc_message_with_context(
                         RpcDispatchState {
                             agent: state.agent.clone(),
                             session_owners: state.session_owners.clone(),
@@ -245,8 +249,16 @@ impl EmbeddedAcpConnection {
                             session_load: Some(session_load),
                             delivery: Some(connection.delivery.clone()),
                         },
-                    )
-                    .await;
+                    );
+                    if speech_request {
+                        tokio::select! {
+                            biased;
+                            _ = connection.connection_cancel.cancelled() => return,
+                            _ = dispatch => {}
+                        }
+                    } else {
+                        dispatch.await;
+                    }
                     if let Some(session_id) = permission_attach_session
                         && state
                             .session_owners
@@ -1361,7 +1373,11 @@ async fn handle_websocket_connection(
                         let translator_dispatch = translator_receive.clone();
                         let session_load_dispatch = session_load_receive.clone();
                         tokio::spawn(async move {
-                            dispatch_rpc_message_with_context(
+                            let speech_request = request
+                                .method
+                                .trim_start_matches('_')
+                                .starts_with("querymt/speech/");
+                            let dispatch = dispatch_rpc_message_with_context(
                                 RpcDispatchState {
                                     agent: state_dispatch.agent.clone(),
                                     session_owners: state_dispatch.session_owners.clone(),
@@ -1382,8 +1398,16 @@ async fn handle_websocket_connection(
                                     session_load: Some(session_load_dispatch.clone()),
                                     delivery: Some(connection_dispatch.delivery.clone()),
                                 },
-                            )
-                            .await;
+                            );
+                            if speech_request {
+                                tokio::select! {
+                                    biased;
+                                    _ = connection_dispatch.connection_cancel.cancelled() => return,
+                                    _ = dispatch => {}
+                                }
+                            } else {
+                                dispatch.await;
+                            }
                             if let Some(session_id) = permission_attach_session
                                 && state_dispatch
                                     .session_owners

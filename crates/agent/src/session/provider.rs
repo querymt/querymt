@@ -636,7 +636,6 @@ impl SessionProvider {
             }
         };
 
-        let factory = binding.factory.clone();
         let resolved_cfg = resolve_provider_config(
             &binding,
             &self.initial_config,
@@ -649,114 +648,12 @@ impl SessionProvider {
         )
         .await?;
 
-        let settings = resolved_cfg.generation_settings;
-        let output_caps = resolved_cfg.output_caps;
-        let reasoning_effort = resolved_cfg.reasoning_effort;
-
-        #[cfg(feature = "oauth")]
-        let builder_config = resolved_cfg.builder_config;
-        let pruned_config_str = resolved_cfg.pruned_config_str;
-        let pruned_keys = resolved_cfg.pruned_keys;
-        let _use_oauth_resolver = resolved_cfg.use_oauth_resolver;
-
-        if !pruned_keys.is_empty() {
-            const MAX_KEYS_TO_LOG: usize = 50;
-            let shown = pruned_keys.len().min(MAX_KEYS_TO_LOG);
-            let suffix = if pruned_keys.len() > shown {
-                format!(" (+{} more)", pruned_keys.len() - shown)
-            } else {
-                String::new()
-            };
-
-            log::warn!(
-                "Pruned unsupported config keys for provider '{}': {}{}",
-                provider_name,
-                pruned_keys[..shown].join(", "),
-                suffix
-            );
-        }
-
-        // If OAuth was used, attach a resolver so expired tokens are refreshed
-        // transparently on each request.
-        //
-        // We try the generic LLMProviderFactory path first: Extism providers
-        // handle HTTP internally and accept set_key_resolver directly on the
-        // LLMProvider. For native HTTP providers the generic path wraps the
-        // inner HTTP provider in Arc before we can set the resolver, so we
-        // fall back to the HTTPLLMProviderFactory path to set it on the inner
-        // provider before wrapping.
-        #[cfg(feature = "oauth")]
-        if _use_oauth_resolver {
-            let initial_key = builder_config
-                .get("api_key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let resolver = std::sync::Arc::new(crate::auth::OAuthKeyResolver::new(
-                provider_name,
-                &initial_key,
-            ));
-
-            // Generic path — works for Extism providers that implement set_key_resolver.
-            let mut provider = factory.from_config(&pruned_config_str)?;
-            provider.set_key_resolver(resolver.clone());
-
-            if provider.key_resolver().is_some() {
-                log::debug!(
-                    "Attached OAuthKeyResolver via LLMProvider for '{}' (model: {})",
-                    provider_name,
-                    model
-                );
-                return Ok(ProviderSnapshot {
-                    provider: Arc::from(provider),
-                    settings,
-                    output_caps,
-                    reasoning_effort,
-                });
-            }
-
-            // Fallback for native HTTP providers: set the resolver on the inner
-            // HTTPLLMProvider before it gets wrapped in Arc by the adapter.
-            if let Some(http_factory) = factory.as_http() {
-                let mut http_provider = http_factory.from_config(&pruned_config_str)?;
-                http_provider.set_key_resolver(resolver);
-
-                log::debug!(
-                    "Attached OAuthKeyResolver via HTTPLLMProvider for '{}' (model: {})",
-                    provider_name,
-                    model
-                );
-
-                let adapter = querymt::adapters::LLMProviderFromHTTP::new(http_provider);
-                return Ok(ProviderSnapshot {
-                    provider: Arc::from(Box::new(adapter) as Box<dyn LLMProvider>),
-                    settings,
-                    output_caps,
-                    reasoning_effort,
-                });
-            }
-
-            // Neither path attached a resolver — return the provider as-is.
-            log::warn!(
-                "OAuthKeyResolver could not be attached for provider '{}' (model: {})",
-                provider_name,
-                model
-            );
-            return Ok(ProviderSnapshot {
-                provider: Arc::from(provider),
-                settings,
-                output_caps,
-                reasoning_effort,
-            });
-        }
-
-        let provider = factory.from_config(&pruned_config_str)?;
+        let provider = resolved_cfg.build_provider(&binding)?;
         Ok(ProviderSnapshot {
-            provider: Arc::from(provider),
-            settings,
-            output_caps,
-            reasoning_effort,
+            provider,
+            settings: resolved_cfg.generation_settings,
+            output_caps: resolved_cfg.output_caps,
+            reasoning_effort: resolved_cfg.reasoning_effort,
         })
     }
 }

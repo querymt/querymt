@@ -32,6 +32,8 @@ pub(crate) struct IzwiProvider {
     /// `izwi_rt.spawn(fut).await` so the caller's own tokio runtime is
     /// never blocked and izwi-core always has the reactor it needs.
     izwi_rt: Arc<tokio::runtime::Runtime>,
+    // Izwi generation selects a shared active model: loading and inference must be atomic.
+    request_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl IzwiProvider {
@@ -48,6 +50,7 @@ impl IzwiProvider {
             cfg,
             runtime: Arc::new(runtime),
             izwi_rt: Arc::new(izwi_rt),
+            request_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -73,6 +76,7 @@ impl IzwiProvider {
                     cfg,
                     runtime: Arc::clone(&cached.runtime),
                     izwi_rt: Arc::clone(&cached.izwi_rt),
+                    request_lock: Arc::clone(&cached.request_lock),
                 });
             }
             log::info!("izwi RuntimeService cache evict (config changed)");
@@ -88,17 +92,20 @@ impl IzwiProvider {
             Arc::new(RuntimeService::new(cfg.engine_config()).map_err(map_izwi_error)?)
         };
 
+        let request_lock = Arc::new(tokio::sync::Mutex::new(()));
         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(CachedRuntime {
             key,
             runtime: Arc::clone(&runtime),
             izwi_rt: Arc::clone(&izwi_rt),
+            request_lock: Arc::clone(&request_lock),
         });
 
         Ok(Self {
             cfg,
             runtime,
             izwi_rt,
+            request_lock,
         })
     }
 
@@ -137,9 +144,9 @@ impl IzwiProvider {
         T: Send + 'static,
         F: std::future::Future<Output = Result<T, LLMError>> + Send + 'static,
     {
-        self.izwi_rt
-            .spawn(fut)
-            .await
+        let task = self.izwi_rt.spawn(fut);
+        let _abort_on_drop = AbortOnDrop(task.abort_handle());
+        task.await
             .map_err(|err| LLMError::ProviderError(format!("izwi task failed: {err}")))?
     }
 
@@ -245,17 +252,26 @@ impl LLMProvider for IzwiProvider {
         let language = req.language.clone();
         let runtime = Arc::clone(&self.runtime);
         let auto_download = self.cfg.auto_download;
+        let request_lock = self.request_lock.clone();
 
         self.on_izwi_rt(async move {
+            let _guard = request_lock.lock().await;
             ensure_model_loaded(&runtime, auto_download, variant).await?;
             let transcription = runtime
                 .asr_transcribe(&audio_base64, Some(model.as_str()), language.as_deref())
                 .await
                 .map_err(map_izwi_error)?;
-            Ok(stt_response_from_asr(
-                transcription.text,
-                transcription.language,
-            ))
+            if matches!(variant.family(), izwi_core::catalog::ModelFamily::Qwen3Asr) {
+                Ok(stt_response_from_asr(
+                    transcription.text,
+                    transcription.language,
+                ))
+            } else {
+                Ok(stt::SttResponse {
+                    text: transcription.text,
+                    language: transcription.language,
+                })
+            }
         })
         .await
     }
@@ -274,8 +290,10 @@ impl LLMProvider for IzwiProvider {
         let generation = self.build_generation_request(req);
         let runtime = Arc::clone(&self.runtime);
         let auto_download = self.cfg.auto_download;
+        let request_lock = self.request_lock.clone();
 
         self.on_izwi_rt(async move {
+            let _guard = request_lock.lock().await;
             ensure_model_loaded(&runtime, auto_download, variant).await?;
             let output = runtime.generate(generation).await.map_err(map_izwi_error)?;
             let encoder = runtime.audio_encoder().await;
@@ -333,6 +351,15 @@ pub(crate) struct CachedRuntime {
     pub key: RuntimeCacheKey,
     pub runtime: Arc<RuntimeService>,
     pub izwi_rt: Arc<tokio::runtime::Runtime>,
+    pub request_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,9 +443,6 @@ fn split_asr_language_prefix(raw: &str) -> (String, Option<String>) {
     if let Some((meta, text)) = rest.split_once("<asr_text>") {
         return (text.trim().to_string(), parse_language_name(meta.trim()));
     }
-    if rest.eq_ignore_ascii_case("none") {
-        return (String::new(), None);
-    }
     match split_language_and_text(rest) {
         Some((language, text)) => (text, Some(language)),
         None => (trimmed.to_string(), None),
@@ -427,7 +451,10 @@ fn split_asr_language_prefix(raw: &str) -> (String, Option<String>) {
 
 fn strip_language_keyword(value: &str) -> Option<&str> {
     const PREFIX: &str = "language ";
-    if value.len() >= PREFIX.len() && value[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+    if value
+        .get(..PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+    {
         Some(&value[PREFIX.len()..])
     } else {
         None
@@ -449,13 +476,11 @@ fn parse_language_name(value: &str) -> Option<String> {
 }
 
 fn split_language_and_text(rest: &str) -> Option<(String, String)> {
-    if let Some((lang, text)) = rest.split_once(char::is_whitespace)
-        && !has_lower_to_upper_transition(lang)
-        && let Some(language) = parse_language_name(lang)
-    {
-        return Some((language, text.trim().to_string()));
+    // Without the explicit marker, only repair glued output that upstream missed.
+    // Whitespace-separated text may be ordinary speech (e.g. "language learning").
+    if !rest.as_bytes().first().is_some_and(u8::is_ascii_uppercase) {
+        return None;
     }
-
     let ascii_end = rest
         .char_indices()
         .find(|(_, ch)| !ch.is_ascii_alphabetic() && *ch != '-')
@@ -469,7 +494,7 @@ fn split_language_and_text(rest: &str) -> Option<(String, String)> {
         let language = parse_language_name(&ascii[..idx])?;
         return Some((language, rest[idx..].trim().to_string()));
     }
-    if ascii_end < rest.len() {
+    if ascii_end < rest.len() && !rest.as_bytes()[ascii_end].is_ascii() {
         let language = parse_language_name(ascii)?;
         return Some((language, rest[ascii_end..].trim().to_string()));
     }
@@ -485,10 +510,6 @@ fn camel_case_split(value: &str) -> Option<usize> {
         prev_lower = ch.is_ascii_lowercase();
     }
     None
-}
-
-fn has_lower_to_upper_transition(value: &str) -> bool {
-    camel_case_split(value).is_some()
 }
 
 fn normalize_language_name(name: &str) -> String {
@@ -510,6 +531,37 @@ mod tests {
     };
     use izwi_core::ModelVariant;
     use izwi_core::audio::AudioFormat;
+
+    #[test]
+    fn dropping_izwi_request_aborts_its_spawned_task() {
+        let provider = IzwiProvider::new(crate::config::IzwiConfig::default()).unwrap();
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        caller.block_on(async {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (drop_tx, drop_rx) = tokio::sync::oneshot::channel::<()>();
+            {
+                let request = provider.on_izwi_rt(async move {
+                    let _drop_tx = drop_tx;
+                    let _ = started_tx.send(());
+                    std::future::pending::<Result<(), querymt::error::LLMError>>().await
+                });
+                tokio::pin!(request);
+                tokio::select! {
+                    _ = started_rx => {},
+                    _ = &mut request => panic!("request finished before cancellation"),
+                }
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), drop_rx)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+        });
+    }
 
     #[test]
     fn parses_audio_formats() {
@@ -604,9 +656,17 @@ mod tests {
 
     #[test]
     fn split_asr_language_prefix_leaves_plain_transcript() {
-        let (text, language) = split_asr_language_prefix("hello world");
-        assert_eq!(language, None);
-        assert_eq!(text, "hello world");
+        for transcript in [
+            "hello world",
+            "Привет, мир!",
+            "甚至出现交易",
+            "language learning is useful",
+            "language English is interesting",
+        ] {
+            let (text, language) = split_asr_language_prefix(transcript);
+            assert_eq!(language, None);
+            assert_eq!(text, transcript);
+        }
     }
 
     #[test]

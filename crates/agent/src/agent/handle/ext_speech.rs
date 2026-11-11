@@ -52,7 +52,9 @@ impl LocalAgentHandle {
     ) -> Result<ExtResponse, Error> {
         let service = self.speech_service()?;
         let parsed: ListProfilesRequest =
-            serde_json::from_str(req.params.get()).unwrap_or_default();
+            serde_json::from_str(req.params.get()).map_err(|error| {
+                Error::invalid_params().data(format!("invalid speech listProfiles params: {error}"))
+            })?;
         ext_json_response(&service.list_profiles(parsed.operation.as_deref()))
     }
 

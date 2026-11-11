@@ -254,17 +254,52 @@ async fn synthesize_returns_audio_from_mock_tts() {
 }
 
 #[tokio::test]
-async fn synthesize_rejects_empty_text() {
+async fn synthesize_rejects_invalid_input_before_calling_provider() {
     let f = speech_fixture_with(mixed_speech_config(), true, None, None).await;
-    let err = f
+    for params in [
+        serde_json::json!({"text": "   "}),
+        serde_json::json!({"text": "x".repeat(16 * 1024 + 1)}),
+        serde_json::json!({"text": "hello", "speed": 0}),
+    ] {
+        let err = f
+            .handle
+            .ext_method(crate::acp::protocol::ExtRequest::new(
+                "querymt/speech/synthesize",
+                raw_params(&params.to_string()),
+            ))
+            .await
+            .expect_err("invalid synthesis input");
+        assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+    }
+}
+
+#[tokio::test]
+async fn synthesize_rejects_oversized_provider_audio() {
+    let audio = vec![0; crate::model::MAX_ATTACHMENT_BYTES + 1];
+    let f = speech_fixture_with(mixed_speech_config(), true, None, Some(&audio)).await;
+    let error = f
         .handle
         .ext_method(crate::acp::protocol::ExtRequest::new(
             "querymt/speech/synthesize",
-            raw_params(r#"{"text":"   "}"#),
+            raw_params(r#"{"text":"hello"}"#),
         ))
         .await
-        .expect_err("empty text should be invalid params");
-    assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+        .expect_err("oversized output");
+    assert!(error.to_string().contains("synthesized audio exceeds"));
+}
+
+#[tokio::test]
+async fn list_profiles_rejects_malformed_params() {
+    let f = speech_fixture(true, None).await;
+    let error = f
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/speech/listProfiles",
+            raw_params(r#"{"operation":7}"#),
+        ))
+        .await
+        .expect_err("invalid filter");
+    assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
 }
 
 #[tokio::test]
