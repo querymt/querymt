@@ -21,8 +21,12 @@ pub use symbol_index::{SymbolEntry, SymbolError, SymbolIndex, SymbolKind, parse_
 pub use workspace_actor::{
     WorkspaceHandle, WorkspaceIndexActor, WorkspaceIndexError, WorkspaceIndexStats,
 };
+pub use workspace_manager_actor::get_or_create_workspace_within;
 pub use workspace_manager_actor::{
     GetOrCreate, WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig,
     get_or_create_workspace_with_timeout,
 };
-pub use workspace_root::{normalize_cwd, resolve_workspace_root};
+pub use workspace_root::{
+    CanonicalWorkspace, canonical_workspace, canonical_workspace_async, normalize_cwd,
+    resolve_workspace_root,
+};

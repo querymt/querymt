@@ -97,10 +97,26 @@ pub async fn get_or_create_workspace_with_timeout(
     manager: &ActorRef<WorkspaceIndexManagerActor>,
     root: PathBuf,
 ) -> Result<WorkspaceHandle, SendError<GetOrCreate, String>> {
+    get_or_create_workspace_within(
+        manager,
+        root,
+        WorkspaceIndexManagerActor::GET_OR_CREATE_REPLY_TIMEOUT,
+    )
+    .await
+}
+
+/// Like [`get_or_create_workspace_with_timeout`], but waiting at most
+/// `reply_timeout` for the index to be created. The build itself continues in
+/// the manager after a timeout.
+pub async fn get_or_create_workspace_within(
+    manager: &ActorRef<WorkspaceIndexManagerActor>,
+    root: PathBuf,
+    reply_timeout: Duration,
+) -> Result<WorkspaceHandle, SendError<GetOrCreate, String>> {
     manager
         .ask(GetOrCreate { root })
         .mailbox_timeout(WorkspaceIndexManagerActor::GET_OR_CREATE_MAILBOX_TIMEOUT)
-        .reply_timeout(WorkspaceIndexManagerActor::GET_OR_CREATE_REPLY_TIMEOUT)
+        .reply_timeout(reply_timeout)
         .send()
         .await
 }

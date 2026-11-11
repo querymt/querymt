@@ -276,6 +276,7 @@ pub(crate) async fn compact_history(
                     MessagePart::Prompt { blocks } | MessagePart::Steering { blocks, .. } => {
                         crate::agent::utils::render_prompt_for_llm(blocks, prompt_limit).len() / 4
                     }
+                    MessagePart::MentionContext { content, .. } => content.render_text().len() / 4,
                     MessagePart::ToolResult { content, .. } => {
                         content
                             .iter()
@@ -410,6 +411,7 @@ pub(crate) async fn compact_history(
                     .and_then(|cfg| cfg.max_prompt_bytes),
                 &ledger,
                 instructions,
+                Some(llm_config.provider.as_str()),
             )
             .await
         {

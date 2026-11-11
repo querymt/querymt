@@ -375,3 +375,215 @@ async fn test_querymt_capabilities_composite_mesh_reports_invites_and_multi_tran
             .any(|method| method == "querymt/schedules/changed")
     );
 }
+
+#[tokio::test]
+async fn capabilities_advertise_workspace_files_query_and_index_ready() {
+    let f = HandleFixture::new().await;
+    let result = ext_method_json(&f.handle, "querymt/capabilities", serde_json::json!({})).await;
+    let listed = |key: &str, name: &str| {
+        result[key]
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|entry| entry == name)
+    };
+    assert!(listed("methods", "querymt/workspace/files"));
+    assert!(listed("notifications", "querymt/workspace/indexReady"));
+}
+
+#[tokio::test]
+async fn workspace_files_rejects_invalid_targets_with_invalid_params() {
+    let f = HandleFixture::new().await;
+    let cwd = f._temp_dir.path().display().to_string();
+    let missing = f._temp_dir.path().join("nope").display().to_string();
+    for params in [
+        serde_json::json!({"session_id": "s", "cwd": cwd}),
+        serde_json::json!({}),
+        serde_json::json!({"cwd": "relative/dir"}),
+        serde_json::json!({"cwd": missing}),
+        serde_json::json!({"cwd": "/"}),
+    ] {
+        let error = f
+            .handle
+            .ext_method(crate::acp::protocol::ExtRequest::new(
+                "querymt/workspace/files",
+                raw_params(&params.to_string()),
+            ))
+            .await
+            .expect_err("invalid target");
+        assert_eq!(
+            error.code,
+            crate::acp::protocol::ErrorCode::InvalidParams,
+            "{params}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn workspace_files_unknown_session_is_resource_not_found() {
+    let f = HandleFixture::new().await;
+    let error = f
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/workspace/files",
+            raw_params(r#"{"session_id":"does-not-exist"}"#),
+        ))
+        .await
+        .expect_err("unknown session");
+    assert_eq!(
+        error.code,
+        crate::acp::protocol::ErrorCode::ResourceNotFound
+    );
+}
+
+#[tokio::test]
+async fn workspace_files_cwd_only_lists_entries_and_creates_no_session() {
+    let f = HandleFixture::new().await;
+    let root = f._temp_dir.path().join("repo");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/model.rs"), "").unwrap();
+    std::fs::write(root.join("target.txt"), "").unwrap();
+    let cwd = root.display().to_string();
+    // The index builds in the background; poll until it is ready.
+    let mut result = serde_json::Value::Null;
+    for _ in 0..100 {
+        result = ext_method_json(
+            &f.handle,
+            "querymt/workspace/files",
+            serde_json::json!({"cwd": cwd, "query": "model"}),
+        )
+        .await;
+        if result["status"] == "ready" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(result["status"], "ready", "{result}");
+    assert_eq!(result["entries"][0]["path"], "src/model.rs");
+    assert_eq!(result["entries"][0]["name"], "model.rs");
+    assert!(
+        result["entries"][0]["uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("file://")
+    );
+    assert!(f.handle.registry.lock().await.session_ids().is_empty());
+}
+
+#[test]
+fn index_ready_event_translates_to_extension_notification() {
+    use crate::events::{AgentEventKind, EventOrigin};
+    let event = crate::events::EventEnvelope::Durable(crate::events::DurableEvent {
+        event_id: "e".into(),
+        stream_seq: 1,
+        session_seq: 1,
+        session_id: "sess-1".into(),
+        timestamp: 1,
+        origin: EventOrigin::Local,
+        source_node: None,
+        kind: AgentEventKind::WorkspaceIndexReady {
+            workspace_root: "/repo".into(),
+        },
+    });
+    let session_id = "sess-1";
+    crate::workspace_files::cache::insert(
+        session_id,
+        std::sync::Arc::new(crate::agent::file_proxy::GetFileIndexResponse {
+            files: Vec::new(),
+            generated_at: 0,
+            workspace_root: "/repo".into(),
+            cwd: None,
+        }),
+    );
+    let notification = crate::acp::shared::on_workspace_index_ready(&event).expect("notification");
+    // Every transport handles the event through this function, so the stale
+    // cached index is always dropped.
+    assert!(crate::workspace_files::cache::get(session_id).is_none());
+    assert_eq!(notification["method"], "querymt/workspace/indexReady");
+    assert_eq!(notification["params"]["session_id"], "sess-1");
+    assert_eq!(notification["params"]["workspace_root"], "/repo");
+}
+
+#[tokio::test]
+async fn workspace_files_excludes_gitignored_entries() {
+    let f = HandleFixture::new().await;
+    let root = f._temp_dir.path().join("ignored-repo");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("target")).unwrap();
+    std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+    std::fs::write(root.join("target/built.rs"), "").unwrap();
+    std::fs::write(root.join("kept.rs"), "").unwrap();
+    let cwd = root.display().to_string();
+    let mut result = serde_json::Value::Null;
+    for _ in 0..100 {
+        result = ext_method_json(
+            &f.handle,
+            "querymt/workspace/files",
+            serde_json::json!({"cwd": cwd}),
+        )
+        .await;
+        if result["status"] == "ready" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(result["status"], "ready", "{result}");
+    let paths: Vec<&str> = result["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"kept.rs"), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.starts_with("target")), "{paths:?}");
+}
+
+#[tokio::test]
+async fn workspace_files_rejects_filesystem_root_aliases() {
+    let f = HandleFixture::new().await;
+    let mut alias = dunce::canonicalize(f._temp_dir.path()).unwrap();
+    for _ in 0..alias.components().count() {
+        alias.push("..");
+    }
+    let error = f
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/workspace/files",
+            raw_params(&serde_json::json!({"cwd": alias}).to_string()),
+        ))
+        .await
+        .expect_err("root alias");
+    assert_eq!(error.code, crate::acp::protocol::ErrorCode::InvalidParams);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_files_resolves_symlinked_and_dotdot_cwds() {
+    let f = HandleFixture::new().await;
+    let root = f._temp_dir.path().join("alias-repo");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "").unwrap();
+    let link = f._temp_dir.path().join("alias-link");
+    std::os::unix::fs::symlink(&root, &link).unwrap();
+    let canonical = dunce::canonicalize(&root).unwrap();
+    for cwd in [link.clone(), link.join("src/..")] {
+        let mut result = serde_json::Value::Null;
+        for _ in 0..100 {
+            result = ext_method_json(
+                &f.handle,
+                "querymt/workspace/files",
+                serde_json::json!({"cwd": cwd, "query": "lib"}),
+            )
+            .await;
+            if result["status"] == "ready" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(result["status"], "ready", "{result}");
+        assert_eq!(result["cwd"], canonical.display().to_string());
+        assert_eq!(result["entries"][0]["path"], "src/lib.rs");
+    }
+}

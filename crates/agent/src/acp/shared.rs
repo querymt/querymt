@@ -671,6 +671,7 @@ pub const QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED: &str = "querymt/session/dele
 pub const QMT_NOTIFICATION_MCP_AUTH_REQUIRED: &str = "querymt/session/mcpAuthRequired";
 pub const QMT_NOTIFICATION_INPUT_STATE: &str = "querymt/session/inputState";
 pub const QMT_NOTIFICATION_RUNTIME_CHANGED: &str = "querymt/session/runtimeChanged";
+pub const QMT_NOTIFICATION_WORKSPACE_INDEX_READY: &str = "querymt/workspace/indexReady";
 pub const QMT_NOTIFICATION_SESSION_PINS_CHANGED: &str = "querymt/session/pinsChanged";
 
 fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -756,6 +757,32 @@ pub fn mcp_auth_required_notification(
         QMT_NOTIFICATION_MCP_AUTH_REQUIRED,
         serde_json::to_value(params).expect("serialize mcp auth required notification"),
     )
+}
+
+/// `querymt/workspace/indexReady` for a [`AgentEventKind::WorkspaceIndexReady`]
+/// event, whether the session is local or remote.
+/// Handle a `WorkspaceIndexReady` event for any transport: drop the session's
+/// cached remote index (it is stale now) and build the client notification.
+pub fn on_workspace_index_ready(event: &EventEnvelope) -> Option<serde_json::Value> {
+    let notification = workspace_index_ready_notification(event)?;
+    crate::workspace_files::cache::invalidate(event.session_id());
+    Some(notification)
+}
+
+pub fn workspace_index_ready_notification(event: &EventEnvelope) -> Option<serde_json::Value> {
+    let AgentEventKind::WorkspaceIndexReady { workspace_root } = event.kind() else {
+        return None;
+    };
+    Some(ext_notification(
+        QMT_NOTIFICATION_WORKSPACE_INDEX_READY,
+        serde_json::to_value(
+            crate::control::notifications::WorkspaceIndexReadyNotification {
+                session_id: event.session_id().to_owned(),
+                workspace_root: workspace_root.clone(),
+            },
+        )
+        .expect("serialize workspace index ready notification"),
+    ))
 }
 
 pub fn delegate_models_changed_notification(
@@ -2042,6 +2069,9 @@ impl AcpLiveEventTranslator {
                 "jsonrpc": "2.0", "method": QMT_NOTIFICATION_RUNTIME_CHANGED,
                 "params": {"version": 1, "session_id": event.session_id(), "runtime": runtime}
             })];
+        }
+        if let Some(notification) = on_workspace_index_ready(event) {
+            return vec![notification];
         }
         if let AgentEventKind::DelegateModelsChanged { revision } = event.kind() {
             return vec![delegate_models_changed_notification(

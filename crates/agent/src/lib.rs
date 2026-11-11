@@ -56,6 +56,7 @@ pub mod snapshot;
 pub mod tasks;
 pub mod tools;
 pub mod verification;
+pub mod workspace_files;
 pub mod workspace_query;
 pub mod worktree;
 

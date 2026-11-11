@@ -54,6 +54,9 @@ impl LocalAgentHandle {
             "querymt/session/getLifecycle" => self.handle_ext_session_get_lifecycle(req).await,
             "querymt/session/setLifecycle" => self.handle_ext_session_set_lifecycle(req).await,
             "querymt/session/setPinned" => self.handle_ext_session_set_pinned(req).await,
+            crate::workspace_files::WORKSPACE_FILES_METHOD => {
+                self.handle_ext_workspace_files(req).await
+            }
             "querymt/worktree/create" => self.handle_ext_worktree_create(req).await,
             "querymt/worktree/handoff" => self.handle_ext_worktree_handoff(req).await,
             "querymt/worktree/list" => self.handle_ext_worktree_list().await,

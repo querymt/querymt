@@ -55,6 +55,10 @@ pub struct GetFileIndexResponse {
     pub generated_at: u64,
     /// Workspace root path on the remote node (as a string for cross-OS compat).
     pub workspace_root: String,
+    /// The session's working directory on the remote node. Absent when the
+    /// peer predates this field; callers then fall back to `workspace_root`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// Successful response from `ReadRemoteFile`.
@@ -69,4 +73,37 @@ pub enum ReadRemoteFileResponse {
     },
     /// Non-text, non-image binary file that cannot be inlined.
     Binary,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Serialize)]
+    struct LegacyResponse {
+        files: Vec<FileIndexEntry>,
+        generated_at: u64,
+        workspace_root: String,
+    }
+
+    #[test]
+    fn mesh_codec_tolerates_peers_without_cwd() {
+        // The mesh encodes named msgpack (kameo `to_vec_named`).
+        let legacy = rmp_serde::to_vec_named(&LegacyResponse {
+            files: Vec::new(),
+            generated_at: 1,
+            workspace_root: "/repo".into(),
+        })
+        .expect("encode");
+        let decoded: GetFileIndexResponse = rmp_serde::from_slice(&legacy).expect("decode");
+        assert_eq!(decoded.cwd, None);
+
+        let current = GetFileIndexResponse {
+            cwd: Some("/repo/sub".into()),
+            ..decoded
+        };
+        let bytes = rmp_serde::to_vec_named(&current).expect("encode");
+        let back: GetFileIndexResponse = rmp_serde::from_slice(&bytes).expect("decode");
+        assert_eq!(back.cwd.as_deref(), Some("/repo/sub"));
+    }
 }

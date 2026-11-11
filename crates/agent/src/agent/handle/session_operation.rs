@@ -16,6 +16,7 @@ pub(crate) enum SessionOperation {
     LegacyPrompt,
     SubmitInput { has_key: bool },
     DiscardQueuedInput,
+    ReadWorkspaceFiles,
     Cancel,
     SetMode,
     SetModel,
@@ -27,6 +28,7 @@ impl SessionOperation {
             Self::LegacyPrompt => "legacy_prompt",
             Self::SubmitInput { .. } => "submit_input",
             Self::DiscardQueuedInput => "discard_queued_input",
+            Self::ReadWorkspaceFiles => "read_workspace_files",
             Self::Cancel => "cancel",
             Self::SetMode => "set_mode",
             Self::SetModel => "set_model",
@@ -35,7 +37,9 @@ impl SessionOperation {
 
     pub(crate) fn safety(self) -> SessionOperationSafety {
         match self {
-            Self::DiscardQueuedInput => SessionOperationSafety::Idempotent,
+            Self::DiscardQueuedInput | Self::ReadWorkspaceFiles => {
+                SessionOperationSafety::Idempotent
+            }
             Self::SubmitInput { has_key: true } => SessionOperationSafety::IdempotentWithKey,
             Self::LegacyPrompt
             | Self::SubmitInput { has_key: false }

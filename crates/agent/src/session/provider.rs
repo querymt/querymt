@@ -1030,12 +1030,7 @@ impl SessionHandle {
         // reasoning, opaque items) may only replay to the exact same
         // provider/protocol/model/endpoint; any other target gets the portable
         // projection.
-        let target = self.llm_config.as_ref().map(|cfg| {
-            let mut target = OutputTarget::new(cfg.provider.clone(), cfg.model.clone());
-            target.protocol = cfg.protocol.clone();
-            target.endpoint = cfg.endpoint.clone();
-            target
-        });
+        let target = self.llm_config.as_ref().map(OutputTarget::from_llm_config);
         let max_prompt_bytes = self
             .execution_config
             .as_ref()

@@ -232,6 +232,7 @@ pub(crate) async fn apply_pending_steering(
     let mut messages = context.messages.to_vec();
     for input in pending {
         let blocks = input.blocks;
+        let mentions = input.mentions;
         let display = crate::agent::utils::render_prompt_for_display(&blocks);
         let message_id = uuid::Uuid::new_v4().to_string();
         let client_prompt_id = input.client_input_id.clone();
@@ -243,15 +244,25 @@ pub(crate) async fn apply_pending_steering(
                 run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
                 client_input_id: client_prompt_id.clone(),
                 blocks: blocks.clone(),
-            }],
+            }]
+            .into_iter()
+            .chain(mentions)
+            .collect(),
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
             source_provider: None,
             source_model: None,
         };
-        let chat_message = message
-            .to_chat_message()
-            .map_err(|error| anyhow::anyhow!("Invalid steering content: {error}"))?;
+        let max_prompt_bytes = exec_ctx
+            .execution_config()
+            .and_then(|cfg| cfg.max_prompt_bytes);
+        let chat_message = match exec_ctx.llm_config() {
+            Some(llm) => {
+                message.to_chat_message_for_model(&llm.provider, &llm.model, max_prompt_bytes)
+            }
+            None => message.to_chat_message_with_max_prompt_bytes(max_prompt_bytes),
+        }
+        .map_err(|error| anyhow::anyhow!("Invalid steering content: {error}"))?;
         exec_ctx.add_message(message).await?;
         messages.push(chat_message);
 

@@ -738,6 +738,18 @@ async fn forward_stdio_event(
             }
             Err(error) => Err(acp::Error::into_internal_error(error)),
         }
+    } else if let Some(notification) = crate::acp::shared::on_workspace_index_ready(event) {
+        match serde_json::value::RawValue::from_string(notification["params"].to_string()) {
+            Ok(params) => {
+                bridge
+                    .notify_ext(crate::acp::protocol::ExtNotification::new(
+                        crate::acp::shared::QMT_NOTIFICATION_WORKSPACE_INDEX_READY,
+                        Arc::from(params),
+                    ))
+                    .await
+            }
+            Err(error) => Err(acp::Error::into_internal_error(error)),
+        }
     } else if let crate::events::AgentEventKind::DelegateModelsChanged { revision } = event.kind() {
         let notification =
             crate::acp::shared::delegate_models_changed_notification(event.session_id(), *revision);

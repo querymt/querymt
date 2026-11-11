@@ -449,6 +449,9 @@ impl DelegationSummarizer {
                         MessagePart::Prompt { blocks } => self
                             .estimator
                             .estimate(&render_prompt_for_llm(blocks, None)),
+                        MessagePart::MentionContext { content, .. } => {
+                            self.estimator.estimate(&content.render_text())
+                        }
                         MessagePart::ToolResult { content, .. } => {
                             let text: String = content
                                 .iter()
@@ -615,6 +618,9 @@ planning conversation."#
                 MessagePart::Text { content } => rendered_parts.push(content.clone()),
                 MessagePart::Prompt { blocks } => {
                     rendered_parts.push(render_prompt_for_display(blocks));
+                }
+                MessagePart::MentionContext { content, .. } => {
+                    rendered_parts.push(content.render_text());
                 }
                 _ => {}
             }
@@ -1516,13 +1522,35 @@ mod tests {
     // ── format_conversation / prepare_llm_input ──────────────────────────────
 
     fn make_user_msg(text: &str) -> AgentMessage {
+        make_user_msg_parts(vec![MessagePart::Text {
+            content: text.to_string(),
+        }])
+    }
+
+    #[test]
+    fn extracted_user_text_includes_mentions() {
+        let msg = make_user_msg_parts(vec![
+            MessagePart::Text {
+                content: "look".into(),
+            },
+            MessagePart::MentionContext {
+                uri: "file:///a.rs".into(),
+                content: crate::model::MentionContent::Text {
+                    path: "/a.rs".into(),
+                    text: "fn mentioned() {}".into(),
+                },
+            },
+        ]);
+        let text = DelegationSummarizer::extract_text_content(&msg);
+        assert!(text.contains("fn mentioned() {}"), "{text}");
+    }
+
+    fn make_user_msg_parts(parts: Vec<MessagePart>) -> AgentMessage {
         AgentMessage {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: "s1".to_string(),
             role: ChatRole::User,
-            parts: vec![MessagePart::Text {
-                content: text.to_string(),
-            }],
+            parts,
             created_at: 0,
             parent_message_id: None,
             source_provider: None,

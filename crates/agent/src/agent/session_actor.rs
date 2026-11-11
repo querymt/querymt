@@ -21,7 +21,10 @@ use crate::agent::utils::{format_prompt_user_text_only, genai, render_prompt_for
 use crate::error::AgentError;
 use crate::events::{AgentEventKind, RunOutcome, SessionLimits};
 use crate::hooks::HookNotice;
-use crate::model::{AgentMessage, MessagePart, prompt_contains_images, validate_prompt_blocks};
+use crate::model::{
+    AgentMessage, MessagePart, prompt_contains_images, validate_prompt_blocks,
+    validate_prompt_usage,
+};
 use crate::session::run_lease::{RunLease, RunLeaseRoot};
 
 /// How long a run start waits for a momentarily held run lease (a reconciler
@@ -323,6 +326,8 @@ fn queued_prompt_capacity_error(session_id: &str) -> AgentError {
 struct QueuedPrompt {
     input_id: String,
     req: crate::acp::protocol::PromptRequest,
+    /// Mention snapshots captured when the input was accepted.
+    mentions: Vec<MessagePart>,
     reply: oneshot::Sender<Result<PromptResponse, AgentError>>,
 }
 
@@ -514,15 +519,41 @@ impl SessionActor {
         });
     }
 
+    /// Snapshot the `file://` links of an accepted input (see
+    /// [`crate::workspace_files::mentions`]). Never fails the input.
+    async fn resolve_prompt_mentions(
+        &self,
+        blocks: &[crate::acp::protocol::ContentBlock],
+        usage: crate::model::PromptUsage,
+    ) -> Vec<MessagePart> {
+        let has_file_link = blocks.iter().any(|block| {
+            matches!(block, crate::acp::protocol::ContentBlock::ResourceLink(link)
+                if link.uri.starts_with("file:"))
+        });
+        if !has_file_link {
+            return Vec::new();
+        }
+        // Mentions share the image, attachment and text limits with the blocks.
+        crate::workspace_files::mentions::resolve_mentions(
+            blocks,
+            self.runtime.canonical_workspace().await,
+            self.config.max_prompt_bytes,
+            usage,
+        )
+        .await
+    }
+
     fn prompt_execution(
         &self,
         req: crate::acp::protocol::PromptRequest,
         run_id: String,
         steering: Arc<crate::agent::turn_control::SteeringInbox>,
         phase_reporter: tokio::sync::mpsc::UnboundedSender<Option<RunPhase>>,
+        mentions: Vec<MessagePart>,
     ) -> DetachedPromptExecution {
         DetachedPromptExecution {
             req,
+            mentions,
             session_id: self.session_id.clone(),
             runtime: self.runtime.clone(),
             config: self.config.clone(),
@@ -604,6 +635,7 @@ impl SessionActor {
         reply: oneshot::Sender<Result<PromptResponse, AgentError>>,
         actor_ref: kameo::actor::ActorRef<SessionActor>,
         queued_input_id: Option<String>,
+        mentions: Vec<MessagePart>,
     ) {
         self.prompt_running = true;
         self.turn_state.generation = self.turn_state.generation.saturating_add(1);
@@ -651,7 +683,7 @@ impl SessionActor {
             }
         });
 
-        let exec = self.prompt_execution(req, run_id.clone(), steering, phase_tx);
+        let exec = self.prompt_execution(req, run_id.clone(), steering, phase_tx, mentions);
         let completion_token = self.turn_state.token.clone();
         let event_stream = self.config.event_sink.session_stream(&self.session_id);
         tokio::spawn(async move {
@@ -870,6 +902,7 @@ impl Message<PromptFinished> for SessionActor {
                 queued.reply,
                 ctx.actor_ref().clone(),
                 Some(queued.input_id),
+                queued.mentions,
             );
         } else {
             self.run_lease = None;
@@ -2081,6 +2114,11 @@ impl Message<crate::agent::messages::GetFileIndex> for SessionActor {
             files: index.files.clone(),
             generated_at: index.generated_at,
             workspace_root: index.root.display().to_string(),
+            cwd: self
+                .runtime
+                .cwd
+                .as_ref()
+                .map(|cwd| cwd.display().to_string()),
         })
     }
 }
@@ -2097,38 +2135,33 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         use crate::agent::file_proxy::{FileProxyError, ReadRemoteFileResponse};
-        use crate::tools::builtins::read_shared::render_read_output;
+        use crate::workspace_files::confined::{ReadError, read_confined};
         use base64::Engine as _;
 
-        let cwd = self
-            .runtime
-            .cwd
-            .as_ref()
-            .ok_or(FileProxyError::NoWorkingDirectory)?;
-
-        let path = std::path::Path::new(&msg.path);
-        let joined = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            cwd.join(path)
-        };
-
-        let resolved = joined
-            .canonicalize()
-            .map_err(|e| FileProxyError::PathResolution(e.to_string()))?;
-
-        let root = crate::index::resolve_workspace_root(cwd);
-        if !resolved.starts_with(&root) {
-            return Err(FileProxyError::PathOutsideWorkspace(
-                resolved.display().to_string(),
-            ));
+        if self.runtime.cwd.is_none() {
+            return Err(FileProxyError::NoWorkingDirectory);
         }
+        let workspace = self.runtime.canonical_workspace().await.ok_or_else(|| {
+            FileProxyError::PathResolution("working directory does not exist".into())
+        })?;
 
-        let blocks = render_read_output(&resolved, msg.offset, msg.limit)
-            .await
-            .map_err(FileProxyError::ReadError)?;
+        let read = read_confined(
+            workspace,
+            std::path::Path::new(&msg.path),
+            msg.offset,
+            msg.limit,
+            None,
+        )
+        .await
+        .map_err(|error| match error {
+            ReadError::NotFound => FileProxyError::PathResolution(error.to_string()),
+            ReadError::Resolution(reason) => FileProxyError::PathResolution(reason),
+            ReadError::OutsideWorkspace(path) => FileProxyError::PathOutsideWorkspace(path),
+            other => FileProxyError::ReadError(other.to_string()),
+        })?;
+        let blocks = read.parts;
 
-        // Map the single result part returned by render_read_output to the
+        // Map the single result part returned by the confined read to the
         // appropriate ReadRemoteFileResponse variant.
         let Some(block) = blocks.into_iter().next() else {
             return Ok(ReadRemoteFileResponse::Binary);
@@ -2168,7 +2201,8 @@ impl Message<SubmitSessionInput> for SessionActor {
                 received: input.session_id,
             }));
         }
-        validate_prompt_blocks(&input.prompt)?;
+        let usage = validate_prompt_usage(&input.prompt)?;
+        let mentions = self.resolve_prompt_mentions(&input.prompt, usage).await;
         let input_id = input
             .client_input_id
             .clone()
@@ -2218,10 +2252,11 @@ impl Message<SubmitSessionInput> for SessionActor {
                 let blocks = input.prompt.clone();
                 let position = run
                     .steering
-                    .push(
+                    .push_with_mentions(
                         input_id.clone(),
                         input.client_input_id.clone(),
                         input.prompt,
+                        mentions,
                     )
                     .await
                     .map_err(AgentError::from)?;
@@ -2277,7 +2312,13 @@ impl Message<SubmitSessionInput> for SessionActor {
                     }
                 });
                 if self.active_run.is_none() {
-                    self.launch_prompt(req, reply, ctx.actor_ref().clone(), Some(input_id.clone()));
+                    self.launch_prompt(
+                        req,
+                        reply,
+                        ctx.actor_ref().clone(),
+                        Some(input_id.clone()),
+                        mentions,
+                    );
                     let run_id = self
                         .active_run
                         .as_ref()
@@ -2309,6 +2350,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                     self.queued_prompts.push_back(QueuedPrompt {
                         input_id: input_id.clone(),
                         req,
+                        mentions,
                         reply,
                     });
                     let result = SubmitInputResult::Queued { input_id, position };
@@ -2364,14 +2406,16 @@ impl Message<Prompt> for SessionActor {
     type Reply = DelegatedReply<Result<PromptResponse, AgentError>>;
 
     async fn handle(&mut self, msg: Prompt, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        if let Err(error) = validate_prompt_blocks(&msg.req.prompt) {
-            return ctx.spawn(async move { Err(AgentError::from(error)) });
-        }
+        let usage = match validate_prompt_usage(&msg.req.prompt) {
+            Ok(usage) => usage,
+            Err(error) => return ctx.spawn(async move { Err(AgentError::from(error)) }),
+        };
         if self.active_run.is_none()
             && let Err(error) = self.acquire_run_lease().await
         {
             return ctx.spawn(async move { Err(error) });
         }
+        let mentions = self.resolve_prompt_mentions(&msg.req.prompt, usage).await;
         let (reply, receiver) = oneshot::channel();
         if self.active_run.is_some() {
             if self.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
@@ -2384,6 +2428,7 @@ impl Message<Prompt> for SessionActor {
             self.queued_prompts.push_back(QueuedPrompt {
                 input_id: input_id.clone(),
                 req: msg.req,
+                mentions,
                 reply,
             });
             self.config.emit_event(
@@ -2400,7 +2445,7 @@ impl Message<Prompt> for SessionActor {
                 },
             );
         } else {
-            self.launch_prompt(msg.req, reply, ctx.actor_ref().clone(), None);
+            self.launch_prompt(msg.req, reply, ctx.actor_ref().clone(), None, mentions);
         }
         self.publish_runtime().await;
         ctx.spawn(async move {
@@ -2522,6 +2567,7 @@ impl Message<ScheduledPrompt> for SessionActor {
             async move {
                 let result = execute_prompt_detached(DetachedPromptExecution {
                     req: prompt_request,
+                    mentions: Vec::new(),
                     session_id: session_id.clone(),
                     runtime,
                     config: config.clone(),
@@ -2598,6 +2644,8 @@ impl Message<ScheduledPrompt> for SessionActor {
 /// It does NOT access the actor — everything is passed as parameters.
 struct DetachedPromptExecution {
     req: crate::acp::protocol::PromptRequest,
+    /// Mention snapshots to persist right after the prompt part.
+    mentions: Vec<MessagePart>,
     session_id: String,
     runtime: Arc<SessionRuntime>,
     config: Arc<AgentConfig>,
@@ -2684,15 +2732,7 @@ fn validate_model_image_support(
 }
 
 fn model_supports_images(model_info: Option<&querymt::providers::ModelInfo>) -> bool {
-    model_info.is_none_or(|info| {
-        info.capabilities.attachment
-            || info
-                .capabilities
-                .modalities
-                .input
-                .iter()
-                .any(|modality| modality == "image")
-    })
+    crate::model_info::supports_image_input(model_info)
 }
 
 async fn validate_execution_task(
@@ -2818,6 +2858,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     let admission_started = std::time::Instant::now();
     let DetachedPromptExecution {
         req,
+        mentions,
         session_id,
         runtime,
         config,
@@ -3100,6 +3141,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     let mut parts = vec![MessagePart::Prompt {
         blocks: req.prompt.clone(),
     }];
+    parts.extend(mentions);
     parts.extend(
         hook_result
             .context_contributions
@@ -3561,6 +3603,7 @@ mod tests {
                     "trace-run".into(),
                 )),
                 tokio::sync::mpsc::unbounded_channel().0,
+                Vec::new(),
             );
             if cancelled {
                 exec.cancel_token.cancel();
@@ -6152,6 +6195,51 @@ mod tests {
         assert_eq!(completed.0, "stopped");
         assert_eq!(completed.1, Some(crate::events::StopType::ModelTokenLimit));
         assert_eq!(completed.2.as_deref(), Some("output limit"));
+    }
+
+    #[tokio::test]
+    async fn accepted_input_snapshots_file_mentions_at_accept_time() {
+        let fixture = ActorFixture::new().await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir(workspace.path().join(".git")).unwrap();
+        let file = workspace.path().join("a.ts");
+        std::fs::write(&file, "BEFORE-EDIT").unwrap();
+        let actor = SessionActor::new(
+            fixture.config.clone(),
+            fixture._session_id.clone(),
+            crate::agent::core::SessionRuntime::new(
+                Some(workspace.path().to_path_buf()),
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        );
+        let uri = url::Url::from_file_path(&file).unwrap().to_string();
+        let blocks = vec![
+            crate::acp::protocol::ContentBlock::from("see this"),
+            crate::acp::protocol::ContentBlock::ResourceLink(
+                crate::acp::protocol::ResourceLink::new("a.ts", uri.clone()),
+            ),
+        ];
+
+        let usage = validate_prompt_usage(&blocks).unwrap();
+        let mentions = actor.resolve_prompt_mentions(&blocks, usage).await;
+        // A tool edits the file after acceptance but before the input runs.
+        std::fs::write(&file, "AFTER-EDIT").unwrap();
+
+        assert!(matches!(
+            mentions.as_slice(),
+            [MessagePart::MentionContext {
+                uri: captured,
+                content: crate::model::MentionContent::Text { text, .. },
+            }] if *captured == uri && text.contains("BEFORE-EDIT") && !text.contains("AFTER-EDIT")
+        ));
+        // Inputs without file links resolve nothing and read nothing.
+        assert!(
+            actor
+                .resolve_prompt_mentions(&blocks[..1], usage)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

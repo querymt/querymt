@@ -219,6 +219,9 @@ pub struct SessionRuntime {
     pub tool_validator_cache: ParkingMutex<HashMap<String, Arc<jsonschema::Validator>>>,
     /// Workspace handle for duplicate code detection (built asynchronously on session start)
     pub workspace_handle: Arc<OnceCell<crate::index::WorkspaceHandle>>,
+    /// `cwd` and its workspace root resolved through the filesystem, once.
+    /// The single identity used by the file index, mentions and remote reads.
+    canonical_workspace: OnceCell<Option<crate::index::CanonicalWorkspace>>,
     /// Turn snapshot: (turn_id, snapshot_id) taken at the start of the turn for undo/redo
     pub turn_snapshot: ParkingMutex<Option<(String, String)>>,
     /// In-flight pre-turn snapshot task, resolved before first assistant response or post-turn use.
@@ -258,6 +261,23 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
+    /// The session's resolved workspace, or `None` when there is no cwd or it
+    /// is not an existing directory on this node. Resolved on first use.
+    pub async fn canonical_workspace(&self) -> Option<&crate::index::CanonicalWorkspace> {
+        self.canonical_workspace
+            .get_or_init(|| async {
+                let cwd = self.cwd.clone()?;
+                crate::index::canonical_workspace_async(cwd)
+                    .await
+                    .inspect_err(|error| {
+                        log::debug!("session cwd has no workspace on this node: {error}");
+                    })
+                    .ok()
+            })
+            .await
+            .as_ref()
+    }
+
     /// The session's accounting projection, hydrated once per runtime.
     ///
     /// The projection is the sink's shared one for the session, so work that
@@ -290,6 +310,7 @@ impl SessionRuntime {
             session_grants: ParkingMutex::new(crate::config::ToolSet::new()),
             tool_validator_cache: ParkingMutex::new(HashMap::new()),
             workspace_handle: Arc::new(OnceCell::new()),
+            canonical_workspace: OnceCell::new(),
             turn_snapshot: ParkingMutex::new(None),
             pre_turn_snapshot_task: ParkingMutex::new(None),
             turn_diffs: ParkingMutex::new(Default::default()),
