@@ -2051,8 +2051,8 @@ messages. The standalone provider/CLI API still requires explicit hints; these
 defaults are agent policy.</p>
 <p>Anthropic accepts at most four cache breakpoints per request. If more are requested,
 the provider keeps the most useful ones and drops the rest with a warning; see
-<a href="../available-providers/#prompt-cache-breakpoints">Prompt cache breakpoints</a>.
-Responses currently defaults to <code>30m</code>, not unlimited session retention. Codex's
+<a href="../available-providers/#prompt-cache-breakpoints">Prompt cache breakpoints</a>.</p>
+<p>Responses currently defaults to <code>30m</code>, not unlimited session retention. Codex's
 unsupported translation remains disabled, so annotations do not guarantee reuse.</p>
 <p>Programmatic callers can pass <code>querymt::params::SystemPrompt::with_cache(text, hint)</code>
 to <code>.system(...)</code>. File references are resolved by the agent, not provider plugins.
