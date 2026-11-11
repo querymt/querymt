@@ -146,9 +146,8 @@ impl SteeringInbox {
         blocks: Vec<ContentBlock>,
         mentions: Vec<crate::model::MessagePart>,
     ) -> Result<usize, TurnControlError> {
-        let bytes = serde_json::to_vec(&blocks)
-            .map(|value| value.len())
-            .unwrap_or(usize::MAX);
+        // Mentions are stored with the input, so they count toward both limits.
+        let bytes = serialized_len(&blocks).saturating_add(serialized_len(&mentions));
         if bytes > MAX_STEERING_INPUT_BYTES {
             return Err(TurnControlError::InputTooLarge {
                 bytes,
@@ -244,6 +243,25 @@ pub fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// JSON size of `value` without materializing it (mentions may carry images).
+fn serialized_len(value: &impl serde::Serialize) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        Err(_) => usize::MAX,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +269,33 @@ mod tests {
 
     fn text(value: &str) -> Vec<ContentBlock> {
         vec![ContentBlock::Text(TextContent::new(value))]
+    }
+
+    #[tokio::test]
+    async fn mentions_count_toward_the_input_limit() {
+        let inbox = SteeringInbox::new("run-1".to_string());
+        let mention = crate::model::MessagePart::MentionContext {
+            uri: "file:///a".into(),
+            content: crate::model::MentionContent::Text {
+                path: "/a".into(),
+                text: "x".repeat(MAX_STEERING_INPUT_BYTES),
+            },
+        };
+        assert!(matches!(
+            inbox
+                .push_with_mentions("a".into(), None, text("hi"), vec![mention])
+                .await,
+            Err(TurnControlError::InputTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn serialized_len_matches_json_size() {
+        let value = text("hello");
+        assert_eq!(
+            serialized_len(&value),
+            serde_json::to_vec(&value).unwrap().len()
+        );
     }
 
     #[tokio::test]

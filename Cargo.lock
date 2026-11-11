@@ -11943,6 +11943,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
+ "cap-primitives",
  "clap",
  "criterion",
  "dirs 7.0.0",

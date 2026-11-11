@@ -5,10 +5,16 @@
 //! 1. *Path pass*: the needle against every relative path.
 //! 2. *Basename pass*: the same needle against the basenames of the path-pass
 //!    matches only.
-//! 3. Score is the saturating sum; ties break on `exact`, shallower depth,
+//! 3. Candidates are ordered by how the basename matches the query
+//!    (case-insensitive exact > prefix > substring > fuzzy), then by the
+//!    saturating sum of both scores; ties break on `exact`, shallower depth,
 //!    shorter path, then lexicographic order, so output is deterministic.
+//!
+//! Matching is smart-case: frizbee rewards letters whose case equals the
+//! query's, which would make `rea` prefer `release.yml` over `README.md`. The
+//! case bonus is disabled unless the query contains an uppercase letter.
 
-use frizbee::{Config, Matcher};
+use frizbee::{Config, Matcher, Scoring};
 use std::cmp::Ordering;
 
 /// Longest query considered; keeps scores inside frizbee's `u16` range.
@@ -22,9 +28,37 @@ pub struct Ranking {
     pub truncated: bool,
 }
 
+/// How well a basename matches the query, worst first so `Ord` ranks best last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Tier {
+    Fuzzy,
+    Substring,
+    Prefix,
+    Exact,
+}
+
+/// `lower_query` must already be lowercased.
+fn tier(base: &str, lower_query: &str) -> Tier {
+    let base = base.to_lowercase();
+    let stem = match base.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => base.as_str(),
+    };
+    if base == lower_query || stem == lower_query {
+        Tier::Exact
+    } else if base.starts_with(lower_query) {
+        Tier::Prefix
+    } else if base.contains(lower_query) {
+        Tier::Substring
+    } else {
+        Tier::Fuzzy
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Scored {
     index: usize,
+    tier: Tier,
     score: u16,
     exact: bool,
 }
@@ -38,7 +72,14 @@ pub fn rank<S: AsRef<str>>(paths: &[S], query: &str, limit: usize) -> Ranking {
     }
 
     let max_typos = u16::try_from(query.chars().count() / 4).unwrap_or(u16::MAX);
-    let config = Config::default().max_typos(Some(max_typos));
+    let mut scoring = Scoring::default();
+    if !query.chars().any(char::is_uppercase) {
+        scoring.matching_case_bonus = 0;
+    }
+    let config = Config::default()
+        .max_typos(Some(max_typos))
+        .scoring(scoring);
+    let lower_query = query.to_lowercase();
     let mut matcher = Matcher::new(query.as_str(), &config);
 
     let path_matches = matcher.match_list(paths);
@@ -54,16 +95,19 @@ pub fn rank<S: AsRef<str>>(paths: &[S], query: &str, limit: usize) -> Ranking {
     let mut scored: Vec<Scored> = path_matches
         .iter()
         .zip(&basename_score)
-        .map(|(path, &(base_score, base_exact))| Scored {
+        .zip(&basenames)
+        .map(|((path, &(base_score, base_exact)), base)| Scored {
             index: path.index as usize,
+            tier: tier(base, &lower_query),
             score: path.score.saturating_add(base_score),
             exact: path.exact || base_exact,
         })
         .collect();
 
     let by_quality = |a: &Scored, b: &Scored| {
-        b.score
-            .cmp(&a.score)
+        b.tier
+            .cmp(&a.tier)
+            .then_with(|| b.score.cmp(&a.score))
             .then_with(|| b.exact.cmp(&a.exact))
             .then_with(|| shallow_first(paths[a.index].as_ref(), paths[b.index].as_ref()))
     };
@@ -131,6 +175,24 @@ mod tests {
             ranked(&paths, "mod", 10),
             ["src/model.rs", "src/m/o/d/x.rs"]
         );
+    }
+
+    #[test]
+    fn lowercase_query_ignores_case_bonus() {
+        let paths = [".github/workflows/release.yml", "README.md"];
+        assert_eq!(ranked(&paths, "rea", 10)[0], "README.md");
+    }
+
+    #[test]
+    fn basename_prefix_beats_gapped_match() {
+        let paths = ["src/release.rs", "src/readme.rs"];
+        assert_eq!(ranked(&paths, "rea", 10)[0], "src/readme.rs");
+    }
+
+    #[test]
+    fn exact_stem_beats_prefix() {
+        let paths = ["readme_extra.md", "docs/README.md"];
+        assert_eq!(ranked(&paths, "readme", 10)[0], "docs/README.md");
     }
 
     #[test]

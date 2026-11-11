@@ -5,7 +5,7 @@ pub const DEFAULT_READ_LIMIT: usize = 2000;
 
 /// Maximum file size (bytes) we will read into memory for binary content.
 /// Files larger than this get a descriptive error instead.
-const MAX_BINARY_READ_BYTES: u64 = 20 * 1024 * 1024; // 20 MiB
+pub(crate) const MAX_BINARY_READ_BYTES: u64 = 20 * 1024 * 1024; // 20 MiB
 
 /// Detect if bytes represent a supported image format.
 pub(crate) fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
@@ -14,6 +14,104 @@ pub(crate) fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
         "image/png" | "image/jpeg" | "image/gif" | "image/webp" => Some(kind.mime_type()),
         _ => None,
     }
+}
+
+/// Text part reported for a file too large to read inline.
+pub(crate) fn too_large_output(len: u64) -> Vec<ToolResultPart> {
+    vec![ToolResultPart::text(format!(
+        "File too large to read inline ({} bytes, limit {} bytes). \
+         Use an external tool to process this file.",
+        len, MAX_BINARY_READ_BYTES,
+    ))]
+}
+
+/// Render the already-read `bytes` of the file `target`: an image attachment,
+/// line-numbered text, or a note for unsupported binary content.
+pub(crate) fn render_file_bytes(
+    bytes: Vec<u8>,
+    target: &Path,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<ToolResultPart>, String> {
+    // Binary detection: images get returned as validated attachment parts.
+    if let Some(mime_type) = detect_image_mime(&bytes) {
+        let media = MediaPart::new(
+            MediaKind::Image,
+            mime_type.parse().ok(),
+            MediaSource::Inline { data: bytes },
+        )
+        .map_err(|e| format!("invalid image media: {e}"))?;
+        return Ok(vec![ToolResultPart::Attachment(Box::new(media))]);
+    }
+
+    // Not a recognised binary format — try to interpret as UTF-8 text.
+    let Ok(content) = String::from_utf8(bytes) else {
+        return Ok(vec![ToolResultPart::text(format!(
+            "Binary file '{}'; not a supported format (image/text). \
+             Use an external tool to process this file.",
+            target.display(),
+        ))]);
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    let end_idx = (offset + limit).min(total_lines);
+
+    let mut file_content = String::new();
+    for (idx, line_content) in lines.iter().enumerate().take(end_idx).skip(offset) {
+        let line_number = idx + 1;
+        file_content.push_str(&format!("{:05}| {}\n", line_number, line_content));
+    }
+
+    if end_idx < total_lines {
+        file_content.push_str(&format!(
+            "\n(File has more lines. Use 'offset' parameter to read beyond line {})\n",
+            end_idx
+        ));
+    } else {
+        file_content.push_str(&format!("\n(End of file - total {} lines)\n", total_lines));
+    }
+
+    Ok(vec![ToolResultPart::text(format!(
+        "<path>{}</path>\n<type>file</type>\n<content>\n{}</content>",
+        target.display(),
+        file_content
+    ))])
+}
+
+/// Render a directory listing: sorted `(name, is_dir)` entries paginated by
+/// `offset`/`limit`.
+pub(crate) fn render_dir_listing(
+    target: &Path,
+    mut entries: Vec<(String, bool)>,
+    offset: usize,
+    limit: usize,
+) -> Vec<ToolResultPart> {
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let total_entries = entries.len();
+    let end_idx = (offset + limit).min(total_entries);
+    let has_more = end_idx < total_entries;
+
+    let mut entries_output = String::new();
+    for (name, is_dir) in entries.iter().take(end_idx).skip(offset) {
+        if *is_dir {
+            entries_output.push_str(&format!("{}/\n", name));
+        } else {
+            entries_output.push_str(&format!("{}\n", name));
+        }
+    }
+
+    let shown = end_idx.saturating_sub(offset.min(total_entries));
+    entries_output.push_str(&format!("({} entries)\n", shown));
+    if has_more {
+        entries_output.push_str("(More entries available. Use a higher offset.)\n");
+    }
+
+    vec![ToolResultPart::text(format!(
+        "<path>{}</path>\n<type>directory</type>\n<entries>\n{}</entries>",
+        target.display(),
+        entries_output
+    ))]
 }
 
 /// Render read output for the given path.
@@ -34,66 +132,13 @@ pub async fn render_read_output(
     if metadata.is_file() {
         // Guard against loading enormous binaries into memory.
         if metadata.len() > MAX_BINARY_READ_BYTES {
-            return Ok(vec![ToolResultPart::text(format!(
-                "File too large to read inline ({} bytes, limit {} bytes). \
-                 Use an external tool to process this file.",
-                metadata.len(),
-                MAX_BINARY_READ_BYTES,
-            ))]);
+            return Ok(too_large_output(metadata.len()));
         }
 
         let bytes = tokio::fs::read(target)
             .await
             .map_err(|e| format!("read failed: {}", e))?;
-
-        // Binary detection: images get returned as validated attachment parts.
-        if let Some(mime_type) = detect_image_mime(&bytes) {
-            let media = MediaPart::new(
-                MediaKind::Image,
-                mime_type.parse().ok(),
-                MediaSource::Inline { data: bytes },
-            )
-            .map_err(|e| format!("invalid image media: {e}"))?;
-            return Ok(vec![ToolResultPart::Attachment(Box::new(media))]);
-        }
-
-        // Not a recognised binary format — try to interpret as UTF-8 text.
-        match String::from_utf8(bytes) {
-            Ok(content) => {
-                let lines: Vec<&str> = content.lines().collect();
-                let total_lines = lines.len();
-                let end_idx = (offset + limit).min(total_lines);
-
-                let mut file_content = String::new();
-                for (idx, line_content) in lines.iter().enumerate().take(end_idx).skip(offset) {
-                    let line_number = idx + 1;
-                    file_content.push_str(&format!("{:05}| {}\n", line_number, line_content));
-                }
-
-                if end_idx < total_lines {
-                    file_content.push_str(&format!(
-                        "\n(File has more lines. Use 'offset' parameter to read beyond line {})\n",
-                        end_idx
-                    ));
-                } else {
-                    file_content
-                        .push_str(&format!("\n(End of file - total {} lines)\n", total_lines));
-                }
-
-                return Ok(vec![ToolResultPart::text(format!(
-                    "<path>{}</path>\n<type>file</type>\n<content>\n{}</content>",
-                    target.display(),
-                    file_content
-                ))]);
-            }
-            Err(_) => {
-                return Ok(vec![ToolResultPart::text(format!(
-                    "Binary file '{}'; not a supported format (image/text). \
-                     Use an external tool to process this file.",
-                    target.display(),
-                ))]);
-            }
-        }
+        return render_file_bytes(bytes, target, offset, limit);
     }
 
     if metadata.is_dir() {
@@ -116,32 +161,7 @@ pub async fn render_read_output(
             entries.push((name, is_dir));
         }
 
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let total_entries = entries.len();
-        let end_idx = (offset + limit).min(total_entries);
-        let has_more = end_idx < total_entries;
-
-        let mut entries_output = String::new();
-        for (name, is_dir) in entries.iter().take(end_idx).skip(offset) {
-            if *is_dir {
-                entries_output.push_str(&format!("{}/\n", name));
-            } else {
-                entries_output.push_str(&format!("{}\n", name));
-            }
-        }
-
-        let shown = end_idx.saturating_sub(offset.min(total_entries));
-        entries_output.push_str(&format!("({} entries)\n", shown));
-        if has_more {
-            entries_output.push_str("(More entries available. Use a higher offset.)\n");
-        }
-
-        return Ok(vec![ToolResultPart::text(format!(
-            "<path>{}</path>\n<type>directory</type>\n<entries>\n{}</entries>",
-            target.display(),
-            entries_output
-        ))]);
+        return Ok(render_dir_listing(target, entries, offset, limit));
     }
 
     Err("Target is neither a file nor a directory".to_string())

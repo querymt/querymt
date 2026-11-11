@@ -1624,11 +1624,15 @@ impl SessionMaterializer {
             if cwd_path.exists() {
                 let manager_actor = self.config.workspace_manager_actor.clone();
                 let runtime_clone = prepared.runtime.clone();
-                let cwd_owned = cwd_path.clone();
                 let config = self.config.clone();
                 let ready_session_id = prepared.session_id.clone();
                 tokio::spawn(async move {
-                    let root = crate::index::resolve_workspace_root(&cwd_owned);
+                    // The resolved root is the identity `querymt/workspace/files`
+                    // also uses, so both reach the same index.
+                    let Some(workspace) = runtime_clone.canonical_workspace().await else {
+                        return;
+                    };
+                    let root = workspace.root.clone();
                     match crate::index::get_or_create_workspace_with_timeout(&manager_actor, root)
                         .await
                     {

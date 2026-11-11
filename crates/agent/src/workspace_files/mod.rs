@@ -6,6 +6,7 @@
 //! and resolution of `file://` prompt links ([`mentions`]).
 
 pub mod cache;
+pub mod confined;
 pub mod mentions;
 pub mod rank;
 pub mod scope;

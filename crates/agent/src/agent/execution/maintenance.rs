@@ -411,6 +411,7 @@ pub(crate) async fn compact_history(
                     .and_then(|cfg| cfg.max_prompt_bytes),
                 &ledger,
                 instructions,
+                Some(llm_config.provider.as_str()),
             )
             .await
         {

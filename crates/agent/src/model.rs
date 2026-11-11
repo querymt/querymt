@@ -61,16 +61,63 @@ pub fn prompt_contains_images(blocks: &[ContentBlock]) -> bool {
     })
 }
 
+/// Header the model sees before embedded text resource content.
+fn embedded_resource_header(uri: &str) -> String {
+    format!("[Embedded Resource: {uri}]\n")
+}
+
+/// Text the model sees for a binary resource that is neither image nor PDF.
+fn attached_resource_marker(uri: &str, mime_type: &str, bytes: usize) -> String {
+    format!("[Attached resource: {uri} ({mime_type}, {bytes} bytes)]")
+}
+
+/// Text the model sees for a `file://` link; its content arrives separately
+/// as a mention snapshot.
+fn file_reference_marker(path: &str) -> String {
+    format!("[File reference: {path}]")
+}
+
+fn audio_marker(mime_type: &str) -> String {
+    format!("[Audio attachment: {mime_type}]")
+}
+
+/// What the blocks of one prompt already consume of the per-input limits.
+///
+/// Mention snapshots of the same input draw from the same image, attachment and
+/// text budgets, so the whole model input stays within the configured limits.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PromptUsage {
+    pub image_count: usize,
+    pub attachment_bytes: usize,
+    /// Text bytes the blocks contribute to the model input before truncation:
+    /// exactly what [`convert_prompt_blocks`] charges against `max_prompt_bytes`.
+    pub text_bytes: usize,
+}
+
 pub fn validate_prompt_blocks(blocks: &[ContentBlock]) -> Result<(), PromptContentError> {
+    validate_prompt_usage(blocks).map(|_| ())
+}
+
+/// Validate `blocks` and report what they consume of the shared input limits.
+pub fn validate_prompt_usage(blocks: &[ContentBlock]) -> Result<PromptUsage, PromptContentError> {
     if blocks.is_empty() {
         return Err(PromptContentError::EmptyPrompt);
     }
 
     let mut image_count = 0usize;
     let mut total_attachment_bytes = 0usize;
+    let mut text_bytes = 0usize;
     for (index, block) in blocks.iter().enumerate() {
         match block {
-            ContentBlock::Text(_) | ContentBlock::ResourceLink(_) | ContentBlock::Audio(_) => {}
+            ContentBlock::Text(text) => text_bytes = text_bytes.saturating_add(text.text.len()),
+            ContentBlock::ResourceLink(link) => {
+                if let Some(path) = file_link_path(&link.uri) {
+                    text_bytes = text_bytes.saturating_add(file_reference_marker(&path).len());
+                }
+            }
+            ContentBlock::Audio(audio) => {
+                text_bytes = text_bytes.saturating_add(audio_marker(&audio.mime_type).len());
+            }
             ContentBlock::Image(image) => {
                 let bytes = validate_encoded_attachment(index, &image.data, false)?;
                 validate_attachment_size(index, bytes, &mut total_attachment_bytes)?;
@@ -79,6 +126,9 @@ pub fn validate_prompt_blocks(blocks: &[ContentBlock]) -> Result<(), PromptConte
             ContentBlock::Resource(resource) => match &resource.resource {
                 EmbeddedResourceResource::TextResourceContents(text) => {
                     validate_attachment_size(index, text.text.len(), &mut total_attachment_bytes)?;
+                    text_bytes = text_bytes.saturating_add(
+                        embedded_resource_header(&text.uri).len() + text.text.len(),
+                    );
                 }
                 EmbeddedResourceResource::BlobResourceContents(blob) => {
                     let mime_type = blob
@@ -93,6 +143,13 @@ pub fn validate_prompt_blocks(blocks: &[ContentBlock]) -> Result<(), PromptConte
                     validate_attachment_size(index, bytes, &mut total_attachment_bytes)?;
                     if mime_type.starts_with("image/") {
                         validate_image(index, mime_type, &mut image_count)?;
+                    } else if mime_type.starts_with("text/") {
+                        text_bytes = text_bytes
+                            .saturating_add(embedded_resource_header(&blob.uri).len() + bytes);
+                    } else if mime_type != "application/pdf" {
+                        text_bytes = text_bytes.saturating_add(
+                            attached_resource_marker(&blob.uri, mime_type, bytes).len(),
+                        );
                     }
                 }
                 _ => {}
@@ -100,19 +157,31 @@ pub fn validate_prompt_blocks(blocks: &[ContentBlock]) -> Result<(), PromptConte
             _ => {}
         }
     }
-    Ok(())
+    Ok(PromptUsage {
+        image_count,
+        attachment_bytes: total_attachment_bytes,
+        text_bytes,
+    })
 }
 
 pub fn convert_prompt_blocks(
     blocks: &[ContentBlock],
     max_text_bytes: Option<usize>,
 ) -> Result<Vec<ChatInputPart>, PromptContentError> {
+    convert_prompt_blocks_with_budget(blocks, &mut { max_text_bytes })
+}
+
+/// Like [`convert_prompt_blocks`], drawing text from `remaining_text_bytes`,
+/// which the caller shares with the other text of the same model input.
+pub(crate) fn convert_prompt_blocks_with_budget(
+    blocks: &[ContentBlock],
+    remaining_text_bytes: &mut Option<usize>,
+) -> Result<Vec<ChatInputPart>, PromptContentError> {
     if blocks.is_empty() {
         return Err(PromptContentError::EmptyPrompt);
     }
 
     let mut converted = Vec::with_capacity(blocks.len());
-    let mut remaining_text_bytes = max_text_bytes;
     let mut image_count = 0usize;
     let mut total_attachment_bytes = 0usize;
 
@@ -120,7 +189,7 @@ pub fn convert_prompt_blocks(
         match block {
             ContentBlock::Text(text) => converted.push(ChatInputPart::text(limit_text(
                 &text.text,
-                &mut remaining_text_bytes,
+                remaining_text_bytes,
             ))),
             ContentBlock::Image(image) => {
                 let data = decode_attachment(index, &image.data)?;
@@ -136,10 +205,10 @@ pub fn convert_prompt_blocks(
             ContentBlock::Resource(resource) => match &resource.resource {
                 EmbeddedResourceResource::TextResourceContents(text) => {
                     validate_attachment_size(index, text.text.len(), &mut total_attachment_bytes)?;
-                    let contextual = format!("[Embedded Resource: {}]\n{}", text.uri, text.text);
+                    let contextual = embedded_resource_header(&text.uri) + &text.text;
                     converted.push(ChatInputPart::text(limit_text(
                         &contextual,
-                        &mut remaining_text_bytes,
+                        remaining_text_bytes,
                     )));
                 }
                 EmbeddedResourceResource::BlobResourceContents(blob) => {
@@ -167,20 +236,16 @@ pub fn convert_prompt_blocks(
                     } else if mime_type.starts_with("text/") {
                         let text = String::from_utf8(data)
                             .map_err(|_| PromptContentError::InvalidTextResource { index })?;
-                        let contextual = format!("[Embedded Resource: {}]\n{}", blob.uri, text);
+                        let contextual = embedded_resource_header(&blob.uri) + &text;
                         converted.push(ChatInputPart::text(limit_text(
                             &contextual,
-                            &mut remaining_text_bytes,
+                            remaining_text_bytes,
                         )));
                     } else {
-                        let marker = format!(
-                            "[Attached resource: {} ({mime_type}, {} bytes)]",
-                            blob.uri,
-                            data.len()
-                        );
+                        let marker = attached_resource_marker(&blob.uri, mime_type, data.len());
                         converted.push(ChatInputPart::text(limit_text(
                             &marker,
-                            &mut remaining_text_bytes,
+                            remaining_text_bytes,
                         )));
                     }
                 }
@@ -189,8 +254,8 @@ pub fn convert_prompt_blocks(
             ContentBlock::ResourceLink(link) if file_link_path(&link.uri).is_some() => {
                 let path = file_link_path(&link.uri).unwrap_or_else(|| link.uri.clone());
                 converted.push(ChatInputPart::text(limit_text(
-                    &format!("[File reference: {path}]"),
-                    &mut remaining_text_bytes,
+                    &file_reference_marker(&path),
+                    remaining_text_bytes,
                 )));
             }
             ContentBlock::ResourceLink(link) => {
@@ -209,10 +274,10 @@ pub fn convert_prompt_blocks(
                 converted.push(ChatInputPart::attachment(media));
             }
             ContentBlock::Audio(audio) => {
-                let marker = format!("[Audio attachment: {}]", audio.mime_type);
+                let marker = audio_marker(&audio.mime_type);
                 converted.push(ChatInputPart::text(limit_text(
                     &marker,
-                    &mut remaining_text_bytes,
+                    remaining_text_bytes,
                 )));
             }
             _ => converted.push(ChatInputPart::text("[Unsupported content block]")),
@@ -222,14 +287,20 @@ pub fn convert_prompt_blocks(
     Ok(converted)
 }
 
+/// `uri` parsed as a `file://` link, or `None` for any other scheme or an
+/// unparsable URI. The one definition of "file link" shared by prompt
+/// conversion and mention resolution.
+pub(crate) fn parse_file_link(uri: &str) -> Option<url::Url> {
+    url::Url::parse(uri)
+        .ok()
+        .filter(|url| url.scheme() == "file")
+}
+
 /// Local path of a `file://` URI, or `None` for any other scheme or an
 /// unparsable URI. A file URI that does not map to a local path (for example a
 /// non-local host) still counts as a file link and renders as its raw URI.
 pub(crate) fn file_link_path(uri: &str) -> Option<String> {
-    let url = url::Url::parse(uri).ok()?;
-    if url.scheme() != "file" {
-        return None;
-    }
+    let url = parse_file_link(uri)?;
     Some(
         url.to_file_path()
             .map(|path| path.display().to_string())
@@ -239,23 +310,31 @@ pub(crate) fn file_link_path(uri: &str) -> Option<String> {
 
 /// Model input for one mention snapshot. An image degrades to a textual
 /// reference when the target model cannot take images.
-fn mention_input_part(content: &MentionContent, target: Option<&OutputTarget>) -> ChatInputPart {
+fn mention_input_part(
+    content: &MentionContent,
+    target: Option<&OutputTarget>,
+    remaining_text_bytes: &mut Option<usize>,
+) -> ChatInputPart {
     let supports_images = target.is_none_or(|target| {
         crate::model_info::supports_image_input(
             crate::model_info::get_model_info(&target.provider, &target.model).as_ref(),
         )
     });
-    mention_input_part_for(content, supports_images)
+    mention_input_part_for(content, supports_images, remaining_text_bytes)
 }
 
-fn mention_input_part_for(content: &MentionContent, supports_images: bool) -> ChatInputPart {
+fn mention_input_part_for(
+    content: &MentionContent,
+    supports_images: bool,
+    remaining_text_bytes: &mut Option<usize>,
+) -> ChatInputPart {
     let MentionContent::Image {
         path,
         mime_type,
         data,
     } = content
     else {
-        return ChatInputPart::text(content.render_text());
+        return ChatInputPart::text(limit_text(&content.render_text(), remaining_text_bytes));
     };
     if supports_images
         && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data)
@@ -274,13 +353,14 @@ fn mention_input_part_for(content: &MentionContent, supports_images: bool) -> Ch
     } else {
         "the selected model does not support images"
     };
-    ChatInputPart::text(
-        MentionContent::Unresolved {
+    ChatInputPart::text(limit_text(
+        &MentionContent::Unresolved {
             path: path.clone(),
             reason: reason.to_owned(),
         }
         .render_text(),
-    )
+        remaining_text_bytes,
+    ))
 }
 
 /// Build a validated inline attachment input part.
@@ -534,6 +614,14 @@ impl OutputTarget {
         }
     }
 
+    /// Full target identity of a session's LLM configuration.
+    pub fn from_llm_config(config: &crate::session::store::LLMConfig) -> Self {
+        let mut target = Self::new(config.provider.clone(), config.model.clone());
+        target.protocol = config.protocol.clone();
+        target.endpoint = config.endpoint.clone();
+        target
+    }
+
     pub fn with_protocol(mut self, protocol: impl Into<String>) -> Self {
         self.protocol = protocol.into();
         self
@@ -615,12 +703,17 @@ pub enum MentionContent {
 }
 
 impl MentionContent {
+    /// Prefix of a rendered text snapshot; part of what a mention costs.
+    pub(crate) fn text_header(path: &str) -> String {
+        format!("[Mentioned file: {path}]\n")
+    }
+
     /// Text the model sees for this mention. Images render as a textual
     /// reference; use this where no image can be attached (estimates, models
     /// without image support).
     pub fn render_text(&self) -> String {
         match self {
-            Self::Text { path, text } => format!("[Mentioned file: {path}]\n{text}"),
+            Self::Text { path, text } => Self::text_header(path) + text,
             Self::Image {
                 path, mime_type, ..
             } => {
@@ -865,11 +958,40 @@ impl AgentMessage {
 
     /// Convert to a `ChatMessage`, authorizing native replay only for the full
     /// provider/protocol/model/endpoint target identity.
+    ///
+    /// `max_prompt_bytes` bounds the text of the whole message: every
+    /// `Prompt`/`Steering` part and every mention snapshot draws from one
+    /// budget, in part order. Mention snapshots are captured against the same
+    /// budget (see `workspace_files::mentions`), so they fit unchanged.
     pub fn to_chat_message_with_output_target(
         &self,
         target: Option<&OutputTarget>,
         max_prompt_bytes: Option<usize>,
     ) -> Result<ChatMessage, PromptContentError> {
+        self.project_message(target, target, max_prompt_bytes)
+    }
+
+    /// Convert for a request to `provider`/`model` without authorizing native
+    /// replay (portable projection), but still degrading image mentions for
+    /// models that cannot take images.
+    pub fn to_chat_message_for_model(
+        &self,
+        provider: &str,
+        model: &str,
+        max_prompt_bytes: Option<usize>,
+    ) -> Result<ChatMessage, PromptContentError> {
+        let image_target = OutputTarget::new(provider, model);
+        self.project_message(None, Some(&image_target), max_prompt_bytes)
+    }
+
+    fn project_message(
+        &self,
+        target: Option<&OutputTarget>,
+        image_target: Option<&OutputTarget>,
+        max_prompt_bytes: Option<usize>,
+    ) -> Result<ChatMessage, PromptContentError> {
+        // Prompt, steering and mention text share one budget.
+        let mut remaining_text_bytes = max_prompt_bytes;
         let mut input_parts = Vec::new();
         let mut output_items = Vec::new();
         // A canonical `Output` part, when present, is the assistant turn's sole
@@ -897,10 +1019,17 @@ impl AgentMessage {
                     input_parts.push(ChatInputPart::text(content.clone()))
                 }
                 MessagePart::Prompt { blocks } | MessagePart::Steering { blocks, .. } => {
-                    input_parts.extend(convert_prompt_blocks(blocks, max_prompt_bytes)?);
+                    input_parts.extend(convert_prompt_blocks_with_budget(
+                        blocks,
+                        &mut remaining_text_bytes,
+                    )?);
                 }
                 MessagePart::MentionContext { content, .. } => {
-                    input_parts.push(mention_input_part(content, target));
+                    let part = mention_input_part(content, image_target, &mut remaining_text_bytes);
+                    // A reference cut to nothing by the budget carries nothing.
+                    if part.as_text() != Some("") {
+                        input_parts.push(part);
+                    }
                 }
                 MessagePart::Reasoning { item, .. } => {
                     let mut item = item.clone();
@@ -1213,6 +1342,48 @@ mod tests {
     }
 
     #[test]
+    fn prompt_and_mention_text_share_one_budget() {
+        let message = user_message(vec![
+            MessagePart::Prompt {
+                blocks: vec![ContentBlock::Text(TextContent::new("x".repeat(80)))],
+            },
+            MessagePart::MentionContext {
+                uri: "file:///a".into(),
+                content: super::MentionContent::Text {
+                    path: "/a".into(),
+                    text: "y".repeat(80),
+                },
+            },
+        ]);
+        let chat = message
+            .to_chat_message_with_max_prompt_bytes(Some(100))
+            .expect("convertible");
+        let text_bytes: usize = chat
+            .portable_input_parts()
+            .iter()
+            .filter_map(|part| part.as_text())
+            .map(str::len)
+            .sum();
+        assert!(text_bytes <= 100, "{text_bytes}");
+    }
+
+    #[test]
+    fn usage_counts_the_text_conversion_charges() {
+        let blocks = vec![
+            ContentBlock::Text(TextContent::new("hello")),
+            link_block("file:///repo/a.ts"),
+        ];
+        let usage = super::validate_prompt_usage(&blocks).expect("valid");
+        let converted = super::convert_prompt_blocks(&blocks, None).expect("converts");
+        let charged: usize = converted
+            .iter()
+            .filter_map(|part| part.as_text())
+            .map(str::len)
+            .sum();
+        assert_eq!(usage.text_bytes, charged);
+    }
+
+    #[test]
     fn file_link_becomes_text_reference_not_url_attachment() {
         let parts = super::convert_prompt_blocks(&[link_block("file:///repo/a.ts")], None)
             .expect("converts");
@@ -1285,12 +1456,15 @@ mod tests {
             data: base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]),
         };
         // Unknown target: assumed image-capable, so an attachment is sent.
-        let attached = super::mention_input_part(&image, None);
+        let attached = super::mention_input_part(&image, None, &mut None);
         assert!(format!("{attached:?}").contains("Inline"));
         // `render_text` is the no-image form used for estimates.
         assert!(image.render_text().contains("image not attached"));
         // A text-only model gets a textual reference with a reason instead.
-        let degraded = format!("{:?}", super::mention_input_part_for(&image, false));
+        let degraded = format!(
+            "{:?}",
+            super::mention_input_part_for(&image, false, &mut None)
+        );
         assert!(
             degraded.contains("[Mentioned file: /repo/p.png]"),
             "{degraded}"

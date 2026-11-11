@@ -738,8 +738,7 @@ async fn forward_stdio_event(
             }
             Err(error) => Err(acp::Error::into_internal_error(error)),
         }
-    } else if let Some(notification) = crate::acp::shared::workspace_index_ready_notification(event)
-    {
+    } else if let Some(notification) = crate::acp::shared::on_workspace_index_ready(event) {
         match serde_json::value::RawValue::from_string(notification["params"].to_string()) {
             Ok(params) => {
                 bridge

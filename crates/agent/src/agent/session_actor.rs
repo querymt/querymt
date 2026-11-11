@@ -21,7 +21,10 @@ use crate::agent::utils::{format_prompt_user_text_only, genai, render_prompt_for
 use crate::error::AgentError;
 use crate::events::{AgentEventKind, RunOutcome, SessionLimits};
 use crate::hooks::HookNotice;
-use crate::model::{AgentMessage, MessagePart, prompt_contains_images, validate_prompt_blocks};
+use crate::model::{
+    AgentMessage, MessagePart, prompt_contains_images, validate_prompt_blocks,
+    validate_prompt_usage,
+};
 use crate::session::run_lease::{RunLease, RunLeaseRoot};
 
 /// How long a run start waits for a momentarily held run lease (a reconciler
@@ -521,6 +524,7 @@ impl SessionActor {
     async fn resolve_prompt_mentions(
         &self,
         blocks: &[crate::acp::protocol::ContentBlock],
+        usage: crate::model::PromptUsage,
     ) -> Vec<MessagePart> {
         let has_file_link = blocks.iter().any(|block| {
             matches!(block, crate::acp::protocol::ContentBlock::ResourceLink(link)
@@ -529,11 +533,12 @@ impl SessionActor {
         if !has_file_link {
             return Vec::new();
         }
-        let max_prompt_bytes = self.config.max_prompt_bytes;
+        // Mentions share the image, attachment and text limits with the blocks.
         crate::workspace_files::mentions::resolve_mentions(
             blocks,
-            self.runtime.cwd.as_deref(),
-            max_prompt_bytes,
+            self.runtime.canonical_workspace().await,
+            self.config.max_prompt_bytes,
+            usage,
         )
         .await
     }
@@ -2130,38 +2135,33 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         use crate::agent::file_proxy::{FileProxyError, ReadRemoteFileResponse};
-        use crate::tools::builtins::read_shared::render_read_output;
+        use crate::workspace_files::confined::{ReadError, read_confined};
         use base64::Engine as _;
 
-        let cwd = self
-            .runtime
-            .cwd
-            .as_ref()
-            .ok_or(FileProxyError::NoWorkingDirectory)?;
-
-        let path = std::path::Path::new(&msg.path);
-        let joined = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            cwd.join(path)
-        };
-
-        let resolved = joined
-            .canonicalize()
-            .map_err(|e| FileProxyError::PathResolution(e.to_string()))?;
-
-        let root = crate::index::resolve_workspace_root(cwd);
-        if !resolved.starts_with(&root) {
-            return Err(FileProxyError::PathOutsideWorkspace(
-                resolved.display().to_string(),
-            ));
+        if self.runtime.cwd.is_none() {
+            return Err(FileProxyError::NoWorkingDirectory);
         }
+        let workspace = self.runtime.canonical_workspace().await.ok_or_else(|| {
+            FileProxyError::PathResolution("working directory does not exist".into())
+        })?;
 
-        let blocks = render_read_output(&resolved, msg.offset, msg.limit)
-            .await
-            .map_err(FileProxyError::ReadError)?;
+        let read = read_confined(
+            workspace,
+            std::path::Path::new(&msg.path),
+            msg.offset,
+            msg.limit,
+            None,
+        )
+        .await
+        .map_err(|error| match error {
+            ReadError::NotFound => FileProxyError::PathResolution(error.to_string()),
+            ReadError::Resolution(reason) => FileProxyError::PathResolution(reason),
+            ReadError::OutsideWorkspace(path) => FileProxyError::PathOutsideWorkspace(path),
+            other => FileProxyError::ReadError(other.to_string()),
+        })?;
+        let blocks = read.parts;
 
-        // Map the single result part returned by render_read_output to the
+        // Map the single result part returned by the confined read to the
         // appropriate ReadRemoteFileResponse variant.
         let Some(block) = blocks.into_iter().next() else {
             return Ok(ReadRemoteFileResponse::Binary);
@@ -2201,8 +2201,8 @@ impl Message<SubmitSessionInput> for SessionActor {
                 received: input.session_id,
             }));
         }
-        validate_prompt_blocks(&input.prompt)?;
-        let mentions = self.resolve_prompt_mentions(&input.prompt).await;
+        let usage = validate_prompt_usage(&input.prompt)?;
+        let mentions = self.resolve_prompt_mentions(&input.prompt, usage).await;
         let input_id = input
             .client_input_id
             .clone()
@@ -2406,15 +2406,16 @@ impl Message<Prompt> for SessionActor {
     type Reply = DelegatedReply<Result<PromptResponse, AgentError>>;
 
     async fn handle(&mut self, msg: Prompt, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        if let Err(error) = validate_prompt_blocks(&msg.req.prompt) {
-            return ctx.spawn(async move { Err(AgentError::from(error)) });
-        }
+        let usage = match validate_prompt_usage(&msg.req.prompt) {
+            Ok(usage) => usage,
+            Err(error) => return ctx.spawn(async move { Err(AgentError::from(error)) }),
+        };
         if self.active_run.is_none()
             && let Err(error) = self.acquire_run_lease().await
         {
             return ctx.spawn(async move { Err(error) });
         }
-        let mentions = self.resolve_prompt_mentions(&msg.req.prompt).await;
+        let mentions = self.resolve_prompt_mentions(&msg.req.prompt, usage).await;
         let (reply, receiver) = oneshot::channel();
         if self.active_run.is_some() {
             if self.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
@@ -6220,7 +6221,8 @@ mod tests {
             ),
         ];
 
-        let mentions = actor.resolve_prompt_mentions(&blocks).await;
+        let usage = validate_prompt_usage(&blocks).unwrap();
+        let mentions = actor.resolve_prompt_mentions(&blocks, usage).await;
         // A tool edits the file after acceptance but before the input runs.
         std::fs::write(&file, "AFTER-EDIT").unwrap();
 
@@ -6232,7 +6234,12 @@ mod tests {
             }] if *captured == uri && text.contains("BEFORE-EDIT") && !text.contains("AFTER-EDIT")
         ));
         // Inputs without file links resolve nothing and read nothing.
-        assert!(actor.resolve_prompt_mentions(&blocks[..1]).await.is_empty());
+        assert!(
+            actor
+                .resolve_prompt_mentions(&blocks[..1], usage)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

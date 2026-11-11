@@ -116,6 +116,9 @@ dunce = "1"
 frizbee = "~0.13.0"
 # Cross-OS path handling for remote workspace paths.
 typed-path = "0.13"
+# Descriptor-confined reads of user-supplied paths below a workspace root.
+# Major 4 is already in the graph (wasmtime); do not add a second major.
+cap-primitives = "4"
 
 # OAuth support (optional, feature-gated) - now provided by querymt-utils
 

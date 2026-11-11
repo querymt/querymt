@@ -140,22 +140,21 @@ impl LocalAgentHandle {
         query: String,
         limit: usize,
     ) -> Result<WorkspaceFilesResponse, Error> {
-        let is_dir = tokio::fs::metadata(&cwd)
-            .await
-            .is_ok_and(|metadata| metadata.is_dir());
-        if !is_dir {
+        // Resolve symlinks and `..` first: aliases of one directory must share
+        // one index, and a root alias such as `/tmp/..` must be refused.
+        let Ok(workspace) = crate::index::canonical_workspace_async(cwd).await else {
             return Err(invalid_params("cwd must be an existing directory"));
+        };
+        if workspace.cwd_is_filesystem_root() {
+            return Err(invalid_params("cwd must not be a filesystem root"));
         }
-        let root = crate::index::resolve_workspace_root(&cwd);
-        let handle = match self
-            .workspace_manager_actor()
-            .ask(crate::index::GetOrCreate { root })
-            .mailbox_timeout(
-                crate::index::WorkspaceIndexManagerActor::GET_OR_CREATE_MAILBOX_TIMEOUT,
-            )
-            .reply_timeout(COLD_INDEX_WAIT)
-            .send()
-            .await
+        let cwd = workspace.cwd;
+        let handle = match crate::index::get_or_create_workspace_within(
+            &self.workspace_manager_actor(),
+            workspace.root,
+            COLD_INDEX_WAIT,
+        )
+        .await
         {
             Ok(handle) => handle,
             Err(kameo::error::SendError::Timeout(_)) => {

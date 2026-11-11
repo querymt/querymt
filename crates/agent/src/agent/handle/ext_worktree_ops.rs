@@ -587,7 +587,16 @@ impl LocalAgentHandle {
         let result = self
             .config
             .compaction
-            .process(&messages, llm_provider, &model, &retry, None, &ledger)
+            .process_with_instructions(
+                &messages,
+                llm_provider,
+                &model,
+                &retry,
+                None,
+                &ledger,
+                None,
+                handle.llm_config().map(|config| config.provider.as_str()),
+            )
             .await
             .map_err(|err| failed(err.to_string()))
             .and_then(|result| {

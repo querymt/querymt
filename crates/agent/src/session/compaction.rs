@@ -185,6 +185,7 @@ impl SessionCompaction {
             max_prompt_bytes,
             ledger,
             None,
+            None,
         )
         .await
     }
@@ -192,6 +193,9 @@ impl SessionCompaction {
     /// Like [`Self::process`], with optional user-provided focus instructions
     /// (for example from `/compact focus on the API changes`) added to the
     /// compaction prompt.
+    ///
+    /// `provider_name` is the provider serving `model`; when known, image
+    /// mentions degrade to text for models that cannot take images.
     #[allow(clippy::too_many_arguments)]
     pub async fn process_with_instructions(
         &self,
@@ -202,6 +206,7 @@ impl SessionCompaction {
         max_prompt_bytes: Option<usize>,
         ledger: &DispatchLedger,
         instructions: Option<&str>,
+        provider_name: Option<&str>,
     ) -> Result<CompactionResult> {
         // Estimate original token count
         let original_token_count = self.estimate_messages_tokens(messages, max_prompt_bytes);
@@ -211,6 +216,7 @@ impl SessionCompaction {
             messages,
             max_prompt_bytes,
             instructions,
+            provider_name.map(|provider| (provider, model)),
         )?;
 
         // Call LLM with retry logic
@@ -250,7 +256,7 @@ impl SessionCompaction {
         messages: &[AgentMessage],
         max_prompt_bytes: Option<usize>,
     ) -> Result<Vec<querymt::chat::ChatMessage>> {
-        self.build_compaction_messages_with_instructions(messages, max_prompt_bytes, None)
+        self.build_compaction_messages_with_instructions(messages, max_prompt_bytes, None, None)
     }
 
     fn build_compaction_messages_with_instructions(
@@ -258,10 +264,16 @@ impl SessionCompaction {
         messages: &[AgentMessage],
         max_prompt_bytes: Option<usize>,
         instructions: Option<&str>,
+        target: Option<(&str, &str)>,
     ) -> Result<Vec<querymt::chat::ChatMessage>> {
         let mut chat_messages: Vec<querymt::chat::ChatMessage> = messages
             .iter()
-            .map(|message| message.to_chat_message_with_max_prompt_bytes(max_prompt_bytes))
+            .map(|message| match target {
+                Some((provider, model)) => {
+                    message.to_chat_message_for_model(provider, model, max_prompt_bytes)
+                }
+                None => message.to_chat_message_with_max_prompt_bytes(max_prompt_bytes),
+            })
             .collect::<std::result::Result<_, _>>()?;
 
         // Add the compaction prompt as a user message
@@ -2273,6 +2285,7 @@ mod tests {
                 &messages,
                 None,
                 Some("ignore the test refactoring"),
+                None,
             )
             .unwrap();
         let last = chat.last().unwrap();

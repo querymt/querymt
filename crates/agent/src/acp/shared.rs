@@ -761,6 +761,14 @@ pub fn mcp_auth_required_notification(
 
 /// `querymt/workspace/indexReady` for a [`AgentEventKind::WorkspaceIndexReady`]
 /// event, whether the session is local or remote.
+/// Handle a `WorkspaceIndexReady` event for any transport: drop the session's
+/// cached remote index (it is stale now) and build the client notification.
+pub fn on_workspace_index_ready(event: &EventEnvelope) -> Option<serde_json::Value> {
+    let notification = workspace_index_ready_notification(event)?;
+    crate::workspace_files::cache::invalidate(event.session_id());
+    Some(notification)
+}
+
 pub fn workspace_index_ready_notification(event: &EventEnvelope) -> Option<serde_json::Value> {
     let AgentEventKind::WorkspaceIndexReady { workspace_root } = event.kind() else {
         return None;
@@ -2062,9 +2070,7 @@ impl AcpLiveEventTranslator {
                 "params": {"version": 1, "session_id": event.session_id(), "runtime": runtime}
             })];
         }
-        if let Some(notification) = workspace_index_ready_notification(event) {
-            // A re-indexed workspace makes any cached remote index stale.
-            crate::workspace_files::cache::invalidate(event.session_id());
+        if let Some(notification) = on_workspace_index_ready(event) {
             return vec![notification];
         }
         if let AgentEventKind::DelegateModelsChanged { revision } = event.kind() {

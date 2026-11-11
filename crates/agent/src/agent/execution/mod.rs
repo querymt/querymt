@@ -253,9 +253,16 @@ pub(crate) async fn apply_pending_steering(
             source_provider: None,
             source_model: None,
         };
-        let chat_message = message
-            .to_chat_message()
-            .map_err(|error| anyhow::anyhow!("Invalid steering content: {error}"))?;
+        let max_prompt_bytes = exec_ctx
+            .execution_config()
+            .and_then(|cfg| cfg.max_prompt_bytes);
+        let chat_message = match exec_ctx.llm_config() {
+            Some(llm) => {
+                message.to_chat_message_for_model(&llm.provider, &llm.model, max_prompt_bytes)
+            }
+            None => message.to_chat_message_with_max_prompt_bytes(max_prompt_bytes),
+        }
+        .map_err(|error| anyhow::anyhow!("Invalid steering content: {error}"))?;
         exec_ctx.add_message(message).await?;
         messages.push(chat_message);
 

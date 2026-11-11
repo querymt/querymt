@@ -2,21 +2,25 @@
 //! [`MessagePart::MentionContext`] snapshots.
 //!
 //! Resolution runs on the node that owns the session, when an input is
-//! accepted. Every link is canonicalized (together with the workspace root)
-//! before the sandbox check, and the *canonical* path is what gets read, so a
-//! symlink swapped after the check cannot redirect the read. Links that cannot
-//! be read never fail the prompt; they become [`MentionContent::Unresolved`].
+//! accepted. Reads go through [`super::confined`], which keeps them inside the
+//! workspace even if a path component is swapped after the check. Links that
+//! cannot be read never fail the prompt; they become
+//! [`MentionContent::Unresolved`].
+//!
+//! Mentions draw from the same text, image and attachment budgets as the
+//! prompt blocks of their input (see [`PromptUsage`]).
 
+use super::confined::{ReadError, read_confined};
 use crate::acp::protocol::ContentBlock;
+use crate::index::CanonicalWorkspace;
 use crate::model::{
-    MAX_ATTACHMENT_BYTES, MAX_IMAGES_PER_PROMPT, MAX_TOTAL_ATTACHMENT_BYTES, MentionContent,
-    MessagePart, validate_attachment_size, validate_image,
+    MAX_ATTACHMENT_BYTES, MAX_IMAGES_PER_PROMPT, MentionContent, MessagePart, PromptUsage,
+    parse_file_link, validate_attachment_size, validate_image,
 };
-use crate::tools::builtins::read_shared::{DEFAULT_READ_LIMIT, render_read_output};
+use crate::tools::builtins::read_shared::DEFAULT_READ_LIMIT;
 use base64::Engine as _;
 use querymt::chat::{MediaSource, ToolResultPart};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use url::Url;
 
 /// Text budget for one mention.
@@ -37,6 +41,8 @@ enum Refusal {
     NotFound,
     #[error("outside workspace")]
     OutsideWorkspace,
+    #[error("text budget exhausted")]
+    BudgetExhausted,
     #[error("{0}")]
     Unreadable(String),
     #[error("image rejected: {0}")]
@@ -44,6 +50,10 @@ enum Refusal {
 }
 
 /// Remaining text budget for one input.
+///
+/// Charges what the model will see for each mention, i.e. what
+/// [`MentionContent::render_text`] produces, so the snapshots fit the
+/// `max_prompt_bytes` budget that message projection applies.
 #[derive(Debug, Clone, Copy)]
 struct Budget {
     per_mention: usize,
@@ -51,9 +61,12 @@ struct Budget {
 }
 
 impl Budget {
-    fn new(max_prompt_bytes: Option<usize>) -> Self {
+    /// `prompt_text_bytes` is what the prompt blocks already take from
+    /// `max_prompt_bytes`.
+    fn new(max_prompt_bytes: Option<usize>, prompt_text_bytes: usize) -> Self {
         let total = max_prompt_bytes.map_or(MAX_TOTAL_MENTION_BYTES, |max| {
-            max.min(MAX_TOTAL_MENTION_BYTES)
+            max.saturating_sub(prompt_text_bytes)
+                .min(MAX_TOTAL_MENTION_BYTES)
         });
         Self {
             per_mention: MAX_MENTION_BYTES.min(total),
@@ -61,23 +74,43 @@ impl Budget {
         }
     }
 
-    /// Fit `text` into the budget, charging what was kept.
+    /// Content bytes a mention of `path` may still keep, after its header and
+    /// a possible truncation note.
+    fn allowance(&self, path: &str) -> usize {
+        self.per_mention
+            .min(self.remaining_total)
+            .saturating_sub(MentionContent::text_header(path).len() + truncation_note(path).len())
+    }
+
+    /// Fit `text` into the budget, charging the header and what was kept.
     fn take(&mut self, text: String, path: &str) -> String {
+        let header = MentionContent::text_header(path).len();
         let allowed = self.per_mention.min(self.remaining_total);
-        if text.len() <= allowed {
-            self.remaining_total -= text.len();
+        if header + text.len() <= allowed {
+            self.remaining_total -= header + text.len();
             return text;
         }
-        let mut end = allowed;
+        let mut end = self.allowance(path).min(text.len());
         while !text.is_char_boundary(end) {
             end -= 1;
         }
-        self.remaining_total -= end;
-        format!(
-            "{}\n[truncated: content of {path} was cut; read it with tools for the rest]",
-            &text[..end]
-        )
+        let note = truncation_note(path);
+        self.remaining_total = self
+            .remaining_total
+            .saturating_sub(header + end + note.len());
+        format!("{}{note}", &text[..end])
     }
+
+    /// Charge the rendered form of a reference that carries no content.
+    fn charge(&mut self, content: &MentionContent) {
+        self.remaining_total = self
+            .remaining_total
+            .saturating_sub(content.render_text().len());
+    }
+}
+
+fn truncation_note(path: &str) -> String {
+    format!("\n[truncated: content of {path} was cut; read it with tools for the rest]")
 }
 
 /// Image accounting shared by the mentions of one input.
@@ -90,34 +123,44 @@ struct ImageTally {
 /// Resolve every `file://` link in `blocks` into a mention snapshot.
 ///
 /// Links of other schemes are skipped (they keep their existing handling), and
-/// repeated links to the same URI are resolved once.
+/// repeated links to the same URI are resolved once. `workspace` is the
+/// session's resolved workspace (`None` when it has none on this node), and
+/// `usage` is what the prompt blocks already consume of the input's limits.
 pub async fn resolve_mentions(
     blocks: &[ContentBlock],
-    cwd: Option<&Path>,
+    workspace: Option<&CanonicalWorkspace>,
     max_prompt_bytes: Option<usize>,
+    usage: PromptUsage,
 ) -> Vec<MessagePart> {
-    let mut budget = Budget::new(max_prompt_bytes);
-    let mut images = ImageTally::default();
+    let mut budget = Budget::new(max_prompt_bytes, usage.text_bytes);
+    let mut images = ImageTally {
+        count: usage.image_count,
+        bytes: usage.attachment_bytes,
+    };
     let mut seen = HashSet::new();
     let mut parts = Vec::new();
     for (index, block) in blocks.iter().enumerate() {
         let ContentBlock::ResourceLink(link) = block else {
             continue;
         };
-        let Ok(url) = Url::parse(&link.uri) else {
+        let Some(url) = parse_file_link(&link.uri) else {
             continue;
         };
-        if url.scheme() != "file" || !seen.insert(link.uri.clone()) {
+        if !seen.insert(link.uri.clone()) {
             continue;
         }
-        let content = match read_link(&url, cwd, index, &mut budget, &mut images).await {
+        let content = match read_link(&url, workspace, index, &mut budget, &mut images).await {
             Ok(content) => content,
-            Err(refusal) => MentionContent::Unresolved {
-                path: url
-                    .to_file_path()
-                    .map_or_else(|()| link.uri.clone(), |path| path.display().to_string()),
-                reason: refusal.to_string(),
-            },
+            Err(refusal) => {
+                let content = MentionContent::Unresolved {
+                    path: url
+                        .to_file_path()
+                        .map_or_else(|()| link.uri.clone(), |path| path.display().to_string()),
+                    reason: refusal.to_string(),
+                };
+                budget.charge(&content);
+                content
+            }
         };
         parts.push(MessagePart::MentionContext {
             uri: link.uri.clone(),
@@ -129,7 +172,7 @@ pub async fn resolve_mentions(
 
 async fn read_link(
     url: &Url,
-    cwd: Option<&Path>,
+    workspace: Option<&CanonicalWorkspace>,
     index: usize,
     budget: &mut Budget,
     images: &mut ImageTally,
@@ -141,15 +184,14 @@ async fn read_link(
         return Err(Refusal::NonLocalHost);
     }
     let target = url.to_file_path().map_err(|()| Refusal::NotLocalPath)?;
-    let cwd = cwd.ok_or(Refusal::NoWorkspace)?;
-    let root = crate::index::resolve_workspace_root(cwd);
-    let canonical = canonical_inside(root, target).await?;
-    let path = canonical.display().to_string();
+    let workspace = workspace.ok_or(Refusal::NoWorkspace)?;
 
-    let parts = render_read_output(&canonical, 0, DEFAULT_READ_LIMIT)
+    let allowance = budget.allowance(&target.display().to_string());
+    let read = read_confined(workspace, &target, 0, DEFAULT_READ_LIMIT, Some(allowance))
         .await
-        .map_err(Refusal::Unreadable)?;
-    match parts.into_iter().next() {
+        .map_err(Refusal::from)?;
+    let path = read.path.display().to_string();
+    match read.parts.into_iter().next() {
         Some(ToolResultPart::Text { text }) => Ok(MentionContent::Text {
             text: budget.take(text, &path),
             path,
@@ -162,11 +204,7 @@ async fn read_link(
                 .media_type()
                 .map(ToString::to_string)
                 .unwrap_or_default();
-            images.bytes = images.bytes.saturating_add(data.len());
-            if images.bytes > MAX_TOTAL_ATTACHMENT_BYTES {
-                return Err(Refusal::InvalidImage("attachments too large".into()));
-            }
-            validate_attachment_size(index, data.len(), &mut 0)
+            validate_attachment_size(index, data.len(), &mut images.bytes)
                 .and_then(|()| validate_image(index, &mime_type, &mut images.count))
                 .map_err(|error| Refusal::InvalidImage(error.to_string()))?;
             Ok(MentionContent::Image {
@@ -179,19 +217,17 @@ async fn read_link(
     }
 }
 
-/// Canonicalize `target` and `root`, requiring the target to lie inside.
-async fn canonical_inside(root: PathBuf, target: PathBuf) -> Result<PathBuf, Refusal> {
-    let (root, target) = tokio::task::spawn_blocking(move || {
-        (dunce::canonicalize(root), dunce::canonicalize(target))
-    })
-    .await
-    .map_err(|error| Refusal::Unreadable(error.to_string()))?;
-    let target = target.map_err(|_| Refusal::NotFound)?;
-    let root = root.map_err(|error| Refusal::Unreadable(error.to_string()))?;
-    if target.starts_with(&root) {
-        Ok(target)
-    } else {
-        Err(Refusal::OutsideWorkspace)
+impl From<ReadError> for Refusal {
+    fn from(error: ReadError) -> Self {
+        match error {
+            ReadError::NotFound => Self::NotFound,
+            ReadError::OutsideWorkspace(_) => Self::OutsideWorkspace,
+            ReadError::BudgetExhausted => Self::BudgetExhausted,
+            ReadError::Resolution(reason) | ReadError::Unreadable(reason) => {
+                Self::Unreadable(reason)
+            }
+            other @ ReadError::NotRegular => Self::Unreadable(other.to_string()),
+        }
     }
 }
 
@@ -202,7 +238,12 @@ const _: () = assert!(MAX_IMAGES_PER_PROMPT > 0 && MAX_ATTACHMENT_BYTES > 0);
 mod tests {
     use super::*;
     use crate::acp::protocol::ResourceLink;
+    use std::path::Path;
     use tempfile::TempDir;
+
+    fn ws(cwd: &Path) -> CanonicalWorkspace {
+        crate::index::canonical_workspace(cwd).expect("workspace")
+    }
 
     fn link(uri: impl Into<String>) -> ContentBlock {
         ContentBlock::ResourceLink(ResourceLink::new("n", uri))
@@ -221,7 +262,8 @@ mod tests {
     }
 
     async fn one(blocks: &[ContentBlock], cwd: &Path) -> MentionContent {
-        let mut parts = resolve_mentions(blocks, Some(cwd), None).await;
+        let mut parts =
+            resolve_mentions(blocks, Some(&ws(cwd)), None, PromptUsage::default()).await;
         assert_eq!(parts.len(), 1, "{parts:?}");
         match parts.remove(0) {
             MessagePart::MentionContext { content, .. } => content,
@@ -303,7 +345,9 @@ mod tests {
             std::fs::write(&file, &body).unwrap();
             blocks.push(link(file_uri(&file)));
         }
-        let parts = resolve_mentions(&blocks, Some(dir.path()), None).await;
+        let parts =
+            resolve_mentions(&blocks, Some(&ws(dir.path())), None, PromptUsage::default()).await;
+        assert_eq!(parts.len(), 6);
         let texts: Vec<&str> = parts
             .iter()
             .filter_map(|part| match part {
@@ -314,11 +358,19 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(texts.len(), 6);
+        // Four files fit, the fifth is cut, and the sixth is not read at all
+        // because no text budget remains.
+        assert_eq!(texts.len(), 5);
         assert!(!texts[0].contains("[truncated"));
-        assert!(texts[5].contains("[truncated: content of"));
+        assert!(texts[4].contains("[truncated: content of"));
         let kept: usize = texts.iter().map(|text| text.len()).sum();
-        assert!(kept < MAX_TOTAL_MENTION_BYTES + 6 * 200);
+        assert!(kept < MAX_TOTAL_MENTION_BYTES + 5 * 200);
+        match &parts[5] {
+            MessagePart::MentionContext { content, .. } => {
+                assert_eq!(reason(content), "text budget exhausted")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -361,7 +413,8 @@ mod tests {
 
     #[tokio::test]
     async fn missing_workspace_is_unresolved_not_an_error() {
-        let parts = resolve_mentions(&[link("file:///a.txt")], None, None).await;
+        let parts =
+            resolve_mentions(&[link("file:///a.txt")], None, None, PromptUsage::default()).await;
         assert!(matches!(
             parts.as_slice(),
             [MessagePart::MentionContext {
@@ -383,14 +436,78 @@ mod tests {
             link(uri.clone()),
             link(uri),
         ];
-        let parts = resolve_mentions(&blocks, Some(dir.path()), None).await;
+        let parts =
+            resolve_mentions(&blocks, Some(&ws(dir.path())), None, PromptUsage::default()).await;
         assert_eq!(parts.len(), 1);
     }
 
     #[test]
-    fn budget_is_clamped_by_max_prompt_bytes() {
-        let mut budget = Budget::new(Some(10));
-        let out = budget.take("0123456789abcdef".into(), "/p");
-        assert!(out.starts_with("0123456789\n[truncated: content of /p"));
+    fn budget_charges_what_the_model_sees() {
+        let path = "/p";
+        let overhead = MentionContent::text_header(path).len() + truncation_note(path).len();
+        let mut budget = Budget::new(Some(overhead + 10), 0);
+        // Longer than the whole budget, so it must be cut.
+        let kept = budget.take(format!("0123456789{}", "a".repeat(200)), path);
+        assert!(kept.starts_with("0123456789\n[truncated: content of /p"));
+        let rendered = MentionContent::Text {
+            path: path.into(),
+            text: kept,
+        }
+        .render_text();
+        assert_eq!(rendered.len(), overhead + 10);
+        assert_eq!(budget.remaining_total, 0);
+    }
+
+    #[test]
+    fn prompt_text_shrinks_the_mention_budget() {
+        let budget = Budget::new(Some(1000), 990);
+        assert_eq!(budget.allowance("/p"), 0);
+        assert_eq!(Budget::new(Some(1000), 0).remaining_total, 1000);
+    }
+
+    #[tokio::test]
+    async fn exhausted_text_budget_skips_the_read() {
+        let dir = workspace();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let usage = PromptUsage {
+            text_bytes: 50,
+            ..Default::default()
+        };
+        let parts = resolve_mentions(
+            &[link(file_uri(&file))],
+            Some(&ws(dir.path())),
+            Some(50),
+            usage,
+        )
+        .await;
+        match &parts[..] {
+            [MessagePart::MentionContext { content, .. }] => {
+                assert_eq!(reason(content), "text budget exhausted")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_images_count_against_the_image_limit() {
+        let dir = workspace();
+        let png: [u8; 16] = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, b'I', b'H', b'D', b'R',
+        ];
+        let file = dir.path().join("p.png");
+        std::fs::write(&file, png).unwrap();
+        let usage = PromptUsage {
+            image_count: MAX_IMAGES_PER_PROMPT,
+            ..Default::default()
+        };
+        let parts =
+            resolve_mentions(&[link(file_uri(&file))], Some(&ws(dir.path())), None, usage).await;
+        match &parts[..] {
+            [MessagePart::MentionContext { content, .. }] => {
+                assert!(reason(content).starts_with("image rejected"), "{content:?}")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

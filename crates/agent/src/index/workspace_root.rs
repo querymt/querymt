@@ -16,6 +16,47 @@ pub fn resolve_workspace_root(cwd: &Path) -> PathBuf {
     }
 }
 
+/// A working directory and its workspace root, both resolved through symlinks
+/// and `..` so that aliases of one directory share one identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalWorkspace {
+    pub root: PathBuf,
+    pub cwd: PathBuf,
+}
+
+impl CanonicalWorkspace {
+    /// Whether the resolved working directory is a filesystem root.
+    pub fn cwd_is_filesystem_root(&self) -> bool {
+        self.cwd.parent().is_none()
+    }
+}
+
+/// Resolve `cwd` through the filesystem, then find its workspace root.
+///
+/// This is the one workspace identity shared by the index manager, the
+/// `querymt/workspace/files` query and workspace-confined reads. Unlike
+/// [`resolve_workspace_root`] it fails when `cwd` is not an existing
+/// directory, and never returns a path that still contains symlinks or `..`.
+/// Performs blocking filesystem calls; see [`canonical_workspace_async`].
+pub fn canonical_workspace(cwd: &Path) -> std::io::Result<CanonicalWorkspace> {
+    let cwd = dunce::canonicalize(normalize_cwd(cwd))?;
+    if !std::fs::metadata(&cwd)?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", cwd.display()),
+        ));
+    }
+    let root = resolve_workspace_root(&cwd);
+    Ok(CanonicalWorkspace { root, cwd })
+}
+
+/// [`canonical_workspace`] off the async worker threads.
+pub async fn canonical_workspace_async(cwd: PathBuf) -> std::io::Result<CanonicalWorkspace> {
+    tokio::task::spawn_blocking(move || canonical_workspace(&cwd))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 pub fn normalize_cwd(cwd: &Path) -> PathBuf {
     if cwd.is_absolute() {
         cwd.to_path_buf()
@@ -61,6 +102,54 @@ mod tests {
             result.ends_with("some/relative"),
             "normalized path should end with the relative part"
         );
+    }
+
+    // ── canonical_workspace ──────────────────────────────────────────────────
+
+    #[test]
+    fn canonical_workspace_resolves_dotdot_and_symlinked_roots() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("a/b")).unwrap();
+        let aliased = tmp.path().join("a/b/../b");
+        let resolved = canonical_workspace(&aliased).unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        assert_eq!(resolved.root, root);
+        assert_eq!(resolved.cwd, root.join("a/b"));
+        assert!(!resolved.cwd_is_filesystem_root());
+    }
+
+    #[test]
+    fn canonical_workspace_detects_filesystem_root_aliases() {
+        let tmp = TempDir::new().unwrap();
+        let mut alias = dunce::canonicalize(tmp.path()).unwrap();
+        let depth = alias.components().count();
+        for _ in 0..depth {
+            alias.push("..");
+        }
+        // `<tmp>/../..` style aliases resolve to the filesystem root.
+        let resolved = canonical_workspace(&alias).unwrap();
+        assert!(resolved.cwd_is_filesystem_root());
+    }
+
+    #[test]
+    fn canonical_workspace_fails_for_missing_directory_and_files() {
+        let tmp = TempDir::new().unwrap();
+        assert!(canonical_workspace(&tmp.path().join("missing")).is_err());
+        std::fs::write(tmp.path().join("file"), "").unwrap();
+        assert!(canonical_workspace(&tmp.path().join("file")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_workspace_resolves_symlinked_cwd_to_one_identity() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join(".git")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("alias")).unwrap();
+        let via_alias = canonical_workspace(&tmp.path().join("alias")).unwrap();
+        let direct = canonical_workspace(&real).unwrap();
+        assert_eq!(via_alias, direct);
     }
 
     // ── resolve_workspace_root ───────────────────────────────────────────────

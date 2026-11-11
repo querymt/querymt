@@ -122,8 +122,12 @@ impl<'a> ScopedIndex<'a> {
 
 /// Components of `path` below `base`, or `None` when `path` is not inside it.
 fn relative_components(base: &str, path: &str) -> Option<Vec<String>> {
-    let full = Utf8TypedPath::derive(path);
-    let rest = full.strip_prefix(base).ok()?;
+    // Resolve `.` and `..` first: a cwd such as `/repo/a/../b` is `/repo/b`,
+    // and one that climbs out of the root is not inside it.
+    let full = Utf8TypedPath::derive(path).normalize();
+    let base = Utf8TypedPath::derive(base).normalize();
+    let full = full.to_path();
+    let rest = full.strip_prefix(base.to_path()).ok()?;
     Some(
         rest.components()
             .filter(|component| component.is_normal())
@@ -200,6 +204,16 @@ mod tests {
         let scoped = ScopedIndex::new("/repo", Some("/elsewhere"), &files);
         assert_eq!(scoped.candidates(), ["a.rs"]);
         assert_eq!(scoped.cwd(), "/repo");
+    }
+
+    #[test]
+    fn parent_components_in_cwd_are_resolved() {
+        let files = [entry("a/x.rs", false), entry("b/y.rs", false)];
+        let scoped = ScopedIndex::new("/repo", Some("/repo/a/../b"), &files);
+        assert_eq!(scoped.candidates(), ["y.rs"]);
+        // Climbing out of the root falls back to the root.
+        let scoped = ScopedIndex::new("/repo", Some("/repo/../other"), &files);
+        assert_eq!(scoped.candidates().len(), 2);
     }
 
     #[test]

@@ -37,7 +37,11 @@ fn path_to_uri(context: &dyn ToolContext, path: &str) -> Result<String, ToolErro
         return Ok(path.to_string());
     }
     let resolved = context.resolve_path(path)?;
-    Ok(format!("file://{}", resolved.display()))
+    url::Url::from_file_path(&resolved)
+        .map(String::from)
+        .map_err(|()| {
+            ToolError::InvalidRequest(format!("not an absolute path: {}", resolved.display()))
+        })
 }
 
 /// Extract a required string field from the tool arguments.
