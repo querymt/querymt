@@ -49,7 +49,9 @@ const GET_TOOL: &str = "repo_knowledge_get";
 /// navigable relative citations without suggesting an unavailable call.
 fn fetch_available(config: &AgentConfig, exec_ctx: &ExecutionContext) -> bool {
     config.tool_registry.find(GET_TOOL).is_some()
-        && crate::agent::tools::is_tool_allowed_with(&exec_ctx.tool_config, GET_TOOL)
+        && exec_ctx
+            .tool_config
+            .allows(crate::config::ToolRef::builtin(GET_TOOL))
 }
 
 /// Whether the stable retrieval policy applies: repository knowledge is
@@ -60,7 +62,9 @@ pub(crate) fn policy_applies(config: &AgentConfig) -> bool {
     config.repository_knowledge().is_some()
         && crate::knowledge::repository::policy::should_attach(|name| {
             config.tool_registry.find(name).is_some()
-                && crate::agent::tools::is_tool_allowed_with(&config.tool_config, name)
+                && config
+                    .tool_config
+                    .allows(crate::config::ToolRef::builtin(name))
         })
 }
 
@@ -621,8 +625,8 @@ mod tests {
         if tools_excluded {
             config
                 .tool_config
-                .denylist
-                .insert("repo_knowledge_get".to_string());
+                .deny
+                .insert(crate::config::ToolRef::builtin("repo_knowledge_get"));
         }
         (config, dir)
     }

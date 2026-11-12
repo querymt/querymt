@@ -3127,8 +3127,8 @@ mod repository_delivery {
 
         // Permissions, allow/deny lists and the system prompt are unchanged.
         let after = &harness.exec_ctx.tool_config;
-        assert_eq!(after.allowlist, tools_before.allowlist);
-        assert_eq!(after.denylist, tools_before.denylist);
+        assert_eq!(after.allow, tools_before.allow);
+        assert_eq!(after.deny, tools_before.deny);
         assert!(!crate::knowledge::repository::policy::RETRIEVAL_POLICY.contains(hostile));
         let system = harness
             .config
@@ -3180,8 +3180,8 @@ mod repository_delivery {
         harness
             .exec_ctx
             .tool_config
-            .denylist
-            .insert("index".to_string());
+            .deny
+            .insert(crate::config::ToolRef::builtin("index"));
         let calls = vec![mock_querymt_tool_call(
             "call-1",
             "index",
@@ -3253,8 +3253,8 @@ mod repository_delivery {
         harness
             .exec_ctx
             .tool_config
-            .denylist
-            .insert("repo_knowledge_get".to_string());
+            .deny
+            .insert(crate::config::ToolRef::builtin("repo_knowledge_get"));
         let denied = crate::agent::repository_delivery::orientation_contexts(
             &harness.config,
             &harness.exec_ctx,
@@ -3265,7 +3265,7 @@ mod repository_delivery {
         assert_eq!(denied.len(), 1);
         assert!(!denied[0].content.contains("repo_knowledge_get"));
         assert!(denied[0].content.contains("docs/arch.md"));
-        harness.exec_ctx.tool_config.denylist.clear();
+        harness.exec_ctx.tool_config.deny = crate::config::ToolSet::new();
 
         *harness.exec_ctx.delivery_budget.lock().unwrap() = None; // new turn
         // A card already present (e.g. from a command-hook wrapper) is not
@@ -3366,14 +3366,17 @@ mod repository_delivery {
 
         // An allowlist that excludes get keeps the allowlist authoritative.
         let mut config = (*harness.config).clone();
-        config.tool_config.allowlist =
-            Some(["repo_knowledge_query".to_string()].into_iter().collect());
+        config.tool_config.allow = Some(
+            [crate::config::ToolSpec::Builtin("repo_knowledge_query".to_string())]
+                .into_iter()
+                .collect(),
+        );
         assert!(!crate::agent::repository_delivery::policy_applies(&config));
-        config.tool_config.allowlist = None;
+        config.tool_config.allow = None;
         config
             .tool_config
-            .denylist
-            .insert("repo_knowledge_query".into());
+            .deny
+            .insert(crate::config::ToolRef::builtin("repo_knowledge_query"));
         assert!(!crate::agent::repository_delivery::policy_applies(&config));
     }
 }

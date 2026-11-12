@@ -623,7 +623,7 @@ async fn execute_prepared_inner(
         exec_ctx,
         &crate::agent::repository_delivery::FinishedCall {
             tool_name: &call.function.name,
-            tool_source,
+            tool_source: tool_source.as_str(),
             execution_is_error,
             result_is_error: is_error,
             output_suppressed,

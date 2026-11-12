@@ -35,8 +35,6 @@ tags = ["coding", "single-agent", "knowledge"]
 [agent]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-assume_mutating = false
-mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
 # Allowlists stay authoritative: the repository tools are usable only because
 # they are listed here. Delivery never adds tools.
 tools = [
@@ -85,7 +83,6 @@ max_bytes = 4096
 
 [[middleware]]
 type = "agent_mode"
-default = "build"
 
 [[middleware]]
 type = "limits"
