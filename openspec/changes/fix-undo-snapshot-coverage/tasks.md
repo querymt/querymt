@@ -1,0 +1,151 @@
+# Tasks
+
+How to check off a task:
+
+- A task may be checked (`- [x]`) only after every command in it has passed **in this change's working tree**. Under the task, record the command and the nextest summary line (for example `12 passed, 4300 skipped`).
+- A test that is skipped, ignored or filtered out does not count as passing. If nextest says a filter matched no tests, fix the filter; never drop it.
+- If a test can't run on the current machine (for example a permission test running as root), leave the task unchecked and note why.
+- Environment for every command below, matching `.github/workflows/test-agent.yml`:
+
+  ```sh
+  export F=dashboard,oauth,zbus-secret-service,systemd-credentials,remote
+  mkdir -p /tmp/qmt-ui && printf '<!doctype html><title>QueryMT</title>\n' > /tmp/qmt-ui/index.html \
+    && printf '{"revision":"ci","target":"embedded","acpWebSocketPath":"/acp/ws"}\n' > /tmp/qmt-ui/querymt-ui.json
+  export QMT_UI_DIST=/tmp/qmt-ui
+  ```
+
+  The zbus/systemd features only take effect on Linux; those paths stay unverified on macOS.
+- New tests are named after their spec scenario in snake_case, so `-E 'test(/<name>/)'` selects them. They assert the THEN outcome through the production path (`SnapshotBackend` trait, `undo_impl`/`redo_impl` via `UndoTestFixture`, or the config loader).
+
+## 1. Module split, backend configuration and baseline (no behaviour change)
+
+- [ ] 1.1 Move `crates/agent/src/snapshot/git.rs` into `snapshot/git/{mod.rs,capture.rs,restore.rs,gc.rs,tests.rs}` without changing behaviour (design D1). Items stay `pub(crate)` or private unless already public (proj-pub-crate-internal). Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/^snapshot::git::|^agent::undo_tests::|^agent::undo_integration_tests::/)'`. It must give the same pass count as before the move (record both).
+- [ ] 1.2 Store `snapshot_base: Option<PathBuf>` and `limits: Limits` on `GitSnapshotBackend`, and make `with_snapshot_base` a public `#[must_use]` builder (design D2, api-builder-must-use). Add `pub(crate) fn with_limits`. Make `diff`, `restore_paths`, `restore` and `gc` clone `self` into `spawn_blocking`, and delete the four `#[cfg(test)]` backend re-creations. Add `trait_methods_use_the_configured_snapshot_base`: track, diff, restore_paths and gc through the trait on a backend with a temp base, then assert nothing was written under `dirs::cache_dir()/querymt/snapshots/<hash>` for that worktree. Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/^snapshot::git::|trait_methods_use_the_configured_snapshot_base/)'`.
+- [ ] 1.3 Add `SnapshotError::Io { op, path, #[source] source }` and the `io_err(op, path)` helper (design D3, err-source-chain). Add unit test `io_error_names_operation_and_path`, which checks `Display` contains the op and the path and that `std::error::Error::source()` is the `io::Error`. Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/io_error_names_operation_and_path/)'`.
+- [ ] 1.4 Move `tempfile` from dev-dependency to a normal dependency of `querymt-agent`. Add `flate2 = { version = "1", default-features = false, features = ["rust_backend"] }` as a normal dependency; keep the build-dependency entry as is (design D6, D9). Confirm `Cargo.lock` gains no new package. Verify with `cargo check -p querymt-agent --features "$F"` and `git diff --stat Cargo.lock`, which must show no added `[[package]]`.
+- [ ] 1.5 Add the criterion bench `crates/agent/benches/snapshot_track.rs` plus its `[[bench]]` entry (design D14, perf-black-box-bench). Groups: 2 000 small files cold, the same files warm, one 256 MiB random file new, and the same file unchanged. Snapshots go through the trait with `with_snapshot_base` on a temp dir. Run it and record the **baseline** numbers under this task. Verify with `cargo bench -p querymt-agent --bench snapshot_track`.
+
+## 2. Complete capture: remove the size cap (`workspace-snapshots`: every file in scope, changing files, unchanged files)
+
+- [ ] 2.1 Remove `max_file_bytes` from `SnapshotBackendConfig`, along with `default_max_file_bytes`, `with_max_file_bytes`, `DEFAULT_MAX_FILE_BYTES`, `SKIPPED_TRAILER`, `skipped_paths`, the `skipped` map and its warnings, the skip filters in `diff_commits`/`checkout_paths`, and the call sites in `agent_config_builder.rs` `with_snapshot_from_execution` and `api/quorum.rs` (design D4). Delete the obsolete tests `test_files_over_max_file_bytes_are_skipped`, `test_zero_max_file_bytes_means_unlimited`, `test_file_growing_past_limit_is_not_reported_deleted_or_removed`, `test_file_shrinking_below_limit_is_not_reported_added`, `test_skipped_paths_do_not_hide_real_changes`, `test_skipped_trailer_round_trips` and `test_shrinking_stream_is_skipped_not_fatal`. Remove the `max_file_bytes` line from `docs/docs/agent/configuration.md`.
+  - Covers `workspace-snapshots` / Removed max_file_bytes key is rejected. Test: `removed_max_file_bytes_key_is_rejected` in `config/tests.rs`. It loads TOML with the key under `[agent.execution.snapshot]` and under a quorum delegate's `execution.snapshot`, and asserts the error names `max_file_bytes`.
+  - Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/removed_max_file_bytes_key_is_rejected|^snapshot::git::|^config::/)'` and `rg -n 'max_file_bytes|qmt-skipped|skipped_paths' crates docs`, which must return nothing outside CHANGELOG.md.
+- [ ] 2.2 Replace `Option<ObjectId>` with `CaptureOutcome { Stored(ObjectId), Changed }` (type-enum-states). The stream path re-stats after the read, and on a short read or a stamp change it captures from an `fs::copy` into a `tempfile::TempDir` under the snapshot git dir (design D4). `SnapshotStats` drops the skip counters and gains `copied_files`.
+  - Covers `workspace-snapshots` / File that shrinks during capture is captured: `file_that_shrinks_during_capture_is_captured` calls the capture function with a listed stamp larger than the file, asserts `copied_files == 1`, and checks the stored blob equals the file.
+  - Covers `workspace-snapshots` / File that grows during capture is captured whole: `file_that_grows_during_capture_is_captured_whole` passes a listed stamp smaller than the file and asserts the blob has every byte.
+  - Both use `with_limits` with a small `stream_bytes`.
+  - Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/file_that_shrinks_during_capture_is_captured|file_that_grows_during_capture_is_captured_whole/)'`, then also check that no leftover entry exists in the copy directory.
+- [ ] 2.3 Add undo/redo regression tests through `UndoTestFixture` in `agent/undo_integration_tests.rs`, with default limits and 17 MiB files.
+  - `workspace-snapshots` / Large file is captured and undone: `large_file_is_captured_and_undone`.
+  - `workspace-snapshots` / Undo and redo of a file that grew restore both versions: `undo_and_redo_of_a_file_that_grew_restore_both_versions`. This is the CodeRabbit finding. It drives `redo_impl` through `fixture.redo` after the 1 KiB → 17 MiB turn is undone, then asserts the 1 KiB content after undo and the exact 17 MiB content and `restored == true` after redo.
+  - Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/large_file_is_captured_and_undone|undo_and_redo_of_a_file_that_grew_restore_both_versions/)'`.
+- [ ] 2.4 Rename the stat-cache tests after their scenarios and keep their assertions.
+  - `test_second_snapshot_reuses_stat_cache` becomes `unchanged_file_is_not_read_again`. Assert `bytes_hashed == 0` for the second snapshot. Covers `workspace-snapshots` / Unchanged file is not read again.
+  - `test_same_size_and_mtime_rewrite_is_detected` becomes `rewrite_with_same_size_and_mtime_is_detected`. Covers `workspace-snapshots` / Rewrite with same size and mtime is detected.
+  - Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/unchanged_file_is_not_read_again|rewrite_with_same_size_and_mtime_is_detected|stat_cache/)'`.
+
+## 3. Snapshot scope by path (`workspace-snapshots`: snapshot scope)
+
+- [ ] 3.1 Set `WalkBuilder` to `.ignore(true).git_ignore(true).git_exclude(true).git_global(false).require_git(false)`, keeping the dot-entry `filter_entry` (design D5). Add tests in `snapshot/git/tests.rs` that track through the trait and inspect the tree:
+  - `workspace-snapshots` / Gitignored file in a git repository is not captured: `gitignored_file_in_a_git_repository_is_not_captured` (uses `git init`).
+  - `workspace-snapshots` / Gitignore applies outside a git repository: `gitignore_applies_outside_a_git_repository` (no `.git`).
+  - `workspace-snapshots` / Ignore file excludes paths: `ignore_file_excludes_paths`.
+  - `workspace-snapshots` / Git info exclude is honoured: `git_info_exclude_is_honoured`.
+  - `workspace-snapshots` / Dot entries are not captured: rename `test_dot_directories_are_pruned` to `dot_entries_are_not_captured`.
+
+  Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/gitignored_file_in_a_git_repository_is_not_captured|gitignore_applies_outside_a_git_repository|ignore_file_excludes_paths|git_info_exclude_is_honoured|dot_entries_are_not_captured/)'`.
+- [ ] 3.2 Add `undo_leaves_ignored_files_alone` in `agent/undo_integration_tests.rs`, covering `workspace-snapshots` / Undo leaves ignored files alone. A turn modifies `kept.txt` and a gitignored `ignored.log`. After undo, `kept.txt` is reverted and `ignored.log` keeps its modified content. Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/undo_leaves_ignored_files_alone/)'`.
+- [ ] 3.3 Document the snapshot scope in `docs/docs/agent/configuration.md` under `[agent.execution.snapshot]`: `.gitignore` (also outside git), `.ignore` as the opt-out, `.git/info/exclude`, and dot entries. Verify by reviewing the rendered markdown, or with `mkdocs build` if available, and record which was used.
+
+## 4. Snapshot reuse and large-file warnings (`workspace-snapshots`: unchanged workspace, large-file reporting)
+
+- [ ] 4.1 Return HEAD's id when the new tree equals HEAD's tree, and record `stats.reused` (design D7). Fold `test_track_idempotent_no_change` into the new tests.
+  - `workspace-snapshots` / Unchanged workspace returns the previous snapshot id: `unchanged_workspace_returns_the_previous_snapshot_id` (ids equal, no new commit in `list_commits`).
+  - `workspace-snapshots` / Changed workspace returns a new snapshot id: `changed_workspace_returns_a_new_snapshot_id`.
+  - Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/unchanged_workspace_returns_the_previous_snapshot_id|changed_workspace_returns_a_new_snapshot_id|^agent::undo_tests::|^agent::undo_integration_tests::/)'`. The undo suites prove that read-only turns, which now return equal ids, still work.
+- [ ] 4.2 Implement large-file detection against HEAD and the pure `large_file_warnings` helper (design D13, obs-structured-fields). Emit with `tracing::warn!`.
+  - `workspace-snapshots` / Large file entering snapshots is reported once: `large_file_entering_snapshots_is_reported_once`. It uses `with_limits` with a 1 KiB `large_warn_bytes`, captures tracing output with a `tracing_subscriber::fmt` writer into a shared buffer under `tracing::subscriber::with_default`, and asserts exactly one warning naming the file across two snapshots (the second after modifying it).
+  - `workspace-snapshots` / Many large files are summarised: `many_large_files_are_summarised`. Twelve new large files produce 10 named warnings and one "2 more" warning, captured the same way.
+  - Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/large_file_entering_snapshots_is_reported_once|many_large_files_are_summarised/)'`.
+
+## 5. Large-file storage, restore correctness and undo failure handling (`workspace-snapshots`: storage, moves, atomic restore, failures)
+
+- [ ] 5.1 Write blobs at or above `stream_bytes` through a second loose store with `Compression::NONE` (design D6). Keep `test_streamed_blob_matches_in_memory_hash`. Covers `workspace-snapshots` / Large file is stored uncompressed and readable by git with `large_file_is_stored_uncompressed_and_readable_by_git`, which uses a real 17 MiB file at default limits. It asserts the loose object file is at least 17 MiB and that `git --git-dir <store> cat-file blob <id>` output equals the file. Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/large_file_is_stored_uncompressed_and_readable_by_git|streamed_blob_matches_in_memory_hash/)'`.
+- [ ] 5.2 Stream large loose blobs on restore through `flate2::read::ZlibDecoder<BufReader<File>>`, checking the header and hash before persisting. Borrow `&object.data` for small blobs instead of cloning (design D6, own-borrow-over-clone, perf-io-buffering). The internal checkout returns `RestoreStats { streamed_files }`.
+  - `workspace-snapshots` / Large file round-trips through restore: rename `test_streamed_large_file_round_trips` to `large_file_round_trips_through_restore` and add an assertion that `streamed_files == 1`. The memory bound itself is checked by reviewing that no `Vec` holds the blob on this path.
+  - Add `streamed_restore_rejects_a_corrupt_object`: flip one byte of the uncompressed object, then assert restore errors and the target keeps its old content.
+  - Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/large_file_round_trips_through_restore|streamed_restore_rejects_a_corrupt_object/)'`.
+- [ ] 5.3 Pass `Some(gix::diff::Options::default())` to `diff_tree_to_tree` and collect paths into a `BTreeSet<PathBuf>` (design D8, coll-set-membership).
+  - `workspace-snapshots` / Diff of a move reports both paths: `diff_of_a_move_reports_both_paths` (through the trait `diff`).
+  - `workspace-snapshots` / Undo of a moved file restores the original path: `undo_of_a_moved_file_restores_the_original_path`, via `UndoTestFixture`.
+  - `workspace-snapshots` / Redo of a moved file moves it back: `redo_of_a_moved_file_moves_it_back`, via `UndoTestFixture`.
+  - Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/diff_of_a_move_reports_both_paths|undo_of_a_moved_file_restores_the_original_path|redo_of_a_moved_file_moves_it_back/)'`.
+- [ ] 5.4 Implement `write_entry` (`NamedTempFile::new_in(parent)` → write → mode → `persist`) and propagate delete errors other than `NotFound`. Use it in `checkout_paths` and `checkout_all`, and remove every `let _ = fs::…` from the restore paths (design D9, anti-empty-catch). All tests are `#[cfg(unix)]`, and the permission-dependent ones return early when `libc::geteuid() == 0`.
+  - `workspace-snapshots` / Executable bit follows the snapshot: `executable_bit_follows_the_snapshot`.
+  - `workspace-snapshots` / Restore keeps a private file private: `restore_keeps_a_private_file_private`.
+  - `workspace-snapshots` / Failed restore leaves no temporary files: `failed_restore_leaves_no_temporary_files`.
+  - `workspace-snapshots` / Full restore reports a write failure: `full_restore_reports_a_write_failure`, through trait `restore`; the error contains the path.
+  - `workspace-snapshots` / Failed delete fails the restore: `failed_delete_fails_the_restore`. Undo through `UndoTestFixture` of a turn that created `sub/new.txt`, with `sub` set to 0555 before undo; the error contains `sub/new.txt`. Permissions are restored at the end.
+  - Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/executable_bit_follows_the_snapshot|restore_keeps_a_private_file_private|failed_restore_leaves_no_temporary_files|full_restore_reports_a_write_failure|failed_delete_fails_the_restore/)'`, and `rg -n 'let _ = fs::' crates/agent/src/snapshot`, which must return nothing.
+- [ ] 5.5 In `undo_impl`, push the redo frame after the restore loop whether or not it succeeded, then return the restore result (design D10). Keep pre-restore validation failures frame-less: the existing `test_undo_rejects_foreign_snapshot_before_any_restore` must still pass.
+  - `workspace-snapshots` / Undo that fails while restoring can be redone: `undo_that_fails_while_restoring_can_be_redone`. A turn modifies `a.txt` and `b.txt`, then `b.txt` is replaced by a non-empty directory. Undo errors naming `b.txt`; after the directory is removed, redo returns `a.txt` to its pre-undo content.
+  - `workspace-snapshots` / Redo that fails keeps its frame: `redo_that_fails_keeps_its_frame`. Redo is blocked by a non-empty directory at the target path and errors; after the directory is removed, a second redo restores the file.
+  - Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/undo_that_fails_while_restoring_can_be_redone|redo_that_fails_keeps_its_frame|test_undo_rejects_foreign_snapshot_before_any_restore|redo_rejects_cross_workspace_frames_without_restoring/)'`.
+
+## 6. Opt-in garbage collection (`workspace-snapshots`: retention settings, no GC by default, pruning, safe deletion, pruned undo/redo, store growth)
+
+- [ ] 6.1 Change `max_snapshots` to `Option<NonZeroUsize>` and `max_age_days` to `Option<NonZeroU64>`, both defaulting to `None` (design D11, num-nonzero, api-parse-dont-validate). Update the `[agent.execution.snapshot]` docs in `docs/docs/agent/configuration.md`: drop the `100`/`30` example defaults; document that unset means no GC, that setting either key prunes and deletes old snapshots for the whole workspace (shared by all sessions and delegates there), that undo/redo past the window fail without changing files, that `0` is rejected and that JSON `null` means unset. Tests in `config/tests.rs`:
+  - `workspace-snapshots` / Retention keys default to unset: `retention_keys_default_to_unset`.
+  - `workspace-snapshots` / Retention values are accepted: `retention_values_are_accepted`.
+  - `workspace-snapshots` / Zero retention values are rejected: `zero_retention_values_are_rejected`. It checks both keys, and each error names its key.
+  - `workspace-snapshots` / JSON null leaves a retention key unset: `json_null_leaves_a_retention_key_unset`.
+  - Plus `schema_retention_keys_have_minimum_one`, which checks the JSON schema `minimum` for both keys.
+  - Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/retention_keys_default_to_unset|retention_values_are_accepted|zero_retention_values_are_rejected|json_null_leaves_a_retention_key_unset|schema_retention_keys_have_minimum_one|^config::/)'`.
+- [ ] 6.2 Add `impl From<&SnapshotBackendConfig> for GcConfig` and `GcConfig::is_enabled` (api-from-not-into, name-is-has-bool), make `GcConfig::default()` `{ None, None }`, and set `snapshot_gc_config` in `with_snapshot_from_execution`. In `session_actor.rs` `execute_prompt_inner`, call `gc` only when `is_enabled()`, and replace `let _ = backend.gc(..)` with a `warn!` carrying the error (design D11, anti-empty-catch). Covers `workspace-snapshots` / Configured retention reaches the snapshot store with `configured_retention_reaches_the_snapshot_store` in `agent_config_builder.rs` tests, which asserts the built `AgentConfig.snapshot_gc_config` is `{ max_snapshots: Some(5), max_age_days: Some(2) }` and that a config without the keys yields `GcConfig::default()` with `is_enabled() == false`. Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/configured_retention_reaches_the_snapshot_store|test_quorum_builder_snapshot_policy/)'`.
+- [ ] 6.3 Add `SnapshotLock` over `<git_dir>/qmt-snapshot.lock` with `File::lock_shared` and `try_lock` (design D12). Hold the shared lock across the blocking bodies of `track`, `restore_paths` and `restore`. Add unit test `exclusive_lock_is_refused_while_shared_is_held`. Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/exclusive_lock_is_refused_while_shared_is_held|^snapshot::git::/)'`.
+- [ ] 6.4 Implement `collect_garbage(repo, cfg, now, lock)`: the disabled early return, window selection, a sweep threshold of 10, marking from kept commits only, deleting pruned commits first, then loose objects; `GcResult.deleted_objects` is added (design D12). Replace `test_gc_by_count` and keep `test_gc_leaves_workspace_baseline_refs_reachable` passing. Each test changes a file before every snapshot, because unchanged snapshots are reused (D7).
+  - `workspace-snapshots` / Garbage collection without limits deletes nothing: `garbage_collection_without_limits_deletes_nothing`. 15 snapshots, `gc` with `GcConfig::default()` reports 0 removed and 15 remaining, and the set of files under `objects/` is identical before and after.
+  - `workspace-snapshots` / Snapshots beyond max_snapshots are pruned: `snapshots_beyond_max_snapshots_are_pruned`.
+  - `workspace-snapshots` / Snapshots older than max_age_days are pruned: `snapshots_older_than_max_age_days_are_pruned`, with injected `now` set to 31 days later.
+  - `workspace-snapshots` / Latest snapshot is kept regardless of age: `latest_snapshot_is_kept_regardless_of_age`.
+  - `workspace-snapshots` / Pruned snapshot content is deleted: `pruned_snapshot_content_is_deleted`. It asserts the pruned blob ids are gone and the total size of the `objects/` directory decreased.
+  - `workspace-snapshots` / Retained snapshot content survives pruning: `retained_snapshot_content_survives_pruning`. It restores every kept snapshot fully through the trait by its original id and compares the contents.
+  - `workspace-snapshots` / Garbage collection skips while a snapshot is in progress: `garbage_collection_skips_while_a_snapshot_is_in_progress`. It holds a shared `SnapshotLock`, runs GC, and asserts `deleted_objects == 0`; a following track still succeeds.
+  - Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/garbage_collection_without_limits_deletes_nothing|snapshots_beyond_max_snapshots_are_pruned|snapshots_older_than_max_age_days_are_pruned|latest_snapshot_is_kept_regardless_of_age|pruned_snapshot_content_is_deleted|retained_snapshot_content_survives_pruning|garbage_collection_skips_while_a_snapshot_is_in_progress|test_gc_/)'`.
+- [ ] 6.5 Add undo/redo tests through `UndoTestFixture` in `agent/undo_integration_tests.rs`:
+  - `workspace-snapshots` / Undo without limits reaches the first turn: `undo_without_limits_reaches_the_first_turn`. Record 12 turns, call `fixture.backend.gc` with `GcConfig::default()` after each, undo the first turn, and assert every file has its pre-first-turn content.
+  - `workspace-snapshots` / Undo to a pruned snapshot changes no files: `undo_to_a_pruned_snapshot_changes_no_files`. Record a turn, take 12 more changed snapshots, run `gc` with `max_snapshots = 1`, undo the turn; it returns an error and every workspace file is byte-identical before and after.
+  - `workspace-snapshots` / Redo to a pruned snapshot keeps its frame: `redo_to_a_pruned_snapshot_keeps_its_frame`. Undo a turn, take 12 more changed snapshots, run `gc` with `max_snapshots = 1`, redo; it returns an error, no file changes, and `peek_revert_state` still returns the frame.
+  - Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/undo_without_limits_reaches_the_first_turn|undo_to_a_pruned_snapshot_changes_no_files|redo_to_a_pruned_snapshot_keeps_its_frame/)'`.
+- [ ] 6.6 Add the process-global store-size gauge (design D12, async-no-lock-await, obs-structured-fields). Tests use `with_limits` with `store_warn_bytes` and `store_measure_every_bytes` of a few KiB and a unique snapshot base each (the gauge is keyed by git dir), and capture tracing output as in 4.2.
+  - `workspace-snapshots` / Large snapshot store is reported once: `large_snapshot_store_is_reported_once`. Grow the store past the limit, take two more changed snapshots, and assert exactly one warning naming the store path and a size.
+  - `workspace-snapshots` / Small snapshot store is not reported: `small_snapshot_store_is_not_reported`. Take a snapshot below the limit and assert no store-size warning.
+  - Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/large_snapshot_store_is_reported_once|small_snapshot_store_is_not_reported/)'`.
+
+## 7. Changelog, measurements and integration checks
+
+- [ ] 7.1 Add Unreleased entries to `CHANGELOG.md`:
+  - **BREAKING:** `.gitignore` applies to snapshots outside git repositories.
+  - Snapshot GC is supported and off by default: `max_snapshots` and `max_age_days` default to unset, and nothing is deleted unless one is set.
+  - **BREAKING:** setting `max_snapshots`/`max_age_days` now prunes and deletes old snapshots for the whole workspace (before, the values were ignored); undo/redo past the window fail without changing files.
+  - **BREAKING:** `max_snapshots = 0` or `max_age_days = 0` is a config load error.
+  - New warnings for files of 64 MiB or more entering snapshots and for snapshot stores of 5 GiB or more, both pointing to `.ignore`.
+  - Undo of moves is fixed; undo/redo now report restore failures; large files are always covered.
+  - A dev note to clear `querymt/snapshots` in the user cache dir after running a `fix/snapshot` build.
+
+  Verify by reviewing the CHANGELOG diff.
+- [ ] 7.2 Re-run `cargo bench -p querymt-agent --bench snapshot_track`. Record the numbers next to the 1.5 baseline. The "256 MiB new" group must not be slower than baseline; if it is, leave this task unchecked and report.
+- [ ] 7.3 Run the full checks for `querymt-agent`, in this order:
+  1. `cargo check -p querymt-agent --features "$F"`
+  2. `cargo nextest run -p querymt-agent --features "$F" -E 'test(/snapshot|undo|redo|config::|agent_config_builder|quorum/)'`
+  3. `cargo test -p querymt-agent --features "$F" --doc snapshot`, because `with_snapshot_base` and `SnapshotError` docs changed
+  4. `cargo fmt -p querymt-agent -- --check`
+  5. `cargo clippy -p querymt-agent --features "$F" --all-targets -- -D warnings`
+- [ ] 7.4 Check the downstream packages from `cargo tree -i querymt-agent --workspace --depth 1`:
+  - `cargo check -p querymt-mobile-ffi`
+  - `PYO3_PYTHON=<python>=3.10> cargo check -p querymt-agent-py`
+- [ ] 7.5 Run `openspec validate fix-undo-snapshot-coverage --strict`; it must report the change as valid.
+
+## Workflow follow-up
+
+- Archive the change after review, which syncs `workspace-snapshots` into `openspec/specs/`.
