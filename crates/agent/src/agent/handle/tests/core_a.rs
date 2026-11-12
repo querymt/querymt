@@ -1752,11 +1752,7 @@ paths = ["{}"]
     ));
     fixture.handle.set_profiles(profiles.clone());
 
-    let unbound = fixture
-        .handle
-        .slash_command_catalog("unbound")
-        .await
-        .expect("unbound session uses this handle's registry");
+    let unbound = fixture.handle.slash_command_catalog("unbound").await;
     assert_eq!(
         advertised_command_names(&unbound),
         vec!["/root".to_string(), "/compact".to_string()]
@@ -1766,11 +1762,7 @@ paths = ["{}"]
         .bind_session_to_profile("bound", "alpha")
         .await
         .expect("bind alpha");
-    let bound = fixture
-        .handle
-        .slash_command_catalog("bound")
-        .await
-        .expect("bound session uses the profile registry");
+    let bound = fixture.handle.slash_command_catalog("bound").await;
     assert_eq!(
         advertised_command_names(&bound),
         vec!["/docs".to_string(), "/compact".to_string()]
@@ -1783,12 +1775,80 @@ paths = ["{}"]
         )
         .await
         .expect("bind missing profile");
-    assert!(
-        fixture
-            .handle
-            .slash_command_catalog("ghost")
-            .await
-            .is_none(),
+    // A failed profile lookup must not borrow this handle's registry, but the
+    // built-ins are not registry entries: every session advertises them.
+    let ghost = fixture.handle.slash_command_catalog("ghost").await;
+    assert_eq!(
+        advertised_command_names(&ghost),
+        vec!["/compact".to_string()],
         "failed profile lookup must not fall back to this handle's registry"
+    );
+}
+
+#[tokio::test]
+async fn catalog_without_workspace_service_lists_compact_but_not_worktree() {
+    let mut registry = crate::slash_commands::SlashCommandRegistry::new();
+    registry.register(test_slash_command("deploy", "Deploy"));
+    // A user command named like a built-in is reserved: never registered,
+    // so it can never be advertised as something that will not run.
+    registry.register(test_slash_command("worktree", "Mine"));
+    registry.register(test_slash_command("compact", "Mine"));
+    let fixture = crate::test_utils::TestAgent::with_slash_command_registry(registry).await;
+    let catalog = fixture.handle.slash_command_catalog("any-session").await;
+    assert_eq!(
+        advertised_command_names(&catalog),
+        vec!["/deploy".to_string(), "/compact".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn steering_compact_is_rejected_but_queueing_it_is_allowed() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let session = fixture
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new("/tmp"))
+        .await
+        .expect("session");
+    let params = serde_json::json!({
+        "session_id": session.session_id.to_string(),
+        "prompt": [{"type": "text", "text": "/compact"}],
+        "expected_run_id": "run-1",
+    })
+    .to_string();
+    let err = fixture
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/session/steer",
+            serde_json::value::RawValue::from_string(params.clone())
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .expect_err("steering /compact must be rejected before reaching the model");
+    assert_eq!(
+        err.message,
+        crate::slash_commands::builtin::BuiltinError::NotAccepted {
+            builtin: crate::slash_commands::builtin::Builtin::Compact,
+            via: crate::slash_commands::builtin::Submission::Steer,
+        }
+        .to_string(),
+        "unexpected error: {err:?}"
+    );
+    // Queueing is not rejected by the built-in guard (it runs when its turn starts).
+    let queued = fixture
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/session/queue",
+            serde_json::value::RawValue::from_string(params)
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .expect("queueing /compact must be accepted");
+    let body: serde_json::Value = serde_json::from_str(queued.0.get()).expect("valid JSON");
+    assert_eq!(body["status"], "started", "unexpected receipt: {body}");
+    assert!(
+        body["data"]["input_id"].is_string(),
+        "missing input_id: {body}"
     );
 }

@@ -159,11 +159,9 @@ impl LocalAgentHandle {
         self.session_materializer
             .ensure_writable(&parsed.session_id)
             .await?;
-        if super::ext_worktree_ops::native_worktree_command(&parsed.prompt)?.is_some() {
-            return Err(Error::invalid_request().data(
-                "native /worktree administration uses session/prompt, not queued or steering input",
-            ));
-        }
+        // Early rejection; the session actor enforces the same rule for callers
+        // that do not come through this handler.
+        crate::slash_commands::builtin::Builtin::parse_for(&parsed.prompt, delivery.into())?;
         let session_id = parsed.session_id.clone();
         #[cfg(feature = "remote")]
         let operation = session_operation::SessionOperation::SubmitInput {

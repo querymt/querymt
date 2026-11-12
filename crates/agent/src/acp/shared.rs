@@ -923,6 +923,30 @@ fn querymt_session_id_from_request(method: &str, params: &serde_json::Value) -> 
     }
 }
 
+/// The session a remote attach request left attached to this connection, if any.
+///
+/// `attachSession` names it in the request; `createSession` names it in the
+/// response, and only when that create attached (`attached: false` creates a
+/// session that exists on the owner host only).
+pub(crate) fn remote_attached_session_id(
+    method: &str,
+    params: &serde_json::Value,
+    response: &serde_json::Value,
+) -> Option<String> {
+    match normalize_querymt_ext_method(method) {
+        "querymt/remote/attachSession" => querymt_session_id_from_request(method, params),
+        "querymt/remote/createSession"
+            if response
+                .get("attached")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false) =>
+        {
+            querymt_session_id_from_response(method, response)
+        }
+        _ => None,
+    }
+}
+
 fn querymt_session_id_from_response(method: &str, value: &serde_json::Value) -> Option<String> {
     match normalize_querymt_ext_method(method) {
         "querymt/remote/createSession" => {
@@ -3025,10 +3049,18 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                 }
                 m if m == AGENT_METHOD_NAMES.session_fork => {
                     match serde_json::from_value(req.params) {
-                        Ok(params) => agent
-                            .fork_session(params)
-                            .await
-                            .map(|r| serde_json::to_value(r).unwrap()),
+                        Ok(params) => match agent.fork_session(params).await {
+                            Ok(r) => {
+                                let fork_id = r.session_id.to_string();
+                                if let Some(notification) =
+                                    available_commands_session_update(agent, &fork_id).await
+                                {
+                                    notifications.push(notification);
+                                }
+                                Ok(serde_json::to_value(r).unwrap())
+                            }
+                            Err(e) => Err(e),
+                        },
                         Err(e) => Err(Error::invalid_params()
                             .data(serde_json::json!({"error": e.to_string()}))),
                     }
@@ -3495,6 +3527,15 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                     return Err(error);
                                 }
                                 drop(post_attach_guard);
+                                if let Some(attached_id) = remote_attached_session_id(
+                                    ext_method,
+                                    &rpc_params,
+                                    &value,
+                                ) && let Some(notification) =
+                                    available_commands_session_update(agent, &attached_id).await
+                                {
+                                    notifications.push(notification);
+                                }
                             }
                             Ok(value)
                         }
@@ -5940,6 +5981,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_fork_advertises_slash_commands_for_the_new_session() {
+        let mut registry = crate::slash_commands::SlashCommandRegistry::new();
+        registry.register(docs_slash_command());
+        let fixture = crate::test_utils::TestAgent::with_slash_command_registry(registry).await;
+
+        let created = dispatch_session_rpc(
+            fixture.handle.as_ref(),
+            AGENT_METHOD_NAMES.session_new,
+            serde_json::json!({"cwd": "/tmp", "mcpServers": []}),
+        )
+        .await;
+        let source_id = created
+            .response
+            .expect("session/new responds")
+            .result
+            .unwrap()["sessionId"]
+            .as_str()
+            .expect("sessionId")
+            .to_string();
+        fixture
+            .config
+            .provider
+            .history_store()
+            .add_message(
+                &source_id,
+                crate::model::AgentMessage {
+                    id: "m1".into(),
+                    session_id: source_id.clone(),
+                    role: querymt::chat::ChatRole::User,
+                    parts: vec![crate::model::MessagePart::Prompt {
+                        blocks: vec![crate::acp::protocol::ContentBlock::Text(
+                            crate::acp::protocol::TextContent::new("hello"),
+                        )],
+                    }],
+                    created_at: 1,
+                    parent_message_id: None,
+                    source_provider: None,
+                    source_model: None,
+                },
+            )
+            .await
+            .expect("seed history");
+
+        let forked = dispatch_session_rpc(
+            fixture.handle.as_ref(),
+            AGENT_METHOD_NAMES.session_fork,
+            serde_json::json!({"sessionId": source_id, "cwd": "/tmp"}),
+        )
+        .await;
+        let response = forked.response.expect("session/fork responds");
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let fork_id = response.result.unwrap()["sessionId"]
+            .as_str()
+            .expect("fork sessionId")
+            .to_string();
+        assert_ne!(fork_id, source_id);
+        assert_eq!(forked.notifications.len(), 1);
+        assert_docs_catalog(&forked.notifications[0], &fork_id);
+    }
+
+    #[tokio::test]
     async fn dispatch_rpc_message_sends_slash_catalog_after_response() {
         let mut registry = crate::slash_commands::SlashCommandRegistry::new();
         registry.register(docs_slash_command());
@@ -6157,6 +6259,19 @@ mod tests {
             ) -> Result<(), Error> {
                 unreachable!()
             }
+            async fn available_slash_commands(
+                &self,
+                session_id: &str,
+            ) -> Option<crate::acp::protocol::SessionNotification> {
+                Some(crate::acp::protocol::SessionNotification::new(
+                    session_id.to_owned(),
+                    crate::acp::protocol::SessionUpdate::AvailableCommandsUpdate(
+                        crate::acp::protocol::AvailableCommandsUpdate::new(vec![
+                            crate::acp::protocol::AvailableCommand::new("/compact", "Compact"),
+                        ]),
+                    ),
+                ))
+            }
             fn as_any(&self) -> &dyn std::any::Any {
                 self
             }
@@ -6182,6 +6297,56 @@ mod tests {
         assert_eq!(
             session_owners.lock().await.get("s-remote").cloned(),
             Some(HashSet::from(["conn-9".to_string()]))
+        );
+        // The attached session must get its slash-command catalog, like
+        // session/new, session/load and session/resume do.
+        let advertised = output
+            .notifications
+            .iter()
+            .find(|n| {
+                n["method"] == "session/update"
+                    && n["params"]["update"]["sessionUpdate"] == "available_commands_update"
+            })
+            .expect("remote attach advertises the command catalog");
+        assert_eq!(advertised["params"]["sessionId"], "s-remote");
+    }
+
+    #[test]
+    fn remote_attached_session_id_covers_attach_and_attached_create_only() {
+        let attach = serde_json::json!({"session_id": "s-1", "node_id": "n-1"});
+        let response = serde_json::json!({"session_id": "s-2", "node_id": "n-1", "attached": true, "config_options": []});
+        assert_eq!(
+            remote_attached_session_id(
+                "_querymt/remote/attachSession",
+                &attach,
+                &serde_json::json!({})
+            ),
+            Some("s-1".to_string())
+        );
+        assert_eq!(
+            remote_attached_session_id(
+                "querymt/remote/createSession",
+                &serde_json::json!({}),
+                &response
+            ),
+            Some("s-2".to_string())
+        );
+        let detached = serde_json::json!({"session_id": "s-2", "node_id": "n-1", "attached": false, "config_options": []});
+        assert_eq!(
+            remote_attached_session_id(
+                "querymt/remote/createSession",
+                &serde_json::json!({}),
+                &detached
+            ),
+            None
+        );
+        assert_eq!(
+            remote_attached_session_id(
+                "querymt/session/steer",
+                &serde_json::json!({"session_id": "s-3"}),
+                &response
+            ),
+            None
         );
     }
 

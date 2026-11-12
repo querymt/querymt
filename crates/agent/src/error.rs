@@ -335,6 +335,20 @@ impl From<crate::agent::turn_control::TurnControlError> for AgentError {
     }
 }
 
+impl From<crate::slash_commands::builtin::BuiltinError> for AgentError {
+    fn from(error: crate::slash_commands::builtin::BuiltinError) -> Self {
+        Self::InvalidPromptContent {
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<crate::slash_commands::builtin::BuiltinError> for AcpError {
+    fn from(error: crate::slash_commands::builtin::BuiltinError) -> Self {
+        AgentError::from(error).into()
+    }
+}
+
 impl From<crate::model::PromptContentError> for AgentError {
     fn from(error: crate::model::PromptContentError) -> Self {
         Self::InvalidPromptContent {

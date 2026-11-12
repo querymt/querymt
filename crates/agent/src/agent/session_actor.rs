@@ -29,6 +29,7 @@ use crate::session::run_lease::{RunLease, RunLeaseRoot};
 const RUN_LEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::LLMConfig;
+use crate::slash_commands::builtin::{Builtin, Submission};
 use kameo::Actor;
 use kameo::message::{Context, Message};
 use kameo::reply::DelegatedReply;
@@ -1461,15 +1462,18 @@ impl Message<GetSessionLimits> for SessionActor {
 }
 
 impl Message<crate::agent::messages::GetSessionSlashRegistry> for SessionActor {
-    type Reply =
-        Result<Option<Arc<crate::slash_commands::SlashCommandRegistry>>, kameo::error::Infallible>;
+    type Reply = Result<Arc<crate::slash_commands::SlashCommandRegistry>, kameo::error::Infallible>;
 
     async fn handle(
         &mut self,
         _msg: crate::agent::messages::GetSessionSlashRegistry,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        Ok(self.runtime.slash_registry.get().cloned())
+        Ok(Arc::new(
+            self.runtime
+                .effective_slash_registry(&self.config.slash_command_registry)
+                .clone(),
+        ))
     }
 }
 
@@ -2189,6 +2193,9 @@ impl Message<SubmitSessionInput> for SessionActor {
 
         match input.delivery {
             InputDelivery::Steer => {
+                // Steered text would reach the model verbatim; reject built-ins
+                // regardless of which path submitted them.
+                Builtin::parse_for(&input.prompt, Submission::Steer)?;
                 let llm_config = self
                     .config
                     .provider
@@ -2251,6 +2258,9 @@ impl Message<SubmitSessionInput> for SessionActor {
                 Ok(result)
             }
             InputDelivery::Queue => {
+                // Reject up front rather than issuing a receipt for input that
+                // would fail when its turn starts.
+                Builtin::parse_for(&input.prompt, Submission::Turn)?;
                 let blocks = input.prompt.clone();
                 let req =
                     crate::acp::protocol::PromptRequest::new(self.session_id.clone(), input.prompt);
@@ -2835,12 +2845,10 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         req.prompt.len()
     );
     let client_prompt_id = client_prompt_id_from_meta(req.meta.as_ref());
-    if req.prompt.iter().any(|block| matches!(block,
-        crate::acp::protocol::ContentBlock::Text(text) if text.text.split_whitespace().next() == Some("/worktree"))) {
-        return Err(AgentError::InvalidPromptContent {
-            message: "native /worktree administration must be submitted through session/prompt, not scheduled or queued model input".to_string(),
-        });
-    }
+    // One parser recognises every built-in. Native `/worktree` administration
+    // is intercepted before a turn starts, so it never reaches this scheduled
+    // or queued path.
+    let builtin = Builtin::parse_for(&req.prompt, Submission::Turn)?;
     validate_prompt_blocks(&req.prompt)?;
 
     // Acquire execution permit (blocking with timeout)
@@ -2973,13 +2981,17 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     // 3b. Native `/compact [instructions]`: compact now, no model turn.
     // Built-ins are matched before registry expansion so they take priority
     // over user-defined commands of the same name.
-    if let Some(command) = crate::slash_commands::builtin::native_compact_command(&req.prompt) {
+    if let Some(command) = builtin
+        .as_ref()
+        .filter(|command| command.builtin == crate::slash_commands::builtin::Builtin::Compact)
+    {
         log::info!("Session {}: manual compaction requested", session_id);
+        let instructions = (!command.args.is_empty()).then_some(command.args.as_str());
         let outcome = crate::agent::execution::compact_history(
             &config,
             &mut exec_ctx,
             crate::agent::execution::TRIGGER_MANUAL,
-            command.instructions.as_deref(),
+            instructions,
         )
         .await;
         return match outcome {
@@ -3039,11 +3051,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     // Managed sessions expand against the registry resolved from their
     // bound checkout, matching the advertised catalog; legacy local
     // sessions keep the agent-level registry built at startup.
-    let slash_registry = runtime
-        .slash_registry
-        .get()
-        .map(Arc::as_ref)
-        .unwrap_or(&config.slash_command_registry);
+    let slash_registry = runtime.effective_slash_registry(&config.slash_command_registry);
     if let Some(crate::acp::protocol::ContentBlock::Text(text_content)) = req.prompt.first()
         && let Some(expansion) =
             crate::slash_commands::try_expand(&text_content.text, slash_registry)
@@ -4144,6 +4152,51 @@ mod tests {
                 .is_some(),
             "lease must be released when the session no longer exists"
         );
+    }
+
+    #[tokio::test]
+    async fn steering_a_builtin_is_rejected_by_the_actor() {
+        let f = ActorFixture::new().await;
+        let mut submit = text_submit(&f._session_id, "/compact");
+        submit.input.delivery = InputDelivery::Steer;
+        submit.input.expected_run_id = Some("run-1".to_string());
+
+        let result = f.actor_ref.ask(submit).await;
+        let expected = crate::slash_commands::builtin::BuiltinError::NotAccepted {
+            builtin: Builtin::Compact,
+            via: Submission::Steer,
+        }
+        .to_string();
+        match result {
+            Err(kameo::error::SendError::HandlerError(AgentError::InvalidPromptContent {
+                message,
+            })) => assert_eq!(message, expected),
+            other => panic!("expected InvalidPromptContent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn queueing_worktree_is_rejected_before_a_receipt_is_issued() {
+        let f = ActorFixture::new().await;
+
+        let result = f
+            .actor_ref
+            .ask(text_submit(&f._session_id, "/worktree list"))
+            .await;
+
+        let expected = crate::slash_commands::builtin::BuiltinError::NotAccepted {
+            builtin: Builtin::Worktree,
+            via: Submission::Turn,
+        }
+        .to_string();
+        match result {
+            Err(kameo::error::SendError::HandlerError(AgentError::InvalidPromptContent {
+                message,
+            })) => assert_eq!(message, expected),
+            other => panic!("expected InvalidPromptContent, got {other:?}"),
+        }
+        let status = f.actor_ref.ask(GetRuntimeStatus).await.unwrap();
+        assert_eq!(status.phase, SessionRuntimePhase::Idle);
     }
 
     #[tokio::test]

@@ -1372,6 +1372,52 @@ mod session_actor_ref_remote_tests {
         assert!(host_config.pending_elicitations.lock().await.is_empty());
     }
 
+    // ── E.13 ─────────────────────────────────────────────────────────────────
+
+    /// A session hosted on a mesh peer advertises only `/compact`: the peer's
+    /// user commands are not visible here, and `/worktree` cannot run there.
+    #[tokio::test]
+    async fn remote_session_catalog_lists_only_compact() {
+        let (session_ref, _local, _host_config, session_id) =
+            remote_session_ref_with_host("e13").await;
+        let mut user = crate::slash_commands::SlashCommandRegistry::new();
+        user.register(crate::slash_commands::SlashCommand {
+            name: "deploy".into(),
+            source: crate::slash_commands::SlashCommandSource::Global("/tmp".into()),
+            path: "/tmp/deploy.md".into(),
+            description: "Deploy".into(),
+            argument_hint: None,
+            tags: Vec::new(),
+            template: "Deploy".into(),
+            script: None,
+            requires_script: false,
+        });
+        let alpha = crate::test_utils::TestAgent::with_slash_command_registry(user).await;
+        let names = |n: &crate::acp::protocol::SessionNotification| -> Vec<String> {
+            serde_json::to_value(n).unwrap()["update"]["availableCommands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let local_names = names(&alpha.handle.slash_command_catalog(&session_id).await);
+        assert!(
+            local_names.contains(&"/deploy".to_string()),
+            "{local_names:?}"
+        );
+
+        alpha
+            .handle
+            .registry
+            .lock()
+            .await
+            .insert(session_id.clone(), session_ref);
+        let remote_names = names(&alpha.handle.slash_command_catalog(&session_id).await);
+        assert_eq!(remote_names, vec!["/compact".to_string()]);
+    }
+
     // ── E.12 ─────────────────────────────────────────────────────────────────
 
     #[tokio::test]
