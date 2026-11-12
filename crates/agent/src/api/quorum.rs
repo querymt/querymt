@@ -579,10 +579,7 @@ impl QuorumBuilder {
                         .with_event_fanout(event_fanout);
 
                 if snapshot_policy_for_delegate != SnapshotPolicy::None {
-                    b = b.with_snapshot_backend(Arc::new(
-                        GitSnapshotBackend::new()
-                            .with_max_file_bytes(Some(exec.snapshot.max_file_bytes)),
-                    ));
+                    b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
                 }
 
                 if let Some(skills) = skills.as_ref()
@@ -815,10 +812,7 @@ impl QuorumBuilder {
             .with_event_fanout(event_fanout);
 
             if snapshot_policy_for_planner != SnapshotPolicy::None {
-                b = b.with_snapshot_backend(Arc::new(
-                    GitSnapshotBackend::new()
-                        .with_max_file_bytes(Some(planner_exec.snapshot.max_file_bytes)),
-                ));
+                b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
             }
 
             if let Some(skills) = planner_skills.as_ref()

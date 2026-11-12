@@ -4567,9 +4567,8 @@ mod worktree_binding_tests {
     async fn parent_undo_excludes_isolated_fork_and_fork_undo_redo_works_after_restart() {
         let fx = worktree_fixture(true).await;
         let snapshot_base = tempfile::TempDir::new().unwrap();
-        let backend = crate::snapshot::GitSnapshotBackend::with_snapshot_base(
-            snapshot_base.path().to_path_buf(),
-        );
+        let backend = crate::snapshot::GitSnapshotBackend::new()
+            .with_snapshot_base(snapshot_base.path().to_path_buf());
 
         // Parent: a plain local session in the real repository.
         let source = fx
@@ -4696,9 +4695,8 @@ mod worktree_binding_tests {
         // backend over the same snapshot base. Fork-local undo rewinds the
         // fork's OWN workspace to its baseline contents; redo reapplies it.
         let restarted = SessionMaterializer::new(fx.materializer.config.clone());
-        let restarted_backend = crate::snapshot::GitSnapshotBackend::with_snapshot_base(
-            snapshot_base.path().to_path_buf(),
-        );
+        let restarted_backend = crate::snapshot::GitSnapshotBackend::new()
+            .with_snapshot_base(snapshot_base.path().to_path_buf());
         // The fork's copied messages carry new public ids; target the
         // copied user message (first entry of the fork's history).
         let fork_target = fx

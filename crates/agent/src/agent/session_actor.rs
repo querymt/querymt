@@ -3352,10 +3352,21 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
                 }
                 Err(e) => warn!("Post-turn snapshot failed: {}", e),
             }
-            let _ = backend
-                .gc(worktree, &config.snapshot_gc_config)
-                .instrument(info_span!("agent.snapshot.post_turn.gc", session_id = %session_id))
-                .await;
+            if config.snapshot_gc_config.is_enabled()
+                && let Err(error) = backend
+                    .gc(worktree, &config.snapshot_gc_config)
+                    .instrument(info_span!(
+                        "agent.snapshot.post_turn.gc",
+                        session_id = %session_id
+                    ))
+                    .await
+            {
+                tracing::warn!(
+                    %session_id,
+                    %error,
+                    "post-turn snapshot garbage collection failed"
+                );
+            }
         }
     } else {
         debug!(

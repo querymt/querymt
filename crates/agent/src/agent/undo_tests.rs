@@ -17,7 +17,7 @@ async fn test_git_backend_track_and_restore_paths() {
     let tmpbase = TempDir::new().unwrap();
 
     fs::write(tmpdir.path().join("a.txt"), "original").unwrap();
-    let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+    let backend = GitSnapshotBackend::new().with_snapshot_base(tmpbase.path().to_path_buf());
     let snap_pre = backend.track(tmpdir.path()).await.unwrap();
 
     fs::write(tmpdir.path().join("a.txt"), "modified").unwrap();
@@ -55,7 +55,7 @@ async fn test_git_backend_multiple_files() {
     fs::write(tmpdir.path().join("b.txt"), "bbb").unwrap();
     fs::write(tmpdir.path().join("c.txt"), "ccc").unwrap();
 
-    let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+    let backend = GitSnapshotBackend::new().with_snapshot_base(tmpbase.path().to_path_buf());
     let snap_pre = backend.track(tmpdir.path()).await.unwrap();
 
     fs::write(tmpdir.path().join("a.txt"), "AAA").unwrap();
@@ -92,7 +92,7 @@ async fn test_git_backend_file_deletion() {
     let tmpbase = TempDir::new().unwrap();
 
     fs::write(tmpdir.path().join("file.txt"), "content").unwrap();
-    let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+    let backend = GitSnapshotBackend::new().with_snapshot_base(tmpbase.path().to_path_buf());
     let snap_with_file = backend.track(tmpdir.path()).await.unwrap();
 
     // Simulate undo by restoring a path that didn't exist in pre-snapshot
@@ -121,7 +121,7 @@ async fn test_git_backend_full_restore() {
     fs::write(tmpdir.path().join("a.txt"), "v1-a").unwrap();
     fs::write(tmpdir.path().join("b.txt"), "v1-b").unwrap();
 
-    let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+    let backend = GitSnapshotBackend::new().with_snapshot_base(tmpbase.path().to_path_buf());
     let snap1 = backend.track(tmpdir.path()).await.unwrap();
 
     fs::write(tmpdir.path().join("a.txt"), "v2-a").unwrap();
@@ -211,7 +211,7 @@ async fn linked_worktree_undo_redo_preserves_siblings_refs_and_git_markers() {
     // repository: undo adds no second snapshot implementation and no
     // project refs.
     let base = TempDir::new().unwrap();
-    let backend = GitSnapshotBackend::with_snapshot_base(base.path().to_path_buf());
+    let backend = GitSnapshotBackend::new().with_snapshot_base(base.path().to_path_buf());
 
     // Turn-style capture inside the linked worktree.
     let snap_pre = backend.track(linked.path()).await.unwrap();

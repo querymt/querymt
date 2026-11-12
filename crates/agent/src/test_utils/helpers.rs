@@ -192,6 +192,19 @@ pub(crate) mod genai_trace {
     }
 }
 
+/// Deterministic incompressible bytes (xorshift), so test files do not deflate.
+pub fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::SnapshotPolicy;
@@ -419,7 +432,7 @@ impl UndoTestFixture {
         let llm = LLMParams::new().provider("mock").model("mock");
 
         let snapshot_base_path = snapshot_base.path().to_path_buf();
-        let backend = GitSnapshotBackend::with_snapshot_base(snapshot_base_path.clone());
+        let backend = GitSnapshotBackend::new().with_snapshot_base(snapshot_base_path.clone());
         let backend_arc = Arc::new(backend);
 
         let builder = AgentConfigBuilder::new(registry, storage.clone(), llm)
@@ -435,7 +448,7 @@ impl UndoTestFixture {
             config_dir,
             storage,
             handle,
-            backend: GitSnapshotBackend::with_snapshot_base(snapshot_base_path),
+            backend: GitSnapshotBackend::new().with_snapshot_base(snapshot_base_path),
         })
     }
 

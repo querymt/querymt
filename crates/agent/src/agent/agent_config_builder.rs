@@ -703,14 +703,12 @@ impl AgentConfigBuilder {
         match exec.snapshot.backend.as_str() {
             "git" => {
                 use crate::snapshot::git::GitSnapshotBackend;
-                self.with_snapshot_backend(Arc::new(
-                    GitSnapshotBackend::new()
-                        .with_max_file_bytes(Some(exec.snapshot.max_file_bytes)),
-                ))
+                self.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()))
+                    .with_snapshot_gc_config(crate::snapshot::GcConfig::from(&exec.snapshot))
             }
             "none" | "" => self,
             other => {
-                log::warn!("Unknown snapshot backend '{}', ignoring", other);
+                tracing::warn!(backend = other, "unknown snapshot backend, ignoring");
                 self
             }
         }
@@ -948,5 +946,35 @@ mod tests {
         let (builder, _td) = make_builder().await;
         let config = builder.build();
         assert!(config.mcp_servers.is_empty());
+    }
+
+    // ── Snapshot retention ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn configured_retention_reaches_the_snapshot_store() {
+        use crate::config::ExecutionPolicy;
+        use crate::snapshot::GcConfig;
+        use std::num::{NonZeroU64, NonZeroUsize};
+
+        let mut exec = ExecutionPolicy::default();
+        exec.snapshot.backend = "git".to_string();
+        exec.snapshot.max_snapshots = NonZeroUsize::new(5);
+        exec.snapshot.max_age_days = NonZeroU64::new(2);
+        let (builder, _td) = make_builder().await;
+        let config = builder.with_snapshot_from_execution(&exec).build();
+        assert_eq!(
+            config.snapshot_gc_config,
+            GcConfig {
+                max_snapshots: NonZeroUsize::new(5),
+                max_age_days: NonZeroU64::new(2),
+            }
+        );
+
+        let mut unset = ExecutionPolicy::default();
+        unset.snapshot.backend = "git".to_string();
+        let (builder, _td) = make_builder().await;
+        let config = builder.with_snapshot_from_execution(&unset).build();
+        assert_eq!(config.snapshot_gc_config, GcConfig::default());
+        assert!(!config.snapshot_gc_config.is_enabled());
     }
 }

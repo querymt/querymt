@@ -278,56 +278,62 @@ pub(crate) async fn undo_impl(
             .diff(worktree, &pre_revert_snapshot, pre_snapshot)
             .await?;
     }
-    // Undo patches in reverse order
-    for (_turn_id, pre_snapshot, changed_paths) in all_patches.iter().rev() {
-        let paths: Vec<PathBuf> = changed_paths.iter().map(PathBuf::from).collect();
-        backend
-            .restore_paths(worktree, pre_snapshot, &paths)
-            .await?;
-        all_reverted_files.extend(changed_paths.iter().cloned());
-    }
-
-    // If no patches found, try a restore to the snapshot at the target message.
+    // If no patches were found, fall back to restoring the snapshot recorded at
+    // the target message. Everything that can reject the undo (provenance
+    // validation, resolving the snapshot, diffing) happens here, before any
+    // file is touched and before a redo frame exists: a rejected undo must
+    // leave no frame behind.
+    let mut fallback: Option<(String, Vec<PathBuf>)> = None;
     if all_patches.is_empty() {
-        // Inherited foreign-workspace fork snapshots are context-only: an
-        // undo landing on a message copied from the parent must not rewind
-        // this session's workspace to the parent's filesystem state. New
-        // turns made in this session remain fully undoable via the patch
-        // scan above; legacy same-workspace forks and non-forked sessions
-        // are unaffected.
+        for part in &history[target_idx].parts {
+            validate_snapshot_workspace(part, worktree)?;
+        }
         if target_idx < inherited_count {
-            // Nothing local can be undone here. Directly selecting a
-            // snapshot recorded in another workspace is a provenance error
-            // (spec: "Workspace binding mismatch"): fail before any
-            // restoration and before a redo frame is pushed, rather than
-            // reporting a success that restored no files.
-            for part in &history[target_idx].parts {
-                validate_snapshot_workspace(part, worktree)?;
-            }
+            // Inherited foreign-workspace fork snapshots are context-only: an
+            // undo landing on a message copied from the parent must not rewind
+            // this session's workspace to the parent's filesystem state.
             debug!("Undo: target message is inherited fork context; skipping snapshot restore");
-        } else {
-            for part in &history[target_idx].parts {
-                validate_snapshot_workspace(part, worktree)?;
-            }
-            for part in &history[target_idx].parts {
-                if let MessagePart::TurnSnapshotPatch { snapshot_id, .. } = part {
-                    debug!("Undo: fallback restore to snapshot {}", snapshot_id);
-                    let current_snapshot = backend.track(worktree).await?;
-                    let changed = backend
-                        .diff(worktree, &current_snapshot, snapshot_id)
-                        .await?;
-                    if !changed.is_empty() {
-                        backend
-                            .restore_paths(worktree, snapshot_id, &changed)
-                            .await?;
-                        all_reverted_files
-                            .extend(changed.iter().map(|p| p.to_string_lossy().to_string()));
-                    }
-                    break;
-                }
+        } else if let Some(snapshot_id) =
+            history[target_idx]
+                .parts
+                .iter()
+                .find_map(|part| match part {
+                    MessagePart::TurnSnapshotPatch { snapshot_id, .. } => Some(snapshot_id),
+                    _ => None,
+                })
+        {
+            debug!("Undo: fallback restore to snapshot {snapshot_id}");
+            let current_snapshot = backend.track(worktree).await?;
+            let changed = backend
+                .diff(worktree, &current_snapshot, snapshot_id)
+                .await?;
+            if !changed.is_empty() {
+                fallback = Some((snapshot_id.clone(), changed));
             }
         }
     }
+
+    // From here on files change. Run the restores as one unit so the redo
+    // frame below is recorded whether or not they succeed: a partially failed
+    // undo can always be redone back to the state before the undo.
+    let restore_result: Result<(), UndoError> = async {
+        // Undo patches in reverse order
+        for (_turn_id, pre_snapshot, changed_paths) in all_patches.iter().rev() {
+            let paths: Vec<PathBuf> = changed_paths.iter().map(PathBuf::from).collect();
+            backend
+                .restore_paths(worktree, pre_snapshot, &paths)
+                .await?;
+            all_reverted_files.extend(changed_paths.iter().cloned());
+        }
+        if let Some((snapshot_id, changed)) = &fallback {
+            backend
+                .restore_paths(worktree, snapshot_id, changed)
+                .await?;
+            all_reverted_files.extend(changed.iter().map(|p| p.to_string_lossy().into_owned()));
+        }
+        Ok(())
+    }
+    .await;
 
     // Store a new stacked revert frame for redo.
     let revert_state = crate::session::domain::RevertState {
@@ -342,12 +348,25 @@ pub(crate) async fn undo_impl(
         created_at: OffsetDateTime::now_utc(),
     };
 
-    provider
+    if let Err(e) = provider
         .history_store()
         .push_revert_state(session_id, revert_state)
         .await
-        .map_err(|e| UndoError::Store(format!("Failed to store revert state: {}", e)))?;
+    {
+        // Do not lose the restore failure behind the store failure.
+        if let Err(restore_error) = &restore_result {
+            tracing::warn!(
+                %session_id,
+                error = %restore_error,
+                "undo restore failed and its redo frame could not be stored"
+            );
+        }
+        return Err(UndoError::Store(format!(
+            "Failed to store revert state: {e}"
+        )));
+    }
 
+    restore_result?;
     tracing::Span::current().record("reverted_files", all_reverted_files.len());
 
     Ok(UndoResult {

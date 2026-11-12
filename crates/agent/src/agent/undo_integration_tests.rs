@@ -1042,6 +1042,15 @@ async fn test_fork_undo_treats_inherited_foreign_snapshots_as_context_only() -> 
         err.to_string().contains("workspace") || format!("{err:?}").contains("WorkspaceMismatch"),
         "expected an explicit provenance error, got: {err:?}"
     );
+    assert!(
+        fixture
+            .storage
+            .session_store()
+            .peek_revert_state(&child_id)
+            .await?
+            .is_none(),
+        "a rejected undo must not record a redo frame"
+    );
     assert_eq!(fixture.read_file("a.txt")?, "a-turn-one");
     assert_eq!(
         fixture.read_file_in(fork_workspace.path(), "a.txt").ok(),
@@ -1135,6 +1144,15 @@ async fn test_fork_undo_from_subdirectory_cwd_is_context_only() -> Result<()> {
         .undo(&child_id, &inherited_target)
         .await
         .expect_err("a directly selected foreign snapshot must be rejected");
+    assert!(
+        fixture
+            .storage
+            .session_store()
+            .peek_revert_state(&child_id)
+            .await?
+            .is_none(),
+        "a rejected undo must not record a redo frame"
+    );
     assert_eq!(fixture.read_file_in(&sub, "nested.txt")?, "edited");
 
     Ok(())
@@ -1273,5 +1291,392 @@ async fn test_undo_without_snapshot_backend_reports_unavailable_backend() -> Res
         "unexpected undo error without snapshot backend: {err:?}"
     );
 
+    Ok(())
+}
+
+// ==================== workspace-snapshots scenarios ====================
+
+use crate::test_utils::noise;
+
+const LARGE: usize = 17 * 1024 * 1024;
+
+/// One recorded turn: pre snapshot, `mutate`, post snapshot (with its patch).
+async fn run_turn(
+    fixture: &UndoTestFixture,
+    session: &str,
+    mutate: impl FnOnce(&std::path::Path) -> Result<()>,
+) -> Result<()> {
+    let (turn, pre) = fixture.take_pre_snapshot(session).await?;
+    mutate(fixture.worktree.path())?;
+    fixture.take_post_snapshot(session, &turn, &pre).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn large_file_is_captured_and_undone() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    let path = fixture.worktree.path().join("big.bin");
+    let original = noise(LARGE, 1);
+    std::fs::write(&path, &original)?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "edit").await?;
+
+    run_turn(&fixture, &session, |w| {
+        std::fs::write(w.join("big.bin"), noise(LARGE, 2))?;
+        Ok(())
+    })
+    .await?;
+    assert!(std::fs::read(&path)? != original);
+
+    fixture.undo(&session, &target).await?;
+
+    assert!(
+        std::fs::read(&path)? == original,
+        "the 17 MiB file must have its exact pre-turn content"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn undo_and_redo_of_a_file_that_grew_restore_both_versions() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    let path = fixture.worktree.path().join("grow.bin");
+    let small = noise(1024, 3);
+    let large = noise(LARGE, 4);
+    std::fs::write(&path, &small)?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "grow").await?;
+
+    run_turn(&fixture, &session, |w| {
+        std::fs::write(w.join("grow.bin"), noise(LARGE, 4))?;
+        Ok(())
+    })
+    .await?;
+
+    fixture.undo(&session, &target).await?;
+    assert!(std::fs::read(&path)? == small, "1 KiB content after undo");
+
+    let redo = fixture.redo(&session).await?;
+    assert!(redo.restored);
+    assert!(
+        std::fs::read(&path)? == large,
+        "exact 17 MiB content after redo"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn undo_leaves_ignored_files_alone() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file(".gitignore", "ignored.log\n")?;
+    fixture.write_file("kept.txt", "kept-original")?;
+    fixture.write_file("ignored.log", "ignored-original")?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "edit").await?;
+
+    run_turn(&fixture, &session, |w| {
+        std::fs::write(w.join("kept.txt"), "kept-modified")?;
+        std::fs::write(w.join("ignored.log"), "ignored-modified")?;
+        Ok(())
+    })
+    .await?;
+
+    fixture.undo(&session, &target).await?;
+
+    assert_eq!(fixture.read_file("kept.txt")?, "kept-original");
+    assert_eq!(fixture.read_file("ignored.log")?, "ignored-modified");
+    Ok(())
+}
+
+#[tokio::test]
+async fn undo_of_a_moved_file_restores_the_original_path() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file("a.txt", "moved content")?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "move").await?;
+
+    run_turn(&fixture, &session, |w| {
+        std::fs::rename(w.join("a.txt"), w.join("b.txt"))?;
+        Ok(())
+    })
+    .await?;
+
+    fixture.undo(&session, &target).await?;
+
+    assert_eq!(fixture.read_file("a.txt")?, "moved content");
+    assert!(!fixture.worktree.path().join("b.txt").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn redo_of_a_moved_file_moves_it_back() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file("a.txt", "moved content")?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "move").await?;
+
+    run_turn(&fixture, &session, |w| {
+        std::fs::rename(w.join("a.txt"), w.join("b.txt"))?;
+        Ok(())
+    })
+    .await?;
+    fixture.undo(&session, &target).await?;
+
+    let redo = fixture.redo(&session).await?;
+
+    assert!(redo.restored);
+    assert_eq!(fixture.read_file("b.txt")?, "moved content");
+    assert!(!fixture.worktree.path().join("a.txt").exists());
+    Ok(())
+}
+
+/// Replace file `name` with a directory that has content, so a restore of
+/// `name` cannot rename onto it.
+fn block_with_directory(fixture: &UndoTestFixture, name: &str) -> Result<()> {
+    let path = fixture.worktree.path().join(name);
+    std::fs::remove_file(&path)?;
+    std::fs::create_dir(&path)?;
+    std::fs::write(path.join("inner"), "x")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn undo_that_fails_while_restoring_can_be_redone() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file("a.txt", "a-original")?;
+    fixture.write_file("b.txt", "b-original")?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "edit").await?;
+    run_turn(&fixture, &session, |w| {
+        std::fs::write(w.join("a.txt"), "a-modified")?;
+        std::fs::write(w.join("b.txt"), "b-modified")?;
+        Ok(())
+    })
+    .await?;
+    block_with_directory(&fixture, "b.txt")?;
+
+    let error = fixture.undo(&session, &target).await.unwrap_err();
+
+    assert!(error.to_string().contains("b.txt"), "{error}");
+    assert!(
+        fixture
+            .storage
+            .session_store()
+            .peek_revert_state(&session)
+            .await?
+            .is_some(),
+        "a failed undo still records a redo frame"
+    );
+    std::fs::remove_dir_all(fixture.worktree.path().join("b.txt"))?;
+    let redo = fixture.redo(&session).await?;
+    assert!(redo.restored);
+    assert_eq!(
+        fixture.read_file("a.txt")?,
+        "a-modified",
+        "redo returns a.txt to its content before the undo"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn redo_that_fails_keeps_its_frame() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file("test.txt", "original")?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "edit").await?;
+    run_turn(&fixture, &session, |w| {
+        std::fs::write(w.join("test.txt"), "modified")?;
+        Ok(())
+    })
+    .await?;
+    fixture.undo(&session, &target).await?;
+    block_with_directory(&fixture, "test.txt")?;
+
+    let error = fixture.redo(&session).await.unwrap_err();
+
+    assert!(error.to_string().contains("test.txt"), "{error}");
+    assert!(
+        fixture
+            .storage
+            .session_store()
+            .peek_revert_state(&session)
+            .await?
+            .is_some(),
+        "a failed redo keeps its frame"
+    );
+    std::fs::remove_dir_all(fixture.worktree.path().join("test.txt"))?;
+    let redo = fixture.redo(&session).await?;
+    assert!(redo.restored);
+    assert_eq!(fixture.read_file("test.txt")?, "modified");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_delete_fails_the_restore() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Permission checks do not apply to root, so the failure cannot be
+    // provoked there. Say so instead of passing silently.
+    // SAFETY: `geteuid` has no preconditions, takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("SKIPPED failed_delete_fails_the_restore: running as root");
+        return Ok(());
+    }
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file("keep.txt", "keep")?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "create").await?;
+    run_turn(&fixture, &session, |w| {
+        std::fs::create_dir(w.join("sub"))?;
+        std::fs::write(w.join("sub/new.txt"), "new")?;
+        Ok(())
+    })
+    .await?;
+    let sub = fixture.worktree.path().join("sub");
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555))?;
+
+    let result = fixture.undo(&session, &target).await;
+    // Always restore permissions so the temp dir can be removed.
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755))?;
+
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("sub/new.txt"), "{error}");
+    assert!(sub.join("new.txt").exists());
+    Ok(())
+}
+
+fn gc_keep(n: usize) -> crate::snapshot::GcConfig {
+    crate::snapshot::GcConfig {
+        max_snapshots: std::num::NonZeroUsize::new(n),
+        max_age_days: None,
+    }
+}
+
+/// `count` extra changed snapshots, so earlier ones can be pruned.
+async fn churn(fixture: &UndoTestFixture, count: usize) -> Result<()> {
+    use crate::snapshot::SnapshotBackend;
+    for i in 0..count {
+        fixture.write_file("churn.txt", &format!("churn {i}"))?;
+        fixture.backend.track(fixture.worktree.path()).await?;
+    }
+    Ok(())
+}
+
+fn workspace_bytes(fixture: &UndoTestFixture) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(fixture.worktree.path())? {
+        let entry = entry?;
+        out.push((
+            entry.file_name().to_string_lossy().into_owned(),
+            std::fs::read(entry.path())?,
+        ));
+    }
+    out.sort();
+    Ok(out)
+}
+
+#[tokio::test]
+async fn undo_without_limits_reaches_the_first_turn() -> Result<()> {
+    use crate::snapshot::SnapshotBackend;
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file("f.txt", "v0")?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "go").await?;
+
+    for i in 1..=12 {
+        run_turn(&fixture, &session, |w| {
+            std::fs::write(w.join("f.txt"), format!("v{i}"))?;
+            std::fs::write(w.join(format!("t{i}.txt")), "turn file")?;
+            Ok(())
+        })
+        .await?;
+        fixture
+            .backend
+            .gc(
+                fixture.worktree.path(),
+                &crate::snapshot::GcConfig::default(),
+            )
+            .await?;
+    }
+
+    fixture.undo(&session, &target).await?;
+
+    assert_eq!(fixture.read_file("f.txt")?, "v0");
+    for i in 1..=12 {
+        assert!(!fixture.worktree.path().join(format!("t{i}.txt")).exists());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn undo_to_a_pruned_snapshot_changes_no_files() -> Result<()> {
+    use crate::snapshot::SnapshotBackend;
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file("test.txt", "original")?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "edit").await?;
+    run_turn(&fixture, &session, |w| {
+        std::fs::write(w.join("test.txt"), "modified")?;
+        Ok(())
+    })
+    .await?;
+    churn(&fixture, 12).await?;
+    let result = fixture
+        .backend
+        .gc(fixture.worktree.path(), &gc_keep(1))
+        .await?;
+    assert!(result.deleted_objects > 0, "content must really be deleted");
+    let before = workspace_bytes(&fixture)?;
+
+    let error = fixture.undo(&session, &target).await;
+
+    assert!(error.is_err(), "undo past the retention window must fail");
+    assert_eq!(before, workspace_bytes(&fixture)?);
+    assert!(
+        fixture
+            .storage
+            .session_store()
+            .peek_revert_state(&session)
+            .await?
+            .is_none(),
+        "an undo rejected before restoring records no redo frame"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn redo_to_a_pruned_snapshot_keeps_its_frame() -> Result<()> {
+    use crate::snapshot::SnapshotBackend;
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file("test.txt", "original")?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "edit").await?;
+    run_turn(&fixture, &session, |w| {
+        std::fs::write(w.join("test.txt"), "modified")?;
+        Ok(())
+    })
+    .await?;
+    fixture.undo(&session, &target).await?;
+    churn(&fixture, 12).await?;
+    let result = fixture
+        .backend
+        .gc(fixture.worktree.path(), &gc_keep(1))
+        .await?;
+    assert!(result.deleted_objects > 0);
+    let before = workspace_bytes(&fixture)?;
+
+    let error = fixture.redo(&session).await;
+
+    assert!(error.is_err(), "redo past the retention window must fail");
+    assert_eq!(before, workspace_bytes(&fixture)?);
+    assert!(
+        fixture
+            .storage
+            .session_store()
+            .peek_revert_state(&session)
+            .await?
+            .is_some(),
+        "the revert frame must still be present"
+    );
     Ok(())
 }

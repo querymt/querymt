@@ -4,6 +4,32 @@
 
 ### Behavior changes
 
+- **BREAKING: `.gitignore` applies to undo snapshots outside git repositories.**
+  Before, it was ignored there, so ignored files were snapshotted and could be
+  reverted by undo. `.ignore` and `.git/info/exclude` are honoured too; `.ignore`
+  is the way to opt paths out.
+- **Snapshot GC is supported and off by default.** `max_snapshots` and
+  `max_age_days` default to unset, and nothing is deleted unless one is set.
+- **BREAKING: setting `max_snapshots`/`max_age_days` now prunes and deletes old
+  snapshots for the whole workspace** (before, the values were ignored).
+  Undo/redo past the window fail without changing files.
+- **BREAKING: `max_snapshots = 0` or `max_age_days = 0` is a config load error.**
+  Remove the key, or use JSON `null`.
+- Snapshots cover files of every size (the unreleased `max_file_bytes` key is
+  removed; setting it is an unknown-field error). Large files are stored
+  uncompressed and restored by streaming.
+- New warnings for files of 64 MiB or more entering snapshots and for snapshot
+  stores of 5 GiB or more, both pointing to `.ignore`.
+- Undo of moved files now restores the original path. Undo and redo report
+  restore failures (writes are atomic and keep permissions), and a failed undo
+  still records a redo frame.
+- **BREAKING (Rust API):** `GitSnapshotBackend::with_snapshot_base` is public;
+  `SnapshotError` gains `Io`; `GcResult` gains `deleted_objects`;
+  `GcConfig` limits are `NonZero*` and `GcConfig::default()` has no limits.
+- Dev note: after running a `fix/snapshot` development build, clear
+  `querymt/snapshots` in the user cache dir (stores from that build may lack
+  large files).
+
 - **BREAKING: default system cache hints cover only the first and last section,
   and the Anthropic provider enforces its cache breakpoint limits.** For
   Anthropic, Codex and OpenAI Responses the agent no longer adds a default `cache`

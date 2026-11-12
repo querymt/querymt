@@ -149,10 +149,8 @@ backoff_multiplier = 2.0
 # Snapshot backend (undo/redo support)
 [agent.execution.snapshot]
 backend = "git"           # "git" or "none"
-max_snapshots = 100       # Maximum snapshots to keep
-max_age_days = 30         # Maximum age of snapshots
-max_file_bytes = 52428800 # Files larger than this (default 50 MiB) are left out of snapshots
-                          # (not covered by undo); 0 = no limit
+# max_snapshots = 100     # Optional: keep at most this many snapshots (>= 1)
+# max_age_days = 30       # Optional: prune snapshots older than this (>= 1)
 
 # Rate limit retry configuration
 [agent.execution.rate_limit]
@@ -160,6 +158,37 @@ max_retries = 3
 default_wait_secs = 60
 backoff_multiplier = 2.0
 ```
+
+#### Snapshot scope and retention
+
+Every file inside the snapshot scope is captured, whatever its size. The scope
+is decided by path:
+
+- `.gitignore` files are honoured, also in workspaces that are not git
+  repositories.
+- `.ignore` files are honoured. Use one to opt heavy paths (model weights,
+  datasets) out of undo, for example `*.gguf`.
+- `.git/info/exclude` is honoured. Global git excludes are not.
+- Files and directories whose name starts with `.` are never captured.
+
+Undo and redo do not touch paths outside the scope. Editing an ignore file
+during a session moves paths in or out of scope.
+
+Files of 16 MiB or more are stored uncompressed. A warning is logged when a file
+of 64 MiB or more enters snapshots, and once per process when a workspace's
+snapshot store reaches 5 GiB; both point to `.ignore`.
+
+`max_snapshots` and `max_age_days` are unset by default, which means **no
+snapshot is ever deleted**. Setting either key enables garbage collection after
+each turn:
+
+- Pruning applies to the whole workspace, which all sessions and delegates in
+  it share. A busy workspace can therefore prune a live session's early turns.
+- Content referenced only by pruned snapshots is deleted from disk once 10 or
+  more snapshots are pruned.
+- Undo or redo that needs a pruned snapshot fails before any file changes, and a
+  failed redo keeps its frame.
+- `0` is rejected at load time. In JSON, `null` leaves the key unset.
 
 ### Skills Configuration
 
