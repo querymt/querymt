@@ -2030,6 +2030,26 @@ mod turn_records {
     }
 
     #[tokio::test]
+    async fn patch_with_its_own_base_ignores_an_unrelated_preceding_start() -> Result<()> {
+        let fixture = UndoTestFixture::new().await?;
+        fixture.write_file("a.txt", "before")?;
+        let session = fixture.create_session().await?;
+        let stale = snapshot(&fixture).await?;
+        start(&fixture, &session, TurnId::new(), &stale).await?;
+        let target = fixture.add_user_message(&session, "edit").await?;
+        let pre = snapshot(&fixture).await?;
+        fixture.write_file("a.txt", "after")?;
+        // Fresh turn id but its own base: the unclaimed start before the
+        // target must not be paired with it.
+        patch(&fixture, &session, TurnId::new(), Some(&pre), &["a.txt"]).await?;
+
+        fixture.undo(&session, &target).await?;
+
+        assert_eq!(fixture.read_file("a.txt")?, "before");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn overlapping_turns_are_paired_by_turn_id() -> Result<()> {
         let fixture = UndoTestFixture::new().await?;
         fixture.write_file("a.txt", "v0")?;

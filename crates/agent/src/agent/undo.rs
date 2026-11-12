@@ -482,9 +482,9 @@ enum SnapshotRecord<'a> {
 /// as a whole).
 ///
 /// 1. The start with the patch's turn id.
-/// 2. Otherwise the record right before the patch, if it is a start that no
-///    patch in the history uses (records from builds that minted a fresh
-///    turn id for the start).
+/// 2. Otherwise, if the patch has no `base_snapshot_id`, the record right
+///    before the patch, if it is a start that no patch in the history uses
+///    (records from builds that minted a fresh turn id for the start).
 ///
 /// The base is the patch's own `base_snapshot_id`, else the start's snapshot.
 fn resolve_turn_patches(
@@ -557,6 +557,10 @@ fn resolve_turn_patches(
             continue;
         }
         let start = starts.get(turn_id).copied().or_else(|| {
+            // A patch with its own base needs no positional guess.
+            if base.is_some() {
+                return None;
+            }
             let (start_idx, part, start_turn, record) = records.get(pos.checked_sub(1)?)?;
             match record {
                 SnapshotRecord::Start { snapshot_id } if !claimed.contains(start_turn) => {

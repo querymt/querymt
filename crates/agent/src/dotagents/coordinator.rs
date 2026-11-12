@@ -498,7 +498,6 @@ impl DotagentsRuntimeCoordinator {
 
     /// Reconcile a single protocol task against its target.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     /// Resolve everything needed to reconcile one task, without writing anything.
     ///
     /// Trust is evaluated here, before any durable record exists. Returning

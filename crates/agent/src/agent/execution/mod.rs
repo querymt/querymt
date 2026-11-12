@@ -1274,6 +1274,8 @@ mod tests {
             )
             .with_request_overrides(overrides),
         );
+        let expected_run_id = exec_ctx.turn_id_string();
+        assert!(!expected_run_id.is_empty());
         let mut live_events = fixture.config.subscribe_events();
 
         let next = apply_pending_steering(
@@ -1304,7 +1306,9 @@ mod tests {
                 run_id,
                 client_input_id: Some(client_input_id),
                 blocks: stored_blocks,
-            } if run_id == "run-1" && client_input_id == "client-1" && stored_blocks == &blocks
+            } if run_id == &expected_run_id
+                && client_input_id == "client-1"
+                && stored_blocks == &blocks
         ));
 
         let mut observed = Vec::new();
