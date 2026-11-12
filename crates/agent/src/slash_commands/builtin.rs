@@ -6,7 +6,7 @@
 //! (prompt, queue, steering, scheduled) uses to recognise them.
 
 use crate::acp::protocol::{
-    AvailableCommand, AvailableCommandInput, ContentBlock, Error, UnstructuredCommandInput,
+    AvailableCommand, AvailableCommandInput, ContentBlock, UnstructuredCommandInput,
 };
 
 /// A natively handled slash command.
@@ -18,6 +18,18 @@ pub enum Builtin {
     /// `/worktree ...`: managed workspace administration. Runs only for local
     /// sessions on an agent with the workspace service enabled.
     Worktree,
+}
+
+/// Why a prompt that names a built-in cannot be accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BuiltinError {
+    /// A built-in must be the only block of its prompt.
+    #[error("{} requires a single text block", .0.name())]
+    NotSingleTextBlock(Builtin),
+    /// Steering text is appended to a live model run, where a built-in would
+    /// reach the model verbatim instead of running.
+    #[error("{} cannot steer a running turn; queue it or submit it with session/prompt", .0.name())]
+    CannotSteer(Builtin),
 }
 
 /// A parsed built-in invocation.
@@ -94,7 +106,12 @@ impl Builtin {
     /// command name (so `/compactor` or `/compact/foo` are not caught). It must
     /// be the only block; anything else is an error rather than silently
     /// reaching the model. Returns `Ok(None)` for every other prompt.
-    pub fn parse(prompt: &[ContentBlock]) -> Result<Option<BuiltinInvocation>, Error> {
+    ///
+    /// # Errors
+    ///
+    /// [`BuiltinError::NotSingleTextBlock`] when a built-in is accompanied by
+    /// other blocks.
+    pub fn parse(prompt: &[ContentBlock]) -> Result<Option<BuiltinInvocation>, BuiltinError> {
         let Some(ContentBlock::Text(text)) = prompt.first() else {
             return Ok(None);
         };
@@ -107,8 +124,7 @@ impl Builtin {
                 continue;
             }
             if prompt.len() != 1 {
-                return Err(Error::invalid_params()
-                    .data(format!("{} requires a single text block", builtin.name())));
+                return Err(BuiltinError::NotSingleTextBlock(builtin));
             }
             return Ok(Some(BuiltinInvocation {
                 builtin,
@@ -169,14 +185,32 @@ mod tests {
     fn a_builtin_must_be_the_only_block() {
         let mut two = text("/compact");
         two.extend(text("more"));
-        assert!(Builtin::parse(&two).is_err());
+        assert_eq!(
+            Builtin::parse(&two),
+            Err(BuiltinError::NotSingleTextBlock(Builtin::Compact))
+        );
         let mut two = text("/worktree list");
         two.extend(text("more"));
-        assert!(Builtin::parse(&two).is_err());
+        assert_eq!(
+            Builtin::parse(&two),
+            Err(BuiltinError::NotSingleTextBlock(Builtin::Worktree))
+        );
         // Not a built-in: any number of blocks passes through.
         let mut two = text("hello");
         two.extend(text("/compact"));
         assert!(Builtin::parse(&two).unwrap().is_none());
+    }
+
+    #[test]
+    fn errors_name_the_builtin() {
+        assert_eq!(
+            BuiltinError::NotSingleTextBlock(Builtin::Compact).to_string(),
+            "/compact requires a single text block"
+        );
+        assert_eq!(
+            BuiltinError::CannotSteer(Builtin::Worktree).to_string(),
+            "/worktree cannot steer a running turn; queue it or submit it with session/prompt"
+        );
     }
 
     #[test]

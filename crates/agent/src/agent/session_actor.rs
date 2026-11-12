@@ -2192,6 +2192,12 @@ impl Message<SubmitSessionInput> for SessionActor {
 
         match input.delivery {
             InputDelivery::Steer => {
+                // Built-ins run as their own turn; steered text would reach the
+                // model verbatim. Reject regardless of which path submitted it.
+                use crate::slash_commands::builtin::{Builtin, BuiltinError};
+                if let Some(invocation) = Builtin::parse(&input.prompt)? {
+                    return Err(BuiltinError::CannotSteer(invocation.builtin).into());
+                }
                 let llm_config = self
                     .config
                     .provider
@@ -2840,15 +2846,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     let client_prompt_id = client_prompt_id_from_meta(req.meta.as_ref());
     // One parser recognises every built-in. `/worktree` administration is only
     // valid through `session/prompt`, never as scheduled or queued model input.
-    let builtin = crate::slash_commands::builtin::Builtin::parse(&req.prompt).map_err(|error| {
-        AgentError::InvalidPromptContent {
-            message: error
-                .data
-                .as_ref()
-                .and_then(|data| data.as_str().map(str::to_owned))
-                .unwrap_or_else(|| error.message.clone()),
-        }
-    })?;
+    let builtin = crate::slash_commands::builtin::Builtin::parse(&req.prompt)?;
     if matches!(
         &builtin,
         Some(crate::slash_commands::builtin::BuiltinInvocation {
@@ -4163,6 +4161,26 @@ mod tests {
                 .is_some(),
             "lease must be released when the session no longer exists"
         );
+    }
+
+    #[tokio::test]
+    async fn steering_a_builtin_is_rejected_by_the_actor() {
+        let f = ActorFixture::new().await;
+        let mut submit = text_submit(&f._session_id, "/compact");
+        submit.input.delivery = InputDelivery::Steer;
+        submit.input.expected_run_id = Some("run-1".to_string());
+
+        let result = f.actor_ref.ask(submit).await;
+        let expected = crate::slash_commands::builtin::BuiltinError::CannotSteer(
+            crate::slash_commands::builtin::Builtin::Compact,
+        )
+        .to_string();
+        match result {
+            Err(kameo::error::SendError::HandlerError(AgentError::InvalidPromptContent {
+                message,
+            })) => assert_eq!(message, expected),
+            other => panic!("expected InvalidPromptContent, got {other:?}"),
+        }
     }
 
     #[tokio::test]

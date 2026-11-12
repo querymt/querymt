@@ -159,7 +159,7 @@ impl LocalAgentHandle {
         self.session_materializer
             .ensure_writable(&parsed.session_id)
             .await?;
-        use crate::slash_commands::builtin::Builtin;
+        use crate::slash_commands::builtin::{Builtin, BuiltinError};
         match Builtin::parse(&parsed.prompt)? {
             Some(inv) if inv.builtin == Builtin::Worktree => {
                 return Err(Error::invalid_request().data(
@@ -172,9 +172,7 @@ impl LocalAgentHandle {
                 if inv.builtin == Builtin::Compact
                     && delivery == crate::agent::messages::InputDelivery::Steer =>
             {
-                return Err(Error::invalid_request().data(
-                    "/compact cannot steer a running turn; queue it or submit it with session/prompt",
-                ));
+                return Err(BuiltinError::CannotSteer(inv.builtin).into());
             }
             _ => {}
         }

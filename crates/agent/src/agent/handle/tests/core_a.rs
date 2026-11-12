@@ -1825,8 +1825,12 @@ async fn steering_compact_is_rejected_but_queueing_it_is_allowed() {
         ))
         .await
         .expect_err("steering /compact must be rejected before reaching the model");
-    assert!(
-        format!("{err:?}").contains("cannot steer"),
+    assert_eq!(
+        err.message,
+        crate::slash_commands::builtin::BuiltinError::CannotSteer(
+            crate::slash_commands::builtin::Builtin::Compact
+        )
+        .to_string(),
         "unexpected error: {err:?}"
     );
     // Queueing is not rejected by the built-in guard (it runs when its turn starts).
@@ -1838,11 +1842,12 @@ async fn steering_compact_is_rejected_but_queueing_it_is_allowed() {
                 .unwrap()
                 .into(),
         ))
-        .await;
-    if let Err(err) = queued {
-        assert!(
-            !format!("{err:?}").contains("cannot steer"),
-            "queue must not hit the steering guard: {err:?}"
-        );
-    }
+        .await
+        .expect("queueing /compact must be accepted");
+    let body: serde_json::Value = serde_json::from_str(queued.0.get()).expect("valid JSON");
+    assert_eq!(body["status"], "started", "unexpected receipt: {body}");
+    assert!(
+        body["data"]["input_id"].is_string(),
+        "missing input_id: {body}"
+    );
 }
