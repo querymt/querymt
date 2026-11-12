@@ -143,7 +143,7 @@ impl SendAgent for LocalAgentHandle {
         &self,
         session_id: &str,
     ) -> Option<crate::acp::protocol::SessionNotification> {
-        self.slash_command_catalog(session_id).await
+        Some(self.slash_command_catalog(session_id).await)
     }
 
     fn as_any(&self) -> &dyn Any {

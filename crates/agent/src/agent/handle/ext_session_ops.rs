@@ -159,10 +159,24 @@ impl LocalAgentHandle {
         self.session_materializer
             .ensure_writable(&parsed.session_id)
             .await?;
-        if super::ext_worktree_ops::native_worktree_command(&parsed.prompt)?.is_some() {
-            return Err(Error::invalid_request().data(
-                "native /worktree administration uses session/prompt, not queued or steering input",
-            ));
+        use crate::slash_commands::builtin::Builtin;
+        match Builtin::parse(&parsed.prompt)? {
+            Some(inv) if inv.builtin == Builtin::Worktree => {
+                return Err(Error::invalid_request().data(
+                    "native /worktree administration uses session/prompt, not queued or steering input",
+                ));
+            }
+            // A queued `/compact` runs when its turn starts; steering input is
+            // appended to a live model run, where it would reach the model as text.
+            Some(inv)
+                if inv.builtin == Builtin::Compact
+                    && delivery == crate::agent::messages::InputDelivery::Steer =>
+            {
+                return Err(Error::invalid_request().data(
+                    "/compact cannot steer a running turn; queue it or submit it with session/prompt",
+                ));
+            }
+            _ => {}
         }
         let session_id = parsed.session_id.clone();
         #[cfg(feature = "remote")]

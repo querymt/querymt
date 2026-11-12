@@ -244,17 +244,14 @@ impl NativeCommand {
 pub(super) fn native_worktree_command(
     prompt: &[ContentBlock],
 ) -> Result<Option<Vec<String>>, Error> {
-    let Some(ContentBlock::Text(text)) = prompt.first() else {
-        return Ok(None);
-    };
-    let words: Vec<String> = text.text.split_whitespace().map(str::to_owned).collect();
-    if words.first().map(String::as_str) != Some("/worktree") {
-        return Ok(None);
-    }
-    if prompt.len() != 1 {
-        return Err(Error::invalid_params().data("worktree commands require a single text block"));
-    }
-    Ok(Some(words.into_iter().skip(1).collect()))
+    use crate::slash_commands::builtin::{Builtin, BuiltinInvocation};
+    Ok(match Builtin::parse(prompt)? {
+        Some(BuiltinInvocation {
+            builtin: Builtin::Worktree,
+            args,
+        }) => Some(args.split_whitespace().map(str::to_owned).collect()),
+        _ => None,
+    })
 }
 
 /// Session creation for [`WorktreeOps::create`] goes through the normal ACP

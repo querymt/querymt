@@ -95,7 +95,19 @@ Slash commands support fuzzy tab completion:
 
 ## Built-in Commands
 
-QueryMT includes several built-in commands:
+QueryMT includes several built-in commands.
+
+Two of them are handled natively by the agent and never reach the model:
+
+- `/compact [instructions]` summarizes the conversation now. It is always
+  available and cannot be turned off.
+- `/worktree ...` administers managed workspaces. It is only available for
+  local sessions on an agent with the workspace service enabled (see
+  [Git Worktree Workspaces](./worktrees.md)).
+
+A session advertises to ACP clients exactly the commands it can run: its user
+commands plus the native built-ins available on its host. A session hosted on a
+remote mesh node currently advertises only `/compact`.
 
 ### `/help [command]`
 
@@ -301,6 +313,8 @@ The filename determines the command name:
 - Hyphens allowed: `code-review.md` → `/code-review`
 - Case-insensitive matching
 - No spaces in filenames
+- `compact` and `worktree` are reserved for the native built-ins: a command
+  file with either name is skipped with a warning
 
 ### Command Discovery
 

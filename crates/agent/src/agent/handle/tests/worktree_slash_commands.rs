@@ -244,7 +244,7 @@ async fn managed_sessions_expand_and_advertise_their_own_checkout_commands() {
     let child_id = created["session_id"].as_str().unwrap().to_owned();
     let checkout = std::path::PathBuf::from(created["checkout_path"].as_str().unwrap());
 
-    let catalog = f.handle.slash_command_catalog(&child_id).await.unwrap();
+    let catalog = f.handle.slash_command_catalog(&child_id).await;
     let names = advertised_names(&catalog);
     assert!(names.contains(&"/deploy".to_string()), "names: {names:?}");
     assert!(names.contains(&"/worktree".to_string()), "names: {names:?}");
@@ -285,7 +285,7 @@ async fn managed_sessions_expand_and_advertise_their_own_checkout_commands() {
         .await
         .unwrap();
 
-    let catalog = f.handle.slash_command_catalog(&child_id).await.unwrap();
+    let catalog = f.handle.slash_command_catalog(&child_id).await;
     let names = advertised_names(&catalog);
     assert!(
         names.contains(&"/isolated-only".to_string()),
@@ -393,7 +393,7 @@ async fn shared_child_in_a_managed_checkout_uses_the_checkout_commands() {
         .expect("a shared child attaches to its owner's managed checkout");
     let shared_id = shared.session_id.to_string();
 
-    let catalog = f.handle.slash_command_catalog(&shared_id).await.unwrap();
+    let catalog = f.handle.slash_command_catalog(&shared_id).await;
     let names = advertised_names(&catalog);
     assert!(names.contains(&"/deploy".to_string()), "names: {names:?}");
     assert!(
@@ -473,7 +473,7 @@ async fn active_session_catalog_and_invocation_share_one_registry() {
     .unwrap();
 
     for session_id in [&owner_id, &shared_id] {
-        let catalog = f.handle.slash_command_catalog(session_id).await.unwrap();
+        let catalog = f.handle.slash_command_catalog(session_id).await;
         let names = advertised_names(&catalog);
         assert!(names.contains(&"/deploy".to_string()), "names: {names:?}");
         assert!(
@@ -498,7 +498,7 @@ async fn active_session_catalog_and_invocation_share_one_registry() {
         ))
         .await
         .unwrap();
-    let catalog = f.handle.slash_command_catalog(&owner_id).await.unwrap();
+    let catalog = f.handle.slash_command_catalog(&owner_id).await;
     assert!(advertised_names(&catalog).contains(&"/late".to_string()));
     prompt(&f.handle, &owner_id, "/late again").await.unwrap();
     assert!(
@@ -581,7 +581,7 @@ async fn native_worktree_interception_and_command_policy_are_preserved() {
         .await
         .unwrap();
     let child_id = created["session_id"].as_str().unwrap().to_owned();
-    let catalog = f.handle.slash_command_catalog(&child_id).await.unwrap();
+    let catalog = f.handle.slash_command_catalog(&child_id).await;
     let names = advertised_names(&catalog);
     assert_eq!(
         names.iter().filter(|name| *name == "/worktree").count(),

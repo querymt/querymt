@@ -258,6 +258,19 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
+    /// The user slash commands this session expands prompts with, and
+    /// therefore the only ones it may advertise: the registry resolved from
+    /// its bound checkout, else the agent-level `startup` registry.
+    pub fn effective_slash_registry<'a>(
+        &'a self,
+        startup: &'a crate::slash_commands::SlashCommandRegistry,
+    ) -> &'a crate::slash_commands::SlashCommandRegistry {
+        self.slash_registry
+            .get()
+            .map(Arc::as_ref)
+            .unwrap_or(startup)
+    }
+
     /// The session's accounting projection, hydrated once per runtime.
     ///
     /// The projection is the sink's shared one for the session, so work that

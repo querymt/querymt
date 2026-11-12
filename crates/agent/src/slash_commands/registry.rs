@@ -1,3 +1,4 @@
+use crate::slash_commands::builtin::Builtin;
 use crate::slash_commands::discovery;
 use crate::slash_commands::types::{
     SlashCommand, SlashCommandDiagnostic, SlashCommandScriptsConfig, SlashCommandSource,
@@ -28,15 +29,12 @@ impl SlashCommandRegistry {
         sources: &[SlashCommandSource],
         scripts_config: &SlashCommandScriptsConfig,
     ) -> (Self, Vec<SlashCommandDiagnostic>) {
-        let (commands, diagnostics) = discovery::discover_all(sources);
+        let (commands, mut diagnostics) = discovery::discover_all(sources);
         let mut registry = Self {
             by_name: HashMap::new(),
             scripts_enabled: scripts_config.enabled,
         };
-
-        for cmd in commands {
-            registry.register(cmd);
-        }
+        registry.register_discovered(commands, &mut diagnostics);
 
         (registry, diagnostics)
     }
@@ -68,8 +66,32 @@ impl SlashCommandRegistry {
     }
 
     /// Register a single command. Later registrations of the same name overwrite.
+    ///
+    /// Built-in names (see [`Builtin`]) are reserved: they are handled
+    /// natively and can never be user commands, so such a command is ignored.
     pub fn register(&mut self, command: SlashCommand) {
+        if Builtin::is_reserved(&command.name) {
+            return;
+        }
         self.by_name.insert(command.name.clone(), Arc::new(command));
+    }
+
+    /// Register discovered commands, reporting reserved names as diagnostics.
+    fn register_discovered(
+        &mut self,
+        commands: Vec<SlashCommand>,
+        diagnostics: &mut Vec<SlashCommandDiagnostic>,
+    ) {
+        for cmd in commands {
+            if Builtin::is_reserved(&cmd.name) {
+                diagnostics.push(SlashCommandDiagnostic {
+                    path: cmd.path.clone(),
+                    message: format!("'/{}' is a reserved built-in command name", cmd.name),
+                });
+                continue;
+            }
+            self.register(cmd);
+        }
     }
 
     /// Look up a command by name.
@@ -131,13 +153,11 @@ impl SlashCommandRegistry {
         let sources =
             discovery::search_paths(project_root, include_global, include_project, extra_paths);
 
-        let (commands, diagnostics) = discovery::discover_all(&sources);
+        let (commands, mut diagnostics) = discovery::discover_all(&sources);
 
         self.by_name.clear();
         self.scripts_enabled = scripts_config.enabled;
-        for cmd in commands {
-            self.register(cmd);
-        }
+        self.register_discovered(commands, &mut diagnostics);
 
         diagnostics
     }
@@ -172,6 +192,48 @@ mod tests {
             },
             requires_script,
         }
+    }
+
+    #[test]
+    fn builtin_names_are_reserved_and_reported_from_discovery() {
+        let dir = TempDir::new().unwrap();
+        for name in ["compact", "worktree", "deploy"] {
+            fs::write(
+                dir.path().join(format!("{name}.md")),
+                "---\ndescription: A command\n---\nBody\n",
+            )
+            .unwrap();
+        }
+        let sources = vec![SlashCommandSource::Global(dir.path().to_path_buf())];
+        let (reg, diagnostics) =
+            SlashCommandRegistry::from_sources(&sources, &SlashCommandScriptsConfig::default());
+        assert_eq!(reg.names(), vec!["deploy"]);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(diagnostics.iter().all(|d| d.message.contains("reserved")));
+    }
+
+    #[test]
+    fn reload_and_register_also_refuse_reserved_names() {
+        let mut reg = SlashCommandRegistry::new();
+        reg.register(make_command("compact", "Mine", false));
+        reg.register(make_command("worktree", "Mine", false));
+        assert!(reg.is_empty());
+
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("compact.md"),
+            "---\ndescription: A command\n---\nBody\n",
+        )
+        .unwrap();
+        let diagnostics = reg.reload(
+            None,
+            false,
+            false,
+            &[dir.path().to_path_buf()],
+            &SlashCommandScriptsConfig::default(),
+        );
+        assert!(reg.is_empty());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     }
 
     #[test]

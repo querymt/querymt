@@ -139,85 +139,110 @@ impl LocalAgentHandle {
         self.profiles.load_full().as_ref().clone()
     }
 
-    /// Catalog belonging to the runtime that owns `session_id`.
+    /// The command catalog a session advertises: exactly what submitting a
+    /// prompt in that session would run.
     ///
-    /// Profile sessions use that profile's registry, not this handle's.
+    /// - User commands come from the session's own host: the profile runtime
+    ///   it is bound to, else this handle. A live session reports the registry
+    ///   it expands prompts with; an idle one re-resolves from its checkout.
+    ///   A session whose profile cannot be loaded, or that lives on a mesh
+    ///   peer (whose commands are not visible here), has none.
+    /// - Built-ins come from [`Builtin`](crate::slash_commands::builtin::Builtin)
+    ///   filtered by what the host can run. `/compact` is always present.
     pub(crate) async fn slash_command_catalog(
         &self,
         session_id: &str,
-    ) -> Option<crate::acp::protocol::SessionNotification> {
-        let registry = if let Some(profiles) = self.profiles() {
-            if let Some(binding) = profiles.session_binding(session_id).await {
-                profiles
-                    .runtime_for_profile(&binding.profile_id)
-                    .await
-                    .ok()?
-                    .agent()
-                    .handle()
-                    .config
-                    .slash_command_registry
-                    .clone()
-            } else {
-                self.config.slash_command_registry.clone()
-            }
+    ) -> crate::acp::protocol::SessionNotification {
+        use crate::slash_commands::builtin::{Builtin, BuiltinHost};
+
+        let remote = matches!(
+            self.session_ref_for_agent_session(session_id).await,
+            Ok(actor) if actor.is_remote()
+        );
+        let mut workspace_service = false;
+        let mut update = if remote {
+            crate::acp::protocol::AvailableCommandsUpdate::new(Vec::new())
         } else {
-            self.config.slash_command_registry.clone()
+            let bound = match self.bound_session_handle(session_id).await {
+                Ok(bound) => bound.map(|(handle, _)| handle),
+                Err(error) => {
+                    log::debug!(
+                        "slash catalog: profile runtime lookup failed for session {session_id}: {error}"
+                    );
+                    return Self::catalog_notification(
+                        session_id,
+                        crate::acp::protocol::AvailableCommandsUpdate::new(Vec::new()),
+                        BuiltinHost {
+                            local: true,
+                            workspace_service: false,
+                        },
+                    );
+                }
+            };
+            let host = bound
+                .as_deref()
+                .and_then(|handle| handle.as_any().downcast_ref::<LocalAgentHandle>())
+                .unwrap_or(self);
+            workspace_service = host.config.workspace_service().is_some();
+            let registry = host.session_user_registry(session_id).await;
+            crate::slash_commands::acp::registry_to_acp_update(&registry)
         };
-        // Prompt sources resolve from the session's bound checkout when it
-        // participates in workspace isolation, so prompts and prompt
-        // includes reflect the workspace's contents instead of the agent
-        // builder's working directory. Local sessions keep the registry
-        // built at agent startup.
-        //
-        // A live session advertises exactly the registry it expands prompts
-        // with (installed once at materialization), so the catalog and
-        // invocation cannot diverge while the session is active. Only
-        // sessions without a live local actor re-resolve from the checkout.
-        let registry = match self.live_session_slash_registry(session_id).await {
-            Some(Some(live)) => (*live).clone(),
-            Some(None) => registry,
-            None => self
-                .workspace_catalog_registry(session_id)
-                .await
-                .unwrap_or(registry),
-        };
-        let mut update = crate::slash_commands::acp::registry_to_acp_update(&registry);
-        // Built-ins take priority over user commands of the same name.
         update
             .available_commands
-            .retain(|cmd| cmd.name != crate::slash_commands::builtin::COMPACT_COMMAND);
-        update
-            .available_commands
-            .push(crate::slash_commands::builtin::compact_available_command());
-        if self.config.workspace_service().is_some() {
-            update
-                .available_commands
-                .retain(|cmd| cmd.name != "/worktree");
-            update.available_commands.push(crate::acp::protocol::AvailableCommand::new(
-                "/worktree", "Create, hand off, archive and inspect isolated sessions; conservative removal, no automatic integration",
-            ).input(crate::acp::protocol::AvailableCommandInput::Unstructured(
-                crate::acp::protocol::UnstructuredCommandInput::new("create [ref] [name] | create --include-local-changes [name] | list | status [id] | result [id] | publish [id] | handoff [name] [--summary] | archive [id] | remove [id] [--archive] | recover <id>"),
-            )));
-        }
-        if update.available_commands.is_empty() {
-            return None;
-        }
-        Some(crate::acp::protocol::SessionNotification::new(
-            session_id.to_owned(),
-            crate::acp::protocol::SessionUpdate::AvailableCommandsUpdate(update),
-        ))
+            .retain(|cmd| !Builtin::is_reserved(cmd.name.trim_start_matches('/')));
+        Self::catalog_notification(
+            session_id,
+            update,
+            BuiltinHost {
+                local: !remote,
+                workspace_service,
+            },
+        )
     }
 
-    /// The slash registry of the live local session actor.
+    /// Append the built-ins `host` can run to `update`.
+    fn catalog_notification(
+        session_id: &str,
+        mut update: crate::acp::protocol::AvailableCommandsUpdate,
+        host: crate::slash_commands::builtin::BuiltinHost,
+    ) -> crate::acp::protocol::SessionNotification {
+        update.available_commands.extend(
+            crate::slash_commands::builtin::Builtin::ALL
+                .into_iter()
+                .filter(|builtin| builtin.available(host))
+                .map(crate::slash_commands::builtin::Builtin::entry),
+        );
+        crate::acp::protocol::SessionNotification::new(
+            session_id.to_owned(),
+            crate::acp::protocol::SessionUpdate::AvailableCommandsUpdate(update),
+        )
+    }
+
+    /// The user commands a locally hosted session on this handle runs.
     ///
-    /// - `None`: no live local actor for `session_id`.
-    /// - `Some(None)`: live session without a session-scoped registry
-    ///   (legacy local session; the agent-level registry applies).
-    /// - `Some(Some(registry))`: the registry the actor expands with.
+    /// A live session reports exactly the registry it expands prompts with
+    /// ([`SessionRuntime::effective_slash_registry`]), so catalog and
+    /// invocation cannot diverge. A session without a live actor re-resolves
+    /// from its bound checkout, falling back to this handle's registry.
+    async fn session_user_registry(
+        &self,
+        session_id: &str,
+    ) -> crate::slash_commands::SlashCommandRegistry {
+        if let Some(live) = self.live_session_slash_registry(session_id).await {
+            return (*live).clone();
+        }
+        match self.workspace_catalog_registry(session_id).await {
+            Some(registry) => registry,
+            None => self.config.slash_command_registry.clone(),
+        }
+    }
+
+    /// The registry the live local session actor expands prompts with, or
+    /// `None` when `session_id` has no live local actor.
     async fn live_session_slash_registry(
         &self,
         session_id: &str,
-    ) -> Option<Option<Arc<crate::slash_commands::SlashCommandRegistry>>> {
+    ) -> Option<Arc<crate::slash_commands::SlashCommandRegistry>> {
         let actor = {
             let registry = self.registry_lock().await;
             registry.local_actor_ref(session_id).cloned()

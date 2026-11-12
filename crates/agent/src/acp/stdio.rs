@@ -1220,8 +1220,15 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         .on_receive_request(
             {
                 let agent = agent.clone();
+                let bridge_sender = bridge_sender.clone();
                 async move |req: ForkSessionRequest, responder, _cx| {
-                    responder.respond_with_result(agent.fork_session(req).await)
+                    let result = agent.fork_session(req).await;
+                    let fork_id = result.as_ref().ok().map(|r| r.session_id.to_string());
+                    let send_result = responder.respond_with_result(result);
+                    if let Some(fork_id) = fork_id {
+                        advertise_available_commands(&agent, &bridge_sender, &fork_id).await;
+                    }
+                    send_result
                 }
             },
             acp::on_receive_request!(),
@@ -1291,14 +1298,33 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         .on_receive_dispatch(
             {
                 let agent = agent.clone();
+                let bridge_sender = bridge_sender.clone();
                 async move |dispatch: acp::Dispatch<ClientRequest, ClientNotification>, _cx| {
                     match dispatch {
                         acp::Dispatch::Request(ClientRequest::ExtMethodRequest(req), responder) => {
-                            let ext_value = agent.ext_method(req).await.and_then(|resp| {
-                                serde_json::from_str(resp.0.get())
-                                    .map_err(|e| acp::Error::internal_error().data(e.to_string()))
+                            let method = req.method.to_string();
+                            let params: serde_json::Value =
+                                serde_json::from_str(req.params.get()).unwrap_or_default();
+                            let ext_value: Result<serde_json::Value, acp::Error> =
+                                agent.ext_method(req).await.and_then(|resp| {
+                                    serde_json::from_str(resp.0.get()).map_err(|e| {
+                                        acp::Error::internal_error().data(e.to_string())
+                                    })
+                                });
+                            // A remote attach binds a session to this connection
+                            // without session/new|load|resume, so advertise its
+                            // slash-command catalog here, after the response.
+                            let attached = ext_value.as_ref().ok().and_then(|value| {
+                                crate::acp::shared::remote_attached_session_id(
+                                    &method, &params, value,
+                                )
                             });
-                            responder.respond_with_result(ext_value)?;
+                            let send_result = responder.respond_with_result(ext_value);
+                            if let Some(session_id) = attached {
+                                advertise_available_commands(&agent, &bridge_sender, &session_id)
+                                    .await;
+                            }
+                            send_result?;
                             Ok(acp::Handled::Yes)
                         }
                         acp::Dispatch::Notification(ClientNotification::ExtNotification(notif)) => {

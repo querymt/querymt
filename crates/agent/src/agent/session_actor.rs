@@ -1461,15 +1461,18 @@ impl Message<GetSessionLimits> for SessionActor {
 }
 
 impl Message<crate::agent::messages::GetSessionSlashRegistry> for SessionActor {
-    type Reply =
-        Result<Option<Arc<crate::slash_commands::SlashCommandRegistry>>, kameo::error::Infallible>;
+    type Reply = Result<Arc<crate::slash_commands::SlashCommandRegistry>, kameo::error::Infallible>;
 
     async fn handle(
         &mut self,
         _msg: crate::agent::messages::GetSessionSlashRegistry,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        Ok(self.runtime.slash_registry.get().cloned())
+        Ok(Arc::new(
+            self.runtime
+                .effective_slash_registry(&self.config.slash_command_registry)
+                .clone(),
+        ))
     }
 }
 
@@ -2835,8 +2838,24 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         req.prompt.len()
     );
     let client_prompt_id = client_prompt_id_from_meta(req.meta.as_ref());
-    if req.prompt.iter().any(|block| matches!(block,
-        crate::acp::protocol::ContentBlock::Text(text) if text.text.split_whitespace().next() == Some("/worktree"))) {
+    // One parser recognises every built-in. `/worktree` administration is only
+    // valid through `session/prompt`, never as scheduled or queued model input.
+    let builtin = crate::slash_commands::builtin::Builtin::parse(&req.prompt).map_err(|error| {
+        AgentError::InvalidPromptContent {
+            message: error
+                .data
+                .as_ref()
+                .and_then(|data| data.as_str().map(str::to_owned))
+                .unwrap_or_else(|| error.message.clone()),
+        }
+    })?;
+    if matches!(
+        &builtin,
+        Some(crate::slash_commands::builtin::BuiltinInvocation {
+            builtin: crate::slash_commands::builtin::Builtin::Worktree,
+            ..
+        })
+    ) {
         return Err(AgentError::InvalidPromptContent {
             message: "native /worktree administration must be submitted through session/prompt, not scheduled or queued model input".to_string(),
         });
@@ -2973,13 +2992,17 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     // 3b. Native `/compact [instructions]`: compact now, no model turn.
     // Built-ins are matched before registry expansion so they take priority
     // over user-defined commands of the same name.
-    if let Some(command) = crate::slash_commands::builtin::native_compact_command(&req.prompt) {
+    if let Some(command) = builtin
+        .as_ref()
+        .filter(|command| command.builtin == crate::slash_commands::builtin::Builtin::Compact)
+    {
         log::info!("Session {}: manual compaction requested", session_id);
+        let instructions = (!command.args.is_empty()).then_some(command.args.as_str());
         let outcome = crate::agent::execution::compact_history(
             &config,
             &mut exec_ctx,
             crate::agent::execution::TRIGGER_MANUAL,
-            command.instructions.as_deref(),
+            instructions,
         )
         .await;
         return match outcome {
@@ -3039,11 +3062,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     // Managed sessions expand against the registry resolved from their
     // bound checkout, matching the advertised catalog; legacy local
     // sessions keep the agent-level registry built at startup.
-    let slash_registry = runtime
-        .slash_registry
-        .get()
-        .map(Arc::as_ref)
-        .unwrap_or(&config.slash_command_registry);
+    let slash_registry = runtime.effective_slash_registry(&config.slash_command_registry);
     if let Some(crate::acp::protocol::ContentBlock::Text(text_content)) = req.prompt.first()
         && let Some(expansion) =
             crate::slash_commands::try_expand(&text_content.text, slash_registry)
