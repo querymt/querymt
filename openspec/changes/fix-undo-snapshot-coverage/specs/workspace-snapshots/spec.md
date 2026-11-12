@@ -23,7 +23,7 @@ A snapshot SHALL capture the full content of every regular file inside the snaps
 - **THEN** loading fails with an unknown-field error naming `max_file_bytes`
 
 ### Requirement: Files that change during capture are still captured
-A file whose size or content changes while a snapshot reads it SHALL NOT be left out and SHALL NOT be captured truncated. The snapshot SHALL capture a complete copy of the file taken during the snapshot.
+A file whose size or content changes while a snapshot reads it SHALL NOT be left out and SHALL NOT be captured truncated. The snapshot SHALL capture a complete copy of the file taken during the snapshot. When no stable copy can be obtained because the file keeps changing across every retry, the snapshot SHALL fail with an error naming the file rather than record a partial or stale version.
 
 #### Scenario: File that shrinks during capture is captured
 - **WHEN** a file is shorter at read time than when the snapshot listed it
@@ -94,7 +94,7 @@ When a file of 64 MiB or more is captured and the previous snapshot of the works
 - **THEN** ten warnings name individual files and one warning reports 2 more files
 
 ### Requirement: Large files are cheap to store and restore
-Files of 16 MiB or more SHALL be stored without compression in the snapshot store, which SHALL stay a plain git object store readable by `git`. Restoring such a file SHALL NOT hold its whole content in memory.
+Files of 16 MiB or more SHALL be stored without compression in the snapshot store, which SHALL stay a plain git object store readable by `git`. Restoring such a file stored as a loose object (the only form the backend writes) SHALL NOT hold its whole content in memory.
 
 #### Scenario: Large file is stored uncompressed and readable by git
 - **WHEN** a 17 MiB file is captured

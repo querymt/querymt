@@ -936,11 +936,12 @@ fn test_concurrent_snapshots_leave_valid_cache_and_no_temp_files() {
         .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
         .count();
     assert_eq!(leftovers, 0, "no temp files may be left behind");
-    let repo = repo_for(&backend, tmpdir.path());
-    assert_eq!(
-        GitSnapshotBackend::load_stat_cache(&repo).version,
-        STAT_CACHE_VERSION
-    );
+    // `load_stat_cache` falls back to an empty cache on corruption, so parse
+    // the persisted file directly.
+    let bytes = fs::read(git_dir.join(STAT_CACHE_FILE)).unwrap();
+    let persisted: StatCache =
+        serde_json::from_slice(&bytes).expect("concurrent saves leave valid cache JSON");
+    assert_eq!(persisted.version, STAT_CACHE_VERSION);
 }
 
 // ==================== Scenario tests (workspace-snapshots) ====================
@@ -1910,4 +1911,156 @@ fn stream_capture_reports_the_bytes_it_read() {
         .unwrap();
 
     assert_eq!(captured.bytes, 4096, "the real size, not the listed one");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn restore_does_not_follow_a_symlinked_parent_out_of_the_worktree() {
+    let work = TempDir::new().unwrap();
+    let base = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    fs::write(work.path().join("keep.txt"), "k").unwrap();
+    let backend = GitSnapshotBackend::new().with_snapshot_base(base.path());
+    // A snapshot that lacks `sub/file.txt`: restoring it deletes that path.
+    let without = backend.track(work.path()).await.unwrap();
+    fs::create_dir(work.path().join("sub")).unwrap();
+    fs::write(work.path().join("sub/file.txt"), "inside").unwrap();
+    let with = backend.track(work.path()).await.unwrap();
+
+    // The directory is swapped for a symlink after the snapshots.
+    fs::remove_dir_all(work.path().join("sub")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), work.path().join("sub")).unwrap();
+    fs::write(outside.path().join("file.txt"), "outside").unwrap();
+
+    let paths = [PathBuf::from("sub/file.txt")];
+    assert!(
+        backend
+            .restore_paths(work.path(), &with, &paths)
+            .await
+            .is_err()
+    );
+    assert!(
+        backend
+            .restore_paths(work.path(), &without, &paths)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(outside.path().join("file.txt")).unwrap(),
+        "outside",
+        "neither write nor delete may escape through the symlink"
+    );
+}
+
+#[tokio::test]
+async fn full_restore_rewrites_nested_files_through_the_confined_root() {
+    let work = TempDir::new().unwrap();
+    let base = TempDir::new().unwrap();
+    fs::create_dir(work.path().join("d")).unwrap();
+    fs::write(work.path().join("d/a.txt"), "one").unwrap();
+    let backend = GitSnapshotBackend::new().with_snapshot_base(base.path());
+    let id = backend.track(work.path()).await.unwrap();
+    fs::write(work.path().join("d/a.txt"), "two").unwrap();
+
+    backend.restore(work.path(), &id).await.unwrap();
+
+    assert_eq!(
+        fs::read_to_string(work.path().join("d/a.txt")).unwrap(),
+        "one"
+    );
+}
+
+#[tokio::test]
+async fn restore_paths_rejects_parent_traversal() {
+    let work = TempDir::new().unwrap();
+    let base = TempDir::new().unwrap();
+    fs::write(work.path().join("a.txt"), "a").unwrap();
+    let backend = GitSnapshotBackend::new().with_snapshot_base(base.path());
+    let id = backend.track(work.path()).await.unwrap();
+
+    let result = backend
+        .restore_paths(work.path(), &id, &[PathBuf::from("../escape.txt")])
+        .await;
+
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn uncaptured_paths_reports_files_outside_the_snapshot() {
+    let work = TempDir::new().unwrap();
+    let base = TempDir::new().unwrap();
+    fs::write(work.path().join("kept.txt"), "k").unwrap();
+    fs::write(work.path().join(".ignore"), "ignored.txt\n").unwrap();
+    fs::write(work.path().join("ignored.txt"), "i").unwrap();
+    let backend = GitSnapshotBackend::new().with_snapshot_base(base.path());
+    let id = backend.track(work.path()).await.unwrap();
+
+    let uncaptured = backend
+        .uncaptured_paths(
+            work.path(),
+            &id,
+            &[
+                PathBuf::from("kept.txt"),
+                PathBuf::from("ignored.txt"),
+                PathBuf::from("gone.txt"),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(uncaptured, vec![PathBuf::from("ignored.txt")]);
+}
+
+#[tokio::test]
+async fn restore_batch_with_a_missing_snapshot_changes_no_files() {
+    let work = TempDir::new().unwrap();
+    let base = TempDir::new().unwrap();
+    fs::write(work.path().join("a.txt"), "one").unwrap();
+    let backend = GitSnapshotBackend::new().with_snapshot_base(base.path());
+    let id = backend.track(work.path()).await.unwrap();
+    fs::write(work.path().join("a.txt"), "two").unwrap();
+
+    let missing = "0".repeat(40);
+    let result = backend
+        .restore_batch(
+            work.path(),
+            &[
+                (id, vec![PathBuf::from("a.txt")]),
+                (missing, vec![PathBuf::from("a.txt")]),
+            ],
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        fs::read_to_string(work.path().join("a.txt")).unwrap(),
+        "two",
+        "every snapshot is resolved before the first file changes"
+    );
+}
+
+#[tokio::test]
+async fn small_file_that_no_longer_matches_its_listing_is_captured_from_a_copy() {
+    let work = TempDir::new().unwrap();
+    let base = TempDir::new().unwrap();
+    let backend = GitSnapshotBackend::new()
+        .with_snapshot_base(base.path())
+        .with_limits(small_limits());
+    let repo = backend.open_or_init(work.path()).unwrap();
+    let path = work.path().join("small.txt");
+    fs::write(&path, "twenty bytes of data").unwrap();
+
+    let captured = backend
+        .capture_file(
+            &repo,
+            &path,
+            ListedFile {
+                size: 5,
+                stamp: None,
+            },
+        )
+        .unwrap();
+
+    assert!(captured.copied, "a stale listing must not be trusted");
+    assert_eq!(captured.bytes, 20);
 }

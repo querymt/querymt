@@ -22,7 +22,9 @@
   stores of 5 GiB or more, both pointing to `.ignore`.
 - Undo of moved files now restores the original path. Undo and redo report
   restore failures (writes are atomic and keep permissions), and a failed undo
-  still records a redo frame.
+  still records a redo frame. That frame never deletes history and is discarded
+  by the next prompt; `undo_stack` entries (`querymt/session/undoStack`, undo
+  and redo responses) gain `restore_failed` so UIs can tell it apart.
 - **BREAKING (Rust API):** `GitSnapshotBackend::with_snapshot_base` is public;
   `SnapshotError` gains `Io`; `GcResult` gains `deleted_objects`;
   `GcConfig` limits are `NonZero*` and `GcConfig::default()` has no limits.

@@ -1389,6 +1389,144 @@ async fn undo_leaves_ignored_files_alone() -> Result<()> {
 }
 
 #[tokio::test]
+async fn undo_refuses_to_overwrite_a_file_ignored_since_the_turn() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file("foo.txt", "original")?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "edit").await?;
+
+    // The turn edits foo.txt and then ignores it: the post snapshot omits it,
+    // and the pre-undo snapshot taken later cannot hold the edit either.
+    run_turn(&fixture, &session, |w| {
+        std::fs::write(w.join("foo.txt"), "edited")?;
+        std::fs::write(w.join(".gitignore"), "foo.txt\n")?;
+        Ok(())
+    })
+    .await?;
+
+    let error = fixture.undo(&session, &target).await.unwrap_err();
+
+    assert!(error.to_string().contains("foo.txt"), "{error}");
+    assert_eq!(
+        fixture.read_file("foo.txt")?,
+        "edited",
+        "a rejected undo must not touch the file"
+    );
+    assert!(
+        fixture
+            .storage
+            .session_store()
+            .peek_revert_state(&session)
+            .await?
+            .is_none(),
+        "a rejected undo leaves no frame behind"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_undo_keeps_history_but_its_frame_is_discarded_by_the_next_prompt() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file("a.txt", "a-original")?;
+    fixture.write_file("b.txt", "b-original")?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "edit").await?;
+    run_turn(&fixture, &session, |w| {
+        std::fs::write(w.join("a.txt"), "a-modified")?;
+        std::fs::write(w.join("b.txt"), "b-modified")?;
+        Ok(())
+    })
+    .await?;
+    block_with_directory(&fixture, "b.txt")?;
+    fixture.undo(&session, &target).await.unwrap_err();
+
+    let journal = fixture.storage.event_journal();
+    crate::agent::undo::cleanup_revert_on_prompt(
+        &fixture.handle.config.provider,
+        &*journal,
+        &session,
+    )
+    .await
+    .expect("cleanup should succeed");
+
+    let history = fixture
+        .storage
+        .session_store()
+        .get_history(&session)
+        .await?;
+    assert!(
+        history.iter().any(|m| m.id == target),
+        "a failed undo must not delete the message history"
+    );
+    assert!(
+        fixture
+            .storage
+            .session_store()
+            .list_revert_states(&session)
+            .await?
+            .is_empty(),
+        "a new prompt discards the recovery frame so redo cannot overwrite its work"
+    );
+    std::fs::remove_dir_all(fixture.worktree.path().join("b.txt"))?;
+    assert!(matches!(
+        fixture.redo(&session).await,
+        Err(crate::agent::undo::UndoError::NothingToRedo)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_undo_then_successful_retry_leaves_no_stale_frame_after_the_next_prompt()
+-> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    fixture.write_file("a.txt", "a-original")?;
+    fixture.write_file("b.txt", "b-original")?;
+    let session = fixture.create_session().await?;
+    let target = fixture.add_user_message(&session, "edit").await?;
+    run_turn(&fixture, &session, |w| {
+        std::fs::write(w.join("a.txt"), "a-modified")?;
+        std::fs::write(w.join("b.txt"), "b-modified")?;
+        Ok(())
+    })
+    .await?;
+    block_with_directory(&fixture, "b.txt")?;
+    fixture.undo(&session, &target).await.unwrap_err();
+
+    // The user fixes the cause and retries the undo, which now succeeds.
+    std::fs::remove_dir_all(fixture.worktree.path().join("b.txt"))?;
+    fixture.undo(&session, &target).await?;
+
+    let journal = fixture.storage.event_journal();
+    crate::agent::undo::cleanup_revert_on_prompt(
+        &fixture.handle.config.provider,
+        &*journal,
+        &session,
+    )
+    .await
+    .expect("cleanup should succeed");
+
+    let store = fixture.storage.session_store();
+    assert!(
+        store.list_revert_states(&session).await?.is_empty(),
+        "no stale failed frame may stay on the stack"
+    );
+    assert!(
+        !store
+            .get_history(&session)
+            .await?
+            .iter()
+            .any(|m| m.id == target),
+        "the completed undo still deletes its history"
+    );
+    assert!(matches!(
+        fixture.redo(&session).await,
+        Err(crate::agent::undo::UndoError::NothingToRedo)
+    ));
+    assert_eq!(fixture.read_file("b.txt")?, "b-original");
+    Ok(())
+}
+
+#[tokio::test]
 async fn undo_of_a_moved_file_restores_the_original_path() -> Result<()> {
     let fixture = UndoTestFixture::new().await?;
     fixture.write_file("a.txt", "moved content")?;

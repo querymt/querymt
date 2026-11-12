@@ -5,7 +5,8 @@
 //! content. Every write, create and delete error is propagated.
 
 use super::GitSnapshotBackend;
-use crate::snapshot::backend::{SnapshotError, SnapshotResult, io_err};
+use super::confined::Root;
+use crate::snapshot::backend::{SnapshotError, SnapshotResult};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufReader, Read, Write};
@@ -35,7 +36,10 @@ fn parse_commit_id(sha: &str) -> SnapshotResult<gix::ObjectId> {
         .map_err(|_| SnapshotError::InvalidSnapshotId(sha.to_string()))
 }
 
-fn commit_tree<'r>(repo: &'r gix::Repository, sha: &str) -> SnapshotResult<gix::Tree<'r>> {
+pub(super) fn commit_tree<'r>(
+    repo: &'r gix::Repository,
+    sha: &str,
+) -> SnapshotResult<gix::Tree<'r>> {
     let commit = repo
         .find_commit(parse_commit_id(sha)?)
         .map_err(|e| SnapshotError::NotFound(format!("commit {sha}: {e}")))?;
@@ -135,10 +139,12 @@ impl GitSnapshotBackend {
         paths: &[PathBuf],
     ) -> SnapshotResult<RestoreStats> {
         let tree = commit_tree(repo, commit_sha)?;
+        let root = Root::open(worktree)?;
         let mut stats = RestoreStats::default();
 
         for path in paths {
-            ensure_inside_worktree(path)?;
+            // Rejects `..`, absolute and empty paths before any lookup.
+            super::confined::validate(path)?;
             let entry = tree.lookup_entry_by_path(path).map_err(|e| {
                 SnapshotError::Repository(format!("Failed to look up tree entry: {e}"))
             })?;
@@ -152,14 +158,14 @@ impl GitSnapshotBackend {
                     }
                     self.restore_blob(
                         repo,
-                        worktree,
+                        &root,
                         path,
                         entry.object_id(),
                         is_executable(entry.mode()),
                         &mut stats,
                     )?;
                 }
-                None => remove_path(&worktree.join(path))?,
+                None => root.remove_file(path)?,
             }
         }
         Ok(stats)
@@ -174,15 +180,16 @@ impl GitSnapshotBackend {
         commit_sha: &str,
     ) -> SnapshotResult<RestoreStats> {
         let tree = commit_tree(repo, commit_sha)?;
+        let root = Root::open(worktree)?;
         let mut stats = RestoreStats::default();
-        self.restore_tree_recursive(repo, worktree, &tree, Path::new(""), &mut stats)?;
+        self.restore_tree_recursive(repo, &root, &tree, Path::new(""), &mut stats)?;
         Ok(stats)
     }
 
     fn restore_tree_recursive(
         &self,
         repo: &gix::Repository,
-        worktree: &Path,
+        root: &Root,
         tree: &gix::Tree<'_>,
         prefix: &Path,
         stats: &mut RestoreStats,
@@ -204,11 +211,11 @@ impl GitSnapshotBackend {
                     })?
                     .try_into_tree()
                     .map_err(|_| SnapshotError::Repository("Expected tree object".to_string()))?;
-                self.restore_tree_recursive(repo, worktree, &sub_tree, &rel, stats)?;
+                self.restore_tree_recursive(repo, root, &sub_tree, &rel, stats)?;
             } else if entry.mode().is_blob() || entry.mode().is_blob_or_symlink() {
                 self.restore_blob(
                     repo,
-                    worktree,
+                    root,
                     &rel,
                     entry.object_id(),
                     is_executable(entry.mode()),
@@ -225,13 +232,13 @@ impl GitSnapshotBackend {
     fn restore_blob(
         &self,
         repo: &gix::Repository,
-        worktree: &Path,
+        root: &Root,
         rel: &Path,
         id: gix::ObjectId,
         executable: bool,
         stats: &mut RestoreStats,
     ) -> SnapshotResult<()> {
-        let target = worktree.join(rel);
+        let target = root.path().join(rel);
 
         let size = repo
             .find_header(id)
@@ -241,6 +248,8 @@ impl GitSnapshotBackend {
             let loose = loose_object_path(repo, &id);
             if loose.is_file() {
                 write_entry(
+                    root,
+                    rel,
                     &target,
                     BlobSource::Loose {
                         path: loose,
@@ -257,7 +266,13 @@ impl GitSnapshotBackend {
         let object = repo
             .find_object(id)
             .map_err(|e| SnapshotError::Repository(format!("Failed to get blob object: {e}")))?;
-        write_entry(&target, BlobSource::Bytes(&object.data), executable)
+        write_entry(
+            root,
+            rel,
+            &target,
+            BlobSource::Bytes(&object.data),
+            executable,
+        )
     }
 }
 
@@ -269,46 +284,24 @@ fn loose_object_path(repo: &gix::Repository, id: &gix::oid) -> PathBuf {
         .join(&hex[2..])
 }
 
-/// Reject paths that could leave the worktree: restore writes and deletes
-/// below the worktree root only. Paths come from stored session history, so
-/// they are not trusted.
-fn ensure_inside_worktree(path: &Path) -> SnapshotResult<()> {
-    use std::path::Component;
-    let escapes = path.as_os_str().is_empty()
-        || path
-            .components()
-            .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir));
-    if escapes {
-        return Err(SnapshotError::Filesystem(format!(
-            "refusing to restore {}: not a path inside the worktree",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-/// Delete `path`; a path that is already gone is fine, anything else fails.
-fn remove_path(path: &Path) -> SnapshotResult<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(io_err("delete", path)(e)),
-    }
-}
-
-/// Atomically replace `target` with the blob: temp file in the same directory,
-/// permissions, then a single rename. The temp file removes itself on drop, so
-/// every early return leaves nothing behind.
-fn write_entry(target: &Path, source: BlobSource<'_>, executable: bool) -> SnapshotResult<()> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(io_err("create directory", parent))?;
-
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .map_err(io_err("create temporary file in", parent))?;
-    match source {
-        BlobSource::Bytes(bytes) => tmp.write_all(bytes).map_err(io_err("write", target))?,
-        BlobSource::Loose { path, id, size } => stream_loose(&path, id, size, tmp.as_file_mut())
-            .map_err(|e| match e {
+/// Atomically replace `rel` below the worktree root with the blob. The write
+/// goes through [`Root`], which never follows a symlink out of the worktree and
+/// renames a temporary file into place, removing it on every failure.
+fn write_entry(
+    root: &Root,
+    rel: &Path,
+    target: &Path,
+    source: BlobSource<'_>,
+    executable: bool,
+) -> SnapshotResult<()> {
+    root.replace_file(rel, executable, |file| match source {
+        BlobSource::Bytes(bytes) => file.write_all(bytes).map_err(|e| SnapshotError::Io {
+            op: "write",
+            path: target.to_path_buf(),
+            source: e,
+        }),
+        BlobSource::Loose { path, id, size } => {
+            stream_loose(&path, id, size, file).map_err(|e| match e {
                 StreamError::Io(source) => SnapshotError::Io {
                     op: "write",
                     path: target.to_path_buf(),
@@ -318,27 +311,9 @@ fn write_entry(target: &Path, source: BlobSource<'_>, executable: bool) -> Snaps
                     "object {id} for {} is corrupt: {why}",
                     target.display()
                 )),
-            })?,
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let existing = fs::symlink_metadata(target)
-            .ok()
-            .filter(fs::Metadata::is_file)
-            .map(|m| m.mode());
-        let mode = restored_mode(existing, executable);
-        tmp.as_file()
-            .set_permissions(fs::Permissions::from_mode(mode))
-            .map_err(io_err("set permissions of", target))?;
-    }
-    #[cfg(not(unix))]
-    let _ = executable;
-
-    tmp.persist(target)
-        .map_err(|e| io_err("write", target)(e.error))?;
-    Ok(())
+            })
+        }
+    })
 }
 
 enum StreamError {

@@ -177,7 +177,31 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0035_knowledge_junction_tables",
         apply: migration_0035_knowledge_junction_tables,
     },
+    Migration {
+        version: "0036_revert_restore_failed",
+        apply: migration_0036_revert_restore_failed,
+    },
 ];
+
+/// Mark revert frames recorded by an undo whose restore failed part-way.
+///
+/// Such frames are recovery points for redo, not committed undos. Existing
+/// rows default to 0 (committed), which is what they were. Guarded so it is
+/// idempotent for fresh installs where `init_schema` created the column.
+fn migration_0036_revert_restore_failed(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let existing: HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(revert_states)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?
+    };
+    if !existing.contains("restore_failed") {
+        conn.execute(
+            "ALTER TABLE revert_states ADD COLUMN restore_failed INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
 
 /// Entity/topic junction tables used for indexed knowledge matching.
 ///

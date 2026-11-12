@@ -345,6 +345,12 @@ pub struct RevertState {
     /// never partially restore files.
     #[serde(default)]
     pub workspace_root: Option<std::path::PathBuf>,
+    /// `true` when the undo that produced this frame failed part-way. The
+    /// frame is a recovery point only: redo can restore it, but it is not a
+    /// committed undo, so a new prompt must neither delete history for it nor
+    /// discard it.
+    #[serde(default)]
+    pub restore_failed: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }

@@ -313,27 +313,64 @@ pub(crate) async fn undo_impl(
         }
     }
 
+    // Undo patches in reverse order, then the fallback snapshot.
+    let mut steps: Vec<(String, Vec<PathBuf>)> = all_patches
+        .iter()
+        .rev()
+        .map(|(_, pre_snapshot, changed_paths)| {
+            (
+                pre_snapshot.clone(),
+                changed_paths.iter().map(PathBuf::from).collect(),
+            )
+        })
+        .collect();
+    if let Some((snapshot_id, changed)) = &fallback {
+        steps.push((snapshot_id.clone(), changed.clone()));
+    }
+
+    // Redo can only bring back what the pre-undo snapshot captured. A file
+    // that exists now but is outside it (e.g. an ignore rule was added after
+    // the turn) would be overwritten for good, so reject before any file
+    // changes and before a redo frame exists.
+    let mut doomed: Vec<PathBuf> = steps.iter().flat_map(|(_, paths)| paths.clone()).collect();
+    doomed.sort();
+    doomed.dedup();
+    let uncaptured = backend
+        .uncaptured_paths(worktree, &pre_revert_snapshot, &doomed)
+        .await?;
+    if !uncaptured.is_empty() {
+        return Err(UndoError::Snapshot(format!(
+            "refusing to undo: {} would be overwritten but is outside the undo snapshot \
+             (ignored since the turn ran), so redo could not bring it back: {}",
+            if uncaptured.len() == 1 {
+                "a file"
+            } else {
+                "files"
+            },
+            uncaptured
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
     // From here on files change. Run the restores as one unit so the redo
     // frame below is recorded whether or not they succeed: a partially failed
-    // undo can always be redone back to the state before the undo.
-    let restore_result: Result<(), UndoError> = async {
-        // Undo patches in reverse order
-        for (_turn_id, pre_snapshot, changed_paths) in all_patches.iter().rev() {
-            let paths: Vec<PathBuf> = changed_paths.iter().map(PathBuf::from).collect();
-            backend
-                .restore_paths(worktree, pre_snapshot, &paths)
-                .await?;
-            all_reverted_files.extend(changed_paths.iter().cloned());
-        }
-        if let Some((snapshot_id, changed)) = &fallback {
-            backend
-                .restore_paths(worktree, snapshot_id, changed)
-                .await?;
-            all_reverted_files.extend(changed.iter().map(|p| p.to_string_lossy().into_owned()));
-        }
-        Ok(())
+    // undo can always be redone back to the state before the undo. The backend
+    // keeps every needed snapshot alive for the whole batch.
+    let restore_result: Result<(), UndoError> = backend
+        .restore_batch(worktree, &steps)
+        .await
+        .map_err(UndoError::from);
+    if restore_result.is_ok() {
+        all_reverted_files.extend(
+            steps
+                .iter()
+                .flat_map(|(_, paths)| paths.iter())
+                .map(|p| p.to_string_lossy().into_owned()),
+        );
     }
-    .await;
 
     // Store a new stacked revert frame for redo.
     let revert_state = crate::session::domain::RevertState {
@@ -345,6 +382,10 @@ pub(crate) async fn undo_impl(
         // Workspace provenance: redo validates every selected frame
         // against the current execution workspace before restoring.
         workspace_root: Some(worktree.to_path_buf()),
+        // A failed restore is a recovery point for an immediate redo; it is
+        // not a committed undo, so it never deletes history, and a new prompt
+        // discards it.
+        restore_failed: restore_result.is_err(),
         created_at: OffsetDateTime::now_utc(),
     };
 
@@ -366,7 +407,11 @@ pub(crate) async fn undo_impl(
         )));
     }
 
-    restore_result?;
+    restore_result.map_err(|e| {
+        UndoError::Snapshot(format!(
+            "{e}. Redo restores the state before this undo; sending a new prompt discards that option."
+        ))
+    })?;
     tracing::Span::current().record("reverted_files", all_reverted_files.len());
 
     Ok(UndoResult {
@@ -406,8 +451,27 @@ pub(crate) async fn redo_impl(
         .await?;
 
     if !changed.is_empty() {
+        // Same guard as undo: never overwrite a file the current snapshot
+        // does not hold (it is ignored now) with an older capture.
+        let uncaptured = backend
+            .uncaptured_paths(worktree, &current_snapshot, &changed)
+            .await?;
+        if !uncaptured.is_empty() {
+            return Err(UndoError::Snapshot(format!(
+                "refusing to redo: files outside the current snapshot (ignored now) \
+                 would be overwritten: {}",
+                uncaptured
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
         backend
-            .restore_paths(worktree, &revert_state.snapshot_id, &changed)
+            .restore_batch(
+                worktree,
+                &[(revert_state.snapshot_id.clone(), changed.clone())],
+            )
             .await?;
     }
 
@@ -603,7 +667,33 @@ pub(crate) async fn cleanup_revert_on_prompt(
         .await
         .map_err(|e| UndoError::Store(format!("Failed to get revert state: {}", e)))?;
 
-    let Some(revert_state) = revert_state else {
+    if revert_state.is_none() {
+        return Ok(());
+    }
+
+    // Frames whose restore failed never committed an undo, so they must not
+    // delete history. They are recovery points for an immediate redo only:
+    // once a new prompt runs, redo could overwrite its work, so they are
+    // discarded with the rest of the stack below. The frontier is the newest
+    // frame whose undo completed.
+    let frames = provider
+        .history_store()
+        .list_revert_states(session_id)
+        .await
+        .map_err(|e| UndoError::Store(format!("Failed to list revert states: {}", e)))?;
+    for frame in frames.iter().filter(|f| f.restore_failed) {
+        tracing::warn!(
+            %session_id,
+            snapshot_id = %frame.snapshot_id,
+            "discarding the recovery frame of a failed undo because a new prompt started"
+        );
+    }
+    let Some(revert_state) = frames.into_iter().rev().find(|f| !f.restore_failed) else {
+        provider
+            .history_store()
+            .clear_revert_states(session_id)
+            .await
+            .map_err(|e| UndoError::Store(format!("Failed to clear revert state: {}", e)))?;
         return Ok(());
     };
 

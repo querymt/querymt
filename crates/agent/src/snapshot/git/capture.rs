@@ -171,6 +171,14 @@ pub(super) fn system_time_ns(time: SystemTime) -> Option<u64> {
         .and_then(|d| u64::try_from(d.as_nanos()).ok())
 }
 
+/// `true` when `meta` still matches what the directory listing reported.
+fn matches_listing(meta: &fs::Metadata, listed: &ListedFile) -> bool {
+    match listed.stamp {
+        Some(stamp) => FileStamp::from_metadata(meta) == Some(stamp),
+        None => meta.len() == listed.size,
+    }
+}
+
 pub(super) fn is_vanished(err: &ignore::Error) -> bool {
     err.io_error()
         .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
@@ -592,6 +600,12 @@ impl GitSnapshotBackend {
     ) -> SnapshotResult<CaptureOutcome> {
         if listed.size < stream_bytes {
             let content = fs::read(path).map_err(io_err("read", path))?;
+            // A write racing the read can yield torn content: only trust it
+            // when the file still matches its listing.
+            let after = fs::metadata(path).map_err(io_err("read", path))?;
+            if !matches_listing(&after, &listed) || content.len() as u64 != listed.size {
+                return Ok(CaptureOutcome::Changed);
+            }
             return repo
                 .write_blob(&content)
                 .map(|id| CaptureOutcome::Stored {
@@ -610,10 +624,7 @@ impl GitSnapshotBackend {
         };
         // A size or stamp change catches growth and in-place rewrites too.
         let after = fs::metadata(path).map_err(io_err("read", path))?;
-        let unchanged = match listed.stamp {
-            Some(stamp) => FileStamp::from_metadata(&after) == Some(stamp),
-            None => after.len() == listed.size,
-        };
+        let unchanged = matches_listing(&after, &listed);
         Ok(if unchanged {
             CaptureOutcome::Stored { oid, bytes: size }
         } else {

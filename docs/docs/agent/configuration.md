@@ -171,8 +171,11 @@ is decided by path:
 - `.git/info/exclude` is honoured. Global git excludes are not.
 - Files and directories whose name starts with `.` are never captured.
 
-Undo and redo do not touch paths outside the scope. Editing an ignore file
-during a session moves paths in or out of scope.
+Undo and redo leave a path alone only if it is outside the scope in both
+snapshots involved. Editing an ignore file during a session moves paths in or
+out of scope, and adding an ignore rule does not protect a file that an older
+snapshot already captured: undo or redo can still restore or delete it. An undo
+that would overwrite such a file, with no snapshot to redo it from, is refused.
 
 Files of 16 MiB or more are stored uncompressed. A warning is logged when a file
 of 64 MiB or more enters snapshots, and once per process when a workspace's
@@ -188,6 +191,10 @@ each turn:
   more snapshots are pruned.
 - Undo or redo that needs a pruned snapshot fails before any file changes, and a
   failed redo keeps its frame.
+- An undo that fails part-way keeps its message history and records a recovery
+  frame, so redo can restore the state before the undo. Sending a new prompt
+  discards that frame (redo could overwrite the prompt's work), and the failed
+  undo never deletes history.
 - `0` is rejected at load time. In JSON, `null` leaves the key unset.
 
 ### Skills Configuration

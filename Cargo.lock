@@ -11988,6 +11988,7 @@ dependencies = [
  "rusqlite",
  "rust-embed",
  "rust-stemmers",
+ "rustix",
  "schemars 1.2.3",
  "serde",
  "serde_json",

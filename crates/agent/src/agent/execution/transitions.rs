@@ -2049,14 +2049,18 @@ pub(super) async fn transition_processing_tool_calls(
         };
 
         // The pre-turn snapshot must exist before anything can modify the
-        // workspace. Read-only segments never wait for it.
-        if indices.iter().any(|&index| {
-            !super::tool_calls::call_is_read_only(
-                config,
-                exec_ctx,
-                &remaining_calls[index].function.name,
-            )
-        }) && let Err(e) = ensure_pre_turn_snapshot_ready(exec_ctx, "before_mutating_tool").await
+        // workspace. Read-only segments never wait for it, unless hooks are
+        // active: a command hook runs in the workspace and can modify it
+        // whatever the tool declares, and `prepare_segment` runs them.
+        if (config.hooks.is_enabled()
+            || indices.iter().any(|&index| {
+                !super::tool_calls::call_is_read_only(
+                    config,
+                    exec_ctx,
+                    &remaining_calls[index].function.name,
+                )
+            }))
+            && let Err(e) = ensure_pre_turn_snapshot_ready(exec_ctx, "before_mutating_tool").await
         {
             warn!(
                 "Failed to resolve pre-turn snapshot before tool execution: {}",

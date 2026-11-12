@@ -2287,7 +2287,7 @@ impl SessionStore for SqliteStorage {
 
         self.run_blocking(move |conn| {
             conn.query_row(
-                "SELECT public_id, message_id, snapshot_id, backend_id, workspace_root, created_at FROM revert_states WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                "SELECT public_id, message_id, snapshot_id, backend_id, workspace_root, created_at, restore_failed FROM revert_states WHERE session_id = ? ORDER BY id DESC LIMIT 1",
                 params![session_internal_id],
                 |row| {
                     let public_id: String = row.get(0)?;
@@ -2296,6 +2296,7 @@ impl SessionStore for SqliteStorage {
                     let backend_id: String = row.get(3)?;
                     let workspace_root: Option<String> = row.get(4)?;
                     let created_at_str: String = row.get(5)?;
+                    let restore_failed: bool = row.get(6)?;
                     let created_at = OffsetDateTime::parse(
                         &created_at_str,
                         &time::format_description::well_known::Rfc3339,
@@ -2309,6 +2310,7 @@ impl SessionStore for SqliteStorage {
                         snapshot_id,
                         backend_id,
                         workspace_root: workspace_root.map(PathBuf::from),
+                        restore_failed,
                         created_at,
                     })
                 },
@@ -2326,7 +2328,7 @@ impl SessionStore for SqliteStorage {
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default();
             conn.execute(
-                "INSERT INTO revert_states (public_id, session_id, message_id, snapshot_id, backend_id, workspace_root, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO revert_states (public_id, session_id, message_id, snapshot_id, backend_id, workspace_root, created_at, restore_failed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     state.public_id,
                     session_internal_id,
@@ -2335,6 +2337,7 @@ impl SessionStore for SqliteStorage {
                     state.backend_id,
                     state.workspace_root.as_ref().map(|p| p.to_string_lossy().into_owned()),
                     now,
+                    state.restore_failed,
                 ],
             )?;
             Ok(())
@@ -2350,7 +2353,7 @@ impl SessionStore for SqliteStorage {
             let tx = conn.transaction()?;
             let state = tx
                 .query_row(
-                    "SELECT id, public_id, message_id, snapshot_id, backend_id, workspace_root, created_at FROM revert_states WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                    "SELECT id, public_id, message_id, snapshot_id, backend_id, workspace_root, created_at, restore_failed FROM revert_states WHERE session_id = ? ORDER BY id DESC LIMIT 1",
                     params![session_internal_id],
                     |row| {
                         let id: i64 = row.get(0)?;
@@ -2360,6 +2363,7 @@ impl SessionStore for SqliteStorage {
                         let backend_id: String = row.get(4)?;
                         let workspace_root: Option<String> = row.get(5)?;
                         let created_at_str: String = row.get(6)?;
+                        let restore_failed: bool = row.get(7)?;
                         let created_at = OffsetDateTime::parse(
                             &created_at_str,
                             &time::format_description::well_known::Rfc3339,
@@ -2375,6 +2379,7 @@ impl SessionStore for SqliteStorage {
                                 snapshot_id,
                                 backend_id,
                                 workspace_root: workspace_root.map(PathBuf::from),
+                                restore_failed,
                                 created_at,
                             },
                         ))
@@ -2400,7 +2405,7 @@ impl SessionStore for SqliteStorage {
 
         self.run_blocking(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT public_id, message_id, snapshot_id, backend_id, workspace_root, created_at FROM revert_states WHERE session_id = ? ORDER BY id ASC",
+                "SELECT public_id, message_id, snapshot_id, backend_id, workspace_root, created_at, restore_failed FROM revert_states WHERE session_id = ? ORDER BY id ASC",
             )?;
             let rows = stmt.query_map(params![session_internal_id], |row| {
                 let public_id: String = row.get(0)?;
@@ -2409,6 +2414,7 @@ impl SessionStore for SqliteStorage {
                 let backend_id: String = row.get(3)?;
                 let workspace_root: Option<String> = row.get(4)?;
                 let created_at_str: String = row.get(5)?;
+                let restore_failed: bool = row.get(6)?;
                 let created_at = OffsetDateTime::parse(
                     &created_at_str,
                     &time::format_description::well_known::Rfc3339,
@@ -2422,6 +2428,7 @@ impl SessionStore for SqliteStorage {
                     snapshot_id,
                     backend_id,
                     workspace_root: workspace_root.map(PathBuf::from),
+                    restore_failed,
                     created_at,
                 })
             })?;

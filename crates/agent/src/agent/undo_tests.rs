@@ -290,6 +290,7 @@ fn revert_frame(workspace_root: Option<&std::path::Path>) -> crate::session::dom
         snapshot_id: "snap-1".to_string(),
         backend_id: "git".to_string(),
         workspace_root: workspace_root.map(std::path::Path::to_path_buf),
+        restore_failed: false,
         created_at: time::OffsetDateTime::now_utc(),
     }
 }

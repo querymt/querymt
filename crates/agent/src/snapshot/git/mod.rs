@@ -6,6 +6,7 @@
 //! from the worktree path. This keeps the user's project directory untouched.
 
 mod capture;
+mod confined;
 mod gc;
 mod restore;
 #[cfg(test)]
@@ -290,6 +291,71 @@ impl SnapshotBackend for GitSnapshotBackend {
             backend
                 .checkout_paths(&repo, &worktree, &snapshot, &paths)
                 .map(drop)
+        })
+        .await
+        .map_err(|_| SnapshotError::TaskPanicked)?
+    }
+
+    async fn restore_batch(
+        &self,
+        worktree: &Path,
+        steps: &[(SnapshotId, Vec<PathBuf>)],
+    ) -> SnapshotResult<()> {
+        let worktree = worktree.to_path_buf();
+        let steps = steps.to_vec();
+        let backend = self.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let repo = backend.open_or_init(&worktree)?;
+            // One shared lock for the whole batch: the sweep needs the
+            // exclusive lock, so no snapshot can be pruned between the
+            // resolution below and the last restore.
+            let _lock = SnapshotLock::shared(repo.git_dir())?;
+            // Resolve every snapshot before the first file changes.
+            for (snapshot, _) in &steps {
+                restore::commit_tree(&repo, snapshot)?;
+            }
+            for (snapshot, paths) in &steps {
+                backend.checkout_paths(&repo, &worktree, snapshot, paths)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| SnapshotError::TaskPanicked)?
+    }
+
+    async fn uncaptured_paths(
+        &self,
+        worktree: &Path,
+        snapshot: &SnapshotId,
+        paths: &[PathBuf],
+    ) -> SnapshotResult<Vec<PathBuf>> {
+        let worktree = worktree.to_path_buf();
+        let snapshot = snapshot.clone();
+        let paths = paths.to_vec();
+        let backend = self.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let repo = backend.open_or_init(&worktree)?;
+            let _lock = SnapshotLock::shared(repo.git_dir())?;
+            let tree = restore::commit_tree(&repo, &snapshot)?;
+            let mut uncaptured = Vec::new();
+            for path in paths {
+                confined::validate(&path)?;
+                let in_snapshot = tree
+                    .lookup_entry_by_path(&path)
+                    .map_err(|e| {
+                        SnapshotError::Repository(format!("Failed to look up tree entry: {e}"))
+                    })?
+                    .is_some();
+                let on_disk = fs::symlink_metadata(worktree.join(&path))
+                    .map(|m| m.is_file())
+                    .unwrap_or(false);
+                if on_disk && !in_snapshot {
+                    uncaptured.push(path);
+                }
+            }
+            Ok(uncaptured)
         })
         .await
         .map_err(|_| SnapshotError::TaskPanicked)?

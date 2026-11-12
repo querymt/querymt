@@ -109,7 +109,11 @@ impl From<&crate::config::SnapshotBackendConfig> for GcConfig {
 }
 
 /// Result of a garbage collection operation
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The struct is `#[non_exhaustive]`: external backends build it from
+/// [`GcResult::default`] and set the fields they know about, so fields added
+/// later start at zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GcResult {
     /// Snapshots (commits) pruned.
@@ -183,6 +187,42 @@ pub trait SnapshotBackend: Send + Sync {
         snapshot: &SnapshotId,
         paths: &[PathBuf],
     ) -> SnapshotResult<()>;
+
+    /// Restore several snapshots' paths as one unit, in order.
+    ///
+    /// Backends that can should keep every snapshot in `steps` alive (and
+    /// resolved before the first file changes) for the whole operation. The
+    /// default restores step by step with [`restore_paths`](Self::restore_paths).
+    ///
+    /// # Errors
+    /// As [`restore_paths`](Self::restore_paths); earlier steps stay restored.
+    async fn restore_batch(
+        &self,
+        worktree: &Path,
+        steps: &[(SnapshotId, Vec<PathBuf>)],
+    ) -> SnapshotResult<()> {
+        for (snapshot, paths) in steps {
+            self.restore_paths(worktree, snapshot, paths).await?;
+        }
+        Ok(())
+    }
+
+    /// Paths among `paths` that exist as files in the worktree but are missing
+    /// from `snapshot`, so overwriting or deleting them could not be undone
+    /// from that snapshot (for example after an ignore rule was added).
+    ///
+    /// The default reports none: a backend that cannot tell does not block.
+    ///
+    /// # Errors
+    /// Fails when `snapshot` is invalid or missing, or a path escapes `worktree`.
+    async fn uncaptured_paths(
+        &self,
+        _worktree: &Path,
+        _snapshot: &SnapshotId,
+        _paths: &[PathBuf],
+    ) -> SnapshotResult<Vec<PathBuf>> {
+        Ok(Vec::new())
+    }
 
     /// Restore entire worktree to a snapshot
     ///
