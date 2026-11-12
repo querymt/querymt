@@ -472,6 +472,10 @@ fn default_max_age_days() -> Option<u64> {
     Some(30)
 }
 
+fn default_max_file_bytes() -> u64 {
+    crate::snapshot::git::DEFAULT_MAX_FILE_BYTES
+}
+
 /// Configuration for snapshot backend (undo/redo support).
 ///
 /// Snapshots capture the state of modified files before each agent action,
@@ -500,6 +504,13 @@ pub struct SnapshotBackendConfig {
     /// Maximum age of snapshots in days. Older snapshots are pruned automatically.
     #[serde(default = "default_max_age_days")]
     pub max_age_days: Option<u64>,
+
+    /// Files larger than this many bytes (default 50 MiB) are left out of
+    /// snapshots, so undo does not cover them. This keeps model weights,
+    /// datasets and other large binaries from being hashed on every turn.
+    /// `0` disables the limit.
+    #[serde(default = "default_max_file_bytes")]
+    pub max_file_bytes: u64,
 }
 
 impl Default for SnapshotBackendConfig {
@@ -508,6 +519,7 @@ impl Default for SnapshotBackendConfig {
             backend: default_snapshot_backend(),
             max_snapshots: default_max_snapshots(),
             max_age_days: default_max_age_days(),
+            max_file_bytes: default_max_file_bytes(),
         }
     }
 }

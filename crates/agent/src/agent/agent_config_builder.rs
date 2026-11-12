@@ -703,7 +703,10 @@ impl AgentConfigBuilder {
         match exec.snapshot.backend.as_str() {
             "git" => {
                 use crate::snapshot::git::GitSnapshotBackend;
-                self.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()))
+                self.with_snapshot_backend(Arc::new(
+                    GitSnapshotBackend::new()
+                        .with_max_file_bytes(Some(exec.snapshot.max_file_bytes)),
+                ))
             }
             "none" | "" => self,
             other => {

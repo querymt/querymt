@@ -151,6 +151,8 @@ backoff_multiplier = 2.0
 backend = "git"           # "git" or "none"
 max_snapshots = 100       # Maximum snapshots to keep
 max_age_days = 30         # Maximum age of snapshots
+max_file_bytes = 52428800 # Files larger than this (default 50 MiB) are left out of snapshots
+                          # (not covered by undo); 0 = no limit
 
 # Rate limit retry configuration
 [agent.execution.rate_limit]

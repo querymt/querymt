@@ -1625,12 +1625,10 @@ pub(super) async fn transition_after_llm(
         return Ok(ExecutionState::Cancelled);
     }
 
-    if let Err(e) = ensure_pre_turn_snapshot_ready(exec_ctx, "before_first_response").await {
-        warn!(
-            "Failed to resolve pre-turn snapshot before first response: {}",
-            e
-        );
-    }
+    // The pre-turn snapshot is deliberately NOT awaited here: the response is
+    // stored and shown immediately. It is resolved right before the first tool
+    // call that can change workspace files (see `transition_processing_tool_calls`)
+    // and, at the latest, before the post-turn snapshot.
 
     let progress_description = if response.has_tool_calls() {
         format!(
@@ -2049,6 +2047,22 @@ pub(super) async fn transition_processing_tool_calls(
             Segment::Parallel(indices) => indices.clone(),
             Segment::Barrier(index) => vec![*index],
         };
+
+        // The pre-turn snapshot must exist before anything can modify the
+        // workspace. Read-only segments never wait for it.
+        if indices.iter().any(|&index| {
+            !super::tool_calls::call_is_read_only(
+                config,
+                exec_ctx,
+                &remaining_calls[index].function.name,
+            )
+        }) && let Err(e) = ensure_pre_turn_snapshot_ready(exec_ctx, "before_mutating_tool").await
+        {
+            warn!(
+                "Failed to resolve pre-turn snapshot before tool execution: {}",
+                e
+            );
+        }
         let segment_plan =
             prepare_segment(config, driver, remaining_calls, &indices, exec_ctx).await?;
         for (index, result) in segment_plan.immediate {
@@ -2448,6 +2462,135 @@ async fn apply_clarification_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-turn snapshot is awaited only before a call that can change the
+    /// workspace; read-only calls and text replies never wait for it.
+    mod snapshot_wait_tests {
+        use super::super::*;
+        use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent, mock_tool_call};
+        use std::time::Duration;
+
+        async fn pending_snapshot_exec(agent: &TestAgent) -> ExecutionContext {
+            let exec = agent.execution_context().await;
+            *exec.runtime.pre_turn_snapshot_task.lock() = Some(tokio::spawn(async {
+                ("turn-1".to_string(), Ok("snapshot-1".to_string()))
+            }));
+            exec
+        }
+
+        async fn agent() -> TestAgent {
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await
+        }
+
+        #[tokio::test]
+        async fn read_only_tool_call_leaves_the_snapshot_pending() {
+            let agent = agent().await;
+            let mut exec = pending_snapshot_exec(&agent).await;
+            let calls: Arc<[MiddlewareToolCall]> = Arc::from(vec![mock_tool_call(
+                "c1",
+                "read_tool",
+                r#"{"path":"/definitely/not/here.txt"}"#,
+            )]);
+            let results: Arc<[ToolResult]> = Arc::from(Vec::new());
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let driver = CompositeDriver::new(vec![]);
+
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                transition_processing_tool_calls(
+                    &agent.config,
+                    &driver,
+                    &calls,
+                    &results,
+                    &context,
+                    &mut exec,
+                ),
+            )
+            .await;
+
+            assert!(
+                exec.runtime.pre_turn_snapshot_task.lock().is_some(),
+                "a read-only call must not wait for the pre-turn snapshot"
+            );
+            assert!(exec.runtime.turn_snapshot.lock().is_none());
+        }
+
+        #[tokio::test]
+        async fn mutating_tool_call_resolves_the_snapshot_first() {
+            let agent = agent().await;
+            let mut exec = pending_snapshot_exec(&agent).await;
+            let calls: Arc<[MiddlewareToolCall]> = Arc::from(vec![mock_tool_call(
+                "c1",
+                "write_file",
+                r#"{"path":"a.txt","content":"x"}"#,
+            )]);
+            let results: Arc<[ToolResult]> = Arc::from(Vec::new());
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let driver = CompositeDriver::new(vec![]);
+
+            // The call itself may be blocked or fail (no workspace, approval);
+            // only the ordering matters: the snapshot is resolved before it.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                transition_processing_tool_calls(
+                    &agent.config,
+                    &driver,
+                    &calls,
+                    &results,
+                    &context,
+                    &mut exec,
+                ),
+            )
+            .await;
+
+            assert!(exec.runtime.pre_turn_snapshot_task.lock().is_none());
+            assert_eq!(
+                exec.runtime.turn_snapshot.lock().clone(),
+                Some(("turn-1".to_string(), "snapshot-1".to_string()))
+            );
+        }
+
+        #[tokio::test]
+        async fn text_only_reply_does_not_wait_for_the_snapshot() {
+            let agent = agent().await;
+            let mut exec = pending_snapshot_exec(&agent).await;
+            // A task that never finishes would hang the turn if it were awaited.
+            *exec.runtime.pre_turn_snapshot_task.lock() = Some(tokio::spawn(async {
+                std::future::pending::<()>().await;
+                ("never".to_string(), Ok(String::new()))
+            }));
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let response = Arc::new(LlmResponse::new(
+                "hello".into(),
+                Vec::new(),
+                None,
+                Some(FinishReason::Stop),
+            ));
+
+            let state = tokio::time::timeout(
+                Duration::from_secs(10),
+                transition_after_llm(&agent.config, &response, &context, &mut exec),
+            )
+            .await
+            .expect("after_llm must not block on the pending snapshot")
+            .expect("after llm");
+
+            assert!(!matches!(state, ExecutionState::ProcessingToolCalls { .. }));
+            let pending = exec.runtime.pre_turn_snapshot_task.lock().take();
+            assert!(pending.is_some(), "snapshot task still pending");
+            pending.unwrap().abort();
+        }
+
+        #[tokio::test]
+        async fn read_only_check_matches_snapshot_preparation() {
+            let agent = agent().await;
+            let exec = agent.execution_context().await;
+            use super::super::super::tool_calls::call_is_read_only;
+            assert!(call_is_read_only(&agent.config, &exec, "read_tool"));
+            assert!(!call_is_read_only(&agent.config, &exec, "write_file"));
+        }
+    }
 
     mod mcp_cancel_tests {
         use super::*;

@@ -3305,11 +3305,19 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
 
         let turn_snapshot_data = runtime.turn_snapshot.lock().take();
         if let Some((_turn_id, pre_snapshot_id)) = turn_snapshot_data {
-            match backend.track(worktree).await {
+            match backend
+                .track(worktree)
+                .instrument(info_span!("agent.snapshot.post_turn.track", session_id = %session_id))
+                .await
+            {
                 Ok(post_snapshot_id) => {
                     if pre_snapshot_id != post_snapshot_id {
                         match backend
                             .diff(worktree, &pre_snapshot_id, &post_snapshot_id)
+                            .instrument(info_span!(
+                                "agent.snapshot.post_turn.diff",
+                                session_id = %session_id
+                            ))
                             .await
                         {
                             Ok(changed) if !changed.is_empty() => {
@@ -3344,7 +3352,10 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
                 }
                 Err(e) => warn!("Post-turn snapshot failed: {}", e),
             }
-            let _ = backend.gc(worktree, &config.snapshot_gc_config).await;
+            let _ = backend
+                .gc(worktree, &config.snapshot_gc_config)
+                .instrument(info_span!("agent.snapshot.post_turn.gc", session_id = %session_id))
+                .await;
         }
     } else {
         debug!(

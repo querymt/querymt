@@ -782,6 +782,17 @@ pub(super) enum ToolTarget {
     Provider,
 }
 
+/// Whether a call to `name` can leave workspace files untouched, using the same
+/// target resolution (built-in, then MCP, then provider) as snapshot
+/// preparation, so both agree on what counts as read-only.
+pub(super) fn call_is_read_only(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    name: &str,
+) -> bool {
+    ToolTarget::resolve(config.tool_registry.find(name), exec_ctx, name).is_read_only()
+}
+
 impl ToolTarget {
     fn resolve(builtin: Option<Arc<dyn Tool>>, exec_ctx: &ExecutionContext, name: &str) -> Self {
         if let Some(tool) = builtin {
