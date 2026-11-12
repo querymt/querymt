@@ -42,6 +42,50 @@ async fn querymt_session_undo_stack_returns_empty_stack_for_new_session() {
 }
 
 #[tokio::test]
+async fn querymt_session_undo_stack_reports_which_frames_failed() {
+    let f = HandleFixture::new().await;
+    let store = f.handle.config.provider.history_store();
+    let session = store
+        .create_session(None, None, None, None)
+        .await
+        .expect("create session");
+    register_test_session(&f, &session.public_id).await;
+    for (id, message_id, restore_failed) in [("rev-1", "msg-1", false), ("rev-2", "msg-2", true)] {
+        store
+            .push_revert_state(
+                &session.public_id,
+                crate::session::domain::RevertState {
+                    public_id: id.to_string(),
+                    session_id: session.public_id.clone(),
+                    message_id: message_id.to_string(),
+                    snapshot_id: "snap".into(),
+                    backend_id: "git".to_string(),
+                    workspace_root: None,
+                    restore_failed,
+                    created_at: time::OffsetDateTime::now_utc(),
+                },
+            )
+            .await
+            .expect("push revert state");
+    }
+
+    let result = ext_method_json(
+        &f.handle,
+        "querymt/session/undoStack",
+        serde_json::json!({ "session_id": session.public_id }),
+    )
+    .await;
+
+    assert_eq!(
+        result["undo_stack"],
+        serde_json::json!([
+            { "message_id": "msg-1", "restore_failed": false },
+            { "message_id": "msg-2", "restore_failed": true },
+        ])
+    );
+}
+
+#[tokio::test]
 async fn querymt_session_undo_stack_rejects_missing_session_id() {
     let f = HandleFixture::new().await;
     let req = crate::acp::protocol::ExtRequest::new("querymt/session/undoStack", raw_params("{}"));

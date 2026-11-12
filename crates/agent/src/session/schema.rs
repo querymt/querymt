@@ -339,6 +339,7 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             snapshot_id TEXT NOT NULL,
             backend_id TEXT NOT NULL DEFAULT 'git',
             workspace_root TEXT,
+            restore_failed INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 

@@ -64,6 +64,10 @@ struct DiscardQueuedInputRequest {
 #[derive(Debug, serde::Serialize)]
 struct UndoStackFrameResponse {
     message_id: String,
+    /// `true` when the undo that produced this frame failed part-way. Redo
+    /// can still restore the state before that undo, but the frame is
+    /// discarded by the next prompt.
+    restore_failed: bool,
 }
 
 #[typeshare]
@@ -342,6 +346,7 @@ impl LocalAgentHandle {
             .into_iter()
             .map(|frame| UndoStackFrameResponse {
                 message_id: frame.message_id,
+                restore_failed: frame.restore_failed,
             })
             .collect()
     }

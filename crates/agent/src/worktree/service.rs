@@ -915,7 +915,7 @@ mod tests {
         let sibling_owner = store.create_session(None, None, None, None).await.unwrap();
         let parent = provision_owned(&svc, repo.path(), &owner.public_id).await;
         let sibling = provision_owned(&svc, repo.path(), &sibling_owner.public_id).await;
-        let snapshots = GitSnapshotBackend::with_snapshot_base(data.path().join("snapshots"));
+        let snapshots = GitSnapshotBackend::new().with_snapshot_base(data.path().join("snapshots"));
         let parent_before = snapshots.track(&parent.checkout_path).await.unwrap();
         fs::write(parent.checkout_path.join("file.txt"), "parent dirty").unwrap();
         let parent_after = snapshots.track(&parent.checkout_path).await.unwrap();

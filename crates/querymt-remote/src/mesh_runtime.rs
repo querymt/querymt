@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt as _;
 use kameo::remote;
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle};
+use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{Multiaddr, PeerId};
 use tokio::sync::{mpsc, oneshot};
 
@@ -20,6 +20,35 @@ use crate::{
     LanDiscovery, MeshError, MeshHandle, MeshRuntimeConfig, MeshRuntimeHandle, MeshScopeId,
     MeshTransportKind, MeshTransportMode, SignedInviteGrant,
 };
+
+/// Holds the `NetworkBehaviour` derive for [`UnifiedMeshBehaviour`], and nothing else.
+///
+/// The `mdns` field is a `Toggle<mdns::tokio::Behaviour>` whose connection handler is
+/// `dummy::ConnectionHandler`, with `Infallible` events in both directions. The derive
+/// still emits arms that pass those values on (`on_connection_handler_event` and
+/// `poll`'s `map_in`), and rustc 1.100 reports that as `unreachable_code`. Lint
+/// attributes on the struct don't reach the generated impls, so the allow is scoped to
+/// this module to keep it away from our own code.
+///
+/// FIXME: remove this allow once `libp2p-swarm-derive` stops emitting code for
+/// uninhabited handler events (it still does in 0.36.0, which only raises the MSRV).
+/// Report or fix it upstream in rust-libp2p, then delete the allow and inline the
+/// struct back into the parent module.
+#[allow(
+    unreachable_code,
+    reason = "NetworkBehaviour derive emits arms for the mdns dummy handler's Infallible events"
+)]
+mod unified_behaviour {
+    use kameo::remote;
+    use libp2p::swarm::{NetworkBehaviour, behaviour::toggle::Toggle};
+
+    #[derive(NetworkBehaviour)]
+    pub(super) struct UnifiedMeshBehaviour {
+        pub(super) kameo: remote::Behaviour,
+        pub(super) mdns: Toggle<libp2p::mdns::tokio::Behaviour>,
+    }
+}
+use unified_behaviour::{UnifiedMeshBehaviour, UnifiedMeshBehaviourEvent};
 
 fn messaging_config(request_timeout: std::time::Duration) -> remote::messaging::Config {
     remote::messaging::Config::default()
@@ -155,12 +184,6 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
     };
 
     let mesh_state_store_loop = mesh_state_store.clone();
-
-    #[derive(NetworkBehaviour)]
-    struct UnifiedMeshBehaviour {
-        kameo: remote::Behaviour,
-        mdns: Toggle<libp2p::mdns::tokio::Behaviour>,
-    }
 
     let mut iroh_endpoint = None;
     let mut swarm: libp2p::Swarm<UnifiedMeshBehaviour> = if has_lan && has_iroh {

@@ -85,7 +85,7 @@ pub(crate) struct ExecutionContext {
     /// Optional workspace query bridge for VS Code language intelligence.
     pub workspace_query_bridge: Option<ClientBridgeSender>,
     /// Stable turn id used by hook payloads and turn-scoped metadata.
-    pub turn_id: Option<String>,
+    pub turn_id: Option<crate::model::TurnId>,
     /// Agent mode captured at turn start for this execution.
     pub turn_mode: AgentMode,
     /// Inbox bound to this run for boundary-safe steering.
@@ -174,8 +174,8 @@ impl ExecutionContext {
         self
     }
 
-    pub fn with_turn_id(mut self, turn_id: impl Into<String>) -> Self {
-        self.turn_id = Some(turn_id.into());
+    pub fn with_turn_id(mut self, turn_id: crate::model::TurnId) -> Self {
+        self.turn_id = Some(turn_id);
         self
     }
 
@@ -255,8 +255,14 @@ impl ExecutionContext {
         self.session_handle.execution_config()
     }
 
-    pub fn turn_id(&self) -> Option<&str> {
-        self.turn_id.as_deref()
+    pub fn turn_id(&self) -> Option<crate::model::TurnId> {
+        self.turn_id
+    }
+
+    /// The turn id as an owned string for hook payloads, events and other
+    /// `String`-typed external contracts. Empty when no turn is set.
+    pub fn turn_id_string(&self) -> String {
+        self.turn_id().map(|id| id.to_string()).unwrap_or_default()
     }
 
     pub fn permission_mode(&self) -> &'static str {

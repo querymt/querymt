@@ -159,7 +159,7 @@ async fn run_stop_hook(
         .hooks
         .run_stop(StopRequest {
             session_id: exec_ctx.session_id.clone(),
-            turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+            turn_id: exec_ctx.turn_id_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
                 .llm_config()
@@ -240,7 +240,7 @@ pub(crate) async fn apply_pending_steering(
             session_id: exec_ctx.session_id.clone(),
             role: querymt::chat::ChatRole::User,
             parts: vec![crate::model::MessagePart::Steering {
-                run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                run_id: exec_ctx.turn_id_string(),
                 client_input_id: client_prompt_id.clone(),
                 blocks: blocks.clone(),
             }],
@@ -313,7 +313,7 @@ pub(crate) async fn apply_pending_steering(
             config.emit_event(
                 &exec_ctx.session_id,
                 AgentEventKind::ObjectiveUpdated {
-                    run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                    run_id: exec_ctx.turn_id_string(),
                     revision,
                     source: "steering".to_string(),
                     source_ref: Some(input.input_id.clone()),
@@ -323,7 +323,7 @@ pub(crate) async fn apply_pending_steering(
         config.emit_event(
             &exec_ctx.session_id,
             AgentEventKind::SteeringApplied {
-                run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                run_id: exec_ctx.turn_id_string(),
                 input_id: input.input_id,
                 boundary: boundary.to_string(),
                 latency_ms: crate::agent::turn_control::now_ms()
@@ -541,7 +541,7 @@ pub(crate) async fn execute_cycle_state_machine(
                     config.emit_event(
                         &exec_ctx.session_id,
                         AgentEventKind::ObjectiveCheckpoint {
-                            run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                            run_id: exec_ctx.turn_id_string(),
                             reason: "periodic_progress_review".to_string(),
                             action: "review_progress".to_string(),
                             objective_revision: exec_ctx.run_objective.as_ref().map(|o| o.revision),
@@ -850,7 +850,7 @@ pub(crate) async fn execute_cycle_state_machine(
                                 config.emit_event(
                                     &exec_ctx.session_id,
                                     AgentEventKind::TaskCompletionGuardTriggered {
-                                        run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                                        run_id: exec_ctx.turn_id_string(),
                                         task_id: task.public_id.clone(),
                                     },
                                 );
@@ -864,7 +864,7 @@ pub(crate) async fn execute_cycle_state_machine(
                             config.emit_event(
                                 &exec_ctx.session_id,
                                 AgentEventKind::TaskCompletionGuardExhausted {
-                                    run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                                    run_id: exec_ctx.turn_id_string(),
                                     task_id: task.public_id.clone(),
                                 },
                             );
@@ -1259,7 +1259,7 @@ mod tests {
             session_handle,
             crate::agent::core::ToolConfig::default(),
         )
-        .with_turn_id("run-1")
+        .with_turn_id(crate::model::TurnId::new())
         .with_steering(steering);
         let overrides = querymt::chat::GenerationOptions::NONE
             .with_max_tokens(128_000)
@@ -1274,6 +1274,8 @@ mod tests {
             )
             .with_request_overrides(overrides),
         );
+        let expected_run_id = exec_ctx.turn_id_string();
+        assert!(!expected_run_id.is_empty());
         let mut live_events = fixture.config.subscribe_events();
 
         let next = apply_pending_steering(
@@ -1304,7 +1306,9 @@ mod tests {
                 run_id,
                 client_input_id: Some(client_input_id),
                 blocks: stored_blocks,
-            } if run_id == "run-1" && client_input_id == "client-1" && stored_blocks == &blocks
+            } if run_id == &expected_run_id
+                && client_input_id == "client-1"
+                && stored_blocks == &blocks
         ));
 
         let mut observed = Vec::new();
@@ -1397,7 +1401,7 @@ mod tests {
         let mut exec_ctx = fixture
             .execution_context()
             .await
-            .with_turn_id("run-1")
+            .with_turn_id(crate::model::TurnId::new())
             .with_steering(steering);
         let assistant = ChatMessage::assistant()
             .tool_use("call-1", "read_file", json!({"path": "."}))

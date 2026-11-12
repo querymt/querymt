@@ -281,7 +281,7 @@ async fn prepare_tool_call_inner(
             session_id: exec_ctx.session_id.clone(),
             mcp_server: target.server().map(str::to_owned),
             mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+            turn_id: exec_ctx.turn_id_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
                 .llm_config()
@@ -493,7 +493,7 @@ async fn execute_prepared_inner(
             session_id: exec_ctx.session_id.clone(),
             mcp_server: target.server().map(str::to_owned),
             mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+            turn_id: exec_ctx.turn_id_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
                 .llm_config()
@@ -782,6 +782,17 @@ pub(super) enum ToolTarget {
     Provider,
 }
 
+/// Whether a call to `name` can leave workspace files untouched, using the same
+/// target resolution (built-in, then MCP, then provider) as snapshot
+/// preparation, so both agree on what counts as read-only.
+pub(super) fn call_is_read_only(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    name: &str,
+) -> bool {
+    ToolTarget::resolve(config.tool_registry.find(name), exec_ctx, name).is_read_only()
+}
+
 impl ToolTarget {
     fn resolve(builtin: Option<Arc<dyn Tool>>, exec_ctx: &ExecutionContext, name: &str) -> Self {
         if let Some(tool) = builtin {
@@ -821,7 +832,7 @@ impl ToolTarget {
     /// Whether the call needs no workspace snapshot. The provider fallback is
     /// never registered by the agent (it only reaches tools added to the LLM
     /// client directly), so it is not snapshotted.
-    fn is_read_only(&self) -> bool {
+    pub(super) fn is_read_only(&self) -> bool {
         match self {
             Self::Builtin(tool) => tool.is_read_only(),
             Self::Mcp(adapter) => adapter.is_read_only(),
@@ -1157,7 +1168,7 @@ fn tool_context_for_call(
 
     let event_sink = config.event_sink.clone();
     let session_id_clone = exec_ctx.session_id.clone();
-    let run_id_clone = exec_ctx.turn_id().unwrap_or_default().to_string();
+    let run_id_clone = exec_ctx.turn_id_string();
     let tool_call_id_clone = call.id.clone();
     let pending_elicitations = config.pending_elicitations.clone();
     let cancellation_token = exec_ctx.cancellation_token.clone();
@@ -1342,13 +1353,13 @@ async fn decide_approval(
         return Ok(Approval::Denied(Denial::TaskInactive));
     }
 
-    let turn_id = exec_ctx.turn_id().unwrap_or_default();
+    let turn_id = exec_ctx.turn_id_string();
     let hook_decision = config
         .hooks
         .run_permission_request(crate::hooks::PermissionRequestRequest {
             session_id: exec_ctx.session_id.clone(),
             mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: turn_id.to_string(),
+            turn_id: turn_id.clone(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
                 .llm_config()
@@ -1384,7 +1395,7 @@ async fn decide_approval(
         None => {}
     }
 
-    Ok(prompt_user(config, exec_ctx, call_id, tool, args, &need, turn_id).await)
+    Ok(prompt_user(config, exec_ctx, call_id, tool, args, &need, &turn_id).await)
 }
 
 /// Register a permission interaction, announce it, and wait for the outcome.
@@ -1637,7 +1648,7 @@ pub(super) async fn record_tool_side_effects(
             .hooks
             .run_pre_delegation(PreDelegationRequest {
                 session_id: exec_ctx.session_id.clone(),
-                turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                turn_id: exec_ctx.turn_id_string(),
                 cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
                 model: exec_ctx
                     .llm_config()

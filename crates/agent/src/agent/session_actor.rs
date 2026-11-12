@@ -6,7 +6,7 @@
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::acp::protocol::{ExtResponse, PromptResponse, StopReason};
 use crate::agent::agent_config::AgentConfig;
-use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig};
+use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig, TurnSnapshot};
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::messages::*;
@@ -518,7 +518,7 @@ impl SessionActor {
     fn prompt_execution(
         &self,
         req: crate::acp::protocol::PromptRequest,
-        run_id: String,
+        turn_id: crate::model::TurnId,
         steering: Arc<crate::agent::turn_control::SteeringInbox>,
         phase_reporter: tokio::sync::mpsc::UnboundedSender<Option<RunPhase>>,
     ) -> DetachedPromptExecution {
@@ -531,7 +531,7 @@ impl SessionActor {
             mode: self.mode,
             tool_config: self.tool_config.clone(),
             execution_origin: crate::agent::execution_context::ExecutionOrigin::Interactive,
-            run_id,
+            turn_id,
             steering,
             phase_reporter,
         }
@@ -610,7 +610,8 @@ impl SessionActor {
         self.turn_state.generation = self.turn_state.generation.saturating_add(1);
         self.turn_state.token = CancellationToken::new();
         let generation = self.turn_state.generation;
-        let run_id = Uuid::new_v4().to_string();
+        let turn_id = crate::model::TurnId::new();
+        let run_id = turn_id.to_string();
         let active_run = ActiveRun::new(run_id.clone(), generation, self.turn_state.token.clone());
         let steering = active_run.steering.clone();
         self.active_run = Some(active_run);
@@ -652,7 +653,7 @@ impl SessionActor {
             }
         });
 
-        let exec = self.prompt_execution(req, run_id.clone(), steering, phase_tx);
+        let exec = self.prompt_execution(req, turn_id, steering, phase_tx);
         let completion_token = self.turn_state.token.clone();
         let event_stream = self.config.event_sink.session_stream(&self.session_id);
         tokio::spawn(async move {
@@ -2475,7 +2476,8 @@ impl Message<ScheduledPrompt> for SessionActor {
         self.prompt_running = true;
         self.turn_state.generation = self.turn_state.generation.saturating_add(1);
         let prompt_generation = self.turn_state.generation;
-        let run_id = Uuid::new_v4().to_string();
+        let turn_id = crate::model::TurnId::new();
+        let run_id = turn_id.to_string();
         self.turn_state.token = CancellationToken::new();
         let scheduled_run = ActiveRun::new(
             run_id.clone(),
@@ -2542,7 +2544,7 @@ impl Message<ScheduledPrompt> for SessionActor {
                         schedule_public_id: schedule_public_id.clone(),
                         task_public_id: task_public_id.clone(),
                     },
-                    run_id: run_id.clone(),
+                    turn_id,
                     steering,
                     phase_reporter,
                 })
@@ -2616,7 +2618,9 @@ struct DetachedPromptExecution {
     tool_config: ToolConfig,
     /// Origin of this execution — interactive or scheduled.
     execution_origin: crate::agent::execution_context::ExecutionOrigin,
-    run_id: String,
+    /// The run's single turn id; the `String` run id used by events, hooks and
+    /// steering is derived from it.
+    turn_id: crate::model::TurnId,
     steering: Arc<crate::agent::turn_control::SteeringInbox>,
     phase_reporter: tokio::sync::mpsc::UnboundedSender<Option<RunPhase>>,
 }
@@ -2835,10 +2839,11 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         mode,
         tool_config,
         execution_origin,
-        run_id,
+        turn_id,
         steering,
         phase_reporter,
     } = exec;
+    let run_id = turn_id.to_string();
     debug!(
         "Prompt request for session {} with {} block(s)",
         session_id,
@@ -2968,7 +2973,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         runtime.managed_checkout.get().copied().unwrap_or(false),
         config.workspace_query_bridge_for_session(&session_id),
     ))
-    .with_turn_id(run_id.clone())
+    .with_turn_id(turn_id)
     .with_turn_mode(mode)
     .with_steering(steering)
     .with_phase_reporter(phase_reporter)
@@ -3226,34 +3231,34 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     if let Some(ref backend) = config.snapshot_backend
         && let Some(worktree) = runtime.cwd.as_ref()
     {
-        let turn_id = Uuid::new_v4().to_string();
+        // The start and change records of a run share the run's turn id.
+        let pre_turn_id = turn_id;
         let backend = Arc::clone(backend);
         let worktree = worktree.to_path_buf();
         let worktree_display = worktree.display().to_string();
         let session_id_for_task = session_id.clone();
-        let turn_id_for_task = turn_id.clone();
 
         let task = tokio::spawn(
             async move {
                 let started = std::time::Instant::now();
-                let snapshot_result = backend.track(&worktree).await.map_err(|e| e.to_string());
+                let snapshot_result = backend.track(&worktree).await;
                 let elapsed = started.elapsed();
                 match &snapshot_result {
                     Ok(snapshot_id) => debug!(
                         "Session {}: pre-turn snapshot ready in {:?} (turn_id={}, snapshot_id={})",
-                        session_id_for_task, elapsed, turn_id_for_task, snapshot_id
+                        session_id_for_task, elapsed, pre_turn_id, snapshot_id
                     ),
                     Err(err) => warn!(
                         "Session {}: pre-turn snapshot failed in {:?} (turn_id={}): {}",
-                        session_id_for_task, elapsed, turn_id_for_task, err
+                        session_id_for_task, elapsed, pre_turn_id, err
                     ),
                 }
-                (turn_id_for_task, snapshot_result)
+                (pre_turn_id, snapshot_result)
             }
             .instrument(info_span!(
                 "agent.snapshot.pre_turn.track",
                 session_id = %session_id,
-                turn_id = %turn_id,
+                turn_id = %pre_turn_id,
                 worktree = %worktree_display
             )),
         );
@@ -3304,18 +3309,31 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         }
 
         let turn_snapshot_data = runtime.turn_snapshot.lock().take();
-        if let Some((_turn_id, pre_snapshot_id)) = turn_snapshot_data {
-            match backend.track(worktree).await {
+        if let Some(TurnSnapshot {
+            turn_id,
+            snapshot_id: pre_snapshot_id,
+        }) = turn_snapshot_data
+        {
+            match backend
+                .track(worktree)
+                .instrument(info_span!("agent.snapshot.post_turn.track", session_id = %session_id))
+                .await
+            {
                 Ok(post_snapshot_id) => {
                     if pre_snapshot_id != post_snapshot_id {
                         match backend
                             .diff(worktree, &pre_snapshot_id, &post_snapshot_id)
+                            .instrument(info_span!(
+                                "agent.snapshot.post_turn.diff",
+                                session_id = %session_id
+                            ))
                             .await
                         {
                             Ok(changed) if !changed.is_empty() => {
                                 let patch_part = MessagePart::TurnSnapshotPatch {
-                                    turn_id: run_id.clone(),
-                                    snapshot_id: post_snapshot_id.clone(),
+                                    turn_id,
+                                    snapshot_id: post_snapshot_id,
+                                    base_snapshot_id: Some(pre_snapshot_id),
                                     workspace_root: Some(worktree.to_path_buf()),
                                     inherited: false,
                                     changed_paths: changed
@@ -3344,7 +3362,21 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
                 }
                 Err(e) => warn!("Post-turn snapshot failed: {}", e),
             }
-            let _ = backend.gc(worktree, &config.snapshot_gc_config).await;
+            if config.snapshot_gc_config.is_enabled()
+                && let Err(error) = backend
+                    .gc(worktree, &config.snapshot_gc_config)
+                    .instrument(info_span!(
+                        "agent.snapshot.post_turn.gc",
+                        session_id = %session_id
+                    ))
+                    .await
+            {
+                tracing::warn!(
+                    %session_id,
+                    %error,
+                    "post-turn snapshot garbage collection failed"
+                );
+            }
         }
     } else {
         debug!(
@@ -3424,7 +3456,12 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
 
     match task.instrument(span).await {
         Ok((turn_id, Ok(snapshot_id))) => {
-            *exec_ctx.runtime.turn_snapshot.lock() = Some((turn_id.clone(), snapshot_id.clone()));
+            // The runtime and the stored start record both own the id; a
+            // `SnapshotId` clone is a reference-count increment.
+            *exec_ctx.runtime.turn_snapshot.lock() = Some(TurnSnapshot {
+                turn_id,
+                snapshot_id: snapshot_id.clone(),
+            });
 
             let start_part = MessagePart::TurnSnapshotStart {
                 turn_id,
@@ -3562,11 +3599,12 @@ mod tests {
                     serde_json::Value::from(format!("00-{trace}-1234567890abcdef-01")),
                 )]));
             }
+            let trace_turn_id = crate::model::TurnId::new();
             let exec = actor.prompt_execution(
                 req,
-                "trace-run".into(),
+                trace_turn_id,
                 Arc::new(crate::agent::turn_control::SteeringInbox::new(
-                    "trace-run".into(),
+                    trace_turn_id.to_string(),
                 )),
                 tokio::sync::mpsc::unbounded_channel().0,
             );
@@ -5433,7 +5471,10 @@ mod tests {
     #[tokio::test]
     async fn status_consistency_steering_drain_publishes_new_revision_without_phase_change() {
         let fixture = crate::test_utils::TestAgent::new().await;
-        let mut exec = fixture.execution_context().await.with_turn_id("held-run");
+        let mut exec = fixture
+            .execution_context()
+            .await
+            .with_turn_id(crate::model::TurnId::new());
         let mut actor = SessionActor::new(
             fixture.config.clone(),
             exec.session_id.clone(),

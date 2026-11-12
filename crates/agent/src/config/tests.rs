@@ -1989,3 +1989,89 @@ auth = { type = "oauth", scopes = ["read"] }
     let names: Vec<_> = config.mcp_servers().map(|s| s.name()).collect();
     assert_eq!(names, ["shared", "private"]);
 }
+
+// ==================== Snapshot retention / removed keys ====================
+
+fn parse_snapshot(body: &str) -> Result<SnapshotBackendConfig, toml::de::Error> {
+    toml::from_str::<SnapshotBackendConfig>(body)
+}
+
+#[test]
+fn removed_max_file_bytes_key_is_rejected() {
+    // Single agent: [agent.execution.snapshot]
+    let err = toml::from_str::<AgentSettings>(
+        "provider = \"p\"\nmodel = \"m\"\n[execution.snapshot]\nbackend = \"git\"\nmax_file_bytes = 1024\n",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("unknown field") && err.contains("max_file_bytes"),
+        "{err}"
+    );
+
+    // Quorum delegate: execution.snapshot
+    let err = toml::from_str::<crate::config::QuorumConfig>(
+        "[quorum]\ncwd = \"/tmp\"\n[planner]\nprovider = \"p\"\nmodel = \"m\"\n\
+         [[delegates]]\nid = \"d\"\nprovider = \"p\"\nmodel = \"m\"\n\
+         [delegates.execution.snapshot]\nbackend = \"git\"\nmax_file_bytes = 1024\n",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("unknown field") && err.contains("max_file_bytes"),
+        "{err}"
+    );
+}
+
+#[test]
+fn retention_keys_default_to_unset() {
+    let cfg = parse_snapshot("backend = \"git\"").unwrap();
+    assert_eq!(cfg.max_snapshots, None);
+    assert_eq!(cfg.max_age_days, None);
+    assert_eq!(SnapshotBackendConfig::default().max_snapshots, None);
+    assert_eq!(SnapshotBackendConfig::default().max_age_days, None);
+}
+
+#[test]
+fn retention_values_are_accepted() {
+    let cfg = parse_snapshot("backend = \"git\"\nmax_snapshots = 5\nmax_age_days = 2").unwrap();
+    assert_eq!(cfg.max_snapshots.map(|n| n.get()), Some(5));
+    assert_eq!(cfg.max_age_days.map(|n| n.get()), Some(2));
+}
+
+#[test]
+fn zero_retention_values_are_rejected() {
+    for key in ["max_snapshots", "max_age_days"] {
+        let err = parse_snapshot(&format!("backend = \"git\"\n{key} = 0"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(key), "{key}: {err}");
+    }
+    let err = parse_snapshot("max_snapshots = -1")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("max_snapshots"), "{err}");
+}
+
+#[test]
+fn json_null_leaves_a_retention_key_unset() {
+    let cfg: SnapshotBackendConfig =
+        serde_json::from_str(r#"{"backend":"git","max_age_days":null,"max_snapshots":null}"#)
+            .unwrap();
+    assert_eq!(cfg.max_age_days, None);
+    assert_eq!(cfg.max_snapshots, None);
+}
+
+#[test]
+fn schema_retention_keys_have_minimum_one() {
+    let schema = schemars::schema_for!(SingleAgentConfig);
+    let json = serde_json::to_value(&schema).unwrap();
+    for key in ["max_snapshots", "max_age_days"] {
+        let minimum = json
+            .pointer(&format!(
+                "/$defs/SnapshotBackendConfig/properties/{key}/minimum"
+            ))
+            .and_then(|v| v.as_u64());
+        assert_eq!(minimum, Some(1), "{key} schema: {json}");
+    }
+}

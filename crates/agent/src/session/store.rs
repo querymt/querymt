@@ -857,7 +857,8 @@ pub trait SessionStore: Send + Sync {
         session_id: &str,
     ) -> SessionResult<Vec<crate::session::domain::RevertState>>;
 
-    /// Clear all revert state frames for a session
+    /// Clear all revert state frames for a session, including the recovery
+    /// frames of failed restores.
     async fn clear_revert_states(&self, session_id: &str) -> SessionResult<()>;
 
     /// Delete the message with the given ID and all messages after it.

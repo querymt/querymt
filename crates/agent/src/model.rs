@@ -1,6 +1,7 @@
 use crate::acp::protocol::{ContentBlock, EmbeddedResourceResource};
 use crate::agent::utils::truncate_to_bytes;
 use crate::index::merkle::DiffPaths;
+use crate::snapshot::SnapshotId;
 use base64::Engine as _;
 use querymt::chat::{
     ChatInputPart, ChatOutput, ChatOutputItem, MediaKind, MediaPart, MediaSource, MediaType,
@@ -11,6 +12,92 @@ use querymt::{
 };
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read};
+
+/// Identifier of one agent turn (a single prompt run).
+///
+/// Always serialized as the lowercase hyphenated UUID string (never `uuid`'s
+/// serde support, which writes raw bytes in non-human-readable formats), so
+/// stored turn records and mesh payloads are unchanged. Hook payloads, events
+/// and scheduler messages keep `String` and convert at their boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TurnId(uuid::Uuid);
+
+/// Namespace for turn ids loaded from stored text that is not a UUID.
+const TURN_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x7f3c_9a52_5d1e_4b0a_9c68_2e4d_b1a7_30f5);
+
+impl TurnId {
+    /// Mint a fresh random turn id.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    /// The underlying UUID.
+    #[must_use]
+    pub fn as_uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+
+    /// Load a stored turn id. Text that is not a UUID maps deterministically
+    /// to a v5 UUID, so one bad record can't fail history loading and records
+    /// that share the same text still pair.
+    #[must_use]
+    pub fn from_stored(text: &str) -> Self {
+        match uuid::Uuid::parse_str(text) {
+            Ok(id) => Self(id),
+            Err(_) => Self(uuid::Uuid::new_v5(&TURN_ID_NAMESPACE, text.as_bytes())),
+        }
+    }
+}
+
+impl Default for TurnId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for TurnId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            self.0
+                .hyphenated()
+                .encode_lower(&mut uuid::Uuid::encode_buffer()),
+        )
+    }
+}
+
+impl From<uuid::Uuid> for TurnId {
+    fn from(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+}
+
+impl Serialize for TurnId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(
+            self.0
+                .hyphenated()
+                .encode_lower(&mut uuid::Uuid::encode_buffer()),
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for TurnId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = TurnId;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a turn id string")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<TurnId, E> {
+                Ok(TurnId::from_stored(v))
+            }
+        }
+        deserializer.deserialize_str(Visitor)
+    }
+}
 
 pub const MAX_IMAGES_PER_PROMPT: usize = 8;
 pub const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
@@ -610,8 +697,8 @@ pub enum MessagePart {
     },
     /// Turn snapshot start: worktree state before turn (user prompt)
     TurnSnapshotStart {
-        turn_id: String,
-        snapshot_id: String,
+        turn_id: TurnId,
+        snapshot_id: SnapshotId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace_root: Option<std::path::PathBuf>,
         #[serde(default)]
@@ -619,8 +706,12 @@ pub enum MessagePart {
     },
     /// Turn snapshot patch: worktree state after turn completes, with changed files
     TurnSnapshotPatch {
-        turn_id: String,
-        snapshot_id: String,
+        turn_id: TurnId,
+        snapshot_id: SnapshotId,
+        /// The snapshot taken before the turn, so the record is self-contained
+        /// for undo. `None` on records written before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_snapshot_id: Option<SnapshotId>,
         changed_paths: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace_root: Option<std::path::PathBuf>,
@@ -1069,6 +1160,71 @@ mod tests {
     };
     use base64::Engine as _;
     use querymt::chat::{ChatRole, ToolResultPart};
+
+    /// Typed ids must not change the released stored or wire format.
+    #[test]
+    fn snapshot_ids_serialize_as_plain_strings() {
+        const TURN: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        const PRE: &str = "0123456789abcdef0123456789abcdef01234567";
+        const POST: &str = "89abcdef0123456789abcdef0123456789abcdef";
+        let start = format!(
+            r#"{{"type":"TurnSnapshotStart","data":{{"turn_id":"{TURN}","snapshot_id":"{PRE}","inherited":false}}}}"#
+        );
+        let patch = format!(
+            r#"{{"type":"TurnSnapshotPatch","data":{{"turn_id":"{TURN}","snapshot_id":"{POST}","changed_paths":["a.txt"],"inherited":false}}}}"#
+        );
+        for literal in [start.as_str(), patch.as_str()] {
+            let part: MessagePart = serde_json::from_str(literal).expect("released format parses");
+            let again = serde_json::to_string(&part).expect("serializes");
+            assert_eq!(again, literal, "round trip must keep the released JSON");
+        }
+
+        let snapshot = crate::snapshot::SnapshotId::from(PRE);
+        let turn = super::TurnId::from_stored(TURN);
+        assert_eq!(
+            rmp_serde::to_vec_named(&snapshot).unwrap(),
+            rmp_serde::to_vec_named(PRE).unwrap()
+        );
+        assert_eq!(
+            rmp_serde::to_vec_named(&turn).unwrap(),
+            rmp_serde::to_vec_named(TURN).unwrap(),
+            "msgpack must carry the hyphenated string, not 16 raw bytes"
+        );
+        assert_eq!(
+            serde_json::to_string(&snapshot).unwrap(),
+            format!("\"{PRE}\"")
+        );
+        assert_eq!(serde_json::to_string(&turn).unwrap(), format!("\"{TURN}\""));
+        let back: super::TurnId = rmp_serde::from_slice(&rmp_serde::to_vec_named(&turn).unwrap())
+            .expect("msgpack round trip");
+        assert_eq!(back, turn);
+    }
+
+    /// A stored turn id that is not a UUID must not fail loading, and records
+    /// carrying the same text must still pair.
+    #[test]
+    fn turn_id_that_is_not_a_uuid_still_pairs() {
+        let literal = |kind: &str, extra: &str| {
+            format!(
+                r#"{{"type":"{kind}","data":{{"turn_id":"turn-1","snapshot_id":"abc"{extra},"inherited":false}}}}"#
+            )
+        };
+        let start: MessagePart =
+            serde_json::from_str(&literal("TurnSnapshotStart", "")).expect("start loads");
+        let patch: MessagePart =
+            serde_json::from_str(&literal("TurnSnapshotPatch", r#","changed_paths":[]"#))
+                .expect("patch loads");
+        let (
+            MessagePart::TurnSnapshotStart { turn_id: a, .. },
+            MessagePart::TurnSnapshotPatch { turn_id: b, .. },
+        ) = (start, patch)
+        else {
+            panic!("unexpected variants");
+        };
+        assert_eq!(a, b);
+        assert_eq!(a, super::TurnId::from_stored("turn-1"));
+        assert_ne!(a, super::TurnId::from_stored("turn-2"));
+    }
 
     fn prompt_message(blocks: Vec<ContentBlock>) -> AgentMessage {
         AgentMessage {

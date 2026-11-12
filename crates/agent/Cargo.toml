@@ -58,7 +58,7 @@ tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "gzip", "brotli", "deflate"] }
 rusqlite = { version = "0.41", features = ["bundled", "uuid", "time"] }
 time = { version = "0.3", features = ["serde", "formatting", "macros", "local-offset"] }
-uuid = { version = "1.18", features = ["v4", "v7"] }
+uuid = { version = "1.18", features = ["v4", "v5", "v7"] }
 url.workspace = true
 rapidhash = "4.2"
 rand = "0.10"
@@ -158,8 +158,12 @@ tree-sitter-md = "0.5"
 # Rust AST parsing for rich structural fingerprinting during function indexing
 syn = { version = "2", features = ["full", "visit"] }
 
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tempfile = "3.0"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
 rmcp = { version = "3.8", features = ["transport-streamable-http-client-unix-socket"] }
 
 [lib]
@@ -177,12 +181,10 @@ ureq = { version = "3", optional = true, default-features = false, features = ["
 [dev-dependencies]
 rmcp = { version = "3.8", features = ["server"] }
 qmt-openai = { path = "../providers/openai", default-features = false, features = ["api"] }
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 mockall = "0.15"
 tar = { version = "0.4", default-features = false }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 env_logger = "0.11"
-tempfile = "3.0"
 clap = { version = "4.5", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
@@ -210,4 +212,8 @@ harness = false
 
 [[bench]]
 name = "event_emit"
+harness = false
+
+[[bench]]
+name = "snapshot_track"
 harness = false
