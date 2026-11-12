@@ -8,6 +8,7 @@
 use crate::acp::protocol::{
     AvailableCommand, AvailableCommandInput, ContentBlock, UnstructuredCommandInput,
 };
+use crate::agent::turn_control::InputDelivery;
 
 /// A natively handled slash command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,16 +21,46 @@ pub enum Builtin {
     Worktree,
 }
 
+/// How a prompt reaches the agent. Which built-ins each path accepts is
+/// decided in one place, [`Builtin::accepts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Submission {
+    /// `session/prompt`, where native commands are intercepted before any turn.
+    Prompt,
+    /// Input that starts or waits for its own turn (queued or scheduled).
+    Turn,
+    /// Input appended to a live model run, where it reaches the model as text.
+    Steer,
+}
+
+impl Submission {
+    const fn verb(self) -> &'static str {
+        match self {
+            Submission::Prompt => "submitted as a prompt",
+            Submission::Turn => "queued or scheduled",
+            Submission::Steer => "steered into a running turn",
+        }
+    }
+}
+
+impl From<InputDelivery> for Submission {
+    fn from(delivery: InputDelivery) -> Self {
+        match delivery {
+            InputDelivery::Steer => Submission::Steer,
+            InputDelivery::Queue => Submission::Turn,
+        }
+    }
+}
+
 /// Why a prompt that names a built-in cannot be accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BuiltinError {
     /// A built-in must be the only block of its prompt.
     #[error("{} requires a single text block", .0.name())]
     NotSingleTextBlock(Builtin),
-    /// Steering text is appended to a live model run, where a built-in would
-    /// reach the model verbatim instead of running.
-    #[error("{} cannot steer a running turn; queue it or submit it with session/prompt", .0.name())]
-    CannotSteer(Builtin),
+    /// The built-in does not run when submitted this way.
+    #[error("{} cannot be {}; {}", .builtin.name(), .via.verb(), .builtin.alternatives())]
+    NotAccepted { builtin: Builtin, via: Submission },
 }
 
 /// A parsed built-in invocation.
@@ -93,6 +124,26 @@ impl Builtin {
         }
     }
 
+    /// Whether this built-in runs when submitted via `via`. Exhaustive on
+    /// purpose: a new built-in or submission path must be decided here.
+    pub const fn accepts(self, via: Submission) -> bool {
+        match (self, via) {
+            (Builtin::Compact, Submission::Prompt | Submission::Turn) => true,
+            (Builtin::Compact, Submission::Steer) => false,
+            (Builtin::Worktree, Submission::Prompt) => true,
+            (Builtin::Worktree, Submission::Turn | Submission::Steer) => false,
+        }
+    }
+
+    /// What to do instead, derived from [`Self::accepts`] so it cannot drift.
+    const fn alternatives(self) -> &'static str {
+        if self.accepts(Submission::Turn) {
+            "queue it or submit it with session/prompt"
+        } else {
+            "submit it with session/prompt"
+        }
+    }
+
     /// Whether a user command file may not use `name` (without the slash).
     pub fn is_reserved(name: &str) -> bool {
         Self::ALL
@@ -132,6 +183,27 @@ impl Builtin {
             }));
         }
         Ok(None)
+    }
+
+    /// [`Self::parse`], then reject a built-in that does not run when
+    /// submitted via `via`.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::parse`] returns, plus [`BuiltinError::NotAccepted`].
+    pub fn parse_for(
+        prompt: &[ContentBlock],
+        via: Submission,
+    ) -> Result<Option<BuiltinInvocation>, BuiltinError> {
+        match Self::parse(prompt)? {
+            Some(invocation) if !invocation.builtin.accepts(via) => {
+                Err(BuiltinError::NotAccepted {
+                    builtin: invocation.builtin,
+                    via,
+                })
+            }
+            other => Ok(other),
+        }
     }
 }
 
@@ -202,14 +274,61 @@ mod tests {
     }
 
     #[test]
-    fn errors_name_the_builtin() {
+    fn submission_table_is_the_single_source_of_truth() {
+        use Submission::{Prompt, Steer, Turn};
+        let table = [
+            (Builtin::Compact, Prompt, true),
+            (Builtin::Compact, Turn, true),
+            (Builtin::Compact, Steer, false),
+            (Builtin::Worktree, Prompt, true),
+            (Builtin::Worktree, Turn, false),
+            (Builtin::Worktree, Steer, false),
+        ];
+        // Every built-in is covered, so a new one fails this test until listed.
+        assert_eq!(table.len(), Builtin::ALL.len() * 3);
+        for (builtin, via, accepted) in table {
+            assert_eq!(builtin.accepts(via), accepted, "{builtin:?} via {via:?}");
+            let parsed = Builtin::parse_for(&text(builtin.name()), via);
+            if accepted {
+                assert_eq!(parsed.unwrap().unwrap().builtin, builtin);
+            } else {
+                assert_eq!(parsed, Err(BuiltinError::NotAccepted { builtin, via }));
+            }
+        }
+        // Ordinary prompts are never rejected, whatever the path.
+        for via in [Prompt, Turn, Steer] {
+            assert_eq!(Builtin::parse_for(&text("hello"), via), Ok(None));
+        }
+    }
+
+    #[test]
+    fn delivery_maps_onto_submission() {
+        assert_eq!(Submission::from(InputDelivery::Steer), Submission::Steer);
+        assert_eq!(Submission::from(InputDelivery::Queue), Submission::Turn);
+    }
+
+    #[test]
+    fn errors_name_the_builtin_and_the_way_forward() {
         assert_eq!(
             BuiltinError::NotSingleTextBlock(Builtin::Compact).to_string(),
             "/compact requires a single text block"
         );
         assert_eq!(
-            BuiltinError::CannotSteer(Builtin::Worktree).to_string(),
-            "/worktree cannot steer a running turn; queue it or submit it with session/prompt"
+            BuiltinError::NotAccepted {
+                builtin: Builtin::Compact,
+                via: Submission::Steer
+            }
+            .to_string(),
+            "/compact cannot be steered into a running turn; queue it or submit it with session/prompt"
+        );
+        // A built-in that cannot be queued must not suggest queueing it.
+        assert_eq!(
+            BuiltinError::NotAccepted {
+                builtin: Builtin::Worktree,
+                via: Submission::Steer
+            }
+            .to_string(),
+            "/worktree cannot be steered into a running turn; submit it with session/prompt"
         );
     }
 

@@ -1827,9 +1827,10 @@ async fn steering_compact_is_rejected_but_queueing_it_is_allowed() {
         .expect_err("steering /compact must be rejected before reaching the model");
     assert_eq!(
         err.message,
-        crate::slash_commands::builtin::BuiltinError::CannotSteer(
-            crate::slash_commands::builtin::Builtin::Compact
-        )
+        crate::slash_commands::builtin::BuiltinError::NotAccepted {
+            builtin: crate::slash_commands::builtin::Builtin::Compact,
+            via: crate::slash_commands::builtin::Submission::Steer,
+        }
         .to_string(),
         "unexpected error: {err:?}"
     );
