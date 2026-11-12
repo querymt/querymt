@@ -2065,6 +2065,20 @@ pub(super) async fn transition_processing_tool_calls(
         }
         let segment_plan =
             prepare_segment(config, driver, remaining_calls, &indices, exec_ctx).await?;
+        // Preparation may resolve a call to a different target than the
+        // pre-check saw (e.g. the MCP tool list reloaded); re-check the
+        // prepared targets. A no-op when the snapshot is already resolved.
+        if segment_plan
+            .ready
+            .iter()
+            .any(|(_, call, _)| !call.target.is_read_only())
+            && let Err(e) = ensure_pre_turn_snapshot_ready(exec_ctx, "before_mutating_tool").await
+        {
+            warn!(
+                "Failed to resolve pre-turn snapshot before tool execution: {}",
+                e
+            );
+        }
         for (index, result) in segment_plan.immediate {
             slots[index] = Some(result);
         }
@@ -2496,7 +2510,7 @@ mod tests {
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let driver = CompositeDriver::new(vec![]);
 
-            let _ = tokio::time::timeout(
+            tokio::time::timeout(
                 Duration::from_secs(10),
                 transition_processing_tool_calls(
                     &agent.config,
@@ -2507,7 +2521,9 @@ mod tests {
                     &mut exec,
                 ),
             )
-            .await;
+            .await
+            .expect("read-only call must complete without waiting for the snapshot")
+            .expect("transition succeeds");
 
             assert!(
                 exec.runtime.pre_turn_snapshot_task.lock().is_some(),

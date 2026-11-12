@@ -688,16 +688,17 @@ impl GitSnapshotBackend {
             }
         }
 
-        // A path missing from one tree only because that snapshot could not
-        // capture it (too large, unstable) did not necessarily appear or
-        // disappear. Reporting it would make undo/redo delete or overwrite
-        // files it never had a copy of.
+        // A path the `from` snapshot could not capture (too large, unstable)
+        // has no copy to restore, and may not have appeared or disappeared at
+        // all; reporting it would make undo delete files it never had a copy
+        // of. A path skipped only in `to` is kept: `from` still holds a copy
+        // that undo can restore, and `checkout_paths` leaves paths the target
+        // snapshot did not capture alone.
         let skipped_from = skipped_paths(repo, from_id);
-        let skipped_to = skipped_paths(repo, to_id);
-        if !skipped_from.is_empty() || !skipped_to.is_empty() {
+        if !skipped_from.is_empty() {
             changed_files.retain(|path| {
                 let path: String = path.to_string_lossy().into_owned();
-                !skipped_from.contains(&path) && !skipped_to.contains(&path)
+                !skipped_from.contains(&path)
             });
         }
 
@@ -1940,8 +1941,9 @@ mod tests {
         gix::open(backend.snapshot_dir(worktree).unwrap()).unwrap()
     }
 
-    /// A file that grows past `max_file_bytes` during a turn must neither be
-    /// reported as deleted by diff nor removed by a restore.
+    /// A file that grows past `max_file_bytes` during a turn is not a deletion:
+    /// diff still reports it (the pre-turn copy is restorable by undo), and a
+    /// restore from the snapshot that could not capture it leaves it alone.
     #[test]
     fn test_file_growing_past_limit_is_not_reported_deleted_or_removed() {
         let tmpdir = TempDir::new().unwrap();
@@ -1959,10 +1961,16 @@ mod tests {
 
         let repo = repo_for(&backend, tmpdir.path());
         let changed = GitSnapshotBackend::diff_commits(&repo, &pre, &post).unwrap();
-        assert!(
-            changed.is_empty(),
-            "uncaptured file is not a deletion: {changed:?}"
+        assert_eq!(
+            changed,
+            vec![PathBuf::from("data.bin")],
+            "pre-turn copy must stay restorable by undo"
         );
+
+        // Undo restores the pre-turn copy.
+        GitSnapshotBackend::checkout_paths(&repo, tmpdir.path(), &pre, &changed).unwrap();
+        assert_eq!(fs::read(&big).unwrap(), vec![1u8; 512]);
+        fs::write(&big, vec![2u8; 4096]).unwrap();
 
         // Redo-style restore from the snapshot that could not capture it.
         GitSnapshotBackend::checkout_paths(

@@ -832,7 +832,7 @@ impl ToolTarget {
     /// Whether the call needs no workspace snapshot. The provider fallback is
     /// never registered by the agent (it only reaches tools added to the LLM
     /// client directly), so it is not snapshotted.
-    fn is_read_only(&self) -> bool {
+    pub(super) fn is_read_only(&self) -> bool {
         match self {
             Self::Builtin(tool) => tool.is_read_only(),
             Self::Mcp(adapter) => adapter.is_read_only(),
