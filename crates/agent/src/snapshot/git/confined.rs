@@ -155,6 +155,9 @@ mod unix {
                 .open_parent(parents, true, rel)?
                 .ok_or_else(|| outside(rel))?;
 
+            // `st_mode` is `u16` on macOS/BSD but already `u32` on Linux, where the
+            // conversion is a no-op that clippy flags.
+            #[allow(clippy::useless_conversion)]
             let existing = match rustix::fs::statat(&dir, *name, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(st) if FileType::from_raw_mode(st.st_mode) == FileType::RegularFile => {
                     Some(u32::from(st.st_mode))
