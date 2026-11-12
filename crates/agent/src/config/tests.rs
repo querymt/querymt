@@ -2335,10 +2335,14 @@ async fn repository_knowledge_coder_example_loads_and_rolls_back_by_disabling() 
     let tools = config.agent.tools.clone();
     assert!(!tools.is_empty(), "explicit allowlist");
     for name in REPOSITORY_TOOL_NAMES {
-        assert!(tools.iter().any(|t| t == name), "{name} listed");
+        assert!(tools.iter().any(|t| t.is_builtin(name)), "{name} listed");
     }
     // Legacy session-memory tools are not pulled in.
-    assert!(!tools.iter().any(|t| t.starts_with("knowledge_")));
+    assert!(
+        !tools
+            .iter()
+            .any(|t| t.as_builtin().is_some_and(|n| n.starts_with("knowledge_")))
+    );
 
     // Rollback: disabling the feature turns off reads and both delivery stages
     // even though the delivery flags remain set.
