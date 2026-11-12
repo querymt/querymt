@@ -1814,7 +1814,18 @@
 </li>
 </ol>
 <h2 id="built-in-commands">Built-in Commands</h2>
-<p>QueryMT includes several built-in commands:</p>
+<p>QueryMT includes several built-in commands.</p>
+<p>Two of them are handled natively by the agent and never reach the model:</p>
+<ul>
+<li><code>/compact [instructions]</code> summarizes the conversation now. It is always
+  available and cannot be turned off.</li>
+<li><code>/worktree ...</code> administers managed workspaces. It is only available for
+  local sessions on an agent with the workspace service enabled (see
+  <a href=".././worktrees/">Git Worktree Workspaces</a>).</li>
+</ul>
+<p>A session advertises to ACP clients exactly the commands it can run: its user
+commands plus the native built-ins available on its host. A session hosted on a
+remote mesh node currently advertises only <code>/compact</code>.</p>
 <h3 id="help-command"><code>/help [command]</code></h3>
 <p>Show available slash commands or detailed help for a specific command.</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1">1</a></span>
@@ -2066,7 +2077,9 @@
 - Filename (without <code>.md</code>) becomes command name
 - Hyphens allowed: <code>code-review.md</code> → <code>/code-review</code>
 - Case-insensitive matching
-- No spaces in filenames</p>
+- No spaces in filenames
+- <code>compact</code> and <code>worktree</code> are reserved for the native built-ins: a command
+  file with either name is skipped with a warning</p>
 <h3 id="command-discovery">Command Discovery</h3>
 <p>Commands are discovered at startup:</p>
 <ol>
