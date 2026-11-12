@@ -291,7 +291,7 @@ pub(crate) async fn compact_history(
         })
         .sum();
 
-    let turn_id = exec_ctx.turn_id().unwrap_or_default().to_string();
+    let turn_id = exec_ctx.turn_id_string();
     let model_name = exec_ctx
         .llm_config()
         .map(|cfg| cfg.model.clone())
@@ -666,7 +666,7 @@ mod tests {
             session_handle,
             ToolConfig::default(),
         )
-        .with_turn_id("run-compaction");
+        .with_turn_id(crate::model::TurnId::new());
         let state = ExecutionState::Stopped {
             message: "context threshold".into(),
             stop_type: StopType::ContextThreshold,

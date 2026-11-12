@@ -5,8 +5,11 @@
 //! set, snapshots beyond the window are pruned and, once enough of them are
 //! pruned, the content only they referenced is deleted from disk.
 
+use super::object_id;
 use super::{GitSnapshotBackend, Limits, SnapshotLock};
-use crate::snapshot::backend::{GcConfig, GcResult, SnapshotError, SnapshotResult, io_err};
+use crate::snapshot::backend::{
+    GcConfig, GcResult, SnapshotError, SnapshotId, SnapshotResult, io_err,
+};
 use gix::hashtable::HashSet;
 use std::collections::HashMap;
 use std::fs;
@@ -24,7 +27,7 @@ const SECS_PER_DAY: u64 = 86_400;
 impl GitSnapshotBackend {
     /// List all commits with timestamps by walking first parents from HEAD.
     /// The walk ends at the first missing commit, i.e. at the last sweep.
-    pub(super) fn list_commits(repo: &gix::Repository) -> SnapshotResult<Vec<(String, i64)>> {
+    pub(super) fn list_commits(repo: &gix::Repository) -> SnapshotResult<Vec<(SnapshotId, i64)>> {
         let Ok(head) = repo.head_commit() else {
             return Ok(Vec::new()); // Empty repo
         };
@@ -36,7 +39,7 @@ impl GitSnapshotBackend {
             match repo.find_commit(oid) {
                 Ok(commit) => {
                     let timestamp = commit.time().map_or(0, |t| t.seconds);
-                    commits.push((oid.to_string(), timestamp));
+                    commits.push((SnapshotId::from(oid), timestamp));
                     current = commit.parent_ids().next().map(gix::Id::detach);
                 }
                 Err(e) => {
@@ -110,7 +113,7 @@ pub(super) fn collect_garbage_with(
     Ok(result)
 }
 
-fn estimate_result(commits: &[(String, i64)], cfg: &GcConfig, now: SystemTime) -> GcResult {
+fn estimate_result(commits: &[(SnapshotId, i64)], cfg: &GcConfig, now: SystemTime) -> GcResult {
     let keep = retained_prefix(commits, cfg, now);
     GcResult {
         removed_count: commits.len() - keep,
@@ -121,7 +124,7 @@ fn estimate_result(commits: &[(String, i64)], cfg: &GcConfig, now: SystemTime) -
 
 /// How many of the newest `commits` are kept: HEAD always, then every commit
 /// newer than the age cutoff, up to the count limit.
-fn retained_prefix(commits: &[(String, i64)], cfg: &GcConfig, now: SystemTime) -> usize {
+fn retained_prefix(commits: &[(SnapshotId, i64)], cfg: &GcConfig, now: SystemTime) -> usize {
     if commits.is_empty() {
         return 0;
     }
@@ -141,23 +144,18 @@ fn cutoff_secs(now: SystemTime, max_age_days: NonZeroU64) -> i64 {
     i64::try_from(now_secs.saturating_sub(window)).unwrap_or(i64::MAX)
 }
 
-fn parse_id(id: &str) -> SnapshotResult<gix::ObjectId> {
-    gix::ObjectId::from_hex(id.as_bytes())
-        .map_err(|_| SnapshotError::InvalidSnapshotId(id.to_string()))
-}
-
 /// Delete every loose object that no kept snapshot references. Parent links
 /// are ignored, so pruned commits become unreachable without rewriting any
 /// kept commit id. Pruned commits are deleted first, so an interrupted sweep
 /// never leaves a reachable commit with missing blobs.
 fn sweep(
     repo: &gix::Repository,
-    kept: &[(String, i64)],
-    pruned: &[(String, i64)],
+    kept: &[(SnapshotId, i64)],
+    pruned: &[(SnapshotId, i64)],
 ) -> SnapshotResult<usize> {
     let mut reachable: HashSet<gix::ObjectId> = HashSet::default();
     for (id, _) in kept {
-        let commit_id = parse_id(id)?;
+        let commit_id = object_id(id)?;
         let commit = repo
             .find_commit(commit_id)
             .map_err(|e| SnapshotError::NotFound(format!("commit {id}: {e}")))?;
@@ -172,7 +170,7 @@ fn sweep(
     let objects = repo.git_dir().join("objects");
     let mut deleted = 0;
     for (id, _) in pruned {
-        let oid = parse_id(id)?;
+        let oid = object_id(id)?;
         if !reachable.contains(&oid) {
             deleted += remove_loose(&objects, &oid)?;
         }

@@ -199,9 +199,22 @@ impl McpToolState {
     }
 }
 
+/// The snapshot taken at the start of a turn, paired with the turn it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnSnapshot {
+    pub turn_id: crate::model::TurnId,
+    pub snapshot_id: crate::snapshot::SnapshotId,
+}
+
 /// Type alias for the in-flight pre-turn snapshot task handle.
-type PreTurnSnapshotTask =
-    ParkingMutex<Option<tokio::task::JoinHandle<(String, Result<String, String>)>>>;
+type PreTurnSnapshotTask = ParkingMutex<
+    Option<
+        tokio::task::JoinHandle<(
+            crate::model::TurnId,
+            crate::snapshot::SnapshotResult<crate::snapshot::SnapshotId>,
+        )>,
+    >,
+>;
 
 /// Runtime state for an active session.
 pub struct SessionRuntime {
@@ -219,8 +232,8 @@ pub struct SessionRuntime {
     pub tool_validator_cache: ParkingMutex<HashMap<String, Arc<jsonschema::Validator>>>,
     /// Workspace handle for duplicate code detection (built asynchronously on session start)
     pub workspace_handle: Arc<OnceCell<crate::index::WorkspaceHandle>>,
-    /// Turn snapshot: (turn_id, snapshot_id) taken at the start of the turn for undo/redo
-    pub turn_snapshot: ParkingMutex<Option<(String, String)>>,
+    /// Turn snapshot taken at the start of the turn for undo/redo.
+    pub turn_snapshot: ParkingMutex<Option<TurnSnapshot>>,
     /// In-flight pre-turn snapshot task, resolved before first assistant response or post-turn use.
     pub pre_turn_snapshot_task: PreTurnSnapshotTask,
     /// Accumulated changed file paths across the entire turn (for end-of-turn dedup check)

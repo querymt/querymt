@@ -334,7 +334,7 @@ pub struct RevertState {
     /// The message ID we reverted to
     pub message_id: String,
     /// Snapshot taken before the undo (for redo)
-    pub snapshot_id: String,
+    pub snapshot_id: crate::snapshot::SnapshotId,
     /// Backend type used (e.g., "git")
     pub backend_id: String,
     /// Workspace provenance: the checkout the snapshot was captured

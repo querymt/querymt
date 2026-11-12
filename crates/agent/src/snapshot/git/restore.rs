@@ -6,7 +6,8 @@
 
 use super::GitSnapshotBackend;
 use super::confined::Root;
-use crate::snapshot::backend::{SnapshotError, SnapshotResult};
+use super::object_id;
+use crate::snapshot::backend::{SnapshotError, SnapshotId, SnapshotResult};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufReader, Read, Write};
@@ -31,17 +32,12 @@ enum BlobSource<'a> {
     },
 }
 
-fn parse_commit_id(sha: &str) -> SnapshotResult<gix::ObjectId> {
-    gix::ObjectId::from_hex(sha.as_bytes())
-        .map_err(|_| SnapshotError::InvalidSnapshotId(sha.to_string()))
-}
-
 pub(super) fn commit_tree<'r>(
     repo: &'r gix::Repository,
-    sha: &str,
+    sha: &SnapshotId,
 ) -> SnapshotResult<gix::Tree<'r>> {
     let commit = repo
-        .find_commit(parse_commit_id(sha)?)
+        .find_commit(object_id(sha)?)
         .map_err(|e| SnapshotError::NotFound(format!("commit {sha}: {e}")))?;
     commit
         .tree()
@@ -78,11 +74,11 @@ impl GitSnapshotBackend {
     /// old and its new path (no rename detection), sorted and de-duplicated.
     pub(super) fn diff_commits(
         repo: &gix::Repository,
-        from: &str,
-        to: &str,
+        from: &SnapshotId,
+        to: &SnapshotId,
     ) -> SnapshotResult<Vec<PathBuf>> {
-        let from_id = parse_commit_id(from)?;
-        let to_id = parse_commit_id(to)?;
+        let from_id = object_id(from)?;
+        let to_id = object_id(to)?;
 
         let from_commit = repo
             .find_commit(from_id)
@@ -135,7 +131,7 @@ impl GitSnapshotBackend {
         &self,
         repo: &gix::Repository,
         worktree: &Path,
-        commit_sha: &str,
+        commit_sha: &SnapshotId,
         paths: &[PathBuf],
     ) -> SnapshotResult<RestoreStats> {
         let tree = commit_tree(repo, commit_sha)?;
@@ -177,7 +173,7 @@ impl GitSnapshotBackend {
         &self,
         repo: &gix::Repository,
         worktree: &Path,
-        commit_sha: &str,
+        commit_sha: &SnapshotId,
     ) -> SnapshotResult<RestoreStats> {
         let tree = commit_tree(repo, commit_sha)?;
         let root = Root::open(worktree)?;

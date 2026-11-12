@@ -2292,7 +2292,7 @@ impl SessionStore for SqliteStorage {
                 |row| {
                     let public_id: String = row.get(0)?;
                     let message_id: String = row.get(1)?;
-                    let snapshot_id: String = row.get(2)?;
+                    let snapshot_id = crate::snapshot::SnapshotId::from(row.get::<_, String>(2)?);
                     let backend_id: String = row.get(3)?;
                     let workspace_root: Option<String> = row.get(4)?;
                     let created_at_str: String = row.get(5)?;
@@ -2333,7 +2333,7 @@ impl SessionStore for SqliteStorage {
                     state.public_id,
                     session_internal_id,
                     state.message_id,
-                    state.snapshot_id,
+                    state.snapshot_id.as_str(),
                     state.backend_id,
                     state.workspace_root.as_ref().map(|p| p.to_string_lossy().into_owned()),
                     now,
@@ -2359,7 +2359,8 @@ impl SessionStore for SqliteStorage {
                         let id: i64 = row.get(0)?;
                         let public_id: String = row.get(1)?;
                         let message_id: String = row.get(2)?;
-                        let snapshot_id: String = row.get(3)?;
+                        let snapshot_id =
+                            crate::snapshot::SnapshotId::from(row.get::<_, String>(3)?);
                         let backend_id: String = row.get(4)?;
                         let workspace_root: Option<String> = row.get(5)?;
                         let created_at_str: String = row.get(6)?;
@@ -2410,7 +2411,7 @@ impl SessionStore for SqliteStorage {
             let rows = stmt.query_map(params![session_internal_id], |row| {
                 let public_id: String = row.get(0)?;
                 let message_id: String = row.get(1)?;
-                let snapshot_id: String = row.get(2)?;
+                let snapshot_id = crate::snapshot::SnapshotId::from(row.get::<_, String>(2)?);
                 let backend_id: String = row.get(3)?;
                 let workspace_root: Option<String> = row.get(4)?;
                 let created_at_str: String = row.get(5)?;

@@ -422,10 +422,24 @@ pub struct UndoTestFixture {
 impl UndoTestFixture {
     /// Creates a new test fixture with snapshot support enabled.
     pub async fn new() -> Result<Self> {
+        let (registry, config_dir) = empty_plugin_registry()?;
+        Self::with_registry(registry, config_dir).await
+    }
+
+    /// Creates a fixture whose LLM is `provider`, so prompts run end to end
+    /// (real turn snapshots, real tool calls) instead of hand-written records.
+    pub(crate) async fn with_provider(
+        provider: crate::test_utils::SharedLlmProvider,
+    ) -> Result<Self> {
+        let (registry, config_dir) =
+            mock_plugin_registry(Arc::new(TestProviderFactory::new(provider)))?;
+        Self::with_registry(registry, config_dir).await
+    }
+
+    async fn with_registry(registry: PluginRegistry, config_dir: TempDir) -> Result<Self> {
         let worktree = TempDir::new()?;
         let snapshot_base = TempDir::new()?;
 
-        let (registry, config_dir) = empty_plugin_registry()?;
         let registry = Arc::new(registry);
 
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
@@ -598,7 +612,10 @@ impl UndoTestFixture {
     }
 
     /// Take a snapshot and record TurnSnapshotStart
-    pub async fn take_pre_snapshot(&self, session_id: &str) -> Result<(String, String)> {
+    pub async fn take_pre_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<(crate::model::TurnId, crate::snapshot::SnapshotId)> {
         self.take_pre_snapshot_with_cwd(session_id, self.worktree.path())
             .await
     }
@@ -608,16 +625,16 @@ impl UndoTestFixture {
         &self,
         session_id: &str,
         cwd: &std::path::Path,
-    ) -> Result<(String, String)> {
+    ) -> Result<(crate::model::TurnId, crate::snapshot::SnapshotId)> {
         let snapshot_id = self.backend.track(cwd).await?;
-        let turn_id = Uuid::new_v4().to_string();
+        let turn_id = crate::model::TurnId::new();
 
         let msg = AgentMessage {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
             role: ChatRole::Assistant,
             parts: vec![MessagePart::TurnSnapshotStart {
-                turn_id: turn_id.clone(),
+                turn_id,
                 snapshot_id: snapshot_id.clone(),
                 workspace_root: Some(cwd.to_path_buf()),
                 inherited: false,
@@ -639,8 +656,8 @@ impl UndoTestFixture {
     pub async fn take_post_snapshot(
         &self,
         session_id: &str,
-        turn_id: &str,
-        pre_snapshot: &str,
+        turn_id: &crate::model::TurnId,
+        pre_snapshot: &crate::snapshot::SnapshotId,
     ) -> Result<Vec<String>> {
         self.take_post_snapshot_with_cwd(session_id, turn_id, pre_snapshot, self.worktree.path())
             .await
@@ -650,16 +667,12 @@ impl UndoTestFixture {
     pub async fn take_post_snapshot_with_cwd(
         &self,
         session_id: &str,
-        turn_id: &str,
-        pre_snapshot: &str,
+        turn_id: &crate::model::TurnId,
+        pre_snapshot: &crate::snapshot::SnapshotId,
         cwd: &std::path::Path,
     ) -> Result<Vec<String>> {
         let post_snapshot = self.backend.track(cwd).await?;
-        let pre_snapshot_string = pre_snapshot.to_string();
-        let changed_paths = self
-            .backend
-            .diff(cwd, &pre_snapshot_string, &post_snapshot)
-            .await?;
+        let changed_paths = self.backend.diff(cwd, pre_snapshot, &post_snapshot).await?;
 
         let changed_strs: Vec<String> = changed_paths
             .iter()
@@ -671,8 +684,9 @@ impl UndoTestFixture {
             session_id: session_id.to_string(),
             role: ChatRole::Assistant,
             parts: vec![MessagePart::TurnSnapshotPatch {
-                turn_id: turn_id.to_string(),
+                turn_id: *turn_id,
                 snapshot_id: post_snapshot,
+                base_snapshot_id: Some(pre_snapshot.clone()),
                 changed_paths: changed_strs.clone(),
                 workspace_root: Some(cwd.to_path_buf()),
                 inherited: false,
@@ -710,6 +724,25 @@ impl UndoTestFixture {
     /// Convenience: read a file under an explicit workspace
     pub fn read_file_in(&self, cwd: &std::path::Path, name: &str) -> Result<String> {
         Ok(std::fs::read_to_string(cwd.join(name))?)
+    }
+
+    /// Send `text` as a real ACP prompt to `session_id` and wait for the turn
+    /// (including its post-turn snapshot) to finish.
+    pub(crate) async fn prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> Result<crate::acp::protocol::PromptResponse> {
+        use crate::send_agent::SendAgent;
+        let request = crate::acp::protocol::PromptRequest::new(
+            session_id.to_owned(),
+            vec![crate::acp::protocol::ContentBlock::Text(
+                crate::acp::protocol::TextContent::new(text),
+            )],
+        );
+        SendAgent::prompt(&self.handle, request)
+            .await
+            .map_err(|e| anyhow::anyhow!("prompt failed: {e:?}"))
     }
 
     /// Perform undo operation via AgentHandle

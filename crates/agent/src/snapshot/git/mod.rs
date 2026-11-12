@@ -211,6 +211,19 @@ impl GitSnapshotBackend {
     }
 }
 
+impl From<gix::ObjectId> for SnapshotId {
+    fn from(id: gix::ObjectId) -> Self {
+        SnapshotId::from(id.to_string())
+    }
+}
+
+/// Parse a snapshot id into a git object id. The single place a stored id is
+/// validated for this backend.
+pub(super) fn object_id(id: &SnapshotId) -> SnapshotResult<gix::ObjectId> {
+    gix::ObjectId::from_hex(id.as_str().as_bytes())
+        .map_err(|_| SnapshotError::InvalidSnapshotId(id.clone()))
+}
+
 #[async_trait]
 impl SnapshotBackend for GitSnapshotBackend {
     fn is_available(&self, worktree: &Path) -> bool {

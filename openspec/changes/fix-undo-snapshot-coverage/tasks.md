@@ -176,6 +176,73 @@ How to check off a task:
 - [x] 7.5 Run `openspec validate fix-undo-snapshot-coverage --strict`; it must report the change as valid.
   - Verified: `openspec validate fix-undo-snapshot-coverage --strict`: "Change ... is valid".
 
+## 8. Typed ids, self-contained turn records and undo of whole turns (`workspace-snapshots`: change record names its pre-turn snapshot, records without a pre-turn reference, undo fails before changing files)
+
+- [x] 8.1 Red test first (design D15). Add `undo_of_a_prompt_that_deleted_a_file_restores_it` to `agent/undo_integration_tests.rs`. It covers `workspace-snapshots` / Undo of a prompt that deleted a file restores it, and must go through a real prompt, not the hand-written records.
+  - Extend `UndoTestFixture` with a constructor that takes a `SharedLlmProvider`. It reuses `mock_plugin_registry` + `TestProviderFactory`, the same pattern as `TestAgent::with_mock_provider`, instead of adding a new harness. Add a `prompt(session, text)` helper that sends an ACP `PromptRequest` through `self.handle`.
+  - The mock answers the first request with a `delete_file` call on `notes.txt` (`MockChatResponse::with_tools`), and the request carrying the tool result with text (`MockChatResponse::text_only`). This is the pattern used in `remote/session_actor_ref_remote_tests.rs:126-147`. If tool approval blocks the call, allow `delete_file` in the fixture config; don't switch to a different tool.
+  - The undo target is the prompt's user message id, read from `get_history`. Assert `notes.txt` has its original content and `reverted_files` contains `notes.txt`.
+  - Run it on the unchanged tree and record the failure (expected: `notes.txt` missing, empty `reverted_files`). Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/undo_of_a_prompt_that_deleted_a_file_restores_it/)'`.
+  - Recorded red run on the unchanged behaviour (1 test run: 0 passed, 1 failed, 4322 skipped): `undo must restore the deleted file`, left `None`, right `Some("original notes")` (`undo_integration_tests.rs:1900`). Undo returned success and `notes.txt` stayed missing.
+- [x] 8.2 Typed snapshot and turn ids, without behaviour change (design D18, type-newtype-ids, anti-stringly-typed):
+  - Replace `pub type SnapshotId = String` with `SnapshotId(Arc<str>)` in `snapshot/backend.rs`, and add `TurnId(Uuid)` (`Copy`) in `model.rs`. Write both serde impls by hand: `SnapshotId` as a plain string, `TurnId` as the lowercase hyphenated string (not `uuid`'s serde, which writes raw bytes in msgpack), loading a non-UUID string through `TurnId::from_stored` (v5 fallback with a fixed namespace). API as in D18; no `Deref`.
+  - Retype `SnapshotBackend` (every method and `restore_batch` steps), `SnapshotError::InvalidSnapshotId`, `MessagePart::TurnSnapshotStart`/`TurnSnapshotPatch` (`turn_id: TurnId`, `snapshot_id: SnapshotId`), `RevertState.snapshot_id`, and the `revert_states` row mapping in `sqlite_storage/session_store.rs` (convert at the column).
+  - Replace `runtime.turn_snapshot: (String, String)` with `TurnSnapshot { turn_id, snapshot_id }` and the pre-turn task output with `(TurnId, SnapshotResult<SnapshotId>)`; the task keeps the `SnapshotError` (err-source-chain). Update the `transitions.rs` assertions.
+  - Mint the run's `TurnId` once where the run starts (`session_actor.rs:613`, `:2478`) and derive the `String` `run_id` from it. `ExecutionContext::turn_id: Option<TurnId>`, `with_turn_id(TurnId)`, `turn_id() -> Option<TurnId>`, plus `turn_id_string()` for hook payloads, events, scheduler messages and steering, which stay `String`.
+  - In the git backend, replace `parse_commit_id` (`git/restore.rs`) and `parse_id` (`git/gc.rs`) with one `object_id(&SnapshotId) -> SnapshotResult<gix::ObjectId>`, and mint ids with `From<gix::ObjectId>`.
+  - No `Uuid::new_v4().to_string()` wrapped into a `TurnId`, no `TurnId` clones (it is `Copy`), and no `SnapshotId` clone without a real second owner (own-borrow-over-clone). Remove `&x.to_string()` conversions that only produced a `&String`.
+  - Tests use real UUID turn ids (`TurnId::new()` or UUID literals), not `"turn-1"`-style strings.
+  - Add `snapshot_ids_serialize_as_plain_strings` in `model.rs` tests: a `TurnSnapshotStart` and a `TurnSnapshotPatch` JSON literal in the released format (UUID turn id, 40-hex snapshot id) deserialize and re-serialize byte-identical, and `rmp_serde::to_vec_named` of a `SnapshotId`/`TurnId` equals that of the bare string. Add `turn_id_that_is_not_a_uuid_still_pairs`: two parts with the same non-UUID turn id load without error and get equal `TurnId`s. Add `revert_state_snapshot_id_round_trips_through_sqlite` asserting the column still holds the bare id.
+
+  Verify with `cargo check -p querymt-agent --features "$F" --all-targets`, then `cargo nextest run -p querymt-agent --features "$F" -E 'test(/snapshot_ids_serialize_as_plain_strings|turn_id_that_is_not_a_uuid_still_pairs|revert_state_snapshot_id|^snapshot::|^agent::undo_|^agent::execution::transitions::|^agent::session_materializer::/)'`, then `cargo check -p querymt-mobile-ffi`. The 8.1 test still fails here (no behaviour change yet). Record each summary.
+  - Verified (rework to `SnapshotId(Arc<str>)` / `TurnId(Uuid)`, features `dashboard,oauth,remote`): `cargo check -p querymt-agent --all-targets` ok; the nextest filter above with `--no-fail-fast`: `238 tests run: 237 passed, 1 failed, 4088 skipped`, the one failure being the 8.1 test (`undo_of_a_prompt_that_deleted_a_file_restores_it`, expected until 8.3). New tests `snapshot_ids_serialize_as_plain_strings`, `turn_id_that_is_not_a_uuid_still_pairs` and `revert_state_snapshot_id_round_trips_through_sqlite` pass. `cargo check -p querymt-mobile-ffi` ok; `cargo fmt --check` and `cargo clippy -p querymt-agent --all-targets -- -D warnings` clean.
+  - `uuid` gained the `v5` feature (for `from_stored`). `Cargo.lock` gains one dependency edge (`uuid` -> `sha1_smol`, already locked) and no new package.
+  - The pre-turn task still mints its own `TurnId::new()` (no behaviour change); 8.3 makes it reuse `exec_ctx.turn_id()`.
+  - Superseded: a first implementation with `String`-backed newtypes passed `cargo check --all-targets`, the filter above without the new turn-id test (`195 tests run: 194 passed, 1 failed, 4088 skipped`, the failure being the 8.1 test) and `cargo check -p querymt-mobile-ffi`. It was reworked because every second owner became an allocating clone (design D18, alternatives).
+- [x] 8.3 Add `base_snapshot_id: Option<SnapshotId>` (`#[serde(default, skip_serializing_if = "Option::is_none")]`) to `MessagePart::TurnSnapshotPatch` in `model.rs` (design D15). Set it in every constructor:
+  - `session_actor.rs` post-turn patch: take `turn_id` and `base_snapshot_id` from the runtime `TurnSnapshot` instead of `run_id`.
+  - `test_utils/helpers.rs` `take_post_snapshot_with_cwd`: `Some(pre_snapshot)`.
+  - The `session_materializer.rs` test helper: `Some(pre_snapshot)`.
+
+  In the pre-turn snapshot task, replace the freshly minted turn id with a copy of the run's `TurnId` (`exec_ctx.turn_id()`). Verify with `cargo check -p querymt-agent --features "$F"`, then the 8.1 command, which must now pass, and `cargo nextest run -p querymt-agent --features "$F" -E 'test(/^agent::undo_|^agent::session_materializer::|fork/)'`. Record both summaries.
+  - Verified (features `dashboard,oauth,remote`): `cargo check -p querymt-agent --all-targets` ok. 8.1 command: `1 test run: 1 passed, 4325 skipped` (`undo_of_a_prompt_that_deleted_a_file_restores_it`, red before). Wider filter `^agent::undo_|^agent::session_materializer::|fork|snapshot_ids_serialize|turn_id_that_is_not|^snapshot::` with `--no-fail-fast`: `193 tests run: 193 passed, 4133 skipped`. `cargo fmt --check` and `cargo clippy -p querymt-agent --all-targets -- -D warnings` clean.
+  - The pre-turn task now copies the run's `TurnId`; the post-turn patch takes `turn_id` and `base_snapshot_id` from the runtime `TurnSnapshot`. The fork copy matches the patch with `..`, so it keeps the new field.
+- [x] 8.4 Replace both two-pass pairing loops in `undo_impl` with `resolve_turn_patches` and `TurnPatch` (design D16). Keep `validate_snapshot_workspace` on every part and leave the child-compatibility filter untouched. Tests in `agent/undo_integration_tests.rs`, writing records through the session store (earlier-format records have `base_snapshot_id: None`):
+  - `workspace-snapshots` / Undo works without the turn's start record: `undo_works_without_the_turns_start_record`.
+  - `workspace-snapshots` / Earlier-format turn is undone through its start record: `earlier_format_turn_is_undone_through_its_start_record`.
+  - `workspace-snapshots` / Turn whose records disagree on turn id is undone by position: `turn_whose_records_disagree_on_turn_id_is_undone_by_position`.
+  - `workspace-snapshots` / Overlapping turns are paired by turn id: `overlapping_turns_are_paired_by_turn_id`. Use two different pre-turn snapshots, so pairing by position would give `a.txt` the wrong content.
+
+  Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/undo_works_without_the_turns_start_record|earlier_format_turn_is_undone_through_its_start_record|turn_whose_records_disagree_on_turn_id_is_undone_by_position|overlapping_turns_are_paired_by_turn_id|^agent::undo_/)'`.
+  - Verified (features `dashboard,oauth,remote`, `--no-fail-fast`): `51 tests run: 51 passed, 4282 skipped` for the 8.4 and 8.5 filters together. `resolve_turn_patches`/`TurnPatch` live in `undo.rs`; the own history and each compatible child call the same resolver, and the child-compatibility filter is unchanged.
+- [x] 8.5 Fail before `diff` validation, `restore_batch` and `push_revert_state` when a resolved patch has no base or its start comes before the target (design D17). Use `UndoError::Snapshot` with the D17 messages, and add no new variant. Tests:
+  - `workspace-snapshots` / Turn without a pre-turn record fails undo without changes: `turn_without_a_pre_turn_record_fails_undo_without_changes`. Assert the error names the turn, `a.txt` is unchanged, and `peek_revert_state` returns `None`.
+  - `workspace-snapshots` / Undo to a message inside a turn is refused: `undo_to_a_message_inside_a_turn_is_refused`. The history is a prompt, then a start, a user message with a `Steering` part, and a patch. Undo to the steering message fails as above. Undo to the prompt still succeeds, which proves the check only applies inside the turn.
+  - `workspace-snapshots` / Turn that changed no files does not block undo: `turn_that_changed_no_files_does_not_block_undo`.
+
+  Verify with `cargo nextest run -p querymt-agent --features "$F" -E 'test(/turn_without_a_pre_turn_record_fails_undo_without_changes|undo_to_a_message_inside_a_turn_is_refused|turn_that_changed_no_files_does_not_block_undo|^agent::undo_/)'`.
+  - Verified: same run as 8.4. The D17 errors are returned from `resolve_turn_patches`, before the `diff` validation, `restore_batch` and `push_revert_state`; the tests assert unchanged files and no revert frame.
+- [x] 8.6 Docs and changelog:
+  - In `CHANGELOG.md` Unreleased, add three entries:
+    - Undo restores files again for turns recorded since steering support. Undo that can't find a turn's pre-turn snapshot fails without changes instead of reporting success.
+    - **BREAKING:** undo to a message inside a turn (for example a steering message) is refused.
+    - **BREAKING (Rust API):** `snapshot::SnapshotId` is a newtype instead of a `String` alias, and turn ids use the new `TurnId` in `MessagePart` turn records and `ExecutionContext`. Stored sessions, revert frames and mesh payloads are unchanged.
+
+    Note that a revert frame left by the broken undo can be removed with redo before the next prompt.
+  - In `docs/docs/agent/configuration.md` "Snapshot scope and retention", add one sentence: undo reverts whole turns.
+
+  Verify by reviewing both diffs.
+  - Verified: reviewed `git diff CHANGELOG.md docs/docs/agent/configuration.md`. The three entries are under Unreleased (next to the other snapshot entries), with the redo note; the "undo reverts whole turns" sentence is in "Snapshot scope and retention".
+- [x] 8.7 Re-run the 7.3 checks in order (`cargo check`, the nextest filter, `--doc snapshot`, `fmt --check`, `clippy -D warnings`), then the 7.4 downstream checks (`cargo check -p querymt-mobile-ffi`, `PYO3_PYTHON=<python>=3.10> cargo check -p querymt-agent-py`), then `openspec validate fix-undo-snapshot-coverage --strict`. Record each result.
+  - Verified (features `dashboard,oauth,remote`, macOS; zbus/systemd are Linux-only and unverified):
+    1. `cargo check -p querymt-agent --features "$F"`: ok.
+    2. `cargo nextest run --no-fail-fast -p querymt-agent --features "$F" -E 'test(/snapshot|undo|redo|config::|agent_config_builder|quorum|turn_id|fork|session_materializer/)'` (the 7.3 filter plus the 8.x areas): `494 tests run: 494 passed, 3839 skipped`.
+    3. `cargo test -p querymt-agent --features "$F" --doc snapshot`: ok (0 passed, 0 failed, 1 ignored).
+    4. `cargo fmt -p querymt-agent -- --check`: ok.
+    5. `cargo clippy -p querymt-agent --features "$F" --all-targets -- -D warnings`: ok.
+    - `cargo check -p querymt-mobile-ffi`: ok. `PYO3_PYTHON=/opt/homebrew/bin/python3.14 cargo check -p querymt-agent-py`: ok.
+    - `openspec validate fix-undo-snapshot-coverage --strict`: "Change ... is valid".
+
 ## Workflow follow-up
 
 - Archive the change after review, which syncs `workspace-snapshots` into `openspec/specs/`.

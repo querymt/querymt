@@ -287,7 +287,7 @@ fn revert_frame(workspace_root: Option<&std::path::Path>) -> crate::session::dom
         public_id: "rev-1".to_string(),
         session_id: "sess-1".to_string(),
         message_id: "msg-1".to_string(),
-        snapshot_id: "snap-1".to_string(),
+        snapshot_id: "snap-1".into(),
         backend_id: "git".to_string(),
         workspace_root: workspace_root.map(std::path::Path::to_path_buf),
         restore_failed: false,

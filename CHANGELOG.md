@@ -31,6 +31,16 @@
 - Dev note: after running a `fix/snapshot` development build, clear
   `querymt/snapshots` in the user cache dir (stores from that build may lack
   large files).
+- **Undo restores files again for turns recorded since steering support.** Undo
+  that can't find a turn's pre-turn snapshot fails without changing files
+  instead of reporting success. A revert frame left by the broken undo can be
+  removed with redo before the next prompt.
+- **BREAKING: undo to a message inside a turn (for example a steering message)
+  is refused.** Undo to the turn's prompt instead.
+- **BREAKING (Rust API):** `snapshot::SnapshotId` is a newtype instead of a
+  `String` alias, and turn ids use the new `TurnId` in `MessagePart` turn records
+  and `ExecutionContext`. Stored sessions, revert frames and mesh payloads are
+  unchanged.
 
 - **BREAKING: default system cache hints cover only the first and last section,
   and the Anthropic provider enforces its cache breakpoint limits.** For

@@ -176,7 +176,7 @@ pub(super) async fn transition_before_llm_call(
         .run_context(crate::hooks::ContextHookRequest {
             session_id: exec_ctx.session_id.clone(),
             mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+            turn_id: exec_ctx.turn_id_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: context.model.to_string(),
             permission_mode: exec_ctx.permission_mode().to_string(),
@@ -2488,11 +2488,14 @@ mod tests {
         use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent, mock_tool_call};
         use std::time::Duration;
 
+        fn turn() -> crate::model::TurnId {
+            crate::model::TurnId::from(uuid::Uuid::from_u128(0x1111))
+        }
+
         async fn pending_snapshot_exec(agent: &TestAgent) -> ExecutionContext {
             let exec = agent.execution_context().await;
-            *exec.runtime.pre_turn_snapshot_task.lock() = Some(tokio::spawn(async {
-                ("turn-1".to_string(), Ok("snapshot-1".to_string()))
-            }));
+            *exec.runtime.pre_turn_snapshot_task.lock() =
+                Some(tokio::spawn(async { (turn(), Ok("snapshot-1".into())) }));
             exec
         }
 
@@ -2567,7 +2570,10 @@ mod tests {
             assert!(exec.runtime.pre_turn_snapshot_task.lock().is_none());
             assert_eq!(
                 exec.runtime.turn_snapshot.lock().clone(),
-                Some(("turn-1".to_string(), "snapshot-1".to_string()))
+                Some(crate::agent::core::TurnSnapshot {
+                    turn_id: turn(),
+                    snapshot_id: "snapshot-1".into(),
+                })
             );
         }
 
@@ -2578,7 +2584,7 @@ mod tests {
             // A task that never finishes would hang the turn if it were awaited.
             *exec.runtime.pre_turn_snapshot_task.lock() = Some(tokio::spawn(async {
                 std::future::pending::<()>().await;
-                ("never".to_string(), Ok(String::new()))
+                (turn(), Ok("".into()))
             }));
             let context = crate::test_utils::test_context(&exec.session_id, 0);
             let response = Arc::new(LlmResponse::new(

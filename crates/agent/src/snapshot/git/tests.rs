@@ -32,10 +32,14 @@ async fn test_track_creates_snapshot() {
     let snapshot_id = backend.track(tmpdir.path()).await.unwrap();
 
     assert!(
-        !snapshot_id.is_empty(),
+        !snapshot_id.as_str().is_empty(),
         "Should return non-empty snapshot ID"
     );
-    assert_eq!(snapshot_id.len(), 40, "Git SHA should be 40 hex characters");
+    assert_eq!(
+        snapshot_id.as_str().len(),
+        40,
+        "Git SHA should be 40 hex characters"
+    );
 }
 
 #[tokio::test]
@@ -216,7 +220,7 @@ async fn test_track_empty_directory() {
     let snapshot_id = backend.track(tmpdir.path()).await.unwrap();
 
     assert!(
-        !snapshot_id.is_empty(),
+        !snapshot_id.as_str().is_empty(),
         "Track empty directory should return valid snapshot ID"
     );
 }
@@ -986,9 +990,9 @@ fn capture_warnings<T>(f: impl FnOnce() -> T) -> (T, String) {
 }
 
 /// Every file path stored in snapshot `id`.
-fn snapshot_files(repo: &gix::Repository, id: &str) -> BTreeSet<String> {
+fn snapshot_files(repo: &gix::Repository, id: &SnapshotId) -> BTreeSet<String> {
     let commit = repo
-        .find_commit(gix::ObjectId::from_hex(id.as_bytes()).unwrap())
+        .find_commit(gix::ObjectId::from_hex(id.as_str().as_bytes()).unwrap())
         .unwrap();
     let tree = commit.tree().unwrap();
     repo.diff_tree_to_tree(None, Some(&tree), Some(gix::diff::Options::default()))
@@ -999,9 +1003,9 @@ fn snapshot_files(repo: &gix::Repository, id: &str) -> BTreeSet<String> {
         .collect()
 }
 
-fn blob_id(repo: &gix::Repository, id: &str, path: &str) -> gix::ObjectId {
+fn blob_id(repo: &gix::Repository, id: &SnapshotId, path: &str) -> gix::ObjectId {
     let commit = repo
-        .find_commit(gix::ObjectId::from_hex(id.as_bytes()).unwrap())
+        .find_commit(gix::ObjectId::from_hex(id.as_str().as_bytes()).unwrap())
         .unwrap();
     commit
         .tree()
@@ -1537,7 +1541,11 @@ fn exclusive_lock_is_refused_while_shared_is_held() {
 
 /// `count` snapshots; every one changes `f.txt` first, because unchanged
 /// snapshots are reused.
-async fn make_snapshots(backend: &GitSnapshotBackend, work: &Path, count: usize) -> Vec<String> {
+async fn make_snapshots(
+    backend: &GitSnapshotBackend,
+    work: &Path,
+    count: usize,
+) -> Vec<SnapshotId> {
     let mut ids = Vec::new();
     for i in 0..count {
         fs::write(work.join("f.txt"), format!("version {i}")).unwrap();
@@ -2020,7 +2028,7 @@ async fn restore_batch_with_a_missing_snapshot_changes_no_files() {
     let id = backend.track(work.path()).await.unwrap();
     fs::write(work.path().join("a.txt"), "two").unwrap();
 
-    let missing = "0".repeat(40);
+    let missing = SnapshotId::from("0".repeat(40));
     let result = backend
         .restore_batch(
             work.path(),

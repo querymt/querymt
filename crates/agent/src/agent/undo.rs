@@ -5,7 +5,8 @@
 //! made after a specific message. Redo restores the pre-undo state.
 
 use crate::events::AgentEventKind;
-use crate::model::MessagePart;
+use crate::model::{MessagePart, TurnId};
+use crate::snapshot::SnapshotId;
 use log::{debug, warn};
 use std::path::PathBuf;
 use time::OffsetDateTime;
@@ -159,123 +160,67 @@ pub(crate) async fn undo_impl(
     let mut sessions_to_scan = vec![session_id.to_string()];
     sessions_to_scan.extend(child_sessions);
 
-    let mut pre_snapshots: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let mut all_patches: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut all_patches: Vec<TurnPatch> = Vec::new();
 
     for scan_session_id in &sessions_to_scan {
-        let session_history = if scan_session_id == session_id {
-            &history[scan_start..]
-        } else {
-            // Only aggregate child history captured in this session's own
-            // workspace: isolated delegates record their snapshot patches
-            // in their own checkouts, and restoring those here would
-            // corrupt the parent's workspace. Children without a cwd
-            // (legacy shared-checkout delegation) stay compatible.
-            //
-            // Workspace-resolution audit: `worktree` is the parent session's
-            // effective cwd as resolved through the single session-cwd path
-            // (durable workspace binding first), and a managed child's row
-            // cwd equals its own bound checkout, so this comparison matches
-            // workspaces — not merely copied source paths. Patches whose
-            // provenance disagrees are additionally rejected below by
-            // `validate_snapshot_workspace` instead of being restored.
-            let compatible = match provider.history_store().get_session(scan_session_id).await {
-                Ok(Some(child)) => child
-                    .cwd
-                    .as_deref()
-                    .map(|child_cwd| same_workspace(child_cwd, worktree))
-                    .unwrap_or(true),
-                _ => false,
-            };
-            if !compatible {
-                debug!(
-                    "Undo: skipping child session {} captured in a different workspace",
-                    scan_session_id
-                );
-                continue;
-            }
-            match provider.history_store().get_history(scan_session_id).await {
-                Ok(child_history) => {
-                    for msg in &child_history {
-                        for part in &msg.parts {
-                            validate_snapshot_workspace(part, worktree)?;
-                            if let MessagePart::TurnSnapshotStart {
-                                turn_id,
-                                snapshot_id,
-                                ..
-                            } = part
-                            {
-                                pre_snapshots.insert(turn_id.clone(), snapshot_id.clone());
-                            }
-                        }
-                    }
-                    for msg in &child_history {
-                        for part in &msg.parts {
-                            validate_snapshot_workspace(part, worktree)?;
-                            if let MessagePart::TurnSnapshotPatch {
-                                turn_id,
-                                snapshot_id: _,
-                                changed_paths,
-                                ..
-                            } = part
-                                && let Some(pre_snapshot) = pre_snapshots.get(turn_id)
-                            {
-                                all_patches.push((
-                                    turn_id.clone(),
-                                    pre_snapshot.clone(),
-                                    changed_paths.clone(),
-                                ));
-                            }
-                        }
-                    }
-                    continue;
-                }
-                Err(_) => continue,
-            }
-        };
-
-        for msg in session_history {
-            for part in &msg.parts {
-                validate_snapshot_workspace(part, worktree)?;
-                if let MessagePart::TurnSnapshotStart {
-                    turn_id,
-                    snapshot_id,
-                    ..
-                } = part
-                {
-                    pre_snapshots.insert(turn_id.clone(), snapshot_id.clone());
-                }
-            }
+        if scan_session_id == session_id {
+            all_patches.extend(resolve_turn_patches(
+                &history,
+                scan_start,
+                inherited_count,
+                Some(target_idx),
+                worktree,
+            )?);
+            continue;
         }
-        for msg in session_history {
-            for part in &msg.parts {
-                validate_snapshot_workspace(part, worktree)?;
-                if let MessagePart::TurnSnapshotPatch {
-                    turn_id,
-                    snapshot_id: _,
-                    changed_paths,
-                    ..
-                } = part
-                    && let Some(pre_snapshot) = pre_snapshots.get(turn_id)
-                {
-                    all_patches.push((
-                        turn_id.clone(),
-                        pre_snapshot.clone(),
-                        changed_paths.clone(),
-                    ));
-                }
-            }
+        // Only aggregate child history captured in this session's own
+        // workspace: isolated delegates record their snapshot patches
+        // in their own checkouts, and restoring those here would
+        // corrupt the parent's workspace. Children without a cwd
+        // (legacy shared-checkout delegation) stay compatible.
+        //
+        // Workspace-resolution audit: `worktree` is the parent session's
+        // effective cwd as resolved through the single session-cwd path
+        // (durable workspace binding first), and a managed child's row
+        // cwd equals its own bound checkout, so this comparison matches
+        // workspaces — not merely copied source paths. Patches whose
+        // provenance disagrees are additionally rejected by
+        // `validate_snapshot_workspace` instead of being restored.
+        let compatible = match provider.history_store().get_session(scan_session_id).await {
+            Ok(Some(child)) => child
+                .cwd
+                .as_deref()
+                .map(|child_cwd| same_workspace(child_cwd, worktree))
+                .unwrap_or(true),
+            _ => false,
+        };
+        if !compatible {
+            debug!(
+                "Undo: skipping child session {} captured in a different workspace",
+                scan_session_id
+            );
+            continue;
+        }
+        if let Ok(child_history) = provider.history_store().get_history(scan_session_id).await {
+            all_patches.extend(resolve_turn_patches(&child_history, 0, 0, None, worktree)?);
         }
     }
 
     tracing::Span::current().record("patches", all_patches.len());
+    for patch in &all_patches {
+        debug!(
+            "Undo: turn {} restores {} path(s) from snapshot {}",
+            patch.turn_id,
+            patch.changed_paths.len(),
+            patch.base_snapshot_id
+        );
+    }
 
     // Resolve every selected snapshot before restoring any path. A missing
     // or foreign snapshot must not leave a partially reverted workspace.
-    for (_, pre_snapshot, _) in &all_patches {
+    for patch in &all_patches {
         backend
-            .diff(worktree, &pre_revert_snapshot, pre_snapshot)
+            .diff(worktree, &pre_revert_snapshot, &patch.base_snapshot_id)
             .await?;
     }
     // If no patches were found, fall back to restoring the snapshot recorded at
@@ -283,7 +228,7 @@ pub(crate) async fn undo_impl(
     // validation, resolving the snapshot, diffing) happens here, before any
     // file is touched and before a redo frame exists: a rejected undo must
     // leave no frame behind.
-    let mut fallback: Option<(String, Vec<PathBuf>)> = None;
+    let mut fallback: Option<(SnapshotId, Vec<PathBuf>)> = None;
     if all_patches.is_empty() {
         for part in &history[target_idx].parts {
             validate_snapshot_workspace(part, worktree)?;
@@ -314,13 +259,13 @@ pub(crate) async fn undo_impl(
     }
 
     // Undo patches in reverse order, then the fallback snapshot.
-    let mut steps: Vec<(String, Vec<PathBuf>)> = all_patches
+    let mut steps: Vec<(SnapshotId, Vec<PathBuf>)> = all_patches
         .iter()
         .rev()
-        .map(|(_, pre_snapshot, changed_paths)| {
+        .map(|patch| {
             (
-                pre_snapshot.clone(),
-                changed_paths.iter().map(PathBuf::from).collect(),
+                patch.base_snapshot_id.clone(),
+                patch.changed_paths.iter().map(PathBuf::from).collect(),
             )
         })
         .collect();
@@ -506,6 +451,148 @@ pub(crate) fn validate_revert_workspace(
         }
         _ => Ok(()),
     }
+}
+
+/// One turn's file changes and the snapshot to restore them from.
+#[derive(Debug)]
+struct TurnPatch {
+    turn_id: TurnId,
+    /// The workspace as it was before the turn ran.
+    base_snapshot_id: SnapshotId,
+    changed_paths: Vec<String>,
+}
+
+/// A turn-snapshot record found in a history slice.
+enum SnapshotRecord<'a> {
+    Start {
+        snapshot_id: &'a SnapshotId,
+    },
+    Patch {
+        base: Option<&'a SnapshotId>,
+        changed_paths: &'a [String],
+    },
+}
+
+/// Find each turn's pre-turn snapshot for the patches at index `>= from`,
+/// newest record format first (design D16), and refuse what can't be undone
+/// as whole turns (design D17).
+///
+/// Start records are looked up from `starts_from`. `target` is the undo
+/// target's index in `history` (`None` for child sessions, which are undone
+/// as a whole).
+///
+/// 1. The start with the patch's turn id.
+/// 2. Otherwise the record right before the patch, if it is a start that no
+///    patch in the history uses (records from builds that minted a fresh
+///    turn id for the start).
+///
+/// The base is the patch's own `base_snapshot_id`, else the start's snapshot.
+fn resolve_turn_patches(
+    history: &[crate::model::AgentMessage],
+    from: usize,
+    starts_from: usize,
+    target: Option<usize>,
+    worktree: &std::path::Path,
+) -> Result<Vec<TurnPatch>, UndoError> {
+    let from = from.min(history.len());
+    let starts_from = starts_from.min(history.len());
+    for msg in &history[from..] {
+        for part in &msg.parts {
+            validate_snapshot_workspace(part, worktree)?;
+        }
+    }
+
+    // (message index, part, record) in history order.
+    let mut records: Vec<(usize, &MessagePart, TurnId, SnapshotRecord<'_>)> = Vec::new();
+    for (idx, msg) in history.iter().enumerate().skip(starts_from) {
+        for part in &msg.parts {
+            match part {
+                MessagePart::TurnSnapshotStart {
+                    turn_id,
+                    snapshot_id,
+                    ..
+                } => records.push((idx, part, *turn_id, SnapshotRecord::Start { snapshot_id })),
+                MessagePart::TurnSnapshotPatch {
+                    turn_id,
+                    base_snapshot_id,
+                    changed_paths,
+                    ..
+                } => records.push((
+                    idx,
+                    part,
+                    *turn_id,
+                    SnapshotRecord::Patch {
+                        base: base_snapshot_id.as_ref(),
+                        changed_paths,
+                    },
+                )),
+                _ => {}
+            }
+        }
+    }
+
+    let claimed: std::collections::HashSet<TurnId> = records
+        .iter()
+        .filter(|(_, _, _, record)| matches!(record, SnapshotRecord::Patch { .. }))
+        .map(|(_, _, turn_id, _)| *turn_id)
+        .collect();
+    let mut starts: std::collections::HashMap<TurnId, (usize, &MessagePart, &SnapshotId)> =
+        std::collections::HashMap::new();
+    for (idx, part, turn_id, record) in &records {
+        if let SnapshotRecord::Start { snapshot_id } = record {
+            starts.insert(*turn_id, (*idx, *part, *snapshot_id));
+        }
+    }
+
+    let mut patches = Vec::new();
+    for (pos, (idx, _, turn_id, record)) in records.iter().enumerate() {
+        let SnapshotRecord::Patch {
+            base,
+            changed_paths,
+        } = record
+        else {
+            continue;
+        };
+        if *idx < from {
+            continue;
+        }
+        let start = starts.get(turn_id).copied().or_else(|| {
+            let (start_idx, part, start_turn, record) = records.get(pos.checked_sub(1)?)?;
+            match record {
+                SnapshotRecord::Start { snapshot_id } if !claimed.contains(start_turn) => {
+                    Some((*start_idx, *part, *snapshot_id))
+                }
+                _ => None,
+            }
+        });
+        if let Some((start_idx, start_part, _)) = start {
+            validate_snapshot_workspace(start_part, worktree)?;
+            if let Some(target_idx) = target
+                && start_idx < target_idx
+            {
+                return Err(UndoError::Snapshot(format!(
+                    "undo reverts whole turns: message {} is inside turn {turn_id}; \
+                     undo to that turn's prompt instead",
+                    history[target_idx].id
+                )));
+            }
+        }
+        let Some(base_snapshot_id) = base.or_else(|| start.map(|(_, _, id)| id)) else {
+            if changed_paths.is_empty() {
+                continue;
+            }
+            return Err(UndoError::Snapshot(format!(
+                "cannot undo: turn {turn_id} changed {} file(s) but its pre-turn snapshot is not recorded",
+                changed_paths.len()
+            )));
+        };
+        patches.push(TurnPatch {
+            turn_id: *turn_id,
+            base_snapshot_id: base_snapshot_id.clone(),
+            changed_paths: changed_paths.to_vec(),
+        });
+    }
+    Ok(patches)
 }
 
 fn validate_snapshot_workspace(

@@ -4484,17 +4484,17 @@ mod worktree_binding_tests {
         backend: &crate::snapshot::GitSnapshotBackend,
         session_id: &str,
         cwd: &std::path::Path,
-    ) -> (String, String) {
+    ) -> (crate::model::TurnId, crate::snapshot::SnapshotId) {
         use crate::model::MessagePart;
         use crate::snapshot::SnapshotBackend as _;
         let snapshot_id = backend.track(cwd).await.expect("track pre snapshot");
-        let turn_id = uuid::Uuid::new_v4().to_string();
+        let turn_id = crate::model::TurnId::new();
         let msg = crate::model::AgentMessage {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
             role: querymt::chat::ChatRole::Assistant,
             parts: vec![MessagePart::TurnSnapshotStart {
-                turn_id: turn_id.clone(),
+                turn_id,
                 snapshot_id: snapshot_id.clone(),
                 workspace_root: Some(cwd.to_path_buf()),
                 inherited: false,
@@ -4518,15 +4518,15 @@ mod worktree_binding_tests {
         storage: &SqliteStorage,
         backend: &crate::snapshot::GitSnapshotBackend,
         session_id: &str,
-        turn_id: &str,
-        pre_snapshot: &str,
+        turn_id: &crate::model::TurnId,
+        pre_snapshot: &crate::snapshot::SnapshotId,
         cwd: &std::path::Path,
     ) -> Vec<String> {
         use crate::model::MessagePart;
         use crate::snapshot::SnapshotBackend as _;
         let post_snapshot = backend.track(cwd).await.expect("track post snapshot");
         let changed = backend
-            .diff(cwd, &pre_snapshot.to_string(), &post_snapshot)
+            .diff(cwd, pre_snapshot, &post_snapshot)
             .await
             .expect("diff post snapshot");
         let changed_strs: Vec<String> = changed
@@ -4538,8 +4538,9 @@ mod worktree_binding_tests {
             session_id: session_id.to_string(),
             role: querymt::chat::ChatRole::Assistant,
             parts: vec![MessagePart::TurnSnapshotPatch {
-                turn_id: turn_id.to_string(),
+                turn_id: *turn_id,
                 snapshot_id: post_snapshot,
+                base_snapshot_id: Some(pre_snapshot.clone()),
                 changed_paths: changed_strs.clone(),
                 workspace_root: Some(cwd.to_path_buf()),
                 inherited: false,

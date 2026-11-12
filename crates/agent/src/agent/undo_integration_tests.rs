@@ -34,7 +34,7 @@ async fn test_undo_rejects_foreign_snapshot_before_any_restore() -> Result<()> {
     let mut message =
         crate::model::AgentMessage::new(session.clone(), querymt::chat::ChatRole::Assistant);
     message.parts.push(MessagePart::TurnSnapshotStart {
-        turn_id: "foreign".into(),
+        turn_id: crate::model::TurnId::new(),
         snapshot_id: pre,
         workspace_root: Some(foreign.path().to_path_buf()),
         inherited: false,
@@ -1817,4 +1817,336 @@ async fn redo_to_a_pruned_snapshot_keeps_its_frame() -> Result<()> {
         "the revert frame must still be present"
     );
     Ok(())
+}
+
+// ==================== self-contained turn records ====================
+
+/// Binds the mock LLM config to `session`, so a real prompt can run.
+async fn bind_mock_llm(fixture: &UndoTestFixture, session: &str) -> Result<()> {
+    let store = fixture.storage.session_store();
+    let llm_config = store
+        .create_or_get_llm_config(
+            &querymt::LLMParams::new()
+                .provider("mock")
+                .model("mock-model"),
+        )
+        .await?;
+    store.set_session_llm_config(session, llm_config.id).await?;
+    Ok(())
+}
+
+/// A mock that answers the first request with one `delete_file` call and
+/// the request carrying the tool result with plain text.
+fn deleting_provider(path: &str) -> crate::test_utils::SharedLlmProvider {
+    use crate::test_utils::{MockChatResponse, MockLlmProvider, SharedLlmProvider};
+    use crate::tools::{Tool, builtins::DeleteFileTool};
+
+    let arguments = serde_json::json!({ "path": path }).to_string();
+    let respond = Arc::new(move |messages: &[querymt::chat::ChatMessage]| {
+        let has_tool_result = messages.last().is_some_and(|message| {
+            message
+                .portable_input_parts()
+                .iter()
+                .any(|part| part.is_tool_result())
+        });
+        if has_tool_result {
+            MockChatResponse::text_only("deleted")
+        } else {
+            MockChatResponse::with_tools(
+                "deleting",
+                vec![crate::test_utils::mock_querymt_tool_call(
+                    "delete-1",
+                    "delete_file",
+                    &arguments,
+                )],
+            )
+        }
+    });
+    let mut mock = MockLlmProvider::new();
+    let with_tools = respond.clone();
+    mock.expect_chat_with_tools()
+        .returning(move |messages, _| Ok(with_tools(messages).into()));
+    mock.expect_chat()
+        .returning(move |messages| Ok(respond(messages).into()));
+    SharedLlmProvider::new(mock, vec![DeleteFileTool::new().definition()])
+}
+
+/// Id of the first user message in `session`.
+async fn first_user_message_id(fixture: &UndoTestFixture, session: &str) -> Result<String> {
+    let history = fixture.storage.session_store().get_history(session).await?;
+    history
+        .iter()
+        .find(|m| matches!(m.role, querymt::chat::ChatRole::User))
+        .map(|m| m.id.clone())
+        .ok_or_else(|| anyhow::anyhow!("no user message recorded"))
+}
+
+#[tokio::test]
+async fn undo_of_a_prompt_that_deleted_a_file_restores_it() -> Result<()> {
+    let fixture = UndoTestFixture::with_provider(deleting_provider("notes.txt")).await?;
+    fixture.write_file("notes.txt", "original notes")?;
+    let session = fixture.create_session().await?;
+    bind_mock_llm(&fixture, &session).await?;
+
+    fixture.prompt(&session, "delete the notes").await?;
+    assert!(
+        !fixture.worktree.path().join("notes.txt").exists(),
+        "the prompt's tool call must have deleted the file"
+    );
+    let target = first_user_message_id(&fixture, &session).await?;
+
+    let result = fixture.undo(&session, &target).await?;
+
+    assert_eq!(
+        std::fs::read_to_string(fixture.worktree.path().join("notes.txt")).ok(),
+        Some("original notes".to_string()),
+        "undo must restore the deleted file"
+    );
+    assert!(
+        result.reverted_files.iter().any(|f| f == "notes.txt"),
+        "reverted_files must contain notes.txt, got {:?}",
+        result.reverted_files
+    );
+    Ok(())
+}
+
+// ==================== Turn record resolution (design D15-D17) ====================
+
+mod turn_records {
+    use super::*;
+    use crate::model::{AgentMessage, TurnId};
+    use crate::snapshot::{SnapshotBackend as _, SnapshotId};
+    use querymt::chat::ChatRole;
+
+    async fn record(fixture: &UndoTestFixture, session: &str, part: MessagePart) -> Result<()> {
+        let mut message = AgentMessage::new(session.to_string(), ChatRole::Assistant);
+        message.parts.push(part);
+        fixture
+            .storage
+            .session_store()
+            .add_message(session, message)
+            .await?;
+        Ok(())
+    }
+
+    async fn snapshot(fixture: &UndoTestFixture) -> Result<SnapshotId> {
+        Ok(fixture.backend.track(fixture.worktree.path()).await?)
+    }
+
+    async fn start(
+        fixture: &UndoTestFixture,
+        session: &str,
+        turn_id: TurnId,
+        snapshot_id: &SnapshotId,
+    ) -> Result<()> {
+        record(
+            fixture,
+            session,
+            MessagePart::TurnSnapshotStart {
+                turn_id,
+                snapshot_id: snapshot_id.clone(),
+                workspace_root: Some(fixture.worktree.path().to_path_buf()),
+                inherited: false,
+            },
+        )
+        .await
+    }
+
+    async fn patch(
+        fixture: &UndoTestFixture,
+        session: &str,
+        turn_id: TurnId,
+        base: Option<&SnapshotId>,
+        paths: &[&str],
+    ) -> Result<()> {
+        let post = snapshot(fixture).await?;
+        record(
+            fixture,
+            session,
+            MessagePart::TurnSnapshotPatch {
+                turn_id,
+                snapshot_id: post,
+                base_snapshot_id: base.cloned(),
+                changed_paths: paths.iter().map(|p| p.to_string()).collect(),
+                workspace_root: Some(fixture.worktree.path().to_path_buf()),
+                inherited: false,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn undo_works_without_the_turns_start_record() -> Result<()> {
+        let fixture = UndoTestFixture::new().await?;
+        fixture.write_file("a.txt", "before")?;
+        let session = fixture.create_session().await?;
+        let target = fixture.add_user_message(&session, "edit").await?;
+        let pre = snapshot(&fixture).await?;
+        fixture.write_file("a.txt", "after")?;
+        patch(&fixture, &session, TurnId::new(), Some(&pre), &["a.txt"]).await?;
+
+        let result = fixture.undo(&session, &target).await?;
+
+        assert_eq!(fixture.read_file("a.txt")?, "before");
+        assert_eq!(result.reverted_files, vec!["a.txt".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn earlier_format_turn_is_undone_through_its_start_record() -> Result<()> {
+        let fixture = UndoTestFixture::new().await?;
+        fixture.write_file("a.txt", "before")?;
+        let session = fixture.create_session().await?;
+        let target = fixture.add_user_message(&session, "edit").await?;
+        let turn = TurnId::new();
+        let pre = snapshot(&fixture).await?;
+        start(&fixture, &session, turn, &pre).await?;
+        fixture.write_file("a.txt", "after")?;
+        patch(&fixture, &session, turn, None, &["a.txt"]).await?;
+
+        fixture.undo(&session, &target).await?;
+
+        assert_eq!(fixture.read_file("a.txt")?, "before");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_whose_records_disagree_on_turn_id_is_undone_by_position() -> Result<()> {
+        let fixture = UndoTestFixture::new().await?;
+        fixture.write_file("a.txt", "before")?;
+        let session = fixture.create_session().await?;
+        let target = fixture.add_user_message(&session, "edit").await?;
+        let pre = snapshot(&fixture).await?;
+        start(&fixture, &session, TurnId::new(), &pre).await?;
+        fixture.write_file("a.txt", "after")?;
+        // Different turn id, no base: only the record right before it can
+        // name the pre-turn snapshot.
+        patch(&fixture, &session, TurnId::new(), None, &["a.txt"]).await?;
+
+        fixture.undo(&session, &target).await?;
+
+        assert_eq!(fixture.read_file("a.txt")?, "before");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlapping_turns_are_paired_by_turn_id() -> Result<()> {
+        let fixture = UndoTestFixture::new().await?;
+        fixture.write_file("a.txt", "v0")?;
+        let session = fixture.create_session().await?;
+        let target = fixture.add_user_message(&session, "edit").await?;
+        let (turn_a, turn_b) = (TurnId::new(), TurnId::new());
+        let snap_a = snapshot(&fixture).await?;
+        start(&fixture, &session, turn_a, &snap_a).await?;
+        fixture.write_file("a.txt", "v1")?;
+        let snap_b = snapshot(&fixture).await?;
+        start(&fixture, &session, turn_b, &snap_b).await?;
+        fixture.write_file("a.txt", "v2")?;
+        patch(&fixture, &session, turn_a, None, &["a.txt"]).await?;
+        fixture.write_file("a.txt", "v3")?;
+        patch(&fixture, &session, turn_b, None, &["a.txt"]).await?;
+
+        fixture.undo(&session, &target).await?;
+
+        // Reverse order: B restores v1, then A restores v0. Pairing by
+        // position would pair A with B's snapshot and end on v1.
+        assert_eq!(fixture.read_file("a.txt")?, "v0");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_without_a_pre_turn_record_fails_undo_without_changes() -> Result<()> {
+        let fixture = UndoTestFixture::new().await?;
+        fixture.write_file("a.txt", "before")?;
+        let session = fixture.create_session().await?;
+        let target = fixture.add_user_message(&session, "edit").await?;
+        fixture.write_file("a.txt", "after")?;
+        let turn = TurnId::new();
+        patch(&fixture, &session, turn, None, &["a.txt"]).await?;
+
+        let error = fixture.undo(&session, &target).await.unwrap_err();
+
+        let UndoError::Snapshot(message) = &error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(message.contains(&turn.to_string()), "{message}");
+        assert!(
+            message.contains("pre-turn snapshot is not recorded"),
+            "{message}"
+        );
+        assert_eq!(fixture.read_file("a.txt")?, "after");
+        assert!(
+            fixture
+                .storage
+                .session_store()
+                .peek_revert_state(&session)
+                .await?
+                .is_none(),
+            "a failed undo must not record a redo frame"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn undo_to_a_message_inside_a_turn_is_refused() -> Result<()> {
+        let fixture = UndoTestFixture::new().await?;
+        fixture.write_file("a.txt", "before")?;
+        let session = fixture.create_session().await?;
+        let prompt = fixture.add_user_message(&session, "edit").await?;
+        let turn = TurnId::new();
+        let pre = snapshot(&fixture).await?;
+        start(&fixture, &session, turn, &pre).await?;
+        let mut steering = AgentMessage::new(session.clone(), ChatRole::User);
+        steering.parts.push(MessagePart::Steering {
+            run_id: turn.to_string(),
+            client_input_id: None,
+            blocks: vec![],
+        });
+        let steering_id = steering.id.clone();
+        fixture
+            .storage
+            .session_store()
+            .add_message(&session, steering)
+            .await?;
+        fixture.write_file("a.txt", "after")?;
+        patch(&fixture, &session, turn, Some(&pre), &["a.txt"]).await?;
+
+        let error = fixture.undo(&session, &steering_id).await.unwrap_err();
+
+        let UndoError::Snapshot(message) = &error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(message.contains("undo reverts whole turns"), "{message}");
+        assert!(message.contains(&turn.to_string()), "{message}");
+        assert_eq!(fixture.read_file("a.txt")?, "after");
+        assert!(
+            fixture
+                .storage
+                .session_store()
+                .peek_revert_state(&session)
+                .await?
+                .is_none()
+        );
+
+        // The check only applies inside the turn.
+        fixture.undo(&session, &prompt).await?;
+        assert_eq!(fixture.read_file("a.txt")?, "before");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_that_changed_no_files_does_not_block_undo() -> Result<()> {
+        let fixture = UndoTestFixture::new().await?;
+        fixture.write_file("a.txt", "before")?;
+        let session = fixture.create_session().await?;
+        let target = fixture.add_user_message(&session, "just chat").await?;
+        let pre = snapshot(&fixture).await?;
+        start(&fixture, &session, TurnId::new(), &pre).await?;
+
+        let result = fixture.undo(&session, &target).await?;
+
+        assert!(result.reverted_files.is_empty());
+        assert_eq!(fixture.read_file("a.txt")?, "before");
+        Ok(())
+    }
 }

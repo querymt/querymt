@@ -58,7 +58,7 @@ async fn querymt_session_undo_stack_reports_which_frames_failed() {
                     public_id: id.to_string(),
                     session_id: session.public_id.clone(),
                     message_id: message_id.to_string(),
-                    snapshot_id: "snap".to_string(),
+                    snapshot_id: "snap".into(),
                     backend_id: "git".to_string(),
                     workspace_root: None,
                     restore_failed,

@@ -171,6 +171,9 @@ is decided by path:
 - `.git/info/exclude` is honoured. Global git excludes are not.
 - Files and directories whose name starts with `.` are never captured.
 
+Undo reverts whole turns: undoing to a message inside a turn (for example a
+steering message) is refused, so undo to that turn's prompt instead.
+
 Undo and redo leave a path alone only if it is outside the scope in both
 snapshots involved. Editing an ignore file during a session moves paths in or
 out of scope, and adding an ignore rule does not protect a file that an older

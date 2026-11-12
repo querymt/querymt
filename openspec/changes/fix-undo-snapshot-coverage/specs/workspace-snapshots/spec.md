@@ -155,6 +155,50 @@ Any failure to write, create or delete a restored path SHALL fail the undo, redo
 - **WHEN** a full restore of a snapshot cannot write one of its files
 - **THEN** the restore returns an error naming that file
 
+### Requirement: Each turn's change record names its pre-turn snapshot
+The record a turn stores for the files it changed SHALL name the snapshot taken before the turn's first change, and the turn's start record and change record SHALL carry the same turn id. Undo SHALL restore every file a later turn changed from the snapshot its change record names, whether or not the turn's start record exists.
+
+#### Scenario: Undo of a prompt that deleted a file restores it
+- **WHEN** a prompt runs a turn that deletes `notes.txt` and the user undoes to that prompt
+- **THEN** `notes.txt` exists with its content from before the prompt
+- **AND** undo reports `notes.txt` among the reverted files
+
+#### Scenario: Undo works without the turn's start record
+- **WHEN** a turn changed `a.txt`, its change record names the pre-turn snapshot, and no start record for the turn exists
+- **THEN** undoing to the message before the turn restores `a.txt` to its pre-turn content
+
+### Requirement: Turns recorded without a pre-turn reference stay undoable
+For a change record that does not name its pre-turn snapshot, undo SHALL use the snapshot of the start record with the same turn id. When no start record has the same turn id, undo SHALL use the nearest earlier start record in the same session, provided no other change record lies between the two and no other change record has the same turn id as that start record.
+
+#### Scenario: Earlier-format turn is undone through its start record
+- **WHEN** a turn's change record names no pre-turn snapshot and a start record with the same turn id exists, and the user undoes to the message before the turn
+- **THEN** the turn's changed files get their content from that start record's snapshot
+
+#### Scenario: Turn whose records disagree on turn id is undone by position
+- **WHEN** a start record with turn id `A` is followed by a change record with turn id `B` that names no pre-turn snapshot, no start record has turn id `B`, and the user undoes to the message before the turn
+- **THEN** the turn's changed files get their content from start record `A`'s snapshot
+
+#### Scenario: Overlapping turns are paired by turn id
+- **WHEN** start records for turns `X` and `Y` are followed by the change record of `X` (which changed `a.txt`) and then of `Y` (which changed `b.txt`), none naming a pre-turn snapshot, and the user undoes to the message before both turns
+- **THEN** `a.txt` gets its content from `X`'s start snapshot and `b.txt` from `Y`'s start snapshot
+
+### Requirement: Undo fails before changing files when it cannot revert a whole turn
+Undo SHALL fail before any workspace file changes, and SHALL record no revert frame, when a turn after the target message changed files and either no pre-turn snapshot can be found for it, or that turn's start record comes before the target message (the target lies inside a turn that may already have changed files). A target at or before the turn's start record SHALL revert the whole turn. A later turn that changed no files SHALL NOT make undo fail.
+
+#### Scenario: Turn without a pre-turn record fails undo without changes
+- **WHEN** a turn changed `a.txt`, its change record names no pre-turn snapshot, the session has no start record, and the user undoes to the message before the turn
+- **THEN** undo returns an error naming the turn
+- **AND** `a.txt` keeps its content and no revert frame is recorded
+
+#### Scenario: Undo to a message inside a turn is refused
+- **WHEN** a turn's start record is followed by a steering message, the turn then changes `a.txt`, and the user undoes to the steering message
+- **THEN** undo returns an error saying undo reverts whole turns
+- **AND** `a.txt` keeps its content and no revert frame is recorded
+
+#### Scenario: Turn that changed no files does not block undo
+- **WHEN** a later turn recorded a start record but no change record, and the user undoes to a message before it
+- **THEN** undo succeeds and reports no reverted files
+
 ### Requirement: Retention settings are validated and off by default
 `[agent.execution.snapshot] max_snapshots` (integer count) and `max_age_days` (integer days) SHALL default to unset, which means no garbage collection; the same keys apply under a planner's or delegate's `execution.snapshot`. When set, each MUST be at least 1; `0` or a negative value MUST fail the config load with an error naming the key. In JSON configs, `null` SHALL leave the key unset.
 

@@ -26,7 +26,12 @@ Current code this change builds on:
   - `diff`, `restore_paths`, `restore` and `gc` build a fresh `GitSnapshotBackend::new()` and ignore `self`. They see the test-only `snapshot_base_override` only through a `#[cfg(test)]` copy.
 - **Trait and errors:** `crates/agent/src/snapshot/backend.rs` defines `SnapshotBackend`, `SnapshotError` (string variants only), `GcConfig` and `GcResult`.
 - **Undo/redo:** `crates/agent/src/agent/undo.rs` has `undo_impl` (track → validate every patch with `diff` → restore patches → push frame) and `redo_impl`.
-- **Turn snapshots:** `crates/agent/src/agent/session_actor.rs` `execute_prompt_inner` handles the post-turn snapshot and `let _ = backend.gc(..)`.
+  - `undo_impl` pairs each `TurnSnapshotPatch` with a `TurnSnapshotStart` by `turn_id`, in two copies of the same two-pass loop: one over the session's history after the target (`undo.rs:238-269`), one over each compatible child's whole history (`:198-231`).
+  - A patch with no same-id start is skipped silently. With no patches left, undo restores nothing, stores a revert frame and returns success. `cleanup_revert_on_prompt` then deletes the undone turn's history on the next prompt.
+- **Turn snapshots:** `crates/agent/src/agent/session_actor.rs` `execute_prompt_inner` handles the pre- and post-turn snapshots and `let _ = backend.gc(..)`.
+  - The pre-turn task gets `turn_id = Uuid::new_v4()` (`:3229`). `ensure_pre_turn_snapshot_ready` (`:3432`) stores it in `runtime.turn_snapshot`, then writes `TurnSnapshotStart` before the first mutating tool runs.
+  - The post-turn `TurnSnapshotPatch` uses `turn_id: run_id` (`:3325`), since `64f6727b` (steering). The ids therefore never match.
+  - The test fixture (`test_utils/helpers.rs:607-690`) writes both records itself with one id, and no undo test runs a real prompt.
 - **Config:** `crates/agent/src/config/execution.rs` has `SnapshotBackendConfig`. `crates/agent/src/agent/agent_config_builder.rs` has `with_snapshot_from_execution`, and `snapshot_gc_config` is never set from config. `crates/agent/src/api/quorum.rs` builds `GitSnapshotBackend::new().with_max_file_bytes(..)` for the planner and delegates.
 
 The rust-skills rules applied below are cited by id.
@@ -216,8 +221,9 @@ sequenceDiagram
     participant B as backend
     participant S as history store
     U->>B: track() -> pre_revert
-    U->>B: diff(pre_revert, each pre_snapshot)  (validation, no writes)
-    alt validation fails
+    U->>S: get_history -> resolve each later turn's base (D16, D17)
+    U->>B: diff(pre_revert, each base)  (validation, no writes)
+    alt resolution or validation fails
         U-->>U: return Err (no frame, no file changed)
     else
         U->>B: restore_paths(...) for each patch
@@ -304,6 +310,99 @@ A pure `fn large_file_warnings(newly: &[(String, u64)]) -> (Vec<…>, usize)` pr
 
 Numbers before and after are recorded in tasks.md. Parallel hashing and a reflink side store wait for these numbers.
 
+### D15. A turn's change record names its pre-turn snapshot
+
+The bug comes from two records, written at different places, that must agree on an id. The fix makes the change record self-contained instead of only repairing the id:
+
+- `MessagePart::TurnSnapshotPatch` gains `#[serde(default, skip_serializing_if = "Option::is_none")] base_snapshot_id: Option<SnapshotId>` (types in D18).
+- In `execute_prompt_inner` the post-turn code already holds the pre-turn ids. The runtime keeps them in one `TurnSnapshot { turn_id, snapshot_id }` (D18) instead of a positional `(String, String)` tuple, and the patch takes `turn_id` and `base_snapshot_id` from that one value, so both records come from the same source.
+- The pre-turn task copies the run's `TurnId` (`exec_ctx.turn_id()`, minted once at run start, D18) instead of minting a fresh UUID. Builds that pair by id, including the released ones, can then undo records written by this build. The steering path already uses `run_id` as the turn id (`with_turn_id(run_id)`).
+- The fixture's `take_post_snapshot_with_cwd` and the `session_materializer` test helper set `base_snapshot_id: Some(pre)`, so existing tests use the new path. Earlier-format records are written by the legacy tests directly.
+
+The field lives in `message_parts.content_json`: no schema change or migration. The fork copy (`session_store.rs:943-953`) round-trips parts through serde, so it keeps the field. Mesh peers decode with kameo's named msgpack (`rmp_serde::to_vec_named`), and `MessagePart` does not deny unknown fields, so older peers ignore it.
+
+Alternatives considered:
+
+- Only change `:3229` to use `run_id`. Rejected: it keeps the pairing that broke, and leaves the nightly records unpaired.
+- Backfill `base_snapshot_id` with a migration. Rejected: it rewrites user session data to repair records that only nightly builds wrote. Resolving them at read time (D16) is about 15 lines and touches nothing on disk.
+- Drop `TurnSnapshotStart`. Rejected: D17 needs it as the turn boundary, and older builds need it to pair.
+
+### D16. One resolver finds each turn's base, newest format first
+
+`undo.rs` gets one `fn resolve_turn_patches(history: &[AgentMessage], from: usize, starts_from: usize, target: Option<usize>) -> Result<Vec<TurnPatch>, UndoError>`. It replaces both two-pass loops: the own history calls it with `from = scan_start`, `starts_from = inherited_count` and `target = Some(target_idx)`; each compatible child calls it with `0`, `0` and `None`. `TurnPatch { turn_id: TurnId, base_snapshot_id: Option<SnapshotId>, changed_paths: Vec<PathBuf>, start_idx: Option<usize> }`; the start lookup is keyed by `TurnId` (`Copy`) and borrows the snapshot ids from the history. `validate_snapshot_workspace` still runs on every part first. The child-compatibility filter that `add-git-worktree-isolation` owns does not change.
+
+For every `TurnSnapshotPatch` at index `>= from`:
+
+1. **Start record.** Find the `TurnSnapshotStart` at index `>= starts_from` with the same `turn_id`. If there is none, take the nearest earlier snapshot record. Use it only if it is a start whose `turn_id` no patch in the history uses; if it is a patch, or a start another patch claims, there is no start.
+2. **Base.** Use `base_snapshot_id` when set, otherwise the start's `snapshot_id`. With neither, D17 applies.
+
+Why this order is safe, measured read-only on a real session database:
+
+| Records | Count | Result |
+|---|---|---|
+| Patches with a same-id start (released format) | 1,917 | Step 1 by id. 2 of them belong to overlapping turns, where the nearest start is the wrong one, so id must come before position. |
+| Patches without a same-id start (nightly since `64f6727b`) | 1,005 | Every one is directly preceded by a start. For the 1,004 with a `run_started` event, exactly one start lies inside the run and no other run overlaps it. |
+| Starts with no patch (turns that changed nothing) | 5,296 | Never block undo. |
+
+Overlapping runs in one session can no longer happen because of the execution permit (`53f8e710`), so the position rule only matters for the nightly records.
+
+### D17. Undo fails before any change when it can't revert whole turns
+
+After resolving, and before the `diff` validation, `undo_impl` returns `UndoError::Snapshot` when a resolved patch has:
+
+- **No base.** Message: `cannot undo: turn <turn_id> changed <n> file(s) but its pre-turn snapshot is not recorded`.
+- **A start before the target** (`start_idx < target_idx`). The target is inside a turn that may already have changed files, for example a steering message. Message: `undo reverts whole turns: message <id> is inside turn <turn_id>; undo to that turn's prompt instead`.
+
+A target at or before the start record is fine. `ensure_pre_turn_snapshot_ready` writes the start before the first mutating tool runs, so the workspace still matches the start's snapshot there. Steering that arrives before the first mutation is therefore undoable, and so is the start record itself.
+
+Both errors happen before `restore_batch` and before `push_revert_state`, so no file changes and no frame is recorded. A failed undo therefore never lets `cleanup_revert_on_prompt` delete history. `UndoError` gains no variant, so the mesh reply type and the desktop contract stay the same.
+
+The target-message fallback (`undo.rs:286-314`) is unchanged: it only runs when no turn after the target changed files.
+
+### D18. Snapshot and turn ids are newtypes
+
+The pairing D15–D17 depend on is between ids that today are all `String`: `SnapshotId` is `pub type SnapshotId = String` (`snapshot/backend.rs:80`), the runtime pairs `(String, String)` by position (`agent/core.rs:223`), the pre-turn task returns `(String, Result<String, String>)` (`agent/core.rs:203`), and `RevertState.snapshot_id` is a `String`. Following `type-newtype-ids` and `anti-stringly-typed`, with storage that matches what each id is:
+
+```rust
+// snapshot/backend.rs
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SnapshotId(Arc<str>);   // serde by hand: a plain string
+
+// model.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TurnId(Uuid);           // serde by hand: the hyphenated string
+
+// agent/core.rs
+pub struct TurnSnapshot { pub turn_id: TurnId, pub snapshot_id: SnapshotId }
+pub turn_snapshot: ParkingMutex<Option<TurnSnapshot>>,
+type PreTurnSnapshotTask = ParkingMutex<Option<JoinHandle<(TurnId, SnapshotResult<SnapshotId>)>>>;
+```
+
+- **Storage.**
+  - `SnapshotId` is opaque and backend-neutral. `Arc<str>` makes a clone a reference-count increment, so a second owner never allocates.
+  - `TurnId` is `Copy`. Every turn id is minted with `Uuid::new_v4()`. Measured read-only on `~/.qmt/sessions.db`: all 8,981 `TurnSnapshotStart` and 2,929 `TurnSnapshotPatch` records hold a v4 UUID turn id and a 40-hex snapshot id, and all 3 `revert_states` rows hold a 40-hex snapshot id. The only non-UUID turn ids are test literals.
+- **Serialization, written by hand.**
+  - `SnapshotId` serializes as `&str` and deserializes a `String` into `Arc<str>`. Serde's `rc` feature is not needed.
+  - `TurnId` always writes the lowercase hyphenated form, encoded into a stack buffer. It does not use `uuid`'s serde support, which writes 16 raw bytes for non-human-readable formats and would change kameo's msgpack payloads.
+  - A stored turn id that is not a UUID loads as `Uuid::new_v5(TURN_ID_NAMESPACE, text)` instead of failing. A bad id must not fail `get_history` for the whole session, or the fork copy that re-reads these parts (`session_store.rs:944`). The same text always maps to the same UUID, so a start and a patch with the same id still pair. Such an id is written back as the derived UUID when a fork copies the part. No record in the measured database is affected.
+- **API.**
+  - `SnapshotId`: `as_str()`, `Display`, `From<String>`, `From<&str>`, `From<gix::ObjectId>` (in the git backend).
+  - `TurnId`: `new()` (v4), `as_uuid()`, `Display`, `From<Uuid>`, and `from_stored(&str)`, which applies the v5 fallback and is used by the deserializer.
+  - No `Deref` on either (type-deref-coercion). `SnapshotBackend` methods take `&SnapshotId` and return `SnapshotId`; `steps` become `&[(SnapshotId, Vec<PathBuf>)]`. `SnapshotError::InvalidSnapshotId` carries the `SnapshotId`.
+- **`SnapshotId` is opaque, not validated during deserialization.** This is a deliberate exception to `type-newtype-validated`/`api-parse-dont-validate`: the trait is backend-neutral, and a SHA check during deserialization would make a single bad stored record fail `get_history`. The git backend parses on use through one `fn object_id(&SnapshotId) -> SnapshotResult<gix::ObjectId>`, which replaces the duplicate parsers in `git/restore.rs` and `git/gc.rs`.
+- **One `TurnId` per run.** The run's `TurnId` is minted once where the run starts (`session_actor.rs:613` and `:2478`). The `String` `run_id` that steering, events and hooks use is derived from it with `to_string()`. `ExecutionContext::turn_id: Option<TurnId>`, `with_turn_id(TurnId)`, `turn_id() -> Option<TurnId>`. Nothing formats a UUID to text in order to wrap or parse it again. Hook payloads, agent events, scheduler messages and steering stay `String` (external contracts, see Non-goals) and convert at their boundary through `ExecutionContext::turn_id_string()`.
+- **Errors.** The pre-turn task keeps `SnapshotError` instead of flattening it to `String` (err-source-chain).
+- **Persisted and wire forms are unchanged.** `message_parts.content_json` and kameo's named msgpack stay byte-identical for every UUID turn id and every snapshot id. The `revert_states` row mapping converts at the column (`SnapshotId::from(row.get::<_, String>(..)?)`, `state.snapshot_id.as_str()`). No migration.
+- **Ownership.** Records are built by moving owned ids in. Copies of `TurnId` are free, so the `turn_id_for_task` clone goes away. The one remaining `SnapshotId` clone, in `ensure_pre_turn_snapshot_ready`, is a real second owner (the runtime `TurnSnapshot` and the stored start record) and costs a reference-count increment. Undo's start lookup borrows from the history (`HashMap<TurnId, &SnapshotId>`) instead of cloning ids into the map (own-borrow-over-clone).
+
+Alternatives considered:
+
+- Keep the alias. Rejected: it is what let three same-typed ids sit side by side.
+- `String`-backed newtypes (the first implementation of 8.2). Rejected: every second owner became an allocating `.clone()`, and every minted UUID was formatted to text only to be wrapped.
+- Wrap `gix::ObjectId` in `SnapshotId`. Rejected: it ties the backend-neutral trait and stored messages to git, and a malformed stored id would need a fallback during deserialization.
+- Fail deserialization on a non-UUID turn id. Rejected: one bad record would fail history loading and forking for the whole session.
+- Make `TurnId` cover hook, event and scheduler payloads too. Rejected for this change: those are external contracts (hook JSON, desktop events) and belong in their own change.
+
 ## Risks / Trade-offs
 
 - **Uncompressed large blobs take more disk.**
@@ -317,9 +416,13 @@ Numbers before and after are recorded in tasks.md. Parallel hashing and a reflin
 - **The ignore scope can move.** Editing `.gitignore`/`.ignore` mid-session moves paths in or out of scope. A path that leaves scope looks deleted in the next diff, and undo could recreate it. This is pre-existing behaviour and is documented.
 - **Snapshot stores from unreleased `fix/snapshot` builds.** Commits there may lack large files. Undo across such a commit treats the file as added and could delete it. Only development builds wrote those stores. Mitigation: a CHANGELOG/dev note to clear `~/Library/Caches/querymt/snapshots` (or `$XDG_CACHE_HOME/querymt/snapshots`) after updating a `fix/snapshot` build. Per AGENTS.md, there is no compatibility shim.
 - **Permission tests need a non-root user.** Tests that rely on read-only directories skip themselves when `libc::geteuid() == 0` (`#[cfg(unix)]`).
+- **Undo can now fail where it used to "succeed".** A turn with no recoverable base, in the session or a compatible child, blocks the whole undo. Before, that turn was skipped silently, and the next prompt deleted its history. Failing is the safer outcome: no file or history changes.
+- **Undo to a steering message is refused** once its turn started changing files. The desktop UI may still offer the action; hiding it there is optional UI follow-up.
+- **Frames already stored by the broken undo stay.** They have `restore_failed = false`, so the next prompt deletes the undone turn's history. Running redo removes such a frame without changing files. They are not cleaned up automatically, because nothing distinguishes them from valid frames.
 
 ## Migration Plan
 
 - **Existing stores.** No migration step is needed. Compressed and uncompressed loose objects coexist, and the stat-cache format is unchanged. With GC enabled, the first run that prunes 10 or more snapshots also sweeps garbage left by earlier builds.
 - **Config.** `max_file_bytes` was never released, so no migration. `max_snapshots = 0` or `max_age_days = 0` now fails to load. The CHANGELOG entry says to remove the key or use JSON `null`. Configs that set other values keep loading, and **start deleting old snapshots** (before, the values were ignored). The CHANGELOG entry calls this out.
 - **Rollback.** Reverting the change leaves a store that older builds can read: plain git objects, with possibly dangling parents that `list_commits` already tolerates.
+- **Turn records.** No data migration; existing records are not rewritten. Records from released builds pair by id, and nightly records pair by position (D16). After a rollback, older builds still undo records written by this build: the start and change records share the run id, and the extra field is ignored.

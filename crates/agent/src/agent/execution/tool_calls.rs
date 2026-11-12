@@ -281,7 +281,7 @@ async fn prepare_tool_call_inner(
             session_id: exec_ctx.session_id.clone(),
             mcp_server: target.server().map(str::to_owned),
             mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+            turn_id: exec_ctx.turn_id_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
                 .llm_config()
@@ -493,7 +493,7 @@ async fn execute_prepared_inner(
             session_id: exec_ctx.session_id.clone(),
             mcp_server: target.server().map(str::to_owned),
             mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+            turn_id: exec_ctx.turn_id_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
                 .llm_config()
@@ -1168,7 +1168,7 @@ fn tool_context_for_call(
 
     let event_sink = config.event_sink.clone();
     let session_id_clone = exec_ctx.session_id.clone();
-    let run_id_clone = exec_ctx.turn_id().unwrap_or_default().to_string();
+    let run_id_clone = exec_ctx.turn_id_string();
     let tool_call_id_clone = call.id.clone();
     let pending_elicitations = config.pending_elicitations.clone();
     let cancellation_token = exec_ctx.cancellation_token.clone();
@@ -1353,13 +1353,13 @@ async fn decide_approval(
         return Ok(Approval::Denied(Denial::TaskInactive));
     }
 
-    let turn_id = exec_ctx.turn_id().unwrap_or_default();
+    let turn_id = exec_ctx.turn_id_string();
     let hook_decision = config
         .hooks
         .run_permission_request(crate::hooks::PermissionRequestRequest {
             session_id: exec_ctx.session_id.clone(),
             mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: turn_id.to_string(),
+            turn_id: turn_id.clone(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
                 .llm_config()
@@ -1395,7 +1395,7 @@ async fn decide_approval(
         None => {}
     }
 
-    Ok(prompt_user(config, exec_ctx, call_id, tool, args, &need, turn_id).await)
+    Ok(prompt_user(config, exec_ctx, call_id, tool, args, &need, &turn_id).await)
 }
 
 /// Register a permission interaction, announce it, and wait for the outcome.
@@ -1648,7 +1648,7 @@ pub(super) async fn record_tool_side_effects(
             .hooks
             .run_pre_delegation(PreDelegationRequest {
                 session_id: exec_ctx.session_id.clone(),
-                turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                turn_id: exec_ctx.turn_id_string(),
                 cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
                 model: exec_ctx
                     .llm_config()

@@ -1294,6 +1294,55 @@ fn migration_0023_persists_revert_workspace_provenance() {
     assert_eq!(root.as_deref(), Some("/tmp/workspaces/ws-1"));
 }
 
+#[tokio::test]
+async fn revert_state_snapshot_id_round_trips_through_sqlite() {
+    use crate::session::domain::RevertState;
+    use crate::snapshot::SnapshotId;
+
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(None, None, None, None)
+        .await
+        .unwrap();
+    let id = SnapshotId::from("0123456789abcdef0123456789abcdef01234567");
+    storage
+        .push_revert_state(
+            &session.public_id,
+            RevertState {
+                public_id: "rev-typed".to_string(),
+                session_id: session.public_id.clone(),
+                message_id: "msg-1".to_string(),
+                snapshot_id: id.clone(),
+                backend_id: "git".to_string(),
+                workspace_root: None,
+                restore_failed: false,
+                created_at: time::OffsetDateTime::now_utc(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let loaded = storage
+        .peek_revert_state(&session.public_id)
+        .await
+        .unwrap()
+        .expect("frame stored");
+    assert_eq!(loaded.snapshot_id, id);
+
+    // The column still holds the bare id, not a wrapped form.
+    let conn = storage.conn_for_test();
+    let raw: String = conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT snapshot_id FROM revert_states WHERE public_id = 'rev-typed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw, "0123456789abcdef0123456789abcdef01234567");
+}
+
 #[test]
 fn migration_0002_drops_legacy_events_table() {
     let mut conn = Connection::open_in_memory().expect("in-memory db");

@@ -502,7 +502,7 @@ impl GitSnapshotBackend {
             && head.tree_id().ok().map(|id| id.detach()) == Some(tree_id)
         {
             stats.reused = true;
-            return Ok((head.id().detach().to_string(), stats));
+            return Ok((head.id().detach().into(), stats));
         }
         let parent_ids: Vec<gix::ObjectId> = head.iter().map(|c| c.id().detach()).collect();
 
@@ -512,7 +512,7 @@ impl GitSnapshotBackend {
             .commit("HEAD", message, tree_id, parent_ids)
             .map_err(|e| SnapshotError::Repository(format!("Failed to create commit: {}", e)))?;
 
-        Ok((commit_id.detach().to_string(), stats))
+        Ok((commit_id.detach().into(), stats))
     }
 
     /// Capture the current content of `path` as a blob.
