@@ -73,8 +73,15 @@ impl LocalAgentHandle {
                 let profiles = self
                     .profiles()
                     .ok_or_else(|| Error::invalid_params().data("profiles are not configured"))?;
-                let runtime = Box::pin(profiles.runtime_for_profile(profile_id))
+                let requested_profile = profile_id.to_owned();
+                // Boxing the future does not isolate its poll stack from ACP dispatch.
+                // A separate task also keeps cold startup off that deep call chain.
+                let load = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                    profiles.runtime_for_profile(&requested_profile).await
+                }));
+                let runtime = load
                     .await
+                    .map_err(|error| Error::internal_error().data(format!("Speech profile task failed: {error}")))?
                     .map_err(|error| {
                         Error::invalid_params().data(serde_json::json!({
                             "message": format_prefixed_error_chain("Failed to load profile", &error),

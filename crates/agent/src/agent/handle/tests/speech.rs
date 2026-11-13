@@ -204,6 +204,82 @@ async fn speech_routes_to_session_and_profile_without_startup_speech() {
     profiles.shutdown().await;
 }
 
+#[cfg(feature = "api")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn speech_cold_profile_lookup_through_acp_dispatch() {
+    let f = speech_fixture(false, None).await;
+    let profiles = attach_speech_profiles(&f).await;
+    // Do not bind a session or otherwise warm the profile runtime before the RPC.
+    let (mut connection, mut messages) =
+        crate::acp::websocket::EmbeddedAcpConnection::open(Arc::new(f.handle), None).await;
+    for (id, method, params) in [
+        (
+            1,
+            "initialize",
+            serde_json::json!({"protocolVersion":1, "clientCapabilities":{}}),
+        ),
+        (
+            2,
+            "_querymt/speech/listProfiles",
+            serde_json::json!({"operation":"transcription", "profileId":"speech"}),
+        ),
+        (
+            3,
+            "_querymt/speech/listProfiles",
+            serde_json::json!({"profileId":"plain"}),
+        ),
+        (
+            4,
+            "_querymt/speech/listProfiles",
+            serde_json::json!({"profileId":"missing"}),
+        ),
+        (
+            5,
+            "_querymt/speech/listProfiles",
+            serde_json::json!({"profileId":"speech"}),
+        ),
+    ] {
+        connection
+            .receive_json(
+                &serde_json::json!({
+                    "jsonrpc":"2.0", "id":id, "method":method, "params":params,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let message: serde_json::Value =
+                    serde_json::from_str(&messages.recv().await.expect("ACP response")).unwrap();
+                if message["id"] == id {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("cold profile lookup must complete on the default worker stack");
+        if id == 4 {
+            assert_eq!(response["error"]["code"], -32602);
+        } else {
+            assert!(response.get("error").is_none(), "{response}");
+            if id == 2 {
+                assert_eq!(response["result"]["profiles"].as_array().unwrap().len(), 1);
+                assert_eq!(response["result"]["profiles"][0]["id"], "local-stt");
+            } else if id == 3 {
+                assert_eq!(
+                    response["result"],
+                    serde_json::json!({"profiles":[], "defaults":{}})
+                );
+            } else if id == 5 {
+                assert_eq!(response["result"]["profiles"].as_array().unwrap().len(), 2);
+            }
+        }
+    }
+    connection.close().await;
+    profiles.shutdown().await;
+}
+
 #[tokio::test]
 async fn speech_scopes_do_not_borrow_startup_service_when_bound_profile_has_none() {
     let f = speech_fixture(true, None).await;
