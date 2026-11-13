@@ -4,7 +4,7 @@ title: Agent execution loop
 description: The execution state machine, tool-call lifecycle, parallel waves, LLM retry and compaction trigger behind one prompt turn.
 tags: execution, state-machine, tool-calls, retry, compaction
 knowledge_paths: ["crates/agent/src/agent/execution/**"]
-knowledge_sources: ["crates/agent/src/agent/execution/wave_plan.rs"]
+knowledge_sources: ["crates/agent/src/agent/execution/wave_plan.rs", "crates/agent/src/agent/execution/llm_retry.rs"]
 ---
 
 # Agent execution loop
@@ -51,10 +51,28 @@ conflicting calls the earlier one in model order lands in the earlier wave.
 
 ## Retry
 
-Transient provider errors are retried by `call_with_retry`
-(`src/agent/execution/llm_retry.rs`). The delay uses the provider's retry hint when one
-exists, capped by the configured maximum wait, otherwise exponential backoff. Attempts
-are bounded by the rate-limit policy and the wait respects cancellation.
+Two retry paths, non-streaming `call_with_retry` and stream recreation, share one
+attempt budget, one backoff calculation and one set of events. Both live in
+`src/agent/execution/llm_retry.rs`. Which errors are transient is decided by
+`LLMError::is_retryable()` in the `querymt` crate; read it there rather than from this
+note.
+
+- **Non-streaming calls** go through `call_with_retry`. The configured `max_retries`
+  (read through `max_attempts()`, at least 1) counts the first request, so the default of
+  3 means three requests in total.
+- **Streaming calls** rebuild the stream on failure (`handle_stream_failure`, a
+  `StreamRetryBudget`). A recreation spends both `max_stream_retries` (default 2) and one
+  of the shared `max_attempts`. If output was already emitted the retry still happens and
+  may repeat visible text (`TODO(stream-retry-safety)`).
+- **Delay** (`retry_delay_secs`): the provider's retry hint when present, capped at
+  `max_wait_secs` and not jittered; otherwise `default_wait_secs` times
+  `backoff_multiplier` to the power of (retry number minus one), so the first retry waits
+  `default_wait_secs`, with proportional jitter (`jitter_ratio`), capped at
+  `max_wait_secs`.
+- **Events:** each wait emits `RateLimited` or `LlmRetryWait` (streams also
+  `StreamRecovering`) and each resume `RateLimitResume` or `LlmRetryResume`. The wait is
+  a `select!` against the cancel token, so cancelling during a delay ends the turn
+  without another attempt.
 
 ## Compaction
 

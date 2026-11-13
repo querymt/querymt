@@ -1,0 +1,48 @@
+{
+  "document": "crates/agent/knowledge/execution.md",
+  "entries": {
+    "section:[\"Agent execution loop\",\"Compaction\"]": {
+      "dependencies": {
+        "crates/agent/src/agent/execution/llm_retry.rs": "sha256-v1:b063a03f988b0289301468fe1a189cb60b19f631b5a333689ca7e29f58ec5eab",
+        "crates/agent/src/agent/execution/wave_plan.rs": "sha256-v1:ace5fd486a03bd5ee03457622d5bae2144b8db56aa0ca88fa45342b14ef52710"
+      },
+      "text": "sha256-v1:8f0a22ce6f3054976c80e5d7524ba0b0d5c3a7a1153314fe34970609a8fc9f69"
+    },
+    "section:[\"Agent execution loop\",\"Parallel waves\"]": {
+      "dependencies": {
+        "crates/agent/src/agent/execution/llm_retry.rs": "sha256-v1:b063a03f988b0289301468fe1a189cb60b19f631b5a333689ca7e29f58ec5eab",
+        "crates/agent/src/agent/execution/wave_plan.rs": "sha256-v1:ace5fd486a03bd5ee03457622d5bae2144b8db56aa0ca88fa45342b14ef52710"
+      },
+      "text": "sha256-v1:6b0f34bb708b899fbdc39cc460daf2921c033cc216b7c795c489bae65ccb8ed6"
+    },
+    "section:[\"Agent execution loop\",\"Retry\"]": {
+      "dependencies": {
+        "crates/agent/src/agent/execution/llm_retry.rs": "sha256-v1:b063a03f988b0289301468fe1a189cb60b19f631b5a333689ca7e29f58ec5eab",
+        "crates/agent/src/agent/execution/wave_plan.rs": "sha256-v1:ace5fd486a03bd5ee03457622d5bae2144b8db56aa0ca88fa45342b14ef52710"
+      },
+      "text": "sha256-v1:411f66d9fb59420f66396fc178c5d8d4c82a28b22e59a6def4e94cae5c1e307b"
+    },
+    "section:[\"Agent execution loop\",\"States and transitions\"]": {
+      "dependencies": {
+        "crates/agent/src/agent/execution/llm_retry.rs": "sha256-v1:b063a03f988b0289301468fe1a189cb60b19f631b5a333689ca7e29f58ec5eab",
+        "crates/agent/src/agent/execution/wave_plan.rs": "sha256-v1:ace5fd486a03bd5ee03457622d5bae2144b8db56aa0ca88fa45342b14ef52710"
+      },
+      "text": "sha256-v1:8bb177e68d77974a8360c64a146df25f2b521b3e8137acf81f0213ea8839db29"
+    },
+    "section:[\"Agent execution loop\",\"Tool-call lifecycle\"]": {
+      "dependencies": {
+        "crates/agent/src/agent/execution/llm_retry.rs": "sha256-v1:b063a03f988b0289301468fe1a189cb60b19f631b5a333689ca7e29f58ec5eab",
+        "crates/agent/src/agent/execution/wave_plan.rs": "sha256-v1:ace5fd486a03bd5ee03457622d5bae2144b8db56aa0ca88fa45342b14ef52710"
+      },
+      "text": "sha256-v1:8f7f38db00b5692f3b4bf56f11537452ed73dce1cf56097e41693d299a99115a"
+    },
+    "section:[\"Agent execution loop\"]": {
+      "dependencies": {
+        "crates/agent/src/agent/execution/llm_retry.rs": "sha256-v1:b063a03f988b0289301468fe1a189cb60b19f631b5a333689ca7e29f58ec5eab",
+        "crates/agent/src/agent/execution/wave_plan.rs": "sha256-v1:ace5fd486a03bd5ee03457622d5bae2144b8db56aa0ca88fa45342b14ef52710"
+      },
+      "text": "sha256-v1:9f28297ce751d80efe9b0460e63454aaaf1606f580696850f3056992f49cf860"
+    }
+  },
+  "version": 1
+}

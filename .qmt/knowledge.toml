@@ -1,0 +1,28 @@
+version = 1
+
+# M5 pilot corpus: reviewed concept notes for selected crates/agent subtrees.
+# No exhaustive per-file inventory is selected here; that is an optional
+# comparison arm (see crates/agent/knowledge/pilot/README.md).
+
+[documents]
+include = ["crates/agent/knowledge/*.md", "openspec/specs/*/spec.md"]
+exclude = []
+
+[code]
+include = [
+  "crates/agent/src/agent/execution/*.rs",
+  "crates/agent/src/agent/repository_delivery.rs",
+  "crates/agent/src/session/*.rs",
+  "crates/agent/src/session/sqlite_storage/*.rs",
+  "crates/agent/src/tools/*.rs",
+  "crates/agent/src/tools/builtins/*.rs",
+  "crates/agent/src/knowledge/repository/*.rs",
+]
+# The evaluation harness is not part of the subject matter being documented.
+exclude = ["crates/agent/src/knowledge/repository/evaluation.rs"]
+
+[orientation]
+entrypoints = ["crates/agent/knowledge/README.md"]
+# Specs stay searchable but are never attached unasked: their normative
+# wording matches ordinary requests and produced false cards.
+retrieval_only = ["openspec/specs/**"]
