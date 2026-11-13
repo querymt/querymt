@@ -88,3 +88,31 @@ The one failure, `agent::handle::remote_connect::tests::connect_budget_defaults_
 
 Legacy checks: no changes to `knowledge/sqlite.rs`, `knowledge/mod.rs`, `dotagents/`, `index/`, or the legacy `knowledge_*`/`index` tools (`git status`); no `qndx` reference in `crates/agent` or `Cargo.lock`.
 
+## Scenario audit follow-up (2026-11-12)
+
+`scenario-audit.md` maps every delta-spec scenario to the tests that assert it. Fixes made from it:
+
+- **Duplicate card across stages (scenario "Orientation and index select the same note") was violated.** Card versions hashed the rendered card, so the different orientation and index framing made one section two versions. Versions now hash the citation, shown summary and evidence state only (`adapters.rs` `content_version`). Test: `orientation_and_index_selecting_the_same_note_deliver_it_once`.
+- **Delivery skipped on any running refresh**, so a parallel call's warm reconcile could drop a card (intermittent `parallel_cards_share_one_turn_budget_in_call_order` failure, also on the previous code). Delivery now waits for the refresh up to its existing deadline (`RepositoryService::wait_until_idle`).
+- **Cold first prompt:** with a delivery stage enabled, session creation now pre-warms the index in the background, only for checkouts with `.qmt/knowledge.toml` (`RepositoryKnowledgeRegistry::prewarm`). Pull-only sessions stay lazy.
+- **Cold first prompt, live finding (2026-11-13):** the index build outlasted the 1.5 s delivery deadline, so the first prompt got no card. A session-start warm-up of the session's own checkout now extends the orientation deadline to 8 s (`WARMUP_TIMEOUT`, `RepositoryKnowledgeRegistry::spawn_prewarm`/`is_warming`, per checkout). A live cold-cache run then delivered the right card. Tests: `a_requested_warm_up_is_visible_until_it_finishes`, `a_running_warm_up_extends_only_the_orientation_deadline`.
+- **`index` cards cite the section that names the file** (`path_knowledge::section_about`), not always the note's first section. Test: `a_note_cites_the_section_that_names_the_indexed_file`.
+- **Specs no longer produce false automatic cards:** manifest `[orientation] retrieval_only` globs stay searchable but are never attached unasked. Tests: `retrieval_only_documents_are_a_validated_glob_list`, `retrieval_only_documents_never_become_path_cards`, `retrieval_only_documents_are_never_orientation_cards_but_stay_retrievable`.
+- **A card's text matches its citation:** the document `description` is shown only for the top-level section; a cited subsection shows its own excerpt. Test: `a_description_stands_in_only_for_the_top_level_of_its_document`.
+- **End-to-end orientation:** `a_path_free_prompt_reaches_the_first_provider_request_with_an_orientation_card` sends prompts through the public API and asserts the card reaches the first provider request.
+- **Stats** report documents by evidence state (scenario "Inspect corpus availability").
+- **Policy scenario amended:** availability comes from `repo_knowledge_stats` and tool diagnostics, keeping the policy byte-stable.
+- **Previously partial scenarios now tested:** tools-excluded mismatch warning, runtime allowlist of only repository tools, default index location following `QMT_CONFIG_DIR`, and the `.agents` protocol loader reading the same memory independently of repository indexing.
+- **Evidence portability** assertions strengthened; **example tests** (maintenance CLI exit codes) now run in CI.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy -p querymt-agent --all-targets --features "dashboard,oauth,remote" -- -D warnings` | clean |
+| `cargo nextest run -p querymt-agent --features "dashboard,oauth,remote" --no-fail-fast` | 4842 run: 4841 passed, 1 failed (`connect_budget_defaults_are_bounded_and_reason_specific`, pre-existing, see above), 12 skipped |
+| repository-knowledge subset, 10 + 8 + 6 consecutive runs | 0 failures |
+| `cargo nextest run -p querymt-agent --example repository_knowledge` | 11/11 passed |
+| `openspec validate add-portable-repository-knowledge --strict` | valid |
+
+Remaining partial scenarios are listed in `scenario-audit.md`; task 6.4 (model-backed comparison) is still open.
+
