@@ -116,6 +116,13 @@ pub struct McpToolSnapshot {
     /// `None` signals that the next turn should unconditionally re-emit a
     /// `ToolsAvailable` event.
     pub tools_hash: Option<crate::hash::RapidHash>,
+    /// Skills published by this session's eligible MCP servers (MCP Skills
+    /// extension). Updated together with the tools so one snapshot is always
+    /// consistent.
+    pub skills: Vec<Arc<crate::skills::mcp::McpSkill>>,
+    /// Peers of the servers that can publish skills, including those that
+    /// currently list none; refresh-on-miss needs them to ask again.
+    pub skill_servers: HashMap<String, rmcp::service::Peer<rmcp::RoleClient>>,
 }
 
 /// Shared, live MCP tool state for a session.
@@ -145,6 +152,8 @@ impl McpToolState {
                 tools,
                 tool_defs,
                 tools_hash: None,
+                skills: Vec::new(),
+                skill_servers: HashMap::new(),
             }),
             skipped: ParkingMutex::new(Vec::new()),
             oauth_servers: ParkingMutex::new(HashSet::new()),
@@ -185,6 +194,83 @@ impl McpToolState {
     /// Atomically replace the snapshot.
     pub fn store(&self, snapshot: McpToolSnapshot) {
         self.snapshot.store(Arc::new(snapshot));
+    }
+
+    /// Replace one server's slice of the snapshot.
+    ///
+    /// `tools` / `skills` of `None` keep that server's current entries. Call
+    /// this only after the network fetch finished: the closure handed to
+    /// `ArcSwap::rcu` is cheap and side-effect free (it may run more than
+    /// once on contention), so a concurrent tools refresh and skills refresh
+    /// cannot lose each other's update. The tools hash is always reset.
+    pub fn replace_server(
+        &self,
+        server: &str,
+        tools: Option<Vec<Arc<querymt::mcp::adapter::McpToolAdapter>>>,
+        skills: Option<Vec<Arc<crate::skills::mcp::McpSkill>>>,
+    ) {
+        use querymt::tool_decorator::CallFunctionTool;
+        self.rcu(|current| {
+            let (tools_map, tool_defs) = match &tools {
+                None => (current.tools.clone(), current.tool_defs.clone()),
+                Some(new_tools) => {
+                    let mut map = HashMap::new();
+                    let mut defs = Vec::new();
+                    for def in &current.tool_defs {
+                        if let Some(adapter) = current.tools.get(&def.function.name)
+                            && adapter.server_name() != server
+                        {
+                            defs.push(def.clone());
+                        }
+                    }
+                    for (name, adapter) in &current.tools {
+                        if adapter.server_name() != server {
+                            map.insert(name.clone(), Arc::clone(adapter));
+                        }
+                    }
+                    for adapter in new_tools {
+                        let name = adapter.descriptor().function.name.clone();
+                        if map.contains_key(&name) {
+                            continue;
+                        }
+                        defs.push(adapter.descriptor());
+                        map.insert(name, Arc::clone(adapter));
+                    }
+                    (map, defs)
+                }
+            };
+            let skills_vec = match &skills {
+                None => current.skills.clone(),
+                Some(new_skills) => current
+                    .skills
+                    .iter()
+                    .filter(|s| s.server_name != server)
+                    .cloned()
+                    .chain(new_skills.iter().cloned())
+                    .collect(),
+            };
+            McpToolSnapshot {
+                tools: tools_map,
+                tool_defs,
+                tools_hash: None,
+                skills: skills_vec,
+                skill_servers: current.skill_servers.clone(),
+            }
+        });
+    }
+
+    /// Remember that `server` can publish skills (see
+    /// [`McpToolSnapshot::skill_servers`]).
+    pub fn register_skill_server(
+        &self,
+        server: &str,
+        peer: &rmcp::service::Peer<rmcp::RoleClient>,
+    ) {
+        self.rcu(|current| {
+            let mut next = current.clone();
+            next.skill_servers.insert(server.to_string(), peer.clone());
+            next
+        });
     }
 
     /// Read-modify-write the snapshot via a closure.

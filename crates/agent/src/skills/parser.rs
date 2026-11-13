@@ -32,37 +32,13 @@ pub fn parse_skill_file_ex(path: &Path, source: SkillSource, protocol: bool) -> 
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
 
-    let parsed = gray_matter::Matter::<gray_matter::engine::YAML>::new()
-        .parse::<gray_matter::Pod>(&content)
-        .with_context(|| format!("Failed to parse file {}", path.display()))?;
-
-    // Extract and validate frontmatter
-    let data = parsed
-        .data
-        .ok_or_else(|| anyhow::anyhow!("Missing YAML frontmatter in {}", path.display()))?;
-    let mut metadata: SkillMetadata = serde_path_to_error::deserialize(&data).map_err(|error| {
-        let field = error.path().to_string();
-        anyhow::Error::new(error.into_inner())
-            .context(format!("Failed to deserialize skill metadata at {field}"))
-    })?;
+    let origin = path.display().to_string();
+    let (mut metadata, body) = parse_document(&content, &origin)?;
 
     if protocol {
         apply_protocol_defaults(&mut metadata, path);
     }
-
-    // Validate required fields
-    if metadata.name.trim().is_empty() {
-        bail!(
-            "Skill 'name' is required and cannot be empty in {}",
-            path.display()
-        );
-    }
-    if metadata.description.trim().is_empty() {
-        bail!(
-            "Skill 'description' is required and cannot be empty in {}",
-            path.display()
-        );
-    }
+    validate_required(&metadata, &origin)?;
 
     let skill_dir = path
         .parent()
@@ -72,9 +48,49 @@ pub fn parse_skill_file_ex(path: &Path, source: SkillSource, protocol: bool) -> 
     Ok(Skill {
         path: skill_dir,
         metadata,
-        content: parsed.content,
+        content: body,
         source,
     })
+}
+
+/// Parse skill definition text in Agent Skills mode (no `.agents` protocol
+/// defaults): `name` and `description` are required.
+///
+/// `origin` only labels errors (a path or an MCP skill URI). Returns the
+/// metadata and the markdown body without frontmatter.
+pub fn parse_skill_str(content: &str, origin: &str) -> Result<(SkillMetadata, String)> {
+    let (metadata, body) = parse_document(content, origin)?;
+    validate_required(&metadata, origin)?;
+    Ok((metadata, body))
+}
+
+/// Split frontmatter from body and deserialize the metadata, without
+/// applying defaults or required-field validation.
+fn parse_document(content: &str, origin: &str) -> Result<(SkillMetadata, String)> {
+    let parsed = gray_matter::Matter::<gray_matter::engine::YAML>::new()
+        .parse::<gray_matter::Pod>(content)
+        .with_context(|| format!("Failed to parse file {origin}"))?;
+
+    // Extract and validate frontmatter
+    let data = parsed
+        .data
+        .ok_or_else(|| anyhow::anyhow!("Missing YAML frontmatter in {origin}"))?;
+    let metadata: SkillMetadata = serde_path_to_error::deserialize(&data).map_err(|error| {
+        let field = error.path().to_string();
+        anyhow::Error::new(error.into_inner())
+            .context(format!("Failed to deserialize skill metadata at {field}"))
+    })?;
+    Ok((metadata, parsed.content))
+}
+
+fn validate_required(metadata: &SkillMetadata, origin: &str) -> Result<()> {
+    if metadata.name.trim().is_empty() {
+        bail!("Skill 'name' is required and cannot be empty in {origin}");
+    }
+    if metadata.description.trim().is_empty() {
+        bail!("Skill 'description' is required and cannot be empty in {origin}");
+    }
+    Ok(())
 }
 
 /// Fill `.agents` Protocol defaults: the stable ID falls back to the entry
@@ -398,6 +414,26 @@ Review instructions.
         let skill = parse_skill_file_ex(&path, SkillSource::Project(entry.clone()), true).unwrap();
         assert_eq!(skill.metadata.id.as_deref(), Some("review"));
         assert_eq!(skill.metadata.name, "review");
+    }
+
+    #[test]
+    fn test_parse_skill_str_returns_metadata_and_body() {
+        let (metadata, body) =
+            parse_skill_str("---\nname: a\ndescription: d\n---\nBody text\n", "mcp:x").unwrap();
+        assert_eq!(metadata.name, "a");
+        assert!(body.contains("Body text"));
+        assert!(!body.contains("name: a"));
+    }
+
+    #[test]
+    fn test_parse_skill_str_does_not_apply_protocol_defaults() {
+        let err = parse_skill_str("---\ndescription: d\n---\nBody\n", "mcp:x").unwrap_err();
+        assert!(format!("{err:#}").contains("mcp:x") || format!("{err:#}").contains("name"));
+        let err = parse_skill_str("no frontmatter", "mcp:x").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Missing YAML frontmatter in mcp:x")
+        );
     }
 
     #[test]

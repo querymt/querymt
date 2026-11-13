@@ -5,9 +5,11 @@
 //! the `skill` tool, keeping initial context small while allowing agents
 //! to gain domain-specific knowledge when needed.
 
+pub mod catalog;
 pub mod discovery;
 #[cfg(test)]
 mod e2e_reload_tests;
+pub mod mcp;
 pub mod parser;
 pub mod permissions;
 pub mod registry;
@@ -15,11 +17,7 @@ pub mod remote;
 pub mod tool;
 pub mod types;
 
-use crate::config::SkillsConfig;
-use crate::tools::Tool;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-
+pub use catalog::{ApprovalMode, SkillCatalog};
 pub use discovery::{default_search_paths, discover_all, discover_from_source};
 pub use parser::{PROTOCOL_SKILL_FILENAME, SKILL_FILENAME, parse_skill_file, parse_skill_file_ex};
 pub use permissions::{PermissionLevel, SkillPermissions};
@@ -27,51 +25,15 @@ pub use registry::SkillRegistry;
 pub use tool::SkillTool;
 pub use types::{Skill, SkillMetadata, SkillSource, ToolAccessPolicy};
 
-/// Discover configured skills and construct the dynamic tool exposed to an agent.
-pub(crate) fn build_skill_tool(config: &SkillsConfig, project_root: &Path) -> Arc<dyn Tool> {
-    let mut search_paths = default_search_paths(project_root);
-    for custom_path in &config.paths {
-        search_paths.push(SkillSource::Configured(custom_path.clone()));
-    }
-
-    let mut registry = SkillRegistry::new();
-    match registry.load_from_sources(&search_paths, config.include_external) {
-        Ok(count) => {
-            if count > 0 {
-                log::info!("Skills system initialized: {count} skills discovered");
-                log::debug!("Discovered skills: {}", registry.names().join(", "));
-            } else {
-                log::debug!(
-                    "Skills system enabled but no skills found in {} search paths",
-                    search_paths.len()
-                );
-            }
-        }
-        Err(error) => {
-            log::warn!(
-                "Failed to discover skills: {}. The skill tool will have no discovered skills.",
-                error
-            );
-        }
-    }
-
-    Arc::new(SkillTool::new_with_fallback(
-        Arc::new(Mutex::new(registry)),
-        Arc::new(config.permissions.clone()),
-        search_paths,
-        config.include_external,
-        project_root.to_path_buf(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::config::SkillsConfig;
     use std::fs;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
-    /// Task 5.4: schema collection through `build_skill_tool` +
+    /// Task 5.4: schema collection through `SkillCatalog::from_config` +
     /// `ToolRegistry::definitions()` refreshes the skill tool, so standalone
     /// construction tracks the filesystem without a restart.
     ///
@@ -98,8 +60,17 @@ mod tests {
             ..Default::default()
         };
 
-        let mut registry = crate::tools::ToolRegistry::new();
-        registry.add(build_skill_tool(&config, project.path()));
+        let catalog = SkillCatalog::from_config(&config, project.path());
+        let rebind = || {
+            let mut registry = crate::tools::ToolRegistry::new();
+            registry.add(Arc::new(catalog.bind(
+                Some(project.path()),
+                crate::agent::core::McpToolState::empty(),
+                Default::default(),
+            )));
+            registry
+        };
+        let registry = rebind();
 
         // Initial schema advertises the discovered skill.
         let skill_def = |defs: &[querymt::chat::Tool]| {
@@ -135,17 +106,14 @@ mod tests {
         let def = skill_def(&defs);
         assert!(def.function.description.contains("added-skill"));
         assert_eq!(
-            def.function.parameters["properties"]["name"]["enum"],
-            json!(["added-skill", "integration-skill"])
+            tool::listed_skill_ids(&def),
+            vec!["added-skill", "integration-skill"]
         );
 
         // Remove a skill: it disappears from the next collected schema.
         fs::remove_dir_all(&added_dir).unwrap();
         let defs = registry.definitions();
         let def = skill_def(&defs);
-        assert_eq!(
-            def.function.parameters["properties"]["name"]["enum"],
-            json!(["integration-skill"])
-        );
+        assert_eq!(tool::listed_skill_ids(&def), vec!["integration-skill"]);
     }
 }

@@ -2964,3 +2964,215 @@ async fn build_reports_a_malformed_tool_selector() {
         "{err}"
     );
 }
+
+async fn agent_with_skills(enabled: bool, tools: &[&str]) -> Result<Agent> {
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    let mut builder = Agent::single()
+        .provider("openai", "gpt-4o-mini")
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .skills(crate::config::SkillsConfig {
+            enabled,
+            include_external: false,
+            ..Default::default()
+        });
+    if !tools.is_empty() {
+        builder = builder.tools(tools.iter().copied());
+    }
+    builder.build().await
+}
+
+#[tokio::test]
+async fn standalone_skill_catalog_only_when_enabled_and_admitted_by_tools() -> Result<()> {
+    let has_catalog = |a: &Agent| a.handle().config.skill_catalog.is_some();
+    assert!(has_catalog(&agent_with_skills(true, &[]).await?));
+    assert!(has_catalog(
+        &agent_with_skills(true, &["skill", "shell"]).await?
+    ));
+    assert!(!has_catalog(&agent_with_skills(true, &["shell"]).await?));
+    assert!(!has_catalog(&agent_with_skills(false, &[]).await?));
+    // The skill tool is never an agent-level registry tool.
+    let agent = agent_with_skills(true, &[]).await?;
+    assert!(agent.handle().tool_registry().find("skill").is_none());
+    Ok(())
+}
+
+// ── Task 5.3: target and parent MCP skills end to end ─────────────────
+
+struct NoPromptCtx;
+
+#[async_trait]
+impl crate::tools::ToolContext for NoPromptCtx {
+    fn session_id(&self) -> &str {
+        "e2e"
+    }
+    fn cwd(&self) -> Option<&std::path::Path> {
+        None
+    }
+    async fn record_progress(
+        &self,
+        _: &str,
+        _: String,
+        _: Option<serde_json::Value>,
+    ) -> Result<String, crate::tools::ToolError> {
+        Ok(String::new())
+    }
+    async fn ask_question(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[(String, String)],
+        _: bool,
+    ) -> Result<Vec<String>, crate::tools::ToolError> {
+        panic!("no prompt expected");
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn skill_enum(tool: &crate::skills::SkillTool) -> Vec<String> {
+    use crate::tools::Tool;
+    crate::skills::tool::listed_skill_ids(&tool.definition())
+}
+
+#[tokio::test]
+async fn target_sees_only_its_server_skills_and_parent_sees_both() -> Result<()> {
+    use crate::test_utils::mcp_harness::{HttpHarness, ScriptedSkill};
+    use crate::tools::Tool;
+
+    let docs = HttpHarness::start(vec![ScriptedSkill::new("guide", "Docs guide")]).await;
+    let ops = HttpHarness::start(vec![ScriptedSkill::new("runbook", "Ops runbook")]).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dotagents_subdir(dir.path());
+    std::fs::write(
+        agents.join("mcp.json"),
+        format!(
+            r#"{{"mcpServers":{{
+                "docs":{{"transport":"streamable-http","url":"{}"}},
+                "ops":{{"transport":"streamable-http","url":"{}"}}}}}}"#,
+            docs.url, ops.url
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(agents.join("agents/writer")).unwrap();
+    std::fs::write(
+        agents.join("agents/writer/agent.md"),
+        "---\nid: writer\ndescription: Writes docs\nrole: delegation-target\n---\nYou write docs.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        agents.join("agents/writer/config.json"),
+        r#"{"model":"fast","mcpServers":["docs"],"tools":["skill","docs.*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        agents.join("models.json"),
+        r#"{"models":{"fast":{"provider":"openai","model":"gpt-4o-mini"}}}"#,
+    )
+    .unwrap();
+
+    let mut skills = crate::config::SkillsConfig::default();
+    skills
+        .permissions
+        .patterns
+        .insert("docs.*".into(), crate::skills::PermissionLevel::Allow);
+
+    // Target: built from the protocol plan through the real factory.
+    let options = crate::dotagents::DotagentsLoadOptions::enabled()
+        .with_workspace(dir.path())
+        .with_global_enabled(false);
+    let manifest = crate::dotagents::DotagentsLoader::new(options.clone())
+        .load()
+        .expect("manifest");
+    let plans = crate::dotagents::DotagentsSubAgentPlans::from_manifest(&manifest);
+    let plan = plans.get("writer").expect("writer plan");
+    assert_eq!(
+        plan.mcp_servers
+            .iter()
+            .map(|s| s.name())
+            .collect::<Vec<_>>(),
+        ["docs"]
+    );
+    let (registry, _tmp) = empty_plugin_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let factory = super::DotagentsTargetFactory::new(Arc::new(registry), storage)
+        .with_skills(Some(skills.clone()), dir.path());
+    let handle = crate::dotagents::ProtocolTargetFactory::create(&factory, plan).expect("target");
+    let target = handle
+        .as_any()
+        .downcast_ref::<crate::agent::LocalAgentHandle>()
+        .expect("local target");
+    let req = crate::acp::protocol::NewSessionRequest::new(dir.path().to_path_buf());
+    let prepared = target
+        .session_materializer
+        .prepare_new_session(req)
+        .await
+        .unwrap();
+    let catalog = target.config.skill_catalog.clone().expect("catalog");
+    let tool = catalog.bind(
+        Some(dir.path()),
+        prepared.runtime.mcp_tool_state.clone(),
+        target.config.tool_config.clone(),
+    );
+    assert_eq!(skill_enum(&tool), vec!["docs.guide"]);
+    let out = tool
+        .call(serde_json::json!({"name": "docs.guide"}), &NoPromptCtx)
+        .await
+        .expect("target loads docs skill without a prompt");
+    let text = match &out[0] {
+        querymt::chat::ToolResultPart::Text { text } => text.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(text.contains("Body of guide"), "{text}");
+    assert!(
+        tool.call(serde_json::json!({"name": "ops.runbook"}), &NoPromptCtx)
+            .await
+            .is_err()
+    );
+    assert!(ops.log.skills_get.lock().is_empty());
+
+    // Parent: no tool restriction; protocol servers `docs` and `ops` attach.
+    let (registry, _tmp2) = empty_plugin_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = Agent::single()
+        .provider("openai", "gpt-4o-mini")
+        .cwd(dir.path())
+        .skills(skills)
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .dotagents_options(options)
+        .build()
+        .await?;
+    let parent = agent.inner.clone();
+    let req = crate::acp::protocol::NewSessionRequest::new(dir.path().to_path_buf());
+    let prepared = parent
+        .session_materializer
+        .prepare_new_session(req)
+        .await
+        .unwrap();
+    let catalog = parent.config.skill_catalog.clone().expect("parent catalog");
+    let tool = catalog.bind(
+        Some(dir.path()),
+        prepared.runtime.mcp_tool_state.clone(),
+        parent.config.tool_config.clone(),
+    );
+    assert_eq!(skill_enum(&tool), vec!["docs.guide", "ops.runbook"]);
+
+    agent.shutdown().await;
+    Ok(())
+}

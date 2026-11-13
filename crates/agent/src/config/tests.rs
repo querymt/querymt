@@ -2076,3 +2076,56 @@ fn schema_retention_keys_have_minimum_one() {
         assert_eq!(minimum, Some(1), "{key} schema: {json}");
     }
 }
+
+#[test]
+fn skills_config_without_mcp_key_enables_mcp_skills() {
+    let parsed = parse_agent("[agent.skills]\nenabled = true\n");
+    assert!(parsed.skills.mcp, "mcp must default to enabled");
+    assert!(SkillsConfig::default().mcp);
+}
+
+#[test]
+fn skills_config_accepts_mcp_false_and_rejects_non_bool() {
+    let base = "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\n[agent.skills]\n";
+    #[derive(Deserialize)]
+    struct Wrapper {
+        agent: AgentSettings,
+    }
+    let off = toml::from_str::<Wrapper>(&format!("{base}mcp = false\n")).unwrap();
+    assert!(!off.agent.skills.mcp);
+    assert!(toml::from_str::<Wrapper>(&format!("{base}mcp = \"no\"\n")).is_err());
+}
+
+#[test]
+fn documented_skills_configuration_parses() {
+    let doc = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/docs/agent/configuration.md"
+    ))
+    .expect("configuration.md");
+    let start = doc.find("[agent.skills]").expect("skills example");
+    let block = &doc[start..];
+    let block = &block[..block.find("```").expect("end of block")];
+    #[derive(Deserialize)]
+    struct Wrapper {
+        agent: AgentSettings,
+    }
+    let full = format!("[agent]\nprovider = \"test\"\nmodel = \"test-model\"\n{block}");
+    // `[agent.skills]` is a sub-table of the `[agent]` header written above.
+    let parsed = toml::from_str::<Wrapper>(&full).expect("documented TOML parses");
+    let skills = parsed.agent.skills;
+    assert!(skills.enabled && skills.mcp);
+    assert_eq!(
+        skills.permissions.check_mcp("docs", "x"),
+        crate::skills::PermissionLevel::Allow
+    );
+    assert_eq!(
+        skills.permissions.check("internal-a"),
+        crate::skills::PermissionLevel::Deny
+    );
+    assert_eq!(
+        skills.permissions.check_mcp("ops", "runbook"),
+        crate::skills::PermissionLevel::Ask
+    );
+    assert!(!doc.contains("agent_id = \"querymt\""), "stale key removed");
+}

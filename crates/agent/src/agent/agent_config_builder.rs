@@ -53,6 +53,7 @@ pub struct AgentConfigBuilder {
     max_prompt_bytes: Option<usize>,
     tool_config: ToolConfig,
     tool_registry: ToolRegistry,
+    skill_catalog: Option<Arc<crate::skills::SkillCatalog>>,
     middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,
     auth_methods: Vec<AuthMethod>,
     agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
@@ -108,6 +109,7 @@ impl AgentConfigBuilder {
             max_prompt_bytes: None,
             tool_config: ToolConfig::default(),
             tool_registry,
+            skill_catalog: None,
             middleware_drivers: Vec::new(),
             auth_methods: Vec::new(),
             agent_registry: Arc::new(DefaultAgentRegistry::new()),
@@ -162,6 +164,7 @@ impl AgentConfigBuilder {
             max_prompt_bytes: None,
             tool_config: ToolConfig::default(),
             tool_registry: ToolRegistry::new(),
+            skill_catalog: None,
             middleware_drivers: Vec::new(),
             auth_methods: Vec::new(),
             agent_registry: Arc::new(DefaultAgentRegistry::new()),
@@ -215,6 +218,7 @@ impl AgentConfigBuilder {
             default_reasoning_effort: Arc::new(ArcSwap::from_pointee(None)),
             tool_config: self.tool_config,
             tool_registry,
+            skill_catalog: self.skill_catalog,
             middleware_drivers: self.middleware_drivers,
             auth_methods: self.auth_methods,
             max_steps: self.max_steps,
@@ -653,6 +657,12 @@ impl AgentConfigBuilder {
         for tool in tools {
             self.tool_registry.add(tool);
         }
+    }
+
+    /// Offer the session-owned `skill` tool backed by `catalog`.
+    pub fn with_skill_catalog(mut self, catalog: Arc<crate::skills::SkillCatalog>) -> Self {
+        self.skill_catalog = Some(catalog);
+        self
     }
 
     /// Mutably access the tool registry (for adding tools during build).

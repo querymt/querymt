@@ -31,24 +31,11 @@ impl ToolRegistry {
     }
 
     pub fn definitions(&self) -> Vec<querymt::chat::Tool> {
-        self.definitions_for_cwd(None)
+        self.tools.values().map(|tool| tool.definition()).collect()
     }
 
-    pub fn definitions_for_cwd(&self, cwd: Option<&Path>) -> Vec<querymt::chat::Tool> {
-        self.tools
-            .values()
-            .map(|tool| tool.definition_for_cwd(cwd))
-            .collect()
-    }
-
-    pub fn definition_for_cwd(
-        &self,
-        name: &str,
-        cwd: Option<&Path>,
-    ) -> Option<querymt::chat::Tool> {
-        self.tools
-            .get(name)
-            .map(|tool| tool.definition_for_cwd(cwd))
+    pub fn definition(&self, name: &str) -> Option<querymt::chat::Tool> {
+        self.tools.get(name).map(|tool| tool.definition())
     }
 
     pub fn find(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -74,16 +61,7 @@ impl ToolRegistry {
         arguments: &serde_json::Value,
         cwd: Option<&Path>,
     ) -> FileAccess {
-        let Some(tool) = self.tools.get(name) else {
-            return FileAccess::None;
-        };
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tool.file_access(arguments, cwd)
-        }))
-        .unwrap_or_else(|_| {
-            log::warn!("file_access of tool `{name}` panicked; serializing the call");
-            FileAccess::Any
-        })
+        file_access_of(self.tools.get(name), name, arguments, cwd)
     }
 
     /// [`Self::file_access`] for a whole batch of `(tool name, effective
@@ -121,6 +99,27 @@ impl ToolRegistry {
     pub fn names(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
     }
+}
+
+/// Declared file access of one call to `tool` (`None` = unknown tool).
+/// A panic in the tool's `file_access` is contained and declared
+/// [`FileAccess::Any`].
+pub(crate) fn file_access_of(
+    tool: Option<&Arc<dyn Tool>>,
+    name: &str,
+    arguments: &serde_json::Value,
+    cwd: Option<&Path>,
+) -> FileAccess {
+    let Some(tool) = tool else {
+        return FileAccess::None;
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tool.file_access(arguments, cwd)
+    }))
+    .unwrap_or_else(|_| {
+        log::warn!("file_access of tool `{name}` panicked; serializing the call");
+        FileAccess::Any
+    })
 }
 
 #[cfg(test)]

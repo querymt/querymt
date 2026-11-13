@@ -1444,47 +1444,16 @@ impl ClientHandler for McpClientHandler {
 
     async fn on_tool_list_changed(&self, context: NotificationContext<RoleClient>) -> () {
         use querymt::mcp::adapter::McpToolAdapter;
-        use querymt::tool_decorator::CallFunctionTool;
 
         let peer = context.peer;
+        // Fetch first; the snapshot is only touched once the listing is in.
         match peer.list_all_tools().await {
             Ok(new_tool_list) => {
-                let mut new_tools = std::collections::HashMap::new();
-                let mut new_defs = Vec::new();
-
-                // Retain tools belonging to other servers from the current snapshot.
-                {
-                    let current = self.tool_state.load();
-                    for (name, adapter) in current.tools.iter() {
-                        if adapter.server_name() != self.server_name {
-                            new_tools.insert(name.clone(), adapter.clone());
-                        }
-                    }
-                    for def in current.tool_defs.iter() {
-                        if let Some(adapter) = current.tools.get(&def.function.name)
-                            && adapter.server_name() != self.server_name
-                        {
-                            new_defs.push(def.clone());
-                        }
-                    }
-                }
-
-                // Add the refreshed tools from this server.
+                let mut adapters = Vec::new();
                 for tool in new_tool_list {
                     match McpToolAdapter::try_new(tool, peer.clone(), self.server_name.clone()) {
                         Ok(adapter) => {
-                            let adapter = adapter.with_router(self.router.clone());
-                            let name = adapter.descriptor().function.name.clone();
-                            if new_tools.contains_key(&name) {
-                                log::warn!(
-                                    "Duplicate MCP tool '{}' after refresh of '{}', keeping first",
-                                    name,
-                                    self.server_name,
-                                );
-                                continue;
-                            }
-                            new_defs.push(adapter.descriptor());
-                            new_tools.insert(name, Arc::new(adapter));
+                            adapters.push(Arc::new(adapter.with_router(self.router.clone())));
                         }
                         Err(e) => {
                             log::warn!(
@@ -1496,18 +1465,15 @@ impl ClientHandler for McpClientHandler {
                     }
                 }
 
-                // Atomically swap the entire snapshot (tools + defs + cleared hash).
-                let snapshot = crate::agent::core::McpToolSnapshot {
-                    tools: new_tools,
-                    tool_defs: new_defs,
-                    tools_hash: None,
-                };
+                // Replaces only this server's tools (its skills are kept) and
+                // clears the tools hash.
+                self.tool_state
+                    .replace_server(&self.server_name, Some(adapters), None);
                 crate::agent::mcp::warn_unmatched_permissions(
                     &self.permissions,
-                    &snapshot,
+                    &self.tool_state.load(),
                     Some(&self.server_name),
                 );
-                self.tool_state.store(snapshot);
 
                 log::info!(
                     "session={} server='{}': MCP tool list refreshed",
@@ -1524,6 +1490,31 @@ impl ClientHandler for McpClientHandler {
                 );
             }
         }
+    }
+
+    async fn on_resource_list_changed(&self, context: NotificationContext<RoleClient>) -> () {
+        // Skills ride on resources. Ineligible servers (no skills extension or
+        // a dotted name) change nothing. An eligible server is registered even
+        // when this listing fails, so refresh-on-miss can retry; a failed
+        // listing keeps the previous skills.
+        if !crate::skills::mcp::is_skill_server(&self.server_name, &context.peer) {
+            return;
+        }
+        self.tool_state
+            .register_skill_server(&self.server_name, &context.peer);
+        let Some(skills) =
+            crate::skills::mcp::discover_server_skills(&self.server_name, &context.peer).await
+        else {
+            return;
+        };
+        let count = skills.len();
+        self.tool_state
+            .replace_server(&self.server_name, None, Some(skills));
+        log::info!(
+            "session={} server='{}': MCP skill list refreshed ({count} skills)",
+            self.session_id,
+            self.server_name,
+        );
     }
 }
 

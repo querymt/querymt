@@ -11,7 +11,7 @@ This page states exactly which parts of the `.agents` Protocol QueryMT Agent sup
 | `mcp.json` | Supported | `stdio` and `streamable-http` transports only |
 | `models.json` | Supported | Model presets as LLM overlays; does not install providers |
 | `skills/` | Supported | `skill.md` and `SKILL.md`; existing sources preserved |
-| `agents/` | Supported | Internal `delegation-target` profiles; extends delegation registries |
+| `agents/` | Supported | Internal `delegation-target` profiles; extends delegation registries. Targets get the `skill` tool (non-interactive; `mcpServers` scopes their MCP skills) |
 | `tasks/` | Supported | Reconciles to durable recurring tasks and interval schedules, subject to trust |
 | `memories/` | Supported | Idempotent import into the configured knowledge store |
 | `speakmcp-settings.json` | Not supported | Detected and reported; never interpreted |

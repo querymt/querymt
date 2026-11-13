@@ -5,6 +5,7 @@ pub mod context_impl;
 pub mod path;
 pub mod read_scope;
 pub mod registry;
+pub mod tool_set;
 pub mod validation;
 
 pub use builtins::{
@@ -25,3 +26,4 @@ pub use path::{
 };
 pub use read_scope::{ReadFilter, ReadScope};
 pub use registry::ToolRegistry;
+pub use tool_set::ToolSet;
