@@ -12021,9 +12021,11 @@ dependencies = [
 name = "querymt-agent-core"
 version = "0.6.0"
 dependencies = [
+ "dunce",
  "rapidhash",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
