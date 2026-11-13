@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, master]
     paths:
-      - 'crates/agent/**'
+      - 'crates/agent*/**'
       - 'crates/querymt-utils/**'
       - 'crates/cli/**'
       - 'crates/service-client/**'
@@ -14,7 +14,7 @@ on:
       - '.github/workflows/test-agent.yml'
   pull_request:
     paths:
-      - 'crates/agent/**'
+      - 'crates/agent*/**'
       - 'crates/querymt-utils/**'
       - 'crates/cli/**'
       - 'crates/service-client/**'
@@ -71,6 +71,12 @@ jobs:
           printf '{"revision":"ci","target":"embedded","acpWebSocketPath":"/acp/ws"}\n' > "$RUNNER_TEMP/dashboard-ui/querymt-ui.json"
           echo "QMT_UI_DIST=$RUNNER_TEMP/dashboard-ui" >> "$GITHUB_ENV"
       
+      - name: Run Clippy (querymt-agent-core)
+        run: cargo clippy --package querymt-agent-core --all-targets -- -D warnings
+
+      - name: Run Clippy (querymt-agent-index)
+        run: cargo clippy --package querymt-agent-index --all-targets -- -D warnings
+
       - name: Run Clippy
         run: cargo clippy --package querymt-agent --all-targets --features "${features}" -- -D warnings
 
@@ -112,6 +118,8 @@ jobs:
         run: |
           cargo llvm-cov nextest \
             --package querymt-agent \
+            --package querymt-agent-core \
+            --package querymt-agent-index \
             --lib --tests \
             --features "${features}" \
             --codecov --output-path ./coverage/codecov.json
