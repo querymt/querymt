@@ -208,8 +208,38 @@ enabled = true
 include_external = true   # Check Claude Code, agents conventions paths
 paths = ["./skills"]      # Custom skill search paths
 urls = []                 # Remote skill URLs (future)
-agent_id = "querymt"      # Agent identifier for skills
+mcp = true                # Offer skills published by connected MCP servers
+
+[agent.skills.permissions]
+"internal-*" = "deny"     # local skills: exact name or prefix wildcard
+"docs.*" = "allow"        # skills of the MCP server "docs"
+"ops.runbook" = "ask"
 ```
+
+#### Skills from MCP servers
+
+An MCP server that declares the MCP Skills extension (`io.modelcontextprotocol/skills`) publishes skills that appear in the `skill` tool next to local skills. Set `mcp = false` to hide and refuse all of them.
+
+- **IDs.** A server skill is listed and loaded as `<server>.<name>`, for example `docs.release-notes`. A local skill with the same ID wins and the server skill is dropped (one warning is logged).
+- **Server names.** A server whose name contains a `.` offers no skills (a warning is logged); its tools are unaffected. Skill names containing a `.` are ignored.
+- **Visibility.** Server skills follow the tool configuration: they are hidden when the agent runs built-in tools only (a restricted `tools` list with no MCP selectors and no attached servers), when `skill` is not admitted by `tools`, when the allowlist lacks `server.*`, or when the denylist contains `server.*` or the bare server name.
+- **Listing text.** Descriptions from servers are reduced to one line of at most 1024 characters.
+- **Refresh.** The list follows `resources/list_changed` notifications. If a skill is requested that is not listed, the server's list is fetched once more before failing.
+- **Verification.** Loading re-fetches the skill entry, checks the `SKILL.md` size and `sha256` digest against its manifest, and requires the frontmatter name to match. `SKILL.md` and each supporting file are limited to 256 KiB. Skills declared `"dynamic"` have no digests and are only bounded by the size limit.
+- **Output.** Skill output is wrapped in `<skill_content>`; skill text cannot close the wrapper (the literal tags are escaped). Server skills report `<source>mcp:<server></source>` and list the relative file names the `file` argument accepts.
+
+The `skill` tool takes an optional `file` argument, a path relative to the skill root, to read a supporting file instead of the skill. Paths that are empty, absolute, scheme-qualified, contain `?`, `#`, a backslash, a `.` or `..` segment (also percent-encoded) or an encoded separator are rejected. Local files must stay inside the skill directory (symlink escapes are rejected). For an MCP skill with a manifest only listed files can be read, and each is verified; `file` uses the same permission as the skill.
+
+#### Skill permissions
+
+Permissions apply when a skill is loaded, not when it is listed. A pattern is an exact ID or a prefix ending in `*`. The longest matching prefix wins, so `"team-secret-*" = "deny"` overrides `"team-*" = "allow"`. For local skills, an unmatched name falls back to `"*"`, then `allow`.
+
+Server skills are untrusted content, so they default to **ask**:
+
+- `"docs.*" = "allow"` (or an exact `"docs.release-notes"`) admits them without a prompt; `"docs.*" = "deny"` blocks them.
+- `"*" = "allow"` or `"*" = "ask"` does **not** admit server skills; they still prompt. Only `"*" = "deny"` applies to them, so locking down all skills also locks down server skills.
+- The prompt names the server and the skill. Each tool call has its own prompt, so parallel loads of the same skill do not collide.
+- An agent that cannot prompt (such as an `.agents` delegation target, see [dotagents](dotagents.md)) fails an `ask` result immediately with an error naming the pattern to configure.
 
 ### Hooks Configuration
 

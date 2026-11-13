@@ -235,7 +235,7 @@ async fn prepare_tool_call_inner(
         });
     }
     let mut args: serde_json::Value = serde_json::from_str(&call.function.arguments)?;
-    let tool = config.tool_registry.find(&call.function.name);
+    let tool = exec_ctx.tool_set(config).find(&call.function.name);
     let target = ToolTarget::resolve(tool.clone(), exec_ctx, &call.function.name);
     let schema = resolve_tool_schema(config, exec_ctx, &call.function.name).await;
     let mut repairs: Vec<Repair> = Vec::new();
@@ -634,9 +634,9 @@ async fn resolve_tool_schema(
     exec_ctx: &ExecutionContext,
     tool_name: &str,
 ) -> Option<serde_json::Value> {
-    let schema = config
-        .tool_registry
-        .definition_for_cwd(tool_name, exec_ctx.cwd())
+    let schema = exec_ctx
+        .tool_set(config)
+        .definition(tool_name)
         .map(|tool| tool.function.parameters)
         .or_else(|| {
             exec_ctx
@@ -751,8 +751,8 @@ async fn truncate_model_tool_output(
             error: Some(format!("Failed to join overflow writer: {}", error)),
         },
     );
-    let hint = config
-        .tool_registry
+    let hint = exec_ctx
+        .tool_set(config)
         .find(tool_name)
         .and_then(|tool| tool.truncation_hint());
     let suffix = format_truncation_message_with_overflow(
@@ -790,7 +790,7 @@ pub(super) fn call_is_read_only(
     exec_ctx: &ExecutionContext,
     name: &str,
 ) -> bool {
-    ToolTarget::resolve(config.tool_registry.find(name), exec_ctx, name).is_read_only()
+    ToolTarget::resolve(exec_ctx.tool_set(config).find(name), exec_ctx, name).is_read_only()
 }
 
 impl ToolTarget {
@@ -1231,6 +1231,7 @@ fn tool_context_for_call(
 
     exec_ctx
         .tool_context(config.agent_registry.clone(), Some(elicitation_tx))
+        .with_tool_call_id(call.id.clone())
         .with_workspace_service(config.workspace_service())
         .with_todo_store(config.todo_store.clone())
         .with_session_store(exec_ctx.state.store.clone())
@@ -2094,9 +2095,9 @@ mod genai_trace_tests {
     #[tokio::test]
     async fn genai_skill_identity_is_verified_after_hooks_on_the_existing_tool_span() {
         use crate::skills::{
+            SkillCatalog,
             permissions::{PermissionLevel, SkillPermissions},
             registry::SkillRegistry,
-            tool::SkillTool,
             types::SkillSource,
         };
         use crate::test_utils::helpers::genai_trace::capture_info;
@@ -2139,8 +2140,10 @@ mod genai_trace_tests {
         let fixture =
             TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
                 .await;
-        let exec = fixture.execution_context().await;
         for mode in ["success", "rewrite", "unknown", "blocked", "custom"] {
+            // The turn's tool set is cached per context, so each mode (own
+            // config and catalog) needs its own context.
+            let exec = fixture.execution_context().await;
             let mut permissions = SkillPermissions::default();
             if mode == "blocked" {
                 permissions
@@ -2148,10 +2151,11 @@ mod genai_trace_tests {
                     .insert("catalog.review".into(), PermissionLevel::Deny);
             }
             let mut registry = ToolRegistry::new();
+            let mut catalog = None;
             if mode == "custom" {
                 registry.add(Arc::new(UnrelatedSkill));
             } else {
-                registry.add(Arc::new(SkillTool::new_with_fallback(
+                catalog = Some(Arc::new(SkillCatalog::from_parts(
                     Arc::new(std::sync::Mutex::new(SkillRegistry::new())),
                     Arc::new(permissions),
                     vec![SkillSource::Configured(dir.path().to_owned())],
@@ -2169,6 +2173,9 @@ mod genai_trace_tests {
                 fixture.storage.event_journal(),
             )
             .with_tool_registry(registry);
+            if let Some(catalog) = catalog {
+                builder = builder.with_skill_catalog(catalog);
+            }
             if mode == "rewrite" {
                 builder = builder.with_hooks(Hooks::new(serde_json::from_value::<HooksConfig>(serde_json::json!({
                     "enabled": true, "pre_tool_use": [{"matcher":"^skill$", "hooks":[{
@@ -2208,7 +2215,6 @@ mod genai_trace_tests {
                 attr(tool, "querymt.tool.execution"),
                 Some(&Value::from(match mode {
                     "blocked" => "permission_denied",
-                    "unknown" => "validation_rejected",
                     _ => "executed",
                 }))
             );
@@ -2216,7 +2222,8 @@ mod genai_trace_tests {
                 attr(tool, "error.type"),
                 match mode {
                     "blocked" => Some(Value::from("permission_denied")),
-                    "unknown" => Some(Value::from("invalid_tool_arguments")),
+                    // Reaches the tool (no schema enum), which reports not-found.
+                    "unknown" => Some(Value::from("tool_error")),
                     _ => None,
                 }
                 .as_ref()
@@ -2299,7 +2306,6 @@ mod genai_trace_tests {
         let fixture =
             TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
                 .await;
-        let mut exec = fixture.execution_context().await;
         for mode in [
             "direct",
             "symlink",
@@ -2311,6 +2317,8 @@ mod genai_trace_tests {
             "policy_blocked",
             "custom",
         ] {
+            // The turn's tool set is cached per context: one context per mode.
+            let mut exec = fixture.execution_context().await;
             let mut registry = ToolRegistry::new();
             if mode == "custom" {
                 registry.add(Arc::new(CustomShell));
@@ -4439,6 +4447,100 @@ mod mcp_tool_tests {
             .collect()
     }
 
+    /// Task 5.4: a skill approval raised in a delegate's session reaches the
+    /// shared fanout and can be answered through the planner (quorum) handle.
+    #[tokio::test]
+    async fn delegate_skill_approval_is_answerable_through_the_planner() {
+        use crate::delegation::{AgentInfo, DefaultAgentRegistry};
+        use crate::elicitation::{ElicitationAction, ElicitationResponse};
+        use crate::skills::{SkillCatalog, SkillPermissions};
+        use crate::test_utils::mcp_harness::ScriptedSkill;
+
+        let harness = McpHarness::start(HarnessOptions {
+            skills: Some(vec![ScriptedSkill::new("a", "A")]),
+            ..HarnessOptions::default()
+        })
+        .await;
+        let agent =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let mut config = agent.config.as_ref().clone();
+        config.skill_catalog = Some(Arc::new(SkillCatalog::from_parts(
+            Arc::new(std::sync::Mutex::new(crate::skills::SkillRegistry::new())),
+            Arc::new(SkillPermissions::default()),
+            vec![],
+            false,
+            std::path::PathBuf::from("."),
+        )));
+        let delegate = Arc::new(crate::agent::LocalAgentHandle::from_config(Arc::new(
+            config.clone(),
+        )));
+        let mut registry = DefaultAgentRegistry::new();
+        registry.register(
+            AgentInfo {
+                isolation: Default::default(),
+                id: "coder".into(),
+                name: "Coder".into(),
+                description: "d".into(),
+                capabilities: vec![],
+                required_capabilities: vec![],
+                meta: None,
+            },
+            delegate.clone(),
+        );
+        let planner_agent =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let mut planner_config = planner_agent.config.as_ref().clone();
+        planner_config.agent_registry = Arc::new(registry);
+        let planner = crate::agent::LocalAgentHandle::from_config(Arc::new(planner_config));
+
+        let exec = agent
+            .execution_context_with_mcp(harness.tool_state.clone())
+            .await;
+        let mut events = config.event_sink.fanout().subscribe();
+        let call = mock_tool_call("call-9", "skill", r#"{"name":"harness.a"}"#);
+        let run = execute_tool_call(&config, &call, &exec);
+        let answer = async {
+            let deadline = Duration::from_secs(5);
+            let id = loop {
+                let envelope = tokio::time::timeout(deadline, events.recv())
+                    .await
+                    .expect("approval event within 5s")
+                    .expect("fanout open");
+                if let AgentEventKind::ElicitationRequested {
+                    elicitation_id,
+                    message,
+                    ..
+                } = envelope.kind()
+                {
+                    assert!(message.contains("'harness'") && message.contains("'a'"));
+                    break elicitation_id.clone();
+                }
+            };
+            assert!(id.starts_with("skill-permission-harness.a-"), "{id}");
+            let sender = crate::elicitation::take_pending_elicitation_sender(&planner, &id)
+                .await
+                .expect("planner finds the delegate's pending approval");
+            sender
+                .send(ElicitationResponse {
+                    action: ElicitationAction::Accept,
+                    content: Some(json!({"selection": "Allow"})),
+                })
+                .expect("delegate still waiting");
+        };
+        let (result, ()) = tokio::join!(run, answer);
+        let result = result.unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(
+            result
+                .content
+                .iter()
+                .filter_map(|b| b.as_text())
+                .any(|t| t.contains("Body of a"))
+        );
+    }
+
     #[tokio::test]
     async fn listed_mcp_tool_is_not_called_until_approved() {
         let f = fixture().await;
@@ -4564,6 +4666,8 @@ mod mcp_tool_tests {
                 tool_defs: vec![],
                 tools: [("missing".to_string(), Arc::new(adapter))].into(),
                 tools_hash: None,
+                skills: vec![],
+                skill_servers: Default::default(),
             });
         let call = mock_tool_call("c1", "missing", "{}");
         let result = execute_tool_call(&f.agent.config, &call, &f.exec)

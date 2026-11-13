@@ -107,6 +107,9 @@ pub(crate) struct ExecutionContext {
     pub budget_warnings: crate::accounting::BudgetWarnings,
     /// Retains a supplementary terminal read across bounded BeforeModel reconciliation.
     pub suspended_recovery: tokio::sync::Mutex<Option<crate::agent::execution::DelegationRecovery>>,
+    /// Turn-scoped tool lookup (session tools over the agent registry),
+    /// built lazily on first use.
+    tool_set: std::sync::OnceLock<crate::tools::ToolSet>,
 }
 
 impl ExecutionContext {
@@ -140,7 +143,27 @@ impl ExecutionContext {
             cycle_accounting: tokio::sync::OnceCell::new(),
             budget_warnings: Default::default(),
             suspended_recovery: tokio::sync::Mutex::new(None),
+            tool_set: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The turn's tool lookup: the session-bound `skill` tool (when the agent
+    /// has a skill catalog) over the agent's tool registry. Cached for the turn.
+    pub fn tool_set(
+        &self,
+        config: &crate::agent::agent_config::AgentConfig,
+    ) -> &crate::tools::ToolSet {
+        self.tool_set.get_or_init(|| {
+            let mut session_tools = crate::tools::ToolRegistry::new();
+            if let Some(catalog) = &config.skill_catalog {
+                session_tools.add(Arc::new(catalog.bind(
+                    self.cwd(),
+                    Arc::clone(&self.runtime.mcp_tool_state),
+                    self.tool_config.clone(),
+                )));
+            }
+            crate::tools::ToolSet::new(Arc::clone(&config.tool_registry), session_tools)
+        })
     }
 
     /// Attach a cancellation token, replacing the default no-op token.

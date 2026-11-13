@@ -91,6 +91,16 @@ Key components for MCP integration are found in the `crates/querymt/src/mcp/` di
         *   The `McpToolAdapter` receives this result and passes it back (as a JSON string) into the QueryMT tool-calling flow.
         *   The LLM receives this result and continues the conversation.
 
+## Skills
+
+When an MCP server declares the MCP Skills extension (`io.modelcontextprotocol/skills`), QueryMT lists its skills with `skills/list` when the server connects and again on `resources/list_changed`. They appear in the agent's `skill` tool as `<server>.<skill-name>`, scoped to the sessions that attach the server.
+
+*   Loading a skill fetches its entry with `skills/get`, reads `SKILL.md` through `resources/read`, and verifies the size and `sha256` digest from the manifest. Content over 256 KiB, or that does not match, is rejected.
+*   Server skills ask for approval by default; allow them with `"<server>.*" = "allow"` under `[agent.skills.permissions]`.
+*   Servers whose name contains a `.` offer no skills. `skills.mcp = false` turns the feature off.
+
+See [Skills Configuration](agent/configuration.md#skills-configuration) for permissions, visibility rules and the `file` argument.
+
 ## Benefits of MCP Integration
 
 *   **Decoupling:** Keep complex tool logic or integrations with external systems separate from your main LLM application code, managed within dedicated MCP servers.

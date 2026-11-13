@@ -109,17 +109,7 @@ async fn hot_reload_end_to_end_tracks_the_filesystem_across_model_requests() {
                         tools.iter().find(|tool| tool.function.name == "skill")
                 {
                     entry.skill_description = Some(skill_tool.function.description.clone());
-                    entry.skill_enum = Some(
-                        skill_tool.function.parameters["properties"]["name"]["enum"]
-                            .as_array()
-                            .map(|values| {
-                                values
-                                    .iter()
-                                    .map(|value| value.as_str().unwrap().to_string())
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    );
+                    entry.skill_enum = Some(crate::skills::tool::listed_skill_ids(skill_tool));
                 }
                 recorded.lock().unwrap().push(entry);
 
@@ -280,13 +270,11 @@ async fn hot_reload_end_to_end_tracks_the_filesystem_across_model_requests() {
         );
 
         let stale = &recorded[6];
-        // The refreshed schema no longer contains the removed ID, so the
-        // stale invocation is rejected deterministically at the tool-argument
-        // validation layer (naming the requested ID and the empty allowed
-        // set) instead of reaching the tool. The tool-level not-found path is
-        // covered by the focused tests in skills::tool.
+        // The schema has no enum, so the stale invocation reaches the tool,
+        // which refreshes once and fails deterministically with a not-found
+        // error naming the requested ID.
         assert!(
-            stale.messages.contains("is not one of") && stale.messages.contains("temp-review"),
+            stale.messages.contains("not found") && stale.messages.contains("temp-review"),
             "stale invocation fails deterministically: {:?}",
             stale.messages
         );

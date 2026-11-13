@@ -46,6 +46,8 @@ pub(crate) async fn build_mcp_state(
     let mut clients = HashMap::new();
     let mut tools = HashMap::new();
     let mut tool_defs = Vec::new();
+    let mut skills = Vec::new();
+    let mut skill_servers = std::collections::HashMap::new();
     let mut skipped_servers = Vec::new();
 
     for server in servers {
@@ -123,6 +125,12 @@ pub(crate) async fn build_mcp_state(
             tool_defs.push(adapter.descriptor());
             tools.insert(name, Arc::new(adapter));
         }
+        // Skills: only eligible servers are asked; a failure never fails the
+        // connection (it is logged inside).
+        if let Some(found) = crate::skills::mcp::discover_server_skills(&server_name, &peer).await {
+            skills.extend(found);
+            skill_servers.insert(server_name.clone(), peer.clone());
+        }
         clients.insert(server_name, running);
     }
 
@@ -136,6 +144,8 @@ pub(crate) async fn build_mcp_state(
         tools,
         tool_defs,
         tools_hash: None,
+        skills,
+        skill_servers,
     };
     crate::agent::mcp::warn_unmatched_permissions(connect_ctx.permissions(), &snapshot, None);
     tool_state.store(snapshot);
@@ -158,8 +168,18 @@ pub(crate) async fn merge_connected_mcp_peers(
     let current = tool_state.load();
     let mut tools = current.tools.clone();
     let mut tool_defs = current.tool_defs.clone();
+    let mut skills = current.skills.clone();
+    let mut skill_servers = current.skill_servers.clone();
 
     for connected in connected_peers {
+        if let Some(found) =
+            crate::skills::mcp::discover_server_skills(&connected.server_name, &connected.peer)
+                .await
+        {
+            skills.retain(|s| s.server_name != connected.server_name);
+            skills.extend(found);
+            skill_servers.insert(connected.server_name.clone(), connected.peer.clone());
+        }
         let tool_list = connected
             .peer
             .list_all_tools()
@@ -187,6 +207,8 @@ pub(crate) async fn merge_connected_mcp_peers(
         tools,
         tool_defs,
         tools_hash: None,
+        skills,
+        skill_servers,
     });
 
     Ok(())

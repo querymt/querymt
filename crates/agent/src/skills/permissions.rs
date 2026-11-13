@@ -23,33 +23,47 @@ pub enum PermissionLevel {
 }
 
 impl SkillPermissions {
-    /// Check permission level for a skill name
-    pub fn check(&self, skill_name: &str) -> PermissionLevel {
-        // Check exact match first
-        if let Some(&level) = self.patterns.get(skill_name) {
-            return level;
+    /// Resolve a configured entry for `name`: an exact entry, else the
+    /// matching prefix wildcard (`prefix*`, other than `*`) with the longest
+    /// prefix. Keys are unique, so the result is deterministic.
+    fn resolve(&self, name: &str) -> Option<PermissionLevel> {
+        if let Some(&level) = self.patterns.get(name) {
+            return Some(level);
         }
-
-        // Check wildcard patterns
-        for (pattern, &level) in &self.patterns {
-            if Self::matches_pattern(pattern, skill_name) {
-                return level;
-            }
-        }
-
-        // Check for catch-all "*"
         self.patterns
-            .get("*")
-            .copied()
+            .iter()
+            .filter_map(|(pattern, &level)| {
+                let prefix = pattern.strip_suffix('*')?;
+                (!prefix.is_empty() && name.starts_with(prefix)).then_some((prefix.len(), level))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, level)| level)
+    }
+
+    /// Check permission level for a local skill name.
+    ///
+    /// Exact entry, else the longest matching prefix wildcard, else the
+    /// catch-all `"*"`, else `Allow`.
+    pub fn check(&self, skill_name: &str) -> PermissionLevel {
+        self.resolve(skill_name)
+            .or_else(|| self.patterns.get("*").copied())
             .unwrap_or(PermissionLevel::Allow)
     }
 
-    fn matches_pattern(pattern: &str, name: &str) -> bool {
-        if let Some(prefix) = pattern.strip_suffix('*') {
-            name.starts_with(prefix)
-        } else {
-            pattern == name
-        }
+    /// Check permission level for a skill published by an MCP server, matched
+    /// against `server.name`.
+    ///
+    /// Exact entry, else the longest matching prefix wildcard (`docs.*`),
+    /// else `"*" = "deny"` denies. A catch-all `allow` or `ask` does not
+    /// apply: untrusted server content is never admitted silently, so the
+    /// default is `Ask`.
+    pub fn check_mcp(&self, server: &str, name: &str) -> PermissionLevel {
+        self.resolve(&format!("{server}.{name}"))
+            .or_else(|| {
+                (self.patterns.get("*") == Some(&PermissionLevel::Deny))
+                    .then_some(PermissionLevel::Deny)
+            })
+            .unwrap_or(PermissionLevel::Ask)
     }
 }
 
@@ -122,5 +136,59 @@ mod tests {
     fn test_empty_pattern() {
         let perms = SkillPermissions::default();
         assert_eq!(perms.check(""), PermissionLevel::Allow);
+    }
+
+    #[test]
+    fn test_overlapping_wildcards_use_the_longest_prefix() {
+        for _ in 0..50 {
+            let mut perms = SkillPermissions::default();
+            perms
+                .patterns
+                .insert("team-*".to_string(), PermissionLevel::Allow);
+            perms
+                .patterns
+                .insert("team-secret-*".to_string(), PermissionLevel::Deny);
+            perms
+                .patterns
+                .insert("t*".to_string(), PermissionLevel::Ask);
+            assert_eq!(perms.check("team-secret-x"), PermissionLevel::Deny);
+            assert_eq!(perms.check("team-x"), PermissionLevel::Allow);
+            assert_eq!(perms.check("tools"), PermissionLevel::Ask);
+        }
+    }
+
+    #[test]
+    fn test_mcp_unconfigured_asks_and_catch_all_allow_does_not_admit() {
+        let mut perms = SkillPermissions::default();
+        assert_eq!(perms.check_mcp("docs", "triage"), PermissionLevel::Ask);
+        perms.patterns.insert("*".into(), PermissionLevel::Allow);
+        assert_eq!(perms.check_mcp("docs", "triage"), PermissionLevel::Ask);
+        perms.patterns.insert("*".into(), PermissionLevel::Ask);
+        assert_eq!(perms.check_mcp("docs", "triage"), PermissionLevel::Ask);
+        // Local behaviour is unchanged.
+        assert_eq!(perms.check("local"), PermissionLevel::Ask);
+    }
+
+    #[test]
+    fn test_mcp_catch_all_deny_and_server_wildcards() {
+        let mut perms = SkillPermissions::default();
+        perms.patterns.insert("*".into(), PermissionLevel::Deny);
+        assert_eq!(perms.check_mcp("docs", "triage"), PermissionLevel::Deny);
+        perms
+            .patterns
+            .insert("docs.*".into(), PermissionLevel::Allow);
+        assert_eq!(perms.check_mcp("docs", "triage"), PermissionLevel::Allow);
+        assert_eq!(perms.check_mcp("ops", "triage"), PermissionLevel::Deny);
+        perms
+            .patterns
+            .insert("docs.secret".into(), PermissionLevel::Deny);
+        assert_eq!(perms.check_mcp("docs", "secret"), PermissionLevel::Deny);
+
+        let mut perms = SkillPermissions::default();
+        perms
+            .patterns
+            .insert("docs.*".into(), PermissionLevel::Deny);
+        assert_eq!(perms.check_mcp("docs", "x"), PermissionLevel::Deny);
+        assert_eq!(perms.check_mcp("ops", "x"), PermissionLevel::Ask);
     }
 }

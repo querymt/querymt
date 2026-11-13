@@ -80,6 +80,10 @@ pub struct AgentConfig {
     pub tool_config: ToolConfig,
     /// Immutable after build; shared (not copied) with tool-aware middleware.
     pub tool_registry: Arc<ToolRegistry>,
+    /// Agent-level skill state. When set, every turn binds a session-owned
+    /// `skill` tool from it (see `ToolSet`); the tool is deliberately absent
+    /// from `tool_registry`.
+    pub skill_catalog: Option<Arc<crate::skills::SkillCatalog>>,
     pub middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,
     pub auth_methods: Vec<AuthMethod>,
 
@@ -364,14 +368,14 @@ impl AgentConfig {
         provider: Arc<dyn querymt::LLMProvider>,
         runtime: Option<&crate::agent::core::SessionRuntime>,
         tool_config_override: Option<&crate::agent::core::ToolConfig>,
+        tool_set: &crate::tools::ToolSet,
     ) -> Vec<querymt::chat::Tool> {
         let mut tools = Vec::new();
         let config = tool_config_override.unwrap_or(&self.tool_config);
-        let cwd = runtime.and_then(|runtime| runtime.cwd.as_deref());
 
         match config.policy {
             ToolPolicy::BuiltInOnly => {
-                tools.extend(self.tool_registry.definitions_for_cwd(cwd));
+                tools.extend(tool_set.definitions());
             }
             ToolPolicy::ProviderOnly => {
                 if let Some(provider_tools) = provider.tools() {
@@ -379,7 +383,7 @@ impl AgentConfig {
                 }
             }
             ToolPolicy::BuiltInAndProvider => {
-                tools.extend(self.tool_registry.definitions_for_cwd(cwd));
+                tools.extend(tool_set.definitions());
                 if let Some(provider_tools) = provider.tools() {
                     tools.extend(provider_tools.iter().cloned::<querymt::chat::Tool>());
                 }

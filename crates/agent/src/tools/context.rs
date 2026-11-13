@@ -74,6 +74,12 @@ pub trait ToolContext: Send + Sync {
     /// no-op — only `AgentToolContext` (which carries an `EventSink`) actually emits.
     fn emit_event(&self, _kind: crate::events::AgentEventKind) {}
 
+    /// ID of the tool call this context was built for, when known. Used to
+    /// keep concurrent approval prompts distinct.
+    fn tool_call_id(&self) -> Option<&str> {
+        None
+    }
+
     /// Get the current working directory, if set.
     fn cwd(&self) -> Option<&Path>;
 
@@ -406,15 +412,6 @@ pub trait Tool: Send + Sync {
 
     /// Get the tool definition (schema, description, etc.)
     fn definition(&self) -> querymt::chat::Tool;
-
-    /// Get the tool definition for an effective workspace.
-    ///
-    /// Most tools have static schemas and use [`Self::definition`]. Dynamic
-    /// tools can override this method so schema advertisement and validation
-    /// reflect the current session working directory.
-    fn definition_for_cwd(&self, _cwd: Option<&Path>) -> querymt::chat::Tool {
-        self.definition()
-    }
 
     /// Whether the tool leaves workspace files untouched (it only reads, or
     /// only changes session / knowledge state). Such calls take no snapshot.

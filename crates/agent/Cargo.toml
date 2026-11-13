@@ -74,7 +74,7 @@ parking_lot = "0.13"
 moka = { version = "0.12", features = ["future", "sync"] }
 
 imara-diff = "0.2"
-rmcp = { version = "3.8", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-async-rw", "elicitation", "reqwest"] }
+rmcp = { version = "3.9", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-async-rw", "elicitation", "reqwest"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 # NOTE: Enabled `debug-embed` for testing debug builds on mobile.
 rust-embed = { version = "8.6", features = ["axum", "include-exclude", "debug-embed", "interpolate-folder-path", "deterministic-timestamps"] }
@@ -164,7 +164,7 @@ tempfile = "3.0"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
-rmcp = { version = "3.8", features = ["transport-streamable-http-client-unix-socket"] }
+rmcp = { version = "3.9", features = ["transport-streamable-http-client-unix-socket"] }
 
 [lib]
 name = "querymt_agent"
@@ -179,7 +179,7 @@ tar = { version = "0.4", optional = true, default-features = false }
 ureq = { version = "3", optional = true, default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
-rmcp = { version = "3.8", features = ["server"] }
+rmcp = { version = "3.9", features = ["server", "transport-streamable-http-server"] }
 qmt-openai = { path = "../providers/openai", default-features = false, features = ["api"] }
 mockall = "0.15"
 tar = { version = "0.4", default-features = false }

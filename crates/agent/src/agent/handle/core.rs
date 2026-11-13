@@ -456,7 +456,11 @@ impl LocalAgentHandle {
         self.config.agent_registry.clone()
     }
 
-    /// Access the tool registry for built-in tool execution.
+    /// Access the agent-level tool registry for built-in tool execution.
+    ///
+    /// This describes the agent, not a session: session-bound tools (the
+    /// `skill` tool) are absent. Session-accurate tool listings come from
+    /// `ToolsAvailable` events, which include them.
     pub fn tool_registry(&self) -> Arc<ToolRegistry> {
         self.config.tool_registry_arc()
     }

@@ -85,6 +85,7 @@ pub struct AgentToolContext {
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
     session_store: Option<Arc<dyn crate::session::store::SessionStore>>,
     todo_store: Option<Arc<crate::tools::builtins::todo::TodoStore>>,
+    tool_call_id: Option<String>,
 }
 
 impl AgentToolContext {
@@ -109,12 +110,19 @@ impl AgentToolContext {
             workspace_service: None,
             session_store: None,
             todo_store: None,
+            tool_call_id: None,
         }
     }
 
     /// Attach the agent's per-session todo store.
     pub fn with_todo_store(mut self, store: Arc<crate::tools::builtins::todo::TodoStore>) -> Self {
         self.todo_store = Some(store);
+        self
+    }
+
+    /// Record the tool call this context serves.
+    pub fn with_tool_call_id(mut self, id: impl Into<String>) -> Self {
+        self.tool_call_id = Some(id.into());
         self
     }
 
@@ -199,6 +207,10 @@ impl ToolContext for AgentToolContext {
 
     fn cwd(&self) -> Option<&Path> {
         self.cwd.as_deref()
+    }
+
+    fn tool_call_id(&self) -> Option<&str> {
+        self.tool_call_id.as_deref()
     }
 
     fn agent_registry(&self) -> Option<Arc<dyn crate::delegation::AgentRegistry>> {

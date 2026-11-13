@@ -15,7 +15,7 @@ use crate::acp::stdio::serve_stdio;
 use crate::acp::websocket::serve_websocket;
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
-use crate::agent::core::{SnapshotPolicy, ToolPolicy};
+use crate::agent::core::SnapshotPolicy;
 use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{
     ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, SingleAgentConfig,
@@ -595,10 +595,13 @@ impl AgentBuilder {
             let registry = crate::dotagents::DotagentsTargetRegistry::new(
                 &plans,
                 explicit_registry,
-                Arc::new(super::DotagentsTargetFactory::new(
-                    plugin_registry.clone(),
-                    backend.clone(),
-                )),
+                Arc::new(
+                    super::DotagentsTargetFactory::new(plugin_registry.clone(), backend.clone())
+                        .with_skills(
+                            self.skills_config.clone(),
+                            cwd.clone().unwrap_or_else(|| std::path::PathBuf::from(".")),
+                        ),
+                ),
             );
             for diagnostic in registry.diagnostics() {
                 log::warn!("dotagents: {diagnostic}");
@@ -655,34 +658,19 @@ impl AgentBuilder {
                     .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME)))
         {
             let project_root = cwd.as_deref().unwrap_or_else(|| std::path::Path::new("."));
-            builder
-                .tool_registry_mut()
-                .add(crate::skills::build_skill_tool(
-                    &skills_config,
-                    project_root,
-                ));
+            builder = builder.with_skill_catalog(crate::skills::SkillCatalog::from_config(
+                &skills_config,
+                project_root,
+            ));
         }
 
         if !self.tools.is_empty() {
-            // Infer tool policy from the tools list:
-            // - If any tool spec looks like an external/MCP pattern (contains a
-            //   dot separator like "server.*" or "server.tool"), use
-            //   BuiltInAndProvider so MCP tool definitions reach the LLM.
-            // - Otherwise BuiltInOnly is sufficient.
-            //
-            // This handles both config-based MCP servers and preconnected
-            // runtime MCP peers (e.g. mobile in-process MCP), since the tools
-            // list already declares the intended tool scope.
-            let has_external_tools = self.tools.iter().any(|t| {
-                // MCP-style specs contain a dot: "server.*" or "server.tool_name"
-                // while builtins are plain names like "create_task", "read_tool".
-                t.is_mcp() || self.mcp_servers.iter().any(|m| t.is_builtin(m.name()))
-            });
-            let policy = if has_external_tools || !self.mcp_servers.is_empty() {
-                ToolPolicy::BuiltInAndProvider
-            } else {
-                ToolPolicy::BuiltInOnly
-            };
+            // Restricted tool lists infer the policy from the selectors and
+            // attached servers (see `infer_restricted_tool_policy`). This
+            // covers config-based MCP servers and preconnected runtime MCP
+            // peers (e.g. mobile in-process MCP).
+            let policy =
+                crate::agent::tools::infer_restricted_tool_policy(&self.tools, &self.mcp_servers);
             builder = builder
                 .with_tool_policy(policy)
                 .with_allowed_tools(self.tools.clone());

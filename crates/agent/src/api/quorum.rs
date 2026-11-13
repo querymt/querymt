@@ -11,7 +11,7 @@ use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::SnapshotPolicy;
 use crate::agent::core::ToolPolicy;
-use crate::config::{MiddlewareEntry, QuorumConfig, ToolSpec, resolve_tools};
+use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
 use crate::delegation::AgentInfo;
 
 use crate::acp::protocol::{ContentBlock, PromptRequest, TextContent};
@@ -589,7 +589,7 @@ impl QuorumBuilder {
                             .iter()
                             .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME)))
                 {
-                    b.tool_registry_mut().add(crate::skills::build_skill_tool(
+                    b = b.with_skill_catalog(crate::skills::SkillCatalog::from_config(
                         skills,
                         &skills_project_root_for_delegate,
                     ));
@@ -602,12 +602,10 @@ impl QuorumBuilder {
                     // MCP selection needs BuiltInAndProvider so MCP tool
                     // definitions reach the LLM; otherwise BuiltInOnly is
                     // sufficient.
-                    let has_external_tools = tools.iter().any(ToolSpec::is_mcp);
-                    let policy = if has_external_tools || !delegate_mcp_servers.is_empty() {
-                        ToolPolicy::BuiltInAndProvider
-                    } else {
-                        ToolPolicy::BuiltInOnly
-                    };
+                    let policy = crate::agent::tools::infer_restricted_tool_policy(
+                        &tools,
+                        &delegate_mcp_servers,
+                    );
                     b = b.with_tool_policy(policy).with_allowed_tools(tools.clone());
                 }
 
@@ -682,7 +680,8 @@ impl QuorumBuilder {
                 let info = plan.info.clone();
                 let target_plan = plan.clone();
                 let factory: Arc<dyn crate::dotagents::ProtocolTargetFactory> = Arc::new(
-                    super::DotagentsTargetFactory::new(registry.clone(), backend.clone()),
+                    super::DotagentsTargetFactory::new(registry.clone(), backend.clone())
+                        .with_skills(planner_config.skills.clone(), skills_project_root.clone()),
                 );
                 let registry_for_fallback = registry.clone();
                 builder = builder.add_delegate_agent(
@@ -822,7 +821,7 @@ impl QuorumBuilder {
                         .iter()
                         .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME)))
             {
-                b.tool_registry_mut().add(crate::skills::build_skill_tool(
+                b = b.with_skill_catalog(crate::skills::SkillCatalog::from_config(
                     skills,
                     &skills_project_root_for_planner,
                 ));
@@ -834,12 +833,10 @@ impl QuorumBuilder {
                 // single-agent path: any external tool spec or resolved MCP
                 // selection needs BuiltInAndProvider so MCP tool definitions
                 // reach the LLM; otherwise BuiltInOnly is sufficient.
-                let has_external_tools = planner_tools.iter().any(ToolSpec::is_mcp);
-                let policy = if has_external_tools || !planner_mcp_servers.is_empty() {
-                    ToolPolicy::BuiltInAndProvider
-                } else {
-                    ToolPolicy::BuiltInOnly
-                };
+                let policy = crate::agent::tools::infer_restricted_tool_policy(
+                    &planner_tools,
+                    &planner_mcp_servers,
+                );
                 b = b
                     .with_tool_policy(policy)
                     .with_allowed_tools(planner_tools.clone());
@@ -1443,6 +1440,7 @@ mod tests {
     #[cfg(feature = "remote")]
     use crate::agent::remote::test_helpers::fixtures::{get_test_mesh, random_node_id};
     use crate::config::McpServerConfig;
+    use crate::config::ToolSpec;
     use crate::test_utils::helpers::empty_plugin_registry;
 
     fn skill_quorum_config(skills_enabled: bool) -> QuorumConfig {
@@ -1827,12 +1825,15 @@ include_external = false
             .as_any()
             .downcast_ref::<AgentHandle>()
             .expect("local planner");
+        // The skill tool is session-bound: it comes from the catalog, never
+        // from the agent-level registry.
+        assert!(planner.config.skill_catalog.is_some());
         assert!(
             planner
                 .config
                 .tool_registry
                 .find(crate::skills::SkillTool::NAME)
-                .is_some()
+                .is_none()
         );
         assert!(
             planner
@@ -1847,12 +1848,15 @@ include_external = false
             .as_any()
             .downcast_ref::<AgentHandle>()
             .expect("local delegate");
+        // The skill tool is session-bound: it comes from the catalog, never
+        // from the agent-level registry.
+        assert!(delegate.config.skill_catalog.is_some());
         assert!(
             delegate
                 .config
                 .tool_registry
                 .find(crate::skills::SkillTool::NAME)
-                .is_some()
+                .is_none()
         );
         assert!(
             delegate

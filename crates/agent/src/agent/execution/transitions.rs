@@ -124,6 +124,7 @@ pub(super) async fn transition_before_llm_call(
             provider,
             Some(exec_ctx.runtime.as_ref()),
             Some(&exec_ctx.tool_config),
+            exec_ctx.tool_set(config),
         );
         let tools_json =
             serde_json::to_vec(&tools).context("Failed to serialize tools for hash computation")?;
@@ -2010,11 +2011,9 @@ pub(super) async fn transition_processing_tool_calls(
     let classes: Vec<crate::tools::ToolExecutionClass> = remaining_calls
         .iter()
         .map(|call| {
-            config
-                .tool_registry
-                .find(&call.function.name)
-                .map(|tool| tool.execution_class())
-                .unwrap_or(crate::tools::ToolExecutionClass::ParallelSafe)
+            exec_ctx
+                .tool_set(config)
+                .execution_class(&call.function.name)
         })
         .collect();
     let segments = split_segments(&classes);
@@ -2303,8 +2302,8 @@ async fn prepare_segment(
 
     // File access is declared once, for the final effective arguments.
     let cwd = exec_ctx.cwd().map(|path| path.to_path_buf());
-    let accesses = config
-        .tool_registry
+    let accesses = exec_ctx
+        .tool_set(config)
         .file_access_batch(
             prepared
                 .iter()
@@ -3567,6 +3566,54 @@ mod tests {
                 exec.session_handle.provider().await.unwrap().capabilities(),
                 "successful initialization must replace a stale or empty profile"
             );
+        }
+
+        /// Task 2.3: the session-bound `skill` tool reaches `ToolsAvailable`
+        /// for an agent with a catalog, but never the agent-level registry; an
+        /// agent without a catalog is unchanged.
+        #[tokio::test]
+        async fn tools_available_includes_session_skill_tool_only_with_a_catalog() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let project = tempfile::tempdir().unwrap();
+
+            async fn tools_event(
+                config: &AgentConfig,
+                fixture: &TestAgent,
+            ) -> Vec<querymt::chat::Tool> {
+                let exec = fixture.execution_context().await;
+                let mut events = config.subscribe_events();
+                let context = crate::test_utils::test_context(&exec.session_id, 0);
+                transition_before_llm_call(config, &context, &exec)
+                    .await
+                    .expect("before llm call");
+                let deadline = std::time::Duration::from_secs(2);
+                while let Ok(Ok(event)) = tokio::time::timeout(deadline, events.recv()).await {
+                    if let crate::events::AgentEventKind::ToolsAvailable { tools, .. } =
+                        event.kind()
+                    {
+                        return tools.clone();
+                    }
+                }
+                panic!("no ToolsAvailable event emitted");
+            }
+
+            // No catalog: unchanged, no skill tool.
+            let without = tools_event(&fixture.config, &fixture).await;
+            assert!(!without.iter().any(|t| t.function.name == "skill"));
+
+            // Catalog: session tool is offered, agent registry still lacks it.
+            let mut config = (*fixture.config).clone();
+            config.skill_catalog = Some(Arc::new(crate::skills::SkillCatalog::from_parts(
+                Arc::new(std::sync::Mutex::new(crate::skills::SkillRegistry::new())),
+                Arc::new(crate::skills::SkillPermissions::default()),
+                vec![],
+                false,
+                project.path().to_path_buf(),
+            )));
+            let with = tools_event(&config, &fixture).await;
+            assert!(with.iter().any(|t| t.function.name == "skill"));
+            let handle = crate::agent::LocalAgentHandle::from_config(Arc::new(config));
+            assert!(handle.tool_registry().find("skill").is_none());
         }
 
         #[tokio::test]
