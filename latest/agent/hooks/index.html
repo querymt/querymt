@@ -2169,7 +2169,7 @@
 <span class="normal"><a href="#__codelineno-2-8">8</a></span>
 <span class="normal"><a href="#__codelineno-2-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a><span class="p">{</span>
 <a id="__codelineno-2-2" name="__codelineno-2-2"></a><span class="w">  </span><span class="nt">"session_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"session-id"</span><span class="p">,</span>
-<a id="__codelineno-2-3" name="__codelineno-2-3"></a><span class="w">  </span><span class="nt">"turn_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"turn-id"</span><span class="p">,</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3"></a><span class="w">  </span><span class="nt">"turn_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"3f2b8c1e-9d4a-4e6b-8a57-1c0d2e9f4b36"</span><span class="p">,</span>
 <a id="__codelineno-2-4" name="__codelineno-2-4"></a><span class="w">  </span><span class="nt">"transcript_path"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
 <a id="__codelineno-2-5" name="__codelineno-2-5"></a><span class="w">  </span><span class="nt">"cwd"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/workspace"</span><span class="p">,</span>
 <a id="__codelineno-2-6" name="__codelineno-2-6"></a><span class="w">  </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"pre_tool_use"</span><span class="p">,</span>
@@ -2177,6 +2177,7 @@
 <a id="__codelineno-2-8" name="__codelineno-2-8"></a><span class="w">  </span><span class="nt">"permission_mode"</span><span class="p">:</span><span class="w"> </span><span class="s2">"plan"</span>
 <a id="__codelineno-2-9" name="__codelineno-2-9"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
+<p><code>turn_id</code> is always a UUID string, never empty. A hook fired inside a run gets that run's id, the same one on the run's events, steering replies and snapshot records, so a hook can be correlated with the run it belongs to. This includes native <code>/compact</code> and maintenance compaction, which run as part of a run. Delegation hooks (<code>delegation_start</code>, <code>post_delegation</code>, <code>delegation_failure</code>) are not tied to an execution context and get a freshly generated UUID that no run shares.</p>
 <p><code>permission_mode</code> is derived from the agent mode captured when the turn starts. If the user changes mode while a turn is running, hooks for that turn continue using the captured mode; the next turn uses the new mode.</p>
 <p>Current values are:</p>
 <ul>
