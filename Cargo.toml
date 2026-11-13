@@ -16,6 +16,23 @@ members = [
     "crates/py/querymt-py",
     "crates/py/querymt-agent-py",
 ]
+# What plain `cargo build/run/test/check` selects from the repository root.
+# Deliberately excludes the WASM provider plugins (`crates/providers/*`, built
+# for wasm32 by their own workflows): they default to the `extism` feature and
+# are cdylibs, so compiling them for the host fails at link time with undefined
+# `extism` host symbols (`alloc`, `error_set`, `qmt_http_request`, ...). Also
+# excluded are the packages that need external tooling (Python extension
+# modules, the mobile FFI) and the heavy native providers (llama-cpp, izwi,
+# mrs). Use `--workspace` or `-p <package>` to select those explicitly.
+default-members = [
+    "crates/agent",
+    "crates/querymt",
+    "crates/querymt-remote",
+    "crates/cli",
+    "crates/provider-common",
+    "crates/querymt-utils",
+    "crates/service-client",
+]
 
 [workspace.package]
 version = "0.6.0"

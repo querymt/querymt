@@ -123,6 +123,15 @@ jobs:
             --lib --tests \
             --features "${features}" \
             --codecov --output-path ./coverage/codecov.json
+
+      # `--lib --tests` skips tests compiled into examples. The repository
+      # knowledge maintenance CLI's exit-code and headless contracts live there.
+      - name: Run example tests
+        run: |
+          cargo nextest run \
+            --package querymt-agent \
+            --example repository_knowledge \
+            --features "${features}"
       
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
