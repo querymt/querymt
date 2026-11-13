@@ -166,7 +166,7 @@ pub struct AtifFinalMetrics {
 pub struct AtifExportOptions {
     /// Custom agent name (defaults to "querymt")
     pub agent_name: Option<String>,
-    /// Custom agent version (defaults to env!("QMT_BUILD_VERSION"))
+    /// Custom agent version (defaults to `querymt_utils::BUILD_VERSION`)
     pub agent_version: Option<String>,
     /// Custom notes to include in trajectory
     pub notes: Option<String>,
@@ -254,7 +254,7 @@ impl ATIFBuilder {
             agent_version: options
                 .agent_version
                 .clone()
-                .unwrap_or_else(|| env!("QMT_BUILD_VERSION").to_string()),
+                .unwrap_or_else(|| querymt_utils::BUILD_VERSION.to_string()),
             model_name: None,
             tool_definitions: None,
             steps: Vec::new(),

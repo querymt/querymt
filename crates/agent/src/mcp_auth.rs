@@ -154,7 +154,7 @@ mod store {
     /// Some authorization servers (IBKR) answer requests without one with
     /// `403`, and rmcp's own client sends none.
     fn user_agent() -> String {
-        format!("querymt-agent/{}", env!("QMT_BUILD_VERSION"))
+        format!("querymt-agent/{}", querymt_utils::BUILD_VERSION)
     }
 
     /// rmcp's default OAuth HTTP client plus a `User-Agent` header.

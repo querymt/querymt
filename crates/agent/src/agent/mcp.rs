@@ -312,7 +312,7 @@ pub(crate) fn report_auth_required(
 
 /// Returns the standard `Implementation` descriptor for the querymt-agent.
 pub fn agent_implementation() -> rmcp::model::Implementation {
-    rmcp::model::Implementation::new("querymt-agent", env!("QMT_BUILD_VERSION"))
+    rmcp::model::Implementation::new("querymt-agent", querymt_utils::BUILD_VERSION)
 }
 
 /// Warn about approval entries (`ask` / `always_ask`) that name a tool the
