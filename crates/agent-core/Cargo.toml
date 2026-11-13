@@ -12,6 +12,8 @@ path = "src/lib.rs"
 [dependencies]
 serde.workspace = true
 rapidhash = "4.2"
+serde_json.workspace = true
+dunce = "1"
 
 [dev-dependencies]
-serde_json.workspace = true
+tempfile = "3.0"
