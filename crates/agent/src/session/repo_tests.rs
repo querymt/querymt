@@ -5,7 +5,8 @@
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
     use time::OffsetDateTime;
 
     use rusqlite::Connection;
@@ -933,7 +934,6 @@ mod tests {
                 .await
                 .unwrap();
             db.lock()
-                .unwrap()
                 .execute(
                     "UPDATE delegations SET isolation = NULL WHERE public_id = ?",
                     rusqlite::params![legacy.public_id],

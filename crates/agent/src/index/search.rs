@@ -1,15 +1,14 @@
+use super::error::IndexError;
 use grep_regex::RegexMatcher;
 use grep_searcher::{Searcher, sinks::Lossy};
 use ignore::WalkBuilder;
-use std::error::Error;
 use std::path::Path;
 
 pub struct CodeSearch;
 
 impl CodeSearch {
-    pub fn search(root: &Path, pattern: &str) -> Result<Vec<String>, Box<dyn Error + Send>> {
-        let matcher =
-            RegexMatcher::new(pattern).map_err(|e| Box::new(e) as Box<dyn Error + Send>)?;
+    pub fn search(root: &Path, pattern: &str) -> Result<Vec<String>, IndexError> {
+        let matcher = RegexMatcher::new(pattern)?;
         let mut matches = vec![];
 
         // TODO: Consider consolidating with file_index.rs's Override pattern for consistency
@@ -40,7 +39,7 @@ impl CodeSearch {
                         Ok(true)
                     }),
                 )
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send>)?;
+                .map_err(IndexError::Search)?;
         }
 
         Ok(matches)
@@ -138,7 +137,10 @@ mod tests {
         let tmp = setup_dir();
         // An invalid regex pattern
         let result = CodeSearch::search(tmp.path(), "[invalid(regex");
-        assert!(result.is_err(), "invalid regex should return an error");
+        assert!(
+            matches!(result, Err(IndexError::Regex(_))),
+            "invalid regex should return IndexError::Regex"
+        );
     }
 
     #[test]

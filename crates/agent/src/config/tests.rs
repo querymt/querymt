@@ -1166,11 +1166,12 @@ UnknownEvent = []
 
     let validation = err.agent.hooks.validate();
     assert!(validation.is_err());
-    let msg = validation.unwrap_err().to_string();
+    let err = validation.unwrap_err();
     assert!(
-        msg.contains("unsupported hook event"),
-        "unexpected error: {msg}"
+        matches!(err, crate::hooks::HookConfigError::UnsupportedEvents(ref keys) if keys == "UnknownEvent"),
+        "unexpected error: {err}"
     );
+    assert!(err.to_string().contains("unsupported hook event"));
 }
 
 // ── Multi-transport mesh config TOML parsing ────────────────────────────

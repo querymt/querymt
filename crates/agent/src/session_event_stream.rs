@@ -5,7 +5,11 @@
 //!
 //! 1. **Sequence at emit time.** Emitting assigns the next `session_seq`
 //!    synchronously, before any spawn or write. Durable and ephemeral events
-//!    share the counter.
+//!    share the counter. A new stream does not read the journal on the
+//!    caller's thread: it starts with an *unresolved base*, numbers events
+//!    relative to it, and holds them back. The writer task reads the
+//!    journal's highest number off the async runtime, then renumbers the held
+//!    events to absolute values and publishes them in order.
 //! 2. **Ordered durable writer.** Durable events are queued to one writer task
 //!    per session, persisted in batches (one transaction per batch), and only
 //!    published after they are persisted.
@@ -26,7 +30,7 @@ use crate::session::projection::{EventJournal, NewDurableEvent};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// Most durable events the writer persists in one transaction.
 const BATCH_LIMIT: usize = 64;
@@ -39,6 +43,11 @@ enum Slot {
 }
 
 struct State {
+    /// Highest number already used before this stream (journal maximum or a
+    /// retired stream's tip). `None` until the writer task has resolved it;
+    /// until then every number below is relative to the unknown base and
+    /// nothing is published.
+    base: Option<i64>,
     /// Next sequence number to hand out.
     next_seq: i64,
     /// Lowest sequence number not yet published (or skipped).
@@ -48,7 +57,32 @@ struct State {
 }
 
 impl State {
+    /// Fix the base: shift every relative number to its absolute value and
+    /// publish whatever was held back, in order.
+    fn resolve(&mut self, base: i64, fanout: &EventFanout) {
+        self.base = Some(base);
+        self.next_seq += base;
+        self.next_publish += base;
+        for (seq, mut slot) in std::mem::take(&mut self.ready) {
+            if let Slot::Publish(publication) = &mut slot
+                && let EventEnvelope::Ephemeral(event) = &mut publication.0
+            {
+                event.session_seq += base;
+            }
+            self.ready.insert(seq + base, slot);
+        }
+        while let Some(slot) = self.ready.remove(&self.next_publish) {
+            Self::publish(slot, fanout);
+            self.next_publish += 1;
+        }
+    }
+
     fn complete(&mut self, seq: i64, slot: Slot, fanout: &EventFanout) {
+        if self.base.is_none() {
+            // Numbers are still relative: hold until `resolve`.
+            self.ready.insert(seq, slot);
+            return;
+        }
         if seq == self.next_publish && self.ready.is_empty() {
             Self::publish(slot, fanout);
             self.next_publish += 1;
@@ -74,6 +108,10 @@ struct Shared {
     journal: Arc<dyn EventJournal>,
     fanout: Arc<EventFanout>,
     state: Mutex<State>,
+    /// Lowest allowed base: the tip of a retired stream of this session.
+    floor: i64,
+    /// Publishes the resolved base to async waiters.
+    base_tx: watch::Sender<Option<i64>>,
 }
 
 /// Messages to a session's writer task, processed strictly in order.
@@ -88,7 +126,10 @@ enum WriterMsg {
 }
 
 struct PendingWrite {
+    /// Relative to the base when `relative`, absolute otherwise.
     seq: i64,
+    /// Queued before the base was resolved.
+    relative: bool,
     event: NewDurableEvent,
     parent: Option<tracing::Span>,
     reply: Option<oneshot::Sender<SessionResult<DurableEvent>>>,
@@ -114,31 +155,34 @@ impl SessionEventStream {
         journal: Arc<dyn EventJournal>,
         fanout: Arc<EventFanout>,
     ) -> Arc<Self> {
-        let base = journal.max_session_seq_blocking(session_id).max(0);
-        Self::with_base(session_id, journal, fanout, base)
+        Self::open(session_id, journal, fanout, 0)
     }
 
-    /// Create the stream for `session_id`, numbering from `base + 1`, and
-    /// start its writer task. The caller supplies `base` (the journal's
-    /// highest number, or a retired stream's tip if higher) so the lookup can
-    /// run outside any lock.
+    /// Create the stream for `session_id` and start its writer task. Does no
+    /// I/O: the writer resolves the base as `max(floor, journal maximum)`,
+    /// where `floor` is a retired stream's tip (ephemeral events consume
+    /// numbers the journal never sees).
     ///
     /// Must be called inside a Tokio runtime.
-    pub(crate) fn with_base(
+    pub(crate) fn open(
         session_id: &str,
         journal: Arc<dyn EventJournal>,
         fanout: Arc<EventFanout>,
-        base: i64,
+        floor: i64,
     ) -> Arc<Self> {
+        let (base_tx, _) = watch::channel(None);
         let shared = Arc::new(Shared {
             session_id: session_id.to_string(),
             journal,
             fanout,
             state: Mutex::new(State {
-                next_seq: base + 1,
-                next_publish: base + 1,
+                base: None,
+                next_seq: 1,
+                next_publish: 1,
                 ready: BTreeMap::new(),
             }),
+            floor,
+            base_tx,
         });
         let (writer, rx) = mpsc::unbounded_channel();
         tokio::spawn(run_writer(shared.clone(), rx));
@@ -150,7 +194,28 @@ impl SessionEventStream {
         &self.shared.session_id
     }
 
+    /// Wait until the stream's base is resolved and return it.
+    async fn resolved_base(&self) -> i64 {
+        let mut rx = self.shared.base_tx.subscribe();
+        let base = rx
+            .wait_for(|base| base.is_some())
+            .await
+            .map(|base| base.unwrap_or(0));
+        base.unwrap_or(0)
+    }
+
+    /// Like [`Self::tip`], but waits until the base is resolved so the value
+    /// is absolute.
+    pub async fn resolved_tip(&self) -> i64 {
+        self.resolved_base().await;
+        self.tip()
+    }
+
     /// Last `session_seq` assigned so far (`0` when nothing was emitted).
+    ///
+    /// Before the writer has resolved the base (immediately after the stream
+    /// is created) the value counts events relative to that base; use
+    /// [`Self::resolved_tip`] where an absolute number is needed.
     ///
     /// Everything up to and including this number is either published or
     /// queued ahead of any later publication, so a consumer that has handled
@@ -210,13 +275,27 @@ impl SessionEventStream {
 
     /// Publish an ephemeral event with the next sequence number.
     pub fn emit_ephemeral(&self, kind: AgentEventKind) {
-        self.emit_ephemeral_seq(kind);
+        self.emit_ephemeral_numbered(kind);
     }
 
-    /// Like [`Self::emit_ephemeral`], returning the assigned `session_seq` so
-    /// a prompt response can wait for the event (`with_event_tip`).
-    pub fn emit_ephemeral_seq(&self, kind: AgentEventKind) -> i64 {
+    /// Like [`Self::emit_ephemeral`], returning the assigned absolute
+    /// `session_seq` so a prompt response can wait for the event
+    /// (`with_event_tip`). Waits for the stream's base when it is not yet
+    /// resolved.
+    pub async fn emit_ephemeral_seq(&self, kind: AgentEventKind) -> i64 {
+        let (seq, absolute) = self.emit_ephemeral_numbered(kind);
+        if absolute {
+            seq
+        } else {
+            seq + self.resolved_base().await
+        }
+    }
+
+    /// Emits and returns `(seq, absolute)`; `seq` is relative to the base
+    /// when `absolute` is false.
+    fn emit_ephemeral_numbered(&self, kind: AgentEventKind) -> (i64, bool) {
         let mut state = self.shared.state.lock();
+        let absolute = state.base.is_some();
         let seq = state.next_seq;
         state.next_seq += 1;
         let envelope = EventEnvelope::Ephemeral(EphemeralEvent {
@@ -232,7 +311,7 @@ impl SessionEventStream {
             Slot::Publish(Box::new((envelope, None))),
             &self.shared.fanout,
         );
-        seq
+        (seq, absolute)
     }
 
     fn enqueue(
@@ -248,10 +327,12 @@ impl SessionEventStream {
         // Assign the number and enqueue under one lock so the writer queue is
         // in sequence order.
         let mut state = self.shared.state.lock();
+        let relative = state.base.is_none();
         let seq = state.next_seq;
         state.next_seq += 1;
         let write = PendingWrite {
             seq,
+            relative,
             event: NewDurableEvent {
                 session_id: self.shared.session_id.clone(),
                 origin,
@@ -279,13 +360,30 @@ impl SessionEventStream {
 }
 
 async fn run_writer(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<WriterMsg>) {
+    // Resolve the base off the emitting threads, before anything is persisted
+    // or published. Events queued meanwhile carry relative numbers.
+    let base = shared
+        .journal
+        .max_session_seq(&shared.session_id)
+        .await
+        .max(0)
+        .max(shared.floor);
+    shared.state.lock().resolve(base, &shared.fanout);
+    shared.base_tx.send_replace(Some(base));
+
     let mut queue: Vec<PendingWrite> = Vec::with_capacity(BATCH_LIMIT);
     let mut flushes: Vec<oneshot::Sender<()>> = Vec::new();
     while let Some(first) = rx.recv().await {
         let mut next = Some(first);
         while let Some(msg) = next.take() {
             match msg {
-                WriterMsg::Write(write) => queue.push(write),
+                WriterMsg::Write(mut write) => {
+                    if write.relative {
+                        write.seq += base;
+                        write.event.session_seq = Some(write.seq);
+                    }
+                    queue.push(write);
+                }
                 WriterMsg::Flush(ack) => flushes.push(ack),
             }
             if queue.len() < BATCH_LIMIT {
@@ -455,6 +553,9 @@ mod tests {
     async fn ephemeral_without_pending_durable_publishes_inline() {
         let (stream, fanout) = make_stream("s-inline").await;
         let mut rx = fanout.subscribe();
+        // A new stream holds events until its writer resolves the base; inline
+        // publication applies once it is resolved.
+        stream.resolved_tip().await;
         stream.emit(delta(1));
         // try_recv: no await point between emit and receive.
         let envelope = rx.try_recv().expect("published inline");
@@ -495,7 +596,7 @@ mod tests {
         impl EventJournal for FailOnce {
             async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent> {
                 if !self.failed.swap(true, Ordering::SeqCst) {
-                    return Err(SessionError::DatabaseError("boom".into()));
+                    return Err(SessionError::Other("boom".into()));
                 }
                 self.inner.append_durable(event).await
             }

@@ -9,32 +9,28 @@ use crate::session::projection::{
     slice_history_page,
 };
 
-use super::SqliteStorage;
+use super::{SqliteStorage, blocking};
 
 #[async_trait]
 impl EventJournal for SqliteStorage {
     async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent> {
         let event_clone = event.clone();
-        let conn_arc = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> SessionResult<DurableEvent> {
-            let conn = conn_arc.lock().unwrap();
-
+        blocking::with_conn(&self.conn, move |conn| {
             insert_journal_event(
-                &conn,
+                conn,
                 &event_clone,
                 event_clone.source_node_id.as_deref(),
                 event_clone.source_seq,
             )?
             .ok_or_else(|| {
-                SessionError::DatabaseError(
+                SessionError::Other(
                     "duplicate source-identity event rejected by the journal unique index"
                         .to_string(),
                 )
             })
         })
         .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
     }
 
     async fn append_durable_batch(
@@ -46,32 +42,42 @@ impl EventJournal for SqliteStorage {
         }
         let batch = events.to_vec();
         let count = batch.len();
-        let conn_arc = self.conn.clone();
 
-        let joined = tokio::task::spawn_blocking(move || {
-            let mut conn = conn_arc.lock().unwrap();
-            insert_batch(&mut conn, &batch)
-        })
-        .await;
+        let joined =
+            blocking::with_conn(&self.conn, move |conn| Ok(insert_batch(conn, &batch))).await;
         match joined {
             Ok(results) => results,
-            Err(e) => (0..count)
-                .map(|_| Err(SessionError::Other(format!("Task execution failed: {}", e))))
-                .collect(),
+            Err(e) => {
+                // The whole batch failed together. `SessionError` is not
+                // `Clone`, so the first slot keeps the typed error and the
+                // others carry its rendered chain.
+                let message = e.to_string();
+                let mut first = Some(e);
+                (0..count)
+                    .map(|_| {
+                        Err(first
+                            .take()
+                            .unwrap_or_else(|| SessionError::Other(message.clone())))
+                    })
+                    .collect()
+            }
         }
     }
 
-    fn max_session_seq_blocking(&self, session_id: &str) -> i64 {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            // Local numbering only: relayed rows carry the host's numbers.
-            // The `session_seq IS NOT NULL` term lets SQLite answer MAX from
-            // the partial unique index instead of scanning the session's rows.
-            "SELECT COALESCE(MAX(session_seq), 0) FROM event_journal \
-             WHERE session_id = ?1 AND source_node_id IS NULL AND session_seq IS NOT NULL",
-            params![session_id],
-            |row| row.get(0),
-        )
+    async fn max_session_seq(&self, session_id: &str) -> i64 {
+        let key = session_id.to_string();
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
+            conn.query_row(
+                // Local numbering only: relayed rows carry the host's numbers.
+                // The `session_seq IS NOT NULL` term lets SQLite answer MAX from
+                // the partial unique index instead of scanning the session's rows.
+                "SELECT COALESCE(MAX(session_seq), 0) FROM event_journal \
+                 WHERE session_id = ?1 AND source_node_id IS NULL AND session_seq IS NOT NULL",
+                params![key],
+                |row| row.get::<_, i64>(0),
+            )
+        })
+        .await
         .unwrap_or_else(|err| {
             log::warn!("failed to read max session_seq for {session_id}: {err}");
             0
@@ -85,10 +91,8 @@ impl EventJournal for SqliteStorage {
         limit: Option<usize>,
     ) -> SessionResult<Vec<DurableEvent>> {
         let session_id = session_id.to_string();
-        let conn_arc = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<DurableEvent>, rusqlite::Error> {
-            let conn = conn_arc.lock().unwrap();
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
             let after = after_seq.unwrap_or(0);
             // SQLite's negative LIMIT means unlimited; explicit limits never wrap.
             let lim = limit.map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX));
@@ -111,8 +115,6 @@ impl EventJournal for SqliteStorage {
             Ok(events)
         })
         .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
     }
 
     async fn load_delegation_terminals(
@@ -126,26 +128,33 @@ impl EventJournal for SqliteStorage {
         let session_id = session_id.to_string();
         let ids = serde_json::to_string(delegation_ids)
             .map_err(|err| SessionError::Other(err.to_string()))?;
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<DurableEvent>, rusqlite::Error> {
-            let conn = conn.lock().unwrap();
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json, session_seq \
                  FROM event_journal WHERE session_id = ?1 \
-                 AND kind IN ('delegation_completed', 'delegation_failed', 'delegation_cancelled') \
+                 AND kind IN (?3, ?4, ?5) \
                  AND json_extract(payload_json, '$.data.delegation_id') IN (SELECT value FROM json_each(?2)) \
                  ORDER BY stream_seq ASC"
             )?;
-            stmt.query_map(params![session_id, ids], parse_journal_row)?.collect()
-        }).await.map_err(|err| SessionError::Other(err.to_string()))?.map_err(SessionError::from)
+            stmt.query_map(
+                params![
+                    session_id,
+                    ids,
+                    AgentEventKind::DELEGATION_COMPLETED_TAG,
+                    AgentEventKind::DELEGATION_FAILED_TAG,
+                    AgentEventKind::DELEGATION_CANCELLED_TAG,
+                ],
+                parse_journal_row,
+            )?
+            .collect()
+        })
+        .await
     }
 
     async fn last_unfinished_run(&self, session_id: &str) -> SessionResult<Option<String>> {
         let session_id = session_id.to_string();
-        let conn_arc = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
-            let conn = conn_arc.lock().unwrap();
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
             // Only run lifecycle rows are decoded; the partial run lifecycle
             // index bounds the scan to this session. Only this node's own
             // events count: mirrored events of a remote host describe runs
@@ -154,29 +163,34 @@ impl EventJournal for SqliteStorage {
             let mut stmt = conn.prepare(
                 "SELECT kind, json_extract(payload_json, '$.data.run_id') \
                  FROM event_journal \
-                 WHERE session_id = ? AND kind IN ('run_started', 'run_completed') \
+                 WHERE session_id = ?1 AND kind IN (?2, ?3) \
                  AND origin = 'local' \
                  ORDER BY stream_seq ASC",
             )?;
             let rows = stmt
-                .query_map(params![session_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                })?
+                .query_map(
+                    params![
+                        session_id,
+                        AgentEventKind::RUN_STARTED_TAG,
+                        AgentEventKind::RUN_COMPLETED_TAG
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(last_unfinished_run_in(rows.into_iter().filter_map(
                 |(kind, run_id)| {
                     let run_id = run_id?;
                     match kind.as_str() {
-                        "run_started" => Some((RunLifecycle::Started, run_id)),
-                        "run_completed" => Some((RunLifecycle::Completed, run_id)),
+                        AgentEventKind::RUN_STARTED_TAG => Some((RunLifecycle::Started, run_id)),
+                        AgentEventKind::RUN_COMPLETED_TAG => {
+                            Some((RunLifecycle::Completed, run_id))
+                        }
                         _ => None,
                     }
                 },
             )))
         })
         .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
     }
 
     async fn load_session_page(
@@ -186,10 +200,8 @@ impl EventJournal for SqliteStorage {
         limit: Option<usize>,
     ) -> SessionResult<Vec<DurableEvent>> {
         let session_id = session_id.to_string();
-        let conn_arc = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<DurableEvent>, rusqlite::Error> {
-            let conn = conn_arc.lock().unwrap();
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
             let after = after_seq.unwrap_or(0);
             let lim = limit.map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX));
             let mut stmt = conn.prepare(
@@ -203,8 +215,6 @@ impl EventJournal for SqliteStorage {
                 .collect::<Result<Vec<_>, _>>()
         })
         .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
     }
 
     async fn load_session_page_before(
@@ -214,10 +224,8 @@ impl EventJournal for SqliteStorage {
         limit: usize,
     ) -> SessionResult<Vec<DurableEvent>> {
         let session_id = session_id.to_string();
-        let conn_arc = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<DurableEvent>, rusqlite::Error> {
-            let conn = conn_arc.lock().unwrap();
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
             let before = before_seq.unwrap_or(i64::MAX);
             let lim = i64::try_from(limit).unwrap_or(i64::MAX);
             let mut stmt = conn.prepare(
@@ -234,8 +242,6 @@ impl EventJournal for SqliteStorage {
             Ok(events)
         })
         .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
     }
 
     async fn load_history_page(
@@ -266,12 +272,11 @@ impl EventJournal for SqliteStorage {
         };
         let session = session_id.to_owned();
         let node = node_id.to_owned();
-        let conn = self.conn.clone();
-        let paged = tokio::task::spawn_blocking(
-            move || -> SessionResult<Option<Vec<(i64, DurableEvent)>>> {
-                let conn = conn.lock().unwrap();
-                let (cursor, complete) = read_sync_row(&conn, &session, &node)?;
-                let mut covered = read_coverage(&conn, &session, &node)?;
+        let paged = blocking::with_conn(
+            &self.conn,
+            move |conn| -> SessionResult<Option<Vec<(i64, DurableEvent)>>> {
+                let (cursor, complete) = read_sync_row(conn, &session, &node)?;
+                let mut covered = read_coverage(conn, &session, &node)?;
                 if cursor > 0 {
                     covered.insert(1, cursor);
                 }
@@ -330,8 +335,7 @@ impl EventJournal for SqliteStorage {
                 Ok(Some(out))
             },
         )
-        .await
-        .map_err(|e| SessionError::Other(e.to_string()))??;
+        .await?;
         match paged {
             Some(page) => Ok(page),
             None => {
@@ -348,10 +352,8 @@ impl EventJournal for SqliteStorage {
         up_to_session_seq: Option<i64>,
     ) -> SessionResult<Vec<DurableEvent>> {
         let session_id = session_id.to_string();
-        let conn_arc = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<DurableEvent>, rusqlite::Error> {
-            let conn = conn_arc.lock().unwrap();
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
             let upper = up_to_session_seq.unwrap_or(i64::MAX);
             // Served by idx_event_journal_session_order, already in order.
             let mut stmt = conn.prepare(
@@ -367,8 +369,6 @@ impl EventJournal for SqliteStorage {
             .collect::<Result<Vec<_>, _>>()
         })
         .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
     }
 
     async fn load_global_stream(
@@ -376,10 +376,7 @@ impl EventJournal for SqliteStorage {
         after_seq: Option<i64>,
         limit: Option<usize>,
     ) -> SessionResult<Vec<DurableEvent>> {
-        let conn_arc = self.conn.clone();
-
-        tokio::task::spawn_blocking(move || -> Result<Vec<DurableEvent>, rusqlite::Error> {
-            let conn = conn_arc.lock().unwrap();
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
             let after = after_seq.unwrap_or(0);
             // SQLite's negative LIMIT means unlimited; explicit limits never wrap.
             let lim = limit.map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX));
@@ -399,8 +396,6 @@ impl EventJournal for SqliteStorage {
             Ok(events)
         })
         .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
     }
 
     async fn delete_session_events_from(
@@ -409,10 +404,8 @@ impl EventJournal for SqliteStorage {
         from_seq: i64,
     ) -> SessionResult<usize> {
         let session_id = session_id.to_string();
-        let conn_arc = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
-            let conn = conn_arc.lock().unwrap();
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
             // Conversation-tail deletion must not erase incurred spend or the
             // evidence that generation happened without an accounting basis:
             // * attempt start/settlement records are the accounting ledger;
@@ -423,11 +416,17 @@ impl EventJournal for SqliteStorage {
             let tx = conn.unchecked_transaction()?;
             let deleted = tx.execute(
                 "DELETE FROM event_journal \
-                 WHERE session_id = ? AND stream_seq >= ? \
-                    AND kind NOT IN ('llm_attempt_started', 'llm_attempt_settled') \
-                   AND NOT (kind = 'llm_request_end' \
+                 WHERE session_id = ?1 AND stream_seq >= ?2 \
+                    AND kind NOT IN (?3, ?4) \
+                   AND NOT (kind = ?5 \
                             AND json_extract(payload_json, '$.data.accounting') IS NULL)",
-                params![session_id, from_seq],
+                params![
+                    session_id,
+                    from_seq,
+                    AgentEventKind::LLM_ATTEMPT_STARTED_TAG,
+                    AgentEventKind::LLM_ATTEMPT_SETTLED_TAG,
+                    AgentEventKind::LLM_REQUEST_END_TAG,
+                ],
             )?;
             if deleted > 0 {
                 tx.execute(
@@ -440,16 +439,12 @@ impl EventJournal for SqliteStorage {
             Ok(deleted)
         })
         .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
     }
 
     async fn history_epoch(&self, session_id: &str) -> SessionResult<u64> {
         let session_id = session_id.to_string();
-        let conn_arc = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<u64, rusqlite::Error> {
-            let conn = conn_arc.lock().unwrap();
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
             let epoch: Option<i64> = conn
                 .query_row(
                     "SELECT epoch FROM event_journal_history_epoch WHERE session_id = ?1",
@@ -460,8 +455,6 @@ impl EventJournal for SqliteStorage {
             Ok(epoch.unwrap_or(0).max(0) as u64)
         })
         .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
     }
 
     async fn append_durable_from_source(
@@ -479,16 +472,14 @@ impl EventJournal for SqliteStorage {
             }
         };
         let event_clone = event.clone();
-        let conn_arc = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> SessionResult<Option<DurableEvent>> {
+        blocking::with_conn(&self.conn, move |conn| {
             // Duplicate replay is a no-op (plan §15/§16): no insert and no
             // stream_seq allocation. The source-existence check, sequence
             // allocation, and insert all run inside one Immediate transaction
             // so concurrent writers serialize at the database level (not just
             // in-process via the connection mutex); the partial unique index
             // (idx_event_journal_source_identity) remains the durable backstop.
-            let mut conn = conn_arc.lock().unwrap();
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
             let existing: Option<i64> = tx
@@ -515,7 +506,6 @@ impl EventJournal for SqliteStorage {
             Ok(inserted)
         })
         .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
     }
 
     async fn latest_source_seq(
@@ -525,10 +515,8 @@ impl EventJournal for SqliteStorage {
     ) -> SessionResult<Option<i64>> {
         let session_id = session_id.to_string();
         let source_node_id = source_node_id.to_string();
-        let conn_arc = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<Option<i64>, rusqlite::Error> {
-            let conn = conn_arc.lock().unwrap();
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
             conn.query_row(
                 "SELECT MAX(source_seq) FROM event_journal \
                  WHERE session_id = ?1 AND source_node_id = ?2",
@@ -537,8 +525,6 @@ impl EventJournal for SqliteStorage {
             )
         })
         .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
     }
 
     async fn remote_sync_cursor(
@@ -548,14 +534,13 @@ impl EventJournal for SqliteStorage {
     ) -> SessionResult<Option<i64>> {
         let session_id = session_id.to_owned();
         let source_node_id = source_node_id.to_owned();
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            conn.lock().unwrap().query_row(
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
+            conn.query_row(
                 "SELECT source_seq FROM remote_session_sync WHERE session_id = ?1 AND source_node_id = ?2",
                 params![session_id, source_node_id],
                 |row| row.get(0),
-            ).optional().map_err(SessionError::from)
-        }).await.map_err(|e| SessionError::Other(e.to_string()))?
+            ).optional()
+        }).await
     }
 
     async fn advance_remote_sync_cursor(
@@ -567,19 +552,18 @@ impl EventJournal for SqliteStorage {
     ) -> SessionResult<()> {
         let session_id = session_id.to_owned();
         let source_node_id = source_node_id.to_owned();
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            conn.lock().unwrap().execute(
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
+            conn.execute(
                 "INSERT INTO remote_session_sync (session_id, source_node_id, source_seq, complete)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT (session_id, source_node_id) DO UPDATE SET
                  source_seq = MAX(source_seq, excluded.source_seq),
                  complete = MAX(complete, excluded.complete)",
                 params![session_id, source_node_id, source_seq, complete],
-            ).map(|_| ()).map_err(SessionError::from)
+            )
+            .map(|_| ())
         })
         .await
-        .map_err(|e| SessionError::Other(e.to_string()))?
     }
 
     async fn load_remote_session_stream(
@@ -589,9 +573,7 @@ impl EventJournal for SqliteStorage {
     ) -> SessionResult<Vec<DurableEvent>> {
         let session_id = session_id.to_owned();
         let source_node_id = source_node_id.to_owned();
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
             // Legacy rows remain intact. Once an authoritative snapshot is
             // complete, prefer it over cursorless copies of the same history.
             let mut stmt = conn.prepare(
@@ -604,8 +586,8 @@ impl EventJournal for SqliteStorage {
                  ) ORDER BY CASE WHEN source_seq IS NULL THEN 0 ELSE 1 END, source_seq, stream_seq",
             )?;
             stmt.query_map(params![session_id, source_node_id], parse_journal_row)?
-                .collect::<Result<Vec<_>, _>>().map_err(SessionError::from)
-        }).await.map_err(|e| SessionError::Other(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+        }).await
     }
 
     async fn load_remote_history(
@@ -615,11 +597,9 @@ impl EventJournal for SqliteStorage {
     ) -> SessionResult<Vec<(i64, DurableEvent)>> {
         let session_id = session_id.to_owned();
         let source_node_id = source_node_id.to_owned();
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> SessionResult<Vec<(i64, DurableEvent)>> {
-            let conn = conn.lock().unwrap();
-            let (cursor, complete) = read_sync_row(&conn, &session_id, &source_node_id)?;
-            let mut covered = read_coverage(&conn, &session_id, &source_node_id)?;
+        blocking::with_conn(&self.conn, move |conn| {
+            let (cursor, complete) = read_sync_row(conn, &session_id, &source_node_id)?;
+            let mut covered = read_coverage(conn, &session_id, &source_node_id)?;
             if cursor > 0 {
                 covered.insert(1, cursor);
             }
@@ -649,7 +629,6 @@ impl EventJournal for SqliteStorage {
             Ok(history)
         })
         .await
-        .map_err(|e| SessionError::Other(e.to_string()))?
     }
 
     async fn remote_coverage(
@@ -659,15 +638,12 @@ impl EventJournal for SqliteStorage {
     ) -> SessionResult<Vec<(i64, i64)>> {
         let session_id = session_id.to_owned();
         let source_node_id = source_node_id.to_owned();
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> SessionResult<Vec<(i64, i64)>> {
-            let conn = conn.lock().unwrap();
-            Ok(read_coverage(&conn, &session_id, &source_node_id)?
+        blocking::with_conn(&self.conn, move |conn| {
+            Ok(read_coverage(conn, &session_id, &source_node_id)?
                 .ranges()
                 .to_vec())
         })
         .await
-        .map_err(|e| SessionError::Other(e.to_string()))?
     }
 
     async fn add_remote_coverage(
@@ -679,9 +655,7 @@ impl EventJournal for SqliteStorage {
     ) -> SessionResult<()> {
         let session_id = session_id.to_owned();
         let source_node_id = source_node_id.to_owned();
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> SessionResult<()> {
-            let mut conn = conn.lock().unwrap();
+        blocking::with_conn(&self.conn, move |conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let mut set = read_coverage(&tx, &session_id, &source_node_id)?;
             set.insert(start, end);
@@ -700,7 +674,6 @@ impl EventJournal for SqliteStorage {
             Ok(())
         })
         .await
-        .map_err(|e| SessionError::Other(e.to_string()))?
     }
 
     async fn remote_history_epoch(
@@ -710,9 +683,7 @@ impl EventJournal for SqliteStorage {
     ) -> SessionResult<Option<u64>> {
         let session_id = session_id.to_owned();
         let source_node_id = source_node_id.to_owned();
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> SessionResult<Option<u64>> {
-            let conn = conn.lock().unwrap();
+        blocking::with_conn(&self.conn, move |conn| {
             let epoch: Option<i64> = conn
                 .query_row(
                     "SELECT epoch FROM remote_session_epoch WHERE session_id = ?1 AND source_node_id = ?2",
@@ -723,7 +694,6 @@ impl EventJournal for SqliteStorage {
             Ok(epoch.map(|epoch| epoch.max(0) as u64))
         })
         .await
-        .map_err(|e| SessionError::Other(e.to_string()))?
     }
 
     async fn set_remote_history_epoch(
@@ -734,9 +704,8 @@ impl EventJournal for SqliteStorage {
     ) -> SessionResult<()> {
         let session_id = session_id.to_owned();
         let source_node_id = source_node_id.to_owned();
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> SessionResult<()> {
-            conn.lock().unwrap().execute(
+        blocking::with_conn(&self.conn, move |conn| {
+            conn.execute(
                 "INSERT INTO remote_session_epoch (session_id, source_node_id, epoch) VALUES (?1, ?2, ?3) \
                  ON CONFLICT (session_id, source_node_id) DO UPDATE SET epoch = excluded.epoch",
                 params![session_id, source_node_id, i64::try_from(epoch).unwrap_or(i64::MAX)],
@@ -744,7 +713,6 @@ impl EventJournal for SqliteStorage {
             Ok(())
         })
         .await
-        .map_err(|e| SessionError::Other(e.to_string()))?
     }
 
     async fn reset_remote_source(
@@ -754,9 +722,7 @@ impl EventJournal for SqliteStorage {
     ) -> SessionResult<usize> {
         let session_id = session_id.to_owned();
         let source_node_id = source_node_id.to_owned();
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> SessionResult<usize> {
-            let mut conn = conn.lock().unwrap();
+        blocking::with_conn(&self.conn, move |conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let deleted = tx.execute(
                 "DELETE FROM event_journal WHERE session_id = ?1 AND source_node_id = ?2",
@@ -782,15 +748,12 @@ impl EventJournal for SqliteStorage {
             Ok(deleted)
         })
         .await
-        .map_err(|e| SessionError::Other(e.to_string()))?
     }
 
     async fn max_stream_seq(&self, session_id: &str) -> SessionResult<i64> {
         let session_id = session_id.to_string();
-        let conn_arc = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<i64, rusqlite::Error> {
-            let conn = conn_arc.lock().unwrap();
+        blocking::with_conn_sqlite(&self.conn, move |conn| {
             conn.query_row(
                 "SELECT COALESCE(MAX(stream_seq), 0) FROM event_journal WHERE session_id = ?1",
                 params![session_id],
@@ -798,8 +761,6 @@ impl EventJournal for SqliteStorage {
             )
         })
         .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
     }
 }
 
@@ -853,10 +814,7 @@ fn insert_journal_event(
     // Unset producer sequence is stored as NULL, never 0, so the unique
     // (session_id, session_seq) index only constrains real sequence numbers.
     let session_seq = event.session_seq.filter(|seq| *seq > 0);
-    let kind_tag = serde_json::to_value(&event.kind)
-        .ok()
-        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
-        .unwrap_or_else(|| "unknown".to_string());
+    let kind_tag = event.kind.tag();
 
     let payload_json = serde_json::to_string(&event.kind)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -982,7 +940,7 @@ fn insert_batch(
                     .map_err(SessionError::from)
                     .and_then(|inserted| {
                         inserted.ok_or_else(|| {
-                            SessionError::DatabaseError(
+                            SessionError::Other(
                                 "duplicate source-identity event rejected by the journal unique index"
                                     .to_string(),
                             )

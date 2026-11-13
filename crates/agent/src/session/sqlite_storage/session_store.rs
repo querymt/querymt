@@ -35,6 +35,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::SqliteStorage;
 use super::row_parsers::{parse_llm_config_row, parse_llm_params};
+use crate::events::AgentEventKind;
 
 fn read_delegate_assignments(
     conn: &rusqlite::Connection,
@@ -51,7 +52,7 @@ fn read_delegate_assignments(
         .optional()?;
     let (id, revision) = row.ok_or_else(|| SessionError::SessionNotFound(session_id.to_owned()))?;
     let revision = u64::try_from(revision.unwrap_or(0))
-        .map_err(|_| SessionError::DatabaseError("Negative delegate assignment revision".into()))?;
+        .map_err(|_| SessionError::Other("Negative delegate assignment revision".into()))?;
     let mut stmt = conn.prepare(
         "SELECT agent_id, model_id, provider_node_id, reasoning_effort
          FROM session_delegate_assignment_overrides WHERE session_id = ?1",
@@ -69,7 +70,7 @@ fn read_delegate_assignments(
     for row in rows {
         let (agent_id, model_id, node_id, reasoning_effort) = row?;
         if model_id.is_none() && (node_id.is_some() || reasoning_effort.is_none()) {
-            return Err(SessionError::DatabaseError(
+            return Err(SessionError::Other(
                 "Invalid delegate assignment row".into(),
             ));
         }
@@ -90,11 +91,7 @@ fn read_delegate_assignments(
             reasoning_overrides.insert(agent_id, reasoning_effort);
         }
     }
-    validate_delegate_assignments(
-        &overrides,
-        &reasoning_overrides,
-        SessionError::DatabaseError,
-    )?;
+    validate_delegate_assignments(&overrides, &reasoning_overrides, SessionError::Other)?;
     Ok((
         id,
         DelegateAssignments {
@@ -184,18 +181,27 @@ fn insert_intent_snapshot(
     Ok(snapshot)
 }
 
+/// An `event_journal` row copied into a fork.
+struct JournalRow {
+    timestamp: i64,
+    origin: String,
+    source_node: Option<String>,
+    kind: String,
+    payload_json: String,
+}
+
 fn map_task_lifecycle_error(error: SessionError) -> SessionError {
     match error {
-        SessionError::DatabaseError(message) if message.contains("revision_conflict") => {
+        e if e.db_message_contains("revision_conflict") => {
             SessionError::InvalidOperation("task revision conflict".to_string())
         }
-        SessionError::DatabaseError(message) if message.contains("invalid_task_transition") => {
+        e if e.db_message_contains("invalid_task_transition") => {
             SessionError::InvalidOperation("invalid task status transition".to_string())
         }
-        SessionError::DatabaseError(message) if message.contains("current_task_conflict") => {
+        e if e.db_message_contains("current_task_conflict") => {
             SessionError::InvalidOperation("a different current task already exists".to_string())
         }
-        SessionError::DatabaseError(message) if message.contains("Query returned no rows") => {
+        SessionError::Database(rusqlite::Error::QueryReturnedNoRows) => {
             SessionError::TaskNotFound("task is not owned by this session".to_string())
         }
         other => other,
@@ -842,60 +848,44 @@ impl SessionStore for SqliteStorage {
                 .map(|(_, public_id, _, _, _, _)| public_id.clone())
                 .collect();
 
-            let conversational_events_to_copy: Vec<(String, i64, String, Option<String>, String, String)> = {
+            let conversational_events_to_copy: Vec<JournalRow> = {
                 let mut stmt = tx.prepare(
-                    "SELECT event_id, timestamp, origin, source_node, kind, payload_json \
+                    "SELECT timestamp, origin, source_node, kind, payload_json \
                      FROM event_journal \
                      WHERE session_id = ? \
                      ORDER BY stream_seq ASC",
                 )?;
 
-                let rows: Vec<(String, i64, String, Option<String>, String, String)> = stmt
+                let rows: Vec<JournalRow> = stmt
                     .query_map(params![source_session_public_id], |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                        ))
+                        Ok(JournalRow {
+                            timestamp: row.get(0)?,
+                            origin: row.get(1)?,
+                            source_node: row.get(2)?,
+                            kind: row.get(3)?,
+                            payload_json: row.get(4)?,
+                        })
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
 
+                // Allowlist: only prompts and assistant messages that belong
+                // to the copied message range. Rows that do not decode are
+                // dropped.
                 rows.into_iter()
-                    .filter(|(_, _, _, _, kind, payload_json)| {
-                        if kind == "prompt_received" {
-                            let parsed: serde_json::Value = match serde_json::from_str(payload_json) {
-                                Ok(value) => value,
-                                Err(_) => return false,
-                            };
-                            // payload_json uses adjacently tagged format: fields are under "data"
-                            let message_id = parsed
-                                .get("data")
-                                .and_then(|d| d.get("message_id"))
-                                .and_then(|id| id.as_str());
-                            return message_id
-                                .map(|id| copied_message_ids.contains(id))
-                                .unwrap_or(false);
+                    .filter(|row| {
+                        match serde_json::from_str::<AgentEventKind>(&row.payload_json) {
+                            Ok(
+                                AgentEventKind::PromptReceived {
+                                    message_id: Some(message_id),
+                                    ..
+                                }
+                                | AgentEventKind::AssistantMessageStored {
+                                    message_id: Some(message_id),
+                                    ..
+                                },
+                            ) => copied_message_ids.contains(&message_id),
+                            _ => false,
                         }
-
-                        if kind == "assistant_message_stored" {
-                            let parsed: serde_json::Value = match serde_json::from_str(payload_json) {
-                                Ok(value) => value,
-                                Err(_) => return false,
-                            };
-                            // payload_json uses adjacently tagged format: fields are under "data"
-                            let message_id = parsed
-                                .get("data")
-                                .and_then(|d| d.get("message_id"))
-                                .and_then(|id| id.as_str());
-                            return message_id
-                                .map(|id| copied_message_ids.contains(id))
-                                .unwrap_or(false);
-                        }
-
-                        false
                     })
                     .collect()
             };
@@ -970,9 +960,14 @@ impl SessionStore for SqliteStorage {
             // delegation telemetry) are intentionally excluded because replaying them in a fork can
             // create contradictory state and duplicate execution traces. The downside is inherited
             // UI telemetry before the fork point is intentionally partial.
-            for (index, (_event_id, timestamp, origin, source_node, kind, payload_json)) in
-                conversational_events_to_copy.into_iter().enumerate()
-            {
+            for (index, row) in conversational_events_to_copy.into_iter().enumerate() {
+                let JournalRow {
+                    timestamp,
+                    origin,
+                    source_node,
+                    kind,
+                    payload_json,
+                } = row;
                 // Copied events are numbered 1..n so the fork's own sequencer
                 // continues after them.
                 let session_seq = index as i64 + 1;
@@ -1164,14 +1159,12 @@ impl SessionStore for SqliteStorage {
         })
         .await
         .map_err(|e| match e {
-            SessionError::DatabaseError(message)
-                if message.contains("session_control_initialized") =>
-            {
+            e if e.db_message_contains("session_control_initialized") => {
                 SessionError::InvalidOperation(
                     "session LLM config must be changed through session control".to_string(),
                 )
             }
-            SessionError::DatabaseError(_) => SessionError::SessionNotFound(session_id.to_string()),
+            SessionError::Database(_) => SessionError::SessionNotFound(session_id.to_string()),
             _ => e,
         })
     }
@@ -1904,7 +1897,7 @@ impl SessionStore for SqliteStorage {
         })
         .await
         .map_err(|error| match error {
-            SessionError::DatabaseError(message) if message.contains("current_task_conflict") => {
+            e if e.db_message_contains("current_task_conflict") => {
                 SessionError::InvalidOperation("a different current task already exists".to_string())
             }
             other => other,
@@ -2085,7 +2078,7 @@ impl SessionStore for SqliteStorage {
         })
         .await
         .map_err(|error| match error {
-            SessionError::DatabaseError(message) if message.contains("Query returned no rows") => {
+            SessionError::Database(rusqlite::Error::QueryReturnedNoRows) => {
                 SessionError::SessionNotFound(session_id)
             }
             other => other,

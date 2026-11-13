@@ -1,5 +1,5 @@
 use crate::LocalAgentHandle;
-use crate::session::domain_schedule::{Schedule, ScheduleTrigger};
+use crate::session::domain_schedule::{Schedule, ScheduleState, ScheduleTrigger};
 use agent_client_protocol::Error;
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
@@ -14,7 +14,7 @@ pub struct ScheduleInfo {
     pub node_id: Option<String>,
     #[typeshare(serialized_as = "any")]
     pub trigger: serde_json::Value,
-    pub state: String,
+    pub state: ScheduleState,
     pub last_run_at: Option<String>,
     pub next_run_at: Option<String>,
     pub run_count: u32,
@@ -93,7 +93,7 @@ pub fn schedule_to_info(schedule: &Schedule, node_id: Option<&str>) -> ScheduleI
         session_public_id: schedule.session_public_id.clone(),
         node_id: node_id.map(ToOwned::to_owned),
         trigger: serde_json::to_value(&schedule.trigger).unwrap_or_default(),
-        state: schedule.state.to_string(),
+        state: schedule.state,
         last_run_at: schedule.last_run_at.and_then(|t| t.format(fmt).ok()),
         next_run_at: schedule.next_run_at.and_then(|t| t.format(fmt).ok()),
         run_count: schedule.run_count,
@@ -384,4 +384,44 @@ pub async fn schedule_action(
     )
     .await;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::domain_schedule::{ScheduleConfig, ScheduleState};
+    use time::OffsetDateTime;
+
+    #[test]
+    fn typed_state_fields_serialize_unchanged() {
+        for (state, wire) in [
+            (ScheduleState::Armed, "armed"),
+            (ScheduleState::Running, "running"),
+            (ScheduleState::Paused, "paused"),
+            (ScheduleState::Exhausted, "exhausted"),
+            (ScheduleState::Failed, "failed"),
+        ] {
+            let schedule = Schedule {
+                id: 0,
+                public_id: "s".into(),
+                task_public_id: "t".into(),
+                session_public_id: "x".into(),
+                task_id: 0,
+                session_id: 0,
+                trigger: ScheduleTrigger::Interval { seconds: 60 },
+                state,
+                last_run_at: None,
+                next_run_at: None,
+                run_count: 0,
+                consecutive_failures: 0,
+                config: ScheduleConfig::default(),
+                created_at: OffsetDateTime::now_utc(),
+                updated_at: OffsetDateTime::now_utc(),
+            };
+            let json = serde_json::to_value(schedule_to_info(&schedule, None)).unwrap();
+            assert_eq!(json["state"], wire);
+            let back: ScheduleInfo = serde_json::from_value(json).unwrap();
+            assert_eq!(back.state, state);
+        }
+    }
 }

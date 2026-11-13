@@ -911,6 +911,67 @@ async fn test_new_session_binds_requested_profile_from_querymt_meta() {
 }
 
 #[tokio::test]
+async fn deleting_a_profile_bound_session_discards_its_todo_list() {
+    use crate::tools::builtins::todo::{TodoItem, TodoPriority, TodoStatus};
+
+    let (f, _profile_dir) = profile_fixture_with_files(&[
+        ("alpha.toml", ALPHA_PROFILE_TOML),
+        ("beta.toml", BETA_PROFILE_TOML),
+    ])
+    .await;
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "querymt".to_string(),
+        serde_json::json!({ "profile_id": "beta" }),
+    );
+    let req = crate::acp::protocol::NewSessionRequest::new(std::path::PathBuf::new()).meta(meta);
+    let session_id = f
+        .handle
+        .new_session(req)
+        .await
+        .expect("new session")
+        .session_id
+        .to_string();
+
+    // The bound session runs with its runtime's own config, so its list lives
+    // in that runtime's store, not the main handle's.
+    let runtime = f
+        .handle
+        .profiles()
+        .expect("profiles configured")
+        .runtime_for_profile("beta")
+        .await
+        .unwrap();
+    let owner = runtime.session_handle(None).unwrap();
+    let owner = owner.as_any().downcast_ref::<LocalAgentHandle>().unwrap();
+    assert!(!Arc::ptr_eq(
+        &owner.config.todo_store,
+        &f.handle.config.todo_store
+    ));
+    owner.config.todo_store.replace(
+        &session_id,
+        vec![TodoItem {
+            id: "1".into(),
+            content: "leftover".into(),
+            status: TodoStatus::Pending,
+            priority: TodoPriority::Low,
+        }],
+    );
+
+    f.handle
+        .delete_session(crate::acp::protocol::DeleteSessionRequest::new(
+            session_id.clone(),
+        ))
+        .await
+        .expect("delete session");
+
+    assert!(
+        owner.config.todo_store.get(&session_id).is_empty(),
+        "profile runtime kept the deleted session's todo list"
+    );
+}
+
+#[tokio::test]
 async fn profile_reopen_preserves_the_owning_actor_and_event_sequence() {
     use crate::session::projection::EventJournal;
 

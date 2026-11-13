@@ -4,15 +4,16 @@ use super::{
     DotagentsDiagnostic, DotagentsDiagnosticCode, DotagentsLayer, DotagentsSource,
     DotagentsStrictness, DotagentsTask, DotagentsTaskKind, normalize_id,
 };
-use crate::session::{SessionError, SessionResult};
+use crate::session::SessionResult;
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use time::OffsetDateTime;
 
 const KEY_VERSION: &str = "v1";
@@ -184,17 +185,7 @@ impl SqliteDotagentsTaskStateRepository {
         F: FnOnce(&mut Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut guard = conn.lock().map_err(|error| {
-                SessionError::DatabaseError(format!("task state store lock poisoned: {error}"))
-            })?;
-            f(&mut guard).map_err(SessionError::from)
-        })
-        .await
-        .map_err(|error| {
-            SessionError::DatabaseError(format!("task state operation join failed: {error}"))
-        })?
+        crate::session::sqlite_storage::blocking::with_conn_sqlite(&self.conn, f).await
     }
 }
 
@@ -1908,7 +1899,7 @@ mod tests {
 
         // A user-created session, task, and schedule with no protocol key.
         {
-            let c = conn.lock().unwrap();
+            let c = conn.lock();
             c.execute(
                 "INSERT INTO sessions (public_id, name, created_at, updated_at) VALUES ('sess-user', 'user', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
                 [],
@@ -1947,7 +1938,7 @@ mod tests {
         // The user-created schedule is untouched: it carries no protocol source
         // key and was never a candidate.
         let user_schedules: i64 = {
-            let c = conn.lock().unwrap();
+            let c = conn.lock();
             c.query_row(
                 "SELECT COUNT(*) FROM schedules WHERE public_id = 'schedule-user'",
                 [],

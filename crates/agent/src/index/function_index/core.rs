@@ -1,5 +1,6 @@
 //! FunctionIndex struct and all impl methods
 
+use super::super::error::IndexError;
 use super::indexing::{
     collect_source_files, get_language_category, index_file_with_language, index_typescript_file,
     index_with_parser,
@@ -32,14 +33,12 @@ impl FunctionIndex {
     ///
     /// This scans all supported source files in the directory (respecting .gitignore)
     /// and extracts function definitions for indexing.
-    pub async fn build(root: &Path, config: FunctionIndexConfig) -> Result<Self, String> {
+    pub async fn build(root: &Path, config: FunctionIndexConfig) -> Result<Self, IndexError> {
         let root = root.to_path_buf();
         let config_clone = config.clone();
 
         // Run the CPU-intensive indexing in a blocking task
-        tokio::task::spawn_blocking(move || Self::build_sync(&root, config_clone))
-            .await
-            .map_err(|e| format!("Index build task panicked: {}", e))?
+        tokio::task::spawn_blocking(move || Self::build_sync(&root, config_clone)).await?
     }
 
     /// Synchronous build implementation
@@ -72,9 +71,9 @@ impl FunctionIndex {
             files_indexed = tracing::field::Empty,
         )
     )]
-    fn build_sync(root: &Path, config: FunctionIndexConfig) -> Result<Self, String> {
+    fn build_sync(root: &Path, config: FunctionIndexConfig) -> Result<Self, IndexError> {
         // Collect all supported source files
-        let files = collect_source_files(root)?;
+        let files = collect_source_files(root);
 
         tracing::Span::current().record("files_found", files.len());
 
@@ -89,10 +88,9 @@ impl FunctionIndex {
         // nested source files (the default 8 MB is not enough for some C/C++ headers).
         let pool = rayon::ThreadPoolBuilder::new()
             .stack_size(64 * 1024 * 1024)
-            .build()
-            .map_err(|e| format!("Failed to build rayon thread pool: {}", e))?;
+            .build()?;
 
-        let functions = pool.install(|| -> Result<HashMap<PathBuf, Vec<IndexedFunctionEntry>>, String> {
+        let functions = pool.install(|| -> Result<HashMap<PathBuf, Vec<IndexedFunctionEntry>>, IndexError> {
             let mut functions: HashMap<PathBuf, Vec<IndexedFunctionEntry>> = HashMap::new();
 
             // Read files in parallel and group by language.

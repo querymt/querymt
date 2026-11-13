@@ -682,7 +682,6 @@ async fn acp_pinned_filter_composes_before_paging_and_hydrates_local_pin_metadat
     {
         let conn = f.storage.conn_for_test();
         conn.lock()
-            .unwrap()
             .execute(
                 "UPDATE sessions SET updated_at = '2000-01-01T00:00:00Z' WHERE public_id = ?1",
                 rusqlite::params![oldest.public_id],

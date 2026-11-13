@@ -573,7 +573,7 @@ mod tests {
                 let session_id = session.public_id.clone();
                 move |actual| actual == session_id
             })
-            .returning(|_| Err(SessionError::DatabaseError("history unavailable".into())))
+            .returning(|_| Err(SessionError::Other("history unavailable".into())))
             .times(1);
         let (plugin_registry, _temp_dir) = empty_plugin_registry().unwrap();
         let provider = Arc::new(SessionProvider::new(
@@ -678,7 +678,7 @@ mod tests {
             _session_id: &str,
             _include_children: bool,
         ) -> SessionResult<AuditView> {
-            Err(SessionError::DatabaseError("no audit projection".into()))
+            Err(SessionError::Other("no audit projection".into()))
         }
 
         async fn get_redacted_view(

@@ -697,6 +697,7 @@ mod tests {
         );
         let exec = ExecutionContext::new(
             session.public_id.clone(),
+            crate::model::TurnId::new(),
             runtime,
             state,
             handle,
@@ -880,7 +881,7 @@ mod tests {
                     Ordering::SeqCst,
                 ) {
                     Ok(_) => {
-                        return Err(crate::session::error::SessionError::DatabaseError(
+                        return Err(crate::session::error::SessionError::Other(
                             "transient terminal read".into(),
                         ));
                     }
@@ -895,8 +896,8 @@ mod tests {
                 None => self.inner.load_delegation_terminals(session, ids).await,
             }
         }
-        fn max_session_seq_blocking(&self, session: &str) -> i64 {
-            self.inner.max_session_seq_blocking(session)
+        async fn max_session_seq(&self, session: &str) -> i64 {
+            self.inner.max_session_seq(session).await
         }
         async fn append_durable(
             &self,
@@ -1251,6 +1252,13 @@ mod tests {
             .await
             .insert("live".into());
         let mut rx = config.subscribe_events();
+        // The stream base resolves off the caller's path; wait for it so the
+        // ephemeral event below is published inline.
+        config
+            .event_sink
+            .session_stream(&exec.session_id)
+            .resolved_tip()
+            .await;
         config.event_sink.emit_ephemeral(
             &exec.session_id,
             AgentEventKind::DelegationCompleted {
@@ -1559,7 +1567,9 @@ mod tests {
             config.delegation_wait_policy = policy.clone();
             let gate = gated_sink(&mut config, usize::MAX);
             gate.failures.store(usize::MAX, Ordering::SeqCst);
-            let inbox = Arc::new(crate::agent::turn_control::SteeringInbox::new("run".into()));
+            let inbox = Arc::new(crate::agent::turn_control::SteeringInbox::new(
+                crate::model::TurnId::new(),
+            ));
             let exec = exec.with_steering(inbox.clone());
             let mut rx = config.subscribe_events();
             let wait = WaitCondition {

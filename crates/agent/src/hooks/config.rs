@@ -1,3 +1,4 @@
+use crate::hooks::error::HookConfigError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -155,15 +156,16 @@ fn validate_handler_fields(
     event: HookEventConfig,
     id: Option<&str>,
     additional_context_limit: Option<u32>,
-) -> anyhow::Result<()> {
+) -> Result<(), HookConfigError> {
     if id.is_some_and(|id| id.trim().is_empty()) {
-        anyhow::bail!("{} hook id must not be empty", event.label());
+        return Err(HookConfigError::EmptyId {
+            event: event.label(),
+        });
     }
     if additional_context_limit == Some(0) {
-        anyhow::bail!(
-            "{} hook additional_context_limit must be greater than zero",
-            event.label()
-        );
+        return Err(HookConfigError::ZeroContextLimit {
+            event: event.label(),
+        });
     }
     Ok(())
 }
@@ -193,11 +195,11 @@ impl HooksConfig {
         }
     }
 
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self) -> Result<(), HookConfigError> {
         if !self.extra.is_empty() {
             let mut keys: Vec<_> = self.extra.keys().cloned().collect();
             keys.sort();
-            anyhow::bail!("unsupported hook event(s): {}", keys.join(", "));
+            return Err(HookConfigError::UnsupportedEvents(keys.join(", ")));
         }
 
         for event in ALL_EVENTS {
@@ -205,28 +207,28 @@ impl HooksConfig {
                 // An invalid pattern would otherwise never match, silently
                 // disabling the hook.
                 if let Some(pattern) = group.matcher.as_deref().filter(|m| !m.trim().is_empty())
-                    && let Err(err) = regex::Regex::new(pattern)
+                    && let Err(source) = regex::Regex::new(pattern)
                 {
-                    anyhow::bail!(
-                        "{} matcher group {} has an invalid matcher regex `{}`: {}",
-                        event.label(),
-                        group_idx,
-                        pattern,
-                        err
-                    );
+                    return Err(HookConfigError::InvalidMatcher {
+                        event: event.label(),
+                        group: group_idx,
+                        pattern: pattern.to_string(),
+                        source,
+                    });
                 }
                 if group.hooks.is_empty() {
-                    anyhow::bail!(
-                        "{} matcher group {} must contain at least one hook",
-                        event.label(),
-                        group_idx
-                    );
+                    return Err(HookConfigError::EmptyGroup {
+                        event: event.label(),
+                        group: group_idx,
+                    });
                 }
                 for hook in &group.hooks {
                     match hook {
                         HookHandlerConfig::Command(cmd) => {
                             if cmd.command.trim().is_empty() {
-                                anyhow::bail!("{} hook command must not be empty", event.label());
+                                return Err(HookConfigError::EmptyCommand {
+                                    event: event.label(),
+                                });
                             }
                             validate_handler_fields(
                                 event,
@@ -242,16 +244,14 @@ impl HooksConfig {
                                     | HookEventConfig::PostToolUse
                                     | HookEventConfig::Context
                             ) {
-                                anyhow::bail!(
-                                    "{} does not have execution-scoped MCP access",
-                                    event.label()
-                                );
+                                return Err(HookConfigError::McpUnsupported {
+                                    event: event.label(),
+                                });
                             }
                             if mcp.server.trim().is_empty() || mcp.tool.trim().is_empty() {
-                                anyhow::bail!(
-                                    "{} MCP hook server and tool must not be empty",
-                                    event.label()
-                                );
+                                return Err(HookConfigError::EmptyMcpTarget {
+                                    event: event.label(),
+                                });
                             }
                             validate_handler_fields(
                                 event,

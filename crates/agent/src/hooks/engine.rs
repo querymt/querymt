@@ -1,6 +1,7 @@
 use crate::hooks::config::{
     HookCommandConfig, HookEventConfig, HookHandlerConfig, HookMcpToolConfig, HooksConfig,
 };
+use crate::hooks::error::HookError;
 use crate::hooks::output_parser::{
     ParsedDecision, ParsedPermissionDecision, parse_context, parse_delegation_failure,
     parse_delegation_start, parse_permission_request, parse_post_compaction, parse_post_delegation,
@@ -411,7 +412,7 @@ pub struct DelegationFailureResult {
 }
 
 impl Hooks {
-    pub fn new(config: HooksConfig) -> anyhow::Result<Self> {
+    pub fn new(config: HooksConfig) -> Result<Self, HookError> {
         config.validate()?;
         Ok(Self {
             config,
@@ -1090,7 +1091,7 @@ impl Hooks {
         Ok(result)
     }
 
-    pub async fn run_stop(&self, request: StopRequest) -> anyhow::Result<StopResult> {
+    pub async fn run_stop(&self, request: StopRequest) -> Result<StopResult, HookError> {
         if !self.is_enabled() {
             return Ok(StopResult::default());
         }
@@ -1573,7 +1574,7 @@ impl Hooks {
         input: &T,
         cwd: Option<&Path>,
         mcp_tool_state: Option<&Arc<crate::agent::core::McpToolState>>,
-    ) -> anyhow::Result<HookInvocationOutcome> {
+    ) -> Result<HookInvocationOutcome, HookError> {
         let stdin_json = serde_json::to_string(input)?;
         let started = Instant::now();
         let span = tracing::info_span!(
@@ -1632,19 +1633,17 @@ impl Hooks {
                 )),
                 notices,
             }),
-            Some(code) => anyhow::bail!(
-                "{} hook command '{}' failed with exit code {}: {}",
-                event.label(),
-                handler.id,
+            Some(code) => Err(HookError::Failed {
+                event: event.label(),
+                handler: handler.id.clone(),
                 code,
-                output.stderr.trim()
-            ),
-            None => anyhow::bail!(
-                "{} hook command '{}' terminated without an exit code: {}",
-                event.label(),
-                handler.id,
-                output.stderr.trim()
-            ),
+                stderr: output.stderr.trim().to_string(),
+            }),
+            None => Err(HookError::Terminated {
+                event: event.label(),
+                handler: handler.id.clone(),
+                stderr: output.stderr.trim().to_string(),
+            }),
         }
     }
 
@@ -1654,7 +1653,7 @@ impl Hooks {
         matcher: Option<&str>,
         input: T,
         cwd: Option<&Path>,
-    ) -> anyhow::Result<Vec<HookInvocationOutcome>> {
+    ) -> Result<Vec<HookInvocationOutcome>, HookError> {
         let mut outcomes = Vec::new();
         for handler in self.matching_handlers(event, matcher.as_slice()) {
             outcomes.push(
@@ -1676,15 +1675,12 @@ async fn run_mcp_hook<T: Serialize>(
     config: &HookMcpToolConfig,
     input: &T,
     mcp_tool_state: Option<&Arc<crate::agent::core::McpToolState>>,
-) -> anyhow::Result<CommandOutput> {
+) -> Result<CommandOutput, HookError> {
     use querymt::tool_decorator::CallFunctionTool;
 
-    let state = mcp_tool_state.ok_or_else(|| {
-        anyhow::anyhow!(
-            "MCP hook '{}.{}' has no execution-scoped MCP state",
-            config.server,
-            config.tool
-        )
+    let state = mcp_tool_state.ok_or_else(|| HookError::McpStateMissing {
+        server: config.server.clone(),
+        tool: config.tool.clone(),
     })?;
     let tool = state
         .load()
@@ -1692,16 +1688,15 @@ async fn run_mcp_hook<T: Serialize>(
         .get(&config.tool)
         .filter(|tool| tool.server_name() == config.server)
         .cloned()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "MCP hook tool '{}.{}' is not connected",
-                config.server,
-                config.tool
-            )
+        .ok_or_else(|| HookError::McpNotConnected {
+            server: config.server.clone(),
+            tool: config.tool.clone(),
         })?;
     let event_value = serde_json::to_value(input)?;
     let arguments = match &config.input {
-        Some(template) => resolve_mcp_input_template(template, &event_value)?,
+        Some(template) => {
+            resolve_mcp_input_template(template, &event_value).map_err(HookError::Mcp)?
+        }
         None => event_value,
     };
     let content = tokio::time::timeout(
@@ -1709,7 +1704,8 @@ async fn run_mcp_hook<T: Serialize>(
         tool.call(arguments),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("MCP hook timed out"))??;
+    .map_err(|_| HookError::McpTimeout)?
+    .map_err(HookError::Mcp)?;
     Ok(CommandOutput {
         exit_code: Some(0),
         stdout: flatten_content(&content),

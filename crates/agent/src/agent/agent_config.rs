@@ -117,6 +117,8 @@ pub struct AgentConfig {
     pub schedule_repository: Option<Arc<dyn crate::session::repo_schedule::ScheduleRepository>>,
     /// Knowledge store for the knowledge tools.
     pub knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
+    /// Per-session todo lists for the `todowrite` / `todoread` tools.
+    pub todo_store: Arc<crate::tools::builtins::todo::TodoStore>,
     /// Slash command registry for prompt expansion and ACP advertising.
     pub slash_command_registry: crate::slash_commands::SlashCommandRegistry,
     /// The slash command discovery configuration, retained so workspace-bound
@@ -232,10 +234,11 @@ impl AgentConfig {
 
     /// Publishes an ephemeral event and returns its `session_seq`, so a prompt
     /// response can be held until the event has been delivered.
-    pub fn emit_ephemeral_event(&self, session_id: &str, kind: AgentEventKind) -> i64 {
+    pub async fn emit_ephemeral_event(&self, session_id: &str, kind: AgentEventKind) -> i64 {
         self.event_sink
             .session_stream(session_id)
             .emit_ephemeral_seq(kind)
+            .await
     }
 
     /// Persists and publishes a durable event, returning the `DurableEvent`.

@@ -154,12 +154,12 @@ async fn run_stop_hook(
     config: &crate::agent::agent_config::AgentConfig,
     exec_ctx: &ExecutionContext,
     stop_reason: &str,
-) -> anyhow::Result<crate::hooks::StopResult> {
+) -> Result<crate::hooks::StopResult, crate::hooks::HookError> {
     let stop_hook = config
         .hooks
         .run_stop(StopRequest {
             session_id: exec_ctx.session_id.clone(),
-            turn_id: exec_ctx.turn_id_string(),
+            turn_id: exec_ctx.turn_id().to_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
                 .llm_config()
@@ -240,7 +240,7 @@ pub(crate) async fn apply_pending_steering(
             session_id: exec_ctx.session_id.clone(),
             role: querymt::chat::ChatRole::User,
             parts: vec![crate::model::MessagePart::Steering {
-                run_id: exec_ctx.turn_id_string(),
+                run_id: exec_ctx.turn_id().to_string(),
                 client_input_id: client_prompt_id.clone(),
                 blocks: blocks.clone(),
             }],
@@ -313,7 +313,7 @@ pub(crate) async fn apply_pending_steering(
             config.emit_event(
                 &exec_ctx.session_id,
                 AgentEventKind::ObjectiveUpdated {
-                    run_id: exec_ctx.turn_id_string(),
+                    run_id: exec_ctx.turn_id().to_string(),
                     revision,
                     source: "steering".to_string(),
                     source_ref: Some(input.input_id.clone()),
@@ -323,7 +323,7 @@ pub(crate) async fn apply_pending_steering(
         config.emit_event(
             &exec_ctx.session_id,
             AgentEventKind::SteeringApplied {
-                run_id: exec_ctx.turn_id_string(),
+                run_id: exec_ctx.turn_id().to_string(),
                 input_id: input.input_id,
                 boundary: boundary.to_string(),
                 latency_ms: crate::agent::turn_control::now_ms()
@@ -541,7 +541,7 @@ pub(crate) async fn execute_cycle_state_machine(
                     config.emit_event(
                         &exec_ctx.session_id,
                         AgentEventKind::ObjectiveCheckpoint {
-                            run_id: exec_ctx.turn_id_string(),
+                            run_id: exec_ctx.turn_id().to_string(),
                             reason: "periodic_progress_review".to_string(),
                             action: "review_progress".to_string(),
                             objective_revision: exec_ctx.run_objective.as_ref().map(|o| o.revision),
@@ -850,7 +850,7 @@ pub(crate) async fn execute_cycle_state_machine(
                                 config.emit_event(
                                     &exec_ctx.session_id,
                                     AgentEventKind::TaskCompletionGuardTriggered {
-                                        run_id: exec_ctx.turn_id_string(),
+                                        run_id: exec_ctx.turn_id().to_string(),
                                         task_id: task.public_id.clone(),
                                     },
                                 );
@@ -864,7 +864,7 @@ pub(crate) async fn execute_cycle_state_machine(
                             config.emit_event(
                                 &exec_ctx.session_id,
                                 AgentEventKind::TaskCompletionGuardExhausted {
-                                    run_id: exec_ctx.turn_id_string(),
+                                    run_id: exec_ctx.turn_id().to_string(),
                                     task_id: task.public_id.clone(),
                                 },
                             );
@@ -1230,7 +1230,7 @@ mod tests {
             crate::agent::core::McpToolState::empty(),
         );
         let steering = Arc::new(crate::agent::turn_control::SteeringInbox::new(
-            "run-1".to_string(),
+            crate::model::TurnId::new(),
         ));
         let blocks = vec![
             crate::acp::protocol::ContentBlock::Text(crate::acp::protocol::TextContent::new(
@@ -1254,12 +1254,12 @@ mod tests {
             .expect("queue steering");
         let mut exec_ctx = crate::agent::execution_context::ExecutionContext::new(
             session_id.clone(),
+            crate::model::TurnId::new(),
             runtime,
             runtime_context,
             session_handle,
             crate::agent::core::ToolConfig::default(),
         )
-        .with_turn_id(crate::model::TurnId::new())
         .with_steering(steering);
         let overrides = querymt::chat::GenerationOptions::NONE
             .with_max_tokens(128_000)
@@ -1274,7 +1274,7 @@ mod tests {
             )
             .with_request_overrides(overrides),
         );
-        let expected_run_id = exec_ctx.turn_id_string();
+        let expected_run_id = exec_ctx.turn_id().to_string();
         assert!(!expected_run_id.is_empty());
         let mut live_events = fixture.config.subscribe_events();
 
@@ -1386,7 +1386,7 @@ mod tests {
 
         let fixture = crate::test_utils::TestAgent::new().await;
         let steering = Arc::new(crate::agent::turn_control::SteeringInbox::new(
-            "run-1".into(),
+            crate::model::TurnId::new(),
         ));
         steering
             .push(
@@ -1398,11 +1398,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut exec_ctx = fixture
-            .execution_context()
-            .await
-            .with_turn_id(crate::model::TurnId::new())
-            .with_steering(steering);
+        let mut exec_ctx = fixture.execution_context().await.with_steering(steering);
         let assistant = ChatMessage::assistant()
             .tool_use("call-1", "read_file", json!({"path": "."}))
             .build();

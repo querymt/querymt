@@ -12,6 +12,7 @@
 //! | `row_parsers.rs`   | Shared SQLite row → domain-type helpers             |
 //! | `tests.rs`         | Integration tests                                   |
 
+pub(crate) mod blocking;
 mod event_journal;
 mod migrations;
 mod row_parsers;
@@ -21,9 +22,10 @@ mod view_store;
 #[cfg(test)]
 mod tests;
 
+use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::session::error::{SessionError, SessionResult};
 
@@ -154,8 +156,7 @@ impl SqliteStorage {
         F: FnOnce(&mut Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        self.run_blocking_session(move |conn| f(conn).map_err(SessionError::from))
-            .await
+        blocking::with_conn_sqlite(&self.conn, f).await
     }
 
     pub(super) async fn run_blocking_session<F, R>(&self, f: F) -> SessionResult<R>
@@ -163,13 +164,7 @@ impl SqliteStorage {
         F: FnOnce(&mut Connection) -> SessionResult<R> + Send + 'static,
         R: Send + 'static,
     {
-        let conn_arc = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = conn_arc.lock().unwrap();
-            f(&mut conn)
-        })
-        .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        blocking::with_conn(&self.conn, f).await
     }
 
     /// Helper: Resolve session public_id → internal i64
@@ -188,7 +183,7 @@ impl SqliteStorage {
         })
         .await
         .map_err(|err| match err {
-            SessionError::DatabaseError(msg) if msg.contains("Query returned no rows") => {
+            SessionError::Database(rusqlite::Error::QueryReturnedNoRows) => {
                 SessionError::SessionNotFound(error_value.clone())
             }
             other => other,
@@ -211,7 +206,7 @@ impl SqliteStorage {
         })
         .await
         .map_err(|err| match err {
-            SessionError::DatabaseError(msg) if msg.contains("Query returned no rows") => {
+            SessionError::Database(rusqlite::Error::QueryReturnedNoRows) => {
                 SessionError::InvalidOperation(format!("Message not found: {}", error_value))
             }
             other => other,

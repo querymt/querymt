@@ -281,7 +281,7 @@ async fn prepare_tool_call_inner(
             session_id: exec_ctx.session_id.clone(),
             mcp_server: target.server().map(str::to_owned),
             mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: exec_ctx.turn_id_string(),
+            turn_id: exec_ctx.turn_id().to_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
                 .llm_config()
@@ -493,7 +493,7 @@ async fn execute_prepared_inner(
             session_id: exec_ctx.session_id.clone(),
             mcp_server: target.server().map(str::to_owned),
             mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: exec_ctx.turn_id_string(),
+            turn_id: exec_ctx.turn_id().to_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
                 .llm_config()
@@ -1104,7 +1104,7 @@ async fn run_mcp_tool(
             call.function.name.clone(),
         );
         super::progress_sink::AgentProgressSink::new(super::progress_sink::THROTTLE, move |u| {
-            event_sink.session_stream(&session_id).emit_ephemeral_seq(
+            event_sink.session_stream(&session_id).emit_ephemeral(
                 AgentEventKind::ToolCallProgress {
                     tool_call_id: tool_call_id.clone(),
                     tool_name: tool_name.clone(),
@@ -1168,7 +1168,7 @@ fn tool_context_for_call(
 
     let event_sink = config.event_sink.clone();
     let session_id_clone = exec_ctx.session_id.clone();
-    let run_id_clone = exec_ctx.turn_id_string();
+    let run_id_clone = exec_ctx.turn_id().to_string();
     let tool_call_id_clone = call.id.clone();
     let pending_elicitations = config.pending_elicitations.clone();
     let cancellation_token = exec_ctx.cancellation_token.clone();
@@ -1232,6 +1232,7 @@ fn tool_context_for_call(
     exec_ctx
         .tool_context(config.agent_registry.clone(), Some(elicitation_tx))
         .with_workspace_service(config.workspace_service())
+        .with_todo_store(config.todo_store.clone())
         .with_session_store(exec_ctx.state.store.clone())
         .with_task_service(crate::session::TaskService::new(
             exec_ctx.state.store.clone(),
@@ -1353,7 +1354,7 @@ async fn decide_approval(
         return Ok(Approval::Denied(Denial::TaskInactive));
     }
 
-    let turn_id = exec_ctx.turn_id_string();
+    let turn_id = exec_ctx.turn_id().to_string();
     let hook_decision = config
         .hooks
         .run_permission_request(crate::hooks::PermissionRequestRequest {
@@ -1648,7 +1649,7 @@ pub(super) async fn record_tool_side_effects(
             .hooks
             .run_pre_delegation(PreDelegationRequest {
                 session_id: exec_ctx.session_id.clone(),
-                turn_id: exec_ctx.turn_id_string(),
+                turn_id: exec_ctx.turn_id().to_string(),
                 cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
                 model: exec_ctx
                     .llm_config()

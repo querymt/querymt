@@ -133,10 +133,7 @@ impl Tool for GetSymbolTool {
             .get("context_lines")
             .and_then(Value::as_u64)
             .unwrap_or(0) as usize;
-        let context_mode = args
-            .get("context_mode")
-            .and_then(Value::as_str)
-            .unwrap_or("none");
+        let context_mode = ContextMode::parse(args.get("context_mode").and_then(Value::as_str));
         let max_relevant = args
             .get("max_relevant_context_lines")
             .and_then(Value::as_u64)
@@ -264,6 +261,26 @@ fn append_file_result(
     }
 }
 
+/// How much surrounding context `get_symbol` renders. Matches the schema enum
+/// `none | lines | relevant`; an unrecognised value behaves like `lines`, as
+/// it always has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextMode {
+    None,
+    Lines,
+    Relevant,
+}
+
+impl ContextMode {
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            None | Some("none") => Self::None,
+            Some("relevant") => Self::Relevant,
+            Some(_) => Self::Lines,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_symbol_result(
     path: &Path,
@@ -274,7 +291,7 @@ fn render_symbol_result(
     kind: Option<SymbolKind>,
     occurrence: usize,
     context_lines: usize,
-    context_mode: &str,
+    context_mode: ContextMode,
     max_relevant: usize,
 ) -> String {
     if matches.is_empty() {
@@ -314,7 +331,7 @@ fn render_single_symbol(
     symbol_index: &SymbolIndex,
     symbol: &SymbolEntry,
     context_lines: usize,
-    context_mode: &str,
+    context_mode: ContextMode,
     max_relevant: usize,
 ) -> String {
     let lines: Vec<&str> = content.lines().collect();
@@ -333,7 +350,7 @@ fn render_single_symbol(
         digest.line_count
     );
 
-    let effective_context = if context_mode == "none" {
+    let effective_context = if context_mode == ContextMode::None {
         0
     } else {
         context_lines
@@ -346,7 +363,7 @@ fn render_single_symbol(
         body.push_str(&format!("{:05}| {}\n", idx + 1, line));
     }
 
-    if context_mode == "relevant" {
+    if context_mode == ContextMode::Relevant {
         let relevant_ctx = extract_relevant_context(content, symbol_index, symbol, max_relevant);
         if relevant_ctx.is_empty() {
             format!("{header}\n{body}")
@@ -481,6 +498,17 @@ fn all_symbols(symbols: &[SymbolEntry]) -> Vec<&SymbolEntry> {
 #[cfg(test)]
 mod tests {
     use crate::tools::FileAccess as Access;
+
+    #[test]
+    fn typed_state_fields_serialize_unchanged() {
+        use super::ContextMode;
+        assert_eq!(ContextMode::parse(None), ContextMode::None);
+        assert_eq!(ContextMode::parse(Some("none")), ContextMode::None);
+        assert_eq!(ContextMode::parse(Some("lines")), ContextMode::Lines);
+        assert_eq!(ContextMode::parse(Some("relevant")), ContextMode::Relevant);
+        // Unrecognised values keep behaving like `lines`.
+        assert_eq!(ContextMode::parse(Some("bogus")), ContextMode::Lines);
+    }
 
     #[test]
     fn file_access_reads_request_paths_for_array_and_single_object() {

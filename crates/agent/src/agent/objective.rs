@@ -79,7 +79,7 @@ pub enum CompletionDisposition {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunObjective {
-    pub run_id: String,
+    pub run_id: crate::model::TurnId,
     pub revision: ObjectiveRevision,
     pub run_instruction: ObjectiveDirective,
     pub amendments: Vec<ObjectiveAmendment>,
@@ -103,7 +103,7 @@ impl RunObjective {
     }
 
     pub fn new(
-        run_id: String,
+        run_id: crate::model::TurnId,
         instruction: String,
         execution_origin: String,
         current_task: Option<&Task>,
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn later_user_updates_render_in_order_without_historical_intent() {
         let mut objective = RunObjective::new(
-            "run-1".into(),
+            crate::model::TurnId::new(),
             "Inspect only".into(),
             "interactive".into(),
             None,
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn progress_review_does_not_narrow_scope() {
         let mut objective = RunObjective::new(
-            "run-1".into(),
+            crate::model::TurnId::new(),
             "Implement the fix".into(),
             "interactive".into(),
             None,
@@ -280,7 +280,7 @@ mod tests {
             updated_at: now,
         };
         let mut objective = RunObjective::new(
-            "run-1".into(),
+            crate::model::TurnId::new(),
             "Implement the fix".into(),
             "interactive".into(),
             Some(&task),

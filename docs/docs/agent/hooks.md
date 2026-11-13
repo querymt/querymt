@@ -118,7 +118,7 @@ Common input fields include:
 ```json
 {
   "session_id": "session-id",
-  "turn_id": "turn-id",
+  "turn_id": "3f2b8c1e-9d4a-4e6b-8a57-1c0d2e9f4b36",
   "transcript_path": null,
   "cwd": "/workspace",
   "hook_event_name": "pre_tool_use",
@@ -126,6 +126,8 @@ Common input fields include:
   "permission_mode": "plan"
 }
 ```
+
+`turn_id` is always a UUID string, never empty. A hook fired inside a run gets that run's id, the same one on the run's events, steering replies and snapshot records, so a hook can be correlated with the run it belongs to. This includes native `/compact` and maintenance compaction, which run as part of a run. Delegation hooks (`delegation_start`, `post_delegation`, `delegation_failure`) are not tied to an execution context and get a freshly generated UUID that no run shares.
 
 `permission_mode` is derived from the agent mode captured when the turn starts. If the user changes mode while a turn is running, hooks for that turn continue using the captured mode; the next turn uses the new mode.
 

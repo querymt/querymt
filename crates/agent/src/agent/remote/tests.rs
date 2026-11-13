@@ -1205,9 +1205,17 @@ mod node_manager_tests {
                 membership_token: foreign,
                 peer_id: subject.clone(),
             })
-            .await
-            .unwrap();
-        assert!(matches!(response, AdmissionResponse::Rejected { .. }));
+            .await;
+        assert!(
+            matches!(
+                response,
+                Err(kameo::error::SendError::HandlerError(
+                    crate::agent::remote::node_manager::AdmissionRejection::Denied(_)
+                        | crate::agent::remote::node_manager::AdmissionRejection::NotAMember
+                ))
+            ),
+            "{response:?}"
+        );
         assert!(!mesh.active_scopes().contains(&MeshScopeId::Iroh {
             mesh_id: foreign_scope
         }));
@@ -1219,9 +1227,16 @@ mod node_manager_tests {
                 membership_token: invalid,
                 peer_id: subject,
             })
-            .await
-            .unwrap();
-        assert!(matches!(response, AdmissionResponse::Rejected { .. }));
+            .await;
+        assert!(
+            matches!(
+                response,
+                Err(kameo::error::SendError::HandlerError(
+                    crate::agent::remote::node_manager::AdmissionRejection::Denied(_)
+                ))
+            ),
+            "{response:?}"
+        );
     }
 
     #[tokio::test]

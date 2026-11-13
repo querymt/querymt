@@ -209,6 +209,7 @@ impl TestHarness {
 
         let exec_ctx = ExecutionContext::new(
             session_id.clone(),
+            crate::model::TurnId::new(),
             session_runtime,
             runtime_context,
             context,
@@ -970,7 +971,7 @@ async fn completion_guard_does_not_continue_for_non_active_task() {
 async fn invalid_steering_conversion_does_not_persist_history() {
     let mut harness = TestHarness::new(vec![], None).await;
     let inbox = Arc::new(crate::agent::turn_control::SteeringInbox::new(
-        "run-1".to_string(),
+        crate::model::TurnId::new(),
     ));
     inbox
         .push(

@@ -792,6 +792,7 @@ impl TestHarness {
 
         let exec_ctx = ExecutionContext::new(
             session_id,
+            crate::model::TurnId::new(),
             session_runtime,
             runtime_context,
             context,

@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use typeshare::typeshare;
 
 /// Describes when a schedule should fire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +38,7 @@ pub struct EventTriggerFilter {
 }
 
 /// Schedule lifecycle state.
+#[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleState {

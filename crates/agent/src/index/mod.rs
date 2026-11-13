@@ -1,3 +1,4 @@
+pub mod error;
 pub mod file_index;
 pub mod function_index;
 pub mod merkle;
@@ -9,6 +10,7 @@ pub mod workspace_manager_actor;
 pub mod workspace_root;
 
 // Re-export commonly used types
+pub use error::IndexError;
 pub use file_index::{
     FileChangeKind, FileChangeSet, FileIndex, FileIndexConfig, FileIndexEntry, FileIndexError,
     FileIndexWatcher,
@@ -18,9 +20,7 @@ pub use function_index::{
 };
 pub use merkle::DiffPaths;
 pub use symbol_index::{SymbolEntry, SymbolError, SymbolIndex, SymbolKind, parse_kind_filter};
-pub use workspace_actor::{
-    WorkspaceHandle, WorkspaceIndexActor, WorkspaceIndexError, WorkspaceIndexStats,
-};
+pub use workspace_actor::{WorkspaceHandle, WorkspaceIndexActor, WorkspaceIndexStats};
 pub use workspace_manager_actor::{
     GetOrCreate, WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig,
     get_or_create_workspace_with_timeout,

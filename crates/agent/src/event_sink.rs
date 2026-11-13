@@ -110,22 +110,20 @@ impl EventSink {
             return stream.clone();
         }
 
-        // The journal lookup may wait on the storage connection, so it runs
-        // without the registry lock. It can be stale by the time the lock is
-        // retaken; the retained tip of a retired stream covers that case.
-        let durable_base = self.journal.max_session_seq_blocking(session_id).max(0);
-
+        // No I/O here: the stream's writer task resolves the durable base off
+        // the caller's thread. `retired_tip` covers numbers consumed by
+        // ephemeral events of a previous stream.
         let mut registry = self.streams.lock();
         // A concurrent caller may have created the stream meanwhile.
         if let Some(stream) = registry.live.get(session_id) {
             return stream.clone();
         }
         let retired_tip = registry.retired_tips.remove(session_id).unwrap_or(0);
-        let stream = SessionEventStream::with_base(
+        let stream = SessionEventStream::open(
             session_id,
             self.journal.clone(),
             self.fanout.clone(),
-            durable_base.max(retired_tip),
+            retired_tip,
         );
         registry.live.insert(session_id.to_string(), stream.clone());
         stream
@@ -774,7 +772,7 @@ mod tests {
                 &self,
                 _event: &NewDurableEvent,
             ) -> SessionResult<DurableEvent> {
-                Err(SessionError::DatabaseError("simulated DB failure".into()))
+                Err(SessionError::Other("simulated DB failure".into()))
             }
 
             async fn load_session_stream(
@@ -993,5 +991,127 @@ mod tests {
             AgentEventKind::PromptReceived { .. }
         ));
         assert!(!serde_json::to_string(&journal).unwrap().contains("AQID"));
+    }
+
+    // ── stream opening (session-storage-reliability) ───────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_opens_while_the_connection_is_busy() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let sink = EventSink::new(storage.event_journal(), Arc::new(EventFanout::new()));
+
+        // Hold the connection on another thread until `released` is set.
+        let released = Arc::new(AtomicBool::new(false));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let conn = storage.conn();
+        let flag = released.clone();
+        let holder = std::thread::spawn(move || {
+            let guard = conn.lock();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            flag.store(true, Ordering::SeqCst);
+            drop(guard);
+        });
+        held_rx.recv().unwrap();
+
+        // A sibling task on the single-threaded runtime must keep running.
+        let sibling_ran = Arc::new(AtomicBool::new(false));
+        let ran = sibling_ran.clone();
+        tokio::spawn(async move { ran.store(true, Ordering::SeqCst) });
+
+        let stream = sink.session_stream("s-busy");
+        stream.emit(AgentEventKind::Cancelled);
+        tokio::task::yield_now().await;
+
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "opening the stream waited for the busy connection"
+        );
+        assert!(
+            sibling_ran.load(Ordering::SeqCst),
+            "sibling task did not run while the stream opened"
+        );
+
+        // Once the connection frees up, the held event is numbered from 1.
+        stream.flush().await;
+        assert_eq!(stream.resolved_tip().await, 1);
+        holder.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reopened_stream_continues_numbering() {
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let first = EventSink::new(storage.event_journal(), Arc::new(EventFanout::new()));
+        for _ in 0..3 {
+            first
+                .emit_durable("s-reopen", AgentEventKind::Cancelled)
+                .await
+                .unwrap();
+        }
+        drop(first);
+
+        // A fresh sink over the same journal models a new process.
+        let second = EventSink::new(storage.event_journal(), Arc::new(EventFanout::new()));
+        let next = second
+            .emit_durable("s-reopen", AgentEventKind::Cancelled)
+            .await
+            .unwrap();
+        assert_eq!(next.session_seq, 4);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_emitted_before_base_resolves_is_numbered_after_the_journal() {
+        use crate::events::EventEnvelope;
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let first = EventSink::new(storage.event_journal(), Arc::new(EventFanout::new()));
+        for _ in 0..3 {
+            first
+                .emit_durable("s-race", AgentEventKind::Cancelled)
+                .await
+                .unwrap();
+        }
+        drop(first);
+
+        // Reopen over the same journal while the connection is busy, so the
+        // writer cannot have read the persisted maximum (3) yet.
+        let fanout = Arc::new(EventFanout::new());
+        let mut rx = fanout.subscribe();
+        let second = EventSink::new(storage.event_journal(), fanout);
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let conn = storage.conn();
+        let holder = std::thread::spawn(move || {
+            let guard = conn.lock();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(guard);
+        });
+        held_rx.recv().unwrap();
+
+        let stream = second.session_stream("s-race");
+        stream.emit_ephemeral(AgentEventKind::Cancelled);
+        tokio::task::yield_now().await;
+
+        // Nothing is published while the base is unknown: a relative number
+        // of 1 would otherwise reach clients below the journal's 3.
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "event was published before the stream base resolved"
+        );
+
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("event is published once the base resolves")
+            .unwrap();
+        let EventEnvelope::Ephemeral(event) = envelope else {
+            panic!("expected the ephemeral event");
+        };
+        assert_eq!(event.session_seq, 4);
+        assert_eq!(stream.resolved_tip().await, 4);
+        holder.join().unwrap();
     }
 }

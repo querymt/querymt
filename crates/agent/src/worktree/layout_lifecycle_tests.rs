@@ -35,9 +35,10 @@ use crate::worktree::repo_workspace::SqliteWorkspaceRepository;
 use crate::worktree::service::WorkspaceService;
 use crate::worktree::session_options::SessionCreationOptions;
 use crate::worktree::test_support::{commit_files, init_repo_with_subdir, materialize};
+use parking_lot::Mutex;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tempfile::TempDir;
 
 // -- fixtures ---------------------------------------------------------------

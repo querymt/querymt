@@ -125,6 +125,7 @@ impl TestAgent {
             crate::agent::core::SessionRuntime::new(cwd, Default::default(), mcp_tool_state);
         crate::agent::execution_context::ExecutionContext::new(
             session_id,
+            crate::model::TurnId::new(),
             runtime,
             state,
             session_handle,

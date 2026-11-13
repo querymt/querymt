@@ -187,12 +187,12 @@ pub(crate) mod tests {
     impl EventJournal for Switchable {
         async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent> {
             if self.fail.load(Ordering::SeqCst) {
-                return Err(SessionError::DatabaseError("injected".into()));
+                return Err(SessionError::Other("injected".into()));
             }
             self.inner.append_durable(event).await
         }
-        fn max_session_seq_blocking(&self, s: &str) -> i64 {
-            self.inner.max_session_seq_blocking(s)
+        async fn max_session_seq(&self, s: &str) -> i64 {
+            self.inner.max_session_seq(s).await
         }
         async fn load_session_stream(
             &self,

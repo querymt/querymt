@@ -1,4 +1,5 @@
 use crate::acp::protocol::ContentBlock;
+use crate::model::TurnId;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -64,9 +65,9 @@ pub enum TurnControlError {
     #[error("expected_run_id is required for steering")]
     ExpectedRunIdRequired,
     #[error("active run mismatch: expected {expected}, active {active}")]
-    RunMismatch { expected: String, active: String },
+    RunMismatch { expected: TurnId, active: TurnId },
     #[error("run {run_id} is closing and no longer accepts steering")]
-    RunClosing { run_id: String },
+    RunClosing { run_id: TurnId },
     #[error("steering queue is full")]
     QueueFull,
     #[error("steering input is too large ({bytes} bytes, maximum {max_bytes})")]
@@ -109,13 +110,13 @@ struct SteeringInboxState {
 
 #[derive(Debug)]
 pub struct SteeringInbox {
-    run_id: String,
+    run_id: TurnId,
     state: Mutex<SteeringInboxState>,
     changed: Notify,
 }
 
 impl SteeringInbox {
-    pub fn new(run_id: String) -> Self {
+    pub fn new(run_id: TurnId) -> Self {
         Self {
             run_id,
             state: Mutex::new(SteeringInboxState {
@@ -151,7 +152,7 @@ impl SteeringInbox {
         let mut state = self.state.lock().await;
         if !state.accepting {
             return Err(TurnControlError::RunClosing {
-                run_id: self.run_id.clone(),
+                run_id: self.run_id,
             });
         }
         if state.pending.len() >= MAX_STEERING_MESSAGES
@@ -200,7 +201,7 @@ impl SteeringInbox {
 
 #[derive(Debug, Clone)]
 pub struct ActiveRun {
-    pub run_id: String,
+    pub run_id: TurnId,
     pub generation: u64,
     pub cancellation: CancellationToken,
     pub steering: Arc<SteeringInbox>,
@@ -209,9 +210,9 @@ pub struct ActiveRun {
 }
 
 impl ActiveRun {
-    pub fn new(run_id: String, generation: u64, cancellation: CancellationToken) -> Self {
+    pub fn new(run_id: TurnId, generation: u64, cancellation: CancellationToken) -> Self {
         Self {
-            steering: Arc::new(SteeringInbox::new(run_id.clone())),
+            steering: Arc::new(SteeringInbox::new(run_id)),
             run_id,
             generation,
             cancellation,
@@ -241,7 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbox_preserves_order_and_closes_atomically() {
-        let inbox = SteeringInbox::new("run-1".to_string());
+        let inbox = SteeringInbox::new(TurnId::new());
         assert_eq!(inbox.push("a".into(), None, text("one")).await.unwrap(), 1);
         assert_eq!(inbox.push("b".into(), None, text("two")).await.unwrap(), 2);
         let drained = inbox.begin_closing_and_drain().await;
@@ -260,7 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbox_rejects_slash_commands() {
-        let inbox = SteeringInbox::new("run-1".to_string());
+        let inbox = SteeringInbox::new(TurnId::new());
         assert_eq!(
             inbox
                 .push("a".into(), None, text(" /compact"))

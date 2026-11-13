@@ -317,6 +317,8 @@ impl LocalAgentHandle {
             .map_err(|e| Error::internal_error().data(serde_json::json!({"error": e.to_string()})))?
             .is_some();
         if !exists {
+            // No row to delete, but a list may still be held in memory.
+            self.discard_session_todos(&session_id).await;
             self.clear_delegate_model_overrides(&session_id).await;
             if let Some(profiles) = self.profiles() {
                 profiles.forget_session_binding(&session_id).await;
@@ -328,6 +330,7 @@ impl LocalAgentHandle {
             Error::internal_error().data(serde_json::json!({"error": e.to_string()}))
         })?;
         self.config.remove_run_lease_file(&session_id);
+        self.discard_session_todos(&session_id).await;
         drop(delete_guard);
         if store.supports_session_pins() {
             crate::control::notifications::emit_session_pins_changed_notification(

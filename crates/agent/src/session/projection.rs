@@ -210,9 +210,8 @@ pub trait EventJournal: Send + Sync {
     }
 
     /// Highest producer `session_seq` persisted for a session (0 when none).
-    /// Synchronous because a session's sequence counter is created at emit
-    /// time, which is not async; it runs once per session per process.
-    fn max_session_seq_blocking(&self, _session_id: &str) -> i64 {
+    /// Read once per session per process, when its event stream opens.
+    async fn max_session_seq(&self, _session_id: &str) -> i64 {
         0
     }
 

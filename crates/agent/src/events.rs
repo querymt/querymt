@@ -993,6 +993,130 @@ pub enum AgentEventKind {
     },
 }
 
+impl AgentEventKind {
+    pub const RUN_STARTED_TAG: &'static str = "run_started";
+    pub const RUN_COMPLETED_TAG: &'static str = "run_completed";
+    pub const DELEGATION_COMPLETED_TAG: &'static str = "delegation_completed";
+    pub const DELEGATION_FAILED_TAG: &'static str = "delegation_failed";
+    pub const DELEGATION_CANCELLED_TAG: &'static str = "delegation_cancelled";
+    pub const LLM_REQUEST_END_TAG: &'static str = "llm_request_end";
+    pub const PROVIDER_CHANGED_TAG: &'static str = "provider_changed";
+    pub const LLM_ATTEMPT_STARTED_TAG: &'static str = "llm_attempt_started";
+    pub const LLM_ATTEMPT_SETTLED_TAG: &'static str = "llm_attempt_settled";
+    pub const PROMPT_RECEIVED_TAG: &'static str = "prompt_received";
+    pub const ASSISTANT_MESSAGE_STORED_TAG: &'static str = "assistant_message_stored";
+
+    /// The serde `"type"` tag of this event kind, as stored in the journal's
+    /// `kind` column. The match is exhaustive so a new variant must add its
+    /// tag here; `event_kind_tag_matches_serde_tag` checks it against serde.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::SessionCreated => "session_created",
+            Self::RuntimeChanged { .. } => "runtime_changed",
+            Self::DelegationStageChanged { .. } => "delegation_stage_changed",
+            Self::SessionWorkspaceBound { .. } => "session_workspace_bound",
+            Self::PromptReceived { .. } => "prompt_received",
+            Self::UserPromptBlock { .. } => "user_prompt_block",
+            Self::UserMessageStored { .. } => "user_message_stored",
+            Self::TurnStarted => "turn_started",
+            Self::RunStarted { .. } => "run_started",
+            Self::RunCompleted { .. } => "run_completed",
+            Self::SteeringAccepted { .. } => "steering_accepted",
+            Self::SteeringApplied { .. } => "steering_applied",
+            Self::SteeringDiscarded { .. } => "steering_discarded",
+            Self::InputQueued { .. } => "input_queued",
+            Self::QueuedInputStarted { .. } => "queued_input_started",
+            Self::QueuedInputDiscarded { .. } => "queued_input_discarded",
+            Self::ObjectiveInitialized { .. } => "objective_initialized",
+            Self::ObjectiveUpdated { .. } => "objective_updated",
+            Self::ObjectiveCheckpoint { .. } => "objective_checkpoint",
+            Self::TaskCompletionGuardTriggered { .. } => "task_completion_guard_triggered",
+            Self::TaskCompletionGuardExhausted { .. } => "task_completion_guard_exhausted",
+            Self::AssistantMessageStored { .. } => "assistant_message_stored",
+            Self::AssistantContentDelta { .. } => "assistant_content_delta",
+            Self::AssistantThinkingDelta { .. } => "assistant_thinking_delta",
+            Self::RemoteStreamDisconnected { .. } => "remote_stream_disconnected",
+            Self::RemoteStreamReconnected { .. } => "remote_stream_reconnected",
+            Self::RemoteSessionDisconnected { .. } => "remote_session_disconnected",
+            Self::RemoteSessionSyncCompleted { .. } => "remote_session_sync_completed",
+            Self::RemoteProviderHeartbeat { .. } => "remote_provider_heartbeat",
+            Self::StreamRecovering { .. } => "stream_recovering",
+            Self::LlmRequestStart { .. } => "llm_request_start",
+            Self::LlmRequestEnd { .. } => "llm_request_end",
+            Self::ProviderChanged { .. } => "provider_changed",
+            Self::ToolCallStart { .. } => "tool_call_start",
+            Self::ToolCallEnd { .. } => "tool_call_end",
+            Self::ToolCallProgress { .. } => "tool_call_progress",
+            Self::McpServerAuthRequired { .. } => "mcp_server_auth_required",
+            Self::HookNotice { .. } => "hook_notice",
+            Self::SnapshotStart { .. } => "snapshot_start",
+            Self::SnapshotEnd { .. } => "snapshot_end",
+            Self::CompactionStart { .. } => "compaction_start",
+            Self::CompactionEnd { .. } => "compaction_end",
+            Self::CompactionSummaryChunk { .. } => "compaction_summary_chunk",
+            Self::CompactionFailed { .. } => "compaction_failed",
+            Self::MiddlewareInjected { .. } => "middleware_injected",
+            Self::MiddlewareStopped { .. } => "middleware_stopped",
+            Self::OutputLimitRecovery { .. } => "output_limit_recovery",
+            Self::SessionQueued { .. } => "session_queued",
+            Self::SessionStopRequested => "session_stop_requested",
+            Self::SessionForceStopped { .. } => "session_force_stopped",
+            Self::Cancelled => "cancelled",
+            Self::Error { .. } => "error",
+            Self::IntentUpdated { .. } => "intent_updated",
+            Self::TaskCreated { .. } => "task_created",
+            Self::TaskUpdated { .. } => "task_updated",
+            Self::TaskStatusChanged { .. } => "task_status_changed",
+            Self::DecisionRecorded { .. } => "decision_recorded",
+            Self::AlternativeRecorded { .. } => "alternative_recorded",
+            Self::AlternativeDiscarded { .. } => "alternative_discarded",
+            Self::ProgressRecorded { .. } => "progress_recorded",
+            Self::ArtifactRecorded { .. } => "artifact_recorded",
+            Self::DelegateModelsChanged { .. } => "delegate_models_changed",
+            Self::WorktreeCommandOutput { .. } => "worktree_command_output",
+            Self::WorktreeOwnershipTransferred { .. } => "worktree_ownership_transferred",
+            Self::WorktreeArchived { .. } => "worktree_archived",
+            Self::DelegationRequested { .. } => "delegation_requested",
+            Self::DelegationCompleted { .. } => "delegation_completed",
+            Self::DelegationFailed { .. } => "delegation_failed",
+            Self::DelegationCancelled { .. } => "delegation_cancelled",
+            Self::DelegationCancelRequested { .. } => "delegation_cancel_requested",
+            Self::UncertaintyEscalated { .. } => "uncertainty_escalated",
+            Self::PermissionRequested { .. } => "permission_requested",
+            Self::PermissionGranted { .. } => "permission_granted",
+            Self::ElicitationRequested { .. } => "elicitation_requested",
+            Self::SessionForked { .. } => "session_forked",
+            Self::SessionConfigured { .. } => "session_configured",
+            Self::ToolsAvailable { .. } => "tools_available",
+            Self::DuplicateCodeDetected { .. } => "duplicate_code_detected",
+            Self::ModeChanged { .. } => "mode_changed",
+            Self::SessionModeChanged { .. } => "session_mode_changed",
+            Self::SessionConfigChanged { .. } => "session_config_changed",
+            Self::SessionMetadataUpdated { .. } => "session_metadata_updated",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::RateLimitResume { .. } => "rate_limit_resume",
+            Self::LlmRetryWait { .. } => "llm_retry_wait",
+            Self::LlmRetryResume { .. } => "llm_retry_resume",
+            Self::WorkspaceIndexReady { .. } => "workspace_index_ready",
+            Self::ScheduleCreated { .. } => "schedule_created",
+            Self::ScheduleFired { .. } => "schedule_fired",
+            Self::ScheduleCycleCompleted { .. } => "schedule_cycle_completed",
+            Self::ScheduleCycleFailed { .. } => "schedule_cycle_failed",
+            Self::SchedulePaused { .. } => "schedule_paused",
+            Self::ScheduleResumed { .. } => "schedule_resumed",
+            Self::ScheduleExhausted { .. } => "schedule_exhausted",
+            Self::ScheduleFailed { .. } => "schedule_failed",
+            Self::ScheduledExecutionCompleted { .. } => "scheduled_execution_completed",
+            Self::ScheduledExecutionFailed { .. } => "scheduled_execution_failed",
+            Self::ScheduleDebounceCompleted { .. } => "schedule_debounce_completed",
+            Self::KnowledgeIngested { .. } => "knowledge_ingested",
+            Self::KnowledgeConsolidated { .. } => "knowledge_consolidated",
+            Self::LlmAttemptStarted { .. } => "llm_attempt_started",
+            Self::LlmAttemptSettled { .. } => "llm_attempt_settled",
+        }
+    }
+}
+
 // ============================================================================
 // Event Bus Refactor: Durability classification + Envelope types
 // ============================================================================
@@ -1224,6 +1348,780 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One JSON value per `AgentEventKind` variant. Deserializing the value
+    /// proves the variant exists; `tag()` must then equal the serde tag.
+    fn one_value_per_variant() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({ "type": "session_created" }),
+            serde_json::json!({
+                "type": "runtime_changed",
+                "data": {
+                    "runtime": {"phase":"idle","active_run_id":null,"steerable":false,"pending_steering_count":0,"queued_input_count":0,"run_started_at_ms":null,"observation":{"availability":"inactive"},"delegation_activity":[]}
+                }
+            }),
+            serde_json::json!({
+                "type": "delegation_stage_changed",
+                "data": {
+                    "delegation_id": "x",
+                    "stage": null,
+                    "source_epoch": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "session_workspace_bound",
+                "data": {
+                    "workspace": {"workspace_id":"w","repository_id":"r","source_cwd":"/","project_name":"p","checkout_path":"/c","branch":"b","baseline_mode":"commit","baseline_commit":null,"lifecycle":"ready","last_error":null},
+                    "cwd": null
+                }
+            }),
+            serde_json::json!({
+                "type": "prompt_received",
+                "data": {
+                    "content": "x",
+                    "message_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "user_prompt_block",
+                "data": {
+                    "message_id": "x",
+                    "client_prompt_id": null,
+                    "block": {"type":"text","text":"x"}
+                }
+            }),
+            serde_json::json!({
+                "type": "user_message_stored",
+                "data": {
+                    "content": "x"
+                }
+            }),
+            serde_json::json!({ "type": "turn_started" }),
+            serde_json::json!({
+                "type": "run_started",
+                "data": {
+                    "run_id": "x",
+                    "origin": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "run_completed",
+                "data": {
+                    "run_id": "x",
+                    "outcome": "x",
+                    "stop_type": null,
+                    "reason": null
+                }
+            }),
+            serde_json::json!({
+                "type": "steering_accepted",
+                "data": {
+                    "run_id": "x",
+                    "input_id": "x",
+                    "position": 0,
+                    "blocks": [],
+                    "accepted_at_ms": null
+                }
+            }),
+            serde_json::json!({
+                "type": "steering_applied",
+                "data": {
+                    "run_id": "x",
+                    "input_id": "x",
+                    "boundary": "x",
+                    "latency_ms": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "steering_discarded",
+                "data": {
+                    "run_id": "x",
+                    "input_id": "x",
+                    "reason": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "input_queued",
+                "data": {
+                    "input_id": "x",
+                    "position": 0,
+                    "blocks": [],
+                    "accepted_at_ms": null
+                }
+            }),
+            serde_json::json!({
+                "type": "queued_input_started",
+                "data": {
+                    "input_id": "x",
+                    "run_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "queued_input_discarded",
+                "data": {
+                    "input_id": "x",
+                    "reason": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "objective_initialized",
+                "data": {
+                    "run_id": "x",
+                    "revision": 0,
+                    "source": "x",
+                    "source_ref": null
+                }
+            }),
+            serde_json::json!({
+                "type": "objective_updated",
+                "data": {
+                    "run_id": "x",
+                    "revision": 0,
+                    "source": "x",
+                    "source_ref": null
+                }
+            }),
+            serde_json::json!({
+                "type": "objective_checkpoint",
+                "data": {
+                    "run_id": "x",
+                    "reason": "x",
+                    "action": "x",
+                    "objective_revision": null,
+                    "current_task_id": null,
+                    "current_task_revision": null
+                }
+            }),
+            serde_json::json!({
+                "type": "task_completion_guard_triggered",
+                "data": {
+                    "run_id": "x",
+                    "task_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "task_completion_guard_exhausted",
+                "data": {
+                    "run_id": "x",
+                    "task_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant_message_stored",
+                "data": {
+                    "content": "x",
+                    "thinking": null,
+                    "reasoning_parts": [],
+                    "message_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant_content_delta",
+                "data": {
+                    "content": "x",
+                    "message_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant_thinking_delta",
+                "data": {
+                    "content": "x",
+                    "message_id": "x",
+                    "part_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "remote_stream_disconnected",
+                "data": {
+                    "message": "x",
+                    "message_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "remote_stream_reconnected",
+                "data": {
+                    "message": "x",
+                    "message_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "remote_session_disconnected",
+                "data": {
+                    "message": "x",
+                    "node_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "remote_session_sync_completed",
+                "data": {
+                    "backfilled": 0,
+                    "boundary": false,
+                    "node_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "remote_provider_heartbeat",
+                "data": {
+                    "phase": "x",
+                    "elapsed_ms": 0,
+                    "idle_ms": 0,
+                    "chunk_count": 0,
+                    "message_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "stream_recovering",
+                "data": {
+                    "message": "x",
+                    "attempt": 0,
+                    "max_attempts": 0,
+                    "message_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "llm_request_start",
+                "data": {
+                    "message_count": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "llm_request_end",
+                "data": {
+                    "usage": null,
+                    "tool_calls": 0,
+                    "finish_reason": null,
+                    "cost_usd": null,
+                    "cumulative_cost_usd": null,
+                    "context_tokens": 0,
+                    "metrics": {"steps":0,"turns":0},
+                    "accounting": null
+                }
+            }),
+            serde_json::json!({
+                "type": "provider_changed",
+                "data": {
+                    "provider": "x",
+                    "model": "x",
+                    "config_id": 0,
+                    "context_limit": null,
+                    "provider_node_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "tool_call_start",
+                "data": {
+                    "tool_call_id": "x",
+                    "tool_name": "x",
+                    "arguments": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "tool_call_end",
+                "data": {
+                    "tool_call_id": "x",
+                    "tool_name": "x",
+                    "is_error": false,
+                    "result": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "tool_call_progress",
+                "data": {
+                    "tool_call_id": "x",
+                    "tool_name": "x",
+                    "progress": null,
+                    "total": null,
+                    "message": null
+                }
+            }),
+            serde_json::json!({
+                "type": "mcp_server_auth_required",
+                "data": {
+                    "server_name": "x",
+                    "provider_id": "x",
+                    "error": null
+                }
+            }),
+            serde_json::json!({
+                "type": "hook_notice",
+                "data": {
+                    "event_name": "x",
+                    "message": "x",
+                    "is_error": false
+                }
+            }),
+            serde_json::json!({
+                "type": "snapshot_start",
+                "data": {
+                    "policy": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "snapshot_end",
+                "data": {
+                    "summary": null
+                }
+            }),
+            serde_json::json!({
+                "type": "compaction_start",
+                "data": {
+                    "token_estimate": 0,
+                    "compaction_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "compaction_end",
+                "data": {
+                    "summary": "x",
+                    "summary_len": 0,
+                    "compaction_id": null,
+                    "context_tokens": null
+                }
+            }),
+            serde_json::json!({
+                "type": "compaction_summary_chunk",
+                "data": {
+                    "compaction_id": "x",
+                    "content": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "compaction_failed",
+                "data": {
+                    "compaction_id": "x",
+                    "reason": "x",
+                    "cancelled": false
+                }
+            }),
+            serde_json::json!({
+                "type": "middleware_injected",
+                "data": {
+                    "message": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "middleware_stopped",
+                "data": {
+                    "stop_type": "step_limit",
+                    "reason": "x",
+                    "metrics": {"steps":0,"turns":0}
+                }
+            }),
+            serde_json::json!({
+                "type": "output_limit_recovery",
+                "data": {
+                    "turn": 0,
+                    "attempt": 0,
+                    "action": "escalate",
+                    "from_max_tokens": null,
+                    "to_max_tokens": null,
+                    "thinking_only": false,
+                    "discarded_message_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "session_queued",
+                "data": {
+                    "reason": "x"
+                }
+            }),
+            serde_json::json!({ "type": "session_stop_requested" }),
+            serde_json::json!({
+                "type": "session_force_stopped",
+                "data": {
+                    "escalated_after_ms": 0,
+                    "reason": "x"
+                }
+            }),
+            serde_json::json!({ "type": "cancelled" }),
+            serde_json::json!({
+                "type": "error",
+                "data": {
+                    "message": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "intent_updated",
+                "data": {
+                    "intent_snapshot": {"summary":"s","constraints":null,"next_step_hint":null,"revision":0,"source":"x","source_ref":null,"created_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "task_created",
+                "data": {
+                    "task": {"public_id":"t","kind":"finite","status":"active","expected_deliverable":null,"acceptance_criteria":null,"revision":0,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "task_updated",
+                "data": {
+                    "task": {"public_id":"t","kind":"finite","status":"active","expected_deliverable":null,"acceptance_criteria":null,"revision":0,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "task_status_changed",
+                "data": {
+                    "task": {"public_id":"t","kind":"finite","status":"active","expected_deliverable":null,"acceptance_criteria":null,"revision":0,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "decision_recorded",
+                "data": {
+                    "decision": {"description":"d","rationale":null,"status":"accepted","created_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "alternative_recorded",
+                "data": {
+                    "alternative": {"description":"d","status":"active","created_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "alternative_discarded",
+                "data": {
+                    "alternative_id": 0,
+                    "task_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "progress_recorded",
+                "data": {
+                    "progress_entry": {"kind":"tool_call","content":"c","metadata":null,"created_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "artifact_recorded",
+                "data": {
+                    "artifact": {"kind":"k","uri":null,"path":null,"summary":null,"created_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "delegate_models_changed",
+                "data": {
+                    "revision": null
+                }
+            }),
+            serde_json::json!({
+                "type": "worktree_command_output",
+                "data": {
+                    "text": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "worktree_ownership_transferred",
+                "data": {
+                    "workspace_id": "x",
+                    "successor_session_id": "x",
+                    "summary_seeded": false
+                }
+            }),
+            serde_json::json!({
+                "type": "worktree_archived",
+                "data": {
+                    "workspace_id": "x",
+                    "by_session_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "delegation_requested",
+                "data": {
+                    "delegation": {"public_id":"d","target_agent_id":"a","objective":"o","objective_hash":"0000000000000000","context":null,"constraints":null,"expected_output":null,"verification_spec":null,"planning_summary":null,"status":"requested","retry_count":0,"created_at":"2026-01-01T00:00:00Z","completed_at":null},
+                    "batch_id": null,
+                    "tool_call_id": null,
+                    "cycle_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "delegation_completed",
+                "data": {
+                    "delegation_id": "x",
+                    "result": null
+                }
+            }),
+            serde_json::json!({
+                "type": "delegation_failed",
+                "data": {
+                    "delegation_id": "x",
+                    "error": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "delegation_cancelled",
+                "data": {
+                    "delegation_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "delegation_cancel_requested",
+                "data": {
+                    "delegation_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "uncertainty_escalated",
+                "data": {
+                    "task_id": null,
+                    "description": "x",
+                    "options": []
+                }
+            }),
+            serde_json::json!({
+                "type": "permission_requested",
+                "data": {
+                    "permission_id": "x",
+                    "task_id": null,
+                    "tool_name": "x",
+                    "reason": "x",
+                    "tool_call_id": "x",
+                    "request": null
+                }
+            }),
+            serde_json::json!({
+                "type": "permission_granted",
+                "data": {
+                    "permission_id": "x",
+                    "granted": false
+                }
+            }),
+            serde_json::json!({
+                "type": "elicitation_requested",
+                "data": {
+                    "elicitation_id": "x",
+                    "session_id": "x",
+                    "message": "x",
+                    "requested_schema": null,
+                    "source": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "session_forked",
+                "data": {
+                    "parent_session_id": "x",
+                    "child_session_id": "x",
+                    "target_agent_id": "x",
+                    "origin": "user",
+                    "fork_point_type": "message_index",
+                    "fork_point_ref": "x",
+                    "instructions": null,
+                    "selected_model_id": null,
+                    "selected_provider_node_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "session_configured",
+                "data": {
+                    "cwd": null,
+                    "mcp_servers": [],
+                    "limits": null
+                }
+            }),
+            serde_json::json!({
+                "type": "tools_available",
+                "data": {
+                    "tools": [],
+                    "tools_hash": "0000000000000000"
+                }
+            }),
+            serde_json::json!({
+                "type": "duplicate_code_detected",
+                "data": {
+                    "warnings": [],
+                    "overflow_path": null
+                }
+            }),
+            serde_json::json!({
+                "type": "mode_changed",
+                "data": {
+                    "mode": "x",
+                    "previous_mode": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "session_mode_changed",
+                "data": {
+                    "mode": "build"
+                }
+            }),
+            serde_json::json!({
+                "type": "session_config_changed",
+                "data": {
+                    "mode": "build",
+                    "reasoning_effort": null
+                }
+            }),
+            serde_json::json!({
+                "type": "session_metadata_updated",
+                "data": {
+                    "title": null,
+                    "updated_at": null
+                }
+            }),
+            serde_json::json!({
+                "type": "rate_limited",
+                "data": {
+                    "message": "x",
+                    "wait_secs": 0,
+                    "started_at": 0,
+                    "attempt": 0,
+                    "max_attempts": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "rate_limit_resume",
+                "data": {
+                    "attempt": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "llm_retry_wait",
+                "data": {
+                    "message": "x",
+                    "wait_secs": 0,
+                    "started_at": 0,
+                    "attempt": 0,
+                    "max_attempts": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "llm_retry_resume",
+                "data": {
+                    "attempt": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "workspace_index_ready",
+                "data": {
+                    "workspace_root": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_created",
+                "data": {
+                    "schedule_public_id": "x",
+                    "session_public_id": "x",
+                    "task_public_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_fired",
+                "data": {
+                    "schedule_public_id": "x",
+                    "session_public_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_cycle_completed",
+                "data": {
+                    "schedule_public_id": "x",
+                    "turn_id": "x",
+                    "run_count": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_cycle_failed",
+                "data": {
+                    "schedule_public_id": "x",
+                    "turn_id": null,
+                    "error": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_paused",
+                "data": {
+                    "schedule_public_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_resumed",
+                "data": {
+                    "schedule_public_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_exhausted",
+                "data": {
+                    "schedule_public_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_failed",
+                "data": {
+                    "schedule_public_id": "x",
+                    "consecutive_failures": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "scheduled_execution_completed",
+                "data": {
+                    "schedule_public_id": "x",
+                    "turn_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "scheduled_execution_failed",
+                "data": {
+                    "schedule_public_id": "x",
+                    "turn_id": null,
+                    "error": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_debounce_completed",
+                "data": {
+                    "schedule_public_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "knowledge_ingested",
+                "data": {
+                    "scope": "x",
+                    "entry_public_id": "x",
+                    "source": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "knowledge_consolidated",
+                "data": {
+                    "scope": "x",
+                    "consolidation_public_id": "x",
+                    "source_count": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "llm_attempt_started",
+                "data": {
+                    "start": serde_json::to_value(crate::accounting::tests::sample_start()).unwrap()
+                }
+            }),
+            serde_json::json!({
+                "type": "llm_attempt_settled",
+                "data": {
+                    "settlement": serde_json::to_value(crate::accounting::tests::sample_settlement()).unwrap()
+                }
+            }),
+        ]
+    }
+
+    #[test]
+    fn event_kind_tag_matches_serde_tag() {
+        let samples = one_value_per_variant();
+        // Update when a variant is added: `tag()`'s exhaustive match forces
+        // the new tag, and this count forces a sample for it.
+        assert_eq!(samples.len(), 102, "one sample per AgentEventKind variant");
+        let mut seen = std::collections::HashSet::new();
+        for sample in samples {
+            let expected = sample["type"].as_str().unwrap().to_string();
+            let kind: AgentEventKind = serde_json::from_value(sample.clone())
+                .unwrap_or_else(|err| panic!("sample for {expected} does not decode: {err}"));
+            let serialized = serde_json::to_value(&kind).unwrap();
+            assert_eq!(serialized["type"], expected.as_str());
+            assert_eq!(kind.tag(), expected, "tag() disagrees with the serde tag");
+            assert!(
+                seen.insert(expected.clone()),
+                "duplicate sample for {expected}"
+            );
+        }
+    }
 
     #[test]
     fn mcp_stdio_info_preserves_config_wire_shape() {

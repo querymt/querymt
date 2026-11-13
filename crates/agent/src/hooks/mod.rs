@@ -1,5 +1,6 @@
 pub mod config;
 pub mod engine;
+pub mod error;
 pub mod output_parser;
 pub mod runner;
 pub mod schema;
@@ -21,6 +22,7 @@ pub use engine::{
     SessionEndRequest, SessionEndResult, SessionStartRequest, SessionStartResult, StopRequest,
     StopResult, UpdatedDelegation, UserPromptSubmitRequest, UserPromptSubmitResult,
 };
+pub use error::{HookConfigError, HookError};
 
 pub fn permission_mode_label(mode: crate::agent::core::AgentMode) -> &'static str {
     match mode {

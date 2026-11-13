@@ -14,10 +14,11 @@ use crate::worktree::domain::{
     WorkspaceOwnership, WorkspaceRecord,
 };
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use time::OffsetDateTime;
 
 /// Durable registry of managed workspaces.
@@ -173,14 +174,10 @@ impl SqliteWorkspaceRepository {
         F: FnOnce(&mut Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        let conn_arc = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = conn_arc.lock().unwrap();
-            f(&mut conn)
+        crate::session::sqlite_storage::blocking::with_conn(&self.conn, move |conn| {
+            f(conn).map_err(map_workspace_db_error)
         })
         .await
-        .map_err(|e| SessionError::Other(format!("Workspace task execution failed: {}", e)))?
-        .map_err(map_workspace_db_error)
     }
 }
 
@@ -871,7 +868,7 @@ mod tests {
         let public_id = public_id.to_string();
         let conn = repo.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock();
             conn.execute(
                 "INSERT INTO sessions (public_id, name, created_at, updated_at) \
                  VALUES (?1, 'test', '2026-01-15T00:00:00Z', '2026-01-15T00:00:00Z')",

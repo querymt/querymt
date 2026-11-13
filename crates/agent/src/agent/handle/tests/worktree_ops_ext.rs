@@ -250,14 +250,14 @@ impl crate::session::projection::EventJournal for AnnouncementRejectingJournal {
             crate::events::AgentEventKind::WorktreeOwnershipTransferred { .. }
                 | crate::events::AgentEventKind::WorktreeArchived { .. }
         ) {
-            return Err(crate::session::error::SessionError::DatabaseError(
+            return Err(crate::session::error::SessionError::Other(
                 "simulated announcement failure".into(),
             ));
         }
         self.0.append_durable(event).await
     }
-    fn max_session_seq_blocking(&self, session_id: &str) -> i64 {
-        self.0.max_session_seq_blocking(session_id)
+    async fn max_session_seq(&self, session_id: &str) -> i64 {
+        self.0.max_session_seq(session_id).await
     }
     async fn load_session_stream(
         &self,

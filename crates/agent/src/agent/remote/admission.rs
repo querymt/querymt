@@ -13,8 +13,11 @@ use libp2p::PeerId;
 
 use super::invite::PeerEntry;
 use super::mesh::MeshHandle;
-use super::node_manager::{AdmissionRequest, AdmissionResponse, RemoteNodeManager};
+use super::node_manager::{
+    AdmissionRejection, AdmissionRequest, AdmissionResponse, RemoteNodeManager,
+};
 use super::scope::{MeshScopeId, scoped_node_manager_for_peer};
+use kameo::error::RemoteSendError;
 
 #[derive(Debug, Clone)]
 pub(crate) struct AdmissionPolicy {
@@ -84,6 +87,14 @@ pub(crate) enum AdmissionError {
     Persistence(String),
 }
 
+impl From<AdmissionRejection> for AdmissionError {
+    fn from(rejection: AdmissionRejection) -> Self {
+        Self::Rejected {
+            reason: rejection.to_string(),
+        }
+    }
+}
+
 impl AdmissionError {
     pub(crate) fn transport(error: impl fmt::Display) -> Self {
         Self::Transport(error.to_string())
@@ -149,7 +160,10 @@ impl AdmissionTransport for MeshAdmissionTransport {
         target
             .ask::<AdmissionRequest>(&request)
             .await
-            .map_err(AdmissionError::transport)
+            .map_err(|error| match error {
+                RemoteSendError::HandlerError(rejection) => AdmissionError::from(rejection),
+                other => AdmissionError::transport(other),
+            })
     }
 }
 
@@ -304,6 +318,23 @@ pub(crate) fn admission_candidates(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn rejection_round_trips_over_msgpack_and_maps_to_rejected() {
+        for rejection in [
+            AdmissionRejection::NoMeshHandle,
+            AdmissionRejection::NotAMember,
+            AdmissionRejection::Denied("invite expired".into()),
+        ] {
+            let bytes = rmp_serde::to_vec(&rejection).unwrap();
+            let back: AdmissionRejection = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(back, rejection);
+            let error = AdmissionError::from(back);
+            assert!(
+                matches!(&error, AdmissionError::Rejected { reason } if *reason == rejection.to_string())
+            );
+        }
+    }
     use super::*;
     use parking_lot::Mutex;
     use std::collections::{HashMap, VecDeque};

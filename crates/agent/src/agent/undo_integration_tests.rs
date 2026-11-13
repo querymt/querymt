@@ -1004,7 +1004,7 @@ async fn test_fork_undo_treats_inherited_foreign_snapshots_as_context_only() -> 
 
     {
         let conn = fixture.storage.conn();
-        let conn = conn.lock().unwrap();
+        let conn = conn.lock();
         conn.execute(
             "UPDATE sessions SET cwd = ? WHERE public_id = ?",
             rusqlite::params![
@@ -1110,7 +1110,7 @@ async fn test_fork_undo_from_subdirectory_cwd_is_context_only() -> Result<()> {
 
     {
         let conn = fixture.storage.conn();
-        let conn = conn.lock().unwrap();
+        let conn = conn.lock();
         conn.execute(
             "UPDATE sessions SET cwd = ? WHERE public_id = ?",
             rusqlite::params![
@@ -1822,7 +1822,7 @@ async fn redo_to_a_pruned_snapshot_keeps_its_frame() -> Result<()> {
 // ==================== self-contained turn records ====================
 
 /// Binds the mock LLM config to `session`, so a real prompt can run.
-async fn bind_mock_llm(fixture: &UndoTestFixture, session: &str) -> Result<()> {
+pub(crate) async fn bind_mock_llm(fixture: &UndoTestFixture, session: &str) -> Result<()> {
     let store = fixture.storage.session_store();
     let llm_config = store
         .create_or_get_llm_config(
@@ -1837,7 +1837,7 @@ async fn bind_mock_llm(fixture: &UndoTestFixture, session: &str) -> Result<()> {
 
 /// A mock that answers the first request with one `delete_file` call and
 /// the request carrying the tool result with plain text.
-fn deleting_provider(path: &str) -> crate::test_utils::SharedLlmProvider {
+pub(crate) fn deleting_provider(path: &str) -> crate::test_utils::SharedLlmProvider {
     use crate::test_utils::{MockChatResponse, MockLlmProvider, SharedLlmProvider};
     use crate::tools::{Tool, builtins::DeleteFileTool};
 

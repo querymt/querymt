@@ -4,10 +4,11 @@ use crate::session::domain::{Delegation, DelegationClaim, DelegationStatus};
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::repository::DelegationRepository;
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -27,14 +28,7 @@ impl SqliteDelegationRepository {
         F: FnOnce(&mut Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        let conn_arc = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = conn_arc.lock().unwrap();
-            f(&mut conn)
-        })
-        .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
+        crate::session::sqlite_storage::blocking::with_conn_sqlite(&self.conn, f).await
     }
 
     async fn resolve_session_internal_id(&self, session_public_id: &str) -> SessionResult<i64> {
@@ -51,7 +45,7 @@ impl SqliteDelegationRepository {
             .await
         {
             Ok(id) => Ok(id),
-            Err(SessionError::DatabaseError(msg)) if msg.contains("Query returned no rows") => {
+            Err(SessionError::Other(msg)) if msg.contains("Query returned no rows") => {
                 Err(SessionError::SessionNotFound(error_value))
             }
             Err(e) => Err(e),
@@ -279,7 +273,7 @@ impl DelegationRepository for SqliteDelegationRepository {
         })
         .await
         .map_err(|e| match e {
-            SessionError::DatabaseError(_) => SessionError::DelegationNotFound(delegation_id),
+            SessionError::Database(_) => SessionError::DelegationNotFound(delegation_id),
             _ => e,
         })
     }
@@ -316,7 +310,7 @@ impl DelegationRepository for SqliteDelegationRepository {
         })
         .await
         .map_err(|e| match e {
-            SessionError::DatabaseError(_) => {
+            SessionError::Database(_) => {
                 SessionError::DelegationNotFound(delegation.public_id)
             }
             _ => e,

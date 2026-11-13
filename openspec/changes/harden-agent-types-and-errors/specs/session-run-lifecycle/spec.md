@@ -14,12 +14,12 @@ Every local prompt run SHALL have exactly one identifier, a lowercase hyphenated
 - **THEN** the steering result's `run_id` equals that run's run-start event `run_id`
 
 ### Requirement: Hook payloads never carry an empty turn id
-Every hook command input SHALL carry a non-empty `turn_id` that parses as a UUID. Hooks fired by work that runs outside a prompt run, such as a native `/compact` command, SHALL receive a turn id minted for that work.
+Every hook command input SHALL carry a non-empty `turn_id` that parses as a UUID. A hook fired by work inside a prompt run, including a native `/compact` command, SHALL receive that run's id. A hook with no execution context, such as a delegation hook, SHALL receive a freshly minted turn id.
 
 #### Scenario: Hook fired inside a run gets the run's id
 - **WHEN** a stop hook fires at the end of a prompt run
 - **THEN** its input `turn_id` equals that run's `run_id`
 
-#### Scenario: Hook fired outside a run gets a fresh id
-- **WHEN** a compaction hook fires because of a native `/compact` command with no active run
-- **THEN** its input `turn_id` is a non-empty UUID string
+#### Scenario: Native compact hook gets its prompt's run id
+- **WHEN** a compaction hook fires because of a native `/compact` command
+- **THEN** its input `turn_id` equals the `run_id` of the run that `/compact` prompt started

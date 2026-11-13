@@ -3,6 +3,7 @@
 //! Manages a pool of `WorkspaceIndexActor` instances, one per workspace root.
 //! TTL-based eviction is performed on each `GetOrCreate` call.
 
+use super::error::IndexError;
 use super::file_index::FileIndexConfig;
 use super::function_index::FunctionIndexConfig;
 use super::workspace_actor::{WorkspaceHandle, WorkspaceIndexActor};
@@ -96,7 +97,7 @@ impl WorkspaceIndexManagerActor {
 pub async fn get_or_create_workspace_with_timeout(
     manager: &ActorRef<WorkspaceIndexManagerActor>,
     root: PathBuf,
-) -> Result<WorkspaceHandle, SendError<GetOrCreate, String>> {
+) -> Result<WorkspaceHandle, SendError<GetOrCreate, IndexError>> {
     manager
         .ask(GetOrCreate { root })
         .mailbox_timeout(WorkspaceIndexManagerActor::GET_OR_CREATE_MAILBOX_TIMEOUT)
@@ -110,7 +111,7 @@ pub async fn get_or_create_workspace_with_timeout(
 // ---------------------------------------------------------------------------
 
 impl Message<GetOrCreate> for WorkspaceIndexManagerActor {
-    type Reply = Result<WorkspaceHandle, String>;
+    type Reply = Result<WorkspaceHandle, IndexError>;
 
     async fn handle(
         &mut self,
@@ -137,8 +138,7 @@ impl Message<GetOrCreate> for WorkspaceIndexManagerActor {
             FileIndexConfig::default(),
             FunctionIndexConfig::default(),
         )
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
 
         self.indexes.insert(
             root,

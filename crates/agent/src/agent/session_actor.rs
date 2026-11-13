@@ -386,7 +386,7 @@ impl SessionActor {
         };
         SessionRuntimeStatus {
             phase,
-            active_run_id: self.active_run.as_ref().map(|run| run.run_id.clone()),
+            active_run_id: self.active_run.as_ref().map(|run| run.run_id.to_string()),
             steerable: self
                 .active_run
                 .as_ref()
@@ -611,8 +611,8 @@ impl SessionActor {
         self.turn_state.token = CancellationToken::new();
         let generation = self.turn_state.generation;
         let turn_id = crate::model::TurnId::new();
-        let run_id = turn_id.to_string();
-        let active_run = ActiveRun::new(run_id.clone(), generation, self.turn_state.token.clone());
+        let run_id = turn_id;
+        let active_run = ActiveRun::new(run_id, generation, self.turn_state.token.clone());
         let steering = active_run.steering.clone();
         self.active_run = Some(active_run);
         self.emit_runtime_changed(0);
@@ -620,7 +620,7 @@ impl SessionActor {
         self.config.emit_event(
             &self.session_id,
             AgentEventKind::RunStarted {
-                run_id: run_id.clone(),
+                run_id: run_id.to_string(),
                 origin: "interactive".to_string(),
             },
         );
@@ -629,20 +629,20 @@ impl SessionActor {
                 &self.session_id,
                 AgentEventKind::QueuedInputStarted {
                     input_id,
-                    run_id: run_id.clone(),
+                    run_id: run_id.to_string(),
                 },
             );
         }
 
         let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel();
         let phase_actor = actor_ref.clone();
-        let phase_run_id = run_id.clone();
+        let phase_run_id = run_id;
         tokio::spawn(async move {
             while let Some(phase) = phase_rx.recv().await {
                 if phase_actor
                     .tell(RunPhaseChanged {
                         generation,
-                        run_id: phase_run_id.clone(),
+                        run_id: phase_run_id,
                         phase,
                     })
                     .await
@@ -662,8 +662,8 @@ impl SessionActor {
             // delivered every update of this prompt.
             let run = execute_prompt_detached(exec).await;
             let disposition = run_disposition(completion_token.is_cancelled(), &run);
-            let result = run
-                .map(|run| crate::acp::delivery::with_event_tip(run.response, event_stream.tip()));
+            let tip = event_stream.resolved_tip().await;
+            let result = run.map(|run| crate::acp::delivery::with_event_tip(run.response, tip));
             let _ = reply.send(result);
             let _ = actor_ref
                 .tell(PromptFinished {
@@ -733,7 +733,7 @@ impl Message<Cancel> for SessionActor {
         }
         if let Some(run) = &mut self.active_run {
             run.phase = RunPhase::Closing;
-            let run_id = run.run_id.clone();
+            let run_id = run.run_id.to_string();
             for input in run.steering.discard().await {
                 self.config.emit_event(
                     &self.session_id,
@@ -817,7 +817,7 @@ impl Message<PromptFinished> for SessionActor {
             .emit_event_persisted(
                 &self.session_id,
                 AgentEventKind::RunCompleted {
-                    run_id: msg.run_id,
+                    run_id: msg.run_id.to_string(),
                     outcome: outcome.into(),
                     stop_type,
                     reason,
@@ -2212,15 +2212,17 @@ impl Message<SubmitSessionInput> for SessionActor {
                 let expected = input
                     .expected_run_id
                     .ok_or_else(|| AgentError::from(TurnControlError::ExpectedRunIdRequired))?;
+                // A non-UUID expected id never matches the active run.
+                let expected = crate::model::TurnId::from_stored(&expected);
                 if expected != run.run_id {
                     return Err(AgentError::from(TurnControlError::RunMismatch {
                         expected,
-                        active: run.run_id.clone(),
+                        active: run.run_id,
                     }));
                 }
                 if run.phase == RunPhase::Closing {
                     return Err(AgentError::from(TurnControlError::RunClosing {
-                        run_id: run.run_id.clone(),
+                        run_id: run.run_id,
                     }));
                 }
                 let blocks = input.prompt.clone();
@@ -2242,7 +2244,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                 self.config.emit_event(
                     &self.session_id,
                     AgentEventKind::SteeringAccepted {
-                        run_id: run.run_id.clone(),
+                        run_id: run.run_id.to_string(),
                         input_id: input_id.clone(),
                         position,
                         blocks,
@@ -2250,7 +2252,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                     },
                 );
                 let result = SubmitInputResult::Steered {
-                    run_id: run.run_id.clone(),
+                    run_id: run.run_id.to_string(),
                     input_id,
                     position,
                 };
@@ -2292,7 +2294,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                     let run_id = self
                         .active_run
                         .as_ref()
-                        .map(|run| run.run_id.clone())
+                        .map(|run| run.run_id.to_string())
                         .unwrap_or_default();
                     let result = SubmitInputResult::Started { run_id, input_id };
                     self.record_submit_receipt(input.client_input_id, &result);
@@ -2477,13 +2479,10 @@ impl Message<ScheduledPrompt> for SessionActor {
         self.turn_state.generation = self.turn_state.generation.saturating_add(1);
         let prompt_generation = self.turn_state.generation;
         let turn_id = crate::model::TurnId::new();
-        let run_id = turn_id.to_string();
+        let run_id = turn_id;
         self.turn_state.token = CancellationToken::new();
-        let scheduled_run = ActiveRun::new(
-            run_id.clone(),
-            prompt_generation,
-            self.turn_state.token.clone(),
-        );
+        let scheduled_run =
+            ActiveRun::new(run_id, prompt_generation, self.turn_state.token.clone());
         let steering = scheduled_run.steering.clone();
         self.active_run = Some(scheduled_run);
         self.emit_runtime_changed(0);
@@ -2507,13 +2506,13 @@ impl Message<ScheduledPrompt> for SessionActor {
         let actor_ref = ctx.actor_ref().clone();
         let (phase_reporter, mut phase_rx) = tokio::sync::mpsc::unbounded_channel();
         let phase_actor = actor_ref.clone();
-        let phase_run_id = run_id.clone();
+        let phase_run_id = run_id;
         tokio::spawn(async move {
             while let Some(phase) = phase_rx.recv().await {
                 if phase_actor
                     .tell(RunPhaseChanged {
                         generation: prompt_generation,
-                        run_id: phase_run_id.clone(),
+                        run_id: phase_run_id,
                         phase,
                     })
                     .await
@@ -2551,7 +2550,8 @@ impl Message<ScheduledPrompt> for SessionActor {
                 .await;
 
                 // Emit explicit scheduled terminal events for SchedulerActor correlation
-                let turn_id = Uuid::new_v4().to_string();
+                // The run's own id, so scheduler correlation matches the run events.
+                let turn_id = run_id.to_string();
                 match &result {
                     Ok(_) => {
                         config.emit_event(
@@ -2843,7 +2843,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         steering,
         phase_reporter,
     } = exec;
-    let run_id = turn_id.to_string();
+    let run_id = turn_id;
     debug!(
         "Prompt request for session {} with {} block(s)",
         session_id,
@@ -2960,6 +2960,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     // The knowledge store is propagated so knowledge tools can access it.
     let mut exec_ctx = ExecutionContext::new(
         session_id.clone(),
+        turn_id,
         runtime.clone(),
         runtime_context,
         session_handle,
@@ -2973,7 +2974,6 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         runtime.managed_checkout.get().copied().unwrap_or(false),
         config.workspace_query_bridge_for_session(&session_id),
     ))
-    .with_turn_id(turn_id)
     .with_turn_mode(mode)
     .with_steering(steering)
     .with_phase_reporter(phase_reporter)
@@ -3085,7 +3085,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         .hooks
         .run_user_prompt_submit(crate::hooks::UserPromptSubmitRequest {
             session_id: session_id.clone(),
-            turn_id: run_id.clone(),
+            turn_id: run_id.to_string(),
             cwd: exec_ctx.cwd().map(|p| p.to_path_buf()),
             model: exec_ctx
                 .llm_config()
@@ -3203,7 +3203,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         }
     };
     let objective = crate::agent::objective::RunObjective::new(
-        run_id.clone(),
+        run_id,
         normalized_run_instruction(&req.prompt),
         origin_label,
         objective_task,
@@ -3212,7 +3212,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     config.emit_event(
         &session_id,
         AgentEventKind::ObjectiveInitialized {
-            run_id: run_id.clone(),
+            run_id: run_id.to_string(),
             revision: objective.revision,
             source: "run_prompt".to_string(),
             source_ref: Some(message_id.clone()),
@@ -3604,7 +3604,7 @@ mod tests {
                 req,
                 trace_turn_id,
                 Arc::new(crate::agent::turn_control::SteeringInbox::new(
-                    trace_turn_id.to_string(),
+                    trace_turn_id,
                 )),
                 tokio::sync::mpsc::unbounded_channel().0,
             );
@@ -3704,7 +3704,7 @@ mod tests {
     impl EventJournal for FailNextAppendJournal {
         async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent> {
             if self.fail_next_append.swap(false, Ordering::SeqCst) {
-                return Err(SessionError::DatabaseError(
+                return Err(SessionError::Other(
                     "simulated event append failure".to_string(),
                 ));
             }
@@ -3880,6 +3880,7 @@ mod tests {
 
             ExecutionContext::new(
                 session_id.to_string(),
+                crate::model::TurnId::new(),
                 runtime,
                 runtime_context,
                 session_handle,
@@ -4307,7 +4308,7 @@ mod tests {
         f.actor_ref
             .tell(PromptFinished {
                 generation: 1,
-                run_id: run_id.clone(),
+                run_id: crate::model::TurnId::from_stored(&run_id),
                 disposition: RunCompletionDisposition::Completed,
             })
             .await
@@ -4351,7 +4352,7 @@ mod tests {
         f.actor_ref
             .tell(PromptFinished {
                 generation: 1,
-                run_id: first.clone(),
+                run_id: crate::model::TurnId::from_stored(&first),
                 disposition: RunCompletionDisposition::Completed,
             })
             .await
@@ -4380,7 +4381,7 @@ mod tests {
         f.actor_ref
             .tell(PromptFinished {
                 generation: 1,
-                run_id: first.clone(),
+                run_id: crate::model::TurnId::from_stored(&first),
                 disposition: RunCompletionDisposition::Completed,
             })
             .await
@@ -4421,7 +4422,7 @@ mod tests {
         f.actor_ref
             .tell(PromptFinished {
                 generation: 2,
-                run_id: second.clone(),
+                run_id: crate::model::TurnId::from_stored(&second),
                 disposition: RunCompletionDisposition::Completed,
             })
             .await
@@ -5471,17 +5472,15 @@ mod tests {
     #[tokio::test]
     async fn status_consistency_steering_drain_publishes_new_revision_without_phase_change() {
         let fixture = crate::test_utils::TestAgent::new().await;
-        let mut exec = fixture
-            .execution_context()
-            .await
-            .with_turn_id(crate::model::TurnId::new());
+        let mut exec = fixture.execution_context().await;
         let mut actor = SessionActor::new(
             fixture.config.clone(),
             exec.session_id.clone(),
             exec.runtime.clone(),
         );
         actor.turn_state.generation = 1;
-        let mut run = ActiveRun::new("held-run".into(), 1, actor.turn_state.token.clone());
+        let held_run_id = crate::model::TurnId::new();
+        let mut run = ActiveRun::new(held_run_id, 1, actor.turn_state.token.clone());
         run.phase = RunPhase::Model;
         exec = exec.with_steering(run.steering.clone());
         actor.active_run = Some(run);
@@ -5494,7 +5493,7 @@ mod tests {
                 forward_actor
                     .tell(RunPhaseChanged {
                         generation: 1,
-                        run_id: "held-run".into(),
+                        run_id: held_run_id,
                         phase,
                     })
                     .await
@@ -5507,7 +5506,7 @@ mod tests {
                 input: SubmitInput {
                     session_id: exec.session_id.clone(),
                     client_input_id: Some("steer-once".into()),
-                    expected_run_id: Some("held-run".into()),
+                    expected_run_id: Some(held_run_id.to_string()),
                     delivery: InputDelivery::Steer,
                     prompt: vec![crate::acp::protocol::ContentBlock::from("adjust task")],
                 },
@@ -5591,7 +5590,7 @@ mod tests {
         f.actor_ref
             .tell(PromptFinished {
                 generation: 0,
-                run_id: String::new(),
+                run_id: crate::model::TurnId::new(),
                 disposition: RunCompletionDisposition::Completed,
             })
             .await
@@ -6151,7 +6150,7 @@ mod tests {
         f.actor_ref
             .tell(PromptFinished {
                 generation: 0,
-                run_id: String::new(),
+                run_id: crate::model::TurnId::new(),
                 disposition: RunCompletionDisposition::Completed,
             })
             .await
@@ -6207,18 +6206,15 @@ mod tests {
                 crate::agent::core::McpToolState::empty(),
             ),
         );
-        actor.active_run = Some(ActiveRun::new(
-            "run-stop".to_string(),
-            1,
-            CancellationToken::new(),
-        ));
+        let stop_run_id = crate::model::TurnId::new();
+        actor.active_run = Some(ActiveRun::new(stop_run_id, 1, CancellationToken::new()));
         let actor_ref = SessionActor::spawn(actor);
         let mut events = fixture.config.subscribe_events();
 
         actor_ref
             .tell(PromptFinished {
                 generation: 1,
-                run_id: "run-stop".to_string(),
+                run_id: stop_run_id,
                 disposition: RunCompletionDisposition::Stopped {
                     stop_type: crate::events::StopType::ModelTokenLimit,
                     reason: "output limit".to_string(),
@@ -6262,7 +6258,7 @@ mod tests {
             ),
         );
         actor.active_run = Some(ActiveRun::new(
-            "running".to_string(),
+            crate::model::TurnId::new(),
             1,
             CancellationToken::new(),
         ));
@@ -6394,7 +6390,7 @@ mod tests {
             ),
         );
         actor.active_run = Some(ActiveRun::new(
-            "running".to_string(),
+            crate::model::TurnId::new(),
             1,
             CancellationToken::new(),
         ));
@@ -7036,5 +7032,230 @@ mod tests {
         assert_eq!(built["max_tokens"], 16_384);
         assert_eq!(built["enable_thinking"], false);
         assert_eq!(built["n_ctx"], 32_768);
+    }
+
+    // ── one run id (session-run-lifecycle) ──────────────────────────────
+
+    /// A command hook for `event` that appends its stdin (one JSON object per
+    /// line) to `capture` and answers with an empty JSON object.
+    fn capturing_hooks(events: &[&str], capture: &std::path::Path) -> crate::hooks::Hooks {
+        let command = format!(
+            "cat >> '{path}'; printf '\\n' >> '{path}'; printf '%s' '{{}}'",
+            path = capture.display()
+        );
+        let mut config = serde_json::json!({"enabled": true});
+        for event in events {
+            config[event] = serde_json::json!([{"hooks": [{
+                "type": "command", "command": command, "timeout_sec": 5
+            }]}]);
+        }
+        crate::hooks::Hooks::new(serde_json::from_value(config).unwrap()).unwrap()
+    }
+
+    fn captured_inputs(capture: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(capture)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("hook input is JSON"))
+            .collect()
+    }
+
+    fn hook_turn_ids(inputs: &[serde_json::Value], event: &str) -> Vec<String> {
+        inputs
+            .iter()
+            .filter(|input| input["hook_event_name"] == event)
+            .map(|input| input["turn_id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn text_provider() -> crate::test_utils::SharedLlmProvider {
+        use crate::test_utils::{MockChatResponse, MockLlmProvider, SharedLlmProvider};
+        let mut mock = MockLlmProvider::new();
+        mock.expect_chat_with_tools()
+            .returning(|_, _| Ok(MockChatResponse::text_only("done").into()));
+        mock.expect_chat()
+            .returning(|_| Ok(MockChatResponse::text_only("done").into()));
+        SharedLlmProvider::new(mock, vec![])
+    }
+
+    /// `(run_started run_id, run_completed run_id)` of the session's journal.
+    async fn journal_run_ids(
+        fixture: &crate::test_utils::UndoTestFixture,
+        session: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        fixture
+            .handle
+            .config
+            .event_sink
+            .session_stream(session)
+            .flush()
+            .await;
+        let (mut started, mut completed) = (Vec::new(), Vec::new());
+        for event in fixture
+            .storage
+            .event_journal()
+            .load_session_stream(session, None, None)
+            .await
+            .unwrap()
+        {
+            match event.kind {
+                AgentEventKind::RunStarted { run_id, .. } => started.push(run_id),
+                AgentEventKind::RunCompleted { run_id, .. } => completed.push(run_id),
+                _ => {}
+            }
+        }
+        (started, completed)
+    }
+
+    #[tokio::test]
+    async fn run_events_hooks_and_snapshot_records_share_the_run_id() {
+        use crate::agent::undo_integration_tests::{bind_mock_llm, deleting_provider};
+        let capture_dir = tempfile::tempdir().unwrap();
+        let capture = capture_dir.path().join("hooks.jsonl");
+        let fixture = crate::test_utils::UndoTestFixture::with_provider_and_hooks(
+            deleting_provider("notes.txt"),
+            capturing_hooks(&["pre_tool_use", "post_tool_use"], &capture),
+        )
+        .await
+        .unwrap();
+        fixture.write_file("notes.txt", "original").unwrap();
+        let session = fixture.create_session().await.unwrap();
+        bind_mock_llm(&fixture, &session).await.unwrap();
+
+        fixture
+            .prompt_to_completion(&session, "delete the notes")
+            .await
+            .unwrap();
+
+        let (started, completed) = journal_run_ids(&fixture, &session).await;
+        assert_eq!((started.len(), completed.len()), (1, 1));
+        let run_id = started[0].clone();
+        assert_eq!(completed[0], run_id, "run_completed run_id");
+        assert!(uuid::Uuid::parse_str(&run_id).is_ok(), "run id is a UUID");
+
+        // Both hooks of one tool call carry the run's id.
+        let inputs = captured_inputs(&capture);
+        assert_eq!(
+            hook_turn_ids(&inputs, "pre_tool_use"),
+            vec![run_id.clone()],
+            "pre-tool-use hook turn_id"
+        );
+        assert_eq!(
+            hook_turn_ids(&inputs, "post_tool_use"),
+            vec![run_id.clone()],
+            "post-tool-use hook turn_id"
+        );
+
+        let history = fixture
+            .storage
+            .session_store()
+            .get_history(&session)
+            .await
+            .unwrap();
+        let (mut starts, mut patches) = (Vec::new(), Vec::new());
+        for part in history.iter().flat_map(|message| message.parts.iter()) {
+            match part {
+                MessagePart::TurnSnapshotStart { turn_id, .. } => starts.push(turn_id.to_string()),
+                MessagePart::TurnSnapshotPatch { turn_id, .. } => patches.push(turn_id.to_string()),
+                _ => {}
+            }
+        }
+        assert_eq!(starts, vec![run_id.clone()], "snapshot start turn_id");
+        assert_eq!(patches, vec![run_id], "snapshot change turn_id");
+    }
+
+    #[tokio::test]
+    async fn steering_reports_the_active_runs_id() {
+        let f = ActorFixture::new().await;
+        // Hold the run open so the steering input reaches an active run.
+        let _execution = f.execution_permit.acquire().await.unwrap();
+        let SubmitInputResult::Started { run_id, .. } = f
+            .actor_ref
+            .ask(text_submit(&f._session_id, "hi"))
+            .await
+            .expect("submit")
+        else {
+            panic!("expected Started");
+        };
+        let mut steer = text_submit(&f._session_id, "adjust");
+        steer.input.delivery = InputDelivery::Steer;
+        steer.input.expected_run_id = Some(run_id.clone());
+        let SubmitInputResult::Steered {
+            run_id: steered, ..
+        } = f.actor_ref.ask(steer).await.expect("steer")
+        else {
+            panic!("expected Steered");
+        };
+        assert_eq!(steered, run_id, "steering result run_id");
+
+        f.config
+            .event_sink
+            .session_stream(&f._session_id)
+            .flush()
+            .await;
+        let events = f.run_lifecycle().await;
+        assert_eq!(events[0].1, steered, "run_started run_id");
+        f.execution_permit.close();
+    }
+
+    #[tokio::test]
+    async fn hook_fired_inside_a_run_gets_the_runs_id() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let capture = capture_dir.path().join("hooks.jsonl");
+        let fixture = crate::test_utils::UndoTestFixture::with_provider_and_hooks(
+            text_provider(),
+            capturing_hooks(&["stop"], &capture),
+        )
+        .await
+        .unwrap();
+        let session = fixture.create_session().await.unwrap();
+        crate::agent::undo_integration_tests::bind_mock_llm(&fixture, &session)
+            .await
+            .unwrap();
+
+        fixture
+            .prompt_to_completion(&session, "hello")
+            .await
+            .unwrap();
+
+        let (started, _) = journal_run_ids(&fixture, &session).await;
+        assert_eq!(started.len(), 1);
+        let stop_ids = hook_turn_ids(&captured_inputs(&capture), "stop");
+        assert_eq!(stop_ids, vec![started[0].clone()], "stop hook turn_id");
+    }
+
+    #[tokio::test]
+    async fn native_compact_hook_gets_that_prompts_run_id() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let capture = capture_dir.path().join("hooks.jsonl");
+        let fixture = crate::test_utils::UndoTestFixture::with_provider_and_hooks(
+            text_provider(),
+            capturing_hooks(&["pre_compaction"], &capture),
+        )
+        .await
+        .unwrap();
+        let session = fixture.create_session().await.unwrap();
+        crate::agent::undo_integration_tests::bind_mock_llm(&fixture, &session)
+            .await
+            .unwrap();
+        // History must exist or `/compact` has nothing to compact.
+        fixture
+            .prompt_to_completion(&session, "hello")
+            .await
+            .unwrap();
+
+        // Native `/compact` is a run of its own (no model turn), so its hook
+        // carries that run's id rather than the earlier prompt's.
+        fixture
+            .prompt_to_completion(&session, "/compact")
+            .await
+            .unwrap();
+
+        let (started, completed) = journal_run_ids(&fixture, &session).await;
+        assert_eq!((started.len(), completed.len()), (2, 2), "{started:?}");
+        let ids = hook_turn_ids(&captured_inputs(&capture), "pre_compaction");
+        assert_eq!(ids, vec![started[1].clone()], "compaction hook turn_id");
+        assert_ne!(ids[0], started[0], "not the earlier prompt's run id");
     }
 }

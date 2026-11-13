@@ -7,8 +7,9 @@ use crate::session::domain_schedule::{
 };
 use crate::session::repo_schedule::{ScheduleRepository, SqliteScheduleRepository};
 use crate::session::schema;
+use parking_lot::Mutex;
 use rusqlite::Connection;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use time::OffsetDateTime;
 
 /// Create an in-memory SQLite DB with schema initialized.
@@ -56,7 +57,7 @@ async fn schedule_state_transitions() {
 
     // Insert prerequisites — guard is dropped at end of block, before any await
     let (session_id, task_id) = {
-        let c = db.lock().unwrap();
+        let c = db.lock();
         let now = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
@@ -137,7 +138,7 @@ async fn event_driven_schedule_storage() {
 
     // Insert prerequisites — guard is dropped at end of block, before any await
     let (session_id, task_id) = {
-        let c = db.lock().unwrap();
+        let c = db.lock();
         let now = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
@@ -211,7 +212,7 @@ async fn once_at_schedule_storage_and_max_runs() {
     let repo = Arc::new(SqliteScheduleRepository::new(db.clone())) as Arc<dyn ScheduleRepository>;
 
     let (session_id, task_id) = {
-        let c = db.lock().unwrap();
+        let c = db.lock();
         let now = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();

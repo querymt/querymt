@@ -674,7 +674,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn shared_db() -> (
-        Arc<std::sync::Mutex<rusqlite::Connection>>,
+        Arc<parking_lot::Mutex<rusqlite::Connection>>,
         SqliteWorkspaceRepository,
     ) {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -687,7 +687,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let conn = Arc::new(std::sync::Mutex::new(conn));
+        let conn = Arc::new(parking_lot::Mutex::new(conn));
         let repo = SqliteWorkspaceRepository::new(conn.clone());
         (conn, repo)
     }

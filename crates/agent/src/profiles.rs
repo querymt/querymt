@@ -3012,7 +3012,6 @@ system = "inline"
         storage
             .conn_for_test()
             .lock()
-            .unwrap()
             .execute_batch(
                 "CREATE TRIGGER reject_binding BEFORE INSERT ON profile_bindings
              BEGIN SELECT RAISE(ABORT, 'binding rejected'); END;",
@@ -3053,7 +3052,6 @@ system = "inline"
         storage
             .conn_for_test()
             .lock()
-            .unwrap()
             .execute_batch("DROP TRIGGER reject_binding")
             .unwrap();
         manager

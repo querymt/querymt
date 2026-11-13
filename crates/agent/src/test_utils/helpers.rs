@@ -221,11 +221,12 @@ use crate::snapshot::backend::SnapshotBackend;
 use crate::snapshot::git::GitSnapshotBackend;
 use crate::test_utils::mocks::{TestPluginLoader, TestProviderFactory};
 use anyhow::Result;
+use parking_lot::Mutex;
 use querymt::LLMParams;
 use querymt::chat::{ChatMessage, ChatRole};
 use querymt::plugin::host::PluginRegistry;
 use rusqlite::Connection;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -423,7 +424,7 @@ impl UndoTestFixture {
     /// Creates a new test fixture with snapshot support enabled.
     pub async fn new() -> Result<Self> {
         let (registry, config_dir) = empty_plugin_registry()?;
-        Self::with_registry(registry, config_dir).await
+        Self::with_registry(registry, config_dir, None).await
     }
 
     /// Creates a fixture whose LLM is `provider`, so prompts run end to end
@@ -433,10 +434,24 @@ impl UndoTestFixture {
     ) -> Result<Self> {
         let (registry, config_dir) =
             mock_plugin_registry(Arc::new(TestProviderFactory::new(provider)))?;
-        Self::with_registry(registry, config_dir).await
+        Self::with_registry(registry, config_dir, None).await
     }
 
-    async fn with_registry(registry: PluginRegistry, config_dir: TempDir) -> Result<Self> {
+    /// Like [`Self::with_provider`], with `hooks` installed on the agent.
+    pub(crate) async fn with_provider_and_hooks(
+        provider: crate::test_utils::SharedLlmProvider,
+        hooks: crate::hooks::Hooks,
+    ) -> Result<Self> {
+        let (registry, config_dir) =
+            mock_plugin_registry(Arc::new(TestProviderFactory::new(provider)))?;
+        Self::with_registry(registry, config_dir, Some(hooks)).await
+    }
+
+    async fn with_registry(
+        registry: PluginRegistry,
+        config_dir: TempDir,
+        hooks: Option<crate::hooks::Hooks>,
+    ) -> Result<Self> {
         let worktree = TempDir::new()?;
         let snapshot_base = TempDir::new()?;
 
@@ -449,9 +464,12 @@ impl UndoTestFixture {
         let backend = GitSnapshotBackend::new().with_snapshot_base(snapshot_base_path.clone());
         let backend_arc = Arc::new(backend);
 
-        let builder = AgentConfigBuilder::new(registry, storage.clone(), llm)
+        let mut builder = AgentConfigBuilder::new(registry, storage.clone(), llm)
             .with_snapshot_policy(SnapshotPolicy::Diff)
             .with_snapshot_backend(backend_arc.clone());
+        if let Some(hooks) = hooks {
+            builder = builder.with_hooks(hooks);
+        }
 
         let config = Arc::new(builder.build());
         let handle = AgentHandle::from_config(config);
@@ -743,6 +761,66 @@ impl UndoTestFixture {
         SendAgent::prompt(&self.handle, request)
             .await
             .map_err(|e| anyhow::anyhow!("prompt failed: {e:?}"))
+    }
+
+    /// Like [`Self::prompt`], but also waits until the run this prompt started
+    /// has its `RunCompleted` persisted and published.
+    ///
+    /// The prompt reply is sent before the actor records the run's completion,
+    /// so a caller that reads the journal right after `prompt` can miss it.
+    /// A durable event is published only after it is persisted, so seeing
+    /// `RunCompleted` on the fanout means it is in the journal. The wait is
+    /// bound to this prompt's run id, so an earlier run cannot satisfy it.
+    pub(crate) async fn prompt_to_completion(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> Result<crate::acp::protocol::PromptResponse> {
+        use crate::events::AgentEventKind;
+        use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+
+        // Subscribe before prompting so neither event can be missed.
+        let mut events = self.handle.config.subscribe_events();
+        let response = self.prompt(session_id, text).await?;
+
+        let mut run_id: Option<String> = None;
+        let wait = async {
+            loop {
+                let envelope = match events.try_recv() {
+                    Ok(envelope) => envelope,
+                    Err(TryRecvError::Empty) => events.recv().await.map_err(|e| match e {
+                        RecvError::Lagged(n) => {
+                            anyhow::anyhow!("event stream lagged by {n}; cannot confirm the run")
+                        }
+                        RecvError::Closed => anyhow::anyhow!("event stream closed"),
+                    })?,
+                    Err(TryRecvError::Lagged(n)) => {
+                        anyhow::bail!("event stream lagged by {n}; cannot confirm the run")
+                    }
+                    Err(TryRecvError::Closed) => anyhow::bail!("event stream closed"),
+                };
+                if envelope.session_id() != session_id {
+                    continue;
+                }
+                match envelope.kind() {
+                    AgentEventKind::RunStarted {
+                        run_id: started, ..
+                    } if run_id.is_none() => {
+                        run_id = Some(started.clone());
+                    }
+                    AgentEventKind::RunCompleted { run_id: done, .. }
+                        if run_id.as_deref() == Some(done.as_str()) =>
+                    {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for the prompt's run to complete"))??;
+        Ok(response)
     }
 
     /// Perform undo operation via AgentHandle
