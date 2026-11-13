@@ -20,14 +20,13 @@
 //! `false`, or when no protocol directory exists, existing QueryMT behavior is
 //! preserved and no `.agents` directory is created.
 
+use querymt_agent_core::dotagents::{diagnostics, frontmatter, layer};
+
 mod adapters;
 mod automation;
 mod confine;
 mod coordinator;
-mod diagnostics;
 mod discovery;
-mod frontmatter;
-mod layer;
 mod loader;
 mod manifest;
 mod memory;
