@@ -41,3 +41,6 @@ typeshare = "1.0"
 dirs = "7"
 hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"] }
 toml = "1"
+
+[profile.dev]
+debug = "line-tables-only"
