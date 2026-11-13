@@ -147,6 +147,27 @@
 
 ### Added
 
+- **Portable repository knowledge (opt-in).** Index a checkout's Markdown notes
+  and source declarations from a committed `.qmt/knowledge.toml` manifest into a
+  disposable local cache, and search it with `repo_knowledge_query`,
+  `repo_knowledge_get`, `repo_knowledge_list` and `repo_knowledge_stats`. It is
+  off unless `[agent.repository_knowledge] enabled = true`; repository files can
+  never enable it, widen it or grant tools. Two separate delivery stages can
+  attach bounded, cited cards: `orientation` before a prompt's first model
+  request and `index_context` after a successful `index` call. Manifest
+  `[orientation] retrieval_only` keeps documents searchable but never attached
+  automatically. Session creation warms the index in the background when a
+  delivery stage is on, and the first prompt waits up to 8 s for it. Notes may
+  carry evidence (`knowledge_sources`) that the maintenance example
+  (`cargo run -p querymt-agent --example repository_knowledge -- check`) reports
+  as changed. See `docs/docs/agent/repository_knowledge.md` and the
+  `repository_knowledge_coder.toml` profile. On the five covered questions in
+  the pilot, median fresh tokens fell 14% with similar rubric coverage; the
+  feature adds a fixed per-request cost (tool schemas, policy text) and, with
+  `entrypoints` configured, a map card on first prompts nothing matched.
+- **A plain `cargo build/run/test` at the workspace root selects only the native
+  crates** (`default-members`); the WASM provider plugins and heavy native
+  providers need `-p <package>` or `--workspace`.
 - **`accept_delegation_result` asks by default** before it integrates a
   delegate's result into the checkout, offering Allow once, Allow for this
   session and Reject. List it in `permissions.always_ask` to ask on every call.
