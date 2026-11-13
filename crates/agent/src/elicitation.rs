@@ -1324,6 +1324,110 @@ impl McpClientHandler {
     }
 }
 
+impl McpClientHandler {
+    /// Ask the user to answer a server's elicitation request and journal how
+    /// it ended.
+    async fn elicit(&self, request: ElicitRequestParams) -> ElicitResult {
+        let elicitation_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+
+        // Extract message and schema from the enum variant.
+        let (message, schema_json) = match &request {
+            ElicitRequestParams::FormElicitationParams {
+                meta,
+                message,
+                requested_schema,
+            } => (
+                message.clone(),
+                form_schema_with_meta(requested_schema, meta.as_ref()),
+            ),
+            ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
+                (message.clone(), serde_json::json!({ "url": url }))
+            }
+            // Non-exhaustive: surface unknown variants as raw JSON.
+            other => (
+                String::new(),
+                serde_json::to_value(other).unwrap_or(serde_json::Value::Null),
+            ),
+        };
+        let source = format!("mcp:{}", self.server_name);
+
+        register_pending_elicitation(
+            &self.pending,
+            elicitation_id.clone(),
+            PendingElicitationRegistration {
+                session_id: self.session_id.clone(),
+                form: PendingElicitationForm {
+                    message: message.clone(),
+                    requested_schema: schema_json.clone(),
+                    source: source.clone(),
+                },
+                owner_authority: None,
+                run_id: None,
+                tool_call_id: None,
+            },
+            tx,
+        )
+        .await;
+        let _cleanup = PendingElicitationCleanup::new(self.pending.clone(), elicitation_id.clone());
+
+        // Durable: elicitation must be visible in UI replay.
+        if let Err(err) = self
+            .event_sink
+            .emit_durable(
+                &self.session_id,
+                crate::events::AgentEventKind::ElicitationRequested {
+                    elicitation_id: elicitation_id.clone(),
+                    session_id: self.session_id.clone(),
+                    message,
+                    requested_schema: schema_json,
+                    source,
+                },
+            )
+            .await
+        {
+            log::warn!("failed to emit ElicitationRequested: {}", err);
+        }
+
+        // Wait for response from UI/ACP
+        let response = rx.await.ok();
+
+        // Journal how the question ended. The submitted form content is
+        // never recorded, so no selection is attached.
+        let outcome = response
+            .as_ref()
+            .map_or(crate::events::ElicitationOutcome::Cancelled, |response| {
+                crate::events::ElicitationOutcome::from_action(&response.action)
+            });
+        if let Err(err) = self
+            .event_sink
+            .emit_durable(
+                &self.session_id,
+                crate::events::AgentEventKind::ElicitationResolved {
+                    elicitation_id,
+                    session_id: self.session_id.clone(),
+                    outcome,
+                    selection: None,
+                },
+            )
+            .await
+        {
+            log::warn!("failed to emit ElicitationResolved: {}", err);
+        }
+
+        match response {
+            Some(response) => {
+                let result = ElicitResult::new(response.action.into());
+                match response.content {
+                    Some(content) => result.with_content(content),
+                    None => result,
+                }
+            }
+            None => ElicitResult::new(rmcp::model::ElicitationAction::Cancel),
+        }
+    }
+}
+
 impl ClientHandler for McpClientHandler {
     #[allow(clippy::manual_async_fn)]
     fn create_elicitation(
@@ -1331,81 +1435,7 @@ impl ClientHandler for McpClientHandler {
         request: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
     ) -> impl std::future::Future<Output = Result<ElicitResult, rmcp::ErrorData>> + Send + '_ {
-        async move {
-            let elicitation_id = uuid::Uuid::new_v4().to_string();
-            let (tx, rx) = oneshot::channel();
-
-            // Extract message and schema from the enum variant.
-            let (message, schema_json) = match &request {
-                ElicitRequestParams::FormElicitationParams {
-                    meta,
-                    message,
-                    requested_schema,
-                } => (
-                    message.clone(),
-                    form_schema_with_meta(requested_schema, meta.as_ref()),
-                ),
-                ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
-                    (message.clone(), serde_json::json!({ "url": url }))
-                }
-                // Non-exhaustive: surface unknown variants as raw JSON.
-                other => (
-                    String::new(),
-                    serde_json::to_value(other).unwrap_or(serde_json::Value::Null),
-                ),
-            };
-            let source = format!("mcp:{}", self.server_name);
-
-            register_pending_elicitation(
-                &self.pending,
-                elicitation_id.clone(),
-                PendingElicitationRegistration {
-                    session_id: self.session_id.clone(),
-                    form: PendingElicitationForm {
-                        message: message.clone(),
-                        requested_schema: schema_json.clone(),
-                        source: source.clone(),
-                    },
-                    owner_authority: None,
-                    run_id: None,
-                    tool_call_id: None,
-                },
-                tx,
-            )
-            .await;
-            let _cleanup =
-                PendingElicitationCleanup::new(self.pending.clone(), elicitation_id.clone());
-
-            // Durable: elicitation must be visible in UI replay.
-            if let Err(err) = self
-                .event_sink
-                .emit_durable(
-                    &self.session_id,
-                    crate::events::AgentEventKind::ElicitationRequested {
-                        elicitation_id: elicitation_id.clone(),
-                        session_id: self.session_id.clone(),
-                        message,
-                        requested_schema: schema_json,
-                        source,
-                    },
-                )
-                .await
-            {
-                log::warn!("failed to emit ElicitationRequested: {}", err);
-            }
-
-            // Wait for response from UI/ACP
-            match rx.await {
-                Ok(response) => {
-                    let result = ElicitResult::new(response.action.into());
-                    Ok(match response.content {
-                        Some(content) => result.with_content(content),
-                        None => result,
-                    })
-                }
-                Err(_) => Ok(ElicitResult::new(rmcp::model::ElicitationAction::Cancel)),
-            }
-        }
+        async move { Ok(self.elicit(request).await) }
     }
 
     fn get_info(&self) -> ClientConfig {
@@ -1522,6 +1552,96 @@ impl ClientHandler for McpClientHandler {
 mod tests {
     use super::*;
     use crate::test_utils::DelegateTestFixture;
+
+    /// Covers session-interactions / Server elicitation content is not recorded.
+    #[tokio::test]
+    async fn server_elicitation_content_is_not_recorded() {
+        use crate::events::{AgentEventKind, ElicitationOutcome};
+        use crate::session::backend::StorageBackend;
+
+        let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+            .await
+            .unwrap();
+        let event_sink = Arc::new(crate::event_sink::EventSink::new(
+            storage.event_journal(),
+            Arc::new(crate::event_fanout::EventFanout::new()),
+        ));
+        let pending = PendingElicitationMap::default();
+        let handler = McpClientHandler::new(
+            pending.clone(),
+            event_sink.clone(),
+            "srv".into(),
+            "s1".into(),
+            crate::agent::mcp::agent_implementation(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let request = ElicitRequestParams::FormElicitationParams {
+            meta: None,
+            message: "Your email?".into(),
+            requested_schema: rmcp::model::ElicitationSchema::builder()
+                .required_email("email")
+                .build()
+                .unwrap(),
+        };
+
+        let run = handler.elicit(request);
+        let answer = async {
+            let id = loop {
+                if let Some(id) = pending.lock().await.keys().next().cloned() {
+                    break id;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            take_from_pending_map(&pending, &id)
+                .await
+                .expect("pending server elicitation")
+                .send(ElicitationResponse {
+                    action: ElicitationAction::Accept,
+                    content: Some(serde_json::json!({"email": "secret@example.com"})),
+                })
+                .expect("handler still waiting");
+            id
+        };
+        let (result, id) = tokio::join!(run, answer);
+        // The server still receives the content.
+        assert!(result.content.is_some());
+
+        let events = event_sink
+            .journal()
+            .load_session_stream("s1", None, None)
+            .await
+            .unwrap();
+        let resolved: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.kind, AgentEventKind::ElicitationResolved { .. }))
+            .collect();
+        assert_eq!(resolved.len(), 1, "exactly one resolution");
+        match &resolved[0].kind {
+            AgentEventKind::ElicitationResolved {
+                elicitation_id,
+                outcome,
+                selection,
+                ..
+            } => {
+                assert_eq!(elicitation_id, &id);
+                assert_eq!(*outcome, ElicitationOutcome::Accepted);
+                assert!(selection.is_none());
+            }
+            _ => unreachable!(),
+        }
+        let payload = serde_json::to_string(&resolved[0].kind).unwrap();
+        assert!(!payload.contains("secret@example.com"), "{payload}");
+        // It follows its own request.
+        let requested_at = events
+            .iter()
+            .position(|e| matches!(e.kind, AgentEventKind::ElicitationRequested { .. }))
+            .expect("request journaled");
+        let resolved_at = events
+            .iter()
+            .position(|e| matches!(e.kind, AgentEventKind::ElicitationResolved { .. }))
+            .unwrap();
+        assert!(requested_at < resolved_at);
+    }
 
     // ── ElicitationAction -> rmcp::model::ElicitationAction ───────────────
 

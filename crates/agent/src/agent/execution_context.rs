@@ -160,6 +160,7 @@ impl ExecutionContext {
                     self.cwd(),
                     Arc::clone(&self.runtime.mcp_tool_state),
                     self.tool_config.clone(),
+                    Arc::clone(&self.runtime.skill_grants),
                 )));
             }
             crate::tools::ToolSet::new(Arc::clone(&config.tool_registry), session_tools)

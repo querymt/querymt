@@ -2,7 +2,7 @@ use crate::agent::core::{McpToolState, ToolConfig, ToolPolicy};
 use crate::skills::catalog::{ApprovalMode, SkillCatalog};
 use crate::skills::mcp::McpSkill;
 use crate::skills::permissions::PermissionLevel;
-use crate::tools::{Tool, ToolContext, ToolError};
+use crate::tools::{QuestionOption, Tool, ToolContext, ToolError};
 use async_trait::async_trait;
 use querymt::chat::ToolResultPart;
 use serde_json::{Value, json};
@@ -127,6 +127,55 @@ pub struct SkillTool {
     workspace: PathBuf,
     mcp_state: Arc<McpToolState>,
     tool_config: ToolConfig,
+    /// Callable skill IDs the user allowed for this session. Shared with the
+    /// session runtime; never held across an `.await`.
+    skill_grants: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// The answers a skill approval prompt offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalChoice {
+    /// Load this once.
+    Allow,
+    /// Load now and skip the prompt for this skill for the rest of the session.
+    AllowForSession,
+    Deny,
+}
+
+impl ApprovalChoice {
+    /// Order shown to the user.
+    const ALL: [Self; 3] = [Self::Allow, Self::AllowForSession, Self::Deny];
+
+    /// Label shown to the user and returned as the answer.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Allow => "Allow",
+            Self::AllowForSession => "Allow for this session",
+            Self::Deny => "Deny",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Allow => "Allow loading this skill",
+            Self::AllowForSession => {
+                "Allow loading this skill, and reading its files, without asking again in this session"
+            }
+            Self::Deny => "Deny loading this skill",
+        }
+    }
+
+    fn option(self) -> QuestionOption {
+        QuestionOption::new(self.label(), self.description())
+    }
+
+    /// Parse an answer label; anything unrecognised is a denial.
+    fn from_answer(answers: &[String]) -> Self {
+        answers
+            .first()
+            .and_then(|answer| Self::ALL.into_iter().find(|c| c.label() == answer))
+            .unwrap_or(Self::Deny)
+    }
 }
 
 impl SkillTool {
@@ -137,12 +186,14 @@ impl SkillTool {
         workspace: PathBuf,
         mcp_state: Arc<McpToolState>,
         tool_config: ToolConfig,
+        skill_grants: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     ) -> Self {
         Self {
             catalog,
             workspace,
             mcp_state,
             tool_config,
+            skill_grants,
         }
     }
 
@@ -241,6 +292,9 @@ impl SkillTool {
                          Allow it with {allow_pattern} under [agent.skills.permissions]"
                     )));
                 }
+                if self.skill_grants.lock().contains(id) {
+                    return Ok(());
+                }
                 // The pending-approval map is shared by every session of an
                 // agent and provider call IDs are not unique across sessions,
                 // so the ID carries its own UUID.
@@ -253,19 +307,20 @@ impl SkillTool {
                              with domain-specific knowledge and workflows from this skill."
                         ),
                         "Permission",
-                        &[
-                            ("Allow".to_string(), "Allow loading this skill".to_string()),
-                            ("Deny".to_string(), "Deny loading this skill".to_string()),
-                        ],
+                        &ApprovalChoice::ALL.map(ApprovalChoice::option),
                         false,
                     )
                     .await?;
-                if answers.first().map(String::as_str) != Some("Allow") {
-                    return Err(ToolError::PermissionDenied(format!(
+                match ApprovalChoice::from_answer(&answers) {
+                    ApprovalChoice::Allow => Ok(()),
+                    ApprovalChoice::AllowForSession => {
+                        self.skill_grants.lock().insert(id.to_string());
+                        Ok(())
+                    }
+                    ApprovalChoice::Deny => Err(ToolError::PermissionDenied(format!(
                         "User denied loading skill '{id}'"
-                    )));
+                    ))),
                 }
-                Ok(())
             }
         }
     }
@@ -506,15 +561,44 @@ impl Tool for SkillTool {
                 workspace.display()
             );
         }
-        if let Some((server, skill_name)) = mcp_candidate
-            && self.catalog.lookup_skill(&workspace, name)?.is_none()
-        {
+        let mcp_branch = match mcp_candidate {
+            Some((server, skill_name))
+                if self.catalog.lookup_skill(&workspace, name)?.is_none() =>
+            {
+                Some((server, skill_name))
+            }
+            _ => None,
+        };
+
+        // An invalid `file` path fails before any approval prompt. A skill
+        // that is denied by configuration still reports the denial first, so
+        // nothing is revealed about it. Normalization is a pure string check:
+        // no request reaches the server earlier than before.
+        let file = match file {
+            Some(file) => {
+                let level = match mcp_branch {
+                    Some((server, skill_name)) => {
+                        self.catalog.permissions().check_mcp(server, skill_name)
+                    }
+                    None => self.catalog.permissions().check(name),
+                };
+                if level == PermissionLevel::Deny {
+                    return Err(ToolError::PermissionDenied(format!(
+                        "Skill '{name}' is blocked by configuration"
+                    )));
+                }
+                Some(
+                    crate::skills::mcp::normalize_file_path(file)
+                        .map_err(ToolError::InvalidRequest)?,
+                )
+            }
+            None => None,
+        };
+        let file = file.as_deref();
+
+        if let Some((server, skill_name)) = mcp_branch {
             self.authorize_mcp(ctx, name, server, skill_name).await?;
-            let file = file
-                .map(crate::skills::mcp::normalize_file_path)
-                .transpose()
-                .map_err(ToolError::InvalidRequest)?;
-            return self.load_mcp(&workspace, name, file.as_deref()).await;
+            return self.load_mcp(&workspace, name, file).await;
         }
 
         // Local skill: check permissions for the requested callable ID.
@@ -554,18 +638,12 @@ impl Tool for SkillTool {
             {
                 self.authorize_mcp(ctx, name, server, skill_name).await?;
             }
-            let file = file
-                .map(crate::skills::mcp::normalize_file_path)
-                .transpose()
-                .map_err(ToolError::InvalidRequest)?;
-            return self.load_mcp(&workspace, name, file.as_deref()).await;
+            return self.load_mcp(&workspace, name, file).await;
         };
 
-        if let Some(file) = file {
-            let path =
-                crate::skills::mcp::normalize_file_path(file).map_err(ToolError::InvalidRequest)?;
-            let text = read_local_file(&skill.path, name, &path)?;
-            return Ok(vec![ToolResultPart::text(file_output(name, &path, &text))]);
+        if let Some(path) = file {
+            let text = read_local_file(&skill.path, name, path)?;
+            return Ok(vec![ToolResultPart::text(file_output(name, path, &text))]);
         }
 
         log::info!("Loading skill: {}", name);
@@ -680,7 +758,7 @@ mod tests {
             _question_id: &str,
             _question: &str,
             _header: &str,
-            _options: &[(String, String)],
+            _options: &[QuestionOption],
             _multiple: bool,
         ) -> Result<Vec<String>, ToolError> {
             let mut answers = self.ask_answers.lock().unwrap();
@@ -732,6 +810,7 @@ mod tests {
             Some(&workspace),
             crate::agent::core::McpToolState::empty(),
             Default::default(),
+            Default::default(),
         )
     }
 
@@ -774,6 +853,7 @@ mod tests {
         Arc::clone(&tool.catalog).bind(
             Some(workspace),
             crate::agent::core::McpToolState::empty(),
+            Default::default(),
             Default::default(),
         )
     }
@@ -1704,7 +1784,7 @@ Body
         config: ToolConfig,
     ) -> SkillTool {
         let ws = PathBuf::from(".");
-        Arc::new(catalog).bind(Some(&ws), state, config)
+        Arc::new(catalog).bind(Some(&ws), state, config, Default::default())
     }
 
     fn plain_catalog() -> SkillCatalog {
@@ -1836,7 +1916,8 @@ Body
         ));
         let state = mcp_state(&h, &["docs"]).await;
         let ws = PathBuf::from(".");
-        let tool = Arc::clone(&catalog).bind(Some(&ws), state, Default::default());
+        let tool =
+            Arc::clone(&catalog).bind(Some(&ws), state, Default::default(), Default::default());
 
         let def = tool.definition();
         assert_eq!(names_from_definition(def.clone()), vec!["docs.triage"]);
@@ -1874,7 +1955,12 @@ Body
         ));
         let state = mcp_state(&h, &["docs"]).await;
         let bound_to = PathBuf::from(".");
-        let tool = Arc::clone(&catalog).bind(Some(&bound_to), state, Default::default());
+        let tool = Arc::clone(&catalog).bind(
+            Some(&bound_to),
+            state,
+            Default::default(),
+            Default::default(),
+        );
 
         // The call's workspace has no snapshot yet, and the MCP default
         // `Ask` would be denied here: the local skill must be found first.
@@ -1899,10 +1985,12 @@ Body
             Some(&ws),
             mcp_state(&h, &["docs"]).await,
             Default::default(),
+            Default::default(),
         );
         let without = Arc::clone(&catalog).bind(
             Some(&ws),
             crate::agent::core::McpToolState::empty(),
+            Default::default(),
             Default::default(),
         );
         assert_eq!(enum_of(&with), vec!["docs.triage"]);
@@ -2242,6 +2330,7 @@ Body
         tool_call_id: Option<String>,
         answer: &'static str,
         asked: Mutex<Vec<(String, String)>>,
+        options: Mutex<Vec<Vec<String>>>,
     }
 
     impl RecordingContext {
@@ -2250,6 +2339,7 @@ Body
                 tool_call_id: tool_call_id.map(str::to_string),
                 answer,
                 asked: Mutex::new(Vec::new()),
+                options: Mutex::new(Vec::new()),
             }
         }
     }
@@ -2278,9 +2368,13 @@ Body
             question_id: &str,
             question: &str,
             _header: &str,
-            _options: &[(String, String)],
+            options: &[QuestionOption],
             _multiple: bool,
         ) -> Result<Vec<String>, ToolError> {
+            self.options
+                .lock()
+                .unwrap()
+                .push(options.iter().map(|o| o.label.clone()).collect());
             self.asked
                 .lock()
                 .unwrap()
@@ -2340,6 +2434,10 @@ Body
             asked[0].1
         );
         drop(asked);
+        assert_eq!(
+            ctx.options.lock().unwrap()[0],
+            ["Allow", "Allow for this session", "Deny"]
+        );
         assert_eq!(h.log.skills_get.lock().len(), 1);
     }
 
@@ -2466,6 +2564,175 @@ Body
             }
             other => panic!("{other:?}"),
         }
+        assert!(ctx.asked.lock().unwrap().is_empty());
+        untouched(&h);
+    }
+
+    // ── Session grants (refine-mcp-skill-approval 1.2) ───────────────────
+
+    fn ask_local_tool(dir: &TempDir, patterns: &[(&str, PermissionLevel)]) -> SkillTool {
+        let mut perms = SkillPermissions::default();
+        for (pattern, level) in patterns {
+            perms.patterns.insert((*pattern).to_string(), *level);
+        }
+        bind_tool(
+            SkillCatalog::from_parts(
+                Arc::new(Mutex::new(SkillRegistry::new())),
+                Arc::new(perms),
+                vec![SkillSource::Project(dir.path().to_path_buf())],
+                true,
+                PathBuf::from("."),
+            ),
+            PathBuf::from("."),
+        )
+    }
+
+    #[tokio::test]
+    async fn session_allow_skips_later_prompts_for_the_same_skill() {
+        let (_h, tool) = perm_tool(&[], ApprovalMode::Interactive).await;
+        let ctx = RecordingContext::new(Some("c"), "Allow for this session");
+        call_named_with_context(&tool, "harness.a", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(ctx.asked.lock().unwrap().len(), 1);
+        let out = call_named_with_context(&tool, "harness.a", &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("Body of a"));
+        assert_eq!(ctx.asked.lock().unwrap().len(), 1, "no second prompt");
+    }
+
+    #[tokio::test]
+    async fn session_allow_covers_the_skills_supporting_files() {
+        let h = McpHarness::start(HarnessOptions {
+            skills: Some(vec![
+                ScriptedSkill::new("a", "A").with_file("refs/guide.md", b"GUIDE"),
+            ]),
+            ..HarnessOptions::default()
+        })
+        .await;
+        let tool = mcp_tool(
+            catalog_with_perms(&[]).with_approval(ApprovalMode::Interactive),
+            h.tool_state.clone(),
+            Default::default(),
+        );
+        let ctx = RecordingContext::new(Some("c"), "Allow for this session");
+        call_named_with_context(&tool, "harness.a", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(ctx.asked.lock().unwrap().len(), 1);
+        let out = tool
+            .call(json!({"name": "harness.a", "file": "refs/guide.md"}), &ctx)
+            .await
+            .map(first_text_block)
+            .unwrap();
+        assert!(out.contains("GUIDE"), "{out}");
+        assert_eq!(ctx.asked.lock().unwrap().len(), 1, "file read did not ask");
+    }
+
+    #[tokio::test]
+    async fn session_allow_does_not_cover_other_skills_of_the_server() {
+        let h = McpHarness::start(HarnessOptions {
+            skills: Some(vec![
+                ScriptedSkill::new("a", "A"),
+                ScriptedSkill::new("b", "B"),
+            ]),
+            ..HarnessOptions::default()
+        })
+        .await;
+        let tool = mcp_tool(
+            catalog_with_perms(&[]).with_approval(ApprovalMode::Interactive),
+            h.tool_state.clone(),
+            Default::default(),
+        );
+        let ctx = RecordingContext::new(Some("c"), "Allow for this session");
+        call_named_with_context(&tool, "harness.a", &ctx)
+            .await
+            .unwrap();
+        call_named_with_context(&tool, "harness.b", &ctx)
+            .await
+            .unwrap();
+        let asked = ctx.asked.lock().unwrap();
+        assert_eq!(asked.len(), 2);
+        assert!(asked[1].0.starts_with("skill-permission-harness.b-"));
+    }
+
+    #[tokio::test]
+    async fn allow_once_is_not_remembered() {
+        let (_h, tool) = perm_tool(&[], ApprovalMode::Interactive).await;
+        let ctx = RecordingContext::new(Some("c"), "Allow");
+        for _ in 0..2 {
+            call_named_with_context(&tool, "harness.a", &ctx)
+                .await
+                .unwrap();
+        }
+        assert_eq!(ctx.asked.lock().unwrap().len(), 2);
+        assert!(tool.skill_grants.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn skill_denial_is_not_remembered() {
+        let (_h, tool) = perm_tool(&[], ApprovalMode::Interactive).await;
+        let ctx = RecordingContext::new(Some("c"), "Deny");
+        for _ in 0..2 {
+            let err = call_named_with_context(&tool, "harness.a", &ctx)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::PermissionDenied(_)));
+        }
+        assert_eq!(ctx.asked.lock().unwrap().len(), 2);
+        assert!(tool.skill_grants.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_allow_applies_to_an_ask_configured_local_skill() {
+        let dir = TempDir::new().unwrap();
+        write_skill(dir.path(), "review", "Review");
+        let tool = ask_local_tool(&dir, &[("review", PermissionLevel::Ask)]);
+        let ctx = RecordingContext::new(Some("c"), "Allow for this session");
+        call_named_with_context(&tool, "review", &ctx)
+            .await
+            .unwrap();
+        call_named_with_context(&tool, "review", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(ctx.asked.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn configured_deny_overrides_a_session_allow() {
+        let (h, tool) = perm_tool(&[], ApprovalMode::Interactive).await;
+        let ctx = RecordingContext::new(Some("c"), "Allow for this session");
+        call_named_with_context(&tool, "harness.a", &ctx)
+            .await
+            .unwrap();
+        // The same session (shared grants) now runs under deny.
+        let denied = Arc::new(catalog_with_perms(&[("harness.*", PermissionLevel::Deny)])).bind(
+            Some(&PathBuf::from(".")),
+            h.tool_state.clone(),
+            Default::default(),
+            Arc::clone(&tool.skill_grants),
+        );
+        assert!(denied.skill_grants.lock().contains("harness.a"));
+        let before = ctx.asked.lock().unwrap().len();
+        let err = call_named_with_context(&denied, "harness.a", &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::PermissionDenied(m) if m.contains("blocked")));
+        assert_eq!(ctx.asked.lock().unwrap().len(), before, "not asked");
+    }
+
+    #[tokio::test]
+    async fn non_interactive_catalog_ignores_a_non_empty_grant_set() {
+        let (h, tool) = perm_tool(&[], ApprovalMode::NonInteractive).await;
+        tool.skill_grants.lock().insert("harness.a".to_string());
+        let ctx = RecordingContext::new(Some("c"), "Allow");
+        let err = call_named_with_context(&tool, "harness.a", &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::PermissionDenied(m) if m.contains("\"harness.*\" = \"allow\""))
+        );
         assert!(ctx.asked.lock().unwrap().is_empty());
         untouched(&h);
     }
@@ -2708,6 +2975,88 @@ Body
             "same permission applies"
         );
         untouched(&h);
+    }
+
+    // ── Path check before approval (refine-mcp-skill-approval 2.1) ───────
+
+    async fn call_with_file(
+        tool: &SkillTool,
+        ctx: &dyn ToolContext,
+        name: &str,
+        file: &str,
+    ) -> Result<String, ToolError> {
+        tool.call(json!({"name": name, "file": file}), ctx)
+            .await
+            .map(first_text_block)
+    }
+
+    #[tokio::test]
+    async fn traversal_path_fails_without_an_approval_request() {
+        let (h, tool) = perm_tool(&[], ApprovalMode::Interactive).await;
+        let ctx = RecordingContext::new(Some("c"), "Allow");
+        let err = call_with_file(&tool, &ctx, "harness.a", "../secrets.env")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidRequest(m) if m.contains("invalid file path")));
+        assert!(ctx.asked.lock().unwrap().is_empty(), "no question");
+        untouched(&h);
+    }
+
+    #[tokio::test]
+    async fn denied_skill_with_an_invalid_path_reports_the_denial() {
+        let (h, tool) = perm_tool(
+            &[("harness.*", PermissionLevel::Deny)],
+            ApprovalMode::Interactive,
+        )
+        .await;
+        let ctx = RecordingContext::new(Some("c"), "Allow");
+        let err = call_with_file(&tool, &ctx, "harness.a", "../secrets.env")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::PermissionDenied(_)), "{err:?}");
+        assert!(ctx.asked.lock().unwrap().is_empty());
+        untouched(&h);
+    }
+
+    #[tokio::test]
+    async fn unlisted_file_still_asks_first() {
+        let h = McpHarness::start(HarnessOptions {
+            skills: Some(vec![ScriptedSkill::new("a", "A").with_file("ok.md", b"x")]),
+            ..HarnessOptions::default()
+        })
+        .await;
+        let tool = mcp_tool(
+            catalog_with_perms(&[]).with_approval(ApprovalMode::Interactive),
+            h.tool_state.clone(),
+            Default::default(),
+        );
+        let ctx = RecordingContext::new(Some("c"), "Allow");
+        let err = call_with_file(&tool, &ctx, "harness.a", "notlisted.md")
+            .await
+            .unwrap_err();
+        assert_rejected(err, "not listed");
+        assert_eq!(ctx.asked.lock().unwrap().len(), 1, "asked before the check");
+        assert!(h.log.resource_reads.lock().is_empty(), "no resources/read");
+    }
+
+    #[tokio::test]
+    async fn invalid_path_on_an_ask_configured_local_skill_does_not_ask() {
+        let dir = TempDir::new().unwrap();
+        write_skill(dir.path(), "review", "Review");
+        let tool = ask_local_tool(&dir, &[("review", PermissionLevel::Ask)]);
+        let ctx = RecordingContext::new(Some("c"), "Allow");
+        let err = call_with_file(&tool, &ctx, "review", "../x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidRequest(m) if m.contains("invalid file path")));
+        assert!(ctx.asked.lock().unwrap().is_empty());
+
+        // A denied local skill still reports the denial.
+        let tool = ask_local_tool(&dir, &[("review", PermissionLevel::Deny)]);
+        let err = call_with_file(&tool, &ctx, "review", "../x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::PermissionDenied(_)));
     }
 
     #[tokio::test]

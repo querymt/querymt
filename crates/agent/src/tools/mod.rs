@@ -15,8 +15,8 @@ pub use builtins::{
     UpdateTaskTool, WebFetchTool, WriteFileTool,
 };
 pub use context::{
-    AliasScope, ArgAlias, CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError,
-    ToolExecutionClass, WrapRule, run_under_mutation_gate,
+    AliasScope, ArgAlias, CapabilityRequirement, FileAccess, QuestionOption, Tool, ToolContext,
+    ToolError, ToolExecutionClass, WrapRule, run_under_mutation_gate,
 };
 pub use context_impl::{AgentToolContext, ElicitationRequest};
 pub use path::{

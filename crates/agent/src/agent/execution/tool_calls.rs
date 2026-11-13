@@ -1156,6 +1156,134 @@ async fn run_mcp_tool(
     }
 }
 
+/// Selected option labels of an accepted built-in question: the `selection`
+/// content key, a string or an array of strings (as `ask_question` reads it).
+fn selection_labels(response: &crate::elicitation::ElicitationResponse) -> Option<Vec<String>> {
+    match response.content.as_ref()?.get("selection")? {
+        serde_json::Value::String(label) => Some(vec![label.clone()]),
+        serde_json::Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(String::from))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Everything the question relay of one tool call needs.
+///
+/// The relay sits between the waiting tool and the pending map: it registers
+/// the request with its own sender, announces it, forwards the answer to the
+/// tool and journals how the question ended.
+#[derive(Clone)]
+struct ElicitationRelay {
+    event_sink: Arc<crate::event_sink::EventSink>,
+    session_id: String,
+    run_id: String,
+    tool_call_id: String,
+    pending: crate::elicitation::PendingElicitationMap,
+    cancellation_token: tokio_util::sync::CancellationToken,
+}
+
+impl ElicitationRelay {
+    async fn relay_request(self, request: crate::tools::ElicitationRequest) {
+        use crate::elicitation::{ElicitationAction, ElicitationResponse};
+        use crate::events::{AgentEventKind, ElicitationOutcome};
+
+        let crate::tools::ElicitationRequest {
+            elicitation_id,
+            message,
+            requested_schema,
+            source,
+            response_tx,
+        } = request;
+
+        let (relay_tx, relay_rx) = tokio::sync::oneshot::channel::<ElicitationResponse>();
+        crate::elicitation::register_pending_elicitation(
+            &self.pending,
+            elicitation_id.clone(),
+            crate::elicitation::PendingElicitationRegistration {
+                session_id: self.session_id.clone(),
+                form: crate::elicitation::PendingElicitationForm {
+                    message: message.clone(),
+                    requested_schema: requested_schema.clone(),
+                    source: source.clone(),
+                },
+                owner_authority: None,
+                run_id: Some(self.run_id.clone()),
+                tool_call_id: Some(self.tool_call_id.clone()),
+            },
+            relay_tx,
+        )
+        .await;
+
+        // Close the race where cancellation happens just before this request
+        // reaches the shared pending map. The question is never announced, so
+        // it is not resolved either.
+        let announced = !self.cancellation_token.is_cancelled();
+        if announced {
+            // Durable: elicitation must be visible in UI replay.
+            if let Err(err) = self
+                .event_sink
+                .emit_durable(
+                    &self.session_id,
+                    AgentEventKind::ElicitationRequested {
+                        elicitation_id: elicitation_id.clone(),
+                        session_id: self.session_id.clone(),
+                        message,
+                        requested_schema,
+                        source,
+                    },
+                )
+                .await
+            {
+                log::warn!("failed to emit ElicitationRequested: {}", err);
+            }
+        } else {
+            crate::elicitation::cancel_pending_elicitations_for_session(
+                &self.pending,
+                &self.session_id,
+            )
+            .await;
+        }
+
+        // An entry that was removed or dropped without an answer ends the
+        // question as cancelled.
+        let answer = relay_rx.await.ok();
+        let (outcome, selection) = match &answer {
+            Some(response) => (
+                ElicitationOutcome::from_action(&response.action),
+                (response.action == ElicitationAction::Accept)
+                    .then(|| selection_labels(response))
+                    .flatten(),
+            ),
+            None => (ElicitationOutcome::Cancelled, None),
+        };
+        if let Some(response) = answer {
+            // The tool may have stopped waiting; nothing else to do then.
+            let _ = response_tx.send(response);
+        }
+
+        if announced
+            && let Err(err) = self
+                .event_sink
+                .emit_durable(
+                    &self.session_id,
+                    AgentEventKind::ElicitationResolved {
+                        elicitation_id,
+                        session_id: self.session_id.clone(),
+                        outcome,
+                        selection,
+                    },
+                )
+                .await
+        {
+            log::warn!("failed to emit ElicitationResolved: {}", err);
+        }
+    }
+}
+
 /// Build the context handed to a built-in tool, wiring its elicitation channel
 /// to the pending-interaction registry for this call.
 fn tool_context_for_call(
@@ -1166,65 +1294,27 @@ fn tool_context_for_call(
     let (elicitation_tx, mut elicitation_rx) =
         tokio::sync::mpsc::channel::<crate::tools::ElicitationRequest>(1);
 
-    let event_sink = config.event_sink.clone();
-    let session_id_clone = exec_ctx.session_id.clone();
-    let run_id_clone = exec_ctx.turn_id().to_string();
-    let tool_call_id_clone = call.id.clone();
-    let pending_elicitations = config.pending_elicitations.clone();
-    let cancellation_token = exec_ctx.cancellation_token.clone();
+    let relay = ElicitationRelay {
+        event_sink: config.event_sink.clone(),
+        session_id: exec_ctx.session_id.clone(),
+        run_id: exec_ctx.turn_id().to_string(),
+        tool_call_id: call.id.clone(),
+        pending: config.pending_elicitations.clone(),
+        cancellation_token: exec_ctx.cancellation_token.clone(),
+    };
     tokio::spawn(async move {
         while let Some(request) = elicitation_rx.recv().await {
-            let elicitation_id = request.elicitation_id.clone();
-            crate::elicitation::register_pending_elicitation(
-                &pending_elicitations,
-                elicitation_id.clone(),
-                crate::elicitation::PendingElicitationRegistration {
-                    session_id: session_id_clone.clone(),
-                    form: crate::elicitation::PendingElicitationForm {
-                        message: request.message.clone(),
-                        requested_schema: request.requested_schema.clone(),
-                        source: request.source.clone(),
-                    },
-                    owner_authority: None,
-                    run_id: Some(run_id_clone.clone()),
-                    tool_call_id: Some(tool_call_id_clone.clone()),
-                },
-                request.response_tx,
-            )
-            .await;
-            // Close the race where cancellation happens just before this request
-            // reaches the shared pending map.
-            if cancellation_token.is_cancelled() {
-                crate::elicitation::cancel_pending_elicitations_for_session(
-                    &pending_elicitations,
-                    &session_id_clone,
-                )
-                .await;
-                continue;
-            }
-            // Durable: elicitation must be visible in UI replay.
-            if let Err(err) = event_sink
-                .emit_durable(
-                    &session_id_clone,
-                    crate::events::AgentEventKind::ElicitationRequested {
-                        elicitation_id,
-                        session_id: session_id_clone.clone(),
-                        message: request.message,
-                        requested_schema: request.requested_schema,
-                        source: request.source,
-                    },
-                )
-                .await
-            {
-                log::warn!("failed to emit ElicitationRequested: {}", err);
-            }
+            // One task per request: it outlives the receive loop's next
+            // iteration while it waits for the user, and journals the end of
+            // the question.
+            tokio::spawn(relay.clone().relay_request(request));
         }
 
         crate::elicitation::remove_pending_elicitations_for_tool(
-            &pending_elicitations,
-            &session_id_clone,
-            &run_id_clone,
-            &tool_call_id_clone,
+            &relay.pending,
+            &relay.session_id,
+            &relay.run_id,
+            &relay.tool_call_id,
         )
         .await;
     });
@@ -4539,6 +4629,326 @@ mod mcp_tool_tests {
                 .filter_map(|b| b.as_text())
                 .any(|t| t.contains("Body of a"))
         );
+    }
+
+    /// Run `skill harness.a` through `execute_tool_call`. When `answer` is
+    /// set, wait for the approval request and answer it with that label.
+    /// Returns the tool result and the approval requests the call raised.
+    async fn run_skill_call(
+        config: &AgentConfig,
+        handle: &crate::agent::LocalAgentHandle,
+        exec: &ExecutionContext,
+        answer: Option<&str>,
+    ) -> (crate::middleware::ToolResult, Vec<String>) {
+        use crate::elicitation::{ElicitationAction, ElicitationResponse};
+
+        let mut events = config.event_sink.fanout().subscribe();
+        // Separate receiver so answering the request does not consume the
+        // events counted below.
+        let mut counted = config.event_sink.fanout().subscribe();
+        let call = mock_tool_call("call-s", "skill", r#"{"name":"harness.a"}"#);
+        let run = execute_tool_call(config, &call, exec);
+        let answer_task = async {
+            let Some(label) = answer else {
+                return;
+            };
+            let id = loop {
+                let envelope = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .expect("approval event within 5s")
+                    .expect("fanout open");
+                if let AgentEventKind::ElicitationRequested { elicitation_id, .. } = envelope.kind()
+                {
+                    break elicitation_id.clone();
+                }
+            };
+            crate::elicitation::take_pending_elicitation_sender(handle, &id)
+                .await
+                .expect("pending approval")
+                .send(ElicitationResponse {
+                    action: ElicitationAction::Accept,
+                    content: Some(json!({"selection": label})),
+                })
+                .expect("tool still waiting");
+        };
+        let (result, ()) = tokio::join!(run, answer_task);
+        let requested = collect(&mut counted, Duration::from_millis(100))
+            .await
+            .iter()
+            .filter_map(|e| match e.kind() {
+                AgentEventKind::ElicitationRequested { elicitation_id, .. } => {
+                    Some(elicitation_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        (result.unwrap(), requested)
+    }
+
+    struct SkillFixture {
+        agent: TestAgent,
+        config: AgentConfig,
+        handle: crate::agent::LocalAgentHandle,
+        harness: McpHarness,
+    }
+
+    async fn skill_fixture() -> SkillFixture {
+        use crate::skills::{SkillCatalog, SkillPermissions};
+        use crate::test_utils::mcp_harness::ScriptedSkill;
+
+        let harness = McpHarness::start(HarnessOptions {
+            skills: Some(vec![ScriptedSkill::new("a", "A")]),
+            ..HarnessOptions::default()
+        })
+        .await;
+        let agent =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let mut config = agent.config.as_ref().clone();
+        config.skill_catalog = Some(Arc::new(SkillCatalog::from_parts(
+            Arc::new(std::sync::Mutex::new(crate::skills::SkillRegistry::new())),
+            Arc::new(SkillPermissions::default()),
+            vec![],
+            false,
+            std::path::PathBuf::from("."),
+        )));
+        let handle = crate::agent::LocalAgentHandle::from_config(Arc::new(config.clone()));
+        SkillFixture {
+            agent,
+            config,
+            handle,
+            harness,
+        }
+    }
+
+    /// Wait for the next `ElicitationRequested` on `events` and return its ID.
+    async fn next_request_id(events: &mut broadcast::Receiver<EventEnvelope>) -> String {
+        loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("approval event within 5s")
+                .expect("fanout open");
+            if let AgentEventKind::ElicitationRequested { elicitation_id, .. } = envelope.kind() {
+                return elicitation_id.clone();
+            }
+        }
+    }
+
+    /// Journaled form-question events of a session, in journal order:
+    /// `(kind tag, elicitation id, resolved outcome, resolved selection)`.
+    /// Waits until `resolved` `ElicitationResolved` events are present.
+    async fn journaled_questions(
+        config: &AgentConfig,
+        session_id: &str,
+        resolved: usize,
+    ) -> Vec<(
+        &'static str,
+        String,
+        Option<crate::events::ElicitationOutcome>,
+        Option<Vec<String>>,
+    )> {
+        for _ in 0..100 {
+            let events = config
+                .event_sink
+                .journal()
+                .load_session_stream(session_id, None, None)
+                .await
+                .unwrap();
+            let rows: Vec<_> = events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    AgentEventKind::ElicitationRequested { elicitation_id, .. } => {
+                        Some(("elicitation_requested", elicitation_id.clone(), None, None))
+                    }
+                    AgentEventKind::ElicitationResolved {
+                        elicitation_id,
+                        outcome,
+                        selection,
+                        ..
+                    } => Some((
+                        "elicitation_resolved",
+                        elicitation_id.clone(),
+                        Some(*outcome),
+                        selection.clone(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            if rows
+                .iter()
+                .filter(|row| row.0 == "elicitation_resolved")
+                .count()
+                >= resolved
+            {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("no elicitation_resolved event was journaled within 5s");
+    }
+
+    /// Covers session-interactions / Skill approval answer is recorded.
+    #[tokio::test]
+    async fn skill_approval_answer_is_recorded() {
+        use crate::events::ElicitationOutcome;
+
+        let f = skill_fixture().await;
+        let exec = f
+            .agent
+            .execution_context_with_mcp(f.harness.tool_state.clone())
+            .await;
+        let (result, requested) =
+            run_skill_call(&f.config, &f.handle, &exec, Some("Allow for this session")).await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(requested.len(), 1);
+
+        let rows = journaled_questions(&f.config, &exec.session_id, 1).await;
+        assert_eq!(
+            rows,
+            vec![
+                ("elicitation_requested", requested[0].clone(), None, None),
+                (
+                    "elicitation_resolved",
+                    requested[0].clone(),
+                    Some(ElicitationOutcome::Accepted),
+                    Some(vec!["Allow for this session".to_string()]),
+                ),
+            ],
+            "resolved follows its own request"
+        );
+    }
+
+    /// Covers session-interactions / Declined question is recorded.
+    #[tokio::test]
+    async fn declined_question_is_recorded() {
+        use crate::elicitation::{ElicitationAction, ElicitationResponse};
+        use crate::events::ElicitationOutcome;
+
+        let f = skill_fixture().await;
+        let exec = f.agent.execution_context().await;
+        let mut events = f.config.event_sink.fanout().subscribe();
+        let call = mock_tool_call(
+            "call-q",
+            "question",
+            r#"{"questions":[{"question":"Which?","header":"Pick","options":[{"label":"A","description":"a"}]}]}"#,
+        );
+        let run = execute_tool_call(&f.config, &call, &exec);
+        let decline = async {
+            let id = next_request_id(&mut events).await;
+            assert!(id.starts_with("question_"), "{id}");
+            crate::elicitation::take_pending_elicitation_sender(&f.handle, &id)
+                .await
+                .expect("pending question")
+                .send(ElicitationResponse {
+                    action: ElicitationAction::Decline,
+                    content: None,
+                })
+                .expect("tool still waiting");
+            id
+        };
+        let (result, id) = tokio::join!(run, decline);
+        assert!(result.unwrap().is_error, "a declined question is an error");
+
+        let rows = journaled_questions(&f.config, &exec.session_id, 1).await;
+        assert_eq!(
+            rows.last().unwrap(),
+            &(
+                "elicitation_resolved",
+                id,
+                Some(ElicitationOutcome::Declined),
+                None
+            )
+        );
+    }
+
+    /// Covers session-interactions / Cancelled run records the pending
+    /// question as cancelled.
+    #[tokio::test]
+    async fn cancelled_run_records_the_pending_question_as_cancelled() {
+        use crate::events::ElicitationOutcome;
+
+        let f = skill_fixture().await;
+        let exec = f
+            .agent
+            .execution_context_with_mcp(f.harness.tool_state.clone())
+            .await;
+        let mut events = f.config.event_sink.fanout().subscribe();
+        let call = mock_tool_call("call-x", "skill", r#"{"name":"harness.a"}"#);
+        let run = execute_tool_call(&f.config, &call, &exec);
+        let cancel = async {
+            let id = next_request_id(&mut events).await;
+            // What the session actor does on `Cancel`.
+            exec.cancellation_token.cancel();
+            crate::elicitation::cancel_pending_elicitations_for_session(
+                &f.config.pending_elicitations,
+                &exec.session_id,
+            )
+            .await;
+            id
+        };
+        let (result, id) = tokio::join!(run, cancel);
+        let _ = result;
+
+        let rows = journaled_questions(&f.config, &exec.session_id, 1).await;
+        assert_eq!(
+            rows,
+            vec![
+                ("elicitation_requested", id.clone(), None, None),
+                (
+                    "elicitation_resolved",
+                    id,
+                    Some(ElicitationOutcome::Cancelled),
+                    None
+                ),
+            ]
+        );
+    }
+
+    /// Covers agent-skills / Session allow does not reach another session.
+    #[tokio::test]
+    async fn session_allow_does_not_reach_another_session() {
+        use crate::skills::{SkillCatalog, SkillPermissions};
+        use crate::test_utils::mcp_harness::ScriptedSkill;
+
+        let harness = McpHarness::start(HarnessOptions {
+            skills: Some(vec![ScriptedSkill::new("a", "A")]),
+            ..HarnessOptions::default()
+        })
+        .await;
+        let agent =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let mut config = agent.config.as_ref().clone();
+        config.skill_catalog = Some(Arc::new(SkillCatalog::from_parts(
+            Arc::new(std::sync::Mutex::new(crate::skills::SkillRegistry::new())),
+            Arc::new(SkillPermissions::default()),
+            vec![],
+            false,
+            std::path::PathBuf::from("."),
+        )));
+        let handle = crate::agent::LocalAgentHandle::from_config(Arc::new(config.clone()));
+        let first = agent
+            .execution_context_with_mcp(harness.tool_state.clone())
+            .await;
+        let second = agent
+            .execution_context_with_mcp(harness.tool_state.clone())
+            .await;
+
+        // The first session answers "Allow for this session".
+        let (result, requested) =
+            run_skill_call(&config, &handle, &first, Some("Allow for this session")).await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(requested.len(), 1);
+
+        // The same session loads the skill again without a prompt.
+        let (result, requested) = run_skill_call(&config, &handle, &first, None).await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(requested.is_empty(), "granted session asked again");
+
+        // Another session of the same agent is asked on its own.
+        let (result, requested) = run_skill_call(&config, &handle, &second, Some("Allow")).await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(requested.len(), 1, "other session must get its own prompt");
     }
 
     #[tokio::test]

@@ -67,6 +67,7 @@ mod tests {
                 Some(project.path()),
                 crate::agent::core::McpToolState::empty(),
                 Default::default(),
+                Default::default(),
             )));
             registry
         };

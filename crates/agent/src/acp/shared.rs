@@ -4065,6 +4065,30 @@ mod tests {
     }
 
     #[test]
+    fn elicitation_resolved_produces_no_acp_notification_or_replay_update() {
+        let event = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
+            event_id: "evt-resolved".into(),
+            stream_seq: 1,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::ElicitationResolved {
+                elicitation_id: "e-1".into(),
+                session_id: "s-1".into(),
+                outcome: crate::events::ElicitationOutcome::Accepted,
+                selection: Some(vec!["Allow".into()]),
+            },
+        });
+        let mut translator = AcpLiveEventTranslator::new();
+        assert!(translator.translate_notifications(&event).is_empty());
+        assert!(translator.translate_updates(&event).is_empty());
+        assert!(translate_replay_event_to_notification(&event).is_none());
+        assert!(translate_replay_event_to_updates(&event).is_empty());
+    }
+
+    #[test]
     fn prompt_received_preserves_message_id() {
         let event = EventEnvelope::Durable(DurableEvent {
             session_seq: 0,

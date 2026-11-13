@@ -176,12 +176,14 @@ impl SkillCatalog {
         workspace: Option<&Path>,
         mcp_state: Arc<crate::agent::core::McpToolState>,
         tool_config: crate::agent::core::ToolConfig,
+        skill_grants: Arc<parking_lot::Mutex<HashSet<String>>>,
     ) -> SkillTool {
         SkillTool::bind(
             Arc::clone(self),
             workspace.unwrap_or(&self.project_root).to_path_buf(),
             mcp_state,
             tool_config,
+            skill_grants,
         )
     }
 
@@ -307,7 +309,7 @@ impl SkillCatalog {
             .or_default()
             .reload_with(skills);
         log::debug!(
-            "Skill registry refreshed for {}: {count} skills available",
+            "Skill registry refreshed for {}: {count} local skills available",
             workspace.display()
         );
         Ok(())

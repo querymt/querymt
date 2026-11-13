@@ -269,6 +269,31 @@ pub struct AgentEvent {
     pub kind: AgentEventKind,
 }
 
+/// How a form question ended.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElicitationOutcome {
+    /// The user answered the form.
+    Accepted,
+    /// The user declined to answer.
+    Declined,
+    /// The question ended without an answer (run cancelled, entry dropped).
+    Cancelled,
+}
+
+impl ElicitationOutcome {
+    /// Map a client's response action to an outcome.
+    pub fn from_action(action: &crate::elicitation::ElicitationAction) -> Self {
+        use crate::elicitation::ElicitationAction;
+        match action {
+            ElicitationAction::Accept => Self::Accepted,
+            ElicitationAction::Decline => Self::Declined,
+            ElicitationAction::Cancel => Self::Cancelled,
+        }
+    }
+}
+
 /// All agent event kinds.
 /// Typeshare-annotated: generated for TypeScript and Swift.
 /// Uses adjacently tagged serde (`tag = "type", content = "data"`) for typeshare compatibility.
@@ -775,6 +800,19 @@ pub enum AgentEventKind {
         requested_schema: serde_json::Value,
         source: String,
     },
+    /// How a form question announced by `ElicitationRequested` ended.
+    ///
+    /// Emitted exactly once per announced question. `selection` carries the
+    /// chosen option labels for built-in questions and skill approvals; it is
+    /// never set for MCP server elicitations, so submitted form content is
+    /// not recorded.
+    ElicitationResolved {
+        elicitation_id: String,
+        session_id: String,
+        outcome: ElicitationOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selection: Option<Vec<String>>,
+    },
     SessionForked {
         parent_session_id: String,
         child_session_id: String,
@@ -1085,6 +1123,7 @@ impl AgentEventKind {
             Self::PermissionRequested { .. } => "permission_requested",
             Self::PermissionGranted { .. } => "permission_granted",
             Self::ElicitationRequested { .. } => "elicitation_requested",
+            Self::ElicitationResolved { .. } => "elicitation_resolved",
             Self::SessionForked { .. } => "session_forked",
             Self::SessionConfigured { .. } => "session_configured",
             Self::ToolsAvailable { .. } => "tools_available",
@@ -1894,6 +1933,15 @@ mod tests {
                 }
             }),
             serde_json::json!({
+                "type": "elicitation_resolved",
+                "data": {
+                    "elicitation_id": "x",
+                    "session_id": "x",
+                    "outcome": "accepted",
+                    "selection": ["x"]
+                }
+            }),
+            serde_json::json!({
                 "type": "session_forked",
                 "data": {
                     "parent_session_id": "x",
@@ -2107,7 +2155,7 @@ mod tests {
         let samples = one_value_per_variant();
         // Update when a variant is added: `tag()`'s exhaustive match forces
         // the new tag, and this count forces a sample for it.
-        assert_eq!(samples.len(), 102, "one sample per AgentEventKind variant");
+        assert_eq!(samples.len(), 103, "one sample per AgentEventKind variant");
         let mut seen = std::collections::HashSet::new();
         for sample in samples {
             let expected = sample["type"].as_str().unwrap().to_string();
@@ -2852,6 +2900,48 @@ mod tests {
             source: "test".into(),
         };
         assert_eq!(classify_durability(&kind), Durability::Durable);
+    }
+
+    #[test]
+    fn elicitation_resolved_is_durable_and_round_trips() {
+        let kind = AgentEventKind::ElicitationResolved {
+            elicitation_id: "e1".into(),
+            session_id: "s1".into(),
+            outcome: ElicitationOutcome::Accepted,
+            selection: Some(vec!["Allow for this session".into()]),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Durable);
+        assert_eq!(kind.tag(), "elicitation_resolved");
+
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "elicitation_resolved");
+        assert_eq!(json["data"]["outcome"], "accepted");
+        let restored: AgentEventKind = serde_json::from_value(json).unwrap();
+        match restored {
+            AgentEventKind::ElicitationResolved {
+                elicitation_id,
+                outcome,
+                selection,
+                ..
+            } => {
+                assert_eq!(elicitation_id, "e1");
+                assert_eq!(outcome, ElicitationOutcome::Accepted);
+                assert_eq!(selection, Some(vec!["Allow for this session".to_string()]));
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+
+        // Without a selection the key is omitted, and still decodes.
+        let bare = AgentEventKind::ElicitationResolved {
+            elicitation_id: "e2".into(),
+            session_id: "s1".into(),
+            outcome: ElicitationOutcome::Cancelled,
+            selection: None,
+        };
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json["data"].get("selection").is_none());
+        assert_eq!(json["data"]["outcome"], "cancelled");
+        serde_json::from_value::<AgentEventKind>(json).unwrap();
     }
 
     fn sample_permission_request() -> crate::acp::protocol::RequestPermissionRequest {

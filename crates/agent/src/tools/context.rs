@@ -21,6 +21,24 @@ pub enum CapabilityRequirement {
     SessionState,
 }
 
+/// One selectable choice of a structured question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    /// Text shown for the choice; also the value returned when it is picked.
+    pub label: String,
+    /// Explanation shown next to the label.
+    pub description: String,
+}
+
+impl QuestionOption {
+    pub fn new(label: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            description: description.into(),
+        }
+    }
+}
+
 /// Unified error type for all tools
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -160,7 +178,7 @@ pub trait ToolContext: Send + Sync {
     /// * `question_id` - Unique identifier for this question
     /// * `question` - The question text to display
     /// * `header` - Short header label (max 12 chars)
-    /// * `options` - Available choices as (label, description) pairs
+    /// * `options` - Available choices
     /// * `multiple` - Whether multiple selections are allowed
     ///
     /// # Returns
@@ -173,7 +191,7 @@ pub trait ToolContext: Send + Sync {
         _question_id: &str,
         question: &str,
         header: &str,
-        options: &[(String, String)],
+        options: &[QuestionOption],
         multiple: bool,
     ) -> Result<Vec<String>, ToolError> {
         // Fallback to stdin/stdout for CLI mode
@@ -184,8 +202,8 @@ pub trait ToolContext: Send + Sync {
         println!("{}", "=".repeat(60));
         println!("{}\n", question);
 
-        for (idx, (label, description)) in options.iter().enumerate() {
-            println!("{}. {} - {}", idx + 1, label, description);
+        for (idx, option) in options.iter().enumerate() {
+            println!("{}. {} - {}", idx + 1, option.label, option.description);
         }
 
         if multiple {
@@ -229,7 +247,7 @@ pub trait ToolContext: Send + Sync {
         let mut answers = Vec::new();
         for sel in selections {
             if sel > 0 && sel <= options.len() {
-                answers.push(options[sel - 1].0.clone());
+                answers.push(options[sel - 1].label.clone());
             }
         }
 

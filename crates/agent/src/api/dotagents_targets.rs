@@ -307,7 +307,7 @@ mod tests {
             _: &str,
             _: &str,
             _: &str,
-            _: &[(String, String)],
+            _: &[crate::tools::QuestionOption],
             _: bool,
         ) -> Result<Vec<String>, ToolError> {
             panic!("a target must never prompt");
@@ -329,7 +329,12 @@ mod tests {
         })
         .await;
         let ws = std::path::PathBuf::from(".");
-        let tool = catalog.bind(Some(&ws), mcp.tool_state.clone(), Default::default());
+        let tool = catalog.bind(
+            Some(&ws),
+            mcp.tool_state.clone(),
+            Default::default(),
+            Default::default(),
+        );
         let err = tool
             .call(serde_json::json!({"name": "docs.a"}), &NoPromptContext)
             .await

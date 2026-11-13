@@ -4,6 +4,29 @@
 
 ### Behavior changes
 
+- **BREAKING (Rust API, journal):** `querymt_agent::events::AgentEventKind` gains
+  `ElicitationResolved { elicitation_id, session_id, outcome, selection }`
+  (kind `elicitation_resolved`, durable) and the `ElicitationOutcome` enum
+  (`accepted`, `declined`, `cancelled`). The enum is not `#[non_exhaustive]`, so
+  exhaustive matches downstream stop compiling. Built-in questions, skill
+  approvals and MCP server elicitations now journal how they ended; MCP form
+  content is never recorded. An older binary cannot decode journals that
+  contain the new event, so downgrading over existing sessions is not
+  supported. Typeshare output gains the types (UI follow-up for
+  querymt-desktop, not done here).
+- **BREAKING (Rust API):** `ToolContext::ask_question` takes `&[QuestionOption]`
+  instead of `&[(String, String)]` (`QuestionOption` moves to
+  `querymt_agent::tools`; the `question` tool re-exports it).
+  `SkillCatalog::bind` and the skill tool binding take the session's skill
+  grant set.
+- Skill approval prompts offer "Allow", "Allow for this session" and "Deny".
+  "Allow for this session" skips later prompts for the same skill ID, and its
+  supporting-file reads, in that session only. Configured `deny` still wins,
+  non-interactive agents still fail at once, and denials and one-time allows
+  are never remembered.
+- An invalid skill `file` path now fails before any approval prompt, for local
+  and MCP skills (a configured `deny` still reports the denial first).
+- The skill registry refresh debug log now says "local skills".
 - **BREAKING (Rust API):** `querymt_agent::tasks::run_verification` and
   `tasks::extract_verification_commands` are removed. Nothing called them, and
   they ran substrings of model output through `sh -c`. `TaskWatcher` is

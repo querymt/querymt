@@ -315,6 +315,10 @@ pub struct SessionRuntime {
     /// Tools the user allowed for the rest of this session (`allow_session`).
     /// Never held across `.await`.
     pub session_grants: ParkingMutex<crate::config::ToolSet>,
+    /// Callable skill IDs the user allowed for the rest of this session
+    /// ("Allow for this session" on a skill approval). Never held across
+    /// `.await`, never shared with other sessions.
+    pub skill_grants: Arc<ParkingMutex<HashSet<String>>>,
     pub tool_validator_cache: ParkingMutex<HashMap<String, Arc<jsonschema::Validator>>>,
     /// Workspace handle for duplicate code detection (built asynchronously on session start)
     pub workspace_handle: Arc<OnceCell<crate::index::WorkspaceHandle>>,
@@ -400,6 +404,7 @@ impl SessionRuntime {
             _mcp_services: mcp_services,
             mcp_tool_state,
             session_grants: ParkingMutex::new(crate::config::ToolSet::new()),
+            skill_grants: Arc::new(ParkingMutex::new(HashSet::new())),
             tool_validator_cache: ParkingMutex::new(HashMap::new()),
             workspace_handle: Arc::new(OnceCell::new()),
             turn_snapshot: ParkingMutex::new(None),

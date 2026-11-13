@@ -3028,7 +3028,7 @@ impl crate::tools::ToolContext for NoPromptCtx {
         _: &str,
         _: &str,
         _: &str,
-        _: &[(String, String)],
+        _: &[crate::tools::QuestionOption],
         _: bool,
     ) -> Result<Vec<String>, crate::tools::ToolError> {
         panic!("no prompt expected");
@@ -3123,6 +3123,7 @@ async fn target_sees_only_its_server_skills_and_parent_sees_both() -> Result<()>
         Some(dir.path()),
         prepared.runtime.mcp_tool_state.clone(),
         target.config.tool_config.clone(),
+        Default::default(),
     );
     assert_eq!(skill_enum(&tool), vec!["docs.guide"]);
     let out = tool
@@ -3170,6 +3171,7 @@ async fn target_sees_only_its_server_skills_and_parent_sees_both() -> Result<()>
         Some(dir.path()),
         prepared.runtime.mcp_tool_state.clone(),
         parent.config.tool_config.clone(),
+        Default::default(),
     );
     assert_eq!(skill_enum(&tool), vec!["docs.guide", "ops.runbook"]);
 

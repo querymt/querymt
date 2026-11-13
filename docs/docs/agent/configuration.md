@@ -239,6 +239,9 @@ Server skills are untrusted content, so they default to **ask**:
 - `"docs.*" = "allow"` (or an exact `"docs.release-notes"`) admits them without a prompt; `"docs.*" = "deny"` blocks them.
 - `"*" = "allow"` or `"*" = "ask"` does **not** admit server skills; they still prompt. Only `"*" = "deny"` applies to them, so locking down all skills also locks down server skills.
 - The prompt names the server and the skill. Each tool call has its own prompt, so parallel loads of the same skill do not collide.
+- The prompt offers **Allow**, **Allow for this session** and **Deny**. "Allow for this session" is remembered per skill ID and per session: later loads of that skill, and reads of its supporting files, run without a prompt. It does not cover other skills of the same server, other sessions or delegate sessions, and it ends with the session. "Allow" and "Deny" apply to one load only. Use `"docs.*" = "allow"` to admit a whole server.
+- `deny` always wins, even over a session allow.
+- A `file` path that can never be valid (for example `../secrets.env`) fails without a prompt. A well-formed file that the MCP skill does not list still prompts first and fails after approval.
 - An agent that cannot prompt (such as an `.agents` delegation target, see [dotagents](dotagents.md)) fails an `ask` result immediately with an error naming the pattern to configure.
 
 ### Hooks Configuration
