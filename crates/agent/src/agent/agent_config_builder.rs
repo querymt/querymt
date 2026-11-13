@@ -659,13 +659,13 @@ impl AgentConfigBuilder {
         }
     }
 
-    /// Mutably access the tool registry (for adding tools during build).
     /// Offer the session-owned `skill` tool backed by `catalog`.
     pub fn with_skill_catalog(mut self, catalog: Arc<crate::skills::SkillCatalog>) -> Self {
         self.skill_catalog = Some(catalog);
         self
     }
 
+    /// Mutably access the tool registry (for adding tools during build).
     pub fn tool_registry_mut(&mut self) -> &mut ToolRegistry {
         &mut self.tool_registry
     }

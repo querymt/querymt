@@ -1432,15 +1432,24 @@ mod tests {
 
     #[tokio::test]
     async fn replace_server_leaves_other_servers_untouched() {
-        let h = McpHarness::start(skills_on(vec![ScriptedSkill::new("a", "A")])).await;
+        // Distinct tool lists, so each server owns tools of its own.
+        let h_one = McpHarness::start(HarnessOptions {
+            tools: vec!["echo"],
+            ..skills_on(vec![ScriptedSkill::new("a", "A")])
+        })
+        .await;
+        let h_two = McpHarness::start(HarnessOptions {
+            tools: vec!["structured"],
+            ..skills_on(vec![ScriptedSkill::new("a", "A")])
+        })
+        .await;
         let state = McpToolState::empty();
-        let peer = h.running.peer().clone();
-        for name in ["one", "two"] {
+        for (name, h) in [("one", &h_one), ("two", &h_two)] {
             crate::agent::protocol::merge_connected_mcp_peers(
                 state.clone(),
                 &[crate::agent::session_mcp::ConnectedMcpPeer {
                     server_name: name.into(),
-                    peer: peer.clone(),
+                    peer: h.running.peer().clone(),
                 }],
             )
             .await
@@ -1453,6 +1462,7 @@ mod tests {
             .values()
             .filter(|a| a.server_name() == "two")
             .count();
+        assert!(tools_two > 0, "server two must own tools before the test");
 
         state.replace_server("one", None, Some(vec![]));
         assert_eq!(skill_names(&state), ["two.a"]);

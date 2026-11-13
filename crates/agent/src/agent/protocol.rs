@@ -44,10 +44,6 @@ pub(crate) async fn build_mcp_state(
 ) -> Result<HashMap<String, RunningService<RoleClient, crate::elicitation::McpClientHandler>>, Error>
 {
     let mut clients = HashMap::new();
-    let mut tools = HashMap::new();
-    let mut tool_defs = Vec::new();
-    let mut skills = Vec::new();
-    let mut skill_servers = std::collections::HashMap::new();
     let mut skipped_servers = Vec::new();
 
     for server in servers {
@@ -109,6 +105,7 @@ pub(crate) async fn build_mcp_state(
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
+        let mut adapters = Vec::with_capacity(tool_list.len());
         for tool in tool_list {
             let adapter = querymt::mcp::adapter::McpToolAdapter::try_new(
                 tool,
@@ -117,20 +114,13 @@ pub(crate) async fn build_mcp_state(
             )
             .map_err(|e| Error::internal_error().data(e.to_string()))?
             .with_router(router.clone());
-            let name = adapter.descriptor().function.name.clone();
-            if tools.contains_key(&name) {
-                warn!("Duplicate MCP tool '{}', keeping first instance", name);
-                continue;
-            }
-            tool_defs.push(adapter.descriptor());
-            tools.insert(name, Arc::new(adapter));
+            adapters.push(Arc::new(adapter));
         }
-        // Skills: only eligible servers are asked; a failure never fails the
-        // connection (it is logged inside).
-        if let Some(found) = crate::skills::mcp::discover_server_skills(&server_name, &peer).await {
-            skills.extend(found);
-            skill_servers.insert(server_name.clone(), peer.clone());
-        }
+        // Skills: only eligible servers are asked; a failed or timed-out
+        // listing never fails the connection (it is logged inside) and leaves
+        // the server registered so a later refresh can recover.
+        let found = crate::skills::mcp::discover_server_skills(&server_name, &peer).await;
+        apply_server_listing(&tool_state, &server_name, &peer, adapters, found);
         clients.insert(server_name, running);
     }
 
@@ -139,16 +129,14 @@ pub(crate) async fn build_mcp_state(
     // session/new and session/load responses disclose them too.
     tool_state.set_skipped_servers(skipped_servers);
 
-    // Populate the shared tool state with the initial tool list.
-    let snapshot = crate::agent::core::McpToolSnapshot {
-        tools,
-        tool_defs,
-        tools_hash: None,
-        skills,
-        skill_servers,
-    };
-    crate::agent::mcp::warn_unmatched_permissions(connect_ctx.permissions(), &snapshot, None);
-    tool_state.store(snapshot);
+    // Each server's listing was already applied to the shared state as it
+    // arrived, so refreshes pushed by earlier servers while later ones were
+    // connecting are not overwritten.
+    crate::agent::mcp::warn_unmatched_permissions(
+        connect_ctx.permissions(),
+        &tool_state.load(),
+        None,
+    );
 
     Ok(clients)
 }
@@ -165,27 +153,13 @@ pub(crate) async fn merge_connected_mcp_peers(
         return Ok(());
     }
 
-    let current = tool_state.load();
-    let mut tools = current.tools.clone();
-    let mut tool_defs = current.tool_defs.clone();
-    let mut skills = current.skills.clone();
-    let mut skill_servers = current.skill_servers.clone();
-
     for connected in connected_peers {
-        if let Some(found) =
-            crate::skills::mcp::discover_server_skills(&connected.server_name, &connected.peer)
-                .await
-        {
-            skills.retain(|s| s.server_name != connected.server_name);
-            skills.extend(found);
-            skill_servers.insert(connected.server_name.clone(), connected.peer.clone());
-        }
         let tool_list = connected
             .peer
             .list_all_tools()
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
-
+        let mut adapters = Vec::with_capacity(tool_list.len());
         for tool in tool_list {
             let adapter = querymt::mcp::adapter::McpToolAdapter::try_new(
                 tool,
@@ -193,25 +167,55 @@ pub(crate) async fn merge_connected_mcp_peers(
                 connected.server_name.clone(),
             )
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
-            let name = adapter.descriptor().function.name.clone();
-            if tools.contains_key(&name) {
-                warn!("Duplicate MCP tool '{}', keeping first instance", name);
-                continue;
-            }
-            tool_defs.push(adapter.descriptor());
-            tools.insert(name, Arc::new(adapter));
+            adapters.push(Arc::new(adapter));
         }
+        let found =
+            crate::skills::mcp::discover_server_skills(&connected.server_name, &connected.peer)
+                .await;
+        apply_server_listing(
+            &tool_state,
+            &connected.server_name,
+            &connected.peer,
+            adapters,
+            found,
+        );
     }
 
-    tool_state.store(crate::agent::core::McpToolSnapshot {
-        tools,
-        tool_defs,
-        tools_hash: None,
-        skills,
-        skill_servers,
-    });
-
     Ok(())
+}
+
+/// Apply one server's freshly fetched listing to the live state.
+///
+/// All network work is done before this runs; the state is then updated with
+/// a read-modify-write that starts from the latest snapshot, so refreshes of
+/// other servers (or of this one) that landed meanwhile are kept. The peer is
+/// registered as a skill server whenever it is eligible, even if its initial
+/// skills listing failed (`skills` is `None`), so refresh-on-miss can retry.
+/// A tool name already provided by another server keeps its first provider.
+fn apply_server_listing(
+    tool_state: &McpToolState,
+    server_name: &str,
+    peer: &rmcp::service::Peer<RoleClient>,
+    adapters: Vec<Arc<querymt::mcp::adapter::McpToolAdapter>>,
+    skills: Option<Vec<Arc<crate::skills::mcp::McpSkill>>>,
+) {
+    {
+        let current = tool_state.load();
+        for adapter in &adapters {
+            let name = &adapter.descriptor().function.name;
+            if current
+                .tools
+                .get(name)
+                .is_some_and(|existing| existing.server_name() != server_name)
+            {
+                warn!("Duplicate MCP tool '{}', keeping first instance", name);
+            }
+        }
+    }
+    if crate::skills::mcp::is_skill_server(server_name, peer) {
+        tool_state.register_skill_server(server_name, peer);
+    }
+    tool_state.replace_server(server_name, Some(adapters), skills);
 }
 
 /// Starts an MCP server based on its configuration.

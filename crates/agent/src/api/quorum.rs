@@ -595,18 +595,18 @@ impl QuorumBuilder {
                     ));
                 }
 
+                // Infer the policy like the single-agent path: any external
+                // tool spec, resolved MCP selection or attached MCP server
+                // needs BuiltInAndProvider so MCP tools and skills reach the
+                // LLM, even when the tool list is empty; otherwise
+                // BuiltInOnly is sufficient.
+                let policy = crate::agent::tools::infer_restricted_tool_policy(
+                    &tools,
+                    &delegate_mcp_servers,
+                );
+                b = b.with_tool_policy(policy);
                 if !tools.is_empty() {
-                    // The resolved tool list contains local tool names plus
-                    // normalized MCP selectors. Infer the policy like the
-                    // single-agent path: any external tool spec or resolved
-                    // MCP selection needs BuiltInAndProvider so MCP tool
-                    // definitions reach the LLM; otherwise BuiltInOnly is
-                    // sufficient.
-                    let policy = crate::agent::tools::infer_restricted_tool_policy(
-                        &tools,
-                        &delegate_mcp_servers,
-                    );
-                    b = b.with_tool_policy(policy).with_allowed_tools(tools.clone());
+                    b = b.with_allowed_tools(tools.clone());
                 }
 
                 // Attach resolved MCP servers through the existing lifecycle.

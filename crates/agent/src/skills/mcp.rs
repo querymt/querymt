@@ -26,6 +26,13 @@ pub const MCP_SKILL_MAX_BYTES: u64 = 256 * 1024;
 /// it; on timeout the server simply contributes no skills.
 pub const MCP_SKILL_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Longest a server may take for one skill load request (`skills/get` or a
+/// resource read). A stalled server must not hang the `skill` tool call.
+pub const MCP_SKILL_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Longest accepted skill name, in characters (the Agent Skills name limit).
+pub const MCP_SKILL_NAME_MAX: usize = 64;
+
 /// One valid skill published by a connected MCP server.
 pub struct McpSkill {
     pub server_name: String,
@@ -89,8 +96,23 @@ pub fn server_name_is_eligible(server_name: &str) -> bool {
     !server_name.contains('.')
 }
 
-/// Keep only the usable entries of a listing: structurally valid, with no `.`
-/// in the name; descriptions are sanitized. Dropped entries are logged with
+/// Names are shown to the model and used in callable IDs, so they must be
+/// non-empty, bounded and free of whitespace and control characters.
+fn check_skill_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("empty");
+    }
+    if name.chars().count() > MCP_SKILL_NAME_MAX {
+        return Err("too long");
+    }
+    if name.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("contains whitespace or control characters");
+    }
+    Ok(())
+}
+
+/// Keep only the usable entries of a listing: structurally valid, with a
+/// well-formed name without `.`; descriptions are sanitized. Dropped entries are logged with
 /// the server name and URI.
 pub fn filter_listed_skills(server_name: &str, listed: Vec<Skill>) -> Vec<Skill> {
     let mut seen = std::collections::HashSet::new();
@@ -106,6 +128,13 @@ pub fn filter_listed_skills(server_name: &str, listed: Vec<Skill>) -> Vec<Skill>
         if skill.name().contains('.') {
             log::warn!(
                 "MCP server '{server_name}': excluding skill '{}': its name contains '.'",
+                skill.uri
+            );
+            continue;
+        }
+        if let Err(why) = check_skill_name(skill.name()) {
+            log::warn!(
+                "MCP server '{server_name}': excluding skill '{}': invalid name: {why}",
                 skill.uri
             );
             continue;
@@ -209,6 +238,29 @@ fn rejected(id: &str, message: impl std::fmt::Display) -> String {
     format!("MCP skill '{id}' rejected: {message}")
 }
 
+/// Fetch the skill's current entry (`skills/get`), bounded by
+/// [`MCP_SKILL_LOAD_TIMEOUT`].
+async fn fetch_current_entry(skill: &McpSkill, id: &str) -> Result<Skill, String> {
+    let response = tokio::time::timeout(
+        MCP_SKILL_LOAD_TIMEOUT,
+        skill
+            .peer
+            .get_skill(GetSkillRequestParams::new(skill.skill.uri.clone())),
+    )
+    .await
+    .map_err(|_| {
+        rejected(
+            id,
+            format!(
+                "skills/get timed out after {}s",
+                MCP_SKILL_LOAD_TIMEOUT.as_secs()
+            ),
+        )
+    })?
+    .map_err(|error| rejected(id, format!("skills/get failed: {error}")))?;
+    Ok(response.skill)
+}
+
 /// Re-check the entry returned at load time against the listed one.
 pub fn check_entry(listed: &Skill, current: &Skill) -> Result<(), String> {
     current.validate().map_err(|error| error.to_string())?;
@@ -263,10 +315,18 @@ pub fn select_content(uri: &str, contents: Vec<ResourceContents>) -> Result<Vec<
 /// Read one resource and return the bytes of exactly that URI, bounded by
 /// [`MCP_SKILL_MAX_BYTES`].
 pub async fn read_uri_bytes(peer: &Peer<RoleClient>, uri: &str) -> Result<Vec<u8>, String> {
-    let result = peer
-        .read_resource(ReadResourceRequestParams::new(uri))
-        .await
-        .map_err(|error| format!("reading {uri} failed: {error}"))?;
+    let result = tokio::time::timeout(
+        MCP_SKILL_LOAD_TIMEOUT,
+        peer.read_resource(ReadResourceRequestParams::new(uri)),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "reading {uri} timed out after {}s",
+            MCP_SKILL_LOAD_TIMEOUT.as_secs()
+        )
+    })?
+    .map_err(|error| format!("reading {uri} failed: {error}"))?;
     let bytes = select_content(uri, result.contents)?;
     if bytes.len() as u64 > MCP_SKILL_MAX_BYTES {
         return Err(format!(
@@ -288,12 +348,7 @@ fn listable_files(skill: &Skill, files: &[SkillResource]) -> Vec<String> {
         .iter()
         .filter(|file| file.uri != skill.uri)
         .filter_map(|file| file.uri.strip_prefix(root))
-        .filter(|rel| {
-            !rel.is_empty()
-                && !rel.contains(['?', '#', '\\', '%'])
-                && rel.split('/').all(|seg| !matches!(seg, "" | "." | ".."))
-                && !rel.split('/').next().is_some_and(|seg| seg.contains(':'))
-        })
+        .filter(|rel| normalize_file_path(rel).is_ok())
         .map(str::to_string)
         .collect();
     keys.sort();
@@ -393,12 +448,7 @@ pub async fn load_mcp_file(skill: &McpSkill, path: &str) -> Result<String, Strin
                     format!("file '{path}' is not listed in its manifest"),
                 ));
             }
-            let current = skill
-                .peer
-                .get_skill(GetSkillRequestParams::new(skill.skill.uri.clone()))
-                .await
-                .map_err(|error| rejected(&id, format!("skills/get failed: {error}")))?
-                .skill;
+            let current = fetch_current_entry(skill, &id).await?;
             check_entry(&skill.skill, &current)
                 .map_err(|error| rejected(&id, format!("integrity error: {error}")))?;
             let SkillResources::Files(current_files) = &current.resources else {
@@ -451,12 +501,7 @@ pub async fn load_mcp_file(skill: &McpSkill, path: &str) -> Result<String, Strin
 /// the skill and returns no content.
 pub async fn load_mcp_skill(skill: &McpSkill) -> Result<LoadedMcpSkill, String> {
     let id = skill.callable_id();
-    let current = skill
-        .peer
-        .get_skill(GetSkillRequestParams::new(skill.skill.uri.clone()))
-        .await
-        .map_err(|error| rejected(&id, format!("skills/get failed: {error}")))?
-        .skill;
+    let current = fetch_current_entry(skill, &id).await?;
     check_entry(&skill.skill, &current)
         .map_err(|error| rejected(&id, format!("integrity error: {error}")))?;
 

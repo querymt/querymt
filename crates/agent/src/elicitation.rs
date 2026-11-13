@@ -1494,15 +1494,20 @@ impl ClientHandler for McpClientHandler {
 
     async fn on_resource_list_changed(&self, context: NotificationContext<RoleClient>) -> () {
         // Skills ride on resources. Ineligible servers (no skills extension or
-        // a dotted name) and failed listings change nothing.
+        // a dotted name) change nothing. An eligible server is registered even
+        // when this listing fails, so refresh-on-miss can retry; a failed
+        // listing keeps the previous skills.
+        if !crate::skills::mcp::is_skill_server(&self.server_name, &context.peer) {
+            return;
+        }
+        self.tool_state
+            .register_skill_server(&self.server_name, &context.peer);
         let Some(skills) =
             crate::skills::mcp::discover_server_skills(&self.server_name, &context.peer).await
         else {
             return;
         };
         let count = skills.len();
-        self.tool_state
-            .register_skill_server(&self.server_name, &context.peer);
         self.tool_state
             .replace_server(&self.server_name, None, Some(skills));
         log::info!(
