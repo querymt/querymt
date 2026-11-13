@@ -5,10 +5,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let mut args = std::env::args().skip(1);
     let config_path = args.next().unwrap_or_else(|| {
-        eprintln!("Usage: cargo run --example from_config <config_file>");
+        eprintln!("Usage: cargo run -p querymt-agent --example from_config <config_file>");
+        eprintln!("Add `--features oauth` to authenticate with a stored OAuth login;");
+        eprintln!("without it the example falls back to API keys.");
         eprintln!("Examples:");
-        eprintln!("  cargo run --example from_config examples/confs/single_agent.toml");
-        eprintln!("  cargo run --example from_config examples/confs/multi_agent.toml");
+        eprintln!(
+            "  cargo run -p querymt-agent --features oauth --example from_config -- crates/agent/examples/confs/single_agent.toml"
+        );
+        eprintln!(
+            "  cargo run -p querymt-agent --features oauth --example from_config -- crates/agent/examples/confs/multi_agent.toml"
+        );
         std::process::exit(1);
     });
 
