@@ -13,12 +13,12 @@
 # of them (a concept note or the source file it explains).
 
 version = 1
-revision = "42823824+worktree"          # HEAD plus the uncommitted pilot corpus; the corpus fingerprints below are the real pin
+revision = "b856dc8c"                   # commit the corpus below was frozen at; the corpus fingerprints are the real pin (refrozen 2026-11-13, see pilot/README.md)
 gate_version = 1
 gate_fingerprint = "985e6fcb143a079c9aea1a8fe6ef8e00"
 
 [frozen_corpus]
-curated = "b7c75bf6ae632fa484e8c5add77ff80f"
+curated = "8173a8ad722347e6edb1c5e7c0cd1ced"
 baseline = "354b3ec283921d37d4440b343e86c542"
 
 [[arm]]
