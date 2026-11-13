@@ -227,7 +227,8 @@ pub enum AuthFlowError {
         /// `client registration`.
         step: &'static str,
         #[source]
-        source: rmcp::transport::AuthError,
+        // Boxed: `AuthError` is large and would bloat every `Result<_, AuthFlowError>`.
+        source: Box<rmcp::transport::AuthError>,
     },
     /// A provider (non-MCP) login failure.
     #[error("{0}")]
