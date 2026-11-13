@@ -25,13 +25,14 @@
 
 use clap::{Args, Parser, Subcommand};
 use querymt_agent::config::RepositoryKnowledgeSettings;
+use querymt_agent::knowledge::host::default_config_dir;
 use querymt_agent::knowledge::repository::evaluation::{
     self, QuestionSet, ReplayOptions, SplitSelect, TrialFile, corpus_fingerprint,
 };
 use querymt_agent::knowledge::repository::{
     AcknowledgeRequest, AcknowledgeSelection, CheckRequest, ExportAction, ExportRequest,
     MapRequest, ReconcileOptions, RefreshPolicy, RepositoryService, RootRequest, ScaffoldRequest,
-    default_config_dir, resolve_root,
+    resolve_root,
 };
 use querymt_agent::knowledge::repository::{GATE_VERSION, gate_fingerprint};
 use serde_json::{Value, json};

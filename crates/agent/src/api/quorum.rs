@@ -503,7 +503,7 @@ impl QuorumBuilder {
         let repository_knowledge = self
             .repository_knowledge
             .as_ref()
-            .and_then(crate::knowledge::repository::RepositoryKnowledgeRegistry::from_settings);
+            .and_then(crate::knowledge::host::registry_from_settings);
         if workspace_service.is_none()
             && let Some(delegate) = self
                 .delegates

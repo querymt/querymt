@@ -699,7 +699,6 @@ mod tests {
     async fn config_with(tools_excluded: bool, enabled: bool) -> (AgentConfig, tempfile::TempDir) {
         use crate::agent::agent_config_builder::AgentConfigBuilder;
         use crate::config::RepositoryKnowledgeSettings;
-        use crate::knowledge::repository::RepositoryKnowledgeRegistry;
         let (plugins, dir) = crate::test_utils::helpers::empty_plugin_registry().unwrap();
         let storage = std::sync::Arc::new(
             crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
@@ -713,9 +712,10 @@ mod tests {
             .system("base two");
         let mut builder = AgentConfigBuilder::new(std::sync::Arc::new(plugins), storage, llm);
         if enabled {
-            builder = builder.with_repository_knowledge(
-                RepositoryKnowledgeRegistry::from_settings(&RepositoryKnowledgeSettings::enabled()),
-            );
+            builder =
+                builder.with_repository_knowledge(crate::knowledge::host::registry_from_settings(
+                    &RepositoryKnowledgeSettings::enabled(),
+                ));
         }
         let mut config = builder.build();
         if tools_excluded {

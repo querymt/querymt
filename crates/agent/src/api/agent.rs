@@ -667,7 +667,7 @@ impl AgentBuilder {
         let repository_knowledge = self.repository_knowledge_registry.clone().or_else(|| {
             self.repository_knowledge
                 .as_ref()
-                .and_then(crate::knowledge::repository::RepositoryKnowledgeRegistry::from_settings)
+                .and_then(crate::knowledge::host::registry_from_settings)
         });
         builder = builder.with_repository_knowledge(repository_knowledge);
 
