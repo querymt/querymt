@@ -70,6 +70,12 @@ The manifest SHALL support optional selected-document or section entrypoints for
 - **THEN** its relative document/section identity is usable after a fresh clone
 - **AND** it is not automatically injected unless the host enables the orientation delivery stage
 
+#### Scenario: Specs stay searchable but are not attached unasked
+- **WHEN** the manifest lists glob patterns under `[orientation] retrieval_only`
+- **THEN** matching selected documents remain indexed and fully available to explicit retrieval
+- **AND** automatic delivery never attaches them, and the setting neither widens indexed coverage nor grants any permission
+- **AND** an invalid pattern is reported as an invalid manifest with a diagnostic, like an invalid `include` pattern, and the repository is not indexed until it is fixed
+
 #### Scenario: Directory association does not acknowledge evidence
 - **WHEN** a note declares applicability to a repository-relative source-directory glob
 - **THEN** that association can select it for authorized index enrichment
