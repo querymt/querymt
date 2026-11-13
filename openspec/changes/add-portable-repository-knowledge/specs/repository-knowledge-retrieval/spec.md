@@ -121,7 +121,7 @@ When repository knowledge is enabled and `repo_knowledge_query` and `repo_knowle
 
 #### Scenario: Opt-in coding session
 - **WHEN** an enabled session has usable repository query/get tools
-- **THEN** it receives concise retrieval guidance and effective-workspace availability information
+- **THEN** it receives concise retrieval guidance scoped to the session's effective checkout, with per-checkout availability reported by `repo_knowledge_stats` and tool diagnostics rather than embedded in the policy
 - **AND** repeated turns do not accumulate duplicate policy parts
 
 ### Requirement: Tool allowlists remain authoritative
