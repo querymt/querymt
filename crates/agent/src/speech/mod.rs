@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{OnceCell, Semaphore};
+use typeshare::typeshare;
 
 const MAX_CONCURRENT_REQUESTS: usize = 4;
 const MAX_SYNTHESIS_TEXT_BYTES: usize = 16 * 1024;
@@ -33,6 +34,7 @@ pub struct SpeechService {
     requests: Semaphore,
 }
 
+#[typeshare]
 #[derive(Debug, Clone, Serialize)]
 pub struct SpeechProfileInfo {
     pub id: String,
@@ -45,6 +47,7 @@ pub struct SpeechProfileInfo {
     pub voice_description: Option<String>,
 }
 
+#[typeshare]
 #[derive(Debug, Clone, Serialize)]
 pub struct SpeechDefaults {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,12 +56,14 @@ pub struct SpeechDefaults {
     pub synthesis: Option<String>,
 }
 
+#[typeshare]
 #[derive(Debug, Clone, Serialize)]
 pub struct ListProfilesResponse {
     pub profiles: Vec<SpeechProfileInfo>,
     pub defaults: SpeechDefaults,
 }
 
+#[typeshare]
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscribeResponse {
     pub text: String,
@@ -67,6 +72,7 @@ pub struct TranscribeResponse {
     pub language: Option<String>,
 }
 
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscribeAudio {
@@ -74,6 +80,7 @@ pub struct TranscribeAudio {
     pub mime_type: String,
 }
 
+#[typeshare]
 #[derive(Debug, Clone, Serialize)]
 pub struct SynthesizeResponse {
     pub audio: TranscribeAudio,

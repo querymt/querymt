@@ -3,7 +3,9 @@ use super::*;
 use crate::error::AgentError;
 use crate::speech::{SpeechError, TranscribeAudio};
 use serde::Deserialize;
+use typeshare::typeshare;
 
+#[typeshare]
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct ListProfilesRequest {
@@ -11,6 +13,7 @@ struct ListProfilesRequest {
     operation: Option<String>,
 }
 
+#[typeshare]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TranscribeRequest {
@@ -23,6 +26,7 @@ struct TranscribeRequest {
     filename: Option<String>,
 }
 
+#[typeshare]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SynthesizeRequest {
