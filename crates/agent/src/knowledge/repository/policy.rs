@@ -33,21 +33,9 @@ pub fn should_attach(usable: impl Fn(&str) -> bool) -> bool {
     REQUIRED_TOOLS.iter().all(|name| usable(name))
 }
 
-/// Add the policy to a system prompt, unless an identical part is already
-/// there. Returns whether a part was added. Existing parts are never
-/// reordered or edited, so the prefix is unchanged.
-pub fn append_once(system: &mut Vec<querymt::params::SystemPrompt>) -> bool {
-    if system.iter().any(|part| part.text() == RETRIEVAL_POLICY) {
-        return false;
-    }
-    system.push(RETRIEVAL_POLICY.into());
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use querymt::params::SystemPrompt;
 
     #[test]
     fn requires_both_query_and_get() {
@@ -59,19 +47,6 @@ mod tests {
         assert!(!should_attach(
             |name| name.ends_with("list") || name.ends_with("stats")
         ));
-    }
-
-    #[test]
-    fn appended_once_after_an_unchanged_prefix() {
-        let mut system: Vec<SystemPrompt> = vec!["base one".into(), "base two".into()];
-        let before = system.clone();
-        assert!(append_once(&mut system));
-        assert_eq!(&system[..2], &before[..]);
-        assert_eq!(system.len(), 3);
-        for _ in 0..5 {
-            assert!(!append_once(&mut system));
-        }
-        assert_eq!(system.len(), 3, "repeated attachment must not accumulate");
     }
 
     #[test]
