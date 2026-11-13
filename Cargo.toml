@@ -44,3 +44,4 @@ toml = "1"
 
 [profile.dev]
 debug = "line-tables-only"
+split-debuginfo = "unpacked"
