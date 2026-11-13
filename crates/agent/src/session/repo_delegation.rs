@@ -45,7 +45,7 @@ impl SqliteDelegationRepository {
             .await
         {
             Ok(id) => Ok(id),
-            Err(SessionError::Other(msg)) if msg.contains("Query returned no rows") => {
+            Err(SessionError::Database(rusqlite::Error::QueryReturnedNoRows)) => {
                 Err(SessionError::SessionNotFound(error_value))
             }
             Err(e) => Err(e),

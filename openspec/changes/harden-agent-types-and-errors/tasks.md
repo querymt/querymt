@@ -20,7 +20,7 @@ Package for every group unless stated: `querymt-agent`. Focused test runs use `c
   - add `is_transient()` for `DatabaseBusy`/`DatabaseLocked`
 
   Verify with `cargo check -p querymt-agent --features remote`.
-- [x] 2.4 Make `From<SessionError> for LLMError` render the full source chain (D3). Covers `session-storage-reliability / Storage error converted for a provider caller keeps its source`; test `storage_error_converted_for_a_provider_caller_keeps_its_source`, which checks that the rusqlite message appears in the LLM error text and that `SessionError::source()` is the rusqlite error.
+- [x] 2.4 Make `From<SessionError> for LLMError` render the full source chain (D3). Covers `session-storage-reliability / Storage error converted for a provider caller keeps its source`; test `storage_error_converted_for_a_provider_caller_keeps_its_source`. Acceptance is checked on the converted `LLMError`: its text must contain the rusqlite message. The test also checks that `SessionError::source()` is the rusqlite error before conversion, which supports `Storage failures keep their cause`.
 - [x] 2.5 Add tests in `session/sqlite_storage/tests.rs` that inject a panicking closure and a failing SQL statement through `with_conn`, then run a session load, an event append and a session list. Covers:
   - `session-storage-reliability / Storage keeps working after an operation panics` (`storage_keeps_working_after_an_operation_panics`)
   - `/ Storage keeps working after an operation returns an error` (`storage_keeps_working_after_an_operation_returns_an_error`)

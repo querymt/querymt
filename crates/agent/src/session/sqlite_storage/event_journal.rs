@@ -11,6 +11,20 @@ use crate::session::projection::{
 
 use super::{SqliteStorage, blocking};
 
+/// Query behind [`EventJournal::last_unfinished_run`].
+///
+/// The `kind IN (...)` list must match the predicate of the partial index
+/// `idx_event_journal_run_lifecycle` exactly (same literals, same order):
+/// SQLite only uses a partial index when the query predicate matches it
+/// structurally, and bound parameters never do. The literals are the
+/// `RUN_STARTED_TAG` / `RUN_COMPLETED_TAG` values;
+/// `last_unfinished_run_query_uses_run_lifecycle_index` checks both.
+pub(super) const LAST_UNFINISHED_RUN_SQL: &str = "SELECT kind, json_extract(payload_json, '$.data.run_id') \
+     FROM event_journal \
+     WHERE session_id = ?1 AND kind IN ('run_started', 'run_completed') \
+     AND origin = 'local' \
+     ORDER BY stream_seq ASC";
+
 #[async_trait]
 impl EventJournal for SqliteStorage {
     async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent> {
@@ -160,22 +174,11 @@ impl EventJournal for SqliteStorage {
             // events count: mirrored events of a remote host describe runs
             // that host owns and closes, so they must never look orphaned
             // here (even after the session's bookmark is gone).
-            let mut stmt = conn.prepare(
-                "SELECT kind, json_extract(payload_json, '$.data.run_id') \
-                 FROM event_journal \
-                 WHERE session_id = ?1 AND kind IN (?2, ?3) \
-                 AND origin = 'local' \
-                 ORDER BY stream_seq ASC",
-            )?;
+            let mut stmt = conn.prepare_cached(LAST_UNFINISHED_RUN_SQL)?;
             let rows = stmt
-                .query_map(
-                    params![
-                        session_id,
-                        AgentEventKind::RUN_STARTED_TAG,
-                        AgentEventKind::RUN_COMPLETED_TAG
-                    ],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-                )?
+                .query_map(params![session_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(last_unfinished_run_in(rows.into_iter().filter_map(
                 |(kind, run_id)| {

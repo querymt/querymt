@@ -1002,15 +1002,17 @@ mod tests {
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let sink = EventSink::new(storage.event_journal(), Arc::new(EventFanout::new()));
 
-        // Hold the connection on another thread until `released` is set.
+        // Hold the connection on another thread until the test sends on
+        // `release_tx`; `released` records that the lock was let go.
         let released = Arc::new(AtomicBool::new(false));
         let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let conn = storage.conn();
         let flag = released.clone();
         let holder = std::thread::spawn(move || {
             let guard = conn.lock();
             held_tx.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            release_rx.recv().unwrap();
             flag.store(true, Ordering::SeqCst);
             drop(guard);
         });
@@ -1035,6 +1037,7 @@ mod tests {
         );
 
         // Once the connection frees up, the held event is numbered from 1.
+        release_tx.send(()).unwrap();
         stream.flush().await;
         assert_eq!(stream.resolved_tip().await, 1);
         holder.join().unwrap();
@@ -1083,11 +1086,12 @@ mod tests {
         let second = EventSink::new(storage.event_journal(), fanout);
 
         let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let conn = storage.conn();
         let holder = std::thread::spawn(move || {
             let guard = conn.lock();
             held_tx.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            release_rx.recv().unwrap();
             drop(guard);
         });
         held_rx.recv().unwrap();
@@ -1103,6 +1107,7 @@ mod tests {
             "event was published before the stream base resolved"
         );
 
+        release_tx.send(()).unwrap();
         let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
             .expect("event is published once the base resolves")

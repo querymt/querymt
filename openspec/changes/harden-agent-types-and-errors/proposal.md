@@ -58,7 +58,7 @@ This change fixes all of the review's findings except the `SessionId`/`ScheduleI
 ### New Capabilities
 
 - `session-storage-reliability`: the session store keeps serving after a failed operation, event stream setup does not stall async execution, and storage failures keep their cause.
-- `session-todos`: behaviour of the `todo_write`/`todo_read` tools: per-session isolation, enumerated status and priority, summary counts, and cleanup on session delete.
+- `session-todos`: behaviour of the `todowrite`/`todoread` tools: per-session isolation, enumerated status and priority, summary counts, and cleanup on session delete.
 
 ### Modified Capabilities
 

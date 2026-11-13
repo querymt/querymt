@@ -20,6 +20,7 @@ use crate::session::projection::{
 use crate::session::store::{RemoteSessionBookmark, SessionStore};
 
 use super::SqliteStorage;
+use super::event_journal::LAST_UNFINISHED_RUN_SQL;
 use super::migrations::{MIGRATIONS, apply_migrations};
 
 #[tokio::test]
@@ -3887,15 +3888,10 @@ async fn last_unfinished_run_query_uses_run_lifecycle_index() {
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
     let conn = storage.conn_for_test();
     let conn = conn.lock();
+    // Plan the production query itself, against the migrated schema, so a
+    // drift on either side (query or index predicate) fails here.
     let plan: Vec<String> = conn
-        .prepare(
-            "EXPLAIN QUERY PLAN \
-             SELECT kind, json_extract(payload_json, '$.data.run_id') \
-             FROM event_journal \
-             WHERE session_id = ? AND kind IN ('run_started', 'run_completed') \
-             AND origin = 'local' \
-             ORDER BY stream_seq ASC",
-        )
+        .prepare(&format!("EXPLAIN QUERY PLAN {LAST_UNFINISHED_RUN_SQL}"))
         .unwrap()
         .query_map(["s"], |row| row.get::<_, String>(3))
         .unwrap()
@@ -3906,6 +3902,16 @@ async fn last_unfinished_run_query_uses_run_lifecycle_index() {
             .any(|step| step.contains("idx_event_journal_run_lifecycle")),
         "query must use the partial index, plan: {plan:?}"
     );
+    // The SQL literals must stay in sync with the lifecycle tags it decodes.
+    for tag in [
+        AgentEventKind::RUN_STARTED_TAG,
+        AgentEventKind::RUN_COMPLETED_TAG,
+    ] {
+        assert!(
+            LAST_UNFINISHED_RUN_SQL.contains(&format!("'{tag}'")),
+            "lifecycle query is missing the {tag:?} literal"
+        );
+    }
 }
 
 #[tokio::test]

@@ -38,7 +38,7 @@ A storage failure reported to callers SHALL identify its kind: not found, databa
 
 #### Scenario: Storage error converted for a provider caller keeps its source
 - **WHEN** a session storage error is converted into an LLM error for a provider-facing caller
-- **THEN** the original storage error is reachable through the error's source chain
+- **THEN** the converted LLM error's message includes the message of every error in the storage error's source chain, including the original database error
 
 ### Requirement: Delegation claims retry only transient storage errors
 When claiming a delegation fails because the database is busy or locked, QueryMT SHALL retry up to three attempts in total. Any other claim failure SHALL be returned after the first attempt, with its storage error kind intact.

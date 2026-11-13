@@ -54,7 +54,7 @@ Add `session/sqlite_storage/blocking.rs` with `pub(crate) async fn with_conn<F, 
 
 ### D3. Source-preserving conversion to `LLMError`
 
-`LLMError` stores only strings. `From<SessionError> for LLMError` keeps its variant mapping but formats with the full source chain: `{err}` followed by `: {source}` for each source. The spec scenario "Storage error converted for a provider caller keeps its source" is satisfied through a `SessionError` that callers can still inspect before converting.
+`LLMError` stores only strings. `From<SessionError> for LLMError` keeps its variant mapping but formats with the full source chain: `{err}` followed by `: {source}` for each source. The spec scenario "Storage error converted for a provider caller keeps its source" is satisfied by the converted `LLMError` itself: its rendered message contains the whole chain, including the original rusqlite message. An inspectable source is available only on `SessionError`, before conversion; that is covered by the separate "Storage failures keep their cause" requirement.
 
 Internal agent code that today converts early to `LLMError` and then inspects it keeps `SessionError` until the boundary. This applies only where the code currently branches on message text; tasks list the sites.
 
