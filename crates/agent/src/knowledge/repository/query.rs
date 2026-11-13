@@ -43,7 +43,7 @@ use super::store::{
     FileRecord, IndexDiagnostic, PurposeMatch, SearchPlan, SearchSnapshot, SectionMatch,
     SymbolMatch,
 };
-use crate::index::symbol_index::SymbolKind;
+use querymt_agent_index::symbol_index::SymbolKind;
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::str::FromStr;
@@ -756,10 +756,10 @@ impl RepositoryService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RepositoryKnowledgeSettings;
     use crate::knowledge::repository::reconcile::ReconcileOptions;
     use crate::knowledge::repository::root::{ResolvedRoot, RootRequest, resolve_root};
     use crate::knowledge::repository::service::RefreshPolicy;
+    use crate::knowledge::repository::settings::RepositoryKnowledgeSettings;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;

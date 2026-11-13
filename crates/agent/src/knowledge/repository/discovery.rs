@@ -29,7 +29,7 @@
 
 use super::manifest::KnowledgeManifest;
 use super::root::ResolvedRoot;
-use crate::config::RepositoryKnowledgeSettings;
+use crate::knowledge::repository::settings::RepositoryKnowledgeSettings;
 use glob::{MatchOptions, Pattern};
 use ignore::WalkBuilder;
 use std::collections::{BTreeMap, HashSet};

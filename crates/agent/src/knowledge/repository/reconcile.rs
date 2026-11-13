@@ -62,7 +62,7 @@ use super::store::{
     GenerationUpdate, IndexDiagnostic, RepositoryStore, SCHEMA_VERSION, SourceRecord, SourceState,
     SourceTouch, StoreError, StoredSource,
 };
-use crate::config::RepositoryKnowledgeSettings;
+use crate::knowledge::repository::settings::RepositoryKnowledgeSettings;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;

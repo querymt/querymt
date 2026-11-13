@@ -13,7 +13,7 @@
 
 use super::adapters::{INDEX_CONTEXT_HANDLER_ID, ORIENTATION_HANDLER_ID};
 use super::budget::{DeliveryBudget, Refusal, estimate_tokens, is_native, serialized_len};
-use crate::hooks::HookContextContribution;
+use querymt_agent_core::HookContextContribution;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
@@ -247,7 +247,7 @@ pub fn allocate_recorded(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RepositoryKnowledgeDeliverySettings;
+    use crate::knowledge::repository::settings::RepositoryKnowledgeDeliverySettings;
 
     fn native(handler: &str, id: &str) -> HookContextContribution {
         HookContextContribution {

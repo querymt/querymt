@@ -953,7 +953,7 @@ mod tests {
                 root,
                 &tmp.path().join("index.sqlite"),
                 crate::knowledge::repository::ReconcileOptions::from(
-                    &crate::config::RepositoryKnowledgeSettings::default(),
+                    &crate::knowledge::repository::settings::RepositoryKnowledgeSettings::default(),
                 ),
                 Default::default(),
             )

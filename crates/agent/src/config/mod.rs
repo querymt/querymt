@@ -20,12 +20,17 @@ mod mesh;
 mod permissions;
 mod prompt;
 mod quorum;
-mod repository_knowledge;
 mod schema;
 mod single;
 mod tools;
 mod workspace;
 
+pub use crate::knowledge::repository::settings::{
+    REPOSITORY_KNOWLEDGE_MAX_DELIVERY_BYTES, REPOSITORY_KNOWLEDGE_MAX_DELIVERY_CARDS,
+    REPOSITORY_KNOWLEDGE_MAX_DELIVERY_TOKENS, REPOSITORY_KNOWLEDGE_MAX_RESPONSE_BYTES,
+    REPOSITORY_KNOWLEDGE_MAX_RESULT_LIMIT, REPOSITORY_KNOWLEDGE_MIN_RESPONSE_BYTES,
+    RepositoryKnowledgeDeliverySettings, RepositoryKnowledgeSettings,
+};
 pub use execution::*;
 pub use extensions::*;
 pub use hooks::*;
@@ -36,7 +41,6 @@ pub use permissions::*;
 pub use prompt::SystemPart;
 pub(crate) use prompt::{deserialize_system_parts, resolve_system_parts};
 pub use quorum::*;
-pub use repository_knowledge::*;
 pub use schema::{schema_for_system_parts, schema_for_value};
 pub use single::*;
 pub use tools::*;

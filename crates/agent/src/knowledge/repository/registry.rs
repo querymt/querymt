@@ -21,7 +21,7 @@
 use super::reconcile::ReconcileOptions;
 use super::root::{ResolvedRoot, RootError, RootRequest, default_config_dir, resolve_root};
 use super::service::{RefreshPolicy, RepositoryService, ServiceError};
-use crate::config::RepositoryKnowledgeSettings;
+use crate::knowledge::repository::settings::RepositoryKnowledgeSettings;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -255,7 +255,7 @@ impl RepositoryKnowledgeRegistry {
     pub fn spawn_change_hints(
         self: &Arc<Self>,
         cwd: PathBuf,
-        mut changes: tokio::sync::broadcast::Receiver<crate::index::FileChangeSet>,
+        mut changes: tokio::sync::broadcast::Receiver<querymt_agent_index::FileChangeSet>,
     ) -> tokio::task::JoinHandle<()> {
         let registry = Arc::clone(self);
         tokio::spawn(async move {
@@ -350,7 +350,8 @@ mod tests {
         let task = fx.registry.spawn_change_hints(repo.clone(), rx);
 
         // Nothing has queried this checkout: a hint must not open or create anything.
-        tx.send(crate::index::FileChangeSet::default()).unwrap();
+        tx.send(querymt_agent_index::FileChangeSet::default())
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(fx.registry.open_services(), 0);
         assert!(!fx.config_exists());
@@ -358,7 +359,8 @@ mod tests {
         // Once a session has opened the checkout, hints refresh it.
         let service = fx.registry.service_for(Some(&repo)).unwrap();
         assert_eq!(service.store().counts().unwrap().documents, 0);
-        tx.send(crate::index::FileChangeSet::default()).unwrap();
+        tx.send(querymt_agent_index::FileChangeSet::default())
+            .unwrap();
         let svc = service.clone();
         assert!(wait_for(move || svc.store().counts().unwrap().documents == 1).await);
 

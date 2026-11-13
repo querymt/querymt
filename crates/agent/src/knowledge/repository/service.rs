@@ -412,9 +412,9 @@ fn same_content(stored: &StoredSource, hash: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RepositoryKnowledgeSettings;
     use crate::knowledge::repository::reconcile::ReconcileStatus;
     use crate::knowledge::repository::root::{RootRequest, resolve_root};
+    use crate::knowledge::repository::settings::RepositoryKnowledgeSettings;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};

@@ -38,8 +38,8 @@
 
 use super::document::DiagnosticSeverity;
 use super::store::IndexDiagnostic;
-use crate::index::outline_index::common::get_language_for_extension;
-use crate::index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind};
+use querymt_agent_index::outline_index::common::get_language_for_extension;
+use querymt_agent_index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind};
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;

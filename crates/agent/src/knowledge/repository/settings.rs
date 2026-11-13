@@ -1,4 +1,8 @@
-use super::*;
+//! Host settings for portable repository knowledge.
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Hard implementation ceilings. Host settings can lower the defaults but can
 /// never raise them past these values.
@@ -157,8 +161,8 @@ impl RepositoryKnowledgeSettings {
     }
 
     /// Resolve a relative `root` against the directory of the config file it
-    /// was written in.
-    pub(crate) fn anchored_at(mut self, config_dir: &Path) -> Self {
+    /// was written in. Used by the config loader.
+    pub fn anchored_at(mut self, config_dir: &Path) -> Self {
         let anchor = |path: PathBuf| {
             if path.is_relative() {
                 config_dir.join(path)

@@ -2,7 +2,7 @@
 //!
 //! Both adapters reuse the existing dotagents frontmatter conventions
 //! (scalars, quoted values, comma-separated lists and JSON-array lists; see
-//! [`crate::dotagents::parse_frontmatter_markdown`]) instead of introducing a
+//! [`parse_frontmatter_markdown`]) instead of introducing a
 //! second parser.
 //!
 //! * **Plain Markdown** needs no frontmatter. When present, the recognized
@@ -12,7 +12,7 @@
 //!   `enabled: false` has no effect on an ordinary document).
 //! * **Workspace memories** (`.agents/memories/<name>.md`) additionally keep
 //!   their legacy semantics: parsing and validation are delegated to
-//!   [`crate::dotagents::parse_memory_document`], so `enabled: false` excludes
+//!   [`parse_memory_document`], so `enabled: false` excludes
 //!   the memory, a memory with neither body nor `content` is invalid, and
 //!   `content` metadata stands in for an empty body — exactly as the protocol
 //!   loader treats them. The repository reads these files directly and never
@@ -26,10 +26,11 @@
 //! the job of the identity pass) and verifies no `knowledge_sources` or
 //! `knowledge_paths` selector; it only records them.
 
-use crate::dotagents::{
-    DotagentsLayer, DotagentsSource, field_list, field_string, parse_frontmatter_markdown,
-    parse_memory_document,
+use querymt_agent_core::dotagents::frontmatter::{
+    field_list, field_string, parse_frontmatter_markdown,
 };
+use querymt_agent_core::dotagents::layer::{DotagentsLayer, DotagentsSource};
+use querymt_agent_core::dotagents::memory::parse_memory_document;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
