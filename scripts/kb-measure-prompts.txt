@@ -1,0 +1,12 @@
+# Prompts for scripts/kb-measure.sh. One per line.
+# Concept questions the notes in crates/agent/knowledge cover (a card should appear):
+how does the execution loop retry transient provider errors?
+what does the orientation relevance gate require before a card is delivered
+make independent tool calls from one model response run at the same time but keep conflicting file writes ordered
+the model sometimes sends a json string where the tool schema declares an array, accept it safely
+how does a session get compacted and what triggers it
+# Prompts that should NOT get a card (cost of the feature must be ~zero here):
+fix the typo "recieve" in CHANGELOG.md
+write a short poem about autumn
+the system shall always respond within two seconds
+make sure the session is saved before the process exits
