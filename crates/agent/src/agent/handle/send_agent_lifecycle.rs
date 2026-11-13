@@ -59,7 +59,7 @@ impl LocalAgentHandle {
             .agent_capabilities(capabilities)
             .auth_methods(auth_methods)
             .agent_info(
-                Implementation::new("querymt-agent", env!("QMT_BUILD_VERSION"))
+                Implementation::new("querymt-agent", querymt_utils::BUILD_VERSION)
                     .title("QueryMT Agent"),
             ))
     }
