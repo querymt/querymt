@@ -237,6 +237,8 @@ struct Shared {
     /// `Some` enables the skills mode.
     skills: Mutex<Option<SkillsScript>>,
     tools: Mutex<Vec<Tool>>,
+    /// Do not declare the tools capability; `tools/list` then fails.
+    no_tools: bool,
     task_script: Mutex<TaskScript>,
     task_polls: AtomicUsize,
     ttl_ms: Mutex<u64>,
@@ -273,7 +275,14 @@ fn task_seed(script: &TaskScript, status: TaskStatus) -> Task {
 
 impl ServerHandler for HarnessServer {
     fn get_info(&self) -> ServerConfig {
-        let caps = if self.shared.skills.lock().is_some() {
+        let caps = if self.shared.skills.lock().is_some() && self.shared.no_tools {
+            ServerCapabilities::builder()
+                .enable_resources()
+                .enable_resources_list_changed()
+                .enable_tasks()
+                .enable_skills()
+                .build()
+        } else if self.shared.skills.lock().is_some() {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
@@ -301,6 +310,9 @@ impl ServerHandler for HarnessServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         self.log.list_tools_calls.fetch_add(1, Ordering::SeqCst);
+        if self.shared.no_tools {
+            return Err(ErrorData::internal_error("tools are not supported", None));
+        }
         let tools = self.shared.tools.lock().clone();
         Ok(ListToolsResult::with_all_items(tools).with_ttl_ms(*self.shared.ttl_ms.lock()))
     }
@@ -485,6 +497,9 @@ pub struct HarnessOptions {
     pub server_name: &'static str,
     /// Start with `skills/list` failing (skills mode only).
     pub fail_list: bool,
+    /// Serve skills without declaring the tools capability (skills mode
+    /// only); `tools/list` fails and no adapters are built.
+    pub no_tools: bool,
 }
 
 impl Default for HarnessOptions {
@@ -493,6 +508,7 @@ impl Default for HarnessOptions {
             skills: None,
             server_name: "harness",
             fail_list: false,
+            no_tools: false,
             tasks: false,
             cache: true,
             ttl_ms: 0,
@@ -539,6 +555,7 @@ impl McpHarness {
                 ..SkillsScript::default()
             })),
             tools: Mutex::new(options.tools.iter().copied().map(tool).collect()),
+            no_tools: options.no_tools,
             ttl_ms: Mutex::new(options.ttl_ms),
             ..Shared::default()
         });
@@ -603,7 +620,12 @@ impl McpHarness {
 
         let peer = running.peer().clone();
         let mut adapters = HashMap::new();
-        for t in peer.list_all_tools().await.expect("list tools") {
+        let listed = if options.no_tools {
+            Vec::new()
+        } else {
+            peer.list_all_tools().await.expect("list tools")
+        };
+        for t in listed {
             let adapter = McpToolAdapter::try_new(t, peer.clone(), options.server_name.into())
                 .expect("adapter")
                 .with_router(router.clone());

@@ -100,10 +100,7 @@ pub(crate) async fn build_mcp_state(
         };
         let peer = running.peer().clone();
         let router = running.service().router();
-        let tool_list = peer
-            .list_all_tools()
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+        let tool_list = list_server_tools(&peer).await?;
 
         let mut adapters = Vec::with_capacity(tool_list.len());
         for tool in tool_list {
@@ -116,11 +113,14 @@ pub(crate) async fn build_mcp_state(
             .with_router(router.clone());
             adapters.push(Arc::new(adapter));
         }
+        // Publish the tools before the (slow) skills discovery, so a tool
+        // refresh pushed meanwhile is not overwritten afterwards.
+        publish_server_tools(&tool_state, &server_name, &peer, adapters);
         // Skills: only eligible servers are asked; a failed or timed-out
         // listing never fails the connection (it is logged inside) and leaves
         // the server registered so a later refresh can recover.
         let found = crate::skills::mcp::discover_server_skills(&server_name, &peer).await;
-        apply_server_listing(&tool_state, &server_name, &peer, adapters, found);
+        tool_state.replace_server(&server_name, None, found);
         clients.insert(server_name, running);
     }
 
@@ -154,11 +154,7 @@ pub(crate) async fn merge_connected_mcp_peers(
     }
 
     for connected in connected_peers {
-        let tool_list = connected
-            .peer
-            .list_all_tools()
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+        let tool_list = list_server_tools(&connected.peer).await?;
         let mut adapters = Vec::with_capacity(tool_list.len());
         for tool in tool_list {
             let adapter = querymt::mcp::adapter::McpToolAdapter::try_new(
@@ -169,35 +165,52 @@ pub(crate) async fn merge_connected_mcp_peers(
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
             adapters.push(Arc::new(adapter));
         }
-        let found =
-            crate::skills::mcp::discover_server_skills(&connected.server_name, &connected.peer)
-                .await;
-        apply_server_listing(
+        publish_server_tools(
             &tool_state,
             &connected.server_name,
             &connected.peer,
             adapters,
-            found,
         );
+        let found =
+            crate::skills::mcp::discover_server_skills(&connected.server_name, &connected.peer)
+                .await;
+        tool_state.replace_server(&connected.server_name, None, found);
     }
 
     Ok(())
 }
 
-/// Apply one server's freshly fetched listing to the live state.
+/// List a server's tools, or none when it does not declare the tools
+/// capability (a skills-only server would answer `tools/list` with an error).
+async fn list_server_tools(
+    peer: &rmcp::service::Peer<RoleClient>,
+) -> Result<Vec<rmcp::model::Tool>, Error> {
+    let advertises_tools = peer
+        .peer_info()
+        .is_some_and(|info| info.capabilities.tools.is_some());
+    if !advertises_tools {
+        return Ok(Vec::new());
+    }
+    peer.list_all_tools()
+        .await
+        .map_err(|e| Error::internal_error().data(e.to_string()))
+}
+
+/// Apply one server's freshly fetched tools to the live state.
 ///
 /// All network work is done before this runs; the state is then updated with
 /// a read-modify-write that starts from the latest snapshot, so refreshes of
-/// other servers (or of this one) that landed meanwhile are kept. The peer is
-/// registered as a skill server whenever it is eligible, even if its initial
-/// skills listing failed (`skills` is `None`), so refresh-on-miss can retry.
-/// A tool name already provided by another server keeps its first provider.
-fn apply_server_listing(
+/// other servers (or of this one) that landed meanwhile are kept. Skills are
+/// applied separately, after discovery, so that a tool refresh received while
+/// discovery was running is preserved. The peer is registered as a skill
+/// server whenever it is eligible, even if its skills listing later fails, so
+/// refresh-on-miss can retry. A tool name already provided by another server
+/// keeps its first provider.
+fn publish_server_tools(
     tool_state: &McpToolState,
     server_name: &str,
     peer: &rmcp::service::Peer<RoleClient>,
     adapters: Vec<Arc<querymt::mcp::adapter::McpToolAdapter>>,
-    skills: Option<Vec<Arc<crate::skills::mcp::McpSkill>>>,
 ) {
     {
         let current = tool_state.load();
@@ -215,7 +228,7 @@ fn apply_server_listing(
     if crate::skills::mcp::is_skill_server(server_name, peer) {
         tool_state.register_skill_server(server_name, peer);
     }
-    tool_state.replace_server(server_name, Some(adapters), skills);
+    tool_state.replace_server(server_name, Some(adapters), None);
 }
 
 /// Starts an MCP server based on its configuration.
@@ -554,6 +567,95 @@ pub(crate) mod tests {
         let missing = dir.path().join("does-not-exist");
         let cmd = stdio_command(&server, Some(&missing));
         assert_eq!(cmd.as_std().get_current_dir(), None);
+    }
+
+    fn connected(h: &crate::test_utils::mcp_harness::McpHarness) -> ConnectedMcpPeer {
+        ConnectedMcpPeer {
+            server_name: "harness".into(),
+            peer: h.running.peer().clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn skills_only_server_connects_without_a_tools_listing() {
+        use crate::test_utils::mcp_harness::{HarnessOptions, McpHarness, ScriptedSkill};
+        let h = McpHarness::start(HarnessOptions {
+            skills: Some(vec![ScriptedSkill::new("a", "A")]),
+            no_tools: true,
+            ..HarnessOptions::default()
+        })
+        .await;
+        // `tools/list` would fail on this server; it must not be asked.
+        assert!(h.running.peer().list_all_tools().await.is_err());
+        assert!(
+            list_server_tools(h.running.peer())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let state = McpToolState::empty();
+        merge_connected_mcp_peers(state.clone(), &[connected(&h)])
+            .await
+            .expect("a skills-only server must not fail the connection");
+        let snapshot = state.load();
+        assert!(snapshot.tools.is_empty());
+        assert_eq!(snapshot.skills.len(), 1);
+        assert!(snapshot.skill_servers.contains_key("harness"));
+    }
+
+    #[tokio::test]
+    async fn server_declaring_tools_is_still_listed() {
+        use crate::test_utils::mcp_harness::{HarnessOptions, McpHarness};
+        let h = McpHarness::start(HarnessOptions::default()).await;
+        assert!(
+            !list_server_tools(h.running.peer())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_are_published_before_skill_discovery_and_survive_it() {
+        use crate::test_utils::mcp_harness::{HarnessOptions, McpHarness, ScriptedSkill};
+        use std::time::Duration;
+        let h = McpHarness::start(HarnessOptions {
+            skills: Some(vec![ScriptedSkill::new("a", "A")]),
+            ..HarnessOptions::default()
+        })
+        .await;
+        h.set_stall_list(true);
+        // Discovery now only ends through its timeout; run it on virtual time.
+        tokio::time::pause();
+
+        let state = McpToolState::empty();
+        let task = {
+            let (state, peer) = (state.clone(), connected(&h));
+            tokio::spawn(async move { merge_connected_mcp_peers(state, &[peer]).await })
+        };
+        // The tools are visible while discovery is still stalled.
+        let mut published = false;
+        for _ in 0..1000 {
+            if !state.load().tools.is_empty() {
+                published = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(published, "tools must be published before discovery ends");
+        assert!(!task.is_finished(), "discovery must still be running");
+
+        // A tool refresh that lands during discovery (here: every tool gone).
+        state.replace_server("harness", Some(vec![]), None);
+        task.await.unwrap().unwrap();
+
+        let snapshot = state.load();
+        assert!(
+            snapshot.tools.is_empty(),
+            "the finished discovery must not restore the older tool list"
+        );
+        assert!(snapshot.skill_servers.contains_key("harness"));
     }
 
     #[tokio::test]

@@ -491,9 +491,22 @@ impl Tool for SkillTool {
         // `<server>.<name>`; local IDs win collisions. Its permission is
         // resolved (and approval obtained) before any request to the server,
         // refresh-on-miss included.
-        if let Some((server, skill_name)) = name.split_once('.')
-            && self.mcp_server_visible(server)
-            && self.mcp_state.load().skill_servers.contains_key(server)
+        let mcp_candidate = name.split_once('.').filter(|(server, _)| {
+            self.mcp_server_visible(server)
+                && self.mcp_state.load().skill_servers.contains_key(*server)
+        });
+        // A workspace that was never loaded has no local snapshot yet, so a
+        // local skill of the same ID would be missed and lose precedence.
+        if mcp_candidate.is_some()
+            && !self.catalog.has_workspace(&workspace)
+            && let Err(error) = self.catalog.refresh_registry_async(&workspace).await
+        {
+            log::warn!(
+                "Could not load local skills for {}: {error:#}",
+                workspace.display()
+            );
+        }
+        if let Some((server, skill_name)) = mcp_candidate
             && self.catalog.lookup_skill(&workspace, name)?.is_none()
         {
             self.authorize_mcp(ctx, name, server, skill_name).await?;
@@ -1840,6 +1853,44 @@ Body
     }
 
     #[tokio::test]
+    async fn local_skill_wins_in_a_workspace_only_the_call_names() {
+        let h = skills_harness().await;
+        let workspace = TempDir::new().unwrap();
+        let dir = workspace.path().join(".agents/skills/shadow");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("skill.md"),
+            "---\nid: docs.triage\nname: Shadow\ndescription: Local wins\n---\nLOCAL BODY\n",
+        )
+        .unwrap();
+        // External (project) sources must be on, or the workspace's skills
+        // are never discovered.
+        let catalog = Arc::new(SkillCatalog::from_parts(
+            Arc::new(Mutex::new(SkillRegistry::new())),
+            Arc::new(SkillPermissions::default()),
+            vec![],
+            true,
+            PathBuf::from("."),
+        ));
+        let state = mcp_state(&h, &["docs"]).await;
+        let bound_to = PathBuf::from(".");
+        let tool = Arc::clone(&catalog).bind(Some(&bound_to), state, Default::default());
+
+        // The call's workspace has no snapshot yet, and the MCP default
+        // `Ask` would be denied here: the local skill must be found first.
+        assert!(!catalog.has_workspace(workspace.path()));
+        let ctx = MockContext::with_cwd(workspace.path());
+        let out = call_named_with_context(&tool, "docs.triage", &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("LOCAL BODY"), "{out}");
+        assert!(
+            h.log.skills_get.lock().is_empty(),
+            "the server is not asked"
+        );
+    }
+
+    #[tokio::test]
     async fn sessions_with_different_mcp_state_see_different_skills() {
         let h = skills_harness().await;
         let catalog = Arc::new(plain_catalog());
@@ -2510,7 +2561,6 @@ Body
     }
 
     #[cfg(unix)]
-    #[cfg(unix)]
     #[test]
     fn same_file_tells_files_apart_by_identity() {
         let dir = TempDir::new().unwrap();
@@ -2521,6 +2571,7 @@ Body
         assert!(!same_file(&meta("one"), &meta("two")));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn local_symlink_escape_is_rejected() {
         let dir = TempDir::new().unwrap();

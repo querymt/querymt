@@ -14,6 +14,7 @@ use crate::skills::types::{Skill, SkillSource};
 use crate::tools::ToolError;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Discovery function used by registry refreshes. Swappable in tests to
@@ -46,6 +47,12 @@ pub struct SkillCatalog {
     /// `(local source, server)` collision pairs already warned about.
     warned_collisions: Mutex<HashSet<(String, String)>>,
     discovery_fn: Arc<DiscoverFn>,
+    /// Source of refresh tickets: taken before discovery starts, so a larger
+    /// ticket means a refresh that began later.
+    refresh_tickets: AtomicU64,
+    /// Newest ticket published per workspace; an older refresh finishing
+    /// late is dropped instead of replacing newer state.
+    published_tickets: Mutex<HashMap<PathBuf, u64>>,
 }
 
 impl SkillCatalog {
@@ -113,6 +120,8 @@ impl SkillCatalog {
             approval: ApprovalMode::Interactive,
             warned_collisions: Mutex::new(HashSet::new()),
             discovery_fn: Arc::new(discovery::discover_all_strict),
+            refresh_tickets: AtomicU64::new(0),
+            published_tickets: Mutex::new(HashMap::new()),
         }
     }
 
@@ -223,23 +232,10 @@ impl SkillCatalog {
     /// Re-discover skills for one workspace and atomically replace only that
     /// workspace's registry snapshot.
     pub(crate) fn refresh_registry(&self, workspace: &Path) -> anyhow::Result<()> {
+        let ticket = self.refresh_tickets.fetch_add(1, Ordering::SeqCst) + 1;
         let sources = self.sources_for_workspace(workspace);
         match (self.discovery_fn)(&sources, self.include_external) {
-            Ok(skills) => {
-                let mut registries = self
-                    .registries
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
-                let count = registries
-                    .entry(workspace.to_path_buf())
-                    .or_default()
-                    .reload_with(skills);
-                log::debug!(
-                    "Skill registry refreshed for {}: {count} skills available",
-                    workspace.display()
-                );
-                Ok(())
-            }
+            Ok(skills) => self.publish_refresh(workspace, ticket, skills),
             Err(error) => {
                 log::warn!(
                     "Failed to refresh skills for {}: {error:#}. Retaining previously discovered skills.",
@@ -254,6 +250,7 @@ impl SkillCatalog {
     /// discovery runs off the Tokio worker via `spawn_blocking`, and the
     /// registry lock is only held to publish the results.
     pub(crate) async fn refresh_registry_async(&self, workspace: &Path) -> anyhow::Result<()> {
+        let ticket = self.refresh_tickets.fetch_add(1, Ordering::SeqCst) + 1;
         let workspace = workspace.to_path_buf();
         let sources = self.sources_for_workspace(&workspace);
         let include_external = self.include_external;
@@ -275,12 +272,38 @@ impl SkillCatalog {
             }
         };
 
+        self.publish_refresh(&workspace, ticket, skills)
+    }
+
+    /// Publish a discovery result unless a refresh that started later has
+    /// already published for this workspace.
+    fn publish_refresh(
+        &self,
+        workspace: &Path,
+        ticket: u64,
+        skills: Vec<Skill>,
+    ) -> anyhow::Result<()> {
         let mut registries = self
             .registries
             .lock()
             .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
+        let mut published = self
+            .published_tickets
+            .lock()
+            .map_err(|_| anyhow::anyhow!("refresh ticket lock poisoned"))?;
+        if published
+            .get(workspace)
+            .is_some_and(|newest| *newest > ticket)
+        {
+            log::debug!(
+                "Dropping stale skill refresh for {}: a newer one was already published",
+                workspace.display()
+            );
+            return Ok(());
+        }
+        published.insert(workspace.to_path_buf(), ticket);
         let count = registries
-            .entry(workspace.clone())
+            .entry(workspace.to_path_buf())
             .or_default()
             .reload_with(skills);
         log::debug!(
@@ -288,6 +311,14 @@ impl SkillCatalog {
             workspace.display()
         );
         Ok(())
+    }
+
+    /// Whether a snapshot for `workspace` has been loaded.
+    pub(crate) fn has_workspace(&self, workspace: &Path) -> bool {
+        self.registries
+            .lock()
+            .map(|registries| registries.contains_key(workspace))
+            .unwrap_or(false)
     }
 
     /// Look up a skill by callable ID in one workspace snapshot.
@@ -335,5 +366,102 @@ impl SkillCatalog {
             },
             Err(_) => "Registry unavailable".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skills::types::SkillMetadata;
+    use std::sync::mpsc;
+
+    fn skill(name: &str) -> Skill {
+        Skill {
+            path: PathBuf::from("/ignored").join(name),
+            metadata: SkillMetadata {
+                name: name.to_string(),
+                description: format!("{name} skill"),
+                id: None,
+                enabled: None,
+                version: None,
+                license: None,
+                compatibility: None,
+                allowed_tools: None,
+                tags: None,
+                author: None,
+                extra: HashMap::new(),
+            },
+            content: name.to_string(),
+            source: SkillSource::Global(PathBuf::from("/ignored")),
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_does_not_replace_a_newer_snapshot() {
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let started_tx = Mutex::new(started_tx);
+        let release_rx = Mutex::new(release_rx);
+        let calls = AtomicU64::new(0);
+        // The first discovery stalls and returns an outdated result; later
+        // ones return the newer one.
+        let discovery_fn = Arc::new(
+            move |_: &[SkillSource], _: bool| -> anyhow::Result<Vec<Skill>> {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    started_tx.lock().unwrap().send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                    Ok(vec![skill("old")])
+                } else {
+                    Ok(vec![skill("new")])
+                }
+            },
+        );
+        let catalog = Arc::new(
+            SkillCatalog::from_parts(
+                Arc::new(Mutex::new(SkillRegistry::new())),
+                Arc::new(SkillPermissions::default()),
+                vec![],
+                false,
+                PathBuf::from("."),
+            )
+            .with_discovery_fn(discovery_fn),
+        );
+        let workspace = PathBuf::from("/ws");
+
+        let slow = {
+            let (catalog, workspace) = (Arc::clone(&catalog), workspace.clone());
+            tokio::spawn(async move { catalog.refresh_registry_async(&workspace).await })
+        };
+        // Wait until the slow refresh is inside discovery (ticket taken).
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        // A refresh that starts later finishes first.
+        catalog.refresh_registry(&workspace).unwrap();
+        release_tx.send(()).unwrap();
+        slow.await.unwrap().unwrap();
+
+        assert!(catalog.lookup_skill(&workspace, "new").unwrap().is_some());
+        assert!(
+            catalog.lookup_skill(&workspace, "old").unwrap().is_none(),
+            "the older refresh must not replace the newer snapshot"
+        );
+    }
+
+    #[test]
+    fn has_workspace_reports_loaded_snapshots_only() {
+        let catalog = SkillCatalog::from_parts(
+            Arc::new(Mutex::new(SkillRegistry::new())),
+            Arc::new(SkillPermissions::default()),
+            vec![],
+            false,
+            PathBuf::from("/root"),
+        )
+        .with_discovery_fn(Arc::new(|_, _| Ok(vec![])));
+        assert!(catalog.has_workspace(Path::new("/root")));
+        assert!(!catalog.has_workspace(Path::new("/other")));
+        catalog.refresh_registry(Path::new("/other")).unwrap();
+        assert!(catalog.has_workspace(Path::new("/other")));
     }
 }

@@ -555,8 +555,23 @@ pub async fn load_mcp_skill(skill: &McpSkill) -> Result<LoadedMcpSkill, String> 
             ),
         ));
     }
+    // Advertise only files `load_mcp_file` will accept: it checks the cached
+    // listing first and then requires the file in the current manifest, so a
+    // cached manifest narrows the list to the files present in both. A
+    // dynamic current entry lists nothing.
     let files = match &current.resources {
-        SkillResources::Files(files) => Some(listable_files(&current, files)),
+        SkillResources::Files(current_files) => {
+            let current_keys = listable_files(&current, current_files);
+            match &skill.skill.resources {
+                SkillResources::Files(cached_files) => Some(
+                    listable_files(&skill.skill, cached_files)
+                        .into_iter()
+                        .filter(|key| current_keys.contains(key))
+                        .collect(),
+                ),
+                _ => Some(current_keys),
+            }
+        }
         _ => None,
     };
     Ok(LoadedMcpSkill {
@@ -611,6 +626,39 @@ mod tests {
                 "{bad:?} must be rejected"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn advertised_files_are_the_ones_load_mcp_file_accepts() {
+        use crate::test_utils::mcp_harness::{HarnessOptions, McpHarness, ScriptedSkill};
+        let base = || ScriptedSkill::new("a", "A").with_file("x.md", b"X");
+        let h = McpHarness::start(HarnessOptions {
+            skills: Some(vec![base().with_file("y.md", b"Y")]),
+            ..HarnessOptions::default()
+        })
+        .await;
+        let skill = h.tool_state.load().skills[0].clone();
+
+        // `y.md` was listed when cached but is gone now: not advertised.
+        h.set_skills(vec![base()]);
+        let loaded = load_mcp_skill(&skill).await.unwrap();
+        assert_eq!(loaded.files, Some(vec!["x.md".to_string()]));
+        assert!(load_mcp_file(&skill, "y.md").await.is_err());
+
+        // `z.md` is new on the server but not in the cached listing, which
+        // `load_mcp_file` checks first: not advertised either.
+        h.set_skills(vec![base().with_file("y.md", b"Y").with_file("z.md", b"Z")]);
+        let loaded = load_mcp_skill(&skill).await.unwrap();
+        assert_eq!(
+            loaded.files,
+            Some(vec!["x.md".to_string(), "y.md".to_string()])
+        );
+        assert!(load_mcp_file(&skill, "z.md").await.is_err());
+        assert_eq!(load_mcp_file(&skill, "y.md").await.unwrap(), "Y");
+
+        // A current dynamic entry lists no files.
+        h.set_skills(vec![ScriptedSkill::new("a", "A").dynamic()]);
+        assert_eq!(load_mcp_skill(&skill).await.unwrap().files, None);
     }
 
     #[tokio::test]
