@@ -132,6 +132,8 @@ pub struct AgentConfig {
     /// sessions may request isolated worktree execution and existing sessions
     /// resolve their persisted workspace binding before startup.
     pub workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    /// Session-independent speech-to-text. `None` leaves ACP methods unadvertised.
+    pub(crate) speech_service: Option<Arc<crate::speech::SpeechService>>,
 }
 
 impl AgentConfig {
@@ -295,6 +297,11 @@ impl AgentConfig {
         self.workspace_service.clone()
     }
 
+    /// Session-independent speech-to-text service, when configured.
+    pub(crate) fn speech_service(&self) -> Option<Arc<crate::speech::SpeechService>> {
+        self.speech_service.clone()
+    }
+
     /// Prepares a snapshot configuration if enabled.
     pub fn prepare_snapshot(
         &self,
@@ -444,6 +451,9 @@ impl AgentConfig {
 
     pub async fn invalidate_provider_cache(&self) {
         self.provider.clear_provider_cache().await;
+        if let Some(speech) = &self.speech_service {
+            speech.clear_provider_cache();
+        }
     }
 }
 

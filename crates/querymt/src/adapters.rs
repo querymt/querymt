@@ -31,12 +31,35 @@ macro_rules! phase {
 }
 
 pub struct LLMProviderFromHTTP {
-    inner: Box<dyn HTTPLLMProvider>,
+    inner: Arc<dyn HTTPLLMProvider>,
 }
 
 impl LLMProviderFromHTTP {
     pub fn new(inner: Box<dyn HTTPLLMProvider>) -> Self {
-        Self { inner }
+        Self {
+            inner: Arc::from(inner),
+        }
+    }
+
+    // WASI request builders/parsers are synchronous and cannot run on a Tokio
+    // worker. Keep HTTP execution async; offload only the short transformations.
+    async fn speech_blocking<T: Send + 'static>(
+        &self,
+        operation: &'static str,
+        call: impl FnOnce(&dyn HTTPLLMProvider) -> Result<T, LLMError> + Send + 'static,
+    ) -> Result<T, LLMError> {
+        let inner = self.inner.clone();
+        #[cfg(feature = "tracing")]
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(feature = "tracing")]
+            let _guard = span.enter();
+            call(inner.as_ref())
+        })
+        .await
+        .map_err(|error| {
+            LLMError::ProviderError(format!("HTTP {operation} task failed: {error}"))
+        })?
     }
 
     /// Ensure the provider's credential is fresh before building a request.
@@ -223,7 +246,9 @@ impl LLMProvider for LLMProviderFromHTTP {
     }
 
     fn set_key_resolver(&mut self, resolver: Arc<dyn crate::auth::ApiKeyResolver>) {
-        self.inner.set_key_resolver(resolver);
+        Arc::get_mut(&mut self.inner)
+            .expect("configure the key resolver before issuing HTTP requests")
+            .set_key_resolver(resolver);
     }
 
     fn key_resolver(&self) -> Option<&Arc<dyn crate::auth::ApiKeyResolver>> {
@@ -236,9 +261,13 @@ impl LLMProvider for LLMProviderFromHTTP {
     )]
     async fn transcribe(&self, req_obj: &stt::SttRequest) -> Result<stt::SttResponse, LLMError> {
         self.ensure_credential_fresh().await?;
-        let req = self.inner.stt_request(req_obj)?;
+        let req_obj = req_obj.clone();
+        let req = self
+            .speech_blocking("stt_request", move |inner| inner.stt_request(&req_obj))
+            .await?;
         let resp = call_outbound(req).await?;
-        self.inner.parse_stt(resp)
+        self.speech_blocking("parse_stt", move |inner| inner.parse_stt(resp))
+            .await
     }
 
     #[cfg_attr(
@@ -247,9 +276,13 @@ impl LLMProvider for LLMProviderFromHTTP {
     )]
     async fn speech(&self, req_obj: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
         self.ensure_credential_fresh().await?;
-        let req = self.inner.tts_request(req_obj)?;
+        let req_obj = req_obj.clone();
+        let req = self
+            .speech_blocking("tts_request", move |inner| inner.tts_request(&req_obj))
+            .await?;
         let resp = call_outbound(req).await?;
-        self.inner.parse_tts(resp)
+        self.speech_blocking("parse_tts", move |inner| inner.parse_tts(resp))
+            .await
     }
 }
 

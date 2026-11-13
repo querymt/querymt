@@ -22,6 +22,7 @@ mod prompt;
 mod quorum;
 mod schema;
 mod single;
+mod speech;
 mod tools;
 mod workspace;
 
@@ -37,6 +38,7 @@ pub(crate) use prompt::{deserialize_system_parts, resolve_system_parts};
 pub use quorum::*;
 pub use schema::{schema_for_system_parts, schema_for_value};
 pub use single::*;
+pub use speech::*;
 pub use tools::*;
 pub use workspace::WorkspaceSettings;
 

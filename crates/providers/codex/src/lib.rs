@@ -12,6 +12,7 @@ use querymt::{
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     plugin::HTTPLLMProviderFactory,
+    stt::{SttRequest, SttResponse},
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
@@ -267,6 +268,15 @@ impl HTTPCompletionProvider for Codex {
 }
 
 impl HTTPLLMProvider for Codex {
+    fn stt_request(&self, req: &SttRequest) -> Result<Request<Vec<u8>>, LLMError> {
+        api::codex_stt_request(self, req)
+    }
+
+    fn parse_stt(&self, resp: Response<Vec<u8>>) -> Result<SttResponse, LLMError> {
+        querymt::handle_http_error!(resp);
+        Ok(serde_json::from_slice(resp.body())?)
+    }
+
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }

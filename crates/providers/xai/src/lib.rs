@@ -27,6 +27,8 @@ use querymt::{
     error::LLMError,
     handle_http_error,
     plugin::HTTPLLMProviderFactory,
+    stt::{SttRequest, SttResponse},
+    tts::{TtsRequest, TtsResponse, VoiceConfig},
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
@@ -472,6 +474,89 @@ fn retag_xai_structured_event(event: StructuredStreamEvent) -> StructuredStreamE
 }
 
 impl HTTPLLMProvider for Xai {
+    fn stt_request(&self, req: &SttRequest) -> Result<Request<Vec<u8>>, LLMError> {
+        let url = self
+            .base_url
+            .join("stt")
+            .map_err(|error| LLMError::HttpError(error.to_string()))?;
+        let mut form = qmt_openai::api::MultipartForm::new("qmt-xai-stt-boundary");
+        let model = req.model.as_deref().unwrap_or(&self.model);
+        if !model.is_empty() {
+            form.text("model", model)?;
+        }
+        if let Some(language) = &req.language {
+            form.text("language", language)?;
+            form.text("format", "true")?;
+        }
+        // xAI reads upload options before streaming the final file field.
+        form.file(
+            "file",
+            req.filename.as_deref().unwrap_or("audio.wav"),
+            req.mime_type.as_deref().unwrap_or("audio/wav"),
+            &req.audio,
+        )?;
+        Ok(Request::builder()
+            .method(Method::POST)
+            .uri(url.to_string())
+            .header(AUTHORIZATION, format!("Bearer {}", self.resolved_key()))
+            .header(CONTENT_TYPE, form.content_type())
+            .body(form.finish())?)
+    }
+
+    fn parse_stt(&self, resp: Response<Vec<u8>>) -> Result<SttResponse, LLMError> {
+        handle_http_error!(resp);
+        Ok(serde_json::from_slice(resp.body())?)
+    }
+
+    fn tts_request(&self, req: &TtsRequest) -> Result<Request<Vec<u8>>, LLMError> {
+        let voice = match &req.voice_config {
+            Some(VoiceConfig::Preset { name }) => name.as_str(),
+            None => "eve",
+            Some(_) => {
+                return Err(LLMError::NotImplemented(
+                    "xAI TTS accepts voice IDs, not inline voice cloning or design".into(),
+                ));
+            }
+        };
+        const MIN_SPEED: f32 = 0.7;
+        const MAX_SPEED: f32 = 1.5;
+        if req
+            .speed
+            .is_some_and(|speed| !speed.is_finite() || !(MIN_SPEED..=MAX_SPEED).contains(&speed))
+        {
+            return Err(LLMError::InvalidRequest(format!(
+                "xAI TTS speed must be between {MIN_SPEED} and {MAX_SPEED}"
+            )));
+        }
+        // xAI selects the synthesis model server-side; there is no model field.
+        let mut body = serde_json::json!({"text":req.text,"voice_id":voice,"language":req.language.as_deref().unwrap_or("auto")});
+        if let Some(codec) = req.format.as_deref() {
+            if !matches!(codec, "mp3" | "wav" | "pcm" | "mulaw" | "alaw") {
+                return Err(LLMError::InvalidRequest(format!(
+                    "unsupported xAI TTS format '{codec}'"
+                )));
+            }
+            body["output_format"] = serde_json::json!({"codec":codec});
+        }
+        if let Some(speed) = req.speed {
+            body["speed"] = serde_json::json!(speed);
+        }
+        let url = self
+            .base_url
+            .join("tts")
+            .map_err(|error| LLMError::HttpError(error.to_string()))?;
+        Ok(Request::builder()
+            .method(Method::POST)
+            .uri(url.to_string())
+            .header(AUTHORIZATION, format!("Bearer {}", self.resolved_key()))
+            .header(CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&body)?)?)
+    }
+
+    fn parse_tts(&self, resp: Response<Vec<u8>>) -> Result<TtsResponse, LLMError> {
+        qmt_openai::api::openai_parse_tts(self, resp)
+    }
+
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }
@@ -1251,6 +1336,133 @@ mod tests {
         req.headers()
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
+    }
+
+    #[test]
+    fn speech_requests_use_xai_contract_and_resolved_credentials() {
+        use querymt::{
+            stt::SttRequest,
+            tts::{TtsRequest, VoiceConfig},
+        };
+        let mut cfg = test_xai("stale");
+        cfg.base_url = Url::parse("https://gateway.invalid/v1/").unwrap();
+        cfg.key_resolver = Some(static_key("fresh"));
+        let request = cfg
+            .stt_request(
+                &SttRequest::new()
+                    .audio(vec![0, 255, 1])
+                    .filename("clip.webm")
+                    .mime_type("audio/webm")
+                    .model("grok-voice-transcribe-2.0")
+                    .language("en"),
+            )
+            .unwrap();
+        assert_eq!(request.uri(), "https://gateway.invalid/v1/stt");
+        assert_eq!(auth_header(&request), Some("Bearer fresh"));
+        let body = String::from_utf8_lossy(request.body());
+        let model = body.find("name=\"model\"").unwrap();
+        let language = body.find("name=\"language\"").unwrap();
+        let file = body.find("name=\"file\"").unwrap();
+        assert!(
+            model < file && language < file,
+            "file must be the final field"
+        );
+        assert!(body.contains("grok-voice-transcribe-2.0"));
+        assert!(body.contains("clip.webm") && body.contains("audio/webm"));
+        assert!(!body.contains("response_format"));
+        assert!(request.body().windows(3).any(|bytes| bytes == [0, 255, 1]));
+
+        let request = cfg
+            .tts_request(
+                &TtsRequest::new()
+                    .text("hello")
+                    .model("not-a-wire-model")
+                    .voice_config(VoiceConfig::preset("eve"))
+                    .format("wav")
+                    .language("en")
+                    .speed(1.25),
+            )
+            .unwrap();
+        assert_eq!(request.uri(), "https://gateway.invalid/v1/tts");
+        assert_eq!(auth_header(&request), Some("Bearer fresh"));
+        let body: Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"text":"hello","voice_id":"eve","language":"en","output_format":{"codec":"wav"},"speed":1.25})
+        );
+        let request = cfg
+            .tts_request(&TtsRequest::new().text("auto detect"))
+            .unwrap();
+        let body: Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(body["language"], "auto");
+        assert!(body.get("model").is_none());
+    }
+
+    #[test]
+    fn speech_rejects_unsupported_options_and_multipart_injection() {
+        use querymt::{
+            stt::SttRequest,
+            tts::{TtsRequest, VoiceConfig},
+        };
+        let cfg = test_xai("key");
+        assert!(matches!(
+            cfg.stt_request(&SttRequest::new().filename("clip\r\nInjected: x")),
+            Err(LLMError::InvalidRequest(_))
+        ));
+        for request in [
+            TtsRequest::new().text("hello").format("opus"),
+            TtsRequest::new().text("hello").speed(0.1),
+            TtsRequest::new().text("hello").speed(f32::NAN),
+            TtsRequest::new()
+                .text("hello")
+                .voice_config(VoiceConfig::design("warm voice")),
+        ] {
+            assert!(cfg.tts_request(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn speech_parses_language_audio_and_http_errors() {
+        let cfg = test_xai("key");
+        let response = cfg
+            .parse_stt(Response::new(
+                br#"{"text":"hello","language":"en","duration":1.2,"words":[]}"#.to_vec(),
+            ))
+            .unwrap();
+        assert_eq!(response.text, "hello");
+        assert_eq!(response.language.as_deref(), Some("en"));
+        assert!(
+            cfg.parse_stt(Response::new(br#"{"unexpected":"shape"}"#.to_vec()))
+                .is_err()
+        );
+        let response = cfg
+            .parse_tts(
+                Response::builder()
+                    .header(CONTENT_TYPE, "audio/wav")
+                    .body(vec![0, 255, 1])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(response.audio, [0, 255, 1]);
+        assert_eq!(response.mime_type.as_deref(), Some("audio/wav"));
+        assert!(
+            cfg.parse_stt(
+                Response::builder()
+                    .status(401)
+                    .body(b"unauthorized".to_vec())
+                    .unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            cfg.parse_tts(
+                Response::builder()
+                    .status(429)
+                    .body(b"rate limited".to_vec())
+                    .unwrap()
+            )
+            .is_err()
+        );
     }
 
     #[test]

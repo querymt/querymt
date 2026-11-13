@@ -219,7 +219,10 @@ impl LLMProvider for MistralRS {
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
 
-        Ok(SttResponse { text })
+        Ok(SttResponse {
+            text,
+            language: None,
+        })
     }
 }
 

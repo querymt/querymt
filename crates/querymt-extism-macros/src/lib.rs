@@ -417,6 +417,60 @@ macro_rules! impl_extism_http_plugin {
             Ok(Json(out))
         }
 
+        // Speech follows the same request/parse split as chat and embeddings:
+        // the host owns HTTP execution, credential refresh, and cancellation.
+        #[plugin_fn]
+        pub fn stt_request(
+            Json(input): Json<ExtismSttRequest<$Config>>,
+        ) -> FnResult<Json<querymt::plugin::extism_impl::SerializableHttpRequest>> {
+            let audio = $crate::decode_base64_standard(&input.audio_base64)?;
+            let stt_req = stt::SttRequest {
+                audio,
+                filename: input.filename,
+                mime_type: input.mime_type,
+                model: input.model,
+                language: input.language,
+            };
+            let req = input.cfg.stt_request(&stt_req).map_err(llm_err_to_pdk)?;
+            Ok(Json(querymt::plugin::extism_impl::SerializableHttpRequest { req }))
+        }
+
+        #[plugin_fn]
+        pub fn parse_stt_response(
+            Json(input): Json<querymt::plugin::extism_impl::ExtismSttParseRequest<$Config>>,
+        ) -> FnResult<Json<stt::SttResponse>> {
+            Ok(Json(input.cfg.parse_stt(input.resp.resp).map_err(llm_err_to_pdk)?))
+        }
+
+        #[plugin_fn]
+        pub fn tts_request(
+            Json(input): Json<ExtismTtsRequest<$Config>>,
+        ) -> FnResult<Json<querymt::plugin::extism_impl::SerializableHttpRequest>> {
+            let voice_config = input.voice_config.map(|vc| vc.into_voice_config())
+                .transpose().map_err(llm_err_to_pdk)?;
+            let tts_req = tts::TtsRequest {
+                text: input.text,
+                model: input.model,
+                voice_config,
+                format: input.format,
+                speed: input.speed,
+                language: input.language,
+            };
+            let req = input.cfg.tts_request(&tts_req).map_err(llm_err_to_pdk)?;
+            Ok(Json(querymt::plugin::extism_impl::SerializableHttpRequest { req }))
+        }
+
+        #[plugin_fn]
+        pub fn parse_tts_response(
+            Json(input): Json<querymt::plugin::extism_impl::ExtismTtsParseRequest<$Config>>,
+        ) -> FnResult<Json<ExtismTtsResponse>> {
+            let resp = input.cfg.parse_tts(input.resp.resp).map_err(llm_err_to_pdk)?;
+            Ok(Json(ExtismTtsResponse {
+                audio_base64: $crate::encode_base64_standard(&resp.audio),
+                mime_type: resp.mime_type,
+            }))
+        }
+
         #[plugin_fn]
         pub fn transcribe(
             Json(input): Json<ExtismSttRequest<$Config>>,
