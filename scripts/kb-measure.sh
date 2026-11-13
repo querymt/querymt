@@ -2,11 +2,12 @@
 # Repository-knowledge A/B measurement: the same prompts with the feature on
 # and off, repeated, summarised from the sessions databases.
 #
-# Usage: scripts/kb-measure.sh [-n REPEATS] [-p PROMPTS_FILE] [-o OUT_DIR] [-m MAX_PROMPTS] [-a]
+# Usage: scripts/kb-measure.sh [-n REPEATS] [-p PROMPTS_FILE] [-o OUT_DIR] [-m MAX_PROMPTS] [-g GROUPS] [-a]
 #
-#   PROMPTS_FILE  one prompt per line; blank lines and lines starting with # are skipped
-#                 (default: scripts/kb-measure-prompts.txt)
+#   PROMPTS_FILE  one `[group] prompt` per line; blank lines and # comments are
+#                 skipped (default: scripts/kb-measure-prompts.txt)
 #   OUT_DIR       per-run databases, logs and results.csv (default: /tmp/kb-measure)
+#   GROUPS        comma-separated groups to run, e.g. concept (default: all)
 #   -a            allow runs that were priced as API spend (see below)
 #
 # Isolation. The model under test must not be able to disturb the measurement:
@@ -33,25 +34,35 @@
 # warm-cache case. Runs alternate between arms (on, off, off, on...) so drift
 # in provider latency or cache state does not favour one arm.
 #
-# Compare arms on tokens: with OAuth there is no dollar cost. This measures
-# requests, tool calls and tokens, not answer quality. Final answers are kept
-# in OUT_DIR/*.log for reading side by side.
+# Reporting. Medians, not only means: one runaway session (a model that
+# decides to read 30 files) otherwise decides the comparison. Cards are counted
+# in two kinds: `gated` (the prompt matched a note) and `fallback` (the
+# repository map attached to a first prompt nothing matched). Cache reads are
+# reported separately from fresh tokens: `fresh_tok` = input + output + cache
+# writes, which is what a run newly pays for; `cache_rd` is replayed context.
+# There is no dollar cost under OAuth.
+#
+# This measures requests, tool calls and tokens, not answer quality. Final
+# answers are kept in OUT_DIR/*.log; scripts/kb-blind.py builds a shuffled,
+# unlabelled bundle of them for blind judging.
 set -euo pipefail
 
 REPEATS=3
 MAX_PROMPTS=0
 OUT=/tmp/kb-measure
 ALLOW_PRICED=0
+GROUPS_FILTER=""
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROMPTS="$ROOT/scripts/kb-measure-prompts.txt"
-while getopts "n:p:o:m:a" opt; do
+while getopts "n:p:o:m:g:a" opt; do
   case $opt in
     n) REPEATS=$OPTARG ;;
     p) PROMPTS=$OPTARG ;;
     o) OUT=$OPTARG ;;
     m) MAX_PROMPTS=$OPTARG ;;
+    g) GROUPS_FILTER=$OPTARG ;;
     a) ALLOW_PRICED=1 ;;
-    *) sed -n '2,40p' "$0"; exit 2 ;;
+    *) sed -n '2,50p' "$0"; exit 2 ;;
   esac
 done
 
@@ -71,7 +82,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "prompt_id,arm,rep,requests,tool_calls,in_tokens,out_tokens,cache_read,cache_write,total_tokens,peak_context,cost_usd,cards" > "$CSV"
+echo "prompt_id,group,arm,rep,requests,tool_calls,in_tokens,out_tokens,cache_read,cache_write,fresh_tokens,peak_context,cost_usd,gated_cards,fallback_cards" > "$CSV"
 
 cd "$ROOT"
 echo "building (with OAuth support)..." >&2
@@ -124,11 +135,19 @@ grep -q '"repo_knowledge_get"' "$ON_CONF" || die "the repository tools are missi
 echo "warming the index cache of the worktree..." >&2
 "$RK" --root "$WT" refresh >/dev/null 2>&1 || die "index refresh of the worktree failed"
 
-# No `mapfile`: macOS ships bash 3.2.
-LINES=()
-while IFS= read -r line; do LINES+=("$line"); done < <(grep -v -E '^\s*(#|$)' "$PROMPTS")
+# Prompts: `[group] text`. No `mapfile`: macOS ships bash 3.2.
+LINES=(); GROUPS_OF=()
+while IFS= read -r line; do
+  if [[ "$line" =~ ^\[([a-z]+)\][[:space:]]+(.*)$ ]]; then
+    g="${BASH_REMATCH[1]}"; text="${BASH_REMATCH[2]}"
+  else
+    die "prompt without a [group] prefix: $line"
+  fi
+  if [ -n "$GROUPS_FILTER" ] && [[ ",$GROUPS_FILTER," != *",$g,"* ]]; then continue; fi
+  LINES+=("$text"); GROUPS_OF+=("$g")
+done < <(grep -v -E '^\s*(#|$)' "$PROMPTS")
 if [ "$MAX_PROMPTS" -gt 0 ]; then LINES=("${LINES[@]:0:$MAX_PROMPTS}"); fi
-[ "${#LINES[@]}" -gt 0 ] || die "no prompts in $PROMPTS"
+[ "${#LINES[@]}" -gt 0 ] || die "no prompts selected from $PROMPTS"
 
 # The run has exited, so the database is quiescent. `immutable=1` opens a WAL
 # database read-only without needing its -shm file (`mode=ro` fails on it).
@@ -136,9 +155,14 @@ metric() { sqlite3 "file:$1?immutable=1" "$2" 2>/dev/null || echo ""; }
 usage_sum() { # db field
   metric "$1" "select ifnull(sum(json_extract(payload_json,'\$.data.usage.$2')),0) from event_journal where kind='llm_request_end'"
 }
+# Cards: the fallback card says so in its own text.
+cards_of() { # db fallback(0|1)
+  local op='not like'; [ "$2" = 1 ] && op='like'
+  metric "$1" "select count(*) from message_parts where part_type='hook_context' and content_json like '%repository_knowledge%' and content_json $op '%general orientation from a configured repository entrypoint%'"
+}
 
-run_one() { # id arm rep prompt
-  local id=$1 arm=$2 rep=$3 prompt=$4 conf db log
+run_one() { # id group arm rep prompt
+  local id=$1 grp=$2 arm=$3 rep=$4 prompt=$5 conf db log
   conf=$ON_CONF; [ "$arm" = off ] && conf=$OFF_CONF
   db="$OUT/$id-$arm-$rep.db"; log="$OUT/$id-$arm-$rep.log"
   rm -rf "$db" "$db-wal" "$db-shm" "${db%.db}.run-leases"
@@ -150,7 +174,7 @@ run_one() { # id arm rep prompt
   if grep -qE '^(Error:|\[ERROR\])' "$log"; then
     die "run $id/$arm/$rep reported an error (see $log): $(grep -m1 -E '^(Error:|\[ERROR\])' "$log" | cut -c1-200)"
   fi
-  local req tools in_t out_t cr cw ctx cost cards total
+  local req tools in_t out_t cr cw ctx cost gated fb fresh
   req=$(metric "$db" "select count(*) from event_journal where kind='llm_request_end'")
   req=${req:-0}
   [ "$req" -gt 0 ] || die "run $id/$arm/$rep made no model request (see $log)"
@@ -161,11 +185,12 @@ run_one() { # id arm rep prompt
   out_t=$(usage_sum "$db" output_tokens)
   cr=$(usage_sum "$db" cache_read)
   cw=$(usage_sum "$db" cache_write)
-  total=$((${in_t:-0} + ${out_t:-0} + ${cr:-0} + ${cw:-0}))
+  fresh=$((${in_t:-0} + ${out_t:-0} + ${cw:-0}))
   ctx=$(metric "$db" "select ifnull(max(json_extract(payload_json,'\$.data.context_tokens')),0) from event_journal where kind='llm_request_end'")
   cost=$(metric "$db" "select ifnull(max(json_extract(payload_json,'\$.data.cumulative_cost_usd')),0) from event_journal where kind='llm_request_end'")
-  cards=$(metric "$db" "select count(*) from message_parts where part_type='hook_context' and content_json like '%repository_knowledge%'")
-  echo "$id,$arm,$rep,$req,${tools:-0},${in_t:-0},${out_t:-0},${cr:-0},${cw:-0},$total,${ctx:-0},${cost:-0},${cards:-0}" | tee -a "$CSV" >&2
+  gated=$(cards_of "$db" 0)
+  fb=$(cards_of "$db" 1)
+  echo "$id,$grp,$arm,$rep,$req,${tools:-0},${in_t:-0},${out_t:-0},${cr:-0},${cw:-0},$fresh,${ctx:-0},${cost:-0},${gated:-0},${fb:-0}" | tee -a "$CSV" >&2
 
   # A dollar price means this was metered API spend, not a subscription attempt.
   if [ "$ALLOW_PRICED" -eq 0 ] && [ "$(echo "${cost:-0} > 0" | bc -l)" = 1 ]; then
@@ -174,34 +199,16 @@ run_one() { # id arm rep prompt
 }
 
 idx=0
-for line in "${LINES[@]}"; do
+for i in "${!LINES[@]}"; do
   idx=$((idx + 1)); id=$(printf 'p%02d' "$idx")
   for rep in $(seq 1 "$REPEATS"); do
     # Alternate which arm goes first.
     if [ $((rep % 2)) -eq 1 ]; then order="on off"; else order="off on"; fi
-    for arm in $order; do run_one "$id" "$arm" "$rep" "$line"; done
+    for arm in $order; do run_one "$id" "${GROUPS_OF[$i]}" "$arm" "$rep" "${LINES[$i]}"; done
   done
 done
 
-summary() { # group-by columns
-  sqlite3 -header -column :memory: <<SQL >&2
-.mode csv
-.import '$CSV' r
-.mode column
-select $1, count(*) as runs,
-       round(avg(requests),1) as requests, round(avg(tool_calls),1) as tools,
-       round(avg(in_tokens)) as in_tok, round(avg(out_tokens)) as out_tok,
-       round(avg(cache_read)) as cache_rd, round(avg(cache_write)) as cache_wr,
-       round(avg(total_tokens)) as total_tok, round(avg(peak_context)) as peak_ctx,
-       round(avg(cards),2) as cards
-from r group by $1 order by $1;
-SQL
-}
 echo >&2
-echo "== mean per arm (all prompts) ==" >&2
-summary "arm"
+python3 "$ROOT/scripts/kb-summary.py" "$CSV" >&2
 echo >&2
-echo "== mean per prompt and arm ==" >&2
-summary "prompt_id, arm"
-echo >&2
-echo "results: $CSV   answers: $OUT/*.log" >&2
+echo "results: $CSV   answers: $OUT/*.log   blind bundle: python3 scripts/kb-blind.py $OUT" >&2
