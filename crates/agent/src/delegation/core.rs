@@ -9,6 +9,7 @@ use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::{
     Delegation, DelegationClaim, DelegationStatus, ForkOrigin, ForkPointType,
 };
+use crate::session::error::SessionResult;
 use crate::session::store::SessionStore;
 use crate::tools::ToolRegistry;
 use crate::verification::VerificationSpec;
@@ -447,20 +448,22 @@ impl DelegationOrchestrator {
         }
     }
 
-    async fn claim_delegation(&self, delegation_id: &str) -> Result<DelegationClaim, String> {
-        let mut last_error = None;
-        for attempt in 0..3 {
+    /// Claims a delegation, retrying only transient storage errors (database
+    /// busy or locked) up to three attempts in total. Any other error is
+    /// returned after the first attempt with its kind intact.
+    async fn claim_delegation(&self, delegation_id: &str) -> SessionResult<DelegationClaim> {
+        const MAX_ATTEMPTS: usize = 3;
+        let mut attempt = 1;
+        loop {
             match self.store.claim_delegation(delegation_id).await {
                 Ok(result) => return Ok(result),
-                Err(err) => {
-                    last_error = Some(err.to_string());
-                    if attempt < 2 {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    }
+                Err(err) if err.is_transient() && attempt < MAX_ATTEMPTS => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
+                Err(err) => return Err(err),
             }
         }
-        Err(last_error.unwrap_or_else(|| "unknown claim error".to_string()))
     }
 
     /// Process a single event envelope.
@@ -1330,7 +1333,7 @@ async fn execute_delegation(
         .run_delegation_start(DelegationStartRequest {
             session_id: parent_session_id.clone(),
             parent_cwd: source_parent_cwd.clone(),
-            turn_id: String::new(),
+            turn_id: crate::model::TurnId::new().to_string(),
             cwd: effective_cwd.clone(),
             model: String::new(),
             permission_mode: "default".to_string(),
@@ -2062,7 +2065,7 @@ async fn execute_delegation(
                 .run_post_delegation(PostDelegationRequest {
                     session_id: parent_session_id.clone(),
                     parent_cwd: source_parent_cwd.clone(),
-                    turn_id: String::new(),
+                    turn_id: crate::model::TurnId::new().to_string(),
                     // Execution hook: identifies the delegate's actual
                     // execution root, not the orchestrator default.
                     cwd: effective_cwd.clone(),
@@ -2384,7 +2387,7 @@ async fn fail_delegation(ctx: DelegationFailureContext<'_>, error_message: &str)
         match hooks
             .run_delegation_failure(DelegationFailureRequest {
                 session_id: ctx.parent_session_id.to_string(),
-                turn_id: String::new(),
+                turn_id: crate::model::TurnId::new().to_string(),
                 // The delegate's execution root once allocated; `None` keeps
                 // explicit parent context for pre-allocation failures.
                 cwd: ctx.execution_cwd.clone(),
@@ -3655,6 +3658,110 @@ mod tests {
             required_capabilities: vec![],
             meta: None,
         }
+    }
+
+    // ── claim_delegation retry ───────────────────────────────────────────────
+
+    /// Builds an orchestrator over a store whose `claim_delegation` pops
+    /// scripted results and counts attempts.
+    async fn claim_orchestrator(
+        script: Vec<SessionResult<DelegationClaim>>,
+    ) -> (DelegationOrchestrator, Arc<std::sync::atomic::AtomicUsize>) {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let script = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            script,
+        )));
+        let mut store = MockSessionStore::new();
+        let counter = attempts.clone();
+        store.expect_claim_delegation().returning(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("claim attempted more often than scripted")
+        });
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("storage"),
+        );
+        let event_sink = Arc::new(EventSink::new(
+            storage.event_journal(),
+            Arc::new(EventFanout::new()),
+        ));
+        let orchestrator = DelegationOrchestrator::new(
+            StubAgentHandle::new("delegator"),
+            event_sink,
+            store,
+            Arc::new(DefaultAgentRegistry::new()),
+            Arc::new(ToolRegistry::new()),
+            Hooks::default(),
+            None,
+        );
+        (orchestrator, attempts)
+    }
+
+    fn busy_error() -> crate::session::error::SessionError {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".to_string()),
+        )
+        .into()
+    }
+
+    #[tokio::test]
+    async fn busy_database_claim_is_retried() {
+        let (orchestrator, attempts) =
+            claim_orchestrator(vec![Err(busy_error()), Ok(DelegationClaim::Claimed)]).await;
+        let claim = orchestrator.claim_delegation("delegation-1").await;
+        assert!(matches!(claim, Ok(DelegationClaim::Claimed)), "{claim:?}");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn busy_database_claim_gives_up_after_three_attempts() {
+        let (orchestrator, attempts) = claim_orchestrator(vec![
+            Err(busy_error()),
+            Err(busy_error()),
+            Err(busy_error()),
+        ])
+        .await;
+        let claim = orchestrator.claim_delegation("delegation-1").await;
+        assert!(claim.unwrap_err().is_transient());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn non_transient_claim_failure_is_not_retried() {
+        let undecodable = rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unknown delegation status",
+            )),
+        );
+        let (orchestrator, attempts) = claim_orchestrator(vec![Err(undecodable.into())]).await;
+        let err = orchestrator
+            .claim_delegation("delegation-1")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::session::error::SessionError::Database(_)),
+            "{err:?}"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_delegation_is_a_claim_outcome_not_a_failure() {
+        let (orchestrator, attempts) =
+            claim_orchestrator(vec![Ok(DelegationClaim::NotFound)]).await;
+        let claim = orchestrator.claim_delegation("delegation-1").await;
+        assert!(matches!(claim, Ok(DelegationClaim::NotFound)), "{claim:?}");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     // ── DefaultAgentRegistry tests ───────────────────────────────────────────

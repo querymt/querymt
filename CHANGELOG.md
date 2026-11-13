@@ -4,6 +4,32 @@
 
 ### Behavior changes
 
+- **BREAKING (Rust API):** `querymt_agent::tasks::run_verification` and
+  `tasks::extract_verification_commands` are removed. Nothing called them, and
+  they ran substrings of model output through `sh -c`. `TaskWatcher` is
+  unchanged, and delegation's `run_verification` config option is unaffected.
+- **BREAKING (Rust API):** run ids are `TurnId` end to end. `ActiveRun`,
+  `SteeringInbox`, `TurnControlError`, `PromptFinished`, `RunPhaseChanged` and
+  `RunObjective` carry `TurnId` instead of `String`.
+  `ExecutionContext::new` now takes the run's `TurnId` and the context's
+  `turn_id` is no longer optional (read it with `turn_id()`).
+  `ExecutionContext::turn_id_string` and `with_turn_id` are removed, and
+  `impl Default for TurnId` is removed (use `TurnId::new()`). Wire formats are
+  unchanged. Hook input `turn_id` is now always a UUID: hooks inside a run
+  (including native `/compact` and maintenance compaction) carry that run's id,
+  and delegation hooks get a freshly generated one instead of an empty string.
+- `ScheduleInfo.state` is typed as `ScheduleState`, and `PendingInputSummary`
+  `delivery`/`state` as `InputDelivery`/`PendingInputState`. JSON values are
+  unchanged. querymt-desktop should regenerate its typeshare output for
+  `ScheduleInfo.state` and `PendingInputSummary` (UI follow-up, not done here).
+- **BREAKING (mesh wire, feature `remote`):** the error arm of the
+  `querymt::AdmissionRequest` reply is now a structured `AdmissionRejection`
+  instead of a string. Nodes on different versions see a decode error instead of
+  the rejection reason, so upgrade all mesh nodes together.
+- **BREAKING (Rust API):** `WorkspaceIndexError` is replaced by `IndexError`
+  (also used by `FunctionIndex::build`, `CodeSearch::search` and the workspace
+  actor replies). `HooksConfig::validate`, `Hooks::new` and `Hooks::run_stop`
+  return `HookConfigError` / `HookError` instead of `anyhow::Error`.
 - **BREAKING: `.gitignore` applies to undo snapshots outside git repositories.**
   Before, it was ignored there, so ignored files were snapshotted and could be
   reverted by undo. `.ignore` and `.git/info/exclude` are honoured too; `.ignore`

@@ -4,10 +4,11 @@ use crate::session::domain::{ProgressEntry, ProgressKind};
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::repository::ProgressRepository;
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use time::OffsetDateTime;
 
 /// SQLite implementation of ProgressRepository
@@ -26,14 +27,7 @@ impl SqliteProgressRepository {
         F: FnOnce(&mut Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        let conn_arc = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = conn_arc.lock().unwrap();
-            f(&mut conn)
-        })
-        .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
+        crate::session::sqlite_storage::blocking::with_conn_sqlite(&self.conn, f).await
     }
 
     async fn resolve_session_internal_id(&self, session_public_id: &str) -> SessionResult<i64> {
@@ -48,7 +42,7 @@ impl SqliteProgressRepository {
         })
         .await
         .map_err(|err| match err {
-            SessionError::DatabaseError(msg) if msg.contains("Query returned no rows") => {
+            SessionError::Database(rusqlite::Error::QueryReturnedNoRows) => {
                 SessionError::SessionNotFound(error_value)
             }
             other => other,
@@ -67,7 +61,7 @@ impl SqliteProgressRepository {
         })
         .await
         .map_err(|err| match err {
-            SessionError::DatabaseError(msg) if msg.contains("Query returned no rows") => {
+            SessionError::Database(rusqlite::Error::QueryReturnedNoRows) => {
                 SessionError::TaskNotFound(error_value)
             }
             other => other,

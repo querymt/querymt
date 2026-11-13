@@ -150,7 +150,6 @@ async fn remote_profile_creation_rejects_failed_binding_without_a_session_or_mem
         .storage
         .conn_for_test()
         .lock()
-        .unwrap()
         .execute_batch(
             "CREATE TABLE rejected_binding_ids (id TEXT NOT NULL);
          CREATE TRIGGER reject_profile_binding BEFORE INSERT ON profile_bindings
@@ -175,7 +174,6 @@ async fn remote_profile_creation_rejects_failed_binding_without_a_session_or_mem
         .storage
         .conn_for_test()
         .lock()
-        .unwrap()
         .query_row("SELECT id FROM rejected_binding_ids", [], |row| row.get(0))
         .unwrap();
     assert!(
@@ -226,7 +224,6 @@ async fn remote_profile_creation_rejects_failed_binding_without_a_session_or_mem
         .storage
         .conn_for_test()
         .lock()
-        .unwrap()
         .execute_batch("DROP TRIGGER reject_profile_binding")
         .unwrap();
     let created = ext_method_json(
@@ -910,7 +907,6 @@ async fn lifecycle_location_conflicts_reject_get_patch_and_acp_hydration() {
         .storage
         .conn_for_test()
         .lock()
-        .unwrap()
         .execute(
             "UPDATE sessions SET public_id = ?1 WHERE public_id = ?2",
             rusqlite::params![owner_session.public_id, collision.public_id],

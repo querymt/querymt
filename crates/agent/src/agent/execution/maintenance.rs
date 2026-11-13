@@ -291,7 +291,7 @@ pub(crate) async fn compact_history(
         })
         .sum();
 
-    let turn_id = exec_ctx.turn_id_string();
+    let turn_id = exec_ctx.turn_id().to_string();
     let model_name = exec_ctx
         .llm_config()
         .map(|cfg| cfg.model.clone())
@@ -661,12 +661,12 @@ mod tests {
         let runtime = SessionRuntime::new(None, Default::default(), McpToolState::empty());
         let exec_ctx = ExecutionContext::new(
             session_id.clone(),
+            crate::model::TurnId::new(),
             runtime,
             runtime_context,
             session_handle,
             ToolConfig::default(),
-        )
-        .with_turn_id(crate::model::TurnId::new());
+        );
         let state = ExecutionState::Stopped {
             message: "context threshold".into(),
             stop_type: StopType::ContextThreshold,

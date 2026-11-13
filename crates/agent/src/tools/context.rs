@@ -56,6 +56,12 @@ pub trait ToolContext: Send + Sync {
         None
     }
 
+    /// Per-session todo lists for the todo tools. `None` in contexts that have
+    /// no agent behind them; the todo tools then report todos as unavailable.
+    fn todo_store(&self) -> Option<Arc<crate::tools::builtins::todo::TodoStore>> {
+        None
+    }
+
     /// Scope policy for knowledge tools. Defaults to permissive (allow all scopes).
     fn scope_policy(&self) -> Arc<dyn ScopePolicy> {
         Arc::new(crate::knowledge::PermissiveScopePolicy)

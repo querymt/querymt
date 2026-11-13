@@ -84,6 +84,7 @@ pub struct AgentToolContext {
     mutation_gate: Option<Arc<crate::worktree::gate::CheckoutMutationGate>>,
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
     session_store: Option<Arc<dyn crate::session::store::SessionStore>>,
+    todo_store: Option<Arc<crate::tools::builtins::todo::TodoStore>>,
 }
 
 impl AgentToolContext {
@@ -107,7 +108,14 @@ impl AgentToolContext {
             mutation_gate: None,
             workspace_service: None,
             session_store: None,
+            todo_store: None,
         }
+    }
+
+    /// Attach the agent's per-session todo store.
+    pub fn with_todo_store(mut self, store: Arc<crate::tools::builtins::todo::TodoStore>) -> Self {
+        self.todo_store = Some(store);
+        self
     }
 
     /// Attach the managed worktree workspace service (when configured).
@@ -207,6 +215,10 @@ impl ToolContext for AgentToolContext {
 
     fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
         self.knowledge_store.clone()
+    }
+
+    fn todo_store(&self) -> Option<Arc<crate::tools::builtins::todo::TodoStore>> {
+        self.todo_store.clone()
     }
 
     fn scope_policy(&self) -> Arc<dyn ScopePolicy> {

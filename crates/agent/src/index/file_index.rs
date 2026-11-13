@@ -248,7 +248,11 @@ impl FileIndexWatcher {
         let index = Arc::new(ArcSwap::from_pointee(None));
         let (index_tx, _) = broadcast::channel(16);
         let (changes_tx, _) = broadcast::channel(64);
-        let (event_tx, mut event_rx) = mpsc::channel::<Event>(256);
+        // Unbounded on purpose: the callback runs on the notify thread, and a
+        // blocking send into a full channel there deadlocks `RecommendedWatcher`'s
+        // drop when the consumer task is no longer polled (runtime shutdown).
+        // The consumer already buffers every event in an unbounded `Vec`.
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
         let overrides = compile_overrides(&root, &config)?;
         let gitignore = Arc::new(ArcSwap::from_pointee(build_gitignore(&root)));
 
@@ -259,7 +263,7 @@ impl FileIndexWatcher {
             move |res: Result<Event, notify::Error>| match res {
                 Ok(event) => {
                     log::trace!("FileWatcher: received event {:?}", event.kind);
-                    let _ = event_tx.blocking_send(event);
+                    let _ = event_tx.send(event);
                 }
                 Err(e) => {
                     log::warn!("FileWatcher: error receiving event: {:?}", e);

@@ -663,6 +663,31 @@ async fn delete_session_clears_delegate_model_overrides() -> Result<()> {
 }
 
 #[tokio::test]
+async fn recreated_session_id_starts_with_an_empty_list() -> Result<()> {
+    use crate::tools::builtins::todo::{TodoItem, TodoPriority, TodoStatus};
+
+    let agent = test_agent().await?;
+    let session_id = agent.create_session().await?;
+    let store = &agent.inner.config.todo_store;
+    store.replace(
+        &session_id,
+        vec![TodoItem {
+            id: "1".into(),
+            content: "write tests".into(),
+            status: TodoStatus::Pending,
+            priority: TodoPriority::High,
+        }],
+    );
+    assert_eq!(store.get(&session_id).len(), 1);
+
+    agent.sessions().delete(&session_id).await?;
+
+    // A session that later appears under the same id sees no leftover list.
+    assert!(store.get(&session_id).is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn delete_loaded_idle_session_does_not_wait_for_stop_grace() -> Result<()> {
     let agent = test_agent().await?;
     let session_id = agent.create_session().await?;
@@ -2017,7 +2042,7 @@ async fn lifecycle_query_modes_preserve_filters_pages_and_metadata() -> Result<(
                 },
             )
             .await?;
-        sqlite.conn_for_test().lock().unwrap().execute(
+        sqlite.conn_for_test().lock().execute(
             "UPDATE sessions SET updated_at = ?1 WHERE public_id = ?2",
             rusqlite::params![updated_at, session.public_id],
         )?;
@@ -2289,7 +2314,6 @@ async fn lifecycle_query_metadata_errors_fail_instead_of_fabricating_open_state(
     sqlite
         .conn_for_test()
         .lock()
-        .unwrap()
         .execute("DROP TABLE session_lifecycle", [])?;
     let error = agent
         .sessions()

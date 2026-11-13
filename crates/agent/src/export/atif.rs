@@ -195,6 +195,13 @@ fn tools_to_atif(tools: &[querymt::chat::Tool]) -> Vec<AtifToolDefinition> {
 /// to the step whose cost they feed (`step_id`); auxiliary attempts
 /// (compaction, delegation summaries) and attempts that never produced a
 /// request end have no step, and no assistant step is invented for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AttemptState {
+    Settled,
+    Unresolved,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct AtifAttempt {
     attempt_id: String,
@@ -202,7 +209,7 @@ struct AtifAttempt {
     cycle_id: String,
     purpose: AttemptPurpose,
     /// `settled`, or `unresolved` when no settlement was recorded.
-    state: &'static str,
+    state: AttemptState,
     #[serde(skip_serializing_if = "Option::is_none")]
     outcome: Option<AttemptOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -289,7 +296,7 @@ impl ATIFBuilder {
                             operation_id: attempt.operation_id.clone(),
                             cycle_id: attempt.cycle_id.clone(),
                             purpose: attempt.purpose,
-                            state: "unresolved",
+                            state: AttemptState::Unresolved,
                             outcome: None,
                             billing: Some(start.billing),
                             known_subtotal_usd: 0.0,
@@ -306,7 +313,7 @@ impl ATIFBuilder {
                         operation_id: attempt.operation_id.clone(),
                         cycle_id: attempt.cycle_id.clone(),
                         purpose: attempt.purpose,
-                        state: "settled",
+                        state: AttemptState::Settled,
                         outcome: Some(settlement.outcome),
                         billing: Some(settlement.valuation.billing),
                         known_subtotal_usd: settlement.valuation.known_subtotal_usd,
@@ -316,7 +323,7 @@ impl ATIFBuilder {
                     match index.get(&attempt.attempt_id) {
                         // The first settlement wins; an identical redelivery
                         // must not add or change anything.
-                        Some(&i) if self.attempts[i].state == "settled" => {}
+                        Some(&i) if self.attempts[i].state == AttemptState::Settled => {}
                         Some(&i) => self.attempts[i] = record,
                         None => {
                             index.insert(attempt.attempt_id.clone(), self.attempts.len());
@@ -616,6 +623,18 @@ impl ATIF {
 mod tests {
     use super::*;
     use crate::events::{AgentEventKind, EventOrigin};
+
+    #[test]
+    fn typed_state_fields_serialize_unchanged() {
+        assert_eq!(
+            serde_json::to_value(AttemptState::Settled).unwrap(),
+            "settled"
+        );
+        assert_eq!(
+            serde_json::to_value(AttemptState::Unresolved).unwrap(),
+            "unresolved"
+        );
+    }
 
     // ── ATIF struct serialization ──────────────────────────────────────────
 

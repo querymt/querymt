@@ -176,7 +176,7 @@ pub(super) async fn transition_before_llm_call(
         .run_context(crate::hooks::ContextHookRequest {
             session_id: exec_ctx.session_id.clone(),
             mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: exec_ctx.turn_id_string(),
+            turn_id: exec_ctx.turn_id().to_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: context.model.to_string(),
             permission_mode: exec_ctx.permission_mode().to_string(),
@@ -6407,7 +6407,6 @@ mod tests {
                 .storage
                 .conn_for_test()
                 .lock()
-                .unwrap()
                 .execute_batch("DROP TABLE event_journal")
                 .unwrap();
             let result =

@@ -4,10 +4,11 @@ use crate::session::domain::{Task, TaskKind, TaskStatus};
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::repository::TaskRepository;
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use time::OffsetDateTime;
 
 /// SQLite implementation of TaskRepository
@@ -26,14 +27,7 @@ impl SqliteTaskRepository {
         F: FnOnce(&mut Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        let conn_arc = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = conn_arc.lock().unwrap();
-            f(&mut conn)
-        })
-        .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
+        crate::session::sqlite_storage::blocking::with_conn_sqlite(&self.conn, f).await
     }
 }
 
@@ -213,7 +207,7 @@ impl TaskRepository for SqliteTaskRepository {
         })
         .await
         .map_err(|e| match e {
-            SessionError::DatabaseError(_) => SessionError::TaskNotFound(task_id.to_string()),
+            SessionError::Database(_) => SessionError::TaskNotFound(task_id.to_string()),
             _ => e,
         })
     }
@@ -239,7 +233,7 @@ impl TaskRepository for SqliteTaskRepository {
         })
         .await
         .map_err(|e| match e {
-            SessionError::DatabaseError(_) => SessionError::TaskNotFound(task_id),
+            SessionError::Database(_) => SessionError::TaskNotFound(task_id),
             _ => e,
         })
     }

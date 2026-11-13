@@ -835,10 +835,12 @@ impl LocalAgentHandle {
             Some(tip) => tip,
             None => match self.hosting_config(&session_id).await {
                 Some(config) => {
-                    let tip = config.emit_ephemeral_event(
-                        &session_id,
-                        AgentEventKind::WorktreeCommandOutput { text },
-                    );
+                    let tip = config
+                        .emit_ephemeral_event(
+                            &session_id,
+                            AgentEventKind::WorktreeCommandOutput { text },
+                        )
+                        .await;
                     // A session without an actor has nothing else to retire
                     // its stream.
                     if self

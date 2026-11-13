@@ -1478,6 +1478,7 @@ impl AgentSessions {
         store.remove_remote_session_bookmark(&session_id).await?;
         store.delete_session(&session_id).await?;
         self.agent.config.remove_run_lease_file(&session_id);
+        self.agent.discard_session_todos(&session_id).await;
         drop(delete_guard);
         if store.supports_session_pins() {
             crate::control::notifications::emit_session_pins_changed_notification(

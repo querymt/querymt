@@ -202,13 +202,13 @@ pub(crate) enum RunCompletionDisposition {
 
 pub(crate) struct PromptFinished {
     pub generation: u64,
-    pub run_id: String,
+    pub run_id: crate::model::TurnId,
     pub disposition: RunCompletionDisposition,
 }
 
 pub(crate) struct RunPhaseChanged {
     pub generation: u64,
-    pub run_id: String,
+    pub run_id: crate::model::TurnId,
     pub phase: Option<crate::agent::turn_control::RunPhase>,
 }
 

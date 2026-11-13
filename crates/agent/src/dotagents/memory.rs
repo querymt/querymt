@@ -1027,7 +1027,8 @@ mod tests {
     #[tokio::test]
     async fn empty_plan_deactivates_stale_protocol_memories() {
         use crate::knowledge::sqlite::SqliteKnowledgeStore;
-        use std::sync::{Arc, Mutex};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
 
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::session::schema::init_schema(&mut conn).unwrap();
@@ -1052,7 +1053,8 @@ mod tests {
     #[tokio::test]
     async fn available_store_imports_and_reports_counts() {
         use crate::knowledge::sqlite::SqliteKnowledgeStore;
-        use std::sync::{Arc, Mutex};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
 
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::session::schema::init_schema(&mut conn).unwrap();

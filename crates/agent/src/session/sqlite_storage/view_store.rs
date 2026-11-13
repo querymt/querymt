@@ -1476,11 +1476,11 @@ impl ViewStore for SqliteStorage {
                     session_id,
                     json_extract(payload_json, '$.data.finish_reason') AS finish_reason
                 FROM event_journal
-                WHERE kind = 'llm_request_end'
-                  AND session_id IN ({})
+                WHERE kind = '{kind}'
+                  AND session_id IN ({placeholders})
                 ORDER BY stream_seq DESC
                 "#,
-                placeholders
+                kind = crate::events::AgentEventKind::LLM_REQUEST_END_TAG,
             ))?;
             let rows = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
@@ -1682,19 +1682,20 @@ impl ViewStore for SqliteStorage {
     ) -> SessionResult<RecentModelsView> {
         use std::collections::HashMap;
 
-        let conn_arc = self.conn.clone();
-
-        let results = tokio::task::spawn_blocking(
-            move || -> Result<Vec<(Option<String>, String, String, i64, u32)>, rusqlite::Error> {
-                let conn = conn_arc.lock().unwrap();
-
-                // Query all ProviderChanged events with workspace info.
-                // Uses event_journal (the legacy `events` table was dropped
-                // by migration 0002).
-                // Note: payload_json uses adjacently tagged serde format
-                // (tag="type", content="data"), so variant payload is under $.data.*
-                let mut stmt = conn.prepare(
-                    r#"
+        let results =
+            super::blocking::with_conn_sqlite(
+                &self.conn,
+                move |conn| -> Result<
+                    Vec<(Option<String>, String, String, i64, u32)>,
+                    rusqlite::Error,
+                > {
+                    // Query all ProviderChanged events with workspace info.
+                    // Uses event_journal (the legacy `events` table was dropped
+                    // by migration 0002).
+                    // Note: payload_json uses adjacently tagged serde format
+                    // (tag="type", content="data"), so variant payload is under $.data.*
+                    let mut stmt = conn.prepare(
+                        r#"
                 SELECT
                     s.cwd,
                     json_extract(e.payload_json, '$.data.provider') as provider,
@@ -1703,36 +1704,35 @@ impl ViewStore for SqliteStorage {
                     COUNT(*) as use_count
                 FROM event_journal e
                 JOIN sessions s ON s.public_id = e.session_id
-                WHERE e.kind = 'provider_changed'
+                WHERE e.kind = ?1
                   AND provider IS NOT NULL
                   AND model IS NOT NULL
                 GROUP BY s.cwd, provider, model
                 ORDER BY last_used_ts DESC
                 "#,
-                )?;
+                    )?;
 
-                let rows = stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, u32>(4)?,
-                    ))
-                })?;
+                    let rows = stmt.query_map(
+                        [crate::events::AgentEventKind::PROVIDER_CHANGED_TAG],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, u32>(4)?,
+                            ))
+                        },
+                    )?;
 
-                let mut results = Vec::new();
-                for row in rows {
-                    results.push(row?);
-                }
-                Ok(results)
-            },
-        )
-        .await
-        .map_err(|e| {
-            crate::session::error::SessionError::Other(format!("Task execution failed: {}", e))
-        })?
-        .map_err(crate::session::error::SessionError::from)?;
+                    let mut results = Vec::new();
+                    for row in rows {
+                        results.push(row?);
+                    }
+                    Ok(results)
+                },
+            )
+            .await?;
 
         // Group by workspace and limit per workspace
         let mut by_workspace: HashMap<Option<String>, Vec<RecentModelEntry>> = HashMap::new();

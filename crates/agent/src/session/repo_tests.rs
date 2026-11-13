@@ -5,7 +5,8 @@
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
     use time::OffsetDateTime;
 
     use rusqlite::Connection;
@@ -199,6 +200,27 @@ mod tests {
             let repo = make_repo();
             let result = repo.delete_session("ghost-id").await;
             assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn unknown_session_or_task_ids_map_to_not_found() {
+            use crate::session::error::SessionError;
+
+            let repo = make_repo();
+            let result = repo.set_active_task("ghost-session", None).await;
+            assert!(
+                matches!(result, Err(SessionError::SessionNotFound(ref id)) if id == "ghost-session"),
+                "unexpected result: {result:?}"
+            );
+
+            let session = repo.create_session(None, None, None, None).await.unwrap();
+            let result = repo
+                .set_active_task(&session.public_id, Some("ghost-task"))
+                .await;
+            assert!(
+                matches!(result, Err(SessionError::TaskNotFound(ref id)) if id == "ghost-task"),
+                "unexpected result: {result:?}"
+            );
         }
 
         #[tokio::test]
@@ -933,7 +955,6 @@ mod tests {
                 .await
                 .unwrap();
             db.lock()
-                .unwrap()
                 .execute(
                     "UPDATE delegations SET isolation = NULL WHERE public_id = ?",
                     rusqlite::params![legacy.public_id],

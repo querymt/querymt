@@ -85,12 +85,12 @@ pub struct NodeInfo {
 
 #[cfg(feature = "remote")]
 pub use remote_impl::{
-    AdmissionRequest, AdmissionResponse, CreateRemoteSchedule, CreateRemoteScheduleResponse,
-    CreateRemoteSession, CreateRemoteSessionResponse, CreateRemoteSessionWithProfile,
-    DeleteRemoteSchedule, ForkRemoteSession, ForkRemoteSessionResponse, GetNodeInfo,
-    GetRemoteDelegateModels, GetRemoteSessionLifecycle, GetRemoteSessionProfile,
-    ListRemoteProfiles, ListRemoteSchedules, ListRemoteSchedulesResponse, ListRemoteSessions,
-    ListRemoteSessionsWithLifecycle, PauseRemoteSchedule, RemoteNodeManager,
+    AdmissionRejection, AdmissionRequest, AdmissionResponse, CreateRemoteSchedule,
+    CreateRemoteScheduleResponse, CreateRemoteSession, CreateRemoteSessionResponse,
+    CreateRemoteSessionWithProfile, DeleteRemoteSchedule, ForkRemoteSession,
+    ForkRemoteSessionResponse, GetNodeInfo, GetRemoteDelegateModels, GetRemoteSessionLifecycle,
+    GetRemoteSessionProfile, ListRemoteProfiles, ListRemoteSchedules, ListRemoteSchedulesResponse,
+    ListRemoteSessions, ListRemoteSessionsWithLifecycle, PauseRemoteSchedule, RemoteNodeManager,
     RemoteNodeManagerState, RemoteSessionProfile, ResumeRemoteSchedule, ResumeRemoteSession,
     SessionHandoff, SetRemoteDelegateModel, SetRemoteSessionLifecycle, StopRemoteSessionRuntime,
     TriggerRemoteSchedule,
@@ -350,6 +350,25 @@ mod remote_impl {
             /// The reconnecting peer's PeerId — must match `membership_token.peer_id`.
             peer_id: String,
         },
+    }
+
+    /// Why a host refused an `AdmissionRequest`. Travels in the error arm of the
+    /// reply, so it must stay serializable.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+    pub enum AdmissionRejection {
+        #[error("host has no mesh handle")]
+        NoMeshHandle,
+        #[error("host has no invite store")]
+        NoInviteStore,
+        #[error("invalid peer id")]
+        InvalidPeerId,
+        #[error("peer_id does not match membership token")]
+        PeerIdMismatch,
+        #[error("host is not a member of this mesh")]
+        NotAMember,
+        /// The invite or membership token failed verification.
+        #[error("{0}")]
+        Denied(String),
     }
 
     /// Response to an `AdmissionRequest`.
@@ -2055,7 +2074,7 @@ mod remote_impl {
     }
 
     impl Message<AdmissionRequest> for RemoteNodeManager {
-        type Reply = Result<AdmissionResponse, String>;
+        type Reply = Result<AdmissionResponse, AdmissionRejection>;
 
         #[tracing::instrument(
             name = "remote.node_manager.admission",
@@ -2081,23 +2100,17 @@ mod remote_impl {
                         .record("peer_id", &peer_id);
 
                     let Some(ref mesh) = self.shared_state.mesh else {
-                        return Ok(AdmissionResponse::Rejected {
-                            reason: "host has no mesh handle".to_string(),
-                        });
+                        return Err(AdmissionRejection::NoMeshHandle);
                     };
 
                     let Some(store_arc) = mesh.invite_store() else {
-                        return Ok(AdmissionResponse::Rejected {
-                            reason: "host has no invite store".to_string(),
-                        });
+                        return Err(AdmissionRejection::NoInviteStore);
                     };
 
                     let parsed_peer = match peer_id.parse::<libp2p::PeerId>() {
                         Ok(peer) => peer,
                         Err(_) => {
-                            return Ok(AdmissionResponse::Rejected {
-                                reason: "invalid peer id".into(),
-                            });
+                            return Err(AdmissionRejection::InvalidPeerId);
                         }
                     };
                     let keypair = mesh.keypair().clone();
@@ -2155,9 +2168,7 @@ mod remote_impl {
                                 peer_id,
                                 e
                             );
-                            Ok(AdmissionResponse::Rejected {
-                                reason: e.to_string(),
-                            })
+                            Err(AdmissionRejection::Denied(e.to_string()))
                         }
                     }
                 }
@@ -2177,31 +2188,23 @@ mod remote_impl {
                             membership_token.peer_id,
                             peer_id
                         );
-                        return Ok(AdmissionResponse::Rejected {
-                            reason: "peer_id does not match membership token".to_string(),
-                        });
+                        return Err(AdmissionRejection::PeerIdMismatch);
                     }
 
                     let Some(mesh) = self.shared_state.mesh.as_ref() else {
-                        return Ok(AdmissionResponse::Rejected {
-                            reason: "host has no mesh handle".into(),
-                        });
+                        return Err(AdmissionRejection::NoMeshHandle);
                     };
                     let parsed_peer = match peer_id.parse::<libp2p::PeerId>() {
                         Ok(peer) => peer,
                         Err(_) => {
-                            return Ok(AdmissionResponse::Rejected {
-                                reason: "invalid peer id".into(),
-                            });
+                            return Err(AdmissionRejection::InvalidPeerId);
                         }
                     };
                     let scope = crate::agent::remote::MeshScopeId::Iroh {
                         mesh_id: membership_token.mesh_id.clone(),
                     };
                     if !mesh.active_scopes().contains(&scope) {
-                        return Ok(AdmissionResponse::Rejected {
-                            reason: "host is not a member of this mesh".into(),
-                        });
+                        return Err(AdmissionRejection::NotAMember);
                     }
                     // Any member of this scope can verify the self-contained token.
                     match InviteStore::verify_membership_token(&membership_token) {
@@ -2226,9 +2229,7 @@ mod remote_impl {
                                 peer_id,
                                 e
                             );
-                            Ok(AdmissionResponse::Rejected {
-                                reason: e.to_string(),
-                            })
+                            Err(AdmissionRejection::Denied(e.to_string()))
                         }
                     }
                 }

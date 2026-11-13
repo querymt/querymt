@@ -20,6 +20,7 @@ use crate::session::projection::{
 use crate::session::store::{RemoteSessionBookmark, SessionStore};
 
 use super::SqliteStorage;
+use super::event_journal::LAST_UNFINISHED_RUN_SQL;
 use super::migrations::{MIGRATIONS, apply_migrations};
 
 #[tokio::test]
@@ -197,7 +198,6 @@ async fn legacy_reasoning_row_resaves_as_canonical_persistence() {
     storage
         .conn_for_test()
         .lock()
-        .unwrap()
         .execute(
             "UPDATE message_parts SET content_json = ? WHERE message_id = (SELECT id FROM messages WHERE public_id = ?)",
             rusqlite::params![legacy_json, "legacy-reasoning"],
@@ -229,7 +229,6 @@ async fn legacy_reasoning_row_resaves_as_canonical_persistence() {
     let saved: String = storage
         .conn_for_test()
         .lock()
-        .unwrap()
         .query_row(
             "SELECT content_json FROM message_parts WHERE message_id = (SELECT id FROM messages WHERE public_id = ?)",
             ["canonical-reasoning"],
@@ -504,7 +503,7 @@ async fn edit_removes_structured_authority_without_resurrection() {
 
     // No sidecar: a full storage scan finds no structured residue.
     let conn = storage.conn_for_test();
-    let conn = conn.lock().unwrap();
+    let conn = conn.lock();
     let residue: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM message_parts WHERE part_type = 'output'",
@@ -1222,7 +1221,7 @@ async fn a_b_a_replay_does_not_resurrect_compacted_group() {
 
     // No hidden sidecar: the structured payload cannot be found anywhere.
     let conn = storage.conn_for_test();
-    let conn = conn.lock().unwrap();
+    let conn = conn.lock();
     let residue: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM message_parts WHERE content_json LIKE '%provider-a-encrypted-continuation%'",
@@ -1333,7 +1332,6 @@ async fn revert_state_snapshot_id_round_trips_through_sqlite() {
     let conn = storage.conn_for_test();
     let raw: String = conn
         .lock()
-        .unwrap()
         .query_row(
             "SELECT snapshot_id FROM revert_states WHERE public_id = 'rev-typed'",
             [],
@@ -1584,7 +1582,6 @@ async fn delegate_assignments_are_read_only_revisioned_and_session_scoped() {
     let rows = storage
         .conn_for_test()
         .lock()
-        .unwrap()
         .query_row(
             "SELECT COUNT(*) FROM session_delegate_assignments",
             [],
@@ -1661,7 +1658,6 @@ async fn delegate_assignments_are_read_only_revisioned_and_session_scoped() {
     let cleared_rows = storage
         .conn_for_test()
         .lock()
-        .unwrap()
         .query_row(
             "SELECT COUNT(*) FROM session_delegate_assignment_overrides o
              JOIN sessions s ON s.id = o.session_id
@@ -1735,7 +1731,6 @@ async fn delegate_assignments_are_read_only_revisioned_and_session_scoped() {
     let count = storage
         .conn_for_test()
         .lock()
-        .unwrap()
         .query_row(
             "SELECT COUNT(*) FROM session_delegate_assignments",
             [],
@@ -2417,7 +2412,7 @@ async fn session_lifecycle_migration_upgrades_legacy_database_without_backfill()
         .unwrap();
     {
         let conn = storage.conn_for_test();
-        let conn = conn.lock().unwrap();
+        let conn = conn.lock();
         let lifecycle_table_exists: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_lifecycle')",
@@ -2834,7 +2829,7 @@ async fn provisioning_intent_migration_upgrades_existing_database() {
     // The pre-migration row survives with NULL replay inputs.
     use crate::worktree::repo_workspace::WorkspaceRepository as _;
     let store = crate::worktree::SqliteWorkspaceRepository::new(std::sync::Arc::new(
-        std::sync::Mutex::new(conn),
+        parking_lot::Mutex::new(conn),
     ));
     let id = crate::worktree::WorkspaceId::from_raw("pre-27");
     let record = store.get_workspace(&id).await.unwrap().unwrap();
@@ -3892,16 +3887,11 @@ async fn assert_last_unfinished_run_semantics(journal: &dyn EventJournal) {
 async fn last_unfinished_run_query_uses_run_lifecycle_index() {
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
     let conn = storage.conn_for_test();
-    let conn = conn.lock().unwrap();
+    let conn = conn.lock();
+    // Plan the production query itself, against the migrated schema, so a
+    // drift on either side (query or index predicate) fails here.
     let plan: Vec<String> = conn
-        .prepare(
-            "EXPLAIN QUERY PLAN \
-             SELECT kind, json_extract(payload_json, '$.data.run_id') \
-             FROM event_journal \
-             WHERE session_id = ? AND kind IN ('run_started', 'run_completed') \
-             AND origin = 'local' \
-             ORDER BY stream_seq ASC",
-        )
+        .prepare(&format!("EXPLAIN QUERY PLAN {LAST_UNFINISHED_RUN_SQL}"))
         .unwrap()
         .query_map(["s"], |row| row.get::<_, String>(3))
         .unwrap()
@@ -3912,6 +3902,16 @@ async fn last_unfinished_run_query_uses_run_lifecycle_index() {
             .any(|step| step.contains("idx_event_journal_run_lifecycle")),
         "query must use the partial index, plan: {plan:?}"
     );
+    // The SQL literals must stay in sync with the lifecycle tags it decodes.
+    for tag in [
+        AgentEventKind::RUN_STARTED_TAG,
+        AgentEventKind::RUN_COMPLETED_TAG,
+    ] {
+        assert!(
+            LAST_UNFINISHED_RUN_SQL.contains(&format!("'{tag}'")),
+            "lifecycle query is missing the {tag:?} literal"
+        );
+    }
 }
 
 #[tokio::test]
@@ -4205,8 +4205,8 @@ async fn journal_replay_orders_by_producer_session_seq() {
     let seqs: Vec<i64> = events.iter().map(|e| e.session_seq).collect();
     assert_eq!(seqs, vec![1, 2], "replay follows production order");
     assert!(matches!(events[0].kind, AgentEventKind::SessionCreated));
-    assert_eq!(journal.max_session_seq_blocking("s1"), 2);
-    assert_eq!(journal.max_session_seq_blocking("other"), 0);
+    assert_eq!(journal.max_session_seq("s1").await, 2);
+    assert_eq!(journal.max_session_seq("other").await, 0);
 }
 
 #[tokio::test]
@@ -4258,7 +4258,7 @@ async fn journal_batch_append_keeps_order_and_isolates_failures() {
     next[2].session_seq = Some(5);
     let results = journal.append_durable_batch(&next).await;
     assert!(results[0].is_ok() && results[1].is_err() && results[2].is_ok());
-    assert_eq!(journal.max_session_seq_blocking("s1"), 5);
+    assert_eq!(journal.max_session_seq("s1").await, 5);
 }
 
 #[tokio::test]
@@ -4323,7 +4323,7 @@ async fn journal_relayed_session_seq_does_not_collide_with_local_numbering() {
     high.session_seq = Some(500);
     journal.append_durable_from_source(&high).await.unwrap();
     assert_eq!(
-        journal.max_session_seq_blocking("s1"),
+        journal.max_session_seq("s1").await,
         1,
         "local counter ignores relayed numbers"
     );
@@ -4450,7 +4450,7 @@ async fn file_databases_use_wal_with_normal_synchronous() {
         .await
         .unwrap();
     let conn = storage.conn_for_test();
-    let conn = conn.lock().unwrap();
+    let conn = conn.lock();
     let mode: String = conn
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .unwrap();
@@ -4493,7 +4493,7 @@ async fn migration_merges_legacy_noncanonical_workspace_groups() {
         .unwrap();
     {
         let conn = storage.conn_for_test();
-        let conn = conn.lock().unwrap();
+        let conn = conn.lock();
         conn.execute(
             "UPDATE sessions SET cwd = '/workspace//' WHERE public_id = ?1",
             [&legacy.public_id],
@@ -4853,7 +4853,6 @@ async fn search_sessions_filters_by_scope() {
 fn set_session_updated_at(storage: &SqliteStorage, session_id: &str, updated_at: &str) {
     let conn = storage.conn_for_test();
     conn.lock()
-        .unwrap()
         .execute(
             "UPDATE sessions SET updated_at = ?1 WHERE public_id = ?2",
             rusqlite::params![updated_at, session_id],
@@ -4884,7 +4883,6 @@ async fn session_lifecycle_storage_defaults_patches_and_cascades() {
     let lifecycle_rows: i64 = storage
         .conn_for_test()
         .lock()
-        .unwrap()
         .query_row("SELECT COUNT(*) FROM session_lifecycle", [], |row| {
             row.get(0)
         })
@@ -4980,7 +4978,6 @@ async fn session_lifecycle_storage_defaults_patches_and_cascades() {
     let internal_id: i64 = storage
         .conn_for_test()
         .lock()
-        .unwrap()
         .query_row(
             "SELECT id FROM sessions WHERE public_id = ?1",
             rusqlite::params![session.public_id],
@@ -4991,7 +4988,6 @@ async fn session_lifecycle_storage_defaults_patches_and_cascades() {
     let remaining_lifecycle_rows: i64 = storage
         .conn_for_test()
         .lock()
-        .unwrap()
         .query_row(
             "SELECT COUNT(*) FROM session_lifecycle WHERE session_id = ?1",
             rusqlite::params![internal_id],
@@ -5060,7 +5056,6 @@ async fn session_pins_are_idempotent_and_cascade_without_activity_writes() {
     let internal_id: i64 = storage
         .conn_for_test()
         .lock()
-        .unwrap()
         .query_row(
             "SELECT id FROM sessions WHERE public_id = ?1",
             rusqlite::params![session.public_id],
@@ -5071,7 +5066,6 @@ async fn session_pins_are_idempotent_and_cascade_without_activity_writes() {
     let remaining_pin_rows: i64 = storage
         .conn_for_test()
         .lock()
-        .unwrap()
         .query_row(
             "SELECT COUNT(*) FROM session_pins WHERE session_id = ?1",
             rusqlite::params![internal_id],
@@ -5920,7 +5914,7 @@ async fn knowledge_query_finds_backfilled_entries_after_upgrade() {
     insert_knowledge_entry(&conn, "e1", r#"["tokio"]"#, r#"["async"]"#);
     apply_migrations(&mut conn).unwrap();
 
-    let store = SqliteKnowledgeStore::new(std::sync::Arc::new(std::sync::Mutex::new(conn)));
+    let store = SqliteKnowledgeStore::new(std::sync::Arc::new(parking_lot::Mutex::new(conn)));
     // The entry summary does not mention "tokio", so only the backfilled
     // entity junction row can make Hybrid retrieval find it.
     let result = store
@@ -5935,4 +5929,76 @@ async fn knowledge_query_finds_backfilled_entries_after_upgrade() {
         .await
         .expect("query must not fail with missing junction tables");
     assert_eq!(result.entries.len(), 1);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Storage failure isolation (session-storage-reliability)
+// ══════════════════════════════════════════════════════════════════════
+
+async fn assert_storage_still_serves(storage: &SqliteStorage, session_id: &str) {
+    let loaded = storage.get_session(session_id).await.unwrap();
+    assert!(loaded.is_some(), "session load must succeed");
+    let appended = storage
+        .append_durable(&new_durable(session_id, AgentEventKind::Cancelled))
+        .await
+        .expect("event append must succeed");
+    assert_eq!(appended.session_id, session_id);
+    let listed = storage.list_sessions().await.unwrap();
+    assert!(listed.iter().any(|s| s.public_id == session_id));
+}
+
+#[tokio::test]
+async fn storage_keeps_working_after_an_operation_panics() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(None, None, None, None)
+        .await
+        .unwrap();
+
+    let result: SessionResult<()> = storage
+        .run_blocking_session(|_conn| panic!("injected storage panic"))
+        .await;
+    assert!(result.is_err(), "the panicking operation must fail");
+
+    assert_storage_still_serves(&storage, &session.public_id).await;
+}
+
+#[tokio::test]
+async fn storage_keeps_working_after_an_operation_returns_an_error() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(None, None, None, None)
+        .await
+        .unwrap();
+
+    let result: SessionResult<()> = storage
+        .run_blocking(|conn| conn.execute_batch("SELECT * FROM table_that_does_not_exist"))
+        .await;
+    assert!(matches!(
+        result,
+        Err(crate::session::error::SessionError::Database(_))
+    ));
+
+    assert_storage_still_serves(&storage, &session.public_id).await;
+}
+
+#[tokio::test]
+async fn panicked_storage_task_is_reported_as_a_task_failure() {
+    use std::error::Error as _;
+
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let err = storage
+        .run_blocking_session::<_, ()>(|_conn| panic!("injected storage panic"))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, crate::session::error::SessionError::TaskFailed(_)),
+        "expected TaskFailed, got {err:?}"
+    );
+    let source = err.source().expect("task failure keeps its source");
+    assert!(
+        source.downcast_ref::<tokio::task::JoinError>().is_some(),
+        "source must be the join error"
+    );
 }

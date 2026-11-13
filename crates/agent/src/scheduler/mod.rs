@@ -1915,7 +1915,7 @@ mod unit_tests {
         // Build a minimal SchedulerActor (not spawned — direct field access)
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         schema::init_schema(&mut conn).unwrap();
-        let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        let db = std::sync::Arc::new(parking_lot::Mutex::new(conn));
         let schedule_store = Arc::new(SqliteScheduleRepository::new(db))
             as Arc<dyn crate::session::repo_schedule::ScheduleRepository>;
 

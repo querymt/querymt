@@ -4,9 +4,8 @@
 //! by the actor mailbox.  A background tokio task forwards `FileChangeSet`
 //! events from `FileIndexWatcher` as `ApplyChanges` messages to self.
 
-use super::file_index::{
-    FileChangeSet, FileIndex, FileIndexConfig, FileIndexError, FileIndexWatcher,
-};
+use super::error::IndexError;
+use super::file_index::{FileChangeSet, FileIndex, FileIndexConfig, FileIndexWatcher};
 use super::function_index::{
     FunctionIndex, FunctionIndexConfig, IndexedFunctionEntry, SimilarFunctionMatch,
 };
@@ -15,21 +14,11 @@ use kameo::actor::{ActorRef, Spawn};
 use kameo::message::{Context, Message};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use thiserror::Error;
 use tracing::instrument;
 
 // ---------------------------------------------------------------------------
 // Error type (kept from old workspace.rs)
 // ---------------------------------------------------------------------------
-
-/// Error types for workspace index operations
-#[derive(Debug, Error)]
-pub enum WorkspaceIndexError {
-    #[error("File index error: {0}")]
-    FileIndex(#[from] FileIndexError),
-    #[error("Function index error: {0}")]
-    FunctionIndex(String),
-}
 
 // ---------------------------------------------------------------------------
 // Statistics type (kept from old workspace.rs)
@@ -163,13 +152,11 @@ impl WorkspaceIndexActor {
         root: PathBuf,
         file_config: FileIndexConfig,
         function_config: FunctionIndexConfig,
-    ) -> Result<WorkspaceHandle, WorkspaceIndexError> {
+    ) -> Result<WorkspaceHandle, IndexError> {
         let file_watcher =
             Arc::new(FileIndexWatcher::with_config(root.clone(), file_config).await?);
 
-        let function_index = FunctionIndex::build(&root, function_config)
-            .await
-            .map_err(WorkspaceIndexError::FunctionIndex)?;
+        let function_index = FunctionIndex::build(&root, function_config).await?;
 
         let file_watcher_clone = file_watcher.clone();
         let actor = WorkspaceIndexActor::spawn(WorkspaceIndexActorArgs {
@@ -361,7 +348,7 @@ impl Message<GetStats> for WorkspaceIndexActor {
 }
 
 impl Message<Rebuild> for WorkspaceIndexActor {
-    type Reply = Result<(), String>;
+    type Reply = Result<(), IndexError>;
 
     #[instrument(name = "workspace_actor.rebuild", skip(self, _msg, _ctx))]
     async fn handle(
@@ -370,10 +357,7 @@ impl Message<Rebuild> for WorkspaceIndexActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // Rebuild file index
-        self.file_watcher
-            .refresh()
-            .await
-            .map_err(|e| e.to_string())?;
+        self.file_watcher.refresh().await?;
 
         // Rebuild function index
         let new_index = FunctionIndex::build(&self.root, FunctionIndexConfig::default()).await?;

@@ -184,6 +184,25 @@ impl LocalAgentHandle {
         guard
     }
 
+    /// Drop the session's todo list. A profile-bound session runs with its
+    /// runtime's own `AgentConfig`, so its list lives in that runtime's store
+    /// rather than this handle's; clear both. Call before the profile binding
+    /// is forgotten.
+    pub(crate) async fn discard_session_todos(&self, session_id: &str) {
+        self.config.todo_store.remove(session_id);
+        match self.bound_session_handle(session_id).await {
+            Ok(Some((handle, _))) => {
+                if let Some(local) = handle.as_any().downcast_ref::<LocalAgentHandle>() {
+                    local.config.todo_store.remove(session_id);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(session_id, %error, "failed to resolve session runtime for todo cleanup");
+            }
+        }
+    }
+
     async fn terminate_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {
         let removed = {
             let mut registry = self.registry.lock().await;

@@ -478,10 +478,8 @@ async fn split_writer(
             let sid = session_id.clone();
             let batch = std::mem::take(&mut kinds);
             let count = batch.len();
-            match tokio::task::spawn_blocking(move || {
-                insert_batch(&mut conn.lock().unwrap(), &sid, &batch)
-            })
-            .await
+            match tokio::task::spawn_blocking(move || insert_batch(&mut conn.lock(), &sid, &batch))
+                .await
             {
                 Ok(Ok(events)) => events.into_iter().map(Some).collect(),
                 Ok(Err(err)) => {
@@ -614,7 +612,7 @@ fn make_agent_config(tmp_dir: &TempDir, store: Arc<SqliteStorage>) -> Arc<AgentC
 
 fn enable_wal(store: &SqliteStorage) {
     let conn = store.conn();
-    let conn = conn.lock().unwrap();
+    let conn = conn.lock();
     let mode: String = conn
         .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
         .expect("enable WAL");

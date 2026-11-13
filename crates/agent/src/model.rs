@@ -28,7 +28,11 @@ const TURN_ID_NAMESPACE: uuid::Uuid =
 
 impl TurnId {
     /// Mint a fresh random turn id.
+    ///
+    /// There is deliberately no `Default`: an id must be minted on purpose, so
+    /// a defaulted struct field can never silently carry a made-up run id.
     #[must_use]
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4())
     }
@@ -48,12 +52,6 @@ impl TurnId {
             Ok(id) => Self(id),
             Err(_) => Self(uuid::Uuid::new_v5(&TURN_ID_NAMESPACE, text.as_bytes())),
         }
-    }
-}
-
-impl Default for TurnId {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

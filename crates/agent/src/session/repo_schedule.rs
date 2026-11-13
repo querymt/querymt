@@ -6,9 +6,10 @@
 use crate::session::domain_schedule::{Schedule, ScheduleConfig, ScheduleState, ScheduleTrigger};
 use crate::session::error::{SessionError, SessionResult};
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use time::OffsetDateTime;
 
 // ─── Repository trait ────────────────────────────────────────────────────────
@@ -103,14 +104,7 @@ impl SqliteScheduleRepository {
         F: FnOnce(&mut Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        let conn_arc = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = conn_arc.lock().unwrap();
-            f(&mut conn)
-        })
-        .await
-        .map_err(|e| SessionError::Other(format!("Schedule task execution failed: {}", e)))?
-        .map_err(SessionError::from)
+        crate::session::sqlite_storage::blocking::with_conn_sqlite(&self.conn, f).await
     }
 }
 
@@ -290,7 +284,7 @@ impl ScheduleRepository for SqliteScheduleRepository {
         })
         .await
         .map_err(|e| match e {
-            SessionError::DatabaseError(_) => {
+            SessionError::Database(_) => {
                 SessionError::Other(format!("Schedule not found: {}", pid))
             }
             _ => e,
@@ -467,7 +461,7 @@ mod tests {
         session_pub: &str,
         task_pub: &str,
     ) -> (i64, i64) {
-        let c = conn.lock().unwrap();
+        let c = conn.lock();
         let now = format_dt(&OffsetDateTime::now_utc());
         c.execute(
             "INSERT INTO sessions (public_id, created_at, updated_at) VALUES (?, ?, ?)",

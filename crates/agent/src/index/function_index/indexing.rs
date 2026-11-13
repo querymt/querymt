@@ -208,7 +208,7 @@ pub(super) fn extract_body_text_lines(source: &str, start_line: u32, end_line: u
         files_found = tracing::field::Empty,
     )
 )]
-pub(super) fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+pub(super) fn collect_source_files(root: &Path) -> Vec<PathBuf> {
     let supported_extensions = [
         "ts", "tsx", "js", "jsx", "mjs", "cjs",  // TypeScript/JavaScript
         "rs",   // Rust
@@ -242,7 +242,7 @@ pub(super) fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, String> 
 
     tracing::Span::current().record("files_found", files.len());
 
-    Ok(files)
+    files
 }
 
 /// Create a parser for the given language name, index the given source, and return entries.

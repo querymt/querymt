@@ -878,10 +878,10 @@ mod tests {
     use crate::worktree::git::CliGit;
     use crate::worktree::repo_workspace::SqliteWorkspaceRepository;
     use crate::worktree::test_support::{commit_files, init_repo, materialize};
+    use parking_lot::Mutex as StdMutex;
     use rusqlite::Connection;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
 
     #[tokio::test]

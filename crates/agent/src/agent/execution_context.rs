@@ -84,8 +84,9 @@ pub(crate) struct ExecutionContext {
 
     /// Optional workspace query bridge for VS Code language intelligence.
     pub workspace_query_bridge: Option<ClientBridgeSender>,
-    /// Stable turn id used by hook payloads and turn-scoped metadata.
-    pub turn_id: Option<crate::model::TurnId>,
+    /// The run this execution belongs to. Set at construction and never
+    /// changes: hook payloads, run events and snapshot records all carry it.
+    turn_id: crate::model::TurnId,
     /// Agent mode captured at turn start for this execution.
     pub turn_mode: AgentMode,
     /// Inbox bound to this run for boundary-safe steering.
@@ -109,9 +110,10 @@ pub(crate) struct ExecutionContext {
 }
 
 impl ExecutionContext {
-    /// Create a new execution context
+    /// Create a new execution context for the run `turn_id`.
     pub fn new(
         session_id: String,
+        turn_id: crate::model::TurnId,
         runtime: Arc<SessionRuntime>,
         state: RuntimeContext,
         session_handle: SessionHandle,
@@ -129,7 +131,7 @@ impl ExecutionContext {
             knowledge_store: None,
             event_sink: None,
             workspace_query_bridge: None,
-            turn_id: None,
+            turn_id,
             turn_mode: AgentMode::Build,
             steering: None,
             run_objective: None,
@@ -171,11 +173,6 @@ impl ExecutionContext {
     /// (diagnostics, references, definitions, etc.) through this bridge.
     pub fn with_workspace_query_bridge(mut self, bridge: Option<ClientBridgeSender>) -> Self {
         self.workspace_query_bridge = bridge;
-        self
-    }
-
-    pub fn with_turn_id(mut self, turn_id: crate::model::TurnId) -> Self {
-        self.turn_id = Some(turn_id);
         self
     }
 
@@ -255,14 +252,10 @@ impl ExecutionContext {
         self.session_handle.execution_config()
     }
 
-    pub fn turn_id(&self) -> Option<crate::model::TurnId> {
+    /// The id of the run this execution belongs to. Work that happens inside
+    /// a run (native `/compact`, maintenance compaction) uses the run's id.
+    pub fn turn_id(&self) -> crate::model::TurnId {
         self.turn_id
-    }
-
-    /// The turn id as an owned string for hook payloads, events and other
-    /// `String`-typed external contracts. Empty when no turn is set.
-    pub fn turn_id_string(&self) -> String {
-        self.turn_id().map(|id| id.to_string()).unwrap_or_default()
     }
 
     pub fn permission_mode(&self) -> &'static str {
@@ -361,6 +354,7 @@ mod tests {
         let session_id = handle.session().public_id.clone();
         let ctx = ExecutionContext::new(
             session_id.clone(),
+            crate::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -374,6 +368,7 @@ mod tests {
         let (runtime, runtime_ctx, handle) = make_context_parts().await;
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
+            crate::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -388,6 +383,7 @@ mod tests {
         let (runtime, runtime_ctx, handle) = make_context_with_cwd(cwd.clone()).await;
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
+            crate::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -402,6 +398,7 @@ mod tests {
         let token = CancellationToken::new();
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
+            crate::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -420,6 +417,7 @@ mod tests {
         let (runtime, runtime_ctx, handle) = make_context_parts().await;
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
+            crate::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -434,6 +432,7 @@ mod tests {
         let (runtime, runtime_ctx, handle) = make_context_parts().await;
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
+            crate::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -456,6 +455,7 @@ mod tests {
         let (runtime, runtime_ctx, handle) = make_context_parts().await;
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
+            crate::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -485,6 +485,7 @@ mod tests {
         runtime.mutation_gate.set(gate.clone()).unwrap();
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
+            crate::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -504,6 +505,7 @@ mod tests {
         let (runtime, runtime_ctx, handle) = make_context_parts().await;
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
+            crate::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,

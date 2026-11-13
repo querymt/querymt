@@ -9,8 +9,9 @@ use crate::knowledge::{
     QueryOpts, RetentionPolicy, RetentionResult, RetrievalMode,
 };
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use rusqlite::{Connection, params, types::Value};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use time::OffsetDateTime;
 
 /// SQLite-backed `KnowledgeStore`.
@@ -31,7 +32,7 @@ impl SqliteKnowledgeStore {
     {
         let conn_arc = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let mut conn = conn_arc.lock().unwrap();
+            let mut conn = conn_arc.lock();
             f(&mut conn)
         })
         .await
@@ -1491,7 +1492,6 @@ mod tests {
     async fn ingest_is_atomic_when_junction_insert_fails() {
         let db = setup_db();
         db.lock()
-            .unwrap()
             .execute_batch("DROP TABLE knowledge_entry_topics;")
             .unwrap();
         let store = SqliteKnowledgeStore::new(db.clone());
@@ -1503,13 +1503,11 @@ mod tests {
 
         let rows: i64 = db
             .lock()
-            .unwrap()
             .query_row("SELECT COUNT(*) FROM knowledge_entries", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 0, "failed ingest must not leave a committed entry");
         let entity_rows: i64 = db
             .lock()
-            .unwrap()
             .query_row("SELECT COUNT(*) FROM knowledge_entry_entities", [], |r| {
                 r.get(0)
             })

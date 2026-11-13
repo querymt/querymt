@@ -861,8 +861,8 @@ mod tests {
     use crate::worktree::test_support::{
         FaultInjectingWorkspaceRepository, RegistryFaultPoint, init_repo_with_subdir, materialize,
     };
+    use parking_lot::Mutex;
     use rusqlite::Connection;
-    use std::sync::Mutex;
     use std::time::SystemTime;
     use tempfile::TempDir;
 
@@ -1458,7 +1458,6 @@ mod tests {
         let public_id = public_id.to_string();
         tokio::task::spawn_blocking(move || {
             conn.lock()
-                .unwrap()
                 .execute(
                     "INSERT INTO sessions (public_id, name, created_at, updated_at) \
                      VALUES (?1, 'test', '2026-01-15T00:00:00Z', '2026-01-15T00:00:00Z')",

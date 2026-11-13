@@ -16,14 +16,15 @@
 //! distinguish protocol-owned automation from user sessions.
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use time::OffsetDateTime;
 
 use super::layer::DotagentsLayer;
 use super::tasks::DotagentsAutomationBinding;
-use crate::session::error::{SessionError, SessionResult};
+use crate::session::error::SessionResult;
 
 /// The `sessions.session_kind` value used for protocol automation sessions.
 pub const AUTOMATION_SESSION_KIND: &str = "dotagents_automation";
@@ -142,17 +143,7 @@ impl SqliteDotagentsAutomationRepository {
         F: FnOnce(&mut Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut guard = conn.lock().map_err(|error| {
-                SessionError::DatabaseError(format!("automation store lock poisoned: {error}"))
-            })?;
-            f(&mut guard).map_err(SessionError::from)
-        })
-        .await
-        .map_err(|error| {
-            SessionError::DatabaseError(format!("automation task join failed: {error}"))
-        })?
+        crate::session::sqlite_storage::blocking::with_conn_sqlite(&self.conn, f).await
     }
 }
 

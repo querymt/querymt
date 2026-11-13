@@ -255,16 +255,32 @@ pub struct SummaryProvider {
     pub position: i64,
 }
 
+/// How a pending input will reach the run.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InputDelivery {
+    Steer,
+    Queue,
+}
+
+/// Where a pending input is in its lifecycle.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PendingInputState {
+    Accepted,
+    Queued,
+}
+
 /// A queued or steering input that has not started or been applied yet.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingInputSummary {
     pub input_id: String,
-    /// `"steer"` or `"queue"`.
-    pub delivery: String,
-    /// `"accepted"` or `"queued"`.
-    pub state: String,
+    pub delivery: InputDelivery,
+    pub state: PendingInputState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -646,8 +662,8 @@ impl SummaryAcc {
                 accepted_at_ms,
             } => self.upsert_pending(PendingInputSummary {
                 input_id: input_id.clone(),
-                delivery: "steer".into(),
-                state: "accepted".into(),
+                delivery: InputDelivery::Steer,
+                state: PendingInputState::Accepted,
                 run_id: Some(run_id.clone()),
                 position: Some(*queue_position),
                 blocks: blocks.clone(),
@@ -661,8 +677,8 @@ impl SummaryAcc {
                 accepted_at_ms,
             } => self.upsert_pending(PendingInputSummary {
                 input_id: input_id.clone(),
-                delivery: "queue".into(),
-                state: "queued".into(),
+                delivery: InputDelivery::Queue,
+                state: PendingInputState::Queued,
                 run_id: None,
                 position: Some(*queue_position),
                 blocks: blocks.clone(),
@@ -885,6 +901,28 @@ mod tests {
     use crate::session::sqlite_storage::SqliteStorage;
 
     const SID: &str = "s1";
+
+    #[test]
+    fn typed_state_fields_serialize_unchanged() {
+        let summary = |delivery, state| PendingInputSummary {
+            input_id: "i".into(),
+            delivery,
+            state,
+            run_id: None,
+            position: None,
+            blocks: vec![],
+            created_at: 0,
+        };
+        let steer =
+            serde_json::to_value(summary(InputDelivery::Steer, PendingInputState::Accepted))
+                .unwrap();
+        assert_eq!(steer["delivery"], "steer");
+        assert_eq!(steer["state"], "accepted");
+        let queue =
+            serde_json::to_value(summary(InputDelivery::Queue, PendingInputState::Queued)).unwrap();
+        assert_eq!(queue["delivery"], "queue");
+        assert_eq!(queue["state"], "queued");
+    }
 
     async fn append(journal: &dyn EventJournal, kind: AgentEventKind) {
         journal

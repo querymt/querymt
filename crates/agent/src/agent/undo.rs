@@ -473,6 +473,15 @@ enum SnapshotRecord<'a> {
     },
 }
 
+/// One snapshot record found in the history, with where it sits.
+struct HistoryRecord<'a> {
+    /// Index of the message holding the record.
+    message_idx: usize,
+    part: &'a MessagePart,
+    turn_id: TurnId,
+    record: SnapshotRecord<'a>,
+}
+
 /// Find each turn's pre-turn snapshot for the patches at index `>= from`,
 /// newest record format first (design D16), and refuse what can't be undone
 /// as whole turns (design D17).
@@ -502,8 +511,8 @@ fn resolve_turn_patches(
         }
     }
 
-    // (message index, part, record) in history order.
-    let mut records: Vec<(usize, &MessagePart, TurnId, SnapshotRecord<'_>)> = Vec::new();
+    // Records in history order.
+    let mut records: Vec<HistoryRecord<'_>> = Vec::new();
     for (idx, msg) in history.iter().enumerate().skip(starts_from) {
         for part in &msg.parts {
             match part {
@@ -511,21 +520,26 @@ fn resolve_turn_patches(
                     turn_id,
                     snapshot_id,
                     ..
-                } => records.push((idx, part, *turn_id, SnapshotRecord::Start { snapshot_id })),
+                } => records.push(HistoryRecord {
+                    message_idx: idx,
+                    part,
+                    turn_id: *turn_id,
+                    record: SnapshotRecord::Start { snapshot_id },
+                }),
                 MessagePart::TurnSnapshotPatch {
                     turn_id,
                     base_snapshot_id,
                     changed_paths,
                     ..
-                } => records.push((
-                    idx,
+                } => records.push(HistoryRecord {
+                    message_idx: idx,
                     part,
-                    *turn_id,
-                    SnapshotRecord::Patch {
+                    turn_id: *turn_id,
+                    record: SnapshotRecord::Patch {
                         base: base_snapshot_id.as_ref(),
                         changed_paths,
                     },
-                )),
+                }),
                 _ => {}
             }
         }
@@ -533,27 +547,28 @@ fn resolve_turn_patches(
 
     let claimed: std::collections::HashSet<TurnId> = records
         .iter()
-        .filter(|(_, _, _, record)| matches!(record, SnapshotRecord::Patch { .. }))
-        .map(|(_, _, turn_id, _)| *turn_id)
+        .filter(|r| matches!(r.record, SnapshotRecord::Patch { .. }))
+        .map(|r| r.turn_id)
         .collect();
     let mut starts: std::collections::HashMap<TurnId, (usize, &MessagePart, &SnapshotId)> =
         std::collections::HashMap::new();
-    for (idx, part, turn_id, record) in &records {
-        if let SnapshotRecord::Start { snapshot_id } = record {
-            starts.insert(*turn_id, (*idx, *part, *snapshot_id));
+    for rec in &records {
+        if let SnapshotRecord::Start { snapshot_id } = rec.record {
+            starts.insert(rec.turn_id, (rec.message_idx, rec.part, snapshot_id));
         }
     }
 
     let mut patches = Vec::new();
-    for (pos, (idx, _, turn_id, record)) in records.iter().enumerate() {
+    for (pos, rec) in records.iter().enumerate() {
+        let turn_id = &rec.turn_id;
         let SnapshotRecord::Patch {
             base,
             changed_paths,
-        } = record
+        } = &rec.record
         else {
             continue;
         };
-        if *idx < from {
+        if rec.message_idx < from {
             continue;
         }
         let start = starts.get(turn_id).copied().or_else(|| {
@@ -561,10 +576,10 @@ fn resolve_turn_patches(
             if base.is_some() {
                 return None;
             }
-            let (start_idx, part, start_turn, record) = records.get(pos.checked_sub(1)?)?;
-            match record {
-                SnapshotRecord::Start { snapshot_id } if !claimed.contains(start_turn) => {
-                    Some((*start_idx, *part, *snapshot_id))
+            let prev = records.get(pos.checked_sub(1)?)?;
+            match prev.record {
+                SnapshotRecord::Start { snapshot_id } if !claimed.contains(&prev.turn_id) => {
+                    Some((prev.message_idx, prev.part, snapshot_id))
                 }
                 _ => None,
             }

@@ -1,27 +1,78 @@
 //! Todo tools for managing agent task lists
 
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::tools::{Tool, ToolContext, ToolError};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TodoItem {
-    id: String,
-    content: String,
-    status: String,   // "pending", "in_progress", "completed", "cancelled"
-    priority: String, // "high", "medium", "low"
+/// Lifecycle state of a todo item. Serialized as the lowercase strings the
+/// `todowrite` tool schema advertises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Cancelled,
 }
 
-type TodoStorageType = Arc<Mutex<HashMap<String, Vec<TodoItem>>>>;
-/// Global todo storage (session_id -> todos)
-static TODO_STORAGE: Lazy<TodoStorageType> = Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+/// Priority of a todo item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoPriority {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    pub status: TodoStatus,
+    pub priority: TodoPriority,
+}
+
+/// Per-session todo lists, owned by `AgentConfig` and shared with tools through
+/// [`ToolContext::todo_store`]. Lists live as long as the agent, so they
+/// survive session actor restarts, and are dropped when the session is deleted.
+#[derive(Debug, Default)]
+pub struct TodoStore {
+    lists: Mutex<HashMap<String, Vec<TodoItem>>>,
+}
+
+impl TodoStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the session's list.
+    pub fn replace(&self, session_id: &str, todos: Vec<TodoItem>) {
+        self.lists.lock().insert(session_id.to_string(), todos);
+    }
+
+    /// The session's list, empty if it never wrote one.
+    pub fn get(&self, session_id: &str) -> Vec<TodoItem> {
+        self.lists
+            .lock()
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Discard the session's list.
+    pub fn remove(&self, session_id: &str) {
+        self.lists.lock().remove(session_id);
+    }
+}
+
+fn unavailable() -> ToolError {
+    ToolError::SessionError("todos are unavailable: this context has no todo store".to_string())
+}
 
 /// TodoWrite tool for updating the todo list
 pub struct TodoWriteTool;
@@ -128,19 +179,27 @@ impl Tool for TodoWriteTool {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ToolError::InvalidRequest(format!("Invalid todo format: {}", e)))?;
 
-        let session_id = context.session_id().to_string();
+        let store = context.todo_store().ok_or_else(unavailable)?;
 
-        // Store todos for this session
-        let mut storage = TODO_STORAGE.lock();
-        storage.insert(session_id, todos.clone());
+        let (mut pending, mut in_progress, mut completed, mut cancelled) = (0, 0, 0, 0);
+        for todo in &todos {
+            match todo.status {
+                TodoStatus::Pending => pending += 1,
+                TodoStatus::InProgress => in_progress += 1,
+                TodoStatus::Completed => completed += 1,
+                TodoStatus::Cancelled => cancelled += 1,
+            }
+        }
+        let total = todos.len();
+        store.replace(context.session_id(), todos);
 
         let result = json!({
             "success": true,
-            "total_todos": todos.len(),
-            "pending": todos.iter().filter(|t| t.status == "pending").count(),
-            "in_progress": todos.iter().filter(|t| t.status == "in_progress").count(),
-            "completed": todos.iter().filter(|t| t.status == "completed").count(),
-            "cancelled": todos.iter().filter(|t| t.status == "cancelled").count(),
+            "total_todos": total,
+            "pending": pending,
+            "in_progress": in_progress,
+            "completed": completed,
+            "cancelled": cancelled,
         });
 
         serde_json::to_string_pretty(&result)
@@ -197,10 +256,8 @@ impl Tool for TodoReadTool {
         _args: Value,
         context: &dyn ToolContext,
     ) -> Result<Vec<ToolResultPart>, ToolError> {
-        let session_id = context.session_id().to_string();
-
-        let storage = TODO_STORAGE.lock();
-        let todos = storage.get(&session_id).cloned().unwrap_or_default();
+        let store = context.todo_store().ok_or_else(unavailable)?;
+        let todos = store.get(context.session_id());
 
         let result = json!({
             "todos": todos,
@@ -216,6 +273,8 @@ impl Tool for TodoReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::AgentToolContext;
+    use std::sync::Arc;
 
     fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
         blocks
@@ -226,45 +285,131 @@ mod tests {
             })
             .unwrap_or_default()
     }
-    use crate::tools::AgentToolContext;
-    use tempfile::TempDir;
+
+    fn context(session: &str, store: &Arc<TodoStore>) -> AgentToolContext {
+        AgentToolContext::basic(session.to_string(), None).with_todo_store(store.clone())
+    }
+
+    fn todo(id: &str, status: &str, priority: &str) -> Value {
+        json!({"id": id, "content": format!("Task {id}"), "status": status, "priority": priority})
+    }
+
+    async fn write(ctx: &AgentToolContext, todos: Vec<Value>) -> Result<Value, ToolError> {
+        let out = TodoWriteTool::new()
+            .call(json!({ "todos": todos }), ctx)
+            .await?;
+        Ok(serde_json::from_str(&first_text_block(out)).unwrap())
+    }
+
+    async fn read(ctx: &AgentToolContext) -> Value {
+        let out = TodoReadTool::new().call(json!({}), ctx).await.unwrap();
+        serde_json::from_str(&first_text_block(out)).unwrap()
+    }
 
     #[tokio::test]
-    async fn test_todo_write_and_read() {
-        let temp_dir = TempDir::new().unwrap();
-        let context = AgentToolContext::basic(
-            "test-session".to_string(),
-            Some(temp_dir.path().to_path_buf()),
-        );
+    async fn two_sessions_keep_separate_todo_lists() {
+        let store = Arc::new(TodoStore::new());
+        let a = context("a", &store);
+        let b = context("b", &store);
+        write(
+            &a,
+            vec![todo("1", "pending", "high"), todo("2", "completed", "low")],
+        )
+        .await
+        .unwrap();
+        write(&b, vec![todo("9", "in_progress", "medium")])
+            .await
+            .unwrap();
 
-        let write_tool = TodoWriteTool::new();
-        let read_tool = TodoReadTool::new();
+        let ra = read(&a).await;
+        let rb = read(&b).await;
+        assert_eq!(ra["total"], 2);
+        assert_eq!(ra["todos"][0]["id"], "1");
+        assert_eq!(ra["todos"][1]["id"], "2");
+        assert_eq!(rb["total"], 1);
+        assert_eq!(rb["todos"][0]["id"], "9");
+    }
 
-        // Write todos
-        let write_args = json!({
-            "todos": [
-                {
-                    "id": "1",
-                    "content": "Task 1",
-                    "status": "pending",
-                    "priority": "high"
-                },
-                {
-                    "id": "2",
-                    "content": "Task 2",
-                    "status": "in_progress",
-                    "priority": "medium"
-                }
-            ]
-        });
+    #[tokio::test]
+    async fn reading_before_any_write_returns_an_empty_list() {
+        let store = Arc::new(TodoStore::new());
+        let result = read(&context("fresh", &store)).await;
+        assert_eq!(result["todos"], json!([]));
+        assert_eq!(result["total"], 0);
+    }
 
-        let write_result = first_text_block(write_tool.call(write_args, &context).await.unwrap());
-        assert!(write_result.contains("\"total_todos\": 2"));
+    #[tokio::test]
+    async fn unknown_status_is_rejected() {
+        let store = Arc::new(TodoStore::new());
+        let ctx = context("s", &store);
+        write(&ctx, vec![todo("1", "pending", "high")])
+            .await
+            .unwrap();
 
-        // Read todos
-        let read_args = json!({});
-        let read_result = first_text_block(read_tool.call(read_args, &context).await.unwrap());
-        assert!(read_result.contains("Task 1"));
-        assert!(read_result.contains("Task 2"));
+        let err = write(&ctx, vec![todo("2", "done", "high")])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidRequest(_)), "{err:?}");
+        let err = write(&ctx, vec![todo("2", "pending", "urgent")])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidRequest(_)), "{err:?}");
+
+        let after = read(&ctx).await;
+        assert_eq!(after["total"], 1);
+        assert_eq!(after["todos"][0]["id"], "1");
+    }
+
+    #[tokio::test]
+    async fn stored_values_round_trip_unchanged() {
+        let store = Arc::new(TodoStore::new());
+        let ctx = context("s", &store);
+        write(&ctx, vec![todo("1", "in_progress", "high")])
+            .await
+            .unwrap();
+        let result = read(&ctx).await;
+        assert_eq!(result["todos"][0]["status"], "in_progress");
+        assert_eq!(result["todos"][0]["priority"], "high");
+    }
+
+    #[tokio::test]
+    async fn counts_match_the_written_list() {
+        let store = Arc::new(TodoStore::new());
+        let ctx = context("s", &store);
+        let result = write(
+            &ctx,
+            vec![
+                todo("1", "pending", "high"),
+                todo("2", "in_progress", "high"),
+                todo("3", "in_progress", "low"),
+                todo("4", "cancelled", "medium"),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["success"], true);
+        assert_eq!(result["total_todos"], 4);
+        assert_eq!(result["pending"], 1);
+        assert_eq!(result["in_progress"], 2);
+        assert_eq!(result["completed"], 0);
+        assert_eq!(result["cancelled"], 1);
+    }
+
+    #[tokio::test]
+    async fn context_without_a_store_reports_todos_unavailable() {
+        let ctx = AgentToolContext::basic("s".to_string(), None);
+        let err = TodoReadTool::new().call(json!({}), &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("unavailable"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn removing_a_session_discards_its_list() {
+        let store = Arc::new(TodoStore::new());
+        let ctx = context("s", &store);
+        write(&ctx, vec![todo("1", "pending", "high")])
+            .await
+            .unwrap();
+        store.remove("s");
+        assert_eq!(read(&ctx).await["total"], 0);
     }
 }
