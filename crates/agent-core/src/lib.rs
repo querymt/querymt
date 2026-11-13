@@ -5,5 +5,7 @@
 
 pub mod diff_paths;
 pub mod hash;
+pub mod hook_context;
 
 pub use diff_paths::DiffPaths;
+pub use hook_context::HookContextContribution;
