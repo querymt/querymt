@@ -30,14 +30,14 @@
 //! duplicates) is decided by the delivery stage; the lifecycle label is carried
 //! on the card for it.
 
-use super::delivery::{EvidenceLookup, apply_evidence, eligible};
+use super::delivery::{EvidenceLookup, apply_evidence, eligible, retrieval_only};
 use super::evidence::{row_record_key, section_record_key};
 use super::orientation::{SummarySource, summarize};
 use super::purpose::PurposeRow;
 use super::query::{excerpt, normalize_relative_path};
 use super::service::{RepositoryService, ServiceError};
 use super::signals::EvidenceState;
-use super::store::{AssociationKind, SourceState, StoredDocument};
+use super::store::{AssociationKind, SourceState, StoredDocument, StoredSection};
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
 
@@ -213,6 +213,56 @@ fn matching_rows<'a>(
     (exact, directory)
 }
 
+/// The section of an associated note to cite for `file`.
+///
+/// The note is already associated with the file, so this only chooses where
+/// to point. A section whose own text names the file's repository path beats
+/// one that names only its file name; with neither, the first section with
+/// text is cited, as before. Ties go to the earlier section.
+fn section_about<'a>(document: &'a StoredDocument, file: &str) -> Option<&'a StoredSection> {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    let score = |section: &StoredSection| -> u8 {
+        if section.body.contains(file) {
+            2
+        } else if mentions_token(&section.body, name) {
+            1
+        } else {
+            0
+        }
+    };
+    let mut best: Option<(&StoredSection, u8)> = None;
+    for section in document
+        .sections
+        .iter()
+        .filter(|section| !section.body.trim().is_empty())
+    {
+        let points = score(section);
+        if best.is_none_or(|(_, top)| points > top) {
+            best = Some((section, points));
+        }
+    }
+    best.map(|(section, _)| section)
+        .or_else(|| document.sections.first())
+}
+
+/// `name` occurs in `text` as a whole path component, not inside a longer
+/// name (`retry.rs` is not in `llm_retry.rs`).
+fn mentions_token(text: &str, name: &str) -> bool {
+    let is_name_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.');
+    text.match_indices(name).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let mut rest = text[at + name.len()..].chars();
+        let after = rest.next();
+        // A sentence-ending dot is punctuation, not part of the name.
+        let name_continues = match after {
+            Some('.') => rest.next().is_some_and(char::is_alphanumeric),
+            Some(c) => is_name_char(c),
+            None => false,
+        };
+        before.is_none_or(|c| !is_name_char(c)) && !name_continues
+    })
+}
+
 impl RepositoryService {
     /// The canonical repository-relative path of the file an `index` call with
     /// these effective `args` reads, resolved with the tool's own root/path
@@ -295,9 +345,14 @@ impl RepositoryService {
 
         let mut candidates: Vec<PathCard> = Vec::new();
         let mut evidence = EvidenceLookup::default();
+        let held_back = retrieval_only(self);
         for (doc_path, via) in documents {
             // The file's own text is the outline's business, not a note.
             if doc_path == file {
+                continue;
+            }
+            // Retrieval-only documents are never attached unasked.
+            if held_back.is_selected(&doc_path) {
                 continue;
             }
             match self.fresh_document(&doc_path) {
@@ -336,12 +391,9 @@ impl RepositoryService {
                 }
             }
             if via.source || via.applies {
-                let section = document
-                    .sections
-                    .iter()
-                    .find(|section| !section.body.trim().is_empty())
-                    .or_else(|| document.sections.first());
-                let Some(section) = section else { continue };
+                let Some(section) = section_about(document, &file) else {
+                    continue;
+                };
                 let (mut summary, mut summary_source) =
                     summarize(document.description.as_deref(), section, &document.title);
                 let state = evidence.state(self, &doc_path, &section_record_key(section));
@@ -491,6 +543,57 @@ mod tests {
         assert!(applies.summary.contains("Sockets are pooled"));
         assert_eq!(applies.selector.as_deref(), Some("Net > Overview"));
         assert!(applies.retrieval_id.starts_with(&applies.doc_id));
+    }
+
+    #[test]
+    fn a_note_cites_the_section_that_names_the_indexed_file() {
+        let fx = Fx::new();
+        fx.put(".qmt/knowledge.toml", MANIFEST);
+        fx.put("src/exec/llm_retry.rs", "pub fn retry() {}\n");
+        fx.put("src/exec/retry.rs", "pub fn other() {}\n");
+        fx.put("src/exec/wave_plan.rs", "pub fn plan() {}\n");
+        fx.put("src/exec/idle.rs", "pub fn idle() {}\n");
+        fx.put(
+            "docs/exec.md",
+            "---\nknowledge_paths: src/exec/**\n---\n# Exec\n## Overview\nThe loop is planned in wave_plan.rs and src/exec/wave_plan.rs.\n## Retry\nBackoff lives in src/exec/llm_retry.rs, not in retry.rs.\n",
+        );
+
+        let retry = select(&fx, "src/exec/llm_retry.rs", 5);
+        assert_eq!(retry.cards.len(), 1);
+        assert_eq!(retry.cards[0].selector.as_deref(), Some("Exec > Retry"));
+
+        let plan = select(&fx, "src/exec/wave_plan.rs", 5);
+        assert_eq!(plan.cards[0].selector.as_deref(), Some("Exec > Overview"));
+
+        // A file name inside a longer name is not a mention, and a bare name
+        // ranks below a full path.
+        let bare = select(&fx, "src/exec/retry.rs", 5);
+        assert_eq!(bare.cards[0].selector.as_deref(), Some("Exec > Retry"));
+
+        // Nothing names the file: the first section with text, as before.
+        let none = select(&fx, "src/exec/idle.rs", 5);
+        assert_eq!(none.cards[0].selector.as_deref(), Some("Exec > Overview"));
+    }
+
+    #[test]
+    fn retrieval_only_documents_never_become_path_cards() {
+        let fx = Fx::new();
+        fx.put(
+            ".qmt/knowledge.toml",
+            "version = 1\n[documents]\ninclude = [\"docs/**/*.md\", \"specs/**/*.md\"]\n[code]\ninclude = [\"src/**/*.rs\"]\n[orientation]\nretrieval_only = [\"specs/**\"]\n",
+        );
+        fx.put("src/queue.rs", "pub fn push() {}\n");
+        fx.put(
+            "specs/queue.md",
+            "---\nknowledge_sources: src/queue.rs\n---\n# Queue spec\nThe queue shall order tasks.\n",
+        );
+        fx.put(
+            "docs/queue.md",
+            "---\nknowledge_sources: src/queue.rs\n---\n# Queue\nTasks are ordered.\n",
+        );
+        let cards = select(&fx, "src/queue.rs", 5);
+        assert_eq!(cards.cards.len(), 1);
+        assert_eq!(cards.cards[0].doc_path, "docs/queue.md");
     }
 
     #[test]

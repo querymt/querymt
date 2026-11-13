@@ -24,7 +24,7 @@
 
 use super::browse::select_section;
 use super::check::codes;
-use super::delivery::{EvidenceLookup, apply_evidence, eligible};
+use super::delivery::{EvidenceLookup, apply_evidence, eligible, retrieval_only};
 use super::document::DiagnosticSeverity::Warning;
 use super::evidence::section_record_key;
 use super::gate::{GATE_VERSION, GateReason};
@@ -85,12 +85,19 @@ pub enum SummarySource {
 
 /// The text a card shows for `section`: the author's description, else a
 /// bounded verbatim excerpt, else a title. Never generated.
+///
+/// The description speaks for the whole document, so it stands in only for
+/// the document's own level (the preamble or the top heading). A card that
+/// cites a subsection shows that subsection's text instead; otherwise the
+/// citation and the text beside it would be about different things.
 pub(super) fn summarize(
     description: Option<&str>,
     section: &StoredSection,
     doc_title: &str,
 ) -> (String, SummarySource) {
-    let described = description.map(str::trim).filter(|d| !d.is_empty());
+    let described = description
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && section.breadcrumb.len() <= 1);
     if let Some(description) = described {
         (description.to_string(), SummarySource::Description)
     } else if !section.body.trim().is_empty() {
@@ -182,9 +189,14 @@ impl RepositoryService {
         let mut seen = BTreeSet::new();
         let mut passed_over = BTreeSet::new();
         let mut evidence = EvidenceLookup::default();
+        let held_back = retrieval_only(self);
         for found in &gated.sections {
             if cards.len() >= request.max_cards {
                 break;
+            }
+            // Retrieval-only documents are never attached unasked.
+            if held_back.is_selected(&found.doc_path) {
+                continue;
             }
             // Lifecycle is checked before the cap and before the one-card-per-
             // document rule, so an ineligible document never takes a slot.
@@ -441,6 +453,36 @@ mod tests {
     }
 
     #[test]
+    fn a_description_stands_in_only_for_the_top_level_of_its_document() {
+        let fx = Fx::new();
+        fx.put(
+            "docs/loop.md",
+            "---\ndescription: The whole loop.\n---\n# Loop\nIntro text.\n## Retry\nBackoff doubles each attempt before the request is retried.\n",
+        );
+        let outcome = orient(&fx, "backoff doubles each attempt before retried", false);
+        let card = &outcome.cards[0];
+        assert_eq!(card.selector.as_deref(), Some("Loop > Retry"));
+        assert_eq!(card.summary_source, SummarySource::Excerpt);
+        assert!(card.summary.contains("Backoff doubles"), "{}", card.summary);
+    }
+
+    #[test]
+    fn retrieval_only_documents_are_never_orientation_cards_but_stay_retrievable() {
+        let fx = Fx::new();
+        fx.put(
+            ".qmt/knowledge.toml",
+            "version = 1\n[documents]\ninclude = [\"docs/**/*.md\", \"specs/**/*.md\"]\n[orientation]\nretrieval_only = [\"specs/**\"]\n",
+        );
+        let body = "# Queue notes\nscheduler dispatch workers queue\n";
+        fx.put("specs/queue.md", body);
+        fx.put("docs/queue.md", body);
+        let outcome = orient(&fx, "scheduler dispatch workers queue notes", false);
+        let docs: Vec<&str> = outcome.cards.iter().map(|c| c.doc_path.as_str()).collect();
+        assert_eq!(docs, ["docs/queue.md"], "the spec took no card");
+        assert!(fx.service.fresh_document("specs/queue.md").is_ok());
+    }
+
+    #[test]
     fn a_draft_only_match_falls_back_to_entrypoints_and_a_draft_entrypoint_is_skipped() {
         let fx = Fx::new();
         fx.put(
@@ -589,7 +631,10 @@ mod tests {
         assert_eq!(first.origin, CardOrigin::Entrypoint);
         assert_eq!(first.doc_path, "docs/map.md");
         assert_eq!(first.selector.as_deref(), Some("Overview > Repository map"));
-        assert_eq!(first.summary, "Reviewed repository map.");
+        // A subsection shows its own text; the description is about the whole
+        // document and only stands in for its top level.
+        assert_eq!(first.summary_source, SummarySource::Excerpt);
+        assert_eq!(first.summary, "runtime lives in src/runtime.");
         // The id form resolves to the same document and a different (first) section.
         assert_eq!(outcome.cards.len(), 2);
         assert_eq!(outcome.cards[1].doc_path, "docs/map.md");

@@ -202,4 +202,9 @@ impl RepositoryKnowledgeSettings {
     pub fn index_context_active(&self) -> bool {
         self.enabled && self.delivery.index_context
     }
+
+    /// Either automatic delivery stage is active.
+    pub fn delivery_active(&self) -> bool {
+        self.orientation_active() || self.index_context_active()
+    }
 }

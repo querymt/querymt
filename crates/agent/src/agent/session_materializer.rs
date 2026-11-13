@@ -1631,6 +1631,16 @@ impl SessionMaterializer {
                 let runtime_clone = prepared.runtime.clone();
                 let cwd_owned = cwd_path.clone();
                 let repository_knowledge = self.config.repository_knowledge();
+                // Automatic delivery gives up at a short deadline, so a cold
+                // index would cost the first prompt its orientation. Build it
+                // in the background now; a checkout without a manifest is left
+                // untouched. Pull-only sessions stay fully lazy.
+                if let Some(registry) = repository_knowledge
+                    .as_ref()
+                    .filter(|registry| registry.settings().delivery_active())
+                {
+                    registry.spawn_prewarm(cwd_path.clone());
+                }
                 tokio::spawn(async move {
                     let root = crate::index::resolve_workspace_root(&cwd_owned);
                     match crate::index::get_or_create_workspace_with_timeout(&manager_actor, root)

@@ -25,6 +25,7 @@
 
 use super::document::Lifecycle;
 use super::evidence::DocumentEvidence;
+use super::manifest::{ManifestOutcome, SourceSelection, load_manifest};
 use super::orientation::SummarySource;
 use super::service::RepositoryService;
 use super::signals::EvidenceState;
@@ -33,6 +34,16 @@ use std::collections::BTreeMap;
 /// Whether a document with this `status` label may become an automatic card.
 pub fn eligible(status: Option<&str>) -> bool {
     Lifecycle::from_status(status).allows_automatic_delivery()
+}
+
+/// Documents the manifest keeps retrieval-only (`[orientation]
+/// retrieval_only`): explicit retrieval serves them, automatic delivery never
+/// attaches them. An unreadable or absent manifest holds nothing back.
+pub(super) fn retrieval_only(service: &RepositoryService) -> SourceSelection {
+    match load_manifest(service.root().root()) {
+        Ok(ManifestOutcome::Loaded(manifest)) => manifest.retrieval_only,
+        _ => SourceSelection::default(),
+    }
 }
 
 /// The explicit label a card with this evidence state must carry, if any.

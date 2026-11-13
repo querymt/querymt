@@ -22,6 +22,10 @@ use std::time::{Duration, Instant};
 /// exceeds this skips the context instead of delaying the turn. Abandoned
 /// blocking work finishes in the background and never touches the result.
 pub(crate) const DELIVERY_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Longest the orientation stage waits while a session-start warm-up is still
+/// building the index. Only a cold first build gets this; a warm index never
+/// waits that long.
+pub(crate) const WARMUP_TIMEOUT: Duration = Duration::from_secs(8);
 /// Minimum spacing between host diagnostics about skipped delivery.
 const DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -216,6 +220,25 @@ fn record_selection(
     }
 }
 
+/// The deadline for the orientation stage: the usual one, extended to
+/// [`WARMUP_TIMEOUT`] from now while a session-start warm-up of this session's
+/// own checkout is still running.
+fn orientation_deadline(
+    registry: &crate::knowledge::repository::RepositoryKnowledgeRegistry,
+    cwd: Option<&std::path::Path>,
+    usual: tokio::time::Instant,
+) -> tokio::time::Instant {
+    if registry.is_warming(cwd) {
+        tracing::debug!(
+            "repository knowledge: waiting up to {WARMUP_TIMEOUT:?} for the index warm-up \
+             before the first prompt"
+        );
+        usual.max(tokio::time::Instant::now() + WARMUP_TIMEOUT)
+    } else {
+        usual
+    }
+}
+
 /// Orientation cards for an accepted prompt, when the host enabled that stage.
 pub(crate) async fn orientation_contexts(
     config: &AgentConfig,
@@ -250,9 +273,14 @@ pub(crate) async fn orientation_contexts(
     let prompt = prompt.to_string();
     let existing = existing.to_vec();
     let started = Instant::now();
+    // A cold first build outlasts the usual deadline; while the session-start
+    // warm-up is running, the first prompt waits for it (bounded) instead of
+    // going without its card.
+    let deadline = orientation_deadline(&registry, cwd.as_deref(), deadline);
+    let until = deadline.into_std();
     let selected = run_bounded(deadline, move || {
         let service = registry.service_for(cwd.as_deref()).ok()?;
-        if service.is_refreshing() {
+        if !service.wait_until_idle(until) {
             return Some(Vec::new());
         }
         Some(orientation_contributions(
@@ -349,9 +377,10 @@ pub(crate) async fn index_contexts(
     }
     let deadline = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
     let started = Instant::now();
+    let until = deadline.into_std();
     let selected = run_bounded(deadline, move || {
         let service = registry.service_for(owned.cwd.as_deref()).ok()?;
-        if service.is_refreshing() {
+        if !service.wait_until_idle(until) {
             return Some(Vec::new());
         }
         Some(post_index_contributions(
@@ -482,9 +511,10 @@ pub(crate) async fn post_compaction_contexts(
     let fetch = fetch_available(config, exec_ctx);
     let cwd = exec_ctx.cwd().map(|path| path.to_path_buf());
     let deadline = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
+    let until = deadline.into_std();
     let selected = run_bounded(deadline, move || {
         let service = registry.service_for(cwd.as_deref()).ok()?;
-        if service.is_refreshing() {
+        if !service.wait_until_idle(until) {
             return Some(Vec::new());
         }
         let mut out = Vec::new();
@@ -516,9 +546,10 @@ pub(crate) async fn post_compaction_contexts(
 }
 
 /// Run selection off the executor and give up at `deadline`. A selection that
-/// finds a refresh already running (for example a cold index still being
-/// built by an earlier, abandoned pass) yields nothing instead of queueing
-/// behind it, so abandoned work cannot pile up. Every failure
+/// finds a refresh already running waits for it only until the same deadline
+/// (a parallel call's warm reconcile ends in milliseconds); a cold index still
+/// being built by an earlier, abandoned pass makes it yield nothing instead of
+/// queueing behind it, so abandoned work cannot pile up. Every failure
 /// mode (unbound or unavailable checkout, selector error, panic, timeout)
 /// yields no contribution; none can fail the turn or the tool call.
 pub(crate) async fn run_bounded<F>(
@@ -557,6 +588,45 @@ mod tests {
             tool_use_id: None,
             content: "c".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_running_warm_up_extends_only_the_orientation_deadline() {
+        use crate::config::RepositoryKnowledgeSettings;
+        use crate::knowledge::repository::RepositoryKnowledgeRegistry;
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = RepositoryKnowledgeRegistry::from_settings_in(
+            &RepositoryKnowledgeSettings::enabled(),
+            tmp.path().join("config"),
+        )
+        .unwrap();
+        let repo = tmp.path().join("repo");
+        let other = tmp.path().join("other");
+        for dir in [&repo, &other] {
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+        }
+        let usual = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
+        assert_eq!(
+            orientation_deadline(&registry, Some(&repo), usual),
+            usual,
+            "warm index"
+        );
+
+        // Held open by the guard, so the check cannot race a finishing warm-up.
+        let guard = registry.track_warming(&repo).expect("resolvable checkout");
+        let extended = orientation_deadline(&registry, Some(&repo), usual);
+        assert!(extended > usual + Duration::from_secs(5), "warming");
+        assert_eq!(
+            orientation_deadline(&registry, Some(&other), usual),
+            usual,
+            "another checkout's warm-up never delays this one"
+        );
+        drop(guard);
+        assert_eq!(
+            orientation_deadline(&registry, Some(&repo), usual),
+            usual,
+            "finished"
+        );
     }
 
     #[tokio::test]
@@ -675,6 +745,49 @@ mod tests {
                 "excluded={excluded} enabled={enabled}: system prompt must be untouched"
             );
         }
+    }
+
+    /// Scenario "Tools are excluded": the configuration mismatch is reported
+    /// to the host log, and only when the feature is enabled.
+    #[tokio::test]
+    async fn excluded_retrieval_tools_are_reported_as_a_configuration_mismatch() {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = |excluded: bool, enabled: bool| async move {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let (config, _dir) = config_with(excluded, enabled).await;
+            let session = config
+                .provider
+                .create_session(None, None, &config.execution_config_snapshot())
+                .await
+                .unwrap();
+            attach_policy(&config, &session.session().public_id).await;
+            String::from_utf8(captured.0.lock().unwrap().clone()).unwrap()
+        };
+        let mismatch = "repo_knowledge_query/get are not usable";
+        let excluded = logs(true, true).await;
+        assert!(excluded.contains(mismatch), "{excluded}");
+        assert!(!logs(false, true).await.contains(mismatch), "usable tools");
+        assert!(
+            !logs(false, false).await.contains(mismatch),
+            "feature disabled"
+        );
     }
 
     #[tokio::test]
