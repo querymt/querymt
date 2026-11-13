@@ -1,0 +1,17 @@
+[package]
+name = "querymt-agent-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bottom layer of the querymt agent: shared domain types and helpers"
+
+[lib]
+name = "querymt_agent_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+rapidhash = "4.2"
+
+[dev-dependencies]
+serde_json.workspace = true

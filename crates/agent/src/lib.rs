@@ -30,7 +30,7 @@ pub mod event_fanout;
 pub mod event_sink;
 pub mod events;
 pub mod export;
-pub mod hash;
+pub use querymt_agent_core::hash;
 pub mod hooks;
 pub mod index;
 pub mod knowledge;

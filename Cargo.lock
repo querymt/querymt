@@ -11975,6 +11975,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "qmt-openai",
  "querymt",
+ "querymt-agent-core",
  "querymt-provider-common",
  "querymt-remote",
  "querymt-utils",
@@ -12040,6 +12041,15 @@ dependencies = [
  "url",
  "uuid 1.29.0",
  "whatlang",
+]
+
+[[package]]
+name = "querymt-agent-core"
+version = "0.6.0"
+dependencies = [
+ "rapidhash",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
