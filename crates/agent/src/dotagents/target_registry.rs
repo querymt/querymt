@@ -26,7 +26,6 @@
 //! protocol parsing independent of runtime construction.
 
 use super::diagnostics::{DotagentsDiagnostic, DotagentsDiagnosticCode};
-use super::layer::DotagentsSource;
 use super::subagent::{DotagentsSubAgentPlan, DotagentsSubAgentPlans};
 use crate::agent::handle::AgentHandle as AgentHandleTrait;
 use crate::delegation::{AgentInfo, AgentRegistry};
@@ -186,7 +185,7 @@ pub fn merge_protocol_targets(
 /// [`super::merge::merge_layers`], which applies layers in ascending order so a
 /// later (workspace) layer replaces a matching ID from an earlier (global) one.
 /// By the time plans exist, each ID has exactly one winning definition and its
-/// [`DotagentsSource`] records the layer that supplied it.
+/// [`super::layer::DotagentsSource`] records the layer that supplied it.
 ///
 /// This function therefore does not re-apply precedence. It normalizes the plan
 /// set into a deterministic, ID-sorted list and tags each entry with the layer
@@ -332,12 +331,5 @@ impl AgentRegistry for DotagentsTargetRegistry {
             *count += 1;
         }
         Some(handle)
-    }
-}
-
-impl DotagentsSource {
-    /// Human-readable provenance for diagnostics that reference a plan.
-    pub fn describe(&self) -> String {
-        self.to_string()
     }
 }

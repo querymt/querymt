@@ -9,6 +9,8 @@ use super::diagnostics::DotagentsDiagnostic;
 use super::layer::{DotagentsSource, DotagentsSourceRef};
 use std::collections::BTreeMap;
 
+pub use querymt_agent_core::dotagents::memory::DotagentsMemory;
+
 /// A Markdown singleton document (`agents.md` or `system-prompt.md`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DotagentsPrompt {
@@ -303,31 +305,6 @@ pub struct DotagentsTask {
     pub profile_id: Option<String>,
     /// The prompt body executed by the task.
     pub prompt: String,
-    /// Unknown frontmatter fields retained for forward compatibility.
-    pub extensions: BTreeMap<String, serde_json::Value>,
-    /// Where the effective entry came from.
-    pub source: DotagentsSource,
-    /// Content fingerprint of the effective source.
-    pub fingerprint: String,
-}
-
-/// A protocol memory from `.agents/memories/<id>.md`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DotagentsMemory {
-    /// Stable normalized ID.
-    pub id: String,
-    /// Optional title.
-    pub title: Option<String>,
-    /// Topics/tags.
-    pub tags: Vec<String>,
-    /// Protocol importance value, when provided.
-    pub importance: Option<String>,
-    /// Explicit content override from metadata, when provided.
-    pub content: Option<String>,
-    /// The Markdown body.
-    pub body: String,
-    /// Whether the memory is enabled (defaults to true).
-    pub enabled: bool,
     /// Unknown frontmatter fields retained for forward compatibility.
     pub extensions: BTreeMap<String, serde_json::Value>,
     /// Where the effective entry came from.

@@ -88,6 +88,11 @@ impl DotagentsSource {
         self
     }
 
+    /// Human-readable provenance for diagnostics that reference a plan.
+    pub fn describe(&self) -> String {
+        self.to_string()
+    }
+
     /// The lexical path.
     pub fn path(&self) -> &Path {
         &self.lexical_path

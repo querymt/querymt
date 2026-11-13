@@ -30,13 +30,14 @@ use super::frontmatter::{
 use super::layer::DotagentsSource;
 use super::manifest::{
     DotagentsAgent, DotagentsAgentConfig, DotagentsAgentConnection, DotagentsAgentConnectionType,
-    DotagentsAgentRole, DotagentsMcpServer, DotagentsMcpTransport, DotagentsMemory,
-    DotagentsModelPreset, DotagentsPrompt, DotagentsSkill, DotagentsTask, DotagentsTaskKind,
+    DotagentsAgentRole, DotagentsMcpServer, DotagentsMcpTransport, DotagentsModelPreset,
+    DotagentsPrompt, DotagentsSkill, DotagentsTask, DotagentsTaskKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+pub use querymt_agent_core::dotagents::fields::{fingerprint, partition_fields};
+pub use querymt_agent_core::dotagents::memory::parse_memory_document;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 /// Frontmatter keys recognized by a parser, in canonical (lowercase) form.
 ///
@@ -46,42 +47,6 @@ fn is_extension_key(known: &BTreeSet<&str>, key: &str) -> bool {
     !known
         .iter()
         .any(|known_key| known_key.to_ascii_lowercase() == key)
-}
-
-/// Split parsed frontmatter into recognized protocol fields and extension
-/// fields, keyed case-insensitively for the recognized set.
-///
-/// The first matching key wins for a recognized field, so a document that
-/// spells the same concept twice keeps deterministic behavior.
-///
-/// Recognized fields are re-keyed to the canonical spelling supplied in
-/// `known`, because the [`super::frontmatter`] field accessors look keys up
-/// verbatim. Protocol documents use camelCase (`intervalMinutes`,
-/// `runOnStartup`), so a case-insensitive match must still be stored under the
-/// accessor's expected spelling.
-fn partition_fields(
-    fields: &BTreeMap<String, Value>,
-    known: &[&str],
-) -> (BTreeMap<String, Value>, BTreeMap<String, Value>) {
-    let mut recognized: BTreeMap<String, Value> = BTreeMap::new();
-    let mut extensions: BTreeMap<String, Value> = BTreeMap::new();
-
-    for (key, value) in fields {
-        match known
-            .iter()
-            .find(|candidate| candidate.eq_ignore_ascii_case(key))
-        {
-            Some(canonical) => {
-                recognized
-                    .entry((*canonical).to_string())
-                    .or_insert_with(|| value.clone());
-            }
-            None => {
-                extensions.insert(key.clone(), value.clone());
-            }
-        }
-    }
-    (recognized, extensions)
 }
 
 /// Fields recognized by the Markdown singleton parsers.
@@ -118,21 +83,6 @@ fn merge_metadata(
     _extensions: BTreeMap<String, Value>,
 ) -> BTreeMap<String, Value> {
     original.clone()
-}
-
-/// A content fingerprint of the raw source text.
-///
-/// Fingerprints are stable across runs and platforms so they can be used as
-/// reconciliation and approval keys. SHA-256 keeps persisted fingerprints
-/// deterministic across processes and platforms.
-pub fn fingerprint(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 /// Parse a JSON document into an object, producing a source-aware diagnostic.
@@ -964,59 +914,6 @@ pub fn parse_task_document(
         interval_minutes,
         profile_id,
         prompt,
-        extensions,
-        source: source.clone(),
-        fingerprint: fingerprint(text),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// `memories/<id>.md`
-// ---------------------------------------------------------------------------
-
-/// Frontmatter keys recognized on a memory document.
-const MEMORY_KEYS: &[&str] = &["id", "title", "tags", "importance", "content", "enabled"];
-
-/// Parse a `memories/*.md` document.
-///
-/// `entry_id` is the file stem, used as the stable ID unless the frontmatter
-/// provides an explicit `id`. The body may be empty when explicit `content`
-/// metadata is provided, since the importer falls back to it.
-pub fn parse_memory_document(
-    text: &str,
-    entry_id: &str,
-    source: DotagentsSource,
-) -> Result<DotagentsMemory, Box<DotagentsDiagnostic>> {
-    let parsed =
-        parse_frontmatter_markdown(text).map_err(|error| error.with_source(source.clone()))?;
-    let (recognized, extensions) = partition_fields(&parsed.fields, MEMORY_KEYS);
-
-    let id = field_string(&recognized, "id").unwrap_or_else(|| entry_id.to_string());
-    let title = field_string(&recognized, "title");
-    let tags = field_list(&recognized, "tags").unwrap_or_default();
-    let importance = field_string(&recognized, "importance");
-    let content = field_string(&recognized, "content");
-    let enabled = field_bool(&recognized, "enabled").unwrap_or(true);
-
-    let body = parsed.body;
-    if body.trim().is_empty() && content.as_deref().map(str::trim).unwrap_or("").is_empty() {
-        return Err(Box::new(
-            DotagentsDiagnostic::error(
-                DotagentsDiagnosticCode::MissingField,
-                format!("memory `{id}` has neither a Markdown body nor `content` metadata"),
-            )
-            .with_source(source),
-        ));
-    }
-
-    Ok(DotagentsMemory {
-        id,
-        title,
-        tags,
-        importance,
-        content,
-        body,
-        enabled,
         extensions,
         source: source.clone(),
         fingerprint: fingerprint(text),

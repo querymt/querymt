@@ -4,6 +4,7 @@
 //! This crate must not depend on any other `querymt-agent-*` crate.
 
 pub mod diff_paths;
+pub mod dotagents;
 pub mod hash;
 pub mod hook_context;
 pub mod path;
