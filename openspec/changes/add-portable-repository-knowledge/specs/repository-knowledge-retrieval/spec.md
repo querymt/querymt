@@ -156,6 +156,16 @@ The system SHALL offer a separately host-enabled user-prompt orientation trigger
 - **WHEN** a prompt has no section passing the relevance gate and no eligible configured entrypoint fallback
 - **THEN** no orientation card is injected and ordinary discovery remains available
 
+#### Scenario: Card text matches its citation
+- **WHEN** a card cites a subsection of a document that has an authored `description`
+- **THEN** the card shows that subsection's own bounded excerpt, because the description speaks for the whole document
+- **AND** the description is shown only when the card cites the document's top level
+
+#### Scenario: Retrieval-only documents are never attached unasked
+- **WHEN** the manifest lists a document under `[orientation] retrieval_only` and it would otherwise pass the gate or match an indexed file
+- **THEN** no orientation or index-enrichment card is attached for it
+- **AND** `repo_knowledge_query`, `repo_knowledge_get` and `repo_knowledge_list` still serve it
+
 ### Requirement: The orientation relevance gate is specified and versioned
 
 The orientation gate SHALL carry a version. A section SHALL pass when the prompt contains an exact indexed repository-relative path or qualified identifier, or when at least two distinct gate tokens match its title, headings, tags, or description, or at least three match its body. Passing sections SHALL be ranked with documentation-lane ranking and deterministic tie-breaking. Thresholds and word lists SHALL change only with a new gate version.
@@ -189,6 +199,11 @@ An explicitly configured, selected repository entrypoint SHALL be eligible as a 
 - **THEN** a bounded cited map pointer can be supplied as general orientation
 - **AND** it is not presented as a confident match to a particular implementation file
 
+#### Scenario: The fallback is not free
+- **WHEN** the fallback attaches the map to a first prompt that is unrelated to the repository
+- **THEN** the card states that it is general orientation and not a match for the task
+- **AND** the documentation and pilot report record that cost (about 1.7k tokens on a prompt of 7k, together with the retrieval tool schemas and policy text) rather than counting only gated false positives
+
 ### Requirement: Index enrichment adds knowledge without changing the outline
 
 The system SHALL offer a separately host-enabled post-tool enrichment stage for successful built-in index calls. It SHALL resolve the indexed file using effective tool arguments and root semantics, validate corpus membership, and attach a bounded digest as separately attributed hook context with the tool-call ID and relative path. The original structural result and error status SHALL be preserved byte-for-byte.
@@ -197,6 +212,11 @@ The system SHALL offer a separately host-enabled post-tool enrichment stage for 
 - **WHEN** a successful built-in index call targets an authorized indexed file with a matching File/Purpose record or declared association
 - **THEN** the model receives the original outline and a separately labeled, cited knowledge digest in the same result exchange
 - **AND** the underlying index output remains byte-for-byte unchanged
+
+#### Scenario: Associated note has several sections
+- **WHEN** a note is associated with the indexed file and one of its sections names that file's repository path or file name as a whole word
+- **THEN** the digest cites that section, preferring a full-path mention over a bare file name
+- **AND** when no section names the file, the note's first section with text is cited
 
 ### Requirement: Enrichment selects only directly associated knowledge
 
@@ -222,7 +242,7 @@ The digest SHALL be selected from File/Purpose rows, documents whose `knowledge_
 
 ### Requirement: Automatic delivery shares bounds and source trust rules
 
-Orientation and index enrichment SHALL use the same repository collection, authorization, source revalidation, and evidence states as explicit retrieval. Each SHALL default off and require host enablement. Automatic delivery SHALL be non-blocking, bounded in time, and SHALL NOT invoke model-visible tools recursively. Draft and deprecated documents SHALL NOT become automatic cards.
+Orientation and index enrichment SHALL use the same repository collection, authorization, source revalidation, and evidence states as explicit retrieval. Each SHALL default off and require host enablement. Automatic delivery SHALL be bounded in time and SHALL NOT invoke model-visible tools recursively. Draft and deprecated documents SHALL NOT become automatic cards.
 
 #### Scenario: Associated evidence has changed
 - **WHEN** an eligible card's supporting source differs from its acknowledged evidence
@@ -232,6 +252,27 @@ Orientation and index enrichment SHALL use the same repository collection, autho
 #### Scenario: Repository attempts to enable execution
 - **WHEN** repository metadata requests a handler, command, or permission not enabled by the host
 - **THEN** no such execution or permission is enabled by indexing or delivery
+
+### Requirement: Automatic delivery waits only briefly
+
+Automatic delivery SHALL NOT queue indefinitely behind an index refresh: it waits for a running refresh only until a short deadline and then adds nothing.
+
+#### Scenario: Refresh outlasts the deadline
+- **WHEN** an index refresh is still running when the short deadline passes
+- **THEN** delivery adds nothing for that stage and the turn proceeds
+
+### Requirement: A cold first prompt may wait for the session-start warm-up
+
+While a session-start warm-up of the session's own checkout is running, the first prompt's orientation MAY wait up to a longer fixed bound, so a cold index does not cost the first prompt its card. A warm-up of another checkout SHALL NOT lengthen the wait, and index enrichment and post-compaction delivery SHALL keep the short deadline.
+
+#### Scenario: Cold index on the first prompt
+- **WHEN** a session starts in a checkout whose index has not been built and the first prompt arrives while the session-start warm-up is still running
+- **THEN** orientation waits for that warm-up up to the longer fixed bound and delivers a matching card if the build finishes in time
+- **AND** a warm index never causes a wait longer than the short deadline
+
+#### Scenario: Another checkout is warming
+- **WHEN** a warm-up is running for a different checkout
+- **THEN** this session's delivery deadline is unchanged
 
 ### Requirement: Automatic delivery has a shared per-turn budget
 

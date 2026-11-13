@@ -130,3 +130,18 @@ Totals after fixes (2026-11-12): covered 95, partial 7, uncovered 3 (of 105).
 | 103 | Retry or resume | covered | DELIV::a_provider_retry_reuses_the_stored_context_without_new_selection; DELIV::resume_suppresses_cards_represented_in_persisted_history; DELIV::a_resumed_session_does_not_reinject_index_cards_already_in_history |  |
 | 104 | Compaction removes useful context | covered | DELIV::compaction_ends_the_epoch_so_dropped_cards_can_be_redelivered; execution::maintenance post-compaction tests (stale payloads not resurrected) |  |
 | 105 | Card is delivered and fetched | covered | diagnostics::delivery_and_fetch_are_separate_events_with_no_followed_outcome; TOOL::successful_get_is_counted_as_a_fetch_and_nothing_else |  |
+
+## Added after the audit (2026-11-13: 8 scenarios, 6 covered, 2 partial)
+
+Scenarios added to the delta specs after live runs. Numbering continues; the totals at the top of this file count only rows 1-105.
+
+| # | Scenario | Status | Tests | Gap |
+|---|---|---|---|---|
+| 106 | Cold index on the first prompt (retrieval) | partial | registry::a_requested_warm_up_is_visible_until_it_finishes; agent::repository_delivery::a_running_warm_up_extends_only_the_orientation_deadline; api::agent_tests::repository_knowledge_binding::a_path_free_prompt_reaches_the_first_provider_request_with_an_orientation_card (asserts the warm-up runs before any prompt) | No automated test builds a real cold index against a slow build and asserts the card arrives. Checked once live on an empty cache: the first prompt got its card. |
+| 107 | Another checkout is warming (retrieval) | covered | agent::repository_delivery::a_running_warm_up_extends_only_the_orientation_deadline; registry::a_requested_warm_up_is_visible_until_it_finishes | |
+| 108 | Associated note has several sections (retrieval) | covered | path_knowledge::a_note_cites_the_section_that_names_the_indexed_file | |
+| 109 | Card text matches its citation (retrieval) | covered | orientation::a_description_stands_in_only_for_the_top_level_of_its_document; adapters::a_path_free_prompt_gets_user_prompt_context_without_a_tool_call_id | |
+| 110 | Retrieval-only documents are never attached unasked (retrieval) | covered | orientation::retrieval_only_documents_are_never_orientation_cards_but_stay_retrievable; path_knowledge::retrieval_only_documents_never_become_path_cards | Retrievability of the held-back document is asserted for orientation only (`fresh_document`), not through each tool. |
+| 111 | The fallback is not free (retrieval) | covered | adapters::entrypoint_fallback_applies_to_the_first_task_only (asserts the "not a match for this task" label); replay `entrypoint_fallbacks` count in `eval replay` | The cost statement is documentation (`pilot/README.md`), not a test. |
+| 112 | Specs stay searchable but are not attached unasked (manifest) | covered | manifest::retrieval_only_documents_are_a_validated_glob_list (including an invalid pattern as `manifest_invalid_pattern`) | |
+| 113 | Refresh outlasts the deadline (retrieval) | partial | agent::repository_delivery::slow_selection_is_abandoned_at_the_deadline; DELIV::an_unavailable_repository_leaves_the_successful_result_intact | The deadline test covers a slow selection, not a refresh still running past the deadline specifically. |
