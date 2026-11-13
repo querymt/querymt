@@ -288,7 +288,7 @@ fn run_eval(cli: &Cli, args: &EvalArgs, out: &mut impl Write) -> Result<i32, Ref
             let all_r = &report.retrieval.get("all/all");
             let all_d = &report.delivery.get("all");
             let text = format!(
-                "arm {} ({} files, corpus {}), split {}, gate v{} {}{}\nretrieval: recall@{} {:.2}, mrr {:.2}, wrong top hit {:.2}\ndelivery: cue hits {}/{}, false positives {}/{}, wrong cards {}, tokens {}\nscenarios ok: {}/{}",
+                "arm {} ({} files, corpus {}), split {}, gate v{} {}{}\nretrieval: recall@{} {:.2}, mrr {:.2}, wrong top hit {:.2}\ndelivery: cue hits {}/{}, false positives {}/{} (gated cards only), entrypoint fallbacks {}/{} (map card on a first prompt nothing else matched), wrong cards {}, tokens {}\nscenarios ok: {}/{}",
                 report.arm,
                 report.corpus_files,
                 report.corpus_fingerprint,
@@ -307,6 +307,8 @@ fn run_eval(cli: &Cli, args: &EvalArgs, out: &mut impl Write) -> Result<i32, Ref
                 all_d.map_or(0, |d| d.cue_hits),
                 all_d.map_or(0, |d| d.positives),
                 all_d.map_or(0, |d| d.false_positive_prompts),
+                all_d.map_or(0, |d| d.negatives),
+                all_d.map_or(0, |d| d.entrypoint_fallbacks),
                 all_d.map_or(0, |d| d.negatives),
                 all_d.map_or(0, |d| d.wrong_cards),
                 all_d.map_or(0, |d| d.added_tokens),

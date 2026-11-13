@@ -1,15 +1,21 @@
-# Prompts for scripts/kb-measure.sh. One per line.
+# Prompts for scripts/kb-measure.sh. One per line, prefixed with its group: [group] prompt
 # The model runs with read-only tools, so every prompt is a question about the
 # code, never an implementation task.
 #
-# Concept questions the notes in crates/agent/knowledge cover (a card should appear):
-how does the execution loop retry transient provider errors?
-what does the orientation relevance gate require before a card is delivered
-how are tool calls from one model response run at the same time while conflicting file writes stay ordered
-the model sometimes sends a json string where the tool schema declares an array, where is that accepted and how is it kept safe
-how does a session get compacted and what triggers it
-# Prompts that should NOT get a card (the feature should cost ~nothing here):
-which file in this repository would hold a typo like "recieve" in the changelog
-write a short poem about autumn
-the system shall always respond within two seconds
-how does the process make sure the session is saved before it exits
+# Groups (the summary is reported per group, because they test different things):
+#   concept   questions the notes in crates/agent/knowledge cover. A gated card
+#             should appear; the feature should save exploration here.
+#   repo      questions about this repository that no note covers. No gated card
+#             should appear, but the entrypoint fallback still attaches the
+#             repository map on a first prompt, so some overhead is expected.
+#   unrelated not about the repository at all. Measures the fixed cost of the
+#             feature (tool schemas, policy paragraph, fallback card).
+[concept] how does the execution loop retry transient provider errors?
+[concept] what does the orientation relevance gate require before a card is delivered
+[concept] how are tool calls from one model response run at the same time while conflicting file writes stay ordered
+[concept] the model sometimes sends a json string where the tool schema declares an array, where is that accepted and how is it kept safe
+[concept] how does a session get compacted and what triggers it
+[repo] which file in this repository would hold a typo like "recieve" in the changelog
+[unrelated] write a short poem about autumn
+[unrelated] the system shall always respond within two seconds
+[repo] how does the process make sure the session is saved before it exits
