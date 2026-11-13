@@ -102,7 +102,7 @@ pub(crate) async fn attach_policy(config: &AgentConfig, session_id: &str) {
         .unwrap_or_default()
         .provider(&current.provider)
         .model(&current.model);
-    if !crate::knowledge::repository::policy::append_once(&mut params.system) {
+    if !append_policy_once(&mut params.system) {
         return;
     }
     let result = async {
@@ -113,6 +113,18 @@ pub(crate) async fn attach_policy(config: &AgentConfig, session_id: &str) {
     if let Err(error) = result {
         tracing::warn!(session_id, %error, "failed to attach repository retrieval policy");
     }
+}
+
+/// Add the stable retrieval policy to a system prompt, unless an identical
+/// part is already there. Returns whether a part was added. Existing parts are
+/// never reordered or edited, so the prefix is unchanged.
+fn append_policy_once(system: &mut Vec<querymt::params::SystemPrompt>) -> bool {
+    use crate::knowledge::repository::policy::RETRIEVAL_POLICY;
+    if system.iter().any(|part| part.text() == RETRIEVAL_POLICY) {
+        return false;
+    }
+    system.push(RETRIEVAL_POLICY.into());
+    true
 }
 
 /// Rebuild the turn budget's duplicate-suppression state from persisted card
@@ -580,6 +592,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appended_once_after_an_unchanged_prefix() {
+        use querymt::params::SystemPrompt;
+        let mut system: Vec<SystemPrompt> = vec!["base one".into(), "base two".into()];
+        let before = system.clone();
+        assert!(append_policy_once(&mut system));
+        assert_eq!(&system[..2], &before[..]);
+        assert_eq!(system.len(), 3);
+        for _ in 0..5 {
+            assert!(!append_policy_once(&mut system));
+        }
+        assert_eq!(system.len(), 3, "repeated attachment must not accumulate");
+    }
 
     fn card() -> HookContextContribution {
         HookContextContribution {
