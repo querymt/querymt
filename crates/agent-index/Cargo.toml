@@ -1,0 +1,68 @@
+[package]
+name = "querymt-agent-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Code index (file, symbol, outline and function indexes) for the querymt agent"
+
+[lib]
+name = "querymt_agent_index"
+path = "src/lib.rs"
+
+[dependencies]
+querymt-agent-core = { path = "../agent-core" }
+typeshare.workspace = true
+serde.workspace = true
+kameo = "0.22"
+thiserror = "2.0"
+log.workspace = true
+tracing = { version = "0.1", features = ["attributes", "release_max_level_debug"] }
+tokio = { version = "1.0", features = ["full"] }
+ignore = "0.4.25"
+notify = "8"
+arc-swap = "1.7"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+rayon = "1.11"
+rapidhash = "4.2"
+
+# Code similarity detection (local fork with tree-sitter 0.26)
+similarity-core = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
+similarity-rs = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
+similarity-py = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
+
+# Tree-sitter grammars for outline and symbol extraction.
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-elixir = "0.3"
+tree-sitter-nix = "0.3"
+tree-sitter-lua = "0.5"
+tree-sitter-svelte-ng = "1.0"
+tree-sitter-bash = "0.25"
+tree-sitter-php = "0.25"
+# crates.io tree-sitter-kotlin 0.3.x pins tree-sitter 0.20, whose C runtime
+# (linked globally via build-script flags) breaks the tree-sitter 0.26 runtime
+# already in the graph. Master binds via tree-sitter-language only.
+tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", rev = "d6af96d2e23ef0a8ff5ab512864378cf08fba311" }
+tree-sitter-swift = "0.7"
+tree-sitter-json = "0.24"
+tree-sitter-yaml = "0.7"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-md = "0.5"
+
+# Rust AST parsing for rich structural fingerprinting during function indexing
+syn = { version = "2", features = ["full", "visit"] }
+
+[dev-dependencies]
+tempfile = "3.0"
+tokio = { version = "1.0", features = ["full"] }
+serde_json.workspace = true
+gix = { version = "0.90", default-features = false, features = ["basic", "worktree-mutation", "attributes", "sha1", "status", "merge"] }

@@ -2,7 +2,7 @@ use tree_sitter::{Node, Parser};
 
 use super::super::types::SymbolDigest;
 use super::safe_slice;
-use crate::index::symbol_index::{SymbolEntry, SymbolError, SymbolKind};
+use crate::symbol_index::{SymbolEntry, SymbolError, SymbolKind};
 
 pub fn extract(source: &str) -> Result<Vec<SymbolEntry>, SymbolError> {
     let mut parser = Parser::new();

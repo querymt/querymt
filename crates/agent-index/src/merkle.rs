@@ -1,5 +1,5 @@
-use crate::hash::RapidHash;
 use ignore::WalkBuilder;
+use querymt_agent_core::hash::RapidHash;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};

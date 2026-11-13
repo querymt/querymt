@@ -11976,11 +11976,11 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-agent-core",
+ "querymt-agent-index",
  "querymt-provider-common",
  "querymt-remote",
  "querymt-utils",
  "rand 0.10.3",
- "rapidhash",
  "rayon",
  "regex",
  "reqwest 0.13.5",
@@ -11995,12 +11995,8 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "sha2 0.11.1",
- "similarity-core",
- "similarity-py",
- "similarity-rs",
  "stop-words 0.10.1",
  "strsim 0.11.1",
- "syn 2.0.119",
  "tar",
  "tempfile",
  "thiserror 2.0.21",
@@ -12014,6 +12010,47 @@ dependencies = [
  "tracing-log",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "typeshare",
+ "ureq 3.5.1",
+ "url",
+ "uuid 1.29.0",
+ "whatlang",
+]
+
+[[package]]
+name = "querymt-agent-core"
+version = "0.6.0"
+dependencies = [
+ "rapidhash",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "querymt-agent-index"
+version = "0.6.0"
+dependencies = [
+ "arc-swap",
+ "gix",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "kameo",
+ "log",
+ "notify",
+ "querymt-agent-core",
+ "rapidhash",
+ "rayon",
+ "serde",
+ "serde_json",
+ "similarity-core",
+ "similarity-py",
+ "similarity-rs",
+ "syn 2.0.119",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",
@@ -12037,19 +12074,6 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-yaml",
  "typeshare",
- "ureq 3.5.1",
- "url",
- "uuid 1.29.0",
- "whatlang",
-]
-
-[[package]]
-name = "querymt-agent-core"
-version = "0.6.0"
-dependencies = [
- "rapidhash",
- "serde",
- "serde_json",
 ]
 
 [[package]]

@@ -4,7 +4,7 @@ use tree_sitter::{Node, Parser};
 
 use super::super::types::SymbolDigest;
 use super::safe_slice;
-use crate::index::symbol_index::{SymbolEntry, SymbolError, SymbolKind};
+use crate::symbol_index::{SymbolEntry, SymbolError, SymbolKind};
 
 const MAX_CHILD_SYMBOLS: usize = 24;
 
