@@ -6,7 +6,7 @@
 //!
 //! Repository content is authoritative Markdown selected by the QueryMT-owned
 //! `.qmt/knowledge.toml` manifest. Nothing here enables itself: the host must
-//! opt in through [`RepositoryKnowledgeSettings`](crate::config::RepositoryKnowledgeSettings).
+//! opt in through [`RepositoryKnowledgeSettings`].
 
 pub mod acknowledge;
 pub mod adapters;
@@ -41,8 +41,16 @@ pub mod registry;
 pub mod root;
 pub mod scaffold;
 pub mod service;
+pub mod settings;
 pub mod signals;
 pub mod store;
+
+pub use settings::{
+    REPOSITORY_KNOWLEDGE_MAX_DELIVERY_BYTES, REPOSITORY_KNOWLEDGE_MAX_DELIVERY_CARDS,
+    REPOSITORY_KNOWLEDGE_MAX_DELIVERY_TOKENS, REPOSITORY_KNOWLEDGE_MAX_RESPONSE_BYTES,
+    REPOSITORY_KNOWLEDGE_MAX_RESULT_LIMIT, REPOSITORY_KNOWLEDGE_MIN_RESPONSE_BYTES,
+    RepositoryKnowledgeDeliverySettings, RepositoryKnowledgeSettings,
+};
 
 pub use store::{
     CorpusEntry, FileRecord, GenerationUpdate, IndexDiagnostic, OpenOutcome, RebuildReason,

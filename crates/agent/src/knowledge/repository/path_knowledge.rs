@@ -273,8 +273,8 @@ impl RepositoryService {
     /// same-named file elsewhere can never be mistaken for the indexed one.
     pub fn index_target(&self, args: &serde_json::Value, cwd: Option<&Path>) -> Option<String> {
         let raw = args.get("path")?.as_str()?;
-        let root = crate::tools::effective_root(args, cwd)?;
-        let target = crate::tools::resolve_arg_path(raw, Some(&root))?;
+        let root = querymt_agent_core::path::effective_root(args, cwd)?;
+        let target = querymt_agent_core::path::resolve_arg_path(raw, Some(&root))?;
         let canonical = target.canonicalize().ok()?;
         if !canonical.is_file() {
             return None;

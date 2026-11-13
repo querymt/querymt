@@ -791,10 +791,10 @@ fn catalog_of(generation: u64, document: &StoredDocument) -> DocumentCatalog {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::config::RepositoryKnowledgeSettings;
     use crate::knowledge::repository::reconcile::ReconcileOptions;
     use crate::knowledge::repository::root::{RootRequest, resolve_root};
     use crate::knowledge::repository::service::RefreshPolicy;
+    use crate::knowledge::repository::settings::RepositoryKnowledgeSettings;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;

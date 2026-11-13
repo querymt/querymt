@@ -33,7 +33,7 @@ use super::query::normalize_relative_path;
 use super::reconcile::ReconcileStatus;
 use super::service::{RepositoryService, ServiceError};
 use super::store::{IndexDiagnostic, MapData, MapFile, PurposeMatch};
-use crate::index::symbol_index::SymbolKind;
+use querymt_agent_index::symbol_index::SymbolKind;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use thiserror::Error;

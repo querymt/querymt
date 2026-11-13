@@ -42,7 +42,7 @@ use super::discovery::FileStamp;
 use super::document::{DiagnosticSeverity, DocumentDiagnostic, DocumentKind};
 use super::identity::NormalizedDocument;
 use super::purpose::PurposeRow;
-use crate::index::symbol_index::SymbolKind;
+use querymt_agent_index::symbol_index::SymbolKind;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;

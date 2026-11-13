@@ -29,7 +29,7 @@ use super::orientation::{CardOrigin, OrientationCard, OrientationRequest, Summar
 use super::path_knowledge::{PathCard, PathCardKind, PathKnowledgeRequest};
 use super::service::RepositoryService;
 use super::signals::EvidenceState;
-use crate::hooks::HookContextContribution;
+use querymt_agent_core::HookContextContribution;
 use serde_json::Value;
 use std::path::Path;
 
