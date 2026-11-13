@@ -33,8 +33,9 @@ description = "Single coder profile with opt-in repository knowledge retrieval a
 tags = ["coding", "single-agent", "knowledge"]
 
 [agent]
+cwd = "."
 provider = "anthropic"
-model = "claude-sonnet-4-5-20250929"
+model = "claude-sonnet-5-5"
 # Allowlists stay authoritative: the repository tools are usable only because
 # they are listed here. Delivery never adds tools.
 tools = [
