@@ -1,12 +1,15 @@
 # Prompts for scripts/kb-measure.sh. One per line.
+# The model runs with read-only tools, so every prompt is a question about the
+# code, never an implementation task.
+#
 # Concept questions the notes in crates/agent/knowledge cover (a card should appear):
 how does the execution loop retry transient provider errors?
 what does the orientation relevance gate require before a card is delivered
-make independent tool calls from one model response run at the same time but keep conflicting file writes ordered
-the model sometimes sends a json string where the tool schema declares an array, accept it safely
+how are tool calls from one model response run at the same time while conflicting file writes stay ordered
+the model sometimes sends a json string where the tool schema declares an array, where is that accepted and how is it kept safe
 how does a session get compacted and what triggers it
-# Prompts that should NOT get a card (cost of the feature must be ~zero here):
-fix the typo "recieve" in CHANGELOG.md
+# Prompts that should NOT get a card (the feature should cost ~nothing here):
+which file in this repository would hold a typo like "recieve" in the changelog
 write a short poem about autumn
 the system shall always respond within two seconds
-make sure the session is saved before the process exits
+how does the process make sure the session is saved before it exits
