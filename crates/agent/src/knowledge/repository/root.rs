@@ -150,14 +150,6 @@ impl ResolvedRoot {
     }
 }
 
-/// The shared QueryMT config directory (`QMT_CONFIG_DIR`, `QMT_HOME`, or
-/// `~/.qmt`), so the index location follows host overrides.
-pub fn default_config_dir() -> Result<PathBuf, RootError> {
-    querymt_utils::providers::config_dir().map_err(|e| RootError::Unavailable {
-        reason: format!("cannot resolve the QueryMT config directory: {e}"),
-    })
-}
-
 /// Resolve and authorize the knowledge root. Reads metadata only; never creates
 /// or modifies anything.
 pub fn resolve_root(request: &RootRequest<'_>) -> Result<ResolvedRoot, RootError> {

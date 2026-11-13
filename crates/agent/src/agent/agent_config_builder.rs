@@ -785,7 +785,6 @@ mod tests {
     #[tokio::test]
     async fn repository_tools_are_registered_only_when_the_feature_is_enabled() {
         use crate::config::RepositoryKnowledgeSettings;
-        use crate::knowledge::repository::RepositoryKnowledgeRegistry;
         use crate::tools::builtins::REPOSITORY_TOOL_NAMES;
 
         let names_of =
@@ -798,7 +797,7 @@ mod tests {
         }
 
         let registry =
-            RepositoryKnowledgeRegistry::from_settings(&RepositoryKnowledgeSettings::enabled());
+            crate::knowledge::host::registry_from_settings(&RepositoryKnowledgeSettings::enabled());
         assert!(registry.is_some());
         let (builder, _td) = make_builder().await;
         let enabled = builder.with_repository_knowledge(registry);
@@ -810,7 +809,7 @@ mod tests {
         // Disabling again removes them; disabled settings yield no registry.
         let (builder, _td) = make_builder().await;
         let registry =
-            RepositoryKnowledgeRegistry::from_settings(&RepositoryKnowledgeSettings::enabled());
+            crate::knowledge::host::registry_from_settings(&RepositoryKnowledgeSettings::enabled());
         let off = builder
             .with_repository_knowledge(registry)
             .with_repository_knowledge(None);
@@ -826,12 +825,11 @@ mod tests {
     #[tokio::test]
     async fn an_allowlist_of_repository_tools_keeps_session_memory_tools_unavailable() {
         use crate::config::{RepositoryKnowledgeSettings, ToolRef, ToolSpec};
-        use crate::knowledge::repository::RepositoryKnowledgeRegistry;
         use crate::tools::builtins::REPOSITORY_TOOL_NAMES;
 
         let (builder, _td) = make_builder().await;
         let config = builder
-            .with_repository_knowledge(RepositoryKnowledgeRegistry::from_settings(
+            .with_repository_knowledge(crate::knowledge::host::registry_from_settings(
                 &RepositoryKnowledgeSettings::enabled(),
             ))
             .with_allowed_tools(

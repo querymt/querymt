@@ -522,7 +522,6 @@ mod tests {
     #[tokio::test]
     async fn tool_context_propagates_repository_knowledge_only_when_set() {
         use crate::config::RepositoryKnowledgeSettings;
-        use crate::knowledge::repository::RepositoryKnowledgeRegistry;
         use crate::tools::context::ToolContext;
 
         let (runtime, runtime_ctx, handle) = make_context_parts().await;
@@ -544,7 +543,7 @@ mod tests {
         assert!(registry(&ctx).is_none(), "absent unless host-enabled");
 
         let enabled =
-            RepositoryKnowledgeRegistry::from_settings(&RepositoryKnowledgeSettings::enabled());
+            crate::knowledge::host::registry_from_settings(&RepositoryKnowledgeSettings::enabled());
         let ctx = ctx.with_repository_knowledge(enabled.clone());
         assert!(Arc::ptr_eq(
             &registry(&ctx).expect("propagated"),

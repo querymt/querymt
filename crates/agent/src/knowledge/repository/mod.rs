@@ -126,10 +126,10 @@ pub use references::{
     DocumentReference, LinkKind, RawLink, Reference, RejectReason, TargetStatus,
     document_references, extract_links, reference_diagnostics, resolve_reference, verify_local,
 };
-pub use registry::{BindingError, RepositoryKnowledgeRegistry};
+pub use registry::{BindingError, ConfigDirLookup, RepositoryKnowledgeRegistry};
 pub use root::{
-    CACHE_KEY_VERSION, ResolvedRoot, RootError, RootRequest, RootSource, default_config_dir,
-    find_git_root, resolve_root,
+    CACHE_KEY_VERSION, ResolvedRoot, RootError, RootRequest, RootSource, find_git_root,
+    resolve_root,
 };
 pub use scaffold::{
     DEFAULT_FILE_NAME, ScaffoldAction, ScaffoldPlan, ScaffoldReceipt, ScaffoldRequest,

@@ -19,7 +19,7 @@
 //!   resumes in another directory is bound to that directory's checkout.
 
 use super::reconcile::ReconcileOptions;
-use super::root::{ResolvedRoot, RootError, RootRequest, default_config_dir, resolve_root};
+use super::root::{ResolvedRoot, RootError, RootRequest, resolve_root};
 use super::service::{RefreshPolicy, RepositoryService, ServiceError};
 use crate::knowledge::repository::settings::RepositoryKnowledgeSettings;
 use std::collections::HashMap;
@@ -46,11 +46,25 @@ impl BindingError {
     }
 }
 
+/// Finds the host's shared config directory. Supplied by the host so this
+/// crate does not depend on how the host lays out its configuration; called
+/// lazily, when a checkout's index is first opened.
+pub type ConfigDirLookup = fn() -> Result<PathBuf, RootError>;
+
+/// Where indexes are placed.
+#[derive(Debug, Clone)]
+enum ConfigDir {
+    /// An explicit directory (hosts with their own layout, and tests).
+    Fixed(PathBuf),
+    /// The host's shared config directory, looked up on first open.
+    Lookup(ConfigDirLookup),
+}
+
 /// Lazily resolves and shares one [`RepositoryService`] per checkout.
 #[derive(Debug)]
 pub struct RepositoryKnowledgeRegistry {
     settings: RepositoryKnowledgeSettings,
-    config_dir: Option<PathBuf>,
+    config_dir: ConfigDir,
     policy: RefreshPolicy,
     services: Mutex<HashMap<String, Arc<RepositoryService>>>,
     /// Serializes opening, so two sessions reaching a new checkout together
@@ -85,32 +99,30 @@ impl Drop for WarmGuard {
 impl RepositoryKnowledgeRegistry {
     /// `Some` only when the host enabled repository knowledge. Disabled
     /// settings produce no registry, so nothing downstream can read or write
-    /// anything. Performs no filesystem access.
-    pub fn from_settings(settings: &RepositoryKnowledgeSettings) -> Option<Arc<Self>> {
-        settings.if_enabled().map(|settings| {
-            Arc::new(Self {
-                settings: settings.clone(),
-                config_dir: None,
-                policy: RefreshPolicy::default(),
-                services: Mutex::new(HashMap::new()),
-                open_lock: Mutex::new(()),
-                diagnostics: Default::default(),
-                warming: Mutex::new(HashMap::new()),
-            })
-        })
+    /// anything. Performs no filesystem access: `config_dir` is only called
+    /// when a checkout's index is first opened.
+    pub fn from_settings_with(
+        settings: &RepositoryKnowledgeSettings,
+        config_dir: ConfigDirLookup,
+    ) -> Option<Arc<Self>> {
+        Self::build(settings, ConfigDir::Lookup(config_dir))
     }
 
-    /// As [`from_settings`](Self::from_settings), placing indexes under
-    /// `config_dir` instead of the shared QueryMT config directory (hosts with
-    /// their own layout, and tests).
+    /// As [`from_settings_with`](Self::from_settings_with), placing indexes
+    /// under `config_dir` instead of the host's shared config directory (hosts
+    /// with their own layout, and tests).
     pub fn from_settings_in(
         settings: &RepositoryKnowledgeSettings,
         config_dir: PathBuf,
     ) -> Option<Arc<Self>> {
+        Self::build(settings, ConfigDir::Fixed(config_dir))
+    }
+
+    fn build(settings: &RepositoryKnowledgeSettings, config_dir: ConfigDir) -> Option<Arc<Self>> {
         settings.if_enabled().map(|settings| {
             Arc::new(Self {
                 settings: settings.clone(),
-                config_dir: Some(config_dir),
+                config_dir,
                 policy: RefreshPolicy::default(),
                 services: Mutex::new(HashMap::new()),
                 open_lock: Mutex::new(()),
@@ -157,8 +169,8 @@ impl RepositoryKnowledgeRegistry {
             return Ok(existing.clone());
         }
         let config_dir = match &self.config_dir {
-            Some(dir) => dir.clone(),
-            None => default_config_dir()?,
+            ConfigDir::Fixed(dir) => dir.clone(),
+            ConfigDir::Lookup(lookup) => lookup()?,
         };
         let index_path = root.index_path(&config_dir)?;
         // Opened outside the map lock so lookups for open checkouts never wait
@@ -369,42 +381,6 @@ mod tests {
         task.await.unwrap();
     }
 
-    /// Scenario "Config directory is overridden", on the production path: a
-    /// registry built without an explicit directory places the index under the
-    /// host's `QMT_CONFIG_DIR`, not a hardcoded home path.
-    #[test]
-    fn the_default_index_location_follows_the_host_config_dir() {
-        let fx = Fx::enabled();
-        let repo = fx.repo("repo");
-        let host_dir = fx.tmp.path().join("host-config");
-        fs::create_dir_all(&host_dir).unwrap();
-        // Canonical form, as the cache path is resolved (`/var` vs `/private/var`).
-        let host_dir = host_dir.canonicalize().unwrap();
-        let previous = std::env::var_os("QMT_CONFIG_DIR");
-        // SAFETY: nextest runs each test in its own process; the previous
-        // value is restored before returning.
-        unsafe { std::env::set_var("QMT_CONFIG_DIR", &host_dir) };
-        let registry =
-            RepositoryKnowledgeRegistry::from_settings(&RepositoryKnowledgeSettings::enabled())
-                .unwrap();
-        let opened = registry.service_for(Some(&repo)).map(|_| ());
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("QMT_CONFIG_DIR", value),
-                None => std::env::remove_var("QMT_CONFIG_DIR"),
-            }
-        }
-        opened.unwrap();
-        let expected = registry
-            .resolve(Some(&repo))
-            .unwrap()
-            .index_path(&host_dir)
-            .unwrap();
-        assert!(expected.starts_with(&host_dir));
-        assert!(expected.exists(), "index created under QMT_CONFIG_DIR");
-        assert!(!fx.config_exists(), "nothing under the fixture's own dir");
-    }
-
     #[test]
     fn prewarm_builds_only_configured_checkouts() {
         let fx = Fx::enabled();
@@ -468,8 +444,11 @@ mod tests {
     #[test]
     fn disabled_settings_produce_no_registry() {
         assert!(
-            RepositoryKnowledgeRegistry::from_settings(&RepositoryKnowledgeSettings::default())
-                .is_none()
+            RepositoryKnowledgeRegistry::from_settings_with(
+                &RepositoryKnowledgeSettings::default(),
+                || unreachable!("disabled settings never look up a directory"),
+            )
+            .is_none()
         );
     }
 
