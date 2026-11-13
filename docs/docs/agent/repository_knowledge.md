@@ -318,8 +318,10 @@ Rollback: set the stage flags (or `enabled`) to `false`.
 `crates/agent/examples/confs/repository_knowledge_coder.toml` is an opt-in coder profile. It lists the four `repo_knowledge_*` tools in its allowlist (browse with `repo_knowledge_list`, search with `_query`, fetch with `_get`), enables both delivery stages with the default budgets, and points at the maintenance example for `check`/`refresh`. A configuration test loads it and verifies the allowlist, delivery flags and rollback.
 
 ```bash
-cargo run --example from_config -- crates/agent/examples/confs/repository_knowledge_coder.toml
+cargo run -p querymt-agent --features oauth --example from_config -- crates/agent/examples/confs/repository_knowledge_coder.toml
 ```
+
+`--features oauth` is what lets the example use a stored OAuth login (`qmt auth login anthropic`). Without it the example is built with no OAuth support and falls back to a stored key or `ANTHROPIC_API_KEY`, which bills the API account. To compare the feature on and off, `scripts/kb-measure.sh` runs a prompt list in both arms and reports requests, tool calls and tokens; it builds with OAuth and runs without `ANTHROPIC_API_KEY`.
 
 **Rollback.** Set `[agent.repository_knowledge] enabled = false` (or remove the table). Delivery flags never enable the feature on their own, so both stages stop with it, the repository is no longer read, and prompts return to their previous form. To also discard the disposable index, delete only `<config_dir>/cache/knowledge/<checkout-key>/`. Committed Markdown, `.qmt/` files, `.agents/`, legacy knowledge and session history are unaffected.
 
