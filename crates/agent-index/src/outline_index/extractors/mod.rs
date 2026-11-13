@@ -6,9 +6,7 @@
 pub(crate) mod helpers;
 
 use super::common::{IndexOptions, OutlineError, Section};
-use crate::index::symbol_index::{
-    SymbolError, SymbolIndex, outline_projection::symbols_to_sections,
-};
+use crate::symbol_index::{SymbolError, SymbolIndex, outline_projection::symbols_to_sections};
 
 /// Extract an outline from source text for the given language.
 pub fn extract_outline(

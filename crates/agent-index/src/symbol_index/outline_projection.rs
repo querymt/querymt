@@ -1,5 +1,5 @@
-use crate::index::outline_index::common::{IndexOptions, Section, SkeletonEntry};
-use crate::index::symbol_index::{SymbolEntry, SymbolKind};
+use crate::outline_index::common::{IndexOptions, Section, SkeletonEntry};
+use crate::symbol_index::{SymbolEntry, SymbolKind};
 
 pub fn symbols_to_sections(symbols: &[SymbolEntry], options: &IndexOptions) -> Vec<Section> {
     let mut package = Vec::new();

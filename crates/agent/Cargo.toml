@@ -40,6 +40,7 @@ querymt-remote = { path = "../querymt-remote" }
 querymt-provider-common = { path = "../provider-common" }
 querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "secret-store"] }
 querymt-agent-core = { path = "../agent-core" }
+querymt-agent-index = { path = "../agent-index" }
 agent-client-protocol = { version = "2.0", features = ["unstable"] }
 kameo = "0.22"
 rmp-serde = "1.3"
@@ -61,7 +62,6 @@ rusqlite = { version = "0.41", features = ["bundled", "uuid", "time"] }
 time = { version = "0.3", features = ["serde", "formatting", "macros", "local-offset"] }
 uuid = { version = "1.18", features = ["v4", "v5", "v7"] }
 url.workspace = true
-rapidhash = "4.2" # still used by index/function_index/fingerprint.rs
 rand = "0.10"
 ignore = "0.4.25"
 notify = "8"
@@ -121,43 +121,6 @@ opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
 opentelemetry-semantic-conventions = { version = "0.32", features = ["semconv_experimental"] }
 tracing-opentelemetry = "0.33"
-
-# Code similarity detection (local fork with tree-sitter 0.26)
-similarity-core = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
-similarity-rs = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
-similarity-py = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
-
-# Tree-sitter grammars for the `index` tool (outline extraction).
-# These crates are already compiled transitively via similarity-*; listing them
-# here lets outline_index use the raw tree-sitter API directly.
-tree-sitter = "0.26"
-tree-sitter-rust = "0.24"
-tree-sitter-python = "0.25"
-tree-sitter-typescript = "0.23"
-tree-sitter-go = "0.25"
-tree-sitter-java = "0.23"
-tree-sitter-c = "0.24"
-tree-sitter-cpp = "0.23"
-tree-sitter-c-sharp = "0.23"
-tree-sitter-ruby = "0.23"
-tree-sitter-elixir = "0.3"
-tree-sitter-nix = "0.3"
-tree-sitter-lua = "0.5"
-tree-sitter-svelte-ng = "1.0"
-tree-sitter-bash = "0.25"
-tree-sitter-php = "0.25"
-# crates.io tree-sitter-kotlin 0.3.x pins tree-sitter 0.20, whose C runtime
-# (linked globally via build-script flags) breaks the tree-sitter 0.26 runtime
-# already in the graph. Master binds via tree-sitter-language only.
-tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", rev = "d6af96d2e23ef0a8ff5ab512864378cf08fba311" }
-tree-sitter-swift = "0.7"
-tree-sitter-json = "0.24"
-tree-sitter-yaml = "0.7"
-tree-sitter-toml-ng = "0.7"
-tree-sitter-md = "0.5"
-
-# Rust AST parsing for rich structural fingerprinting during function indexing
-syn = { version = "2", features = ["full", "visit"] }
 
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tempfile = "3.0"

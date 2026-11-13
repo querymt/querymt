@@ -1,4 +1,4 @@
-use crate::hash::RapidHash;
+use querymt_agent_core::hash::RapidHash;
 
 /// A compact digest of a symbol's body content for change detection.
 #[derive(Debug, Clone, PartialEq, Eq)]

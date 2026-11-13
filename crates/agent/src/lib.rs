@@ -32,7 +32,7 @@ pub mod events;
 pub mod export;
 pub use querymt_agent_core::hash;
 pub mod hooks;
-pub mod index;
+pub use querymt_agent_index as index;
 pub mod knowledge;
 pub mod middleware;
 pub mod model;

@@ -4,7 +4,7 @@ mod types;
 
 use std::path::Path;
 
-use crate::index::outline_index::common::get_language_for_extension;
+use crate::outline_index::common::get_language_for_extension;
 
 pub use types::{SymbolDigest, SymbolEntry, SymbolKind, parse_kind_filter};
 
