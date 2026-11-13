@@ -141,14 +141,12 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
     if agent.config.workspace_service().is_some() {
         methods.push("querymt/worktree/handoff".to_string());
     }
-    if let Some(speech) = agent.config.speech_service() {
-        methods.push("querymt/speech/listProfiles".to_string());
-        if speech.supports(crate::config::SpeechOperation::Transcription) {
-            methods.push("querymt/speech/transcribe".to_string());
-        }
-        if speech.supports(crate::config::SpeechOperation::Synthesis) {
-            methods.push("querymt/speech/synthesize".to_string());
-        }
+    if agent.config.speech_service().is_some() || agent.profiles().is_some() {
+        methods.extend([
+            "querymt/speech/listProfiles".to_string(),
+            "querymt/speech/transcribe".to_string(),
+            "querymt/speech/synthesize".to_string(),
+        ]);
     }
 
     if agent.profiles().is_some() {

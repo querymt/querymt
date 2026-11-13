@@ -1,4 +1,4 @@
-use super::utils::ext_json_response;
+use super::utils::{ext_json_response, format_prefixed_error_chain};
 use super::*;
 use crate::error::AgentError;
 use crate::speech::{SpeechError, TranscribeAudio};
@@ -9,6 +9,8 @@ use typeshare::typeshare;
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct ListProfilesRequest {
+    session_id: Option<String>,
+    profile_id: Option<String>,
     #[serde(default)]
     operation: Option<String>,
 }
@@ -17,6 +19,8 @@ struct ListProfilesRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TranscribeRequest {
+    session_id: Option<String>,
+    profile_id: Option<String>,
     #[serde(default)]
     profile: Option<String>,
     audio: TranscribeAudio,
@@ -30,6 +34,8 @@ struct TranscribeRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SynthesizeRequest {
+    session_id: Option<String>,
+    profile_id: Option<String>,
     #[serde(default)]
     profile: Option<String>,
     text: String,
@@ -44,33 +50,78 @@ struct SynthesizeRequest {
 }
 
 impl LocalAgentHandle {
-    fn speech_service(&self) -> Result<std::sync::Arc<crate::speech::SpeechService>, Error> {
-        self.config
-            .speech_service()
-            .ok_or_else(Error::method_not_found)
+    async fn scoped_speech_service(
+        &self,
+        session_id: Option<&str>,
+        profile_id: Option<&str>,
+    ) -> Result<Option<Arc<crate::speech::SpeechService>>, Error> {
+        match (session_id, profile_id) {
+            (Some(_), Some(_)) => {
+                Err(Error::invalid_params().data("provide sessionId or profileId, not both"))
+            }
+            // Profile construction futures are large; keep them off the ACP request stack.
+            (Some(session_id), None) => {
+                match Box::pin(self.bound_session_handle(session_id)).await? {
+                    Some((handle, _)) => Ok(handle
+                        .as_any()
+                        .downcast_ref::<LocalAgentHandle>()
+                        .and_then(|host| host.config.speech_service())),
+                    None => Ok(self.config.speech_service()),
+                }
+            }
+            (None, Some(profile_id)) => {
+                let profiles = self
+                    .profiles()
+                    .ok_or_else(|| Error::invalid_params().data("profiles are not configured"))?;
+                let runtime = Box::pin(profiles.runtime_for_profile(profile_id))
+                    .await
+                    .map_err(|error| {
+                        Error::invalid_params().data(serde_json::json!({
+                            "message": format_prefixed_error_chain("Failed to load profile", &error),
+                            "profileId": profile_id,
+                        }))
+                    })?;
+                Ok(runtime.agent().handle().config.speech_service())
+            }
+            (None, None) => Ok(self.config.speech_service()),
+        }
     }
 
     pub(super) async fn handle_ext_speech_list_profiles(
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let service = self.speech_service()?;
         let parsed: ListProfilesRequest =
             serde_json::from_str(req.params.get()).map_err(|error| {
                 Error::invalid_params().data(format!("invalid speech listProfiles params: {error}"))
             })?;
-        ext_json_response(&service.list_profiles(parsed.operation.as_deref()))
+        let service = self
+            .scoped_speech_service(parsed.session_id.as_deref(), parsed.profile_id.as_deref())
+            .await?;
+        let response = service
+            .map(|service| service.list_profiles(parsed.operation.as_deref()))
+            .unwrap_or(crate::speech::ListProfilesResponse {
+                profiles: Vec::new(),
+                defaults: crate::speech::SpeechDefaults {
+                    transcription: None,
+                    synthesis: None,
+                },
+            });
+        ext_json_response(&response)
     }
 
     pub(super) async fn handle_ext_speech_transcribe(
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let service = self.speech_service()?;
         let parsed: TranscribeRequest =
             serde_json::from_str(req.params.get()).map_err(|error| {
                 Error::invalid_params().data(format!("invalid speech transcribe params: {error}"))
             })?;
+        let service = self
+            .scoped_speech_service(parsed.session_id.as_deref(), parsed.profile_id.as_deref())
+            .await?
+            .ok_or_else(Error::method_not_found)?;
         let response = service
             .transcribe(
                 parsed.profile.as_deref(),
@@ -87,11 +138,14 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let service = self.speech_service()?;
         let parsed: SynthesizeRequest =
             serde_json::from_str(req.params.get()).map_err(|error| {
                 Error::invalid_params().data(format!("invalid speech synthesize params: {error}"))
             })?;
+        let service = self
+            .scoped_speech_service(parsed.session_id.as_deref(), parsed.profile_id.as_deref())
+            .await?
+            .ok_or_else(Error::method_not_found)?;
         let response = service
             .synthesize(
                 parsed.profile.as_deref(),

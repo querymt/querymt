@@ -117,13 +117,6 @@ impl SpeechService {
         }))
     }
 
-    pub fn supports(&self, operation: SpeechOperation) -> bool {
-        self.config
-            .profiles
-            .iter()
-            .any(|profile| profile.operation == operation)
-    }
-
     pub fn list_profiles(&self, operation: Option<&str>) -> ListProfilesResponse {
         let profiles = self
             .config

@@ -118,6 +118,149 @@ async fn speech_fixture_with(
     }
 }
 
+async fn attach_speech_profiles(f: &SpeechExtFixture) -> Arc<ProfileRuntimeManager> {
+    let plain = "[agent]\nprovider = 'mock'\nmodel = 'mock-model'\ntools = []\n";
+    let speech = format!(
+        r#"{plain}
+[speech]
+default_transcription = "local-stt"
+default_synthesis = "local-tts"
+[[speech.profiles]]
+id = "local-stt"
+provider = "mock"
+model = "mock-model"
+[[speech.profiles]]
+id = "local-tts"
+provider = "mock"
+model = "mock-tts"
+operation = "synthesis"
+"#
+    );
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+        crate::profiles::LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .include_default_user_dir(false)
+            .embedded_config_toml("speech", "Speech", None, speech)
+            .embedded_config_toml("plain", "Plain", None, plain)
+            .build(),
+    );
+    let storage = Arc::new(
+        crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+            .await
+            .unwrap(),
+    );
+    let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        catalog,
+        "plain",
+        AgentInfra {
+            plugin_registry: f.handle.config.provider.plugin_registry(),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        },
+    ));
+    f.handle.set_profiles(profiles.clone());
+    profiles
+}
+
+#[tokio::test]
+async fn speech_routes_to_session_and_profile_without_startup_speech() {
+    let f = speech_fixture_with(
+        mixed_speech_config(),
+        false,
+        Some("scoped text"),
+        Some(b"audio"),
+    )
+    .await;
+    let profiles = attach_speech_profiles(&f).await;
+    profiles
+        .bind_session_to_profile("bound", "speech")
+        .await
+        .unwrap();
+    for scope in [
+        serde_json::json!({"profileId":"speech"}),
+        serde_json::json!({"sessionId":"bound"}),
+    ] {
+        let listed = ext_method_json(&f.handle, "querymt/speech/listProfiles", scope.clone()).await;
+        assert_eq!(listed["profiles"].as_array().unwrap().len(), 2);
+        assert_eq!(listed["defaults"]["transcription"], "local-stt");
+        let mut params = scope.clone();
+        params["audio"] = audio_params("aGVsbG8=", "audio/wav")["audio"].clone();
+        let result = ext_method_json(&f.handle, "querymt/speech/transcribe", params).await;
+        assert_eq!(result["text"], "scoped text");
+        let mut params = scope;
+        params["text"] = "hello".into();
+        let result = ext_method_json(&f.handle, "querymt/speech/synthesize", params).await;
+        assert_eq!(result["audio"]["data"], "YXVkaW8=");
+    }
+    let caps = crate::control::capabilities::get_capabilities(&f.handle);
+    for method in [
+        "querymt/speech/listProfiles",
+        "querymt/speech/transcribe",
+        "querymt/speech/synthesize",
+    ] {
+        assert!(caps.methods.iter().any(|available| available == method));
+    }
+    profiles.shutdown().await;
+}
+
+#[tokio::test]
+async fn speech_scopes_do_not_borrow_startup_service_when_bound_profile_has_none() {
+    let f = speech_fixture(true, None).await;
+    let profiles = attach_speech_profiles(&f).await;
+    profiles
+        .bind_session_to_profile("plain-session", "plain")
+        .await
+        .unwrap();
+    for scope in [
+        serde_json::json!({"profileId":"plain"}),
+        serde_json::json!({"sessionId":"plain-session"}),
+    ] {
+        let listed = ext_method_json(&f.handle, "querymt/speech/listProfiles", scope.clone()).await;
+        assert_eq!(listed, serde_json::json!({"profiles":[], "defaults":{}}));
+        let mut params = scope;
+        params["audio"] = audio_params("aGVsbG8=", "audio/wav")["audio"].clone();
+        params["text"] = "hello".into();
+        for method in ["querymt/speech/transcribe", "querymt/speech/synthesize"] {
+            let error = f
+                .handle
+                .ext_method(crate::acp::protocol::ExtRequest::new(
+                    method,
+                    raw_params(&params.to_string()),
+                ))
+                .await
+                .expect_err("bound profile has no speech");
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::MethodNotFound);
+        }
+    }
+    let listed = ext_method_json(
+        &f.handle,
+        "querymt/speech/listProfiles",
+        serde_json::json!({"sessionId":"unbound"}),
+    )
+    .await;
+    assert_eq!(
+        listed["profiles"].as_array().unwrap().len(),
+        1,
+        "unbound session falls back to startup config"
+    );
+    for scope in [
+        serde_json::json!({"profileId":"missing"}),
+        serde_json::json!({"sessionId":"plain-session","profileId":"speech"}),
+    ] {
+        let error = f
+            .handle
+            .ext_method(crate::acp::protocol::ExtRequest::new(
+                "querymt/speech/listProfiles",
+                raw_params(&scope.to_string()),
+            ))
+            .await
+            .expect_err("invalid scope must not silently use startup speech");
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+    }
+    profiles.shutdown().await;
+}
+
 #[tokio::test]
 async fn list_profiles_returns_configured_profiles() {
     let f = speech_fixture(true, None).await;
@@ -319,16 +462,28 @@ async fn synthesize_rejects_transcription_profile() {
 #[tokio::test]
 async fn speech_methods_are_absent_without_config() {
     let f = speech_fixture(false, None).await;
-    for method in [
+    let listed = ext_method_json(
+        &f.handle,
         "querymt/speech/listProfiles",
-        "querymt/speech/transcribe",
-        "querymt/speech/synthesize",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(listed, serde_json::json!({"profiles":[], "defaults":{}}));
+    for (method, params) in [
+        (
+            "querymt/speech/transcribe",
+            audio_params("aGVsbG8=", "audio/wav"),
+        ),
+        (
+            "querymt/speech/synthesize",
+            serde_json::json!({"text":"hello"}),
+        ),
     ] {
         let err = f
             .handle
             .ext_method(crate::acp::protocol::ExtRequest::new(
                 method,
-                raw_params("{}"),
+                raw_params(&params.to_string()),
             ))
             .await
             .expect_err("unconfigured speech should be method not found");
@@ -358,8 +513,7 @@ async fn speech_methods_are_advertised_when_configured() {
             .any(|method| method == "querymt/speech/transcribe")
     );
     assert!(
-        !caps
-            .methods
+        caps.methods
             .iter()
             .any(|method| method == "querymt/speech/synthesize")
     );
