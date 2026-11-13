@@ -820,6 +820,52 @@ mod tests {
         }
     }
 
+    /// Scenario "Profile allowlists only repository tools": with an allowlist
+    /// naming only the repository tools, those are registered and allowed at
+    /// runtime, while the registered session-memory tools stay unavailable.
+    #[tokio::test]
+    async fn an_allowlist_of_repository_tools_keeps_session_memory_tools_unavailable() {
+        use crate::config::{RepositoryKnowledgeSettings, ToolRef, ToolSpec};
+        use crate::knowledge::repository::RepositoryKnowledgeRegistry;
+        use crate::tools::builtins::REPOSITORY_TOOL_NAMES;
+
+        let (builder, _td) = make_builder().await;
+        let config = builder
+            .with_repository_knowledge(RepositoryKnowledgeRegistry::from_settings(
+                &RepositoryKnowledgeSettings::enabled(),
+            ))
+            .with_allowed_tools(
+                REPOSITORY_TOOL_NAMES
+                    .iter()
+                    .map(|name| ToolSpec::Builtin(name.to_string())),
+            )
+            .build();
+
+        for name in REPOSITORY_TOOL_NAMES {
+            assert!(
+                config.tool_registry.find(name).is_some(),
+                "{name} registered"
+            );
+            assert!(
+                config.is_tool_allowed(ToolRef::builtin(name)),
+                "{name} allowed"
+            );
+        }
+        for name in [
+            "knowledge_query",
+            "knowledge_list_unconsolidated",
+            "knowledge_stats",
+            "knowledge_ingest",
+            "knowledge_consolidate",
+        ] {
+            assert!(
+                !config.is_tool_allowed(ToolRef::builtin(name)),
+                "{name} must stay unavailable"
+            );
+        }
+        assert!(crate::agent::repository_delivery::policy_applies(&config));
+    }
+
     // ── Builder setters ─────────────────────────────────────────────────────
 
     #[tokio::test]

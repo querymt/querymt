@@ -2,8 +2,11 @@
 //!
 //! A [`RepositoryKnowledgeRegistry`] is created once from host settings (and
 //! only when the feature is enabled). It does **nothing** at construction: no
-//! root is resolved, no directory is created and no index is opened. The first
-//! tool call for a session resolves the root from that session's *effective*
+//! root is resolved, no directory is created and no index is opened. When an
+//! automatic delivery stage is enabled, session creation pre-warms the index
+//! of a checkout that has a manifest ([`RepositoryKnowledgeRegistry::prewarm`]);
+//! otherwise the first tool call for a session resolves the root from that
+//! session's *effective*
 //! working directory (the bound worktree for isolated sessions), authorizes it
 //! against the host allowlist, and opens or reuses the checkout's service.
 //!
@@ -55,6 +58,28 @@ pub struct RepositoryKnowledgeRegistry {
     open_lock: Mutex<()>,
     /// Local, in-memory delivery counters for this registry only.
     diagnostics: super::diagnostics::DeliveryDiagnostics,
+    /// Session-start warm-ups requested and not yet finished, per checkout.
+    warming: Mutex<HashMap<String, usize>>,
+}
+
+/// Marks one checkout as being warmed until dropped. See
+/// [`RepositoryKnowledgeRegistry::track_warming`].
+#[derive(Debug)]
+pub struct WarmGuard {
+    registry: Arc<RepositoryKnowledgeRegistry>,
+    key: String,
+}
+
+impl Drop for WarmGuard {
+    fn drop(&mut self) {
+        let mut warming = self.registry.warming();
+        if let Some(count) = warming.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                warming.remove(&self.key);
+            }
+        }
+    }
 }
 
 impl RepositoryKnowledgeRegistry {
@@ -70,6 +95,7 @@ impl RepositoryKnowledgeRegistry {
                 services: Mutex::new(HashMap::new()),
                 open_lock: Mutex::new(()),
                 diagnostics: Default::default(),
+                warming: Mutex::new(HashMap::new()),
             })
         })
     }
@@ -89,6 +115,7 @@ impl RepositoryKnowledgeRegistry {
                 services: Mutex::new(HashMap::new()),
                 open_lock: Mutex::new(()),
                 diagnostics: Default::default(),
+                warming: Mutex::new(HashMap::new()),
             })
         })
     }
@@ -144,6 +171,70 @@ impl RepositoryKnowledgeRegistry {
         )?);
         self.lock().insert(key, opened.clone());
         Ok(opened)
+    }
+
+    /// Build or reconcile the index for the checkout containing `cwd` ahead of
+    /// the first prompt, so automatic delivery does not hit a cold index at
+    /// its deadline. Does nothing (no directory created, nothing opened) when
+    /// the root cannot be resolved or the checkout has no manifest, so an
+    /// unconfigured repository is never crawled. Blocking; run it off the
+    /// async executor. Returns whether a refresh ran.
+    pub fn prewarm(&self, cwd: &Path) -> bool {
+        let Ok(root) = self.resolve(Some(cwd)) else {
+            return false;
+        };
+        if !root
+            .root()
+            .join(super::manifest::MANIFEST_RELATIVE_PATH)
+            .is_file()
+        {
+            return false;
+        }
+        match self.service_for(Some(cwd)) {
+            Ok(service) => service.refresh().is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Start [`prewarm`](Self::prewarm) on the blocking pool. The warm-up is
+    /// counted from this call, not from when the pool runs it, so a prompt
+    /// that arrives right away already sees it ([`is_warming`](Self::is_warming)).
+    /// Must be called inside a Tokio runtime.
+    pub fn spawn_prewarm(self: &Arc<Self>, cwd: PathBuf) {
+        let guard = self.track_warming(&cwd);
+        let registry = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            registry.prewarm(&cwd)
+        });
+    }
+
+    /// Mark the checkout containing `cwd` as being warmed until the returned
+    /// guard is dropped. `None` when the root cannot be resolved, which
+    /// leaves nothing to wait for.
+    pub fn track_warming(self: &Arc<Self>, cwd: &Path) -> Option<WarmGuard> {
+        let key = self.resolve(Some(cwd)).ok()?.cache_key();
+        *self.warming().entry(key.clone()).or_default() += 1;
+        Some(WarmGuard {
+            registry: self.clone(),
+            key,
+        })
+    }
+
+    /// A session-start warm-up of the checkout containing `cwd` is still
+    /// running. Automatic delivery for a first prompt then waits for it longer
+    /// than it otherwise would, since a cold build is the one case that
+    /// legitimately outlasts the usual deadline. Other checkouts' warm-ups
+    /// never count.
+    pub fn is_warming(&self, cwd: Option<&Path>) -> bool {
+        let Some(key) = self.resolve(cwd).ok().map(|root| root.cache_key()) else {
+            return false;
+        };
+        self.warming().contains_key(&key)
+    }
+
+    fn warming(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
+        self.warming.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The already-open service for the checkout containing `cwd`. Never
@@ -274,6 +365,102 @@ mod tests {
         // A lagged/closed channel never panics; closing ends the task.
         drop(tx);
         task.await.unwrap();
+    }
+
+    /// Scenario "Config directory is overridden", on the production path: a
+    /// registry built without an explicit directory places the index under the
+    /// host's `QMT_CONFIG_DIR`, not a hardcoded home path.
+    #[test]
+    fn the_default_index_location_follows_the_host_config_dir() {
+        let fx = Fx::enabled();
+        let repo = fx.repo("repo");
+        let host_dir = fx.tmp.path().join("host-config");
+        fs::create_dir_all(&host_dir).unwrap();
+        // Canonical form, as the cache path is resolved (`/var` vs `/private/var`).
+        let host_dir = host_dir.canonicalize().unwrap();
+        let previous = std::env::var_os("QMT_CONFIG_DIR");
+        // SAFETY: nextest runs each test in its own process; the previous
+        // value is restored before returning.
+        unsafe { std::env::set_var("QMT_CONFIG_DIR", &host_dir) };
+        let registry =
+            RepositoryKnowledgeRegistry::from_settings(&RepositoryKnowledgeSettings::enabled())
+                .unwrap();
+        let opened = registry.service_for(Some(&repo)).map(|_| ());
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("QMT_CONFIG_DIR", value),
+                None => std::env::remove_var("QMT_CONFIG_DIR"),
+            }
+        }
+        opened.unwrap();
+        let expected = registry
+            .resolve(Some(&repo))
+            .unwrap()
+            .index_path(&host_dir)
+            .unwrap();
+        assert!(expected.starts_with(&host_dir));
+        assert!(expected.exists(), "index created under QMT_CONFIG_DIR");
+        assert!(!fx.config_exists(), "nothing under the fixture's own dir");
+    }
+
+    #[test]
+    fn prewarm_builds_only_configured_checkouts() {
+        let fx = Fx::enabled();
+        let bare = fx.repo("bare");
+        assert!(!fx.registry.prewarm(&bare), "no manifest: nothing to warm");
+        assert_eq!(fx.registry.open_services(), 0);
+        assert!(
+            !fx.config_exists(),
+            "an unconfigured checkout creates no cache"
+        );
+
+        let repo = fx.repo("repo");
+        fs::create_dir_all(repo.join(".qmt")).unwrap();
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(
+            repo.join(".qmt/knowledge.toml"),
+            "version = 1\n[documents]\ninclude = [\"docs/**/*.md\"]\n",
+        )
+        .unwrap();
+        fs::write(repo.join("docs/a.md"), "# A\nbody\n").unwrap();
+        assert!(fx.registry.prewarm(&repo.join("docs")));
+        let service = fx.registry.open_service_for(&repo).expect("opened");
+        assert_eq!(service.store().counts().unwrap().documents, 1);
+        assert!(
+            !repo.join(".qmt/cache").exists(),
+            "nothing written into the repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_requested_warm_up_is_visible_until_it_finishes() {
+        let fx = Fx::enabled();
+        let repo = fx.repo("repo");
+        fs::create_dir_all(repo.join(".qmt")).unwrap();
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(
+            repo.join(".qmt/knowledge.toml"),
+            "version = 1\n[documents]\ninclude = [\"docs/**/*.md\"]\n",
+        )
+        .unwrap();
+        fs::write(repo.join("docs/a.md"), "# A\nbody\n").unwrap();
+
+        let other = fx.repo("other");
+        assert!(!fx.registry.is_warming(Some(&repo)));
+        fx.registry.spawn_prewarm(repo.clone());
+        assert!(
+            fx.registry.is_warming(Some(&repo.join("docs"))),
+            "visible before the pool runs it, from anywhere in the checkout"
+        );
+        assert!(
+            !fx.registry.is_warming(Some(&other)),
+            "another checkout is not affected"
+        );
+        let registry = fx.registry.clone();
+        let watched = repo.clone();
+        assert!(wait_for(move || !registry.is_warming(Some(&watched))).await);
+        let service = fx.registry.open_service_for(&repo).expect("opened");
+        assert_eq!(service.store().counts().unwrap().documents, 1);
     }
 
     #[test]

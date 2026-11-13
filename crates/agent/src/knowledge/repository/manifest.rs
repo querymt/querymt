@@ -17,6 +17,9 @@
 //!
 //! [orientation]
 //! entrypoints = ["docs/architecture/README.md#Repository map"]
+//! # Indexed and retrievable, but never attached to a prompt or an `index`
+//! # result on its own (e.g. normative specs that read like any request).
+//! retrieval_only = ["openspec/specs/**"]
 //! ```
 //!
 //! Only `<root>/.qmt/knowledge.toml` is ever read. `.agents/knowledge.toml` is
@@ -115,6 +118,9 @@ pub struct KnowledgeManifest {
     pub documents: SourceSelection,
     pub code: SourceSelection,
     pub entrypoints: Vec<Entrypoint>,
+    /// Documents that explicit retrieval serves but automatic delivery never
+    /// attaches. Only the `include` side is used.
+    pub retrieval_only: SourceSelection,
 }
 
 /// A reviewed orientation entrypoint: a stable document ID or a repository-
@@ -204,6 +210,8 @@ struct RawSelection {
 struct RawOrientation {
     #[serde(default)]
     entrypoints: Vec<String>,
+    #[serde(default)]
+    retrieval_only: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,8 +340,19 @@ impl KnowledgeManifest {
         let documents = SourceSelection::compile("documents", raw.documents.unwrap_or_else(empty))?;
         let code = SourceSelection::compile("code", raw.code.unwrap_or_else(empty))?;
 
+        let orientation = raw.orientation.unwrap_or(RawOrientation {
+            entrypoints: Vec::new(),
+            retrieval_only: Vec::new(),
+        });
+        let retrieval_only = SourceSelection::compile(
+            "orientation",
+            RawSelection {
+                include: orientation.retrieval_only,
+                exclude: Vec::new(),
+            },
+        )?;
         let mut entrypoints: Vec<Entrypoint> = Vec::new();
-        for entry in raw.orientation.map(|o| o.entrypoints).unwrap_or_default() {
+        for entry in orientation.entrypoints {
             let parsed = parse_entrypoint(&entry)?;
             if !entrypoints.contains(&parsed) {
                 entrypoints.push(parsed);
@@ -344,6 +363,7 @@ impl KnowledgeManifest {
             documents,
             code,
             entrypoints,
+            retrieval_only,
         })
     }
 }
@@ -408,6 +428,20 @@ mod tests {
 
     fn err_code(content: &str) -> &'static str {
         KnowledgeManifest::parse(content).unwrap_err().code()
+    }
+
+    #[test]
+    fn retrieval_only_documents_are_a_validated_glob_list() {
+        let m = parse(
+            "version = 1\n[documents]\ninclude = [\"**/*.md\"]\n[orientation]\nretrieval_only = [\"specs/**\"]\n",
+        );
+        assert!(m.retrieval_only.is_selected("specs/a/spec.md"));
+        assert!(!m.retrieval_only.is_selected("docs/a.md"));
+        assert!(parse("version = 1\n").retrieval_only.is_empty());
+        assert_eq!(
+            err_code("version = 1\n[orientation]\nretrieval_only = [\"../x\"]\n"),
+            "manifest_invalid_pattern"
+        );
     }
 
     #[test]

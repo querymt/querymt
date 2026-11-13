@@ -352,6 +352,9 @@ pub struct StatsReport {
     /// Diagnostic counts by stable code.
     pub diagnostics: BTreeMap<String, usize>,
     pub coverage: Vec<IndexDiagnostic>,
+    /// Indexed documents by evidence state (`unverified`, `unchanged`,
+    /// `changed`, `missing`). States with no documents are omitted.
+    pub evidence: BTreeMap<&'static str, usize>,
 }
 
 impl RepositoryService {
@@ -683,6 +686,14 @@ impl RepositoryService {
             .iter()
             .filter(|s| s.is_document && !s.has_document)
             .count();
+        let (_, corpus) = self.store().corpus().map_err(ServiceError::unavailable)?;
+        let mut cache = super::evidence::DependencyCache::default();
+        let mut evidence: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for entry in &corpus {
+            let document =
+                super::evidence::evaluate_document(self.root().root(), entry, &mut cache);
+            *evidence.entry(document.state.as_str()).or_default() += 1;
+        }
         Ok(StatsReport {
             generation: state.generation,
             status: report.status,
@@ -698,6 +709,7 @@ impl RepositoryService {
             coverage_complete: state.coverage.is_empty(),
             diagnostics,
             coverage: state.coverage,
+            evidence,
         })
     }
 }
@@ -1341,5 +1353,43 @@ pub(super) mod tests {
         assert!(!stats.diagnostics.is_empty());
         assert_eq!(stats.index_format, SCHEMA_VERSION);
         assert!(stats.generation > 0);
+        assert_eq!(stats.evidence.get("unverified"), Some(&1));
+    }
+
+    /// Scenario "Inspect corpus availability": changed-evidence documents are
+    /// distinguishable from indexed, unverified ones.
+    #[test]
+    fn stats_count_documents_by_evidence_state() {
+        use crate::knowledge::repository::acknowledge::{AcknowledgeRequest, Selection};
+        let fx = Fx::new();
+        fx.put("src/lib.rs", "pub fn run() {}\n");
+        fx.put(
+            "docs/arch.md",
+            "---\nknowledge_sources: src/lib.rs\n---\n# Arch\nRuns things.\n",
+        );
+        fx.put("docs/other.md", "# Other\nx\n");
+        fx.service.refresh().unwrap();
+        let plan = fx
+            .service
+            .plan_acknowledge(&AcknowledgeRequest {
+                document: "docs/arch.md".into(),
+                selection: Selection::WholeDocument,
+            })
+            .unwrap();
+        fx.service.apply_acknowledge(&plan).unwrap();
+        let stats = fx.service.stats().unwrap();
+        assert_eq!(stats.evidence.get("unchanged"), Some(&1));
+        assert_eq!(stats.evidence.get("unverified"), Some(&1));
+
+        fx.put("src/lib.rs", "pub fn run() { other() }\n");
+        let stats = fx.service.stats().unwrap();
+        assert_eq!(
+            stats.evidence.get("changed"),
+            Some(&1),
+            "{:?}",
+            stats.evidence
+        );
+        assert_eq!(stats.evidence.get("unverified"), Some(&1));
+        assert_eq!(stats.evidence.get("unchanged"), None);
     }
 }

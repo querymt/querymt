@@ -224,6 +224,26 @@ impl RepositoryService {
         )
     }
 
+    /// Wait until no refresh is running, polling, and give up at `until`.
+    /// Returns whether the service became idle in time. Automatic delivery
+    /// uses this instead of skipping on the first sight of a refresh: a warm
+    /// reconcile by a parallel caller finishes in milliseconds, while a cold
+    /// build still makes the caller give up at its deadline rather than queue
+    /// an unbounded number of blocked selections behind it.
+    pub fn wait_until_idle(&self, until: std::time::Instant) -> bool {
+        const POLL: Duration = Duration::from_millis(5);
+        loop {
+            if !self.is_refreshing() {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= until {
+                return false;
+            }
+            std::thread::sleep(POLL.min(until - now));
+        }
+    }
+
     /// Attempts bounding refresh, revalidation and retrieval retries.
     pub(super) fn attempts(&self) -> u32 {
         self.policy.max_attempts.max(1)
@@ -914,6 +934,32 @@ mod tests {
             .unwrap();
         assert_eq!(seen, Some(true), "visible from inside a refresh");
         assert!(!fx.service.is_refreshing(), "released afterwards");
+    }
+
+    #[test]
+    fn waiting_for_idle_returns_once_a_refresh_ends_and_gives_up_at_the_deadline() {
+        let fx = Fx::new();
+        let soon = || std::time::Instant::now() + Duration::from_secs(5);
+        assert!(fx.service.wait_until_idle(soon()), "idle immediately");
+
+        // A short refresh in progress: the waiter sees it end.
+        std::thread::scope(|scope| {
+            let guard = fx.service.refresh_lock.lock().unwrap();
+            let waiter = scope.spawn(|| fx.service.wait_until_idle(soon()));
+            std::thread::sleep(Duration::from_millis(30));
+            drop(guard);
+            assert!(waiter.join().unwrap(), "became idle before the deadline");
+        });
+
+        // A refresh that outlasts the deadline: the waiter gives up.
+        let guard = fx.service.refresh_lock.lock().unwrap();
+        let started = std::time::Instant::now();
+        assert!(
+            !fx.service
+                .wait_until_idle(started + Duration::from_millis(40))
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "bounded wait");
+        drop(guard);
     }
 
     #[test]

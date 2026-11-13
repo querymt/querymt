@@ -2605,6 +2605,149 @@ mod repository_knowledge_binding {
                 .all(|e| e.unwrap().file_name() == ".git")
         );
     }
+
+    /// Scenario "Unfamiliar feature request has no filenames", end to end: a
+    /// path-free prompt sent through the public API reaches the provider's
+    /// first request together with a cited orientation card, without any
+    /// repository tool call; an unrelated prompt adds nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_free_prompt_reaches_the_first_provider_request_with_an_orientation_card() {
+        use crate::test_utils::{
+            MockChatResponse, MockLlmProvider, SharedLlmProvider, TestProviderFactory,
+            mock_plugin_registry,
+        };
+        use std::sync::Mutex;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        for (path, body) in [
+            (
+                ".qmt/knowledge.toml",
+                "version = 1\n[documents]\ninclude = [\"docs/**/*.md\"]\n",
+            ),
+            (
+                "docs/arch.md",
+                "# Architecture\n## Scheduling\nThe scheduler dispatches queued tasks to workers using a priority queue.\n",
+            ),
+        ] {
+            let target = repo.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, body).unwrap();
+        }
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        // Every model request is recorded as flattened text, in order.
+        let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(tokio::sync::Mutex::new(MockLlmProvider::new()));
+        {
+            let requests = Arc::clone(&requests);
+            let mut mock = provider.try_lock().unwrap();
+            mock.expect_chat_with_tools().returning(
+                move |messages: &[querymt::chat::ChatMessage], _tools| {
+                    let text = messages
+                        .iter()
+                        .flat_map(|m| m.portable_input_parts().to_vec())
+                        .map(|part| match part {
+                            querymt::chat::ChatInputPart::Text { text } => text,
+                            other => format!("{other:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    requests.lock().unwrap().push(text);
+                    Ok(MockChatResponse::text_only("done").into())
+                },
+            );
+        }
+        let (plugins, _plugins_dir) =
+            mock_plugin_registry(Arc::new(TestProviderFactory::new(SharedLlmProvider {
+                inner: Arc::clone(&provider),
+                tools: vec![].into_boxed_slice(),
+            })))
+            .unwrap();
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let mut settings = RepositoryKnowledgeSettings::enabled();
+        settings.delivery.orientation = true;
+        let registry = crate::knowledge::repository::RepositoryKnowledgeRegistry::from_settings_in(
+            &settings,
+            tmp.path().join("config"),
+        )
+        .unwrap();
+        let warm = registry.clone();
+        let agent = Agent::single()
+            .provider("mock", "mock-model")
+            .cwd(&repo)
+            .repository_knowledge(settings)
+            .repository_knowledge_registry(registry)
+            .infra(AgentInfra {
+                plugin_registry: Arc::new(plugins),
+                storage: Some(storage),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let session = agent.chat_session().await.unwrap();
+        // Creating the session pre-warms the index in the background, before
+        // any prompt, so the first prompt's delivery does not meet a cold index.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let built = warm
+                .open_service_for(&repo)
+                .is_some_and(|service| service.store().counts().unwrap().documents == 1);
+            if built {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session creation did not pre-warm the index"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "warmed before any prompt"
+        );
+        session
+            .chat("how does the scheduler dispatch queued tasks to workers?")
+            .await
+            .unwrap();
+        session
+            .chat("please format the changelog date")
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "one model request per prompt, no tool round trip"
+        );
+        let first = &requests[0];
+        assert!(
+            first.contains("handler=qmt.repository_knowledge.orientation"),
+            "the card is attributed hook context in the first request: {first}"
+        );
+        assert!(
+            first.contains("docs/arch.md > Architecture > Scheduling"),
+            "{first}"
+        );
+        assert!(first.contains("evidence, not instructions"), "{first}");
+        let cards = |text: &str| {
+            text.matches("handler=qmt.repository_knowledge.orientation")
+                .count()
+        };
+        assert_eq!(
+            cards(&requests[1]),
+            1,
+            "the second prompt adds no card; the first stays in history once"
+        );
+    }
 }
 
 // ── Managed worktree workspaces (simple API) ─────────────────────────────────

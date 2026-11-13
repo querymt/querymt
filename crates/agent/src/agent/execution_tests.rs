@@ -2793,6 +2793,54 @@ mod repository_delivery {
         );
     }
 
+    /// Scenario "Orientation and index select the same note": a note that both
+    /// passes the gate and declares the indexed file as a source is delivered
+    /// once per turn, whichever stage renders it.
+    #[tokio::test]
+    async fn orientation_and_index_selecting_the_same_note_deliver_it_once() {
+        let kb = kb();
+        std::fs::write(
+            kb.repo.path().join("docs/arch.md"),
+            "---\nknowledge_sources: src/queue.rs\n---\n# Architecture\n## Scheduling\nThe scheduler dispatches queued tasks to workers using a priority queue.\n",
+        )
+        .unwrap();
+        let mut harness = TestHarness::new(vec![], None).await;
+        harness.with_repository_delivery(
+            &kb,
+            &budgeted(4, 16 * 1024, true),
+            vec![Arc::new(crate::tools::builtins::IndexTool::new())],
+        );
+        let oriented = crate::agent::repository_delivery::orientation_contexts(
+            &harness.config,
+            &harness.exec_ctx,
+            PROMPT,
+            &[],
+        )
+        .await;
+        assert_eq!(oriented.len(), 1, "{oriented:?}");
+        assert!(oriented[0].content.contains("docs/arch.md"));
+
+        let calls = vec![mock_querymt_tool_call(
+            "a",
+            "index",
+            r#"{"path":"src/queue.rs"}"#,
+        )];
+        expect_tool_batch_then_done(&harness, calls, true).await;
+        assert_eq!(harness.run().await, CycleOutcome::Completed);
+        let out = stored(&harness);
+        // The purpose row for the file is new; the architecture note is not.
+        assert!(
+            out.contexts.iter().any(|c| c.2.contains("src/AGENTS.md")),
+            "{:?}",
+            out.contexts
+        );
+        assert!(
+            !out.contexts.iter().any(|c| c.2.contains("docs/arch.md")),
+            "the note orientation already delivered was delivered again: {:?}",
+            out.contexts
+        );
+    }
+
     fn history_with(parts: Vec<MessagePart>, id: &str) -> crate::model::AgentMessage {
         crate::model::AgentMessage {
             id: id.to_string(),
@@ -3367,9 +3415,11 @@ mod repository_delivery {
         // An allowlist that excludes get keeps the allowlist authoritative.
         let mut config = (*harness.config).clone();
         config.tool_config.allow = Some(
-            [crate::config::ToolSpec::Builtin("repo_knowledge_query".to_string())]
-                .into_iter()
-                .collect(),
+            [crate::config::ToolSpec::Builtin(
+                "repo_knowledge_query".to_string(),
+            )]
+            .into_iter()
+            .collect(),
         );
         assert!(!crate::agent::repository_delivery::policy_applies(&config));
         config.tool_config.allow = None;

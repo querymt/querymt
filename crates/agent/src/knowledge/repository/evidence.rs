@@ -764,10 +764,33 @@ mod tests {
         assert!(document < entries && entries < version);
         assert!(text.find("[\\\"A\\\"]").unwrap() < text.find("[\\\"B\\\"]").unwrap());
         assert_eq!(text, file.clone().to_text());
-        assert!(
-            !text.contains('/') || !text.contains(":\\"),
-            "no absolute paths"
-        );
+
+        // Every string in the file, key or value, is portable: no absolute or
+        // drive-qualified path anywhere.
+        fn strings(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::String(s) => out.push(s.clone()),
+                serde_json::Value::Array(items) => items.iter().for_each(|v| strings(v, out)),
+                serde_json::Value::Object(map) => {
+                    for (key, v) in map {
+                        out.push(key.clone());
+                        strings(v, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut all = Vec::new();
+        strings(&serde_json::from_str(&text).unwrap(), &mut all);
+        for s in &all {
+            let drive = s.as_bytes().get(1) == Some(&b':')
+                && s.as_bytes()[0].is_ascii_alphabetic()
+                && matches!(s.as_bytes().get(2), Some(b'/' | b'\\'));
+            assert!(
+                !s.starts_with('/') && !s.starts_with('\\') && !drive,
+                "absolute path in evidence file: {s}"
+            );
+        }
     }
 
     #[test]

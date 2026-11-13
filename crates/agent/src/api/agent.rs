@@ -127,6 +127,10 @@ pub struct AgentBuilder {
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
     /// Portable repository knowledge settings; disabled when omitted.
     repository_knowledge: Option<crate::config::RepositoryKnowledgeSettings>,
+    /// Prebuilt repository knowledge registry; wins over `repository_knowledge`
+    /// (hosts and tests that place the index outside the shared config dir).
+    repository_knowledge_registry:
+        Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
     /// MCP servers from TOML `[[mcp]]` config, attached to every new session.
     mcp_servers: Vec<McpServerConfig>,
     /// Runtime MCP attachment source (e.g., mobile in-process MCP peers).
@@ -174,6 +178,7 @@ impl AgentBuilder {
             workspace: None,
             workspace_service: None,
             repository_knowledge: None,
+            repository_knowledge_registry: None,
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: None,
             agent_registry: None,
@@ -336,6 +341,17 @@ impl AgentBuilder {
         settings: crate::config::RepositoryKnowledgeSettings,
     ) -> Self {
         self.repository_knowledge = Some(settings);
+        self
+    }
+
+    /// Use a prebuilt repository knowledge registry instead of building one
+    /// from settings, for example one whose index lives in a chosen directory.
+    #[cfg(test)]
+    pub(crate) fn repository_knowledge_registry(
+        mut self,
+        registry: Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>,
+    ) -> Self {
+        self.repository_knowledge_registry = Some(registry);
         self
     }
 
@@ -648,10 +664,12 @@ impl AgentBuilder {
 
         // Repository knowledge: a lazy registry only when the host enabled it.
         // Nothing is resolved, created or read until a session uses it.
-        builder =
-            builder.with_repository_knowledge(self.repository_knowledge.as_ref().and_then(
-                crate::knowledge::repository::RepositoryKnowledgeRegistry::from_settings,
-            ));
+        let repository_knowledge = self.repository_knowledge_registry.clone().or_else(|| {
+            self.repository_knowledge
+                .as_ref()
+                .and_then(crate::knowledge::repository::RepositoryKnowledgeRegistry::from_settings)
+        });
+        builder = builder.with_repository_knowledge(repository_knowledge);
 
         // Wire schedule repository and knowledge store from the storage backend.
         // These are optional — backends that don't support them return None.

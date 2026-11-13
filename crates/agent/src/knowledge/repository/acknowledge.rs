@@ -320,6 +320,25 @@ mod tests {
             !text.contains(fx.repo.to_str().unwrap()),
             "no absolute paths"
         );
+
+        // Portable: only the documented fields, and a second checkout at a
+        // different path, acknowledged later, writes the identical bytes (no
+        // absolute paths, session IDs, timestamps or machine data).
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["document", "entries", "version"]);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let other = fixture();
+        assert_ne!(other.repo, fx.repo);
+        other
+            .service
+            .apply_acknowledge(&whole(&other, "docs/arch.md"))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(other.repo.join(&plan.write.path)).unwrap(),
+            text
+        );
     }
 
     #[test]
