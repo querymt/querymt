@@ -834,7 +834,7 @@ impl Redactor for DefaultRedactor {
             }
             RedactionPolicy::Minimal => {
                 // Only show first 100 chars as summary
-                querymt_utils::str_utils::truncate_with_ellipsis(content, 100)
+                truncate_with_ellipsis(content, 100)
             }
         }
     }
@@ -1047,6 +1047,27 @@ pub struct RecentModelsView {
     pub by_workspace: std::collections::HashMap<Option<String>, Vec<RecentModelEntry>>,
     #[serde(with = "time::serde::rfc3339")]
     pub generated_at: OffsetDateTime,
+}
+
+/// Truncate `input` to at most `max_bytes` bytes, appending `"..."` when it is
+/// shortened. Always cuts on a UTF-8 char boundary.
+///
+/// A private copy of `querymt_utils::str_utils::truncate_with_ellipsis`: the
+/// core layer must not depend on `querymt-utils`.
+fn truncate_with_ellipsis(input: &str, max_bytes: usize) -> String {
+    const ELLIPSIS: &str = "...";
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    if max_bytes <= ELLIPSIS.len() {
+        // Not enough room for text + "...": return as many whole chars as fit.
+        return input.chars().take(max_bytes).collect();
+    }
+    let mut end = max_bytes - ELLIPSIS.len();
+    while !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &input[..end], ELLIPSIS)
 }
 
 #[cfg(test)]
@@ -1326,5 +1347,18 @@ mod tests {
         assert_eq!(view.session_id, "sess-r");
         assert!(view.active_task.is_some());
         assert_eq!(view.recent_progress.len(), 1);
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_respects_char_boundaries() {
+        assert_eq!(truncate_with_ellipsis("hello", 10), "hello");
+        assert_eq!(truncate_with_ellipsis("hello world", 8), "hello...");
+        assert_eq!(truncate_with_ellipsis("abc", 1), "a");
+        // Each Cyrillic char is 2 bytes: 7 bytes leaves room for 2 chars + "...".
+        assert_eq!(truncate_with_ellipsis("абвгдежз", 7), "аб...");
+        // Budget lands inside a multibyte char: walk back to the boundary.
+        let out = truncate_with_ellipsis("абвгдежз", 8);
+        assert!(out.ends_with("..."));
+        assert!(out.len() <= 8);
     }
 }

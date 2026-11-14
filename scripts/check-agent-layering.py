@@ -88,6 +88,7 @@ RULES: List[Tuple[str, str]] = [
         r"backend|lifecycle|location|ranges)\.rs$",
         "core",
     ),
+    (r"^session/backend/contract\.rs$", "core"),
     (r"^worktree/domain\.rs$", "core"),
     (r"^delegation/model_overrides\.rs$", "core"),
     (r"^knowledge/(mod|text_processing)\.rs$", "core"),
