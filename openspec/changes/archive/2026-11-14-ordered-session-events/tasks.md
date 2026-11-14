@@ -42,7 +42,7 @@
 - [x] 7.4 Host forwarder sends `RelayLagged` on lag and the relay fetches the durable tail; verify a lost tail is recovered without a later event.
 - [x] 7.5 Regenerate typeshare types; verify `session_seq` is in the generated TypeScript.
 - [x] 7.6 Resolve the prompt-ordering contradiction in `mesh.md` and document the guard and lag signal in `event-ordering.md`.
-- [ ] 7.7 Follow-up change: cross-session batched writer (one writer per database), measured against WAL first.
+- [x] 7.7 Deferred to the `batch-journal-writes-across-sessions` change (not done here): cross-session batched writer (one writer per database), measured against WAL first. Only a proposal exists so far.
 
 ## Workflow follow-up
 

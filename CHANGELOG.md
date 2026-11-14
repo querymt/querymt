@@ -121,6 +121,41 @@
 - Hook tool matchers also match the server-qualified MCP name
   (`server.tool`); hook input gained `mcp_server`; hook commands get
   `QMT_PROFILE_DIR`.
+- **BREAKING (storage, mesh wire): session events are delivered and replayed in
+  production order.** Every event now carries a per-session `session_seq`,
+  assigned when the session produces it. Each session has one ordered writer
+  that persists durable events in batches (up to 64 per transaction) and
+  publishes them after commit. Ephemeral deltas wait only for earlier durable
+  events. Replay uses the same order as live delivery, so back-to-back events
+  such as a tool-call start and end no longer swap. Relayed events keep the
+  host's `session_seq`.
+  - **`session/prompt` responses follow their updates.** The prompt reply
+    carries an internal `event_tip`, and the connection holds the response until
+    it has delivered every update of the run. The wait is released on
+    disconnect, lag-recovery failure, connection close or a 30 s safety limit.
+    The client-facing `PromptResponse` is unchanged.
+  - **Lagging consumers recover.** The WebSocket forwarder used to stop
+    delivering session updates for the rest of the connection once it fell
+    behind the live buffer. The WebSocket and stdio forwarders and the remote
+    relay now reload the missed durable range from the journal (the relay
+    fetches it from the host) and keep receiving. Ephemeral deltas missed while
+    lagging are not replayed. The recovered durable event supersedes them.
+  - **Journal migration `0024_event_journal_session_seq`** adds the
+    `session_seq` column and a unique index on `(session_id, session_seq)` for
+    locally produced rows, and backfills existing local rows. Relayed legacy
+    rows stay unnumbered.
+  - **File databases now use WAL with `synchronous=NORMAL`.** The latest commits
+    can be lost on power loss, but the database cannot be corrupted.
+    In-memory databases are unchanged.
+  - **Upgrade all mesh nodes together.** A node that does not send `event_tip`
+    is treated as "no watermark", but ordering across mixed versions is not
+    guaranteed. An older binary cannot read a migrated journal correctly, so
+    roll back by restoring a pre-upgrade database copy together with the
+    matching binary.
+  - **UI follow-up:** `session_seq` is added to the typeshare types for
+    `DurableEvent`, `EphemeralEvent` and `AgentEvent`. querymt-desktop should
+    regenerate its types (not done here).
+  - See `docs/docs/agent/event-ordering.md`.
 
 ### Fixed
 
