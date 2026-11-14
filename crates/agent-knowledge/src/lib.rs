@@ -1,7 +1,7 @@
 //! Portable repository knowledge.
 //!
-//! This module is deliberately separate from the legacy session-oriented
-//! [`KnowledgeStore`](super::KnowledgeStore): it owns its own schema, lifecycle
+//! This crate is deliberately separate from the legacy session-oriented
+//! `KnowledgeStore` in `querymt-agent`: it owns its own schema, lifecycle
 //! and tools, and never reads or writes the protocol/session tables.
 //!
 //! Repository content is authoritative Markdown selected by the QueryMT-owned

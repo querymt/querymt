@@ -2078,8 +2078,8 @@ fn remove_database_files(path: &Path) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::document::parse_documents;
-    use crate::knowledge::repository::identity::normalize_documents;
+    use crate::document::parse_documents;
+    use crate::identity::normalize_documents;
     use std::fs;
 
     fn stamp(n: u64) -> FileStamp {

@@ -16,7 +16,7 @@
 //! implementation — no embedded AI logic.
 
 pub mod host;
-pub mod repository;
+pub use querymt_agent_knowledge as repository;
 pub mod sqlite;
 pub mod text_processing;
 

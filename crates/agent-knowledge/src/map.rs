@@ -383,7 +383,7 @@ impl RepositoryService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::browse::tests::Fx;
+    use crate::browse::tests::Fx;
 
     const QUEUE: &str = "use std::fmt;\npub struct Queue { items: Vec<u32> }\nimpl Queue {\n    pub fn push(&mut self, item: u32) {}\n}\npub fn helper() {}\n";
 

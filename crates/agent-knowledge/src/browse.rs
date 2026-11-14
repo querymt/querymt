@@ -791,10 +791,10 @@ fn catalog_of(generation: u64, document: &StoredDocument) -> DocumentCatalog {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::knowledge::repository::reconcile::ReconcileOptions;
-    use crate::knowledge::repository::root::{RootRequest, resolve_root};
-    use crate::knowledge::repository::service::RefreshPolicy;
-    use crate::knowledge::repository::settings::RepositoryKnowledgeSettings;
+    use crate::reconcile::ReconcileOptions;
+    use crate::root::{RootRequest, resolve_root};
+    use crate::service::RefreshPolicy;
+    use crate::settings::RepositoryKnowledgeSettings;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -802,14 +802,14 @@ pub(super) mod tests {
     const MANIFEST: &str = "version = 1\n[documents]\ninclude = [\"docs/**/*.md\"]\n[code]\ninclude = [\"src/**/*.rs\"]\n";
     const ARCH: &str = "Intro text before any heading.\n# Architecture\n## Scheduling\nThe scheduler dispatches tasks.\n## Storage\nRows live in SQLite.\n";
 
-    pub(in crate::knowledge::repository) struct Fx {
+    pub(crate) struct Fx {
         _tmp: tempfile::TempDir,
-        pub(in crate::knowledge::repository) repo: PathBuf,
-        pub(in crate::knowledge::repository) service: RepositoryService,
+        pub(crate) repo: PathBuf,
+        pub(crate) service: RepositoryService,
     }
 
     impl Fx {
-        pub(in crate::knowledge::repository) fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let tmp = tempfile::tempdir().unwrap();
             let repo = tmp.path().join("repo");
             fs::create_dir_all(repo.join(".git")).unwrap();
@@ -838,7 +838,7 @@ pub(super) mod tests {
             fx
         }
 
-        pub(in crate::knowledge::repository) fn put(&self, rel: &str, content: &str) {
+        pub(crate) fn put(&self, rel: &str, content: &str) {
             let path = self.repo.join(rel);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, content).unwrap();
@@ -874,12 +874,10 @@ pub(super) mod tests {
     fn a_section_id_returns_the_current_body_not_a_summary() {
         let fx = Fx::new();
         fx.put("docs/arch.md", ARCH);
-        let found = fx
-            .service
-            .query(&crate::knowledge::repository::QueryRequest {
-                question: "scheduler dispatches".into(),
-                ..Default::default()
-            });
+        let found = fx.service.query(&crate::QueryRequest {
+            question: "scheduler dispatches".into(),
+            ..Default::default()
+        });
         let hit = &found.unwrap().hits[0];
         let body = section(
             fx.get(GetRequest {
@@ -1360,7 +1358,7 @@ pub(super) mod tests {
     /// distinguishable from indexed, unverified ones.
     #[test]
     fn stats_count_documents_by_evidence_state() {
-        use crate::knowledge::repository::acknowledge::{AcknowledgeRequest, Selection};
+        use crate::acknowledge::{AcknowledgeRequest, Selection};
         let fx = Fx::new();
         fx.put("src/lib.rs", "pub fn run() {}\n");
         fx.put(

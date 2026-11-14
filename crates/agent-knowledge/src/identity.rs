@@ -627,7 +627,7 @@ pub fn is_workspace_memory(document: &NormalizedDocument) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::document::parse_documents;
+    use crate::document::parse_documents;
 
     fn normalize(inputs: &[(&str, &str)]) -> NormalizedBatch {
         normalize_documents(parse_documents(

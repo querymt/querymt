@@ -21,7 +21,7 @@
 use super::reconcile::ReconcileOptions;
 use super::root::{ResolvedRoot, RootError, RootRequest, resolve_root};
 use super::service::{RefreshPolicy, RepositoryService, ServiceError};
-use crate::knowledge::repository::settings::RepositoryKnowledgeSettings;
+use crate::settings::RepositoryKnowledgeSettings;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};

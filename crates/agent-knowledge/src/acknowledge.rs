@@ -239,9 +239,9 @@ impl RepositoryService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::browse::tests::Fx;
-    use crate::knowledge::repository::evidence::EVIDENCE_DIR;
-    use crate::knowledge::repository::signals::EvidenceState;
+    use crate::browse::tests::Fx;
+    use crate::evidence::EVIDENCE_DIR;
+    use crate::signals::EvidenceState;
     use std::fs;
     use std::path::Path;
 

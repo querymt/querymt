@@ -13,7 +13,7 @@
 //!   wrapper included), so the ceiling holds for what is actually sent.
 
 use super::adapters::{INDEX_CONTEXT_HANDLER_ID, ORIENTATION_HANDLER_ID, parse_mark, stamp_epoch};
-use crate::knowledge::repository::settings::RepositoryKnowledgeDeliverySettings;
+use crate::settings::RepositoryKnowledgeDeliverySettings;
 use querymt_agent_core::HookContextContribution;
 use std::collections::BTreeSet;
 

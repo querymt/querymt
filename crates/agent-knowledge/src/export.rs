@@ -413,7 +413,7 @@ impl RepositoryService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::browse::tests::Fx;
+    use crate::browse::tests::Fx;
     use std::path::PathBuf;
 
     const QUEUE: &str = "use std::fmt;\npub struct Queue { items: Vec<u32> }\nimpl Queue {\n    pub fn push(&mut self, item: u32) {}\n}\n";
@@ -722,7 +722,7 @@ mod tests {
             .plan_export(&ExportRequest {
                 target: "generated/map.md".into(),
                 scope: None,
-                max_bytes: Some(crate::knowledge::repository::map::MIN_MAP_BYTES),
+                max_bytes: Some(crate::map::MIN_MAP_BYTES),
             })
             .unwrap();
         assert!(planned.map.truncated);
