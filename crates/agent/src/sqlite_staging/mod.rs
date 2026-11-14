@@ -4,8 +4,12 @@
 //! is task 5.1.
 
 pub mod backend;
+#[cfg(test)]
+mod delegation_override_tests;
 pub mod error;
 pub mod repo_dotagents_automation;
 pub mod repo_dotagents_tasks;
 pub mod repo_schedule;
 pub mod repo_workspace;
+#[cfg(test)]
+pub mod test_support;

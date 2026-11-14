@@ -8,41 +8,11 @@ use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::session::backend::StorageBackend;
 use crate::session::sqlite_storage::SqliteStorage;
+pub use crate::sqlite_staging::test_support::TestStorage;
 use crate::test_utils::helpers::empty_plugin_registry;
 use querymt::LLMParams;
 use std::sync::Arc;
 use tempfile::TempDir;
-
-// ── Tier 1 ── raw storage ────────────────────────────────────────────────────
-
-/// In-memory SQLite storage with no agent.
-pub struct TestStorage {
-    pub storage: Arc<SqliteStorage>,
-    pub _tempdir: TempDir,
-}
-
-impl TestStorage {
-    pub async fn new() -> Self {
-        let tempdir = TempDir::new().expect("create temp dir");
-        let storage = Arc::new(
-            SqliteStorage::connect(":memory:".into())
-                .await
-                .expect("create in-memory sqlite"),
-        );
-        Self {
-            storage,
-            _tempdir: tempdir,
-        }
-    }
-
-    pub fn session_store(&self) -> Arc<dyn crate::session::store::SessionStore> {
-        self.storage.session_store()
-    }
-
-    pub fn event_journal(&self) -> Arc<dyn crate::session::projection::EventJournal> {
-        self.storage.event_journal()
-    }
-}
 
 // ── Tier 2 ── storage + AgentConfig + AgentHandle ────────────────────────────
 

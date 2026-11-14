@@ -20,5 +20,7 @@ pub mod protocol;
 pub mod run_lease_path;
 pub mod runtime_status;
 pub mod stream_cursor;
+#[cfg(test)]
+pub mod test_support;
 pub mod verification;
 pub mod worktree;

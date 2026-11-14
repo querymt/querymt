@@ -214,29 +214,20 @@ use crate::model::{AgentMessage, MessagePart};
 use crate::prelude::AgentInfo;
 use crate::session::backend::StorageBackend;
 use crate::session::domain::ForkOrigin;
-use crate::session::schema;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::session::store::{LLMConfig, Session};
 use crate::snapshot::backend::SnapshotBackend;
 use crate::snapshot::git::GitSnapshotBackend;
+pub use crate::sqlite_staging::test_support::sqlite_conn_with_schema;
 use crate::test_utils::mocks::{TestPluginLoader, TestProviderFactory};
 use anyhow::Result;
-use parking_lot::Mutex;
 use querymt::LLMParams;
 use querymt::chat::{ChatMessage, ChatRole};
 use querymt::plugin::host::PluginRegistry;
-use rusqlite::Connection;
 use std::sync::Arc;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use uuid::Uuid;
-
-/// Creates an in-memory SQLite connection with the full agent schema initialized.
-pub fn sqlite_conn_with_schema() -> Arc<Mutex<Connection>> {
-    let mut conn = Connection::open_in_memory().expect("open in-memory sqlite");
-    schema::init_schema(&mut conn).expect("initialize schema");
-    Arc::new(Mutex::new(conn))
-}
 
 /// Creates a test conversation context with the given session ID and step count
 pub fn test_context(session_id: &str, steps: usize) -> Arc<ConversationContext> {
