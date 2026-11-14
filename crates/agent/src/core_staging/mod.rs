@@ -11,6 +11,7 @@ pub mod delegation;
 pub mod delegation_update;
 pub mod elicitation;
 pub mod history;
+pub mod knowledge;
 pub mod meta;
 pub mod prompt_text;
 pub mod protocol;
