@@ -471,6 +471,10 @@ class Tree:
         if i == len(segs):
             return Target(rel, "", self.files[rel].layer)
         target = self._resolve_item(module, rel, segs[i], depth)
+        # A re-exported module (`pub use crate::core_staging::protocol;`): keep
+        # resolving the remaining segments inside the module it points to.
+        if target is not None and not target.item and target.file and i + 1 < len(segs):
+            return self.resolve(list(self.files[target.file].module) + segs[i + 1 :], depth + 1)
         # An inline `mod name { ... }` is a namespace, not an item: count the
         # item inside it (`genai::shell_executable`, not `genai`).
         if (
