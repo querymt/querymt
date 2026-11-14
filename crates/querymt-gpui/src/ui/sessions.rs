@@ -176,8 +176,8 @@ impl QmtApp {
 
         let mut rows = Vec::new();
         if !collapsed {
-            for (ix, s) in list.into_iter().take(shown).enumerate() {
-                rows.push(self.session_row(gix * 10_000 + ix, s, pinned_group, p, cx).into_any_element());
+            for s in list.into_iter().take(shown) {
+                rows.push(self.session_row(s, pinned_group, p, cx).into_any_element());
             }
             if total > shown || expanded && total > GROUP_ROWS {
                 let more = total - shown;
@@ -204,7 +204,7 @@ impl QmtApp {
         v_flex().child(head).children(rows)
     }
 
-    fn session_row(&self, ix: usize, s: SessionSummary, in_pinned: bool, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    fn session_row(&self, s: SessionSummary, in_pinned: bool, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let hover = p.card;
         let (agent, id, pinned) = (s.agent_id.clone(), s.id.clone(), s.pinned);
         let status = if s.archived {
@@ -214,8 +214,10 @@ impl QmtApp {
         } else {
             None
         };
+        // A pinned session also appears in its workspace group: keep the two rows distinct.
+        let row_key: SharedString = if in_pinned { format!("pinned:{}", s.id) } else { s.id.clone() }.into();
         h_flex()
-            .id(("session-row", ix))
+            .id(kit::keyed("session-row", row_key.clone()))
             .group("srow")
             .cursor_pointer()
             .on_click({
@@ -238,7 +240,7 @@ impl QmtApp {
                         h_flex()
                             .gap_2()
                             .child(div().min_w_0().truncate().text_sm().font_semibold().child(s.display_title()))
-                            .when(s.running(), |el| el.child(kit::spinner(("row-spin", ix), 13., p.success)))
+                            .when(s.running(), |el| el.child(kit::spinner(kit::keyed("row-spin", row_key.clone()), 13., p.success)))
                             .when_some(status, |el, (t, c)| el.child(kit::tone_chip(t, c))),
                     )
                     .child(
@@ -255,7 +257,7 @@ impl QmtApp {
                 div()
                     .when(!pinned, |el| el.opacity(0.).group_hover("srow", |st| st.opacity(1.)))
                     .child(
-                        kit::icon_button(("pin", ix), if pinned { IconName::PinOff } else { IconName::Pin }, if pinned { "Unpin" } else { "Pin" })
+                        kit::icon_button(kit::keyed("pin", row_key), if pinned { IconName::PinOff } else { IconName::Pin }, if pinned { "Unpin" } else { "Pin" })
                             .xsmall()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.store.update(cx, |st, cx| st.set_pinned(&agent, &id, !pinned, cx))

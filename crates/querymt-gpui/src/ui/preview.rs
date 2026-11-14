@@ -143,7 +143,7 @@ impl QmtApp {
     pub(super) fn attachment_strip(&self, session: bool, p: &Palette, cx: &mut Context<Self>) -> Option<Div> {
         let list = if session { &self.session_attachments } else { &self.attachments };
         (!list.is_empty()).then(|| {
-            h_flex().flex_wrap().items_end().gap_1p5().px_1().children(list.iter().enumerate().map(|(ix, a)| {
+            h_flex().flex_wrap().items_end().gap_1p5().px_1().children(list.iter().map(|a| {
                 let remove = {
                     let id = a.id.clone();
                     cx.listener(move |this: &mut Self, _: &ClickEvent, _, cx| {
@@ -155,9 +155,9 @@ impl QmtApp {
                 };
                 let tip = format!("{} · {}", a.name, human_size(a.size));
                 match a.image.clone() {
-                    Some(image) => composer_thumb(a, image, ix, session, tip, remove, p, cx).into_any_element(),
+                    Some(image) => composer_thumb(a, image, session, tip, remove, p, cx).into_any_element(),
                     None => h_flex()
-                        .id(("att-file", ix))
+                        .id(kit::keyed("att-file", a.id.clone()))
                         .gap_1p5()
                         .pl_2()
                         .pr_1()
@@ -168,7 +168,7 @@ impl QmtApp {
                         .child(kit::icon(if a.is_image() { IconName::Image } else { IconName::FileText }, 13., p.muted))
                         .child(div().max_w(px(200.)).truncate().font_medium().child(a.name.clone()))
                         .child(div().text_color(p.dim).child(human_size(a.size)))
-                        .child(remove_button(("rm-attach-file", ix), 18., p.muted, remove, p))
+                        .child(remove_button(kit::keyed("rm-attach-file", a.id.clone()), 18., p.muted, remove, p))
                         .into_any_element(),
                 }
             }))
@@ -346,7 +346,6 @@ impl QmtApp {
 fn composer_thumb(
     a: &Attachment,
     image: Arc<Image>,
-    ix: usize,
     session: bool,
     tip: String,
     remove: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -356,7 +355,7 @@ fn composer_thumb(
     let id = a.id.clone();
     let (border, hover) = (p.border, p.accent);
     div()
-        .id(("att-thumb", ix))
+        .id(kit::keyed("att-thumb", a.id.clone()))
         .relative()
         .flex_none()
         .size(px(56.))
@@ -371,7 +370,7 @@ fn composer_thumb(
         .child(div().size_full().rounded(px(9.)).overflow_hidden().child(img(image).size_full().rounded(px(9.)).object_fit(ObjectFit::Cover)))
         // Desktop: inside the thumbnail's top-right corner, so the composer
         // never clips it; as the last child it paints over the image.
-        .child(div().absolute().top(px(2.)).right(px(2.)).child(remove_button(("att-thumb-rm", ix), 18., p.text, remove, p)))
+        .child(div().absolute().top(px(2.)).right(px(2.)).child(remove_button(kit::keyed("att-thumb-rm", a.id.clone()), 18., p.text, remove, p)))
 }
 
 /// Opaque round remove button (desktop `.session-attachment-remove`): a solid

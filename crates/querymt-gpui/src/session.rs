@@ -59,7 +59,7 @@ fn parse_receipt(output: &str) -> HashMap<String, Vec<ReceiptHunk>> {
                 Some((a.parse().ok()?, b.parse().ok()?))
             };
             if let (Some((old_start, old_count)), Some((new_start, new_count))) = (field("old="), field("new=")) {
-                files.get_mut(path).unwrap().push(ReceiptHunk { old_start, old_count, new_start, new_count });
+                files.entry(path.clone()).or_default().push(ReceiptHunk { old_start, old_count, new_start, new_count });
             }
         }
     }
@@ -236,8 +236,8 @@ impl ToolCall {
     /// Output prettified: shell JSON results become stdout + stderr.
     pub fn pretty_output(&self) -> String {
         let trimmed = self.output.trim();
-        if trimmed.starts_with('{') {
-            if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        if trimmed.starts_with('{')
+            && let Ok(v) = serde_json::from_str::<Value>(trimmed) {
                 let out = v.get("stdout").and_then(Value::as_str);
                 let err = v.get("stderr").and_then(Value::as_str);
                 if out.is_some() || err.is_some() {
@@ -254,7 +254,6 @@ impl ToolCall {
                     return text;
                 }
             }
-        }
         self.output.clone()
     }
 }
@@ -263,7 +262,7 @@ impl ToolCall {
 #[derive(Clone, Debug)]
 pub enum WorkEntry {
     Thought { id: String, text: String },
-    Tool(ToolCall),
+    Tool(Box<ToolCall>),
 }
 
 impl WorkEntry {
@@ -836,11 +835,10 @@ impl SessionView {
     /// option's choice label when it has one.
     pub fn model_label(&self) -> Option<String> {
         let id = self.model.as_deref()?;
-        if let Some(o) = self.select_option(&["model"]) {
-            if let Some((_, label)) = o.choices.iter().find(|(v, _)| v == id) {
+        if let Some(o) = self.select_option(&["model"])
+            && let Some((_, label)) = o.choices.iter().find(|(v, _)| v == id) {
                 return Some(label.clone());
             }
-        }
         Some(id.rsplit('/').next().unwrap_or(id).to_string())
     }
 
@@ -851,11 +849,10 @@ impl SessionView {
         match kind {
             "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" => {
                 let content = update.get("content");
-                if kind == "user_message_chunk" {
-                    if let Some(a) = content.and_then(UserAttachment::from_block) {
+                if kind == "user_message_chunk"
+                    && let Some(a) = content.and_then(UserAttachment::from_block) {
                         return self.apply_user_attachment(message_id, a);
                     }
-                }
                 let text = content.map(content_text).unwrap_or_default();
                 self.apply_chunk(kind, message_id, text);
             }
@@ -893,11 +890,10 @@ impl SessionView {
             }
             "current_mode_update" => {
                 self.mode = update.get("currentModeId").and_then(Value::as_str).map(str::to_owned);
-                if let Some(o) = self.options.iter_mut().find(|o| o.get("id").and_then(Value::as_str) == Some("mode")) {
-                    if let Some(m) = &self.mode {
+                if let Some(o) = self.options.iter_mut().find(|o| o.get("id").and_then(Value::as_str) == Some("mode"))
+                    && let Some(m) = &self.mode {
                         o["currentValue"] = Value::String(m.clone());
                     }
-                }
             }
             "available_commands_update" => {}
             "session_info_update" => {
@@ -1046,15 +1042,14 @@ impl SessionView {
     }
 
     fn apply_thought(&mut self, message_id: Option<String>, text: String) {
-        if let Some(ix) = self.items.len().checked_sub(1) {
-            if let ItemKind::Work(entries) = &mut self.items[ix].kind {
-                if let Some(WorkEntry::Thought { id, text: t }) = entries.last_mut() {
-                    if message_id.as_ref().is_none_or(|m| m == id) {
+        if let Some(ix) = self.items.len().checked_sub(1)
+            && let ItemKind::Work(entries) = &mut self.items[ix].kind {
+                if let Some(WorkEntry::Thought { id, text: t }) = entries.last_mut()
+                    && message_id.as_ref().is_none_or(|m| m == id) {
                         t.push_str(&text);
                         self.touch(ix);
                         return;
                     }
-                }
                 if text.is_empty() {
                     return;
                 }
@@ -1063,7 +1058,6 @@ impl SessionView {
                 self.touch(ix);
                 return;
             }
-        }
         if text.is_empty() {
             return;
         }
@@ -1090,11 +1084,11 @@ impl SessionView {
                 };
                 let ix = match self.items.last_mut() {
                     Some(Item { kind: ItemKind::Work(entries), .. }) => {
-                        entries.push(WorkEntry::Tool(call));
+                        entries.push(WorkEntry::Tool(Box::new(call)));
                         self.items.len() - 1
                     }
                     _ => {
-                        self.push(format!("work-{id}"), ItemKind::Work(vec![WorkEntry::Tool(call)]));
+                        self.push(format!("work-{id}"), ItemKind::Work(vec![WorkEntry::Tool(Box::new(call))]));
                         self.items.len() - 1
                     }
                 };
@@ -1153,11 +1147,10 @@ impl SessionView {
                 call.stats = diffs.iter().map(diff_stats).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
                 call.diffs = diffs;
             }
-        } else if call.output.is_empty() {
-            if let Some(raw) = update.get("rawOutput").filter(|v| !v.is_null()) {
+        } else if call.output.is_empty()
+            && let Some(raw) = update.get("rawOutput").filter(|v| !v.is_null()) {
                 call.output = raw.as_str().map(str::to_owned).unwrap_or_else(|| raw.to_string());
             }
-        }
         // Edit tools report a receipt, not a diff: rebuild one from the arguments.
         if call.diffs.is_empty() || call.synthesized {
             let diffs = synthesized_diffs(call);

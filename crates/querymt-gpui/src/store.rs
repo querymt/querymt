@@ -113,7 +113,9 @@ fn slug(name: &str) -> String {
 // Runtime data
 
 #[derive(Clone, Debug, PartialEq)]
+#[derive(Default)]
 pub enum ConnState {
+    #[default]
     Idle,
     Connecting,
     Connected,
@@ -488,11 +490,6 @@ pub struct AgentRuntime {
     refresh_scheduled: bool,
 }
 
-impl Default for ConnState {
-    fn default() -> Self {
-        ConnState::Idle
-    }
-}
 
 impl AgentRuntime {
     fn log(&mut self, line: impl Into<String>) {
@@ -627,13 +624,24 @@ fn save_persisted(state: &Persisted) {
     let Ok(text) = serde_json::to_string_pretty(state) else { return };
     #[cfg(not(target_family = "wasm"))]
     if let Some(path) = state_path() {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        // Write a sibling file and rename it over the old one, so a crash or a
+        // full disk mid-write never leaves a truncated state file behind.
+        let write = || -> std::io::Result<()> {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, text)?;
+            std::fs::rename(&tmp, &path)
+        };
+        if let Err(err) = write() {
+            eprintln!("querymt-gpui: failed to save {}: {err}", path.display());
         }
-        let _ = std::fs::write(path, text);
     }
     #[cfg(target_family = "wasm")]
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        // Quota or private-mode failures are not actionable here; the next
+        // successful save rewrites the whole state.
         let _ = storage.set_item("querymt-gpui:state", &text);
     }
 }
@@ -646,8 +654,8 @@ fn seed_configs() -> Vec<AgentConfig> {
         // `--agent host:port` or QMT_AGENT=host:port adds a WebSocket agent.
         let args: Vec<String> = std::env::args().collect();
         let from_arg = args.iter().position(|a| a == "--agent").and_then(|i| args.get(i + 1).cloned());
-        if let Some(address) = from_arg.or_else(|| std::env::var("QMT_AGENT").ok()) {
-            if let Ok((address, secure)) = normalize_address(&address) {
+        if let Some(address) = from_arg.or_else(|| std::env::var("QMT_AGENT").ok())
+            && let Ok((address, secure)) = normalize_address(&address) {
                 seeds.push(AgentConfig {
                     id: format!("ws-{address}"),
                     name: address.clone(),
@@ -656,7 +664,6 @@ fn seed_configs() -> Vec<AgentConfig> {
                     host_managed: false,
                 });
             }
-        }
         let on_path = std::env::var_os("PATH").is_some_and(|paths| {
             std::env::split_paths(&paths).any(|dir| dir.join("qmtcode").is_file())
         });
@@ -1159,11 +1166,10 @@ impl AgentsStore {
         let params = json!({ "flow_id": flow.flow_id, "response": response });
         let tag = format!("oauth:{}", flow.provider);
         self.ext(id, &tag, "_querymt/auth/complete", params, cx, |s, id, res, cx| {
-            if res.is_ok() {
-                if let Some(rt) = s.runtime.get_mut(id) {
+            if res.is_ok()
+                && let Some(rt) = s.runtime.get_mut(id) {
                     rt.oauth = None;
                 }
-            }
             s.refresh_extras(id, cx);
         });
     }
@@ -1768,15 +1774,14 @@ impl AgentsStore {
             rpc.request("session/set_mode", json!({ "sessionId": session_id, "modeId": value }))
         } else {
             let mut params = json!({ "sessionId": session_id, "configId": config_id, "value": value });
-            if config_id == "model" {
-                if let Some(model) = rt.models.iter().find(|m| m.id == value) {
+            if config_id == "model"
+                && let Some(model) = rt.models.iter().find(|m| m.id == value) {
                     let mut entry = model.raw.clone();
                     if let Some(obj) = entry.as_object_mut() {
                         obj.remove("availability");
                     }
                     params["_meta"] = json!({ "querymt": { "modelEntry": entry } });
                 }
-            }
             rpc.request("session/set_config_option", params)
         };
         let (config_id, value) = (config_id.to_string(), value.to_string());
@@ -1966,12 +1971,11 @@ impl AgentsStore {
             Incoming::Notification { method, params } => {
                 if method == "session/update" {
                     let session_id = params.get("sessionId").and_then(Value::as_str).unwrap_or_default();
-                    if let Some(view) = self.session.as_mut().filter(|v| v.agent_id == id && v.session_id == session_id) {
-                        if let Some(update) = params.get("update") {
+                    if let Some(view) = self.session.as_mut().filter(|v| v.agent_id == id && v.session_id == session_id)
+                        && let Some(update) = params.get("update") {
                             view.apply(update);
                             cx.notify();
                         }
-                    }
                 }
                 if method.ends_with("session/runtimeChanged") {
                     let sid = params.get("session_id").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -2361,7 +2365,7 @@ async fn load_extras(
                             })
                         })
                         .collect();
-                    rt.mesh_nodes.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+                    rt.mesh_nodes.sort_by_key(|a| a.label.to_lowercase());
                 }
                 if let Ok(v) = invites {
                     let num = |i: &Value, k: &str| i.get(k).and_then(Value::as_f64).unwrap_or(0.0);

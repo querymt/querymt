@@ -204,10 +204,10 @@ impl QmtApp {
         let nodes_list = if nodes.is_empty() {
             panel(&p).p_4().text_sm().text_color(p.dim).child("No remote nodes yet. Invite a peer to join this mesh.")
         } else {
-            panel(&p).p_1().children(nodes.into_iter().enumerate().map(|(ix, n)| {
+            panel(&p).p_1().children(nodes.into_iter().map(|n| {
                 let hover = p.card;
                 h_flex()
-                    .id(("node", ix))
+                    .id(kit::keyed("node", n.id.clone()))
                     .group("node")
                     .gap_3()
                     .px_3()
@@ -244,7 +244,7 @@ impl QmtApp {
                         div()
                             .opacity(0.)
                             .group_hover("node", |s| s.opacity(1.))
-                            .child(copy_button(("copy-node", ix), n.id.clone(), "Copy peer id")),
+                            .child(copy_button(kit::keyed("copy-node", n.id.clone()), n.id.clone(), "Copy peer id")),
                     )
             }))
         };
@@ -330,7 +330,7 @@ impl QmtApp {
         let invites_list = if invites.is_empty() {
             panel(&p).p_4().text_sm().text_color(p.dim).child("No active invites. Create one when another peer needs access.")
         } else {
-            panel(&p).p_1().children(invites.into_iter().enumerate().map(|(ix, i)| {
+            panel(&p).p_1().children(invites.into_iter().map(|i| {
                 let a = agent.clone();
                 let id = i.id.clone();
                 let active = i.status == "active";
@@ -369,11 +369,11 @@ impl QmtApp {
                     )
                     .when(active, |el| {
                         el.child(
-                            kit::button(("revoke", ix))
+                            kit::button(kit::keyed("revoke", id.clone()))
                                 .xsmall()
                                 .ghost()
                                 .label("Revoke")
-                                .map(|button| kit::loading_button(button, ("revoke-spinner", ix), revoking.contains(&id), 12.))
+                                .map(|button| kit::loading_button(button, kit::keyed("revoke-spinner", id.clone()), revoking.contains(&id), 12.))
                                 .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.revoke_invite(&a, &id, cx)))),
                         )
                     })

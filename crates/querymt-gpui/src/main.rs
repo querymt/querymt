@@ -73,11 +73,10 @@ impl<A: AssetSource> AssetSource for AppAssets<A> {
             "brand/querymt-dark.svg" => return Ok(Some(Cow::Borrowed(BRAND_DARK_SVG))),
             _ => {}
         }
-        if let Some(id) = path.strip_prefix("providers/").and_then(|p| p.strip_suffix(".svg")) {
-            if let Some((_, bytes)) = PROVIDER_SVGS.iter().find(|(k, _)| *k == id) {
+        if let Some(id) = path.strip_prefix("providers/").and_then(|p| p.strip_suffix(".svg"))
+            && let Some((_, bytes)) = PROVIDER_SVGS.iter().find(|(k, _)| *k == id) {
                 return Ok(Some(Cow::Borrowed(bytes)));
             }
-        }
         self.0.load(path)
     }
 

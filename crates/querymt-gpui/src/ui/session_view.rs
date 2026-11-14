@@ -184,8 +184,8 @@ impl Transcript {
         }
         // Older history was prepended: insert those rows above, so the list's
         // scroll anchor shifts with them and the reader stays where they were.
-        if let Some(first) = self.keys.first() {
-            if let Some(added) = keys.iter().position(|k| k == first).filter(|&n| n > 0) {
+        if let Some(first) = self.keys.first()
+            && let Some(added) = keys.iter().position(|k| k == first).filter(|&n| n > 0) {
                 let mut items = self.items.borrow_mut();
                 let older: Vec<Rc<Item>> = view[..added].iter().cloned().map(Rc::new).collect();
                 items.splice(0..0, older);
@@ -193,7 +193,6 @@ impl Transcript {
                 self.keys.splice(0..0, keys[..added].iter().cloned());
                 self.list.splice(0..0, added);
             }
-        }
         let old_len = self.sigs.len();
         let mut items = self.items.borrow_mut();
         for ix in 0..old_len.min(view.len()) {
@@ -2489,7 +2488,7 @@ impl QmtApp {
         });
         let can_discard = control && self.store.read(cx).can_discard_queued();
         let waiting_panel = (waiting_open && count > 0).then(|| {
-            let rows = pending_inputs.iter().enumerate().map(|(ix, input)| {
+            let rows = pending_inputs.iter().map(|input| {
                 let queue = input.delivery == "queue";
                 let mut state = input.state.clone();
                 if let Some(first) = state.get_mut(0..1) {
@@ -2530,7 +2529,7 @@ impl QmtApp {
                     .when(removable, |el| {
                         el.child(
                             div()
-                                .id(("waiting-rm", ix))
+                                .id(kit::keyed("waiting-rm", id.clone()))
                                 .flex_none()
                                 .size(px(24.))
                                 .flex()

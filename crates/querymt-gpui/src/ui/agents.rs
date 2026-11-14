@@ -138,8 +138,8 @@ impl QmtApp {
                 .into_any_element()
         } else {
             let mut rows = Vec::new();
-            for (ix, c) in configs.iter().enumerate() {
-                rows.push(self.agent_row(ix, c, &p, cx).into_any_element());
+            for c in configs.iter() {
+                rows.push(self.agent_row(c, &p, cx).into_any_element());
             }
             v_flex().gap_2().children(rows).into_any_element()
         };
@@ -152,7 +152,7 @@ impl QmtApp {
                         .child(div().font_semibold().child("Needs attention"))
                         .child(div().text_sm().text_color(p.muted).child("Agents with connection or runtime issues.")),
                 )
-                .children(attention.into_iter().enumerate().map(|(ix, (c, reason))| {
+                .children(attention.into_iter().map(|(c, reason)| {
                     let id = c.id.clone();
                     h_flex()
                         .gap_3()
@@ -171,7 +171,7 @@ impl QmtApp {
                                 .child(div().text_xs().text_color(p.muted).truncate().child(reason)),
                         )
                         .child(
-                            kit::button(("attention-retry", ix))
+                            kit::button(kit::keyed("attention-retry", id.clone()))
                                 .small()
                                 .label(if c.is_websocket() { "Reconnect" } else { "Restart" })
                                 .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.connect(&id, cx)))),
@@ -191,7 +191,7 @@ impl QmtApp {
         )
     }
 
-    fn agent_row(&self, ix: usize, c: &AgentConfig, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    fn agent_row(&self, c: &AgentConfig, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
         let state = store.state(&c.id);
         let rt = store.runtime(&c.id);
@@ -276,7 +276,7 @@ impl QmtApp {
             .pl_2()
             .child(
                 kit::icon_button(
-                    ("toggle", ix),
+                    kit::keyed("toggle", c.id.clone()),
                     if live { IconName::Square } else { IconName::Play },
                     match (live, websocket) {
                         (true, true) => "Disconnect",
@@ -291,11 +291,11 @@ impl QmtApp {
             )
             .when(live, |el| {
                 el.child(
-                    kit::icon_button(("restart", ix), IconName::RotateCcw, if websocket { "Reconnect" } else { "Restart" })
+                    kit::icon_button(kit::keyed("restart", c.id.clone()), IconName::RotateCcw, if websocket { "Reconnect" } else { "Restart" })
                         .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.connect(&id_restart, cx)))),
                 )
             })
-            .child(kit::icon_button(("details", ix), IconName::Info, "Details").on_click(cx.listener(move |this, _, _, cx| {
+            .child(kit::icon_button(kit::keyed("details", c.id.clone()), IconName::Info, "Details").on_click(cx.listener(move |this, _, _, cx| {
                 this.details = Some(id_details.clone());
                 cx.notify();
             })))
@@ -305,18 +305,18 @@ impl QmtApp {
                         .gap_0p5()
                         .opacity(0.)
                         .group_hover("arow", |s| s.opacity(1.))
-                        .child(kit::icon_button(("edit", ix), IconName::Pencil, "Edit").on_click(cx.listener(
+                        .child(kit::icon_button(kit::keyed("edit", c.id.clone()), IconName::Pencil, "Edit").on_click(cx.listener(
                             move |this, _, window, cx| this.open_edit_dialog(&id_edit, window, cx),
                         )))
                         .child(
                             kit::icon_button(
-                                ("auto", ix),
+                                kit::keyed("auto", c.id.clone()),
                                 if c.auto_start { IconName::ToggleRight } else { IconName::ToggleLeft },
                                 if c.auto_start { "Disable auto-start" } else { "Enable auto-start" },
                             )
                             .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.toggle_auto_start(&id_auto, cx)))),
                         )
-                        .child(kit::icon_button(("delete", ix), IconName::Trash, "Delete").on_click(cx.listener(
+                        .child(kit::icon_button(kit::keyed("delete", c.id.clone()), IconName::Trash, "Delete").on_click(cx.listener(
                             move |this, _, _, cx| {
                                 this.confirm_delete = Some(id_delete.clone());
                                 cx.notify();
@@ -327,7 +327,7 @@ impl QmtApp {
 
         let name_id = c.id.clone();
         h_flex()
-            .id(("agent-row", ix))
+            .id(kit::keyed("agent-row", c.id.clone()))
             .group("arow")
             .gap_3()
             .px_4()
