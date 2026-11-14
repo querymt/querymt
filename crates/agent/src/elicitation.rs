@@ -19,6 +19,32 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 
+/// Convert an [`ElicitationAction`] to the `rmcp` wire action.
+///
+/// These conversions live here, not on the type, because `ElicitationAction`
+/// belongs to the core layer, which must not depend on `rmcp`.
+fn to_rmcp_action(action: ElicitationAction) -> rmcp::model::ElicitationAction {
+    match action {
+        ElicitationAction::Accept => rmcp::model::ElicitationAction::Accept,
+        ElicitationAction::Decline => rmcp::model::ElicitationAction::Decline,
+        ElicitationAction::Cancel => rmcp::model::ElicitationAction::Cancel,
+    }
+}
+
+/// Convert an `rmcp` action to an [`ElicitationAction`].
+///
+/// Only the tests use it today; it documents and pins the inverse mapping.
+#[cfg(test)]
+fn from_rmcp_action(action: rmcp::model::ElicitationAction) -> ElicitationAction {
+    match action {
+        rmcp::model::ElicitationAction::Accept => ElicitationAction::Accept,
+        rmcp::model::ElicitationAction::Decline => ElicitationAction::Decline,
+        rmcp::model::ElicitationAction::Cancel => ElicitationAction::Cancel,
+        // Non-exhaustive upstream: treat unknown actions as a cancel.
+        _ => ElicitationAction::Cancel,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingElicitationForm {
     pub message: String,
@@ -1380,7 +1406,7 @@ impl McpClientHandler {
 
         match response {
             Some(response) => {
-                let result = ElicitResult::new(response.action.into());
+                let result = ElicitResult::new(to_rmcp_action(response.action));
                 match response.content {
                     Some(content) => result.with_content(content),
                     None => result,
@@ -1611,21 +1637,21 @@ mod tests {
     #[test]
     fn elicitation_action_accept_converts_to_rmcp_accept() {
         let action = ElicitationAction::Accept;
-        let rmcp_action: rmcp::model::ElicitationAction = action.into();
+        let rmcp_action = to_rmcp_action(action);
         assert_eq!(rmcp_action, rmcp::model::ElicitationAction::Accept);
     }
 
     #[test]
     fn elicitation_action_decline_converts_to_rmcp_decline() {
         let action = ElicitationAction::Decline;
-        let rmcp_action: rmcp::model::ElicitationAction = action.into();
+        let rmcp_action = to_rmcp_action(action);
         assert_eq!(rmcp_action, rmcp::model::ElicitationAction::Decline);
     }
 
     #[test]
     fn elicitation_action_cancel_converts_to_rmcp_cancel() {
         let action = ElicitationAction::Cancel;
-        let rmcp_action: rmcp::model::ElicitationAction = action.into();
+        let rmcp_action = to_rmcp_action(action);
         assert_eq!(rmcp_action, rmcp::model::ElicitationAction::Cancel);
     }
 
@@ -1634,21 +1660,21 @@ mod tests {
     #[test]
     fn rmcp_accept_converts_to_elicitation_action_accept() {
         let rmcp_action = rmcp::model::ElicitationAction::Accept;
-        let action: ElicitationAction = rmcp_action.into();
+        let action = from_rmcp_action(rmcp_action);
         assert_eq!(action, ElicitationAction::Accept);
     }
 
     #[test]
     fn rmcp_decline_converts_to_elicitation_action_decline() {
         let rmcp_action = rmcp::model::ElicitationAction::Decline;
-        let action: ElicitationAction = rmcp_action.into();
+        let action = from_rmcp_action(rmcp_action);
         assert_eq!(action, ElicitationAction::Decline);
     }
 
     #[test]
     fn rmcp_cancel_converts_to_elicitation_action_cancel() {
         let rmcp_action = rmcp::model::ElicitationAction::Cancel;
-        let action: ElicitationAction = rmcp_action.into();
+        let action = from_rmcp_action(rmcp_action);
         assert_eq!(action, ElicitationAction::Cancel);
     }
 
