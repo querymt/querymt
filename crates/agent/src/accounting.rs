@@ -96,7 +96,6 @@
 //! }
 //! ```
 
-use querymt::Usage;
 mod budget_warning;
 mod cycle;
 mod dispatch;
@@ -106,6 +105,7 @@ mod dispatch_coverage_tests;
 mod e2e_tests;
 #[cfg(test)]
 mod failure_tests;
+mod pricing;
 mod projection;
 mod recorder;
 mod reducer;
@@ -119,209 +119,23 @@ pub use dispatch::{
     ActiveAttempt, AttemptOperation, DispatchLedger, PricingLookup, accounting_llm_error,
     classify_error, merge_usage, run_attempt,
 };
+pub(crate) use pricing::is_non_billable_oauth_provider;
+pub use pricing::{pricing_for, resolve_billing_basis};
 pub use projection::{PAGE_SIZE, SessionAccounting};
 pub use recorder::{AccountingError, AttemptHandle, AttemptRecorder};
 pub use reducer::{
-    AccountingConflict, AccountingReason, AccountingReducer, Applied, ComponentSums, ScopeTotals,
-    TokenSums,
+    AccountingConflict, AccountingReducer, Applied, ComponentSums, ScopeTotals, TokenSums,
 };
 pub use snapshot::{
     ACCOUNTING_SNAPSHOT_VERSION, AccountingBillingScope, AccountingBudgetSnapshot,
     AccountingCycleSnapshot, AccountingScopeSnapshot, AccountingSnapshot,
 };
 
-use querymt::providers::{BillingClass, ModelPricing, UsageValuation};
-use serde::{Deserialize, Serialize};
-use typeshare::typeshare;
-
-/// Why an attempt was dispatched.
-#[typeshare]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttemptPurpose {
-    /// The main assistant response for a prompt.
-    MainResponse,
-    /// A context-compaction summary.
-    Compaction,
-    /// A delegation summary generated for a parent.
-    DelegationSummary,
-}
-
-/// How the attempt was dispatched.
-#[typeshare]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DispatchMode {
-    Streaming,
-    NonStreaming,
-}
-
-/// Identity and ownership of one attempt, shared by start and settlement.
-///
-/// `attempt_id` is the idempotency key: it is unique per dispatched attempt,
-/// stable across settlement re-appends, and distinct for each retry.
-/// `operation_id` groups the attempts of one logical operation.
-#[typeshare]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AttemptRef {
-    pub operation_id: String,
-    pub attempt_id: String,
-    /// Zero-based position of this attempt within its operation.
-    pub attempt_index: u32,
-    /// Session that initiated (and is charged for) the attempt.
-    pub session_id: String,
-    /// Execution cycle that initiated the attempt. Retained even if the
-    /// attempt settles after a newer cycle has begun.
-    pub cycle_id: String,
-    pub purpose: AttemptPurpose,
-}
-
-/// Appended durably before the attempt is dispatched.
-#[typeshare]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AttemptStart {
-    pub attempt: AttemptRef,
-    pub mode: DispatchMode,
-    /// Requested provider.
-    pub provider: String,
-    /// Requested model.
-    pub model: String,
-    /// Scheme and host of the endpoint, when known. See [`non_secret_route`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub route: Option<String>,
-    /// Billing class bound at dispatch. `Excluded` attempts (subscription or
-    /// OAuth-backed) never acquire catalog charges.
-    #[typeshare(serialized_as = "string")]
-    pub billing: BillingClass,
-    /// Catalog/API pricing snapshot bound at dispatch, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[typeshare(serialized_as = "any")]
-    pub pricing: Option<ModelPricing>,
-    /// Separate manual budget pricing snapshot, when configured.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[typeshare(serialized_as = "any")]
-    pub budget_pricing: Option<ModelPricing>,
-}
-
-/// What is known about the usage reported for an attempt.
-#[typeshare]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UsageDisposition {
-    /// The provider reported its final usage.
-    Final,
-    /// The attempt was interrupted; the usage is what had arrived.
-    Partial,
-    /// Dispatched, but no usage is available and billing is unknown.
-    Unavailable,
-    /// The provider confirmed a rejection that is not billed.
-    NotBillable,
-    /// Abandoned before any network dispatch.
-    NotSent,
-}
-
-/// How the attempt ended.
-#[typeshare]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttemptOutcome {
-    Succeeded,
-    Cancelled,
-    ProviderRejected,
-    TransportFailure,
-    /// The provider responded, but the output failed validation (for example
-    /// an empty or refused summary). Its usage is still accountable.
-    OutputRejected,
-    /// Rejected locally before anything was sent to the provider.
-    LocalFailure,
-}
-
-/// Which pricing the catalog valuation used.
-#[typeshare]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PricingApplicability {
-    /// The pricing bound at dispatch applied.
-    Selected,
-    /// The provider reported a different effective model and a trustworthy
-    /// applicable pricing basis was bound instead.
-    Rebound,
-    /// The reported effective model makes the selected pricing inapplicable
-    /// and no other basis is available; the valuation is incomplete.
-    Inapplicable,
-}
-
-/// Appended durably once the attempt's accounting is known.
-#[typeshare]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AttemptSettlement {
-    pub attempt: AttemptRef,
-    pub disposition: UsageDisposition,
-    pub outcome: AttemptOutcome,
-    /// Usage as reported; `None` when unavailable. Never fabricated.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[typeshare(serialized_as = "any")]
-    pub usage: Option<Usage>,
-    /// Effective provider/model reported by provenance, when it differs from
-    /// or confirms the request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective_provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective_model: Option<String>,
-    pub pricing_applicability: PricingApplicability,
-    /// The pricing the catalog valuation actually used (differs from the
-    /// start snapshot only when `Rebound`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[typeshare(serialized_as = "any")]
-    pub pricing: Option<ModelPricing>,
-    /// Catalog/API-spend valuation, recorded so replay never reprices.
-    #[typeshare(serialized_as = "any")]
-    pub valuation: UsageValuation,
-    /// Manual budget valuation using the start's budget snapshot, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[typeshare(serialized_as = "any")]
-    pub budget_valuation: Option<UsageValuation>,
-}
-
-/// Accounting detail accompanying a derived `LlmRequestEnd`.
-///
-/// `LlmRequestEnd.cost_usd` is a presentation figure: the complete supported
-/// cost of the whole logical operation (every attempt, retries included), or
-/// `None`. This record carries the identifiers consumers need to deduplicate
-/// against the durable attempt records, and the known subtotal and
-/// completeness when the complete figure is unavailable. It is never an
-/// additional ledger entry.
-#[typeshare]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RequestAccounting {
-    pub operation_id: String,
-    /// Every attempt of the operation, in dispatch order.
-    pub attempt_ids: Vec<String>,
-    /// Known charges across the operation's attempts.
-    pub known_subtotal_usd: f64,
-    /// True only when `LlmRequestEnd.cost_usd` is a complete total.
-    pub complete: bool,
-    #[typeshare(serialized_as = "any")]
-    pub reasons: Vec<AccountingReason>,
-}
-
-/// Reduce an endpoint to `scheme://host[:port]`, dropping userinfo, path,
-/// query and fragment (any of which may carry credentials or tenant secrets).
-/// Returns `None` for anything that is not an `http(s)` URL.
-pub fn non_secret_route(endpoint: &str) -> Option<String> {
-    let (scheme, rest) = endpoint.trim().split_once("://")?;
-    let scheme = scheme.to_ascii_lowercase();
-    if scheme != "http" && scheme != "https" {
-        return None;
-    }
-    let authority = rest.split(['/', '?', '#']).next()?;
-    // Everything up to the last '@' is userinfo.
-    let host = authority.rsplit('@').next()?;
-    if host.is_empty() {
-        return None;
-    }
-    Some(format!("{scheme}://{}", host.to_ascii_lowercase()))
-}
+pub use crate::core_staging::accounting::{
+    AccountingReason, AttemptOutcome, AttemptPurpose, AttemptRef, AttemptSettlement, AttemptStart,
+    BillingBasis, DispatchMode, PricingApplicability, RequestAccounting, UsageDisposition,
+    non_secret_route,
+};
 
 /// A ledger over a fresh in-memory journal for tests of components that
 /// require explicit recording but do not assert on it.
@@ -351,7 +165,7 @@ pub(crate) async fn test_ledger() -> DispatchLedger {
             "p",
             "m",
         )),
-        basis: crate::session::provider::BillingBasis {
+        basis: BillingBasis {
             billing: querymt::providers::BillingClass::Unknown,
             pricing: None,
         },
@@ -361,7 +175,8 @@ pub(crate) async fn test_ledger() -> DispatchLedger {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use querymt::providers::value_usage;
+    use querymt::Usage;
+    use querymt::providers::{BillingClass, ModelPricing, value_usage};
 
     pub(crate) fn sample_ref() -> AttemptRef {
         AttemptRef {

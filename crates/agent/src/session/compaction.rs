@@ -769,7 +769,7 @@ mod tests {
         (
             DispatchLedger {
                 operation: Arc::new(operation),
-                basis: crate::session::provider::BillingBasis { billing, pricing },
+                basis: crate::accounting::BillingBasis { billing, pricing },
             },
             accounting,
         )

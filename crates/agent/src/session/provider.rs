@@ -1,4 +1,7 @@
 #[cfg(feature = "remote")]
+use crate::accounting::{
+    BillingBasis, is_non_billable_oauth_provider, pricing_for, resolve_billing_basis,
+};
 use crate::agent::remote::NodeId;
 use crate::middleware::ModelProfile;
 use crate::model::{AgentMessage, MessagePart, OutputTarget};
@@ -49,37 +52,6 @@ pub(crate) fn supported_overrides(
         );
     }
     supported
-}
-
-/// Billing class plus the pricing snapshot bound at dispatch.
-#[derive(Debug, Clone)]
-pub struct BillingBasis {
-    pub billing: BillingClass,
-    pub pricing: Option<ModelPricing>,
-}
-
-impl BillingBasis {
-    /// Classify `provider/model` from the current catalog. Subscription and
-    /// OAuth-backed providers are `Excluded` and never carry catalog pricing.
-    pub fn resolve(provider: &str, model: &str, oauth_backed: bool) -> Self {
-        if oauth_backed || is_non_billable_oauth_provider(provider) {
-            return Self {
-                billing: BillingClass::Excluded,
-                pricing: None,
-            };
-        }
-        let pricing = get_model_info(provider, model).map(|info| info.pricing);
-        let billing = match &pricing {
-            None => BillingClass::Unknown,
-            Some(p) if p.is_explicit_zero() => BillingClass::ZeroPriced,
-            Some(_) => BillingClass::Metered,
-        };
-        Self { billing, pricing }
-    }
-}
-
-fn is_non_billable_oauth_provider(provider: &str) -> bool {
-    matches!(provider, "codex" | "kimi-code")
 }
 
 /// A wrapper around a `SessionStore` that resolves providers dynamically.
@@ -469,10 +441,7 @@ impl SessionProvider {
 
     /// Get pricing information for a specific provider and model
     pub fn get_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
-        if is_non_billable_oauth_provider(provider) {
-            return None;
-        }
-        get_model_info(provider, model).map(|info| info.pricing)
+        pricing_for(provider, model)
     }
 
     /// Get LLM config by ID
@@ -1155,7 +1124,7 @@ impl SessionHandle {
             .get()
             .is_some_and(|provider| provider.provider.key_resolver().is_some());
         match self.llm_config.as_ref() {
-            Some(config) => BillingBasis::resolve(
+            Some(config) => resolve_billing_basis(
                 &config.provider,
                 model.unwrap_or(&config.model),
                 oauth_backed,
@@ -1990,12 +1959,12 @@ pub mod tests {
     #[test]
     fn billing_basis_excludes_subscription_providers_without_catalog_pricing() {
         for provider in ["codex", "kimi-code"] {
-            let basis = BillingBasis::resolve(provider, "any-model", false);
+            let basis = resolve_billing_basis(provider, "any-model", false);
             assert_eq!(basis.billing, BillingClass::Excluded);
             assert!(basis.pricing.is_none());
         }
         // An OAuth-resolved key on an otherwise metered provider is excluded too.
-        let basis = BillingBasis::resolve("openai", "gpt-5", true);
+        let basis = resolve_billing_basis("openai", "gpt-5", true);
         assert_eq!(basis.billing, BillingClass::Excluded);
         assert!(basis.pricing.is_none());
     }

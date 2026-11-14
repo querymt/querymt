@@ -21,37 +21,14 @@
 //!   attempts are counted but never produce a total, so an all-excluded scope
 //!   has no dollar amount rather than a known zero.
 
-use super::{AttemptPurpose, AttemptRef, AttemptSettlement, AttemptStart, UsageDisposition};
+use super::{
+    AccountingReason, AttemptPurpose, AttemptRef, AttemptSettlement, AttemptStart, UsageDisposition,
+};
 use crate::events::AgentEventKind;
 use crate::hash::RapidHash;
 use querymt::providers::{BillingClass, ComponentCharges, IncompleteReason};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-/// Why a scope cannot claim a complete total.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AccountingReason {
-    /// An attempt was started but no settlement has been recorded.
-    UnresolvedAttempt,
-    /// An interrupted attempt reported only part of its usage.
-    PartialUsage,
-    /// A dispatched attempt has no usage.
-    UsageUnavailable,
-    /// The valuation of a settled attempt was incomplete.
-    Valuation { reason: IncompleteReason },
-    /// A settlement was internally inconsistent (bad amounts or a complete
-    /// claim its own fields contradict); it is never trusted as complete.
-    InvalidSettlement,
-    /// Retained history contains local generation records written before
-    /// accounting existed. Their cost is unknown: old cumulative amounts are
-    /// not trusted and no historical rate is applied.
-    UnaccountedHistory,
-    /// A remote session's older history has not been transferred to this
-    /// agent yet, so the totals cover only the events held locally. Never
-    /// produced by the reducer; added to a load snapshot while history fills.
-    UntransferredHistory,
-}
 
 /// Summed USD per category. Unknown components contribute nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]

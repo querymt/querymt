@@ -2,12 +2,12 @@
   "_comment": "Distinct upward production items per layer pair, from scripts/check-agent-layering.py. Lower these as cuts land; never raise.",
   "pairs": {
     "core->sqlite": 6,
-    "core->services": 6,
+    "core->services": 3,
     "core->runtime": 6,
     "sqlite->services": 4,
     "sqlite->runtime": 3,
     "services->sqlite": 1,
-    "services->runtime": 10,
+    "services->runtime": 9,
     "runtime->sqlite": 2,
     "runtime->top": 8
   },

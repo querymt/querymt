@@ -4,6 +4,7 @@
 //! (with an injectable append failure), the `EventSink` remote-relay path and
 //! range-deletion rewind, all on fresh databases.
 
+use crate::accounting::BillingBasis;
 use crate::accounting::recorder::tests::Switchable;
 use crate::accounting::tests::{sample_settlement, sample_start};
 use crate::accounting::{
@@ -15,7 +16,6 @@ use crate::event_sink::EventSink;
 use crate::events::AgentEventKind;
 use crate::session::backend::StorageBackend;
 use crate::session::projection::EventJournal;
-use crate::session::provider::BillingBasis;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::session_event_stream::SessionEventStream;
 use querymt::chat::ChatOutput;

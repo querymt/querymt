@@ -17,11 +17,10 @@
 
 use super::{
     AccountingError, AccountingReducer, AttemptOutcome, AttemptPurpose, AttemptRecorder,
-    AttemptRef, AttemptSettlement, AttemptStart, CycleAccounting, DispatchMode,
+    AttemptRef, AttemptSettlement, AttemptStart, BillingBasis, CycleAccounting, DispatchMode,
     PricingApplicability, ScopeTotals, UsageDisposition,
 };
 use crate::events::AgentEventKind;
-use crate::session::provider::BillingBasis;
 use parking_lot::Mutex;
 use querymt::Usage;
 use querymt::chat::{ChatOutput, ChatOutputProvenance};
@@ -37,9 +36,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub type PricingLookup = Arc<dyn Fn(&str, &str) -> Option<ModelPricing> + Send + Sync>;
 
 fn catalog_lookup() -> PricingLookup {
-    Arc::new(|provider, model| {
-        crate::session::provider::SessionProvider::get_pricing(provider, model)
-    })
+    Arc::new(super::pricing_for)
 }
 
 /// True when `effective` is `requested` or a dated snapshot of it
