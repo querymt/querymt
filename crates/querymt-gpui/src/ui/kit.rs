@@ -11,6 +11,13 @@ use crate::theme::Palette;
 
 pub const MONO: &str = "IBM Plex Mono";
 
+/// Stable identity for a repeated element, keyed by a domain id (session id,
+/// agent id, attachment id, …) rather than its position, so hover, tooltip and
+/// other keyed element state stays with the item when the list reorders.
+pub fn keyed(name: &'static str, key: impl Into<SharedString>) -> ElementId {
+    ElementId::from((ElementId::from(name), key.into()))
+}
+
 pub fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
     Icon::new(name).size(px(size)).text_color(color)
 }

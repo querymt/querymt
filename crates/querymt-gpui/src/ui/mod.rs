@@ -154,7 +154,10 @@ impl QmtApp {
         });
 
         let mut subs = vec![
-            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.observe(&store, |this, _, cx| {
+                this.open_pending_session(cx);
+                cx.notify();
+            }),
             // Follow the OS light/dark switch when the theme is set to System.
             cx.observe_window_appearance(window, |this, window, cx| {
                 if this.store.read(cx).prefs.dark.is_none() {
@@ -256,17 +259,27 @@ impl QmtApp {
         }
     }
 
+    /// Open the deep-linked session (`?session=` / `QMT_SESSION`) once the
+    /// store knows about it. Driven by store notifications, not by `render`.
+    fn open_pending_session(&mut self, cx: &mut Context<Self>) {
+        let Some(sid) = self.pending_open.as_deref() else { return };
+        let found = self.store.read(cx).all_sessions().into_iter().find(|s| s.id == sid).cloned();
+        if let Some(summary) = found {
+            self.pending_open = None;
+            self.open_summary(&summary, cx);
+        }
+    }
+
     fn go(&mut self, page: Page, cx: &mut Context<Self>) {
         self.page = page;
         self.session_options_open = false;
         self.session_details_open = false;
         self.session_menu_open = false;
         // Mesh and Settings show live server data: refresh it on entry.
-        if matches!(page, Page::Mesh | Page::Settings) {
-            if let Some(agent) = self.store.read(cx).primary_agent() {
+        if matches!(page, Page::Mesh | Page::Settings)
+            && let Some(agent) = self.store.read(cx).primary_agent() {
                 self.store.update(cx, |s, cx| s.refresh_extras(&agent, cx));
             }
-        }
         cx.notify();
     }
 
@@ -444,7 +457,7 @@ impl QmtApp {
                             .w_full()
                             .items_center()
                             .gap_1p5()
-                            .children(open.into_iter().enumerate().map(|(ix, s)| {
+                            .children(open.into_iter().map(|s| {
                                 let current = self.page == Page::Session
                                     && store.session.as_ref().is_some_and(|v| v.agent_id == s.agent_id && v.session_id == s.id);
                                 let title = format!("{}\n{}", s.display_title(), workspace_name(&s.cwd));
@@ -462,7 +475,7 @@ impl QmtApp {
                                                 .p_0p5()
                                                 .rounded_full()
                                                 .bg(p.bg)
-                                                .child(kit::spinner(("rail-spin", ix), 10., p.success)),
+                                                .child(kit::spinner(kit::keyed("rail-spin", s.id.clone()), 10., p.success)),
                                         )
                                     })
                                     .on_click(cx.listener(move |this, _, _, cx| this.open_summary(&s, cx)))
@@ -552,10 +565,10 @@ impl QmtApp {
                 }))
             })
             .when(show_pinned && !pinned.is_empty(), |el| {
-                el.child(section("Pinned")).children(pinned.iter().enumerate().map(|(ix, s)| {
+                el.child(section("Pinned")).children(pinned.iter().map(|s| {
                     let hover_bg = p.card_hover;
                     h_flex()
-                        .id(("pinned-session", ix))
+                        .id(kit::keyed("pinned-session", s.id.clone()))
                         .gap_2()
                         .px_2()
                         .h(px(28.))
@@ -569,16 +582,16 @@ impl QmtApp {
                         })
                         .child(kit::identicon(&s.id, 14.))
                         .child(div().flex_1().min_w_0().text_sm().truncate().child(s.display_title()))
-                        .when(s.running(), |el| el.child(kit::spinner(("pin-spin", ix), 12., p.success)))
+                        .when(s.running(), |el| el.child(kit::spinner(kit::keyed("pin-spin", s.id.clone()), 12., p.success)))
                 }))
                 .child(open_header())
             })
-            .children(open.into_iter().enumerate().map(|(ix, s)| {
+            .children(open.into_iter().map(|s| {
                 let hover_bg = p.card_hover;
                 let current = self.page == Page::Session && store.session.as_ref().is_some_and(|v| v.session_id == s.id);
                 let s2 = s.clone();
                 v_flex()
-                    .id(("open-session", ix))
+                    .id(kit::keyed("open-session", s.id.clone()))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.open_summary(&s2, cx)))
                     .px_2()
@@ -600,7 +613,7 @@ impl QmtApp {
                                     .truncate()
                                     .child(s.display_title()),
                             )
-                            .when(s.running(), |el| el.child(kit::spinner(("sb-spin", ix), 13., p.success))),
+                            .when(s.running(), |el| el.child(kit::spinner(kit::keyed("sb-spin", s.id.clone()), 13., p.success))),
                     )
                     .child(
                         h_flex()
@@ -720,13 +733,6 @@ fn initial_view(store: &Entity<AgentsStore>, cx: &App) -> (Page, Option<String>)
 impl Render for QmtApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *palette(cx);
-        if let Some(sid) = self.pending_open.clone() {
-            let found = self.store.read(cx).all_sessions().into_iter().find(|s| s.id == sid).cloned();
-            if let Some(summary) = found {
-                self.pending_open = None;
-                self.open_summary(&summary, cx);
-            }
-        }
         let body = match self.page {
             Page::Start => self.render_start(cx).into_any_element(),
             Page::Sessions => self.render_sessions(cx).into_any_element(),

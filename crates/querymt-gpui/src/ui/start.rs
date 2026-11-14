@@ -166,6 +166,17 @@ fn file_uri_paths(text: &str) -> Option<Vec<std::path::PathBuf>> {
     parse_file_uris(text).filter(|paths| paths.iter().all(|p| p.exists()))
 }
 
+/// Presentation snapshot of the model picker's reasoning-effort control.
+struct ReasoningControl {
+    /// Session config option to update; `None` edits the launch preference.
+    config_id: Option<String>,
+    current: String,
+    /// `(value, label)` pairs, in display order.
+    choices: Vec<(String, String)>,
+    /// A change was sent and the agent has not confirmed it yet.
+    pending: bool,
+}
+
 /// Desktop `.composer-reasoning-badge[data-level]` colour (light, dark).
 pub(super) fn reasoning_color(level: &str, p: &Palette) -> Hsla {
     let (light, dark) = match level.trim().to_ascii_lowercase().as_str() {
@@ -732,12 +743,12 @@ impl QmtApp {
                 .w_full()
                 .gap_0p5()
                 .child(div().px_2().pb_1().text_xs().font_semibold().text_color(p.muted).child("Continue where you left off"))
-                .children(recent.into_iter().enumerate().map(|(ix, s)| {
+                .children(recent.into_iter().map(|s| {
                     let hover = p.card;
                     let open_bg = p.card_hover;
                     let s2 = s.clone();
                     h_flex()
-                        .id(("recent", ix))
+                        .id(kit::keyed("recent", s.id.clone()))
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| this.open_summary(&s2, cx)))
                         .gap_3()
@@ -747,12 +758,12 @@ impl QmtApp {
                         .hover(move |el| el.bg(hover))
                         .child(kit::identicon(&s.id, 18.))
                         .child(div().flex_1().min_w_0().text_sm().font_medium().truncate().child(s.display_title()))
-                        .when(s.running(), |el| el.child(kit::spinner(("recent-spin", ix), 14., p.success)))
+                        .when(s.running(), |el| el.child(kit::spinner(kit::keyed("recent-spin", s.id.clone()), 14., p.success)))
                         .child(div().flex_none().max_w(px(160.)).truncate().text_xs().text_color(p.dim).child(workspace_name(&s.cwd)))
                         .child(div().flex_none().w(px(36.)).text_right().text_xs().text_color(p.dim).child(short_time(&s.updated_at)))
                         .child(
                             div()
-                                .id(("recent-open", ix))
+                                .id(kit::keyed("recent-open", s.id.clone()))
                                 .flex_none()
                                 .cursor_pointer()
                                 .px_2p5()
@@ -872,9 +883,9 @@ impl QmtApp {
             .child(div().text_xs().text_color(p.muted).child(describe(&LAUNCH_MODES, mode)))
             .when(agents.len() > 1, |el| {
                 el.child(div().pt_1().child(kit::divider(p))).child(section("Agent")).child(
-                    v_flex().gap_0p5().children(agents.iter().enumerate().map(|(ix, (id, name))| {
+                    v_flex().gap_0p5().children(agents.iter().map(|(id, name)| {
                         let id = id.clone();
-                        kit::button(("opt-agent", ix))
+                        kit::button(kit::keyed("opt-agent", id.clone()))
                             .xsmall()
                             .ghost()
                             .w_full()
@@ -911,20 +922,27 @@ impl QmtApp {
             store.launch_model(&agent).map(|m| m.id.clone())
         };
         // Reasoning effort: the session's config option, or the launch preference on Start.
-        let reasoning: Option<(String, String, Vec<(String, String)>, bool)> = if in_session {
+        let reasoning: Option<ReasoningControl> = if in_session {
             store.session.as_ref().and_then(|v| {
                 let r = v.reasoning_option()?;
-                let pending = v.pending_options.contains(&r.id);
-                Some((r.id.clone(), r.current.clone(), r.choices.clone(), pending))
+                Some(ReasoningControl {
+                    config_id: Some(r.id.clone()),
+                    current: r.current.clone(),
+                    choices: r.choices.clone(),
+                    pending: v.pending_options.contains(&r.id),
+                })
             })
         } else {
-            let choices = LAUNCH_REASONING.iter().map(|(v, l, _)| (v.to_string(), l.to_string())).collect();
-            Some((String::new(), store.prefs.reasoning().to_string(), choices, false))
+            Some(ReasoningControl {
+                config_id: None,
+                current: store.prefs.reasoning().to_string(),
+                choices: LAUNCH_REASONING.iter().map(|(v, l, _)| (v.to_string(), l.to_string())).collect(),
+                pending: false,
+            })
         };
         let total: usize = sections.iter().map(|(_, m)| m.len()).sum();
 
         let mut rows: Vec<AnyElement> = Vec::new();
-        let mut n = 0usize;
         for (label, models) in sections {
             let recent = label == "Recent";
             let group_icon: AnyElement = if recent {
@@ -942,17 +960,18 @@ impl QmtApp {
                     .font_semibold()
                     .text_color(p.dim)
                     .child(group_icon)
-                    .child(label)
+                    .child(label.clone())
                     .child(div().text_color(p.border_strong).child(models.len().to_string()))
                     .into_any_element(),
             );
             let shown = if searching || recent { models.len() } else { models.len().min(GROUP_ROW_LIMIT) };
             let hidden = models.len() - shown;
             for m in models.into_iter().take(shown) {
-                n += 1;
                 let is_selected = selected.as_deref() == Some(m.id.as_str());
                 let hover = p.card;
                 let id = m.id.clone();
+                // A model can be listed under Recent and under its provider.
+                let row_key = format!("{label}:{id}");
                 let known = !m.modalities.is_empty();
                 let modalities: Vec<String> = if known { m.modalities.clone() } else { vec!["text".into()] };
                 let context_tip = match m.context {
@@ -962,7 +981,7 @@ impl QmtApp {
                 let detail_color = if is_selected { p.muted } else { p.dim };
                 rows.push(
                     h_flex()
-                        .id(("model-row", n))
+                        .id(kit::keyed("model-row", row_key.clone()))
                         .cursor_pointer()
                         .gap_3()
                         .px_2p5()
@@ -1012,7 +1031,7 @@ impl QmtApp {
                                         })
                                         .child(
                                             h_flex()
-                                                .id(("model-ctx", n))
+                                                .id(kit::keyed("model-ctx", row_key.clone()))
                                                 .cursor_pointer()
                                                 .gap_1()
                                                 .tooltip(move |window, cx| {
@@ -1022,10 +1041,10 @@ impl QmtApp {
                                                 .child(m.context_short()),
                                         ),
                                 )
-                                .child(h_flex().gap_1().children(modalities.into_iter().enumerate().map(|(ix, modality)| {
+                                .child(h_flex().gap_1().children(modalities.into_iter().map(|modality| {
                                     let tip = if known { format!("Supports {modality} input") } else { "Model modalities unknown".to_string() };
                                     div()
-                                        .id(("model-modality", n * 8 + ix))
+                                        .id(kit::keyed("model-modality", format!("{row_key}:{modality}")))
                                         .cursor_pointer()
                                         .tooltip(move |window, cx| kit::wrap_tip(tip.clone()).build(window, cx))
                                         .child(kit::icon(kit::modality_icon(&modality), 13., detail_color))
@@ -1045,7 +1064,7 @@ impl QmtApp {
 
         // Segmented control like the Options popover: one pill per effort level,
         // with the selected level's description underneath.
-        let reasoning_footer = reasoning.map(|(config_id, current, choices, pending)| {
+        let reasoning_footer = reasoning.map(|ReasoningControl { config_id, current, choices, pending }| {
             let describe = LAUNCH_REASONING
                 .iter()
                 .find(|(v, _, _)| *v == current)
@@ -1059,12 +1078,9 @@ impl QmtApp {
                     .label(label)
                     .inactive(pending)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.store.update(cx, |s, cx| {
-                            if config_id.is_empty() {
-                                s.set_launch_reasoning(&value, cx)
-                            } else {
-                                s.set_session_option(&config_id, &value, cx)
-                            }
+                        this.store.update(cx, |s, cx| match &config_id {
+                            Some(config_id) => s.set_session_option(config_id, &value, cx),
+                            None => s.set_launch_reasoning(&value, cx),
                         })
                     }))
             });

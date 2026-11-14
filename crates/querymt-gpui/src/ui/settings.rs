@@ -199,9 +199,9 @@ impl QmtApp {
                 h_flex()
                     .gap_1()
                     .when(agents.is_empty(), |el| el.child(div().text_xs().text_color(p.dim).child("No agent connected")))
-                    .children(agents.into_iter().enumerate().map(|(ix, (id, name))| {
+                    .children(agents.into_iter().map(|(id, name)| {
                         let selected = primary.as_deref() == Some(id.as_str());
-                        kit::button(("def-agent", ix)).xsmall().ghost().label(name).selected(selected).on_click(cx.listener(
+                        kit::button(kit::keyed("def-agent", id.clone())).xsmall().ghost().label(name).selected(selected).on_click(cx.listener(
                             move |this, _, _, cx| this.store.update(cx, |s, cx| s.set_primary_agent(&id, cx)),
                         ))
                     })),
@@ -389,6 +389,7 @@ impl QmtApp {
         for (ix, pr) in providers.iter().enumerate() {
             let state = provider_state(pr);
             let (pending, method_pending) = busy[ix];
+            let pkey: SharedString = pr.provider.clone().into();
             let open = self.provider_open.contains(&pr.provider);
             let signing = oauth.as_ref().is_some_and(|f| f.provider == pr.provider);
             let primary = match state {
@@ -401,9 +402,9 @@ impl QmtApp {
                 let a = agent.clone();
                 h_flex()
                     .gap_1()
-                    .child(action_btn(("prov-signing", ix), false, true, p).child(kit::spinner(("prov-spin", ix), 14., p.muted)).child("Signing in…"))
+                    .child(action_btn(kit::keyed("prov-signing", pkey.clone()), false, true, p).child(kit::spinner(kit::keyed("prov-spin", pkey.clone()), 14., p.muted)).child("Signing in…"))
                     .child(
-                        kit::icon_button(("prov-cancel", ix), IconName::CircleStop, "Cancel sign-in")
+                        kit::icon_button(kit::keyed("prov-cancel", pkey.clone()), IconName::CircleStop, "Cancel sign-in")
                             .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.cancel_oauth(&a, cx)))),
                     )
                     .into_any_element()
@@ -418,7 +419,7 @@ impl QmtApp {
                     .gap_2()
                     .when(reconnect, |el| {
                         el.child(
-                            action_btn(("prov-reconnect", ix), enabled, true, p)
+                            action_btn(kit::keyed("prov-reconnect", pkey.clone()), enabled, true, p)
                                 .text_color(p.warn)
                                 .child(kit::icon(IconName::LogIn, 14., p.warn))
                                 .child("Reconnect")
@@ -459,10 +460,10 @@ impl QmtApp {
                             .gap_2()
                             .when(flow.needs_code, |el| el.child(Input::new(&self.oauth_code).small().flex_1()))
                             .when(!flow.needs_code, |el| el.child(div().flex_1()))
-                            .child(kit::button(("oauth-cancel", ix)).small().label("Cancel").on_click(cx.listener(move |this, _, _, cx| {
+                            .child(kit::button(kit::keyed("oauth-cancel", pkey.clone())).small().label("Cancel").on_click(cx.listener(move |this, _, _, cx| {
                                 this.store.update(cx, |s, cx| s.cancel_oauth(&a, cx))
                             })))
-                            .child(kit::button(("oauth-done", ix)).small().primary().label("Done").on_click(cx.listener(move |this, _, window, cx| {
+                            .child(kit::button(kit::keyed("oauth-done", pkey.clone())).small().primary().label("Done").on_click(cx.listener(move |this, _, window, cx| {
                                 let code = this.oauth_code.read(cx).value().trim().to_string();
                                 this.oauth_code.update(cx, |s, cx| s.set_value(SharedString::default(), window, cx));
                                 this.store.update(cx, |s, cx| s.complete_oauth(&a2, code, cx));
@@ -502,12 +503,12 @@ impl QmtApp {
                 let menu_open = self.method_menu.as_deref() == Some(pr.provider.as_str());
                 let select_enabled = can_set_method && !method_pending;
                 let prov = pr.provider.clone();
-                let trigger = action_btn(("prov-method", ix), select_enabled, true, p)
+                let trigger = action_btn(kit::keyed("prov-method", pkey.clone()), select_enabled, true, p)
                     .min_w(px(128.))
                     .justify_between()
                     .child(current_label)
                     .child(if method_pending {
-                        kit::spinner(("prov-method-spin", ix), 13., p.muted).into_any_element()
+                        kit::spinner(kit::keyed("prov-method-spin", pkey.clone()), 13., p.muted).into_any_element()
                     } else {
                         kit::icon(if menu_open { IconName::ChevronUp } else { IconName::ChevronDown }, 13., p.muted).into_any_element()
                     })
@@ -521,12 +522,11 @@ impl QmtApp {
                     let hover = p.card_hover;
                     let items: Vec<AnyElement> = choices
                         .iter()
-                        .enumerate()
-                        .map(|(cix, (value, text))| {
+                        .map(|(value, text)| {
                             let (a, prov, value) = (agent.clone(), pr.provider.clone(), value.to_string());
                             let selected = value == current;
                             h_flex()
-                                .id(("prov-method-opt", ix * 8 + cix))
+                                .id(kit::keyed("prov-method-opt", format!("{}:{value}", pr.provider)))
                                 .h(px(30.))
                                 .px_2()
                                 .gap_2()
@@ -548,7 +548,7 @@ impl QmtApp {
                         .collect();
                     deferred(
                         v_flex()
-                            .id(("prov-method-menu", ix))
+                            .id(kit::keyed("prov-method-menu", pkey.clone()))
                             .absolute()
                             .top(px(36.))
                             .right_0()
@@ -577,7 +577,7 @@ impl QmtApp {
                     let enabled = !pending && !sign_in_locked;
                     let (a, prov) = (agent.clone(), pr.provider.clone());
                     actions.push(
-                        action_btn(("prov-signin", ix), enabled, true, p)
+                        action_btn(kit::keyed("prov-signin", pkey.clone()), enabled, true, p)
                             .child(kit::icon(IconName::LogIn, 14., p.text))
                             .child(if pr.oauth_status.as_deref() == Some("expired") { "Reconnect OAuth" } else { "Sign in with OAuth" })
                             .when(enabled, |el| el.on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.start_oauth(&a, &prov, cx)))))
@@ -587,7 +587,7 @@ impl QmtApp {
                 if pr.supports_oauth && oauth_connected {
                     let (a, prov) = (agent.clone(), pr.provider.clone());
                     actions.push(
-                        action_btn(("prov-signout", ix), !pending, true, p)
+                        action_btn(kit::keyed("prov-signout", pkey.clone()), !pending, true, p)
                             .child(kit::icon(IconName::LogOut, 14., p.text))
                             .child("Disconnect OAuth")
                             .when(!pending, |el| el.on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.logout_provider(&a, &prov, cx)))))
@@ -597,7 +597,7 @@ impl QmtApp {
                 if show_set {
                     let prov = pr.provider.clone();
                     actions.push(
-                        action_btn(("prov-setkey", ix), !pending, true, p)
+                        action_btn(kit::keyed("prov-setkey", pkey.clone()), !pending, true, p)
                             .child(kit::icon(IconName::KeyRound, 14., p.text))
                             .child(if pr.has_stored_api_key { "Replace API key" } else { "Set API key" })
                             .when(!pending, |el| {
@@ -617,7 +617,7 @@ impl QmtApp {
                     let (a, prov) = (agent.clone(), pr.provider.clone());
                     let danger = p.danger;
                     actions.push(
-                        action_btn(("prov-clearkey", ix), !pending, true, p)
+                        action_btn(kit::keyed("prov-clearkey", pkey.clone()), !pending, true, p)
                             .border_color(danger.opacity(0.35))
                             .bg(danger.opacity(0.1))
                             .text_color(danger)
@@ -639,11 +639,11 @@ impl QmtApp {
                         .border_t_1()
                         .border_color(subtle_border)
                         .child(Input::new(&self.key_input).small().flex_1().mask_toggle())
-                        .child(kit::button(("key-cancel", ix)).small().label("Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        .child(kit::button(kit::keyed("key-cancel", pkey.clone())).small().label("Cancel").on_click(cx.listener(|this, _, _, cx| {
                             this.key_editing = None;
                             cx.notify();
                         })))
-                        .child(kit::button(("key-save", ix)).small().primary().label("Save").on_click(cx.listener(move |this, _, window, cx| {
+                        .child(kit::button(kit::keyed("key-save", pkey.clone())).small().primary().label("Save").on_click(cx.listener(move |this, _, window, cx| {
                             let key = this.key_input.read(cx).value().trim().to_string();
                             if key.is_empty() {
                                 return;
@@ -703,7 +703,7 @@ impl QmtApp {
             let has_body = oauth_box.is_some() || details.is_some();
             rows.push(
                 v_flex()
-                    .id(("prov-row", ix))
+                    .id(kit::keyed("prov-row", pkey.clone()))
                     .relative()
                     .min_w_0()
                     .bg(if open { hover } else { p.card })
@@ -712,7 +712,7 @@ impl QmtApp {
                     .when(!first, |el| el.border_t_1().border_color(subtle_border))
                     .child(
                         h_flex()
-                            .id(("prov-head", ix))
+                            .id(kit::keyed("prov-head", pkey.clone()))
                             .relative()
                             .min_w_0()
                             .gap_3()
