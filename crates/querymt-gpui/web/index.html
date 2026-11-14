@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>QueryMT</title>
+    <style>
+      /* GPUI appends a single <canvas> to <body> and sizes it to 100%. */
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0a0a; }
+      #loading {
+        position: fixed; inset: 0; display: grid; place-items: center;
+        color: #888; font: 14px system-ui, sans-serif;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="loading">Loading QueryMT…</div>
+    <script type="module">
+      import init from "./querymt_gpui.js";
+      try {
+        await init(); // runs the #[wasm_bindgen(start)] entry
+      } finally {
+        document.getElementById("loading")?.remove();
+      }
+    </script>
+  </body>
+</html>

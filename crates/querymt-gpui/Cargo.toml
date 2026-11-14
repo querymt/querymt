@@ -1,0 +1,62 @@
+[package]
+name = "querymt-gpui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "querymt-gpui"
+path = "src/main.rs"
+
+[dependencies]
+# gpui-kit pins a matching GPUI snapshot and re-exports gpui, gpui-base,
+# gpui-component and the Lucide icon assets, keeping their versions in sync.
+gpui-kit = { version = "0.9.1", features = ["syntect"] }
+# Standalone tool-output highlighting uses the same backend and features as the
+# component library, without depending on its private highlighting API.
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
+two-face = { version = "0.4.5", default-features = false, features = ["syntect-fancy"] }
+async-channel = "2"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+similar = "2"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+dirs = "6"
+# Native WebSocket client (ws:// and wss://) on a background thread.
+tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+# Must match the wasm-bindgen CLI version in flake.nix exactly.
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+# Same `Instant` gpui's executor clock uses on wasm.
+web-time = "1"
+web-sys = { version = "0.3", features = [
+  "WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "Window", "Location", "Storage",
+] }
+
+[build-dependencies]
+dirs = "6"
+sha2 = "0.10"
+tempfile = "3"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+# Prioritize the shipped executable's size over compile time and peak throughput.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+debug = 0
+strip = "symbols"
+panic = "abort"
+incremental = false
+
+[profile.release-web]
+inherits = "release"
+# wasm-bindgen needs target-feature metadata; wasm-opt strips names afterward.
+strip = "debuginfo"
