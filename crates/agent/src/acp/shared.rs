@@ -1378,8 +1378,7 @@ struct MaterializedReplayState {
 /// Deterministic plan identity for QueryMT's todo list within a session.
 pub const QUERYMT_TODO_PLAN_ID: &str = "querymt-todos";
 
-/// QueryMT extension namespace inside ACP's `_meta` escape hatch.
-pub const QUERYMT_META_NAMESPACE: &str = "querymt";
+pub use crate::core_staging::meta::QUERYMT_META_NAMESPACE;
 
 /// `_meta.querymt.sessionLoadSnapshot` key. A client that advertises a
 /// supported version promises it can hydrate session history directly from the

@@ -6,7 +6,9 @@
 
 pub mod dedup;
 pub mod delegation;
+pub mod elicitation;
 pub mod history;
+pub mod meta;
 pub mod prompt_text;
 pub mod protocol;
 pub mod run_lease_path;
