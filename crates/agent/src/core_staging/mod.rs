@@ -4,6 +4,7 @@
 //! moved items, so no caller changes. `git mv` of this directory into
 //! `crates/agent-core/src` is task 4.1.
 
+pub mod dedup;
 pub mod delegation;
 pub mod history;
 pub mod prompt_text;

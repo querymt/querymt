@@ -30,6 +30,7 @@
 //! min_lines = 5
 //! ```
 
+pub use crate::core_staging::dedup::{DuplicateWarning, FunctionLocation, SimilarMatch};
 use crate::event_sink::EventSink;
 use crate::events::AgentEventKind;
 use crate::index::workspace_actor::{FindSimilarToCode, RemoveFile, UpdateFile};
@@ -40,14 +41,11 @@ use crate::middleware::{
 };
 use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tracing::instrument;
-use typeshare::typeshare;
 
 /// Maximum number of warnings shown inline in the injected summary message.
 /// Remaining warnings are still in the overflow file but not listed in context.
@@ -68,61 +66,25 @@ struct WarningOffset {
     length: usize,
 }
 
-/// Location of a function in source code
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionLocation {
-    #[typeshare(serialized_as = "string")]
-    pub file_path: PathBuf,
-    pub function_name: String,
-    pub start_line: u32,
-    pub end_line: u32,
-}
-
-impl FunctionLocation {
-    pub fn from_entry(entry: &IndexedFunctionEntry) -> Self {
-        Self {
-            file_path: entry.file_path.clone(),
-            function_name: entry.name.clone(),
-            start_line: entry.start_line,
-            end_line: entry.end_line,
-        }
+/// Location of an indexed function.
+fn function_location(entry: &IndexedFunctionEntry) -> FunctionLocation {
+    FunctionLocation {
+        file_path: entry.file_path.clone(),
+        function_name: entry.name.clone(),
+        start_line: entry.start_line,
+        end_line: entry.end_line,
     }
 }
 
-/// A warning about duplicate code
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DuplicateWarning {
-    /// The newly written function that is similar to existing code
-    pub new_function: FunctionLocation,
-    /// Matching functions from the codebase, ordered by similarity (highest first)
-    pub matches: Vec<SimilarMatch>,
-}
-
-/// A match found in the existing codebase
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimilarMatch {
-    #[typeshare(serialized_as = "string")]
-    pub file_path: PathBuf,
-    pub function_name: String,
-    pub start_line: u32,
-    pub end_line: u32,
-    pub similarity: f64,
-    pub body_text: String,
-}
-
-impl From<&SimilarFunctionMatch> for SimilarMatch {
-    fn from(m: &SimilarFunctionMatch) -> Self {
-        Self {
-            file_path: m.function.file_path.clone(),
-            function_name: m.function.name.clone(),
-            start_line: m.function.start_line,
-            end_line: m.function.end_line,
-            similarity: m.similarity,
-            body_text: m.function.body_text.clone(),
-        }
+/// A similar-code match from an index hit.
+fn similar_match(m: &SimilarFunctionMatch) -> SimilarMatch {
+    SimilarMatch {
+        file_path: m.function.file_path.clone(),
+        function_name: m.function.name.clone(),
+        start_line: m.function.start_line,
+        end_line: m.function.end_line,
+        similarity: m.similarity,
+        body_text: m.function.body_text.clone(),
     }
 }
 
@@ -308,13 +270,13 @@ impl DedupCheckMiddleware {
                         }
                     );
                     if m.similarity >= self.threshold {
-                        filtered_matches.push(SimilarMatch::from(m));
+                        filtered_matches.push(similar_match(m));
                     }
                 }
 
                 if !filtered_matches.is_empty() {
                     warnings.push(DuplicateWarning {
-                        new_function: FunctionLocation::from_entry(&entry),
+                        new_function: function_location(&entry),
                         matches: filtered_matches,
                     });
                 }
@@ -871,6 +833,7 @@ impl MiddlewareFactory for DedupCheckFactory {
 mod tests {
     use super::*;
     use crate::model::MessagePart;
+    use std::path::PathBuf;
 
     #[test]
     fn test_middleware_defaults() {
