@@ -14,6 +14,19 @@ QMT_DEBUG=1 nix develop -c cargo run                       # log agent/RPC traff
 
 Agents are stored in `~/.config/querymt-gpui/state.json`.
 
+### Run or install with Nix
+
+```bash
+nix run github:querymt/querymt-gpui                          # build and run without installing
+nix run github:querymt/querymt-gpui -- --agent 127.0.0.1:42069
+nix profile install github:querymt/querymt-gpui              # install (adds a "QueryMT" launcher entry)
+nix build                                                    # local checkout: ./result/bin/querymt-gpui
+```
+
+The package embeds the pinned IBM Plex fonts (pre-fetched, since the Nix build has no network),
+installs a desktop entry and icon, and wraps the binary with the Vulkan/Wayland/X11 libraries GPUI
+loads at runtime.
+
 ### Release
 
 ```bash
