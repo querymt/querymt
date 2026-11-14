@@ -49,10 +49,11 @@ async fn fork_isolation_intent_is_atomic_and_survives_reopen() {
     let intent = crate::session::store::PendingForkIsolation {
         source_session_id: source.public_id.clone(),
         source_cwd: dir.path().to_path_buf(),
-        options: crate::worktree::SessionCreationOptions::isolated_worktree(
-            crate::worktree::BaselineMode::CurrentWorkingTree,
-        )
-        .to_workspace_options(),
+        options: crate::worktree::WorkspaceCreationOptions {
+            execution: crate::worktree::ExecutionMode::Worktree,
+            baseline: crate::worktree::BaselineMode::CurrentWorkingTree,
+            base_ref: None,
+        },
         handoff_workspace_id: None,
     };
     storage
