@@ -77,6 +77,9 @@ jobs:
       - name: Run Clippy (querymt-agent-index)
         run: cargo clippy --package querymt-agent-index --all-targets -- -D warnings
 
+      - name: Run Clippy (querymt-agent-knowledge)
+        run: cargo clippy --package querymt-agent-knowledge --all-targets -- -D warnings
+
       - name: Run Clippy
         run: cargo clippy --package querymt-agent --all-targets --features "${features}" -- -D warnings
 
@@ -120,6 +123,7 @@ jobs:
             --package querymt-agent \
             --package querymt-agent-core \
             --package querymt-agent-index \
+            --package querymt-agent-knowledge \
             --lib --tests \
             --features "${features}" \
             --codecov --output-path ./coverage/codecov.json

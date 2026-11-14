@@ -3,15 +3,15 @@ id: pilot-repository-knowledge
 title: Repository knowledge delivery
 description: How repository documentation is indexed, retrieved, and delivered as orientation and index-context cards.
 tags: knowledge, retrieval, delivery, orientation, gate
-knowledge_paths: ["crates/agent/src/knowledge/repository/**", "crates/agent/src/agent/repository_delivery.rs"]
-knowledge_sources: ["crates/agent/src/knowledge/repository/gate.rs"]
+knowledge_paths: ["crates/agent-knowledge/src/**", "crates/agent/src/agent/repository_delivery.rs"]
+knowledge_sources: ["crates/agent-knowledge/src/gate.rs"]
 ---
 
 # Repository knowledge delivery
 
 Repository knowledge is off by default and enabled only by host settings. The documents
 stay as Markdown in the repository; the index is a disposable SQLite cache under the
-QueryMT config directory (`src/knowledge/repository/root.rs`, `store.rs`).
+QueryMT config directory (`crates/agent-knowledge/src/root.rs`, `store.rs`).
 
 ## Selection and refresh
 

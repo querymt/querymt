@@ -16,7 +16,7 @@ note first, then open only the files it names.
 | [execution.md](execution.md) | How one prompt turns into model requests, tool calls, compaction and a final stop (`src/agent/execution`). |
 | [tools.md](tools.md) | How tools are defined, normalized, validated, scheduled and permitted (`src/tools`). |
 | [sessions.md](sessions.md) | How sessions, events and history are stored, pruned, compacted and leased (`src/session`). |
-| [repository-knowledge.md](repository-knowledge.md) | How repository knowledge is wired into prompts and `index` results (`src/knowledge/repository`, `src/agent/repository_delivery.rs`). |
+| [repository-knowledge.md](repository-knowledge.md) | How repository knowledge is wired into prompts and `index` results (`crates/agent-knowledge`, `src/agent/repository_delivery.rs`). |
 
 Conventions used by the notes:
 

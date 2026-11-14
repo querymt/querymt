@@ -13,7 +13,7 @@ Totals after fixes (2026-11-12): covered 95, partial 7, uncovered 3 (of 105).
 | 1 | Rust module is indexed | covered | code::rust_declarations_carry_kind_signature_parent_and_ranges; code::imports_are_syntax_not_resolved_dependencies |  |
 | 2 | Existing Rust documentation is available | covered | code::rust_documentation_is_verbatim_with_coordinates; code::documentation_is_never_invented_for_other_languages |  |
 | 3 | Fresh clone generates the same map | covered | export::exports_are_byte_identical_across_checkout_paths; map::identical_sources_render_identical_maps_in_different_checkouts |  |
-| 4 | Offline generation | partial | (none) | Offline by construction (no network code in knowledge/repository); no test denies network or credentials. |
+| 4 | Offline generation | partial | (none) | Offline by construction (no network code in crates/agent-knowledge); no test denies network or credentials. |
 | 5 | One file changes | covered | reconcile::only_the_changed_file_is_re_extracted |  |
 | 6 | Extractor version changes | covered | reconcile::a_new_extractor_format_re_extracts_code_but_not_documents |  |
 | 7 | Unsupported selected source | covered | code::unsupported_languages_keep_a_path_level_record_with_a_diagnostic |  |
