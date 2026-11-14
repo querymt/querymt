@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::elicitation::{ElicitationAction, ElicitationResponse};
 use crate::event_sink::EventSink;
 use crate::knowledge::{KnowledgeStore, ScopePolicy};
-use crate::tools::context::{ToolContext, ToolError};
+use crate::tools::context::{QuestionOption, ToolContext, ToolError};
 
 /// A request to elicit information from the user, sent from tool context to the agent
 pub struct ElicitationRequest {
@@ -37,12 +37,12 @@ fn question_option_schema(label: &str, description: &str) -> serde_json::Value {
 fn question_schema(
     question: &str,
     header: &str,
-    options: &[(String, String)],
+    options: &[QuestionOption],
     multiple: bool,
 ) -> serde_json::Value {
     let choices: Vec<serde_json::Value> = options
         .iter()
-        .map(|(label, description)| question_option_schema(label, description))
+        .map(|option| question_option_schema(&option.label, &option.description))
         .collect();
     let selection = if multiple {
         json!({
@@ -86,6 +86,7 @@ pub struct AgentToolContext {
     session_store: Option<Arc<dyn crate::session::store::SessionStore>>,
     todo_store: Option<Arc<crate::tools::builtins::todo::TodoStore>>,
     repository_knowledge: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
+    tool_call_id: Option<String>,
 }
 
 impl AgentToolContext {
@@ -111,6 +112,7 @@ impl AgentToolContext {
             session_store: None,
             todo_store: None,
             repository_knowledge: None,
+            tool_call_id: None,
         }
     }
 
@@ -126,6 +128,12 @@ impl AgentToolContext {
         registry: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
     ) -> Self {
         self.repository_knowledge = registry;
+        self
+    }
+
+    /// Record the tool call this context serves.
+    pub fn with_tool_call_id(mut self, id: impl Into<String>) -> Self {
+        self.tool_call_id = Some(id.into());
         self
     }
 
@@ -212,6 +220,10 @@ impl ToolContext for AgentToolContext {
         self.cwd.as_deref()
     }
 
+    fn tool_call_id(&self) -> Option<&str> {
+        self.tool_call_id.as_deref()
+    }
+
     fn agent_registry(&self) -> Option<Arc<dyn crate::delegation::AgentRegistry>> {
         self.agent_registry.clone()
     }
@@ -256,7 +268,7 @@ impl ToolContext for AgentToolContext {
         question_id: &str,
         question: &str,
         header: &str,
-        options: &[(String, String)],
+        options: &[QuestionOption],
         multiple: bool,
     ) -> Result<Vec<String>, ToolError> {
         if let Some(tx) = &self.elicitation_tx {
@@ -417,9 +429,9 @@ mod tests {
         let schema = question_schema(
             "Choose a deployment target",
             "Target",
-            &[(
-                "Production".to_string(),
-                "Deploy to the customer-facing environment".to_string(),
+            &[QuestionOption::new(
+                "Production",
+                "Deploy to the customer-facing environment",
             )],
             false,
         );
@@ -441,8 +453,8 @@ mod tests {
             "Choose environments",
             "Environments",
             &[
-                ("Staging".to_string(), "Internal validation".to_string()),
-                ("Production".to_string(), "Customer traffic".to_string()),
+                QuestionOption::new("Staging", "Internal validation"),
+                QuestionOption::new("Production", "Customer traffic"),
             ],
             true,
         );

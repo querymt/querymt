@@ -5,6 +5,7 @@ pub mod context_impl;
 pub mod path;
 pub mod read_scope;
 pub mod registry;
+pub mod tool_set;
 pub mod validation;
 
 pub use builtins::{
@@ -14,8 +15,8 @@ pub use builtins::{
     UpdateTaskTool, WebFetchTool, WriteFileTool,
 };
 pub use context::{
-    AliasScope, ArgAlias, CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError,
-    ToolExecutionClass, WrapRule, run_under_mutation_gate,
+    AliasScope, ArgAlias, CapabilityRequirement, FileAccess, QuestionOption, Tool, ToolContext,
+    ToolError, ToolExecutionClass, WrapRule, run_under_mutation_gate,
 };
 pub use context_impl::{AgentToolContext, ElicitationRequest};
 pub use path::{
@@ -25,3 +26,4 @@ pub use path::{
 };
 pub use read_scope::{ReadFilter, ReadScope};
 pub use registry::ToolRegistry;
+pub use tool_set::ToolSet;

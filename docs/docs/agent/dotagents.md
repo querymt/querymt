@@ -159,6 +159,13 @@ Protocol `agents/<id>/agent.md` profiles with role `delegation-target` and a sup
 
 The configured planner and configured delegates are never replaced.
 
+### Skills and MCP in targets
+
+- **Skills.** A target gets the `skill` tool when the registering runtime has skills enabled and the profile's `tools` list is absent or contains `skill`. A quorum target uses the planner's skills configuration, including its permissions.
+- **MCP scope.** A profile's `mcpServers` selects the servers its sessions attach, so a target sees only the skills published by those servers (as `<server>.<name>`). The parent's other servers are not visible to it.
+- **No prompts.** A target's sessions have their own event sink and cannot reach the user, so a target never prompts. A skill whose permission resolves to `ask` fails immediately with an error naming the pattern to configure. Allow server skills for targets with `"<server>.*" = "allow"` under `[agent.skills.permissions]`; see [Skills Configuration](configuration.md#skills-configuration).
+- **Restricted `tools`.** With a `tools` list, built-in tools are limited to that list. MCP tools stay available when servers are attached, or when an entry contains a `.` (`docs.*`) or names an attached server; otherwise the target runs with built-in tools only. For example `tools: ["read_tool", "docs.*"]` with server `docs` offers `read_tool` and the `docs` tools only.
+
 Protocol loading **never enables delegation**. When delegation is disabled, protocol targets remain inspectable in the manifest but are not registered.
 
 ### Collision Rules

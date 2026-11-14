@@ -300,7 +300,7 @@ impl OAuthService {
             move |source: AuthError| AuthFlowError::McpAuthorization {
                 server: server.to_string(),
                 step,
-                source,
+                source: Box::new(source),
             }
         };
         let redirect_uri = cfg.redirect_uri();

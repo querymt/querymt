@@ -27,6 +27,10 @@ pub struct SkillsConfig {
     /// Skill permissions
     #[serde(default)]
     pub permissions: crate::skills::SkillPermissions,
+
+    /// Offer skills published by connected MCP servers (default: true)
+    #[serde(default = "default_true")]
+    pub mcp: bool,
 }
 
 impl Default for SkillsConfig {
@@ -37,6 +41,7 @@ impl Default for SkillsConfig {
             paths: vec![],
             urls: vec![],
             permissions: crate::skills::SkillPermissions::default(),
+            mcp: true,
         }
     }
 }

@@ -7,12 +7,7 @@ use serde_json::{Value, json};
 
 use crate::tools::{Tool, ToolContext, ToolError, ToolExecutionClass};
 
-/// A single option in a question
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuestionOption {
-    pub label: String,
-    pub description: String,
-}
+pub use crate::tools::context::QuestionOption;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct QuestionInfo {
@@ -156,20 +151,13 @@ impl Tool for QuestionTool {
             // Create a unique question ID for this question
             let question_id = format!("question_{}_{}", uuid::Uuid::new_v4(), idx);
 
-            // Convert QuestionOption to (label, description) pairs
-            let options: Vec<(String, String)> = question
-                .options
-                .iter()
-                .map(|opt| (opt.label.clone(), opt.description.clone()))
-                .collect();
-
             // Use context.ask_question() which works across all transports
             let answers = context
                 .ask_question(
                     &question_id,
                     &question.question,
                     truncate_header(&question.header),
-                    &options,
+                    &question.options,
                     question.multiple,
                 )
                 .await?;
