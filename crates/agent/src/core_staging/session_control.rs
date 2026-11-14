@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use querymt::chat::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::core::AgentMode;
+use super::agent_mode::AgentMode;
 
 /// Model and provider route selected for one session mode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

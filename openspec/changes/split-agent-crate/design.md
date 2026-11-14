@@ -117,6 +117,7 @@ There are 81 distinct upward production items (lower bound). Most of them are re
 |---|---|---|
 | `agent/core.rs` | `AgentMode` | 9-line enum. `support-mcp-skills` edited `agent/core.rs`; it is merged into this branch (task 2.2), so the move no longer conflicts with it |
 | `agent/session_control.rs` | `SessionControlState`, `SessionModelBinding` (whole file, 58 lines) | depends only on `AgentMode` |
+| `snapshot/backend.rs` | `SnapshotId` | 40-line `Arc<str>` newtype with hand-written serde. Used by `model.rs`, `session/domain.rs` and `sqlite_storage/session_store.rs`; found by the layering script, not by the original inventory. The rest of `snapshot` stays in services |
 | `agent/messages.rs` | `SessionRuntimeStatus`, `SessionRuntimePhase`, `RuntimeObservation` | pulls in `DelegationUpdateNotification` |
 | `control/delegation_notifications.rs` | `DelegationStage`, `DelegationActivity`, `DelegationUpdateNotification` | the projector moves to services |
 | `agent/utils.rs` | `truncate_to_bytes`, `render_prompt_for_display` | |

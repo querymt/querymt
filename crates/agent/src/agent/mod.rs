@@ -28,7 +28,7 @@ pub mod protocol;
 pub mod remote;
 pub(crate) mod repository_delivery;
 pub mod session_actor;
-pub mod session_control;
+pub use crate::core_staging::session_control;
 pub mod session_materializer;
 pub mod session_mcp;
 pub mod session_registry;

@@ -5,6 +5,7 @@
 //! `crates/agent-core/src` is task 4.1.
 
 pub mod accounting;
+pub mod agent_mode;
 pub mod config;
 pub mod dedup;
 pub mod delegation;
@@ -19,6 +20,8 @@ pub mod prompt_text;
 pub mod protocol;
 pub mod run_lease_path;
 pub mod runtime_status;
+pub mod session_control;
+pub mod snapshot_id;
 pub mod stream_cursor;
 #[cfg(test)]
 pub mod test_support;
