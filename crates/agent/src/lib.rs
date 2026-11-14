@@ -10,8 +10,8 @@ pub mod prelude;
 pub use api as simple;
 
 pub mod config;
-pub(crate) mod core_staging;
 pub mod control;
+pub(crate) mod core_staging;
 pub mod runner;
 pub mod template;
 

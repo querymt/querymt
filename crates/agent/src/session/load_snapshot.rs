@@ -1,5 +1,6 @@
 use crate::acp::protocol::ContentBlock;
 use crate::agent::LocalAgentHandle;
+pub use crate::core_staging::stream_cursor::{StreamCursor, observe_cursor};
 use crate::events::AgentEvent;
 use crate::model::MessagePart;
 use crate::session::error::{SessionError, SessionResult};
@@ -8,19 +9,9 @@ use crate::session::history_window::{
 };
 use crate::session::projection::{AuditView, ViewStore};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use typeshare::typeshare;
-
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct StreamCursor {
-    #[typeshare(serialized_as = "number")]
-    pub local_seq: i64,
-    #[typeshare(serialized_as = "Record<string, number>")]
-    pub remote_seq_by_source: HashMap<String, i64>,
-}
 
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -66,27 +57,6 @@ pub struct SessionLoadSnapshot {
     /// Present only for windowed loads that shortened tool content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<Vec<TruncatedEntry>>,
-}
-
-/// Fold one event into a stream cursor.
-pub(crate) fn observe_cursor(cursor: &mut StreamCursor, event: &AgentEvent) {
-    match event.origin {
-        crate::events::EventOrigin::Local => {
-            cursor.local_seq = cursor.local_seq.max(event.seq);
-        }
-        crate::events::EventOrigin::Remote => {
-            if let Some(source) = event.source_node.as_ref() {
-                cursor
-                    .remote_seq_by_source
-                    .entry(source.clone())
-                    .and_modify(|seq| *seq = (*seq).max(event.seq))
-                    .or_insert(event.seq);
-            }
-        }
-        crate::events::EventOrigin::Unknown(_) => {
-            cursor.local_seq = cursor.local_seq.max(event.seq);
-        }
-    }
 }
 
 pub fn cursor_from_events(events: &[AgentEvent]) -> StreamCursor {

@@ -1,6 +1,9 @@
 //! Utility functions for the agent
 
 use crate::acp::protocol::{ContentBlock, EmbeddedResourceResource, ToolCallLocation, ToolKind};
+pub use crate::core_staging::prompt_text::{
+    format_prompt_user_text_only, render_prompt_for_display, truncate_to_bytes,
+};
 use log::warn;
 
 /// Latency histograms for the model call and the work that precedes it.
@@ -669,39 +672,6 @@ pub(crate) mod genai {
     }
 }
 
-const ATTACHMENTS_DISPLAY_FALLBACK: &str = "(attachments included)";
-const IMAGE_DISPLAY_FALLBACK: &str = "(image attached)";
-
-/// Collect user-authored text without incorporating attachment payloads.
-pub fn format_prompt_user_text_only(blocks: &[ContentBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-/// Render prompt blocks for user-facing displays/events.
-///
-/// If there is no user text but attachments exist, return a placeholder.
-pub fn render_prompt_for_display(blocks: &[ContentBlock]) -> String {
-    let user_text = format_prompt_user_text_only(blocks).trim().to_string();
-    if !user_text.is_empty() {
-        return user_text;
-    }
-
-    if crate::model::prompt_contains_images(blocks) {
-        IMAGE_DISPLAY_FALLBACK.to_string()
-    } else if !blocks.is_empty() {
-        ATTACHMENTS_DISPLAY_FALLBACK.to_string()
-    } else {
-        String::new()
-    }
-}
-
 /// Render prompt blocks for LLM context/history replay.
 pub fn render_prompt_for_llm(blocks: &[ContentBlock], max_prompt_bytes: Option<usize>) -> String {
     let mut content = String::new();
@@ -764,26 +734,6 @@ pub fn approximate_token_count(messages: &[querymt::chat::ChatMessage]) -> usize
     (chars / 4).max(1)
 }
 
-/// Truncates a string to fit within a byte limit
-pub fn truncate_to_bytes(input: &str, max_bytes: usize) -> String {
-    if input.len() <= max_bytes {
-        return input.to_string();
-    }
-    let note = "\n[truncated]";
-    if max_bytes <= note.len() {
-        // Not enough room for text + note: return as many whole chars as fit.
-        return input.chars().take(max_bytes).collect();
-    }
-
-    let mut end = max_bytes - note.len();
-    while !input.is_char_boundary(end) && end > 0 {
-        end -= 1;
-    }
-    let mut truncated = input[..end].to_string();
-    truncated.push_str(note);
-    truncated
-}
-
 /// Determines the tool kind for a given tool name
 pub fn tool_kind_for_tool(name: &str) -> ToolKind {
     match name {
@@ -843,8 +793,8 @@ pub fn u32_from_usize(value: usize, field_name: &str, session_id: Option<&str>) 
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_locations, format_prompt_user_text_only, render_prompt_for_display};
-    use crate::acp::protocol::{ContentBlock, TextContent, ToolCallLocation};
+    use super::extract_locations;
+    use crate::acp::protocol::ToolCallLocation;
 
     #[test]
     fn extract_locations_includes_file_path_path_and_root() {
@@ -1336,26 +1286,5 @@ mod tests {
             );
             assert_private(&spans);
         }
-    }
-
-    #[test]
-    fn render_prompt_for_display_prefers_user_text() {
-        let blocks = vec![
-            ContentBlock::Text(TextContent::new("hello".to_string())),
-            ContentBlock::Text(TextContent::new("[file: x]".to_string())),
-        ];
-
-        assert_eq!(render_prompt_for_display(&blocks), "hello\n\n[file: x]");
-        assert_eq!(format_prompt_user_text_only(&blocks), "hello\n\n[file: x]");
-    }
-
-    #[test]
-    fn render_prompt_for_display_uses_attachment_placeholder() {
-        let blocks = vec![
-            ContentBlock::Text(TextContent::new("".to_string())),
-            ContentBlock::Text(TextContent::new("[file: x]".to_string())),
-        ];
-
-        assert_eq!(render_prompt_for_display(&blocks), "[file: x]");
     }
 }

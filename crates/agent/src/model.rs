@@ -1,6 +1,5 @@
 use crate::acp::protocol::{ContentBlock, EmbeddedResourceResource};
-use crate::agent::utils::truncate_to_bytes;
-use crate::index::merkle::DiffPaths;
+use crate::core_staging::prompt_text::truncate_to_bytes;
 use crate::snapshot::SnapshotId;
 use base64::Engine as _;
 use querymt::chat::{
@@ -10,6 +9,7 @@ use querymt::{
     ToolCall,
     chat::{ChatMessage, ChatRole},
 };
+use querymt_agent_core::DiffPaths;
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read};
 
@@ -1766,7 +1766,7 @@ mod tests {
     #[test]
     fn to_chat_message_tool_results_before_snapshot_text() {
         use crate::hash::RapidHash;
-        use crate::index::merkle::DiffPaths;
+        use querymt_agent_core::DiffPaths;
 
         let msg = AgentMessage {
             id: "m1".to_string(),

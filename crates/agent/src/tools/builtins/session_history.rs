@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
-use crate::agent::utils::{render_prompt_for_display, truncate_to_bytes};
+use crate::core_staging::prompt_text::{render_prompt_for_display, truncate_to_bytes};
 use crate::model::{AgentMessage, MessagePart};
 use crate::tools::{Tool as ToolTrait, ToolContext, ToolError};
 
