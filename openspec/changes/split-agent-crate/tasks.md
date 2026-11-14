@@ -215,7 +215,11 @@ Each task moves the listed definitions inside `crates/agent/src` into a staging 
 
 ## 6. Knowledge crate follow-up (the extraction itself is task 1.9)
 
-- [ ] 6.1 Confirm that nothing in Phases 2 to 5 added a dependency from `querymt-agent-knowledge` on core's storage contracts, sqlite, services or runtime. Verify: `cargo tree -p querymt-agent-knowledge -e normal` shows only core, index and external crates; `cargo tree -p querymt-agent-knowledge -e normal -i rusqlite` lists only the knowledge package's own direct dependency.
+- [x] 6.1 Confirm that nothing in Phases 2 to 5 added a dependency from `querymt-agent-knowledge` on core's storage contracts, sqlite, services or runtime. Verify: `cargo tree -p querymt-agent-knowledge -e normal` shows only core, index and external crates; `cargo tree -p querymt-agent-knowledge -e normal -i rusqlite` lists only the knowledge package's own direct dependency.
+  - Checked at the state of group 5 (`c60e0586`), no code change needed. `cargo tree -p querymt-agent-knowledge -e normal` lists, among workspace crates, only `querymt-agent-core`, `querymt-agent-index` and `querymt` (reached through core); the same holds with `-e normal,dev`. No `querymt-agent-sqlite`, `-services`, `-runtime`, `querymt-agent`, `rmcp` or `querymt-utils`.
+  - `cargo tree -p querymt-agent-knowledge -e normal -i rusqlite` prints `rusqlite` with `querymt-agent-knowledge` as its only dependent.
+  - Source imports from core are limited to `dotagents::{frontmatter, layer, memory}`, `HookContextContribution` and `path::{effective_root, resolve_arg_path}`; none touch core's storage contracts.
+  - `cargo fmt --check`, `cargo clippy --all-targets -D warnings` and `cargo nextest run -p querymt-agent-knowledge` pass (443 passed). The layering script still exits 0 with 17 items.
 
 ## 7. Extract `querymt-agent-services`
 
