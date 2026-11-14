@@ -45,8 +45,24 @@ macro_rules! provider_icons {
     };
 }
 provider_icons!(
-    "openai", "anthropic", "google", "mistral", "groq", "xai", "deepseek", "openrouter", "alibaba",
-    "moonshot", "kimi", "zai", "codex", "ollama", "llama-cpp", "mistral-rs", "izwi", "vllm-cpp",
+    "openai",
+    "anthropic",
+    "google",
+    "mistral",
+    "groq",
+    "xai",
+    "deepseek",
+    "openrouter",
+    "alibaba",
+    "moonshot",
+    "kimi",
+    "zai",
+    "codex",
+    "ollama",
+    "llama-cpp",
+    "mistral-rs",
+    "izwi",
+    "vllm-cpp",
 );
 
 /// Asset path of a provider's logo, if we ship one (runtime ids map onto sprite ids).
@@ -60,7 +76,10 @@ pub fn provider_icon_path(provider: &str) -> Option<String> {
         "vllm.cpp" => "vllm-cpp",
         other => other,
     };
-    PROVIDER_SVGS.iter().any(|(k, _)| *k == id).then(|| format!("providers/{id}.svg"))
+    PROVIDER_SVGS
+        .iter()
+        .any(|(k, _)| *k == id)
+        .then(|| format!("providers/{id}.svg"))
 }
 
 /// Icon assets plus app-specific assets (`brand/*`).
@@ -73,10 +92,13 @@ impl<A: AssetSource> AssetSource for AppAssets<A> {
             "brand/querymt-dark.svg" => return Ok(Some(Cow::Borrowed(BRAND_DARK_SVG))),
             _ => {}
         }
-        if let Some(id) = path.strip_prefix("providers/").and_then(|p| p.strip_suffix(".svg"))
-            && let Some((_, bytes)) = PROVIDER_SVGS.iter().find(|(k, _)| *k == id) {
-                return Ok(Some(Cow::Borrowed(bytes)));
-            }
+        if let Some(id) = path
+            .strip_prefix("providers/")
+            .and_then(|p| p.strip_suffix(".svg"))
+            && let Some((_, bytes)) = PROVIDER_SVGS.iter().find(|(k, _)| *k == id)
+        {
+            return Ok(Some(Cow::Borrowed(bytes)));
+        }
         self.0.load(path)
     }
 
@@ -110,11 +132,22 @@ pub fn run(app: Application) {
         #[cfg(target_family = "wasm")]
         let forced = web_sys::window()
             .and_then(|w| w.location().search().ok())
-            .and_then(|s| if s.contains("theme=dark") { Some(true) } else if s.contains("theme=light") { Some(false) } else { None });
+            .and_then(|s| {
+                if s.contains("theme=dark") {
+                    Some(true)
+                } else if s.contains("theme=light") {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
         #[cfg(not(target_family = "wasm"))]
         let forced: Option<bool> = std::env::var("QMT_THEME").ok().map(|t| t == "dark");
         let dark = forced.or(store.read(cx).prefs.dark).unwrap_or_else(|| {
-            matches!(cx.window_appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark)
+            matches!(
+                cx.window_appearance(),
+                WindowAppearance::Dark | WindowAppearance::VibrantDark
+            )
         });
         let accent = store.read(cx).prefs.accent.clone();
         theme::apply(dark, &accent, cx);
@@ -152,8 +185,10 @@ pub fn run(app: Application) {
             }
         };
 
-        gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| ui::QmtApp::new(store, window, cx)))
-            .expect("failed to open window");
+        gpui_kit::open_window(options, cx, |window, cx| {
+            cx.new(|cx| ui::QmtApp::new(store, window, cx))
+        })
+        .expect("failed to open window");
         cx.activate(true);
     });
 }
@@ -165,24 +200,107 @@ mod web {
 
     // Embed exactly the icons the app and the components it uses need: the
     // stock wasm loader fetches lazily over HTTP and never redraws.
-    gpui_kit::assets::icon_assets!(WebIcons, [
-        // app
-        LayoutDashboard, Inbox, MessagesSquare, Bot, Network, Settings, Sun, Moon, FolderOpen,
-        TriangleAlert, CircleAlert, SendHorizontal, X, Plus, RefreshCw, Globe, Terminal, Info,
-        Pencil, Square, Play, ArrowLeft, ArrowUp, CircleStop, CircleCheck, CircleX, CircleDashed, Circle,
-        Wrench, FilePen, FileSearch, SquareTerminal, ListChecks, ShieldAlert, Hand, MessageSquare, ExternalLink, Brain, RotateCcw, ToggleLeft, ToggleRight, Trash,
-        WindowMinimize, WindowMaximize, WindowRestore, WindowClose,
-        PanelLeftOpen, PanelLeftClose, Palette, Keyboard, KeyRound, Ticket,
-        SlidersHorizontal, Paperclip, Pin, PinOff, File, FileText, Image, Clock, Archive, Brain, Ellipsis,
-        // session view + composer
-        EllipsisVertical, Sparkles, FilePenLine, ListTodo, MessageCircleQuestionMark, Navigation, Settings2,
-        Diff, ArrowDown,
-        // model picker
-        Gauge, Type, AudioLines, Video,
-        // used internally by gpui-component widgets
-        Check, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, ChevronsUpDown, Close, CircleX,
-        Search, Copy, Eye, EyeOff, Loader, LoaderCircle, Minus, CircleCheck,
-    ]);
+    gpui_kit::assets::icon_assets!(
+        WebIcons,
+        [
+            // app
+            LayoutDashboard,
+            Inbox,
+            MessagesSquare,
+            Bot,
+            Network,
+            Settings,
+            Sun,
+            Moon,
+            FolderOpen,
+            TriangleAlert,
+            CircleAlert,
+            SendHorizontal,
+            X,
+            Plus,
+            RefreshCw,
+            Globe,
+            Terminal,
+            Info,
+            Pencil,
+            Square,
+            Play,
+            ArrowLeft,
+            ArrowUp,
+            CircleStop,
+            CircleCheck,
+            CircleX,
+            CircleDashed,
+            Circle,
+            Wrench,
+            FilePen,
+            FileSearch,
+            SquareTerminal,
+            ListChecks,
+            ShieldAlert,
+            Hand,
+            MessageSquare,
+            ExternalLink,
+            Brain,
+            RotateCcw,
+            ToggleLeft,
+            ToggleRight,
+            Trash,
+            WindowMinimize,
+            WindowMaximize,
+            WindowRestore,
+            WindowClose,
+            PanelLeftOpen,
+            PanelLeftClose,
+            Palette,
+            Keyboard,
+            KeyRound,
+            Ticket,
+            SlidersHorizontal,
+            Paperclip,
+            Pin,
+            PinOff,
+            File,
+            FileText,
+            Image,
+            Clock,
+            Archive,
+            Brain,
+            Ellipsis,
+            // session view + composer
+            EllipsisVertical,
+            Sparkles,
+            FilePenLine,
+            ListTodo,
+            MessageCircleQuestionMark,
+            Navigation,
+            Settings2,
+            Diff,
+            ArrowDown,
+            // model picker
+            Gauge,
+            Type,
+            AudioLines,
+            Video,
+            // used internally by gpui-component widgets
+            Check,
+            ChevronDown,
+            ChevronUp,
+            ChevronLeft,
+            ChevronRight,
+            ChevronsUpDown,
+            Close,
+            CircleX,
+            Search,
+            Copy,
+            Eye,
+            EyeOff,
+            Loader,
+            LoaderCircle,
+            Minus,
+            CircleCheck,
+        ]
+    );
 
     #[wasm_bindgen(start)]
     pub fn start() {

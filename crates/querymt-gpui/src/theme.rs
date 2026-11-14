@@ -108,27 +108,50 @@ pub const ACCENTS: [(&str, &str, u32, u32); 9] = [
 ];
 
 pub fn accent_color(id: &str, dark: bool) -> Hsla {
-    let (_, _, d, l) = ACCENTS.iter().find(|a| a.0 == id).copied().unwrap_or(ACCENTS[4]);
+    let (_, _, d, l) = ACCENTS
+        .iter()
+        .find(|a| a.0 == id)
+        .copied()
+        .unwrap_or(ACCENTS[4]);
     hex(if dark { d } else { l })
 }
 
 /// Switch light/dark/accent and re-apply QueryMT colors over the component theme.
 pub fn apply(dark: bool, accent: &str, cx: &mut App) {
-    let mut p = if dark { Palette::dark() } else { Palette::light() };
+    let mut p = if dark {
+        Palette::dark()
+    } else {
+        Palette::light()
+    };
     if !accent.is_empty() && accent != "orange" {
         let a = accent_color(accent, dark);
         p.accent = a;
-        p.accent_hover = Hsla { l: (a.l + if dark { 0.08 } else { -0.08 }).clamp(0., 1.), ..a };
+        p.accent_hover = Hsla {
+            l: (a.l + if dark { 0.08 } else { -0.08 }).clamp(0., 1.),
+            ..a
+        };
         p.accent_dim = a.opacity(if dark { 0.16 } else { 0.12 });
     }
     cx.set_global(p);
-    Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
+    Theme::change(
+        if dark {
+            ThemeMode::Dark
+        } else {
+            ThemeMode::Light
+        },
+        None,
+        cx,
+    );
     Theme::update(cx, |t| {
         t.font_family = "IBM Plex Sans".into();
         t.mono_font_family = "IBM Plex Mono".into();
         t.radius = px(8.);
         t.radius_lg = px(12.);
-        t.window_radius = if cfg!(target_os = "linux") { px(12.) } else { px(0.) };
+        t.window_radius = if cfg!(target_os = "linux") {
+            px(12.)
+        } else {
+            px(0.)
+        };
 
         t.background = p.bg;
         t.foreground = p.text;

@@ -65,11 +65,19 @@ mod native {
                 ready_rx
                     .await
                     .map_err(|_| "Connection thread exited.".to_string())??;
-                Ok(Connection { outgoing: out_tx, incoming: in_rx, pid: None })
+                Ok(Connection {
+                    outgoing: out_tx,
+                    incoming: in_rx,
+                    pid: None,
+                })
             }
             Target::Command(command_line) => {
                 let pid = spawn_process(&command_line, out_rx, in_tx)?;
-                Ok(Connection { outgoing: out_tx, incoming: in_rx, pid: Some(pid) })
+                Ok(Connection {
+                    outgoing: out_tx,
+                    incoming: in_rx,
+                    pid: Some(pid),
+                })
             }
         }
     }
@@ -102,7 +110,9 @@ mod native {
                 match out_rx.try_recv() {
                     Ok(text) => {
                         if let Err(err) = socket.send(Message::Text(text.into())) {
-                            let _ = in_tx.send_blocking(Inbound::Closed(format!("WebSocket send failed: {err}")));
+                            let _ = in_tx.send_blocking(Inbound::Closed(format!(
+                                "WebSocket send failed: {err}"
+                            )));
                             return;
                         }
                     }
@@ -116,7 +126,10 @@ mod native {
             }
             match socket.read() {
                 Ok(Message::Text(text)) => {
-                    if in_tx.send_blocking(Inbound::Message(text.as_str().to_owned())).is_err() {
+                    if in_tx
+                        .send_blocking(Inbound::Message(text.as_str().to_owned()))
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -127,14 +140,23 @@ mod native {
                 }
                 Ok(Message::Close(frame)) => {
                     let reason = frame
-                        .map(|f| format!("WebSocket closed: {} ({})", f.reason.as_str(), u16::from(f.code)))
+                        .map(|f| {
+                            format!(
+                                "WebSocket closed: {} ({})",
+                                f.reason.as_str(),
+                                u16::from(f.code)
+                            )
+                        })
                         .unwrap_or_else(|| "WebSocket closed.".into());
                     let _ = in_tx.send_blocking(Inbound::Closed(reason));
                     return;
                 }
                 Ok(_) => {}
                 Err(tungstenite::Error::Io(err))
-                    if matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
                 Err(err) => {
                     let _ = in_tx.send_blocking(Inbound::Closed(format!("WebSocket error: {err}")));
                     return;
@@ -143,7 +165,11 @@ mod native {
         }
     }
 
-    fn spawn_process(command_line: &str, out_rx: Receiver<String>, in_tx: Sender<Inbound>) -> Result<u32, String> {
+    fn spawn_process(
+        command_line: &str,
+        out_rx: Receiver<String>,
+        in_tx: Sender<Inbound>,
+    ) -> Result<u32, String> {
         let parts = split_command_line(command_line)?;
         let (program, args) = parts.split_first().ok_or("Command line is empty.")?;
         let mut child = Command::new(program)
@@ -157,7 +183,9 @@ mod native {
         let mut stdin = child.stdin.take().ok_or("No stdin")?;
         let stdout = child.stdout.take().ok_or("No stdout")?;
         let stderr = child.stderr.take().ok_or("No stderr")?;
-        let _ = in_tx.try_send(Inbound::Log(format!("Started `{command_line}` (pid {pid}).")));
+        let _ = in_tx.try_send(Inbound::Log(format!(
+            "Started `{command_line}` (pid {pid})."
+        )));
 
         let tx = in_tx.clone();
         std::thread::spawn(move || {
@@ -182,7 +210,10 @@ mod native {
         });
         std::thread::spawn(move || {
             while let Ok(line) = out_rx.recv_blocking() {
-                if writeln!(stdin, "{line}").and_then(|_| stdin.flush()).is_err() {
+                if writeln!(stdin, "{line}")
+                    .and_then(|_| stdin.flush())
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -244,7 +275,9 @@ mod web {
     pub async fn connect(target: Target) -> Result<Connection, String> {
         let url = match target {
             Target::WebSocket(url) => url,
-            Target::Command(_) => return Err("Local processes cannot be started from the browser.".into()),
+            Target::Command(_) => {
+                return Err("Local processes cannot be started from the browser.".into());
+            }
         };
         let ws = WebSocket::new(&url).map_err(|e| format!("Invalid WebSocket URL {url}: {e:?}"))?;
         ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
@@ -336,6 +369,10 @@ mod web {
             detach(&socket);
         });
         drop(in_tx);
-        Ok(Connection { outgoing: out_tx, incoming: in_rx, pid: None })
+        Ok(Connection {
+            outgoing: out_tx,
+            incoming: in_rx,
+            pid: None,
+        })
     }
 }

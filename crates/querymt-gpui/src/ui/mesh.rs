@@ -11,7 +11,8 @@ use super::{Page, QmtApp, kit};
 use crate::theme::{Palette, palette};
 use crate::util::now_ms;
 
-pub const INVITE_TTLS: [(&str, &str); 3] = [("1h", "1 hour"), ("24h", "24 hours"), ("168h", "7 days")];
+pub const INVITE_TTLS: [(&str, &str); 3] =
+    [("1h", "1 hour"), ("24h", "24 hours"), ("168h", "7 days")];
 
 /// `12D3KooWPtRj...unWZUT62`
 pub fn short_peer(id: &str) -> String {
@@ -49,7 +50,11 @@ pub fn section_title(title: &'static str, desc: &'static str, p: &Palette) -> Di
 }
 
 pub fn panel(p: &Palette) -> Div {
-    v_flex().rounded(px(14.)).bg(p.surface).border_1().border_color(p.border)
+    v_flex()
+        .rounded(px(14.))
+        .bg(p.surface)
+        .border_1()
+        .border_color(p.border)
 }
 
 fn copy_button(id: impl Into<ElementId>, text: String, tooltip: &'static str) -> impl IntoElement {
@@ -63,9 +68,14 @@ impl QmtApp {
         let p = *palette(cx);
         let store = self.store.read(cx);
         let agent = store.primary_agent();
-        let agent_name = agent.as_deref().and_then(|a| store.config(a)).map(|c| c.name.clone());
+        let agent_name = agent
+            .as_deref()
+            .and_then(|a| store.config(a))
+            .map(|c| c.name.clone());
         let rt = agent.as_deref().and_then(|a| store.runtime(a));
-        let refreshing = agent.as_deref().is_some_and(|a| store.is_pending(a, "extras"));
+        let refreshing = agent
+            .as_deref()
+            .is_some_and(|a| store.is_pending(a, "extras"));
         let mesh_feature = rt
             .and_then(|r| r.capabilities.as_ref())
             .and_then(|c| c.pointer("/features/mesh"))
@@ -76,10 +86,16 @@ impl QmtApp {
         let invites = rt.map(|r| r.mesh_invites.clone()).unwrap_or_default();
         let last_invite = rt.and_then(|r| r.last_invite.clone());
         let error = rt.and_then(|r| r.action_error.clone());
-        let creating = agent.as_deref().is_some_and(|a| store.is_pending(a, "invite"));
+        let creating = agent
+            .as_deref()
+            .is_some_and(|a| store.is_pending(a, "invite"));
         let revoking: Vec<String> = invites
             .iter()
-            .filter(|i| agent.as_deref().is_some_and(|a| store.is_pending(a, &format!("revoke:{}", i.id))))
+            .filter(|i| {
+                agent
+                    .as_deref()
+                    .is_some_and(|a| store.is_pending(a, &format!("revoke:{}", i.id)))
+            })
             .map(|i| i.id.clone())
             .collect();
 
@@ -91,19 +107,39 @@ impl QmtApp {
                     .flex_1()
                     .gap_1()
                     .child(div().text_2xl().font_bold().child("Mesh"))
-                    .child(div().text_sm().text_color(p.muted).child("Manage remote nodes and invites.")),
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(p.muted)
+                            .child("Manage remote nodes and invites."),
+                    ),
             )
-            .when_some(agent_name.clone(), |el, name| el.child(kit::chip(format!("via {name}"), &p)))
+            .when_some(agent_name.clone(), |el, name| {
+                el.child(kit::chip(format!("via {name}"), &p))
+            })
             .when_some(agent.clone(), |el, a| {
                 el.child(
-                    kit::loading_icon_button("mesh-refresh", IconName::RefreshCw, "Refresh mesh", refreshing, 24.)
-                        .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.refresh_extras(&a, cx)))),
+                    kit::loading_icon_button(
+                        "mesh-refresh",
+                        IconName::RefreshCw,
+                        "Refresh mesh",
+                        refreshing,
+                        24.,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store.update(cx, |s, cx| s.refresh_extras(&a, cx))
+                    })),
                 )
             });
 
         let page = |body: Vec<AnyElement>| {
             div().w_full().flex().justify_center().px_8().py_6().child(
-                v_flex().w_full().max_w(px(1040.)).gap_5().child(header).children(body),
+                v_flex()
+                    .w_full()
+                    .max_w(px(1040.))
+                    .gap_5()
+                    .child(header)
+                    .children(body),
             )
         };
 
@@ -114,7 +150,12 @@ impl QmtApp {
                 .gap_2()
                 .child(kit::icon(IconName::Network, 22., p.accent))
                 .child(div().font_semibold().child("No agent connected"))
-                .child(div().text_sm().text_color(p.muted).child("Mesh status comes from a connected agent."))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(p.muted)
+                        .child("Mesh status comes from a connected agent."),
+                )
                 .child(
                     kit::button("mesh-agents")
                         .primary()
@@ -124,13 +165,20 @@ impl QmtApp {
             return page(vec![empty.into_any_element()]);
         };
         if !mesh_feature {
-            let empty = panel(&p)
-                .p_6()
-                .items_center()
-                .gap_2()
-                .child(kit::icon(IconName::Network, 22., p.dim))
-                .child(div().font_semibold().child("Mesh is not enabled on this agent"))
-                .child(div().text_sm().text_color(p.muted).child("Start qmtcode with mesh support to share sessions across machines."));
+            let empty =
+                panel(&p)
+                    .p_6()
+                    .items_center()
+                    .gap_2()
+                    .child(kit::icon(IconName::Network, 22., p.dim))
+                    .child(
+                        div()
+                            .font_semibold()
+                            .child("Mesh is not enabled on this agent"),
+                    )
+                    .child(div().text_sm().text_color(p.muted).child(
+                        "Start qmtcode with mesh support to share sessions across machines.",
+                    ));
             return page(vec![empty.into_any_element()]);
         }
 
@@ -146,9 +194,19 @@ impl QmtApp {
                 .gap_0p5()
                 .when(!last, |el| el.border_r_1().border_color(p.border))
                 .child(div().text_xs().text_color(p.dim).child(label))
-                .child(div().text_lg().font_semibold().text_color(color).when(mono, |el| el.font_family(kit::MONO)).child(value))
+                .child(
+                    div()
+                        .text_lg()
+                        .font_semibold()
+                        .text_color(color)
+                        .when(mono, |el| el.font_family(kit::MONO))
+                        .child(value),
+                )
         };
-        let peer_id = mesh.as_ref().and_then(|m| m.peer_id.clone()).unwrap_or_default();
+        let peer_id = mesh
+            .as_ref()
+            .and_then(|m| m.peer_id.clone())
+            .unwrap_or_default();
         let relays = mesh.as_ref().map(|m| m.relays.clone()).unwrap_or_default();
         let meta = |label: &'static str, value: String| {
             h_flex()
@@ -162,14 +220,30 @@ impl QmtApp {
                 h_flex()
                     .child(cell(
                         "Status",
-                        if enabled { "Enabled".into() } else { "Disabled".into() },
+                        if enabled {
+                            "Enabled".into()
+                        } else {
+                            "Disabled".into()
+                        },
                         if enabled { p.success } else { p.status_muted },
                         true,
                         false,
                     ))
                     .child(cell("Nodes", nodes.len().to_string(), p.text, false, false))
-                    .child(cell("Active sessions", active_sessions.to_string(), p.text, false, false))
-                    .child(cell("Active invites", active_invites.to_string(), p.text, false, true)),
+                    .child(cell(
+                        "Active sessions",
+                        active_sessions.to_string(),
+                        p.text,
+                        false,
+                        false,
+                    ))
+                    .child(cell(
+                        "Active invites",
+                        active_invites.to_string(),
+                        p.text,
+                        false,
+                        true,
+                    )),
             )
             .child(
                 h_flex()
@@ -185,13 +259,28 @@ impl QmtApp {
                         h_flex()
                             .gap_1()
                             .child(meta("Peer", short_peer(&peer_id)))
-                            .when(!peer_id.is_empty(), |el| el.child(copy_button("copy-peer", peer_id.clone(), "Copy peer id"))),
+                            .when(!peer_id.is_empty(), |el| {
+                                el.child(copy_button("copy-peer", peer_id.clone(), "Copy peer id"))
+                            }),
                     )
-                    .when_some(mesh.as_ref().and_then(|m| m.hostname.clone()), |el, h| el.child(meta("Host", h)))
-                    .child(meta("Transport", mesh.as_ref().and_then(|m| m.transport.clone()).unwrap_or("—".into())))
-                    .child(meta("Known peers", mesh.as_ref().map_or(0, |m| m.peers).to_string()))
+                    .when_some(mesh.as_ref().and_then(|m| m.hostname.clone()), |el, h| {
+                        el.child(meta("Host", h))
+                    })
+                    .child(meta(
+                        "Transport",
+                        mesh.as_ref()
+                            .and_then(|m| m.transport.clone())
+                            .unwrap_or("—".into()),
+                    ))
+                    .child(meta(
+                        "Known peers",
+                        mesh.as_ref().map_or(0, |m| m.peers).to_string(),
+                    ))
                     .children(relays.into_iter().take(2).map(|(url, ok)| {
-                        let host = url.trim_start_matches("https://").trim_end_matches(['/', '.']).to_string();
+                        let host = url
+                            .trim_start_matches("https://")
+                            .trim_end_matches(['/', '.'])
+                            .to_string();
                         h_flex()
                             .gap_1p5()
                             .child(kit::dot(if ok { p.success } else { p.warn }).size(px(6.)))
@@ -202,7 +291,11 @@ impl QmtApp {
 
         // ---- nodes
         let nodes_list = if nodes.is_empty() {
-            panel(&p).p_4().text_sm().text_color(p.dim).child("No remote nodes yet. Invite a peer to join this mesh.")
+            panel(&p)
+                .p_4()
+                .text_sm()
+                .text_color(p.dim)
+                .child("No remote nodes yet. Invite a peer to join this mesh.")
         } else {
             panel(&p).p_1().children(nodes.into_iter().map(|n| {
                 let hover = p.card;
@@ -223,13 +316,24 @@ impl QmtApp {
                             .child(
                                 h_flex()
                                     .gap_2()
-                                    .child(div().text_sm().font_semibold().child(if n.label.is_empty() { short_peer(&n.id) } else { n.label.clone() }))
+                                    .child(div().text_sm().font_semibold().child(
+                                        if n.label.is_empty() {
+                                            short_peer(&n.id)
+                                        } else {
+                                            n.label.clone()
+                                        },
+                                    ))
                                     .child(if n.active_sessions > 0 {
-                                        kit::tone_chip(format!("{} active", n.active_sessions), p.success)
+                                        kit::tone_chip(
+                                            format!("{} active", n.active_sessions),
+                                            p.success,
+                                        )
                                     } else {
                                         kit::chip("idle", &p)
                                     })
-                                    .children(n.capabilities.iter().map(|c| kit::chip(c.clone(), &p))),
+                                    .children(
+                                        n.capabilities.iter().map(|c| kit::chip(c.clone(), &p)),
+                                    ),
                             )
                             .child(
                                 h_flex()
@@ -237,14 +341,21 @@ impl QmtApp {
                                     .text_xs()
                                     .text_color(p.dim)
                                     .child(div().font_family(kit::MONO).child(short_peer(&n.id)))
-                                    .when(!n.transport.is_empty() && n.transport != "unknown", |el| el.child("·").child(n.transport.clone())),
+                                    .when(
+                                        !n.transport.is_empty() && n.transport != "unknown",
+                                        |el| el.child("·").child(n.transport.clone()),
+                                    ),
                             ),
                     )
                     .child(
                         div()
                             .opacity(0.)
                             .group_hover("node", |s| s.opacity(1.))
-                            .child(copy_button(kit::keyed("copy-node", n.id.clone()), n.id.clone(), "Copy peer id")),
+                            .child(copy_button(
+                                kit::keyed("copy-node", n.id.clone()),
+                                n.id.clone(),
+                                "Copy peer id",
+                            )),
                     )
             }))
         };
@@ -264,37 +375,58 @@ impl QmtApp {
                         .child(
                             v_flex()
                                 .gap_1()
-                                .child(div().text_xs().font_medium().text_color(p.muted).child("Expires after"))
-                                .child(kit::segment_bar(&p).children(INVITE_TTLS.iter().enumerate().map(
-                                    |(ix, (v, label))| {
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(p.muted)
+                                        .child("Expires after"),
+                                )
+                                .child(kit::segment_bar(&p).children(
+                                    INVITE_TTLS.iter().enumerate().map(|(ix, (v, label))| {
                                         let v: &'static str = v;
-                                        kit::segment(("ttl", ix), ttl == v, &p).label(*label).on_click(cx.listener(
-                                            move |this, _, _, cx| {
+                                        kit::segment(("ttl", ix), ttl == v, &p)
+                                            .label(*label)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.invite_ttl = v;
                                                 cx.notify();
-                                            },
-                                        ))
-                                    },
-                                ))),
+                                            }))
+                                    }),
+                                )),
                         )
                         .child(
                             v_flex()
                                 .gap_1()
-                                .child(div().text_xs().font_medium().text_color(p.muted).child("Max uses"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(p.muted)
+                                        .child("Max uses"),
+                                )
                                 .child(Input::new(&self.invite_uses).small().w(px(130.))),
                         )
                         .child(div().flex_1())
-                        .child(kit::button("invite-cancel").small().label("Cancel").on_click(cx.listener(|this, _, _, cx| {
-                            this.invite_form = false;
-                            cx.notify();
-                        })))
+                        .child(
+                            kit::button("invite-cancel")
+                                .small()
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.invite_form = false;
+                                    cx.notify();
+                                })),
+                        )
                         .child(
                             kit::button("invite-create")
                                 .small()
                                 .primary()
                                 .label("Create invite")
-                                .map(|button| kit::loading_button(button, "invite-spinner", creating, 12.))
-                                .on_click(cx.listener(move |this, _, _, cx| this.create_invite(&a, cx))),
+                                .map(|button| {
+                                    kit::loading_button(button, "invite-spinner", creating, 12.)
+                                })
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.create_invite(&a, cx)),
+                                ),
                         ),
                 )
         });
@@ -314,21 +446,38 @@ impl QmtApp {
                         .flex_1()
                         .min_w_0()
                         .child(div().text_sm().font_semibold().child("Invite created"))
-                        .child(div().text_xs().font_family(kit::MONO).text_color(p.muted).truncate().child(url.clone())),
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(kit::MONO)
+                                .text_color(p.muted)
+                                .truncate()
+                                .child(url.clone()),
+                        ),
                 )
                 .child(
                     kit::button("copy-invite")
                         .small()
                         .icon(IconName::Copy)
                         .label("Copy link")
-                        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(url.clone()))),
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(url.clone()))
+                        }),
                 )
-                .child(kit::icon_button("dismiss-invite", IconName::X, "Dismiss").on_click(cx.listener(move |this, _, _, cx| {
-                    this.store.update(cx, |s, cx| s.dismiss_invite(&a, cx))
-                })))
+                .child(
+                    kit::icon_button("dismiss-invite", IconName::X, "Dismiss").on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.store.update(cx, |s, cx| s.dismiss_invite(&a, cx))
+                        }),
+                    ),
+                )
         });
         let invites_list = if invites.is_empty() {
-            panel(&p).p_4().text_sm().text_color(p.dim).child("No active invites. Create one when another peer needs access.")
+            panel(&p)
+                .p_4()
+                .text_sm()
+                .text_color(p.dim)
+                .child("No active invites. Create one when another peer needs access.")
         } else {
             panel(&p).p_1().children(invites.into_iter().map(|i| {
                 let a = agent.clone();
@@ -338,7 +487,11 @@ impl QmtApp {
                     .gap_3()
                     .px_3()
                     .py_2p5()
-                    .child(kit::icon(IconName::Ticket, 16., if active { p.accent } else { p.dim }))
+                    .child(kit::icon(
+                        IconName::Ticket,
+                        16.,
+                        if active { p.accent } else { p.dim },
+                    ))
                     .child(
                         v_flex()
                             .flex_1()
@@ -347,8 +500,13 @@ impl QmtApp {
                             .child(
                                 h_flex()
                                     .gap_2()
-                                    .child(div().text_sm().font_semibold().child(i.mesh_name.clone().unwrap_or_else(|| "Mesh invite".into())))
-                                    .child(kit::tone_chip(i.status.clone(), if active { p.success } else { p.status_muted })),
+                                    .child(div().text_sm().font_semibold().child(
+                                        i.mesh_name.clone().unwrap_or_else(|| "Mesh invite".into()),
+                                    ))
+                                    .child(kit::tone_chip(
+                                        i.status.clone(),
+                                        if active { p.success } else { p.status_muted },
+                                    )),
                             )
                             .child(
                                 h_flex()
@@ -373,8 +531,17 @@ impl QmtApp {
                                 .xsmall()
                                 .ghost()
                                 .label("Revoke")
-                                .map(|button| kit::loading_button(button, kit::keyed("revoke-spinner", id.clone()), revoking.contains(&id), 12.))
-                                .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.revoke_invite(&a, &id, cx)))),
+                                .map(|button| {
+                                    kit::loading_button(
+                                        button,
+                                        kit::keyed("revoke-spinner", id.clone()),
+                                        revoking.contains(&id),
+                                        12.,
+                                    )
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.store.update(cx, |s, cx| s.revoke_invite(&a, &id, cx))
+                                })),
                         )
                     })
             }))
@@ -391,14 +558,20 @@ impl QmtApp {
                 .text_sm()
                 .child(kit::icon(IconName::CircleAlert, 15., p.danger))
                 .child(div().flex_1().child(err))
-                .child(kit::icon_button("mesh-err", IconName::X, "Dismiss").on_click(cx.listener(move |this, _, _, cx| {
-                    this.store.update(cx, |s, cx| s.clear_action_error(&a, cx))
-                })))
+                .child(
+                    kit::icon_button("mesh-err", IconName::X, "Dismiss").on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.store.update(cx, |s, cx| s.clear_action_error(&a, cx))
+                        },
+                    )),
+                )
         });
 
         let invites_header = h_flex()
             .items_end()
-            .child(section_title("Invites", "Access links for peers joining this mesh.", &p).flex_1())
+            .child(
+                section_title("Invites", "Access links for peers joining this mesh.", &p).flex_1(),
+            )
             .when(!self.invite_form, |el| {
                 el.child(
                     kit::button("new-invite")
@@ -416,7 +589,11 @@ impl QmtApp {
             summary.into_any_element(),
             v_flex()
                 .gap_3()
-                .child(section_title("Nodes", "Remote peers available through the selected agent.", &p))
+                .child(section_title(
+                    "Nodes",
+                    "Remote peers available through the selected agent.",
+                    &p,
+                ))
                 .child(nodes_list)
                 .into_any_element(),
             v_flex()
@@ -431,10 +608,18 @@ impl QmtApp {
     }
 
     fn create_invite(&mut self, agent: &str, cx: &mut Context<Self>) {
-        let uses = self.invite_uses.read(cx).value().trim().parse::<u64>().ok().filter(|n| *n > 0);
+        let uses = self
+            .invite_uses
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0);
         let ttl = self.invite_ttl;
         self.invite_form = false;
-        self.store.update(cx, |s, cx| s.create_invite(agent, ttl, uses, None, cx));
+        self.store
+            .update(cx, |s, cx| s.create_invite(agent, ttl, uses, None, cx));
         cx.notify();
     }
 }

@@ -2,7 +2,9 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, StyledExt as _, h_flex};
+use gpui_kit::component::{
+    Disableable as _, Icon, Selectable as _, Sizable as _, StyledExt as _, h_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -45,19 +47,35 @@ pub const SEGMENT_H: f32 = 32.;
 
 /// Track of a segmented picker; fill it with [`segment`] buttons.
 pub fn segment_bar(p: &Palette) -> Div {
-    h_flex().flex_none().h(px(SEGMENT_H)).p_0p5().gap_0p5().rounded(px(8.)).bg(p.card)
+    h_flex()
+        .flex_none()
+        .h(px(SEGMENT_H))
+        .p_0p5()
+        .gap_0p5()
+        .rounded(px(8.))
+        .bg(p.card)
 }
 
 /// One option of a segmented picker. The selected option gets a clearly
 /// raised fill and full-strength text; the others use muted text.
 pub fn segment(id: impl Into<ElementId>, selected: bool, p: &Palette) -> Button {
-    let (fill, text, muted) = (if p.dark { p.border_strong } else { p.surface }, p.text, p.muted);
+    let (fill, text, muted) = (
+        if p.dark { p.border_strong } else { p.surface },
+        p.text,
+        p.muted,
+    );
     button(id)
         .small()
         .ghost()
         .h(px(SEGMENT_H - 4.))
         .selected(selected)
-        .map(|b| if selected { b.bg(fill).text_color(text).shadow_xs() } else { b.text_color(muted) })
+        .map(|b| {
+            if selected {
+                b.bg(fill).text_color(text).shadow_xs()
+            } else {
+                b.text_color(muted)
+            }
+        })
 }
 
 /// Widest a tooltip grows before its text wraps onto more lines.
@@ -67,7 +85,9 @@ pub const TOOLTIP_MAX_W: f32 = 320.;
 /// keep everything on one line). Short text still sizes to its content.
 pub fn wrap_tip(text: impl Into<SharedString>) -> gpui_kit::component::tooltip::Tooltip {
     let text: SharedString = text.into();
-    gpui_kit::component::tooltip::Tooltip::element(move |_, _| div().max_w(px(TOOLTIP_MAX_W)).child(text.clone()))
+    gpui_kit::component::tooltip::Tooltip::element(move |_, _| {
+        div().max_w(px(TOOLTIP_MAX_W)).child(text.clone())
+    })
 }
 
 /// Title-bar icon items share the session-details/plan look: a 30px square
@@ -91,7 +111,12 @@ pub fn title_chip(id: impl Into<ElementId>, p: &Palette) -> Stateful<Div> {
 }
 
 /// Title-bar icon button: [`title_chip`] with a muted icon and a tooltip.
-pub fn title_icon_button(id: impl Into<ElementId>, name: IconName, tip: &'static str, p: &Palette) -> Stateful<Div> {
+pub fn title_icon_button(
+    id: impl Into<ElementId>,
+    name: IconName,
+    tip: &'static str,
+    p: &Palette,
+) -> Stateful<Div> {
     title_chip(id, p)
         .child(icon(name, TITLE_ICON, p.muted))
         .tooltip(move |window, cx| wrap_tip(tip).build(window, cx))
@@ -99,7 +124,12 @@ pub fn title_icon_button(id: impl Into<ElementId>, name: IconName, tip: &'static
 
 /// Left-aligned popover menu row: icon + label, `card` background on hover.
 /// (`Button` centres its content in an inner row, so `justify_start` can't.)
-pub fn menu_item(id: impl Into<ElementId>, name: IconName, label: impl Into<SharedString>, p: &Palette) -> Stateful<Div> {
+pub fn menu_item(
+    id: impl Into<ElementId>,
+    name: IconName,
+    label: impl Into<SharedString>,
+    p: &Palette,
+) -> Stateful<Div> {
     let hover = p.card;
     h_flex()
         .id(id)
@@ -163,7 +193,11 @@ pub fn tone_chip(text: impl Into<SharedString>, fg: Hsla) -> Div {
         .child(text.into())
 }
 
-pub fn icon_button(id: impl Into<ElementId>, name: IconName, tooltip: impl Into<SharedString>) -> Button {
+pub fn icon_button(
+    id: impl Into<ElementId>,
+    name: IconName,
+    tooltip: impl Into<SharedString>,
+) -> Button {
     button(id).ghost().small().icon(name).tooltip(tooltip)
 }
 
@@ -188,7 +222,11 @@ pub fn rail_button(id: impl Into<ElementId>, active: bool, p: &Palette) -> State
 }
 
 /// `N label` pill with the number emphasized.
-pub fn count_pill(count: impl Into<SharedString>, label: impl Into<SharedString>, p: &Palette) -> Div {
+pub fn count_pill(
+    count: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    p: &Palette,
+) -> Div {
     h_flex()
         .gap_1()
         .px_3()
@@ -201,7 +239,12 @@ pub fn count_pill(count: impl Into<SharedString>, label: impl Into<SharedString>
         .child(label.into())
 }
 
-pub fn stat_card(label: &'static str, value: impl Into<SharedString>, value_color: Hsla, p: &Palette) -> Div {
+pub fn stat_card(
+    label: &'static str,
+    value: impl Into<SharedString>,
+    value_color: Hsla,
+    p: &Palette,
+) -> Div {
     div()
         .flex_1()
         .min_w(px(120.))
@@ -212,7 +255,14 @@ pub fn stat_card(label: &'static str, value: impl Into<SharedString>, value_colo
         .border_1()
         .border_color(p.border)
         .child(div().text_xs().text_color(p.dim).child(label))
-        .child(div().mt_1().text_lg().font_semibold().text_color(value_color).child(value.into()))
+        .child(
+            div()
+                .mt_1()
+                .text_lg()
+                .font_semibold()
+                .text_color(value_color)
+                .child(value.into()),
+        )
 }
 
 pub fn divider(p: &Palette) -> Div {
@@ -222,22 +272,46 @@ pub fn divider(p: &Palette) -> Div {
 // Idle BootMark geometry from the desktop app's lib/design/boot-mark.ts.
 // First seven cells form the Q; the remaining cells are its surrounding peers.
 const BOOT_MARK_CELLS: [(i8, i8); 18] = [
-    (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1), (1, 0), (1, 1),
-    (0, 2), (-1, 2), (-2, 2), (-2, 1), (-2, 0), (-1, -1),
-    (0, -2), (1, -2), (2, -2), (2, -1), (2, 0),
+    (1, -1),
+    (0, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 0),
+    (1, 1),
+    (0, 2),
+    (-1, 2),
+    (-2, 2),
+    (-2, 1),
+    (-2, 0),
+    (-1, -1),
+    (0, -2),
+    (1, -2),
+    (2, -2),
+    (2, -1),
+    (2, 0),
 ];
 const BOOT_MARK_LOGO_HEX: [(f32, f32); 6] = [
-    (27.2, -15.7), (27.2, 15.7), (0., 31.4),
-    (-27.2, 15.7), (-27.2, -15.7), (0., -31.4),
+    (27.2, -15.7),
+    (27.2, 15.7),
+    (0., 31.4),
+    (-27.2, 15.7),
+    (-27.2, -15.7),
+    (0., -31.4),
 ];
 const BOOT_MARK_PEER_HEX: [(f32, f32); 6] = [
-    (17.3, -10.), (17.3, 10.), (0., 20.),
-    (-17.3, 10.), (-17.3, -10.), (0., -20.),
+    (17.3, -10.),
+    (17.3, 10.),
+    (0., 20.),
+    (-17.3, 10.),
+    (-17.3, -10.),
+    (0., -20.),
 ];
 
 fn boot_mark_nodes() -> [Point<f32>; 18] {
     let row = 64. * 3_f32.sqrt() / 2.;
-    BOOT_MARK_CELLS.map(|(q, r)| point(64. * (f32::from(q) + f32::from(r) / 2.), row * f32::from(r)))
+    BOOT_MARK_CELLS
+        .map(|(q, r)| point(64. * (f32::from(q) + f32::from(r) / 2.), row * f32::from(r)))
 }
 
 /// The desktop Start page's static mark, with themed peers and an accent-colored Q.
@@ -251,7 +325,11 @@ pub fn boot_mark(size: f32, p: &Palette) -> impl IntoElement {
             let scale = f32::from(bounds.size.width) / 328.;
             let (sin, cos) = 14.906_842_f32.to_radians().sin_cos();
             let transform = |pt: Point<f32>| {
-                bounds.center() + point(px((pt.x * cos - pt.y * sin) * scale), px((pt.x * sin + pt.y * cos) * scale))
+                bounds.center()
+                    + point(
+                        px((pt.x * cos - pt.y * sin) * scale),
+                        px((pt.x * sin + pt.y * cos) * scale),
+                    )
             };
             for (i, a) in nodes.iter().enumerate() {
                 for b in &nodes[i + 1..] {
@@ -268,7 +346,11 @@ pub fn boot_mark(size: f32, p: &Palette) -> impl IntoElement {
             // Opaque hexagons cover the links, matching BootMark's paint order.
             for (i, center) in nodes.iter().enumerate() {
                 let logo = i < 7;
-                let vertices = if logo { &BOOT_MARK_LOGO_HEX } else { &BOOT_MARK_PEER_HEX };
+                let vertices = if logo {
+                    &BOOT_MARK_LOGO_HEX
+                } else {
+                    &BOOT_MARK_PEER_HEX
+                };
                 let mut fill = PathBuilder::fill();
                 let mut stroke = PathBuilder::stroke(px(scale));
                 for (j, &(x, y)) in vertices.iter().enumerate() {
@@ -301,7 +383,9 @@ pub fn boot_mark(size: f32, p: &Palette) -> impl IntoElement {
 // ---------------------------------------------------------------------------
 // Session identicon: port of the Svelte app's hex identicon (same seed -> same glyph).
 
-const IDENTICON_PALETTE: [u32; 8] = [0x3B82F6, 0x10B981, 0xF59E0B, 0xEF4444, 0x8B5CF6, 0xEC4899, 0x06B6D4, 0xF97316];
+const IDENTICON_PALETTE: [u32; 8] = [
+    0x3B82F6, 0x10B981, 0xF59E0B, 0xEF4444, 0x8B5CF6, 0xEC4899, 0x06B6D4, 0xF97316,
+];
 const IDENTICON_SIZE: f32 = 40.;
 
 fn identicon_cells(seed: &str) -> Vec<(f32, f32, Hsla)> {
@@ -319,7 +403,9 @@ fn identicon_cells(seed: &str) -> Vec<(f32, f32, Hsla)> {
     }
     let color_count = (bytes[0] % 2) as usize + 1;
     let colors: Vec<Hsla> = (0..color_count)
-        .map(|i| rgb(IDENTICON_PALETTE[(bytes[1 + i] as usize + i * 3) % IDENTICON_PALETTE.len()]).into())
+        .map(|i| {
+            rgb(IDENTICON_PALETTE[(bytes[1 + i] as usize + i * 3) % IDENTICON_PALETTE.len()]).into()
+        })
         .collect();
     let (c, hex_r) = (IDENTICON_SIZE / 2., IDENTICON_SIZE * 0.082);
     let spacing = hex_r * 2.05;
@@ -328,13 +414,19 @@ fn identicon_cells(seed: &str) -> Vec<(f32, f32, Hsla)> {
         let count = 6 * ring;
         for i in 0..count {
             let ang = std::f32::consts::TAU * i as f32 / count as f32;
-            positions.push((c + spacing * ring as f32 * ang.cos(), c + spacing * ring as f32 * ang.sin()));
+            positions.push((
+                c + spacing * ring as f32 * ang.cos(),
+                c + spacing * ring as f32 * ang.sin(),
+            ));
         }
     }
     let mut cells: Vec<(f32, f32, Hsla)> = Vec::new();
     let mut put = |x: f32, y: f32, color: Hsla| {
         let key = |a: f32| (a * 10.).round() as i32;
-        match cells.iter_mut().find(|(cx, cy, _)| key(*cx) == key(x) && key(*cy) == key(y)) {
+        match cells
+            .iter_mut()
+            .find(|(cx, cy, _)| key(*cx) == key(x) && key(*cy) == key(y))
+        {
             Some(cell) => cell.2 = color,
             None => cells.push((x, y, color)),
         }
@@ -366,8 +458,13 @@ pub fn identicon(seed: &str, size: f32) -> impl IntoElement {
                 let mut path = PathBuilder::fill();
                 for i in 0..6 {
                     let ang = std::f32::consts::FRAC_PI_3 * i as f32 - std::f32::consts::FRAC_PI_6;
-                    let pt = bounds.origin + point(px(cx + hex_r * ang.cos()), px(cy + hex_r * ang.sin()));
-                    if i == 0 { path.move_to(pt) } else { path.line_to(pt) }
+                    let pt = bounds.origin
+                        + point(px(cx + hex_r * ang.cos()), px(cy + hex_r * ang.sin()));
+                    if i == 0 {
+                        path.move_to(pt)
+                    } else {
+                        path.line_to(pt)
+                    }
                 }
                 path.close();
                 if let Ok(path) = path.build() {
@@ -400,7 +497,13 @@ pub fn ring(fraction: f32, size: f32, color: Hsla, track: Hsla) -> impl IntoElem
                 let ang = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * frac;
                 let mut path = PathBuilder::stroke(px(2.));
                 path.move_to(point(c.x, c.y - px(r)));
-                path.arc_to(radii, px(0.), frac > 0.5, true, point(c.x + px(r * ang.cos()), c.y + px(r * ang.sin())));
+                path.arc_to(
+                    radii,
+                    px(0.),
+                    frac > 0.5,
+                    true,
+                    point(c.x + px(r * ang.cos()), c.y + px(r * ang.sin())),
+                );
                 if let Ok(path) = path.build() {
                     window.paint_path(path, color);
                 }
@@ -412,7 +515,15 @@ pub fn ring(fraction: f32, size: f32, color: Hsla, track: Hsla) -> impl IntoElem
 }
 
 /// Clockwise stroked arc from angle `a0` to `a1` (radians, 0 = 3 o'clock).
-fn paint_arc(window: &mut Window, c: Point<Pixels>, r: f32, a0: f32, a1: f32, width: f32, color: Hsla) {
+fn paint_arc(
+    window: &mut Window,
+    c: Point<Pixels>,
+    r: f32,
+    a0: f32,
+    a1: f32,
+    width: f32,
+    color: Hsla,
+) {
     let at = |a: f32| point(c.x + px(r * a.cos()), c.y + px(r * a.sin()));
     let radii = point(px(r), px(r));
     let mut path = PathBuilder::stroke(px(width));
@@ -442,10 +553,34 @@ pub fn corner_mask(radius: f32, color: Hsla) -> impl IntoElement {
             let c = px(radius * 0.5523);
             let corners = [
                 // (corner, edge point A, curve end B, control near A, control near B)
-                (point(x0, y0), point(x0 + r, y0), point(x0, y0 + r), point(x0 + r - c, y0), point(x0, y0 + r - c)),
-                (point(x1, y0), point(x1, y0 + r), point(x1 - r, y0), point(x1, y0 + r - c), point(x1 - r + c, y0)),
-                (point(x1, y1), point(x1 - r, y1), point(x1, y1 - r), point(x1 - r + c, y1), point(x1, y1 - r + c)),
-                (point(x0, y1), point(x0, y1 - r), point(x0 + r, y1), point(x0, y1 - r + c), point(x0 + r - c, y1)),
+                (
+                    point(x0, y0),
+                    point(x0 + r, y0),
+                    point(x0, y0 + r),
+                    point(x0 + r - c, y0),
+                    point(x0, y0 + r - c),
+                ),
+                (
+                    point(x1, y0),
+                    point(x1, y0 + r),
+                    point(x1 - r, y0),
+                    point(x1, y0 + r - c),
+                    point(x1 - r + c, y0),
+                ),
+                (
+                    point(x1, y1),
+                    point(x1 - r, y1),
+                    point(x1, y1 - r),
+                    point(x1 - r + c, y1),
+                    point(x1, y1 - r + c),
+                ),
+                (
+                    point(x0, y1),
+                    point(x0, y1 - r),
+                    point(x0 + r, y1),
+                    point(x0, y1 - r + c),
+                    point(x0 + r - c, y1),
+                ),
             ];
             for (corner, a, b, ca, cb) in corners {
                 let mut path = PathBuilder::fill();
@@ -465,7 +600,13 @@ pub fn corner_mask(radius: f32, color: Hsla) -> impl IntoElement {
 
 /// Segmented ring (usage breakdown): `(share 0..=1, color)` clockwise from 12
 /// o'clock over a track; a dashed track marks proportions of reported tokens only.
-pub fn donut(segments: Vec<(f32, Hsla)>, size: f32, stroke: f32, track: Hsla, dashed: bool) -> impl IntoElement {
+pub fn donut(
+    segments: Vec<(f32, Hsla)>,
+    size: f32,
+    stroke: f32,
+    track: Hsla,
+    dashed: bool,
+) -> impl IntoElement {
     use std::f32::consts::{FRAC_PI_2, TAU};
     canvas(
         |_, _, _| {},
@@ -504,7 +645,9 @@ impl SecondClock {
     fn new(cx: &mut Context<Self>) -> Self {
         let ticker = cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
                 if this.update(cx, |_, cx| cx.notify()).is_err() {
                     break;
                 }
@@ -529,14 +672,24 @@ impl RenderOnce for LiveDuration {
             let clock = window.use_keyed_state(self.id, cx, |_, cx| SecondClock::new(cx));
             let _ = clock.read(cx);
         }
-        let live = self.started_at.map_or(0., |s| (crate::util::now_ms() - s).max(0.));
+        let live = self
+            .started_at
+            .map_or(0., |s| (crate::util::now_ms() - s).max(0.));
         div().child(crate::usage::format_duration(self.settled_ms + live))
     }
 }
 
 /// `17m 15s` of active work, counting up each second while `started_at` is set.
-pub fn live_duration(id: impl Into<ElementId>, settled_ms: f64, started_at: Option<f64>) -> impl IntoElement {
-    LiveDuration { id: id.into(), settled_ms, started_at }
+pub fn live_duration(
+    id: impl Into<ElementId>,
+    settled_ms: f64,
+    started_at: Option<f64>,
+) -> impl IntoElement {
+    LiveDuration {
+        id: id.into(),
+        settled_ms,
+        started_at,
+    }
 }
 
 /// `12.3k` style token counts.
@@ -551,7 +704,12 @@ pub fn short_num(n: u64) -> String {
 /// Provider logo, falling back to the generic bot icon.
 pub fn provider_icon(provider: &str, size: f32, color: Hsla) -> AnyElement {
     match crate::provider_icon_path(provider) {
-        Some(path) => svg().path(path).flex_none().size(px(size)).text_color(color).into_any_element(),
+        Some(path) => svg()
+            .path(path)
+            .flex_none()
+            .size(px(size))
+            .text_color(color)
+            .into_any_element(),
         None => icon(IconName::Bot, size, color).into_any_element(),
     }
 }
@@ -578,16 +736,24 @@ impl SpinnerClock {
         let started = cx.background_executor().now();
         let ticker = cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(std::time::Duration::from_millis(33)).await;
-                if this.update(cx, |clock, cx| {
-                    clock.phase = spinner_phase(cx.background_executor().now() - started);
-                    cx.notify();
-                }).is_err() {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(33))
+                    .await;
+                if this
+                    .update(cx, |clock, cx| {
+                        clock.phase = spinner_phase(cx.background_executor().now() - started);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
         });
-        Self { phase: 0., _ticker: ticker }
+        Self {
+            phase: 0.,
+            _ticker: ticker,
+        }
     }
 }
 
@@ -620,13 +786,26 @@ impl RenderOnce for ActivitySpinner {
 
 /// Rotating activity indicator, including when the system reduces decorative motion.
 pub fn spinner(id: impl Into<ElementId>, size: f32, color: Hsla) -> impl IntoElement {
-    ActivitySpinner { id: id.into(), size, color: Some(color) }
+    ActivitySpinner {
+        id: id.into(),
+        size,
+        color: Some(color),
+    }
 }
 
 /// Loading content for a button: disable repeat actions and inherit its foreground.
-pub fn loading_button(button: Button, id: impl Into<ElementId>, loading: bool, size: f32) -> Button {
+pub fn loading_button(
+    button: Button,
+    id: impl Into<ElementId>,
+    loading: bool,
+    size: f32,
+) -> Button {
     button.when(loading, |button| {
-        button.inactive(true).child(ActivitySpinner { id: id.into(), size, color: None })
+        button.inactive(true).child(ActivitySpinner {
+            id: id.into(),
+            size,
+            color: None,
+        })
     })
 }
 
@@ -637,10 +816,20 @@ pub fn loading_icon_button(
     loading: bool,
     size: f32,
 ) -> Button {
-    let button = button(id).ghost().small().when(size < 24., |button| button.xsmall()).size(px(size)).px_0()
+    let button = button(id)
+        .ghost()
+        .small()
+        .when(size < 24., |button| button.xsmall())
+        .size(px(size))
+        .px_0()
         .when(!loading, |button| button.icon(name))
         .tooltip(tooltip);
-    loading_button(button, (ElementId::from(id), "spinner"), loading, size * 0.75)
+    loading_button(
+        button,
+        (ElementId::from(id), "spinner"),
+        loading,
+        size * 0.75,
+    )
 }
 
 #[cfg(test)]
@@ -650,7 +839,14 @@ mod tests {
     #[test]
     fn spinner_advances_and_wraps_without_losing_long_running_precision() {
         use std::time::Duration;
-        for (ms, expected) in [(0, 0.), (225, 0.25), (450, 0.5), (675, 0.75), (900, 0.), (1125, 0.25)] {
+        for (ms, expected) in [
+            (0, 0.),
+            (225, 0.25),
+            (450, 0.5),
+            (675, 0.75),
+            (900, 0.),
+            (1125, 0.25),
+        ] {
             assert!((spinner_phase(Duration::from_millis(ms)) - expected).abs() < 1e-6);
         }
         // A late frame samples the current phase instead of replaying missed ticks.
@@ -663,16 +859,29 @@ mod tests {
     fn boot_mark_matches_desktop_topology() {
         let nodes = boot_mark_nodes();
         // The six-hex ring has an empty counter, followed by the Q's tail.
-        assert!(nodes[..6].iter().all(|p| (p.x.hypot(p.y) - 64.).abs() < 0.001));
+        assert!(
+            nodes[..6]
+                .iter()
+                .all(|p| (p.x.hypot(p.y) - 64.).abs() < 0.001)
+        );
         assert_eq!(nodes[6].x, 96.);
         assert!((nodes[6].y - 55.425_625).abs() < 0.001);
-        let degrees: Vec<_> = nodes.iter().enumerate().map(|(i, a)| {
-            nodes.iter().enumerate().filter(|(j, b)| {
-                i != *j && (a.x - b.x).hypot(a.y - b.y) < 65.
-            }).count()
-        }).collect();
+        let degrees: Vec<_> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, b)| i != *j && (a.x - b.x).hypot(a.y - b.y) < 65.)
+                    .count()
+            })
+            .collect();
         // Same seven logo nodes, eleven peers, and 36 links as BootMark.svelte.
-        assert_eq!(degrees, [5, 5, 5, 5, 5, 5, 4, 3, 4, 3, 4, 3, 4, 3, 4, 3, 4, 3]);
+        assert_eq!(
+            degrees,
+            [5, 5, 5, 5, 5, 5, 4, 3, 4, 3, 4, 3, 4, 3, 4, 3, 4, 3]
+        );
         assert_eq!(degrees.iter().sum::<usize>() / 2, 36);
     }
 }
