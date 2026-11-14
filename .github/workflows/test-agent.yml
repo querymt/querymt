@@ -82,6 +82,20 @@ jobs:
       - name: Run Clippy (querymt-agent-core)
         run: cargo clippy --package querymt-agent-core --all-targets -- -D warnings
 
+      # Core builds on its own and must not depend on rmcp, querymt-utils or
+      # rusqlite (design D7).
+      - name: Check querymt-agent-core standalone and dependency exclusions
+        run: |
+          cargo check --package querymt-agent-core --no-default-features
+          cargo check --package querymt-agent-core --features test-support
+          tree="$(cargo tree --package querymt-agent-core --edges normal)"
+          for forbidden in rmcp querymt-utils rusqlite; do
+            if grep -q "^[^a-z]*${forbidden} " <<<"$tree"; then
+              echo "querymt-agent-core must not depend on ${forbidden}" >&2
+              exit 1
+            fi
+          done
+
       - name: Run Clippy (querymt-agent-index)
         run: cargo clippy --package querymt-agent-index --all-targets -- -D warnings
 
