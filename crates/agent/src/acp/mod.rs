@@ -7,7 +7,7 @@ pub mod websocket;
 pub(crate) mod client_bridge;
 pub mod cwd;
 pub(crate) mod delivery;
-pub mod protocol;
+pub use crate::core_staging::protocol;
 pub mod shared;
 pub(crate) mod stdio;
 pub(crate) mod trace_context;
