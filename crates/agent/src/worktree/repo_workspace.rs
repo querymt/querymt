@@ -8,6 +8,7 @@
 //! surfaced as explicit [`SessionError`] variants.
 
 use crate::session::error::{SessionError, SessionResult};
+use crate::sqlite_staging::error::session_db_error;
 use crate::worktree::domain::{
     Baseline, BaselineMode, ExecutionMode, ManagedBranch, ProvisioningPhase, RepositoryIdentity,
     ResultProvenance, ResultVerificationStatus, WorkspaceId, WorkspaceLifecycle,
@@ -190,7 +191,7 @@ fn map_workspace_db_error(err: rusqlite::Error) -> SessionError {
     } else if msg.contains("idx_workspaces_checkout") || msg.contains("workspaces.checkout_path") {
         SessionError::WorkspaceCheckoutTaken(msg)
     } else {
-        SessionError::from(err)
+        session_db_error(err)
     }
 }
 

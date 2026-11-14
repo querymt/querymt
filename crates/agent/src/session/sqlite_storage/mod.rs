@@ -22,6 +22,7 @@ mod view_store;
 #[cfg(test)]
 mod tests;
 
+use crate::sqlite_staging::error::session_db_error;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -143,7 +144,7 @@ impl SqliteStorage {
         })
         .await
         .map_err(|e| SessionError::Other(format!("Failed to spawn blocking task: {}", e)))?
-        .map_err(SessionError::from)?;
+        .map_err(session_db_error)?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -183,7 +184,7 @@ impl SqliteStorage {
         })
         .await
         .map_err(|err| match err {
-            SessionError::Database(rusqlite::Error::QueryReturnedNoRows) => {
+            ref e @ SessionError::Database(_) if e.is_no_rows() => {
                 SessionError::SessionNotFound(error_value.clone())
             }
             other => other,
@@ -206,7 +207,7 @@ impl SqliteStorage {
         })
         .await
         .map_err(|err| match err {
-            SessionError::Database(rusqlite::Error::QueryReturnedNoRows) => {
+            ref e @ SessionError::Database(_) if e.is_no_rows() => {
                 SessionError::InvalidOperation(format!("Message not found: {}", error_value))
             }
             other => other,

@@ -8,6 +8,7 @@ use crate::knowledge::{
     KnowledgeFilter, KnowledgeQueryResult, KnowledgeStats, KnowledgeStore, ProtocolUpsertOutcome,
     QueryOpts, RetentionPolicy, RetentionResult, RetrievalMode,
 };
+use crate::sqlite_staging::error::SqliteResultExt;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rusqlite::{Connection, params, types::Value};
@@ -196,7 +197,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
             .run_blocking(move |conn| {
                 // Atomic: a failing junction insert must not leave a committed
                 // entry without its entity/topic links.
-                let tx = conn.transaction().map_err(KnowledgeError::from)?;
+                let tx = conn.transaction().knowledge_db()?;
                 tx.execute(
                     "INSERT INTO knowledge_entries (
                         public_id, scope, source, raw_text, summary,
@@ -216,7 +217,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                         now_str,
                     ],
                 )
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
                 let row_id = tx.last_insert_rowid();
 
                 // Populate junction tables with normalized forms for indexed matching
@@ -227,7 +228,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                          VALUES (?, ?, ?)",
                         params![row_id, entity, normalized],
                     )
-                    .map_err(KnowledgeError::from)?;
+                    .knowledge_db()?;
                 }
                 for topic in &entry.topics {
                     let normalized = crate::knowledge::text_processing::normalize_term(topic);
@@ -236,10 +237,10 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                          VALUES (?, ?, ?)",
                         params![row_id, topic, normalized],
                     )
-                    .map_err(KnowledgeError::from)?;
+                    .knowledge_db()?;
                 }
 
-                tx.commit().map_err(KnowledgeError::from)?;
+                tx.commit().knowledge_db()?;
                 Ok(row_id)
             })
             .await?;
@@ -276,12 +277,11 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                      WHERE scope = ? AND consolidated_at IS NULL AND {ACTIVE_ONLY} \
                      ORDER BY created_at ASC LIMIT ?"
                 ))
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
             let rows = stmt
                 .query_map(params![scope, limit as i64], row_to_entry)
-                .map_err(KnowledgeError::from)?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(KnowledgeError::from)
+                .knowledge_db()?;
+            rows.collect::<Result<Vec<_>, _>>().knowledge_db()
         })
         .await
     }
@@ -367,15 +367,14 @@ impl KnowledgeStore for SqliteKnowledgeStore {
             );
             bindings.push((limit_idx, Value::Integer(filter.limit as i64)));
 
-            let mut stmt = conn.prepare(&sql).map_err(KnowledgeError::from)?;
+            let mut stmt = conn.prepare(&sql).knowledge_db()?;
             for (idx, val) in &bindings {
-                stmt.raw_bind_parameter(*idx, val)
-                    .map_err(KnowledgeError::from)?;
+                stmt.raw_bind_parameter(*idx, val).knowledge_db()?;
             }
             let mut rows = stmt.raw_query();
             let mut results = Vec::new();
-            while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
-                results.push(row_to_entry(row).map_err(KnowledgeError::from)?);
+            while let Some(row) = rows.next().knowledge_db()? {
+                results.push(row_to_entry(row).knowledge_db()?);
             }
             Ok(results)
         })
@@ -404,7 +403,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 
         let id = self
             .run_blocking(move |conn| {
-                let tx = conn.transaction().map_err(KnowledgeError::from)?;
+                let tx = conn.transaction().knowledge_db()?;
 
                 // Insert the consolidation
                 tx.execute(
@@ -422,7 +421,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                         now_str,
                     ],
                 )
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
                 let consolidation_id = tx.last_insert_rowid();
 
                 // Mark source entries as consolidated
@@ -432,10 +431,10 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                          WHERE public_id = ? AND scope = ? AND consolidated_at IS NULL",
                         params![now_str, entry_public_id, scope_clone],
                     )
-                    .map_err(KnowledgeError::from)?;
+                    .knowledge_db()?;
                 }
 
-                tx.commit().map_err(KnowledgeError::from)?;
+                tx.commit().knowledge_db()?;
                 Ok(consolidation_id)
             })
             .await?;
@@ -495,7 +494,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                     params![scope],
                     |row| row.get(0),
                 )
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
 
             let unconsolidated_entries: i64 = conn
                 .query_row(
@@ -506,7 +505,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                     params![scope],
                     |row| row.get(0),
                 )
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
 
             let total_consolidations: i64 = conn
                 .query_row(
@@ -514,7 +513,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                     params![scope],
                     |row| row.get(0),
                 )
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
 
             let latest_entry_at: Option<String> = conn
                 .query_row(
@@ -524,7 +523,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                     params![scope],
                     |row| row.get(0),
                 )
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
 
             let latest_consolidation_at: Option<String> = conn
                 .query_row(
@@ -532,7 +531,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                     params![scope],
                     |row| row.get(0),
                 )
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
 
             Ok(KnowledgeStats {
                 total_entries,
@@ -554,7 +553,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
         let policy = policy.clone();
 
         self.run_blocking(move |conn| {
-            let tx = conn.transaction().map_err(KnowledgeError::from)?;
+            let tx = conn.transaction().knowledge_db()?;
             let mut archived: i64 = 0;
             let mut deleted: i64 = 0;
 
@@ -571,7 +570,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                              WHERE scope = ? AND created_at < ? AND raw_text IS NOT NULL",
                             params![scope, cutoff_str],
                         )
-                        .map_err(KnowledgeError::from)?;
+                        .knowledge_db()?;
                     archived += count as i64;
                 } else {
                     // Hard delete old entries
@@ -581,7 +580,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                              WHERE scope = ? AND created_at < ?",
                             params![scope, cutoff_str],
                         )
-                        .map_err(KnowledgeError::from)?;
+                        .knowledge_db()?;
                     deleted += count as i64;
                 }
             }
@@ -594,7 +593,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                         params![scope],
                         |row| row.get(0),
                     )
-                    .map_err(KnowledgeError::from)?;
+                    .knowledge_db()?;
 
                 if current_count > max_entries {
                     let excess = current_count - max_entries;
@@ -612,7 +611,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                                  )",
                                 params![scope, scope, excess],
                             )
-                            .map_err(KnowledgeError::from)?;
+                            .knowledge_db()?;
                         archived += count as i64;
                     } else {
                         // Hard delete the oldest entries
@@ -626,13 +625,13 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                                  )",
                                 params![scope, scope, excess],
                             )
-                            .map_err(KnowledgeError::from)?;
+                            .knowledge_db()?;
                         deleted += count as i64;
                     }
                 }
             }
 
-            tx.commit().map_err(KnowledgeError::from)?;
+            tx.commit().knowledge_db()?;
             Ok(RetentionResult { archived, deleted })
         })
         .await
@@ -653,7 +652,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                     params![scope, source_key],
                     |row| row.get(0),
                 )
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
             Ok(exists)
         })
         .await
@@ -674,7 +673,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                  (scope, source_key, processed_at) VALUES (?, ?, ?)",
                 params![scope, source_key, now_str],
             )
-            .map_err(KnowledgeError::from)?;
+            .knowledge_db()?;
             Ok(())
         })
         .await
@@ -700,7 +699,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 
         let outcome = self
             .run_blocking(move |conn| {
-                let tx = conn.transaction().map_err(KnowledgeError::from)?;
+                let tx = conn.transaction().knowledge_db()?;
                 let existing: Option<(i64, String, String)> = match tx.query_row(
                     "SELECT id, public_id, created_at FROM knowledge_entries \
                      WHERE scope = ? AND protocol_source_key = ?",
@@ -709,7 +708,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                 ) {
                     Ok(existing) => Some(existing),
                     Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(KnowledgeError::DatabaseError(error.to_string())),
                 };
 
                 let (row_id, public_id, created_at, created) = match existing {
@@ -735,7 +734,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                                 row_id,
                             ],
                         )
-                        .map_err(KnowledgeError::from)?;
+                        .knowledge_db()?;
 
                         // Rebuild junction rows so topic/entity matching reflects
                         // the updated content rather than stale values.
@@ -743,12 +742,12 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                             "DELETE FROM knowledge_entry_entities WHERE entry_id = ?",
                             params![row_id],
                         )
-                        .map_err(KnowledgeError::from)?;
+                        .knowledge_db()?;
                         tx.execute(
                             "DELETE FROM knowledge_entry_topics WHERE entry_id = ?",
                             params![row_id],
                         )
-                        .map_err(KnowledgeError::from)?;
+                        .knowledge_db()?;
 
                         (row_id, public_id, parse_dt(&created_at)?, false)
                     }
@@ -775,7 +774,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                                 fingerprint,
                             ],
                         )
-                        .map_err(KnowledgeError::from)?;
+                        .knowledge_db()?;
                         (tx.last_insert_rowid(), public_id, now, true)
                     }
                 };
@@ -787,7 +786,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                          VALUES (?, ?, ?)",
                         params![row_id, entity, normalized],
                     )
-                    .map_err(KnowledgeError::from)?;
+                    .knowledge_db()?;
                 }
                 for topic in &entry.topics {
                     let normalized = crate::knowledge::text_processing::normalize_term(topic);
@@ -796,10 +795,10 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                          VALUES (?, ?, ?)",
                         params![row_id, topic, normalized],
                     )
-                    .map_err(KnowledgeError::from)?;
+                    .knowledge_db()?;
                 }
 
-                tx.commit().map_err(KnowledgeError::from)?;
+                tx.commit().knowledge_db()?;
                 Ok(ProtocolUpsertOutcome {
                     entry: KnowledgeEntry {
                         id: row_id,
@@ -841,7 +840,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                      WHERE scope = ? AND protocol_source_key IS NOT NULL \
                        AND protocol_active = 1",
                 )
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
             let candidates = stmt
                 .query_map(params![scope], |row| {
                     Ok((
@@ -850,12 +849,12 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                         row.get::<_, Option<String>>(2)?,
                     ))
                 })
-                .map_err(KnowledgeError::from)?
+                .knowledge_db()?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
             drop(stmt);
 
-            let tx = conn.transaction().map_err(KnowledgeError::from)?;
+            let tx = conn.transaction().knowledge_db()?;
             let mut deactivated = Vec::new();
             for (row_id, public_id, source_key) in candidates {
                 let Some(source_key) = source_key else {
@@ -868,10 +867,10 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                     "UPDATE knowledge_entries SET protocol_active = 0 WHERE id = ?",
                     params![row_id],
                 )
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
                 deactivated.push(public_id);
             }
-            tx.commit().map_err(KnowledgeError::from)?;
+            tx.commit().knowledge_db()?;
             deactivated.sort();
             Ok(deactivated)
         })
@@ -892,12 +891,11 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                      WHERE scope = ? AND protocol_source_key IS NOT NULL \
                      ORDER BY protocol_source_key ASC"
                 ))
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
             let rows = stmt
                 .query_map(params![scope], row_to_entry)
-                .map_err(KnowledgeError::from)?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(KnowledgeError::from)
+                .knowledge_db()?;
+            rows.collect::<Result<Vec<_>, _>>().knowledge_db()
         })
         .await
     }
@@ -978,15 +976,14 @@ fn query_entries(
                     "SELECT {ENTRY_COLS} FROM knowledge_entries \
                      WHERE scope = ?1 AND {ACTIVE_ONLY} ORDER BY created_at DESC LIMIT ?2"
                 ))
-                .map_err(KnowledgeError::from)?;
-            stmt.raw_bind_parameter(1, scope)
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
+            stmt.raw_bind_parameter(1, scope).knowledge_db()?;
             stmt.raw_bind_parameter(2, opts.limit as i64)
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
             let mut rows = stmt.raw_query();
             let mut results = Vec::new();
-            while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
-                results.push(row_to_entry(row).map_err(KnowledgeError::from)?);
+            while let Some(row) = rows.next().knowledge_db()? {
+                results.push(row_to_entry(row).knowledge_db()?);
             }
             return Ok(results);
         }
@@ -1071,15 +1068,14 @@ fn query_entries(
             boost_expr_unaliased = boost_expr.replace("e.id", "knowledge_entries.id"),
         );
 
-        let mut stmt = conn.prepare(&sql).map_err(KnowledgeError::from)?;
+        let mut stmt = conn.prepare(&sql).knowledge_db()?;
         for (idx, val) in &bindings {
-            stmt.raw_bind_parameter(*idx, val)
-                .map_err(KnowledgeError::from)?;
+            stmt.raw_bind_parameter(*idx, val).knowledge_db()?;
         }
         let mut rows = stmt.raw_query();
         let mut results = Vec::new();
-        while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
-            results.push(row_to_entry(row).map_err(KnowledgeError::from)?);
+        while let Some(row) = rows.next().knowledge_db()? {
+            results.push(row_to_entry(row).knowledge_db()?);
         }
         Ok(results)
     } else {
@@ -1093,17 +1089,15 @@ fn query_entries(
              LIMIT ?3"
         );
 
-        let mut stmt = conn.prepare(&sql).map_err(KnowledgeError::from)?;
-        stmt.raw_bind_parameter(1, fts_query)
-            .map_err(KnowledgeError::from)?;
-        stmt.raw_bind_parameter(2, scope)
-            .map_err(KnowledgeError::from)?;
+        let mut stmt = conn.prepare(&sql).knowledge_db()?;
+        stmt.raw_bind_parameter(1, fts_query).knowledge_db()?;
+        stmt.raw_bind_parameter(2, scope).knowledge_db()?;
         stmt.raw_bind_parameter(3, opts.limit as i64)
-            .map_err(KnowledgeError::from)?;
+            .knowledge_db()?;
         let mut rows = stmt.raw_query();
         let mut results = Vec::new();
-        while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
-            results.push(row_to_entry(row).map_err(KnowledgeError::from)?);
+        while let Some(row) = rows.next().knowledge_db()? {
+            results.push(row_to_entry(row).knowledge_db()?);
         }
         Ok(results)
     }
@@ -1127,15 +1121,13 @@ fn query_consolidations(
                     "SELECT {CONSOLIDATION_COLS} FROM knowledge_consolidations \
                      WHERE scope = ?1 ORDER BY created_at DESC LIMIT ?2"
                 ))
-                .map_err(KnowledgeError::from)?;
-            stmt.raw_bind_parameter(1, scope)
-                .map_err(KnowledgeError::from)?;
-            stmt.raw_bind_parameter(2, limit as i64)
-                .map_err(KnowledgeError::from)?;
+                .knowledge_db()?;
+            stmt.raw_bind_parameter(1, scope).knowledge_db()?;
+            stmt.raw_bind_parameter(2, limit as i64).knowledge_db()?;
             let mut rows = stmt.raw_query();
             let mut results = Vec::new();
-            while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
-                results.push(row_to_consolidation(row).map_err(KnowledgeError::from)?);
+            while let Some(row) = rows.next().knowledge_db()? {
+                results.push(row_to_consolidation(row).knowledge_db()?);
             }
             Ok(results)
         }
@@ -1149,17 +1141,14 @@ fn query_consolidations(
                  LIMIT ?3"
             );
 
-            let mut stmt = conn.prepare(&sql).map_err(KnowledgeError::from)?;
-            stmt.raw_bind_parameter(1, fts_q)
-                .map_err(KnowledgeError::from)?;
-            stmt.raw_bind_parameter(2, scope)
-                .map_err(KnowledgeError::from)?;
-            stmt.raw_bind_parameter(3, limit as i64)
-                .map_err(KnowledgeError::from)?;
+            let mut stmt = conn.prepare(&sql).knowledge_db()?;
+            stmt.raw_bind_parameter(1, fts_q).knowledge_db()?;
+            stmt.raw_bind_parameter(2, scope).knowledge_db()?;
+            stmt.raw_bind_parameter(3, limit as i64).knowledge_db()?;
             let mut rows = stmt.raw_query();
             let mut results = Vec::new();
-            while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
-                results.push(row_to_consolidation(row).map_err(KnowledgeError::from)?);
+            while let Some(row) = rows.next().knowledge_db()? {
+                results.push(row_to_consolidation(row).knowledge_db()?);
             }
             Ok(results)
         }

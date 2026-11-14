@@ -3704,11 +3704,10 @@ mod tests {
     }
 
     fn busy_error() -> crate::session::error::SessionError {
-        rusqlite::Error::SqliteFailure(
+        crate::sqlite_staging::error::session_db_error(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
             Some("database is locked".to_string()),
-        )
-        .into()
+        ))
     }
 
     #[tokio::test]
@@ -3743,7 +3742,10 @@ mod tests {
                 "unknown delegation status",
             )),
         );
-        let (orchestrator, attempts) = claim_orchestrator(vec![Err(undecodable.into())]).await;
+        let (orchestrator, attempts) = claim_orchestrator(vec![Err(
+            crate::sqlite_staging::error::session_db_error(undecodable),
+        )])
+        .await;
         let err = orchestrator
             .claim_delegation("delegation-1")
             .await

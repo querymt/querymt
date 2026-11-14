@@ -13,6 +13,7 @@ pub mod config;
 pub mod control;
 pub(crate) mod core_staging;
 pub mod runner;
+pub(crate) mod sqlite_staging;
 pub mod template;
 
 pub mod auth;

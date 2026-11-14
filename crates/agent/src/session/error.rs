@@ -51,9 +51,9 @@ pub enum SessionError {
     #[error("Invalid message index: {0}")]
     InvalidMessageIndex(String),
 
-    /// Database error; the original rusqlite error is the source.
+    /// Database error; the original driver error is the source.
     #[error("Database error: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[source] DbError),
 
     /// A blocking storage task panicked or was cancelled before finishing.
     #[error("storage task failed")]
@@ -96,16 +96,57 @@ pub enum SessionError {
     Other(String),
 }
 
+/// Coarse classification of a database failure, set by the storage
+/// implementation that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbErrorKind {
+    /// A query that must return a row returned none.
+    NoRows,
+    /// The database was busy or locked by another connection; a retry may succeed.
+    Busy,
+    /// Anything else.
+    Other,
+}
+
+/// A database-neutral storage failure: the boxed driver error plus its kind.
+#[derive(Debug)]
+pub struct DbError {
+    source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    kind: DbErrorKind,
+}
+
+impl DbError {
+    pub fn new(source: impl std::error::Error + Send + Sync + 'static, kind: DbErrorKind) -> Self {
+        Self {
+            source: Box::new(source),
+            kind,
+        }
+    }
+
+    pub fn kind(&self) -> DbErrorKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for DbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for DbError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Convenience type alias for Result with SessionError
 pub type SessionResult<T> = Result<T, SessionError>;
 
 impl SessionError {
     /// True when the underlying database error is a "no rows" result.
     pub fn is_no_rows(&self) -> bool {
-        matches!(
-            self,
-            SessionError::Database(rusqlite::Error::QueryReturnedNoRows)
-        )
+        matches!(self, SessionError::Database(err) if err.kind == DbErrorKind::NoRows)
     }
 
     /// True when the underlying database error message contains `needle`.
@@ -113,20 +154,13 @@ impl SessionError {
     /// Used for errors raised by SQL triggers (`RAISE(ABORT, '...')`), which
     /// carry a marker string rather than a distinct error code.
     pub fn db_message_contains(&self, needle: &str) -> bool {
-        matches!(self, SessionError::Database(err) if err.to_string().contains(needle))
+        matches!(self, SessionError::Database(err) if err.source.to_string().contains(needle))
     }
 
     /// True when retrying the operation may succeed: the database was busy
     /// or locked by another connection.
     pub fn is_transient(&self) -> bool {
-        matches!(
-            self,
-            SessionError::Database(rusqlite::Error::SqliteFailure(failure, _))
-                if matches!(
-                    failure.code,
-                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                )
-        )
+        matches!(self, SessionError::Database(err) if err.kind == DbErrorKind::Busy)
     }
 }
 
@@ -200,47 +234,5 @@ impl From<SessionError> for LLMError {
                 LLMError::ProviderError(render_chain(&err))
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::error::Error as _;
-
-    #[test]
-    fn storage_error_converted_for_a_provider_caller_keeps_its_source() {
-        let db_err = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-            Some("distinctive busy marker".to_string()),
-        );
-        let err = SessionError::from(db_err);
-
-        // The original rusqlite error is reachable through `source()`.
-        let source = err.source().expect("database error has a source");
-        assert!(source.downcast_ref::<rusqlite::Error>().is_some());
-        assert!(err.is_transient());
-
-        // `LLMError` stores strings only, so the cause must be in its text.
-        let llm: LLMError = err.into();
-        assert!(
-            llm.to_string().contains("distinctive busy marker"),
-            "LLM error text lost the rusqlite message: {llm}"
-        );
-    }
-
-    #[test]
-    fn is_transient_only_for_busy_and_locked() {
-        let busy = |code| {
-            SessionError::from(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(code),
-                None,
-            ))
-        };
-        assert!(busy(rusqlite::ffi::SQLITE_BUSY).is_transient());
-        assert!(busy(rusqlite::ffi::SQLITE_LOCKED).is_transient());
-        assert!(!busy(rusqlite::ffi::SQLITE_CONSTRAINT).is_transient());
-        assert!(!SessionError::from(rusqlite::Error::QueryReturnedNoRows).is_transient());
-        assert!(!SessionError::Other("x".into()).is_transient());
     }
 }

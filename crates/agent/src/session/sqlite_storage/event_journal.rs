@@ -1,3 +1,4 @@
+use crate::sqlite_staging::error::{SqliteResultExt, session_db_error};
 use async_trait::async_trait;
 use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
@@ -36,7 +37,8 @@ impl EventJournal for SqliteStorage {
                 &event_clone,
                 event_clone.source_node_id.as_deref(),
                 event_clone.source_seq,
-            )?
+            )
+            .db()?
             .ok_or_else(|| {
                 SessionError::Other(
                     "duplicate source-identity event rejected by the journal unique index"
@@ -278,8 +280,8 @@ impl EventJournal for SqliteStorage {
         let paged = blocking::with_conn(
             &self.conn,
             move |conn| -> SessionResult<Option<Vec<(i64, DurableEvent)>>> {
-                let (cursor, complete) = read_sync_row(conn, &session, &node)?;
-                let mut covered = read_coverage(conn, &session, &node)?;
+                let (cursor, complete) = read_sync_row(conn, &session, &node).db()?;
+                let mut covered = read_coverage(conn, &session, &node).db()?;
                 if cursor > 0 {
                     covered.insert(1, cursor);
                 }
@@ -295,14 +297,14 @@ impl EventJournal for SqliteStorage {
                         "{COLUMNS} ORDER BY source_seq {} LIMIT ?5",
                         if desc { "DESC" } else { "ASC" }
                     );
-                    let mut stmt = conn.prepare_cached(&sql)?;
+                    let mut stmt = conn.prepare_cached(&sql).db()?;
                     let take = i64::try_from(take).unwrap_or(i64::MAX);
                     let rows = stmt.query_map(params![session, node, lo, hi, take], |row| {
                         Ok((parse_journal_row(row)?, row.get::<_, i64>(8)?))
-                    })?;
+                    }).db()?;
                     let mut out = Vec::new();
                     for row in rows {
-                        let (event, position) = row?;
+                        let (event, position) = row.db()?;
                         out.push((position, event));
                     }
                     Ok(out)
@@ -483,7 +485,9 @@ impl EventJournal for SqliteStorage {
             // so concurrent writers serialize at the database level (not just
             // in-process via the connection mutex); the partial unique index
             // (idx_event_journal_source_identity) remains the durable backstop.
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .db()?;
 
             let existing: Option<i64> = tx
                 .query_row(
@@ -492,20 +496,22 @@ impl EventJournal for SqliteStorage {
                     params![event_clone.session_id, source_node_id, source_seq],
                     |row| row.get(0),
                 )
-                .optional()?;
+                .optional()
+                .db()?;
             if existing.is_some() {
                 return Ok(None);
             }
 
             let inserted =
-                insert_journal_event(&tx, &event_clone, Some(&source_node_id), Some(source_seq))?;
+                insert_journal_event(&tx, &event_clone, Some(&source_node_id), Some(source_seq))
+                    .db()?;
             if inserted.is_none() {
                 // Lost the race against a concurrent duplicate writer: dropping
                 // the transaction rolls back (releasing the allocated sequence)
                 // and the replay reports no-op.
                 return Ok(None);
             }
-            tx.commit()?;
+            tx.commit().db()?;
             Ok(inserted)
         })
         .await
@@ -601,28 +607,31 @@ impl EventJournal for SqliteStorage {
         let session_id = session_id.to_owned();
         let source_node_id = source_node_id.to_owned();
         blocking::with_conn(&self.conn, move |conn| {
-            let (cursor, complete) = read_sync_row(conn, &session_id, &source_node_id)?;
-            let mut covered = read_coverage(conn, &session_id, &source_node_id)?;
+            let (cursor, complete) = read_sync_row(conn, &session_id, &source_node_id).db()?;
+            let mut covered = read_coverage(conn, &session_id, &source_node_id).db()?;
             if cursor > 0 {
                 covered.insert(1, cursor);
             }
             // Cursorless legacy copies stay visible only until any
             // source-identified history exists for this session.
             let include_legacy = !complete && covered.is_empty();
-            let mut stmt = conn.prepare(
-                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, \
+            let mut stmt = conn
+                .prepare(
+                    "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, \
                         payload_json, session_seq, source_seq \
                  FROM event_journal WHERE session_id = ?1 AND ( \
                      source_node_id = ?2 OR (source_node_id IS NULL AND ?3)) \
                  ORDER BY CASE WHEN source_seq IS NULL THEN 0 ELSE 1 END, source_seq, stream_seq",
-            )?;
+                )
+                .db()?;
             let rows = stmt
                 .query_map(params![session_id, source_node_id, include_legacy], |row| {
                     Ok((parse_journal_row(row)?, row.get::<_, Option<i64>>(8)?))
-                })?;
+                })
+                .db()?;
             let mut history = Vec::new();
             for row in rows {
-                let (event, source_seq) = row?;
+                let (event, source_seq) = row.db()?;
                 match source_seq {
                     Some(seq) if covered.contains(seq) => history.push((seq, event)),
                     Some(_) => {}
@@ -642,7 +651,8 @@ impl EventJournal for SqliteStorage {
         let session_id = session_id.to_owned();
         let source_node_id = source_node_id.to_owned();
         blocking::with_conn(&self.conn, move |conn| {
-            Ok(read_coverage(conn, &session_id, &source_node_id)?
+            Ok(read_coverage(conn, &session_id, &source_node_id)
+                .db()?
                 .ranges()
                 .to_vec())
         })
@@ -659,21 +669,21 @@ impl EventJournal for SqliteStorage {
         let session_id = session_id.to_owned();
         let source_node_id = source_node_id.to_owned();
         blocking::with_conn(&self.conn, move |conn| {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let mut set = read_coverage(&tx, &session_id, &source_node_id)?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).db()?;
+            let mut set = read_coverage(&tx, &session_id, &source_node_id).db()?;
             set.insert(start, end);
             tx.execute(
                 "DELETE FROM remote_session_coverage WHERE session_id = ?1 AND source_node_id = ?2",
                 params![session_id, source_node_id],
-            )?;
+            ).db()?;
             for (a, b) in set.ranges() {
                 tx.execute(
                     "INSERT INTO remote_session_coverage (session_id, source_node_id, start_seq, end_seq) \
                      VALUES (?1, ?2, ?3, ?4)",
                     params![session_id, source_node_id, a, b],
-                )?;
+                ).db()?;
             }
-            tx.commit()?;
+            tx.commit().db()?;
             Ok(())
         })
         .await
@@ -693,7 +703,7 @@ impl EventJournal for SqliteStorage {
                     params![session_id, source_node_id],
                     |row| row.get(0),
                 )
-                .optional()?;
+                .optional().db()?;
             Ok(epoch.map(|epoch| epoch.max(0) as u64))
         })
         .await
@@ -712,7 +722,7 @@ impl EventJournal for SqliteStorage {
                 "INSERT INTO remote_session_epoch (session_id, source_node_id, epoch) VALUES (?1, ?2, ?3) \
                  ON CONFLICT (session_id, source_node_id) DO UPDATE SET epoch = excluded.epoch",
                 params![session_id, source_node_id, i64::try_from(epoch).unwrap_or(i64::MAX)],
-            )?;
+            ).db()?;
             Ok(())
         })
         .await
@@ -726,19 +736,19 @@ impl EventJournal for SqliteStorage {
         let session_id = session_id.to_owned();
         let source_node_id = source_node_id.to_owned();
         blocking::with_conn(&self.conn, move |conn| {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).db()?;
             let deleted = tx.execute(
                 "DELETE FROM event_journal WHERE session_id = ?1 AND source_node_id = ?2",
                 params![session_id, source_node_id],
-            )?;
+            ).db()?;
             tx.execute(
                 "DELETE FROM remote_session_coverage WHERE session_id = ?1 AND source_node_id = ?2",
                 params![session_id, source_node_id],
-            )?;
+            ).db()?;
             tx.execute(
                 "DELETE FROM remote_session_epoch WHERE session_id = ?1 AND source_node_id = ?2",
                 params![session_id, source_node_id],
-            )?;
+            ).db()?;
             // Cursor back to 0 but marked authoritative, so cursorless legacy
             // copies of the rewritten history never reappear.
             tx.execute(
@@ -746,8 +756,8 @@ impl EventJournal for SqliteStorage {
                  VALUES (?1, ?2, 0, 1) \
                  ON CONFLICT (session_id, source_node_id) DO UPDATE SET source_seq = 0, complete = 1",
                 params![session_id, source_node_id],
-            )?;
-            tx.commit()?;
+            ).db()?;
+            tx.commit().db()?;
             Ok(deleted)
         })
         .await
@@ -928,7 +938,7 @@ fn insert_batch(
     })();
     match batched {
         Ok(persisted) => persisted.into_iter().map(Ok).collect(),
-        Err(batch_error) if events.len() == 1 => vec![Err(SessionError::from(batch_error))],
+        Err(batch_error) if events.len() == 1 => vec![Err(session_db_error(batch_error))],
         Err(batch_error) => {
             log::debug!("journal batch failed, retrying events individually: {batch_error}");
             events
@@ -940,7 +950,7 @@ fn insert_batch(
                         event.source_node_id.as_deref(),
                         event.source_seq,
                     )
-                    .map_err(SessionError::from)
+                    .map_err(session_db_error)
                     .and_then(|inserted| {
                         inserted.ok_or_else(|| {
                             SessionError::Other(

@@ -45,9 +45,7 @@ impl SqliteSessionRepository {
             .await
         {
             Ok(id) => Ok(id),
-            Err(SessionError::Database(rusqlite::Error::QueryReturnedNoRows)) => {
-                Err(SessionError::SessionNotFound(error_value))
-            }
+            Err(ref e) if e.is_no_rows() => Err(SessionError::SessionNotFound(error_value)),
             Err(e) => Err(e),
         }
     }
@@ -66,9 +64,7 @@ impl SqliteSessionRepository {
             .await
         {
             Ok(id) => Ok(id),
-            Err(SessionError::Database(rusqlite::Error::QueryReturnedNoRows)) => {
-                Err(SessionError::TaskNotFound(error_value))
-            }
+            Err(ref e) if e.is_no_rows() => Err(SessionError::TaskNotFound(error_value)),
             Err(e) => Err(e),
         }
     }

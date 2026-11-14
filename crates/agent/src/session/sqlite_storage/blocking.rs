@@ -7,6 +7,7 @@
 //! and later calls keep working.
 
 use crate::session::error::{SessionError, SessionResult};
+use crate::sqlite_staging::error::session_db_error;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::sync::Arc;
@@ -35,5 +36,5 @@ where
     F: FnOnce(&mut Connection) -> rusqlite::Result<R> + Send + 'static,
     R: Send + 'static,
 {
-    with_conn(conn, move |conn| f(conn).map_err(SessionError::from)).await
+    with_conn(conn, move |conn| f(conn).map_err(session_db_error)).await
 }

@@ -427,12 +427,6 @@ pub enum KnowledgeError {
     Other(String),
 }
 
-impl From<rusqlite::Error> for KnowledgeError {
-    fn from(err: rusqlite::Error) -> Self {
-        KnowledgeError::DatabaseError(err.to_string())
-    }
-}
-
 impl From<serde_json::Error> for KnowledgeError {
     fn from(err: serde_json::Error) -> Self {
         KnowledgeError::SerializationError(err.to_string())

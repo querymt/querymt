@@ -1,3 +1,4 @@
+use crate::sqlite_staging::error::{SqliteResultExt, session_db_error};
 use async_trait::async_trait;
 use querymt::LLMParams;
 use querymt::chat::ChatRole;
@@ -49,26 +50,31 @@ fn read_delegate_assignments(
             [session_id],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
         )
-        .optional()?;
+        .optional()
+        .db()?;
     let (id, revision) = row.ok_or_else(|| SessionError::SessionNotFound(session_id.to_owned()))?;
     let revision = u64::try_from(revision.unwrap_or(0))
         .map_err(|_| SessionError::Other("Negative delegate assignment revision".into()))?;
-    let mut stmt = conn.prepare(
-        "SELECT agent_id, model_id, provider_node_id, reasoning_effort
+    let mut stmt = conn
+        .prepare(
+            "SELECT agent_id, model_id, provider_node_id, reasoning_effort
          FROM session_delegate_assignment_overrides WHERE session_id = ?1",
-    )?;
-    let rows = stmt.query_map([id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-        ))
-    })?;
+        )
+        .db()?;
+    let rows = stmt
+        .query_map([id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .db()?;
     let mut overrides = std::collections::BTreeMap::new();
     let mut reasoning_overrides = std::collections::BTreeMap::new();
     for row in rows {
-        let (agent_id, model_id, node_id, reasoning_effort) = row?;
+        let (agent_id, model_id, node_id, reasoning_effort) = row.db()?;
         if model_id.is_none() && (node_id.is_some() || reasoning_effort.is_none()) {
             return Err(SessionError::Other(
                 "Invalid delegate assignment row".into(),
@@ -81,13 +87,16 @@ fn read_delegate_assignments(
             );
         }
         if let Some(reasoning_effort) = reasoning_effort {
-            let reasoning_effort = reasoning_effort.parse().map_err(|error: String| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
-                )
-            })?;
+            let reasoning_effort = reasoning_effort
+                .parse()
+                .map_err(|error: String| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                    )
+                })
+                .db()?;
             reasoning_overrides.insert(agent_id, reasoning_effort);
         }
     }
@@ -201,7 +210,7 @@ fn map_task_lifecycle_error(error: SessionError) -> SessionError {
         e if e.db_message_contains("current_task_conflict") => {
             SessionError::InvalidOperation("a different current task already exists".to_string())
         }
-        SessionError::Database(rusqlite::Error::QueryReturnedNoRows) => {
+        ref e @ SessionError::Database(_) if e.is_no_rows() => {
             SessionError::TaskNotFound("task is not owned by this session".to_string())
         }
         other => other,
@@ -249,14 +258,17 @@ impl SessionStore for SqliteStorage {
         let session_id = session_id.to_owned();
         let patch = patch.clone();
         self.run_blocking_session(move |conn| {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .db()?;
             let internal_id: Option<i64> = tx
                 .query_row(
                     "SELECT id FROM sessions WHERE public_id = ?1",
                     params![session_id],
                     |row| row.get(0),
                 )
-                .optional()?;
+                .optional()
+                .db()?;
             let Some(internal_id) = internal_id else {
                 return Err(SessionError::SessionNotFound(session_id));
             };
@@ -294,27 +306,30 @@ impl SessionStore for SqliteStorage {
                          ELSE session_lifecycle.archived_at
                      END",
                 params![internal_id, resolved, now, archived, now],
-            )?;
+            )
+            .db()?;
 
-            let lifecycle = tx.query_row(
-                "SELECT s.public_id, l.resolved_at, l.archived_at
+            let lifecycle = tx
+                .query_row(
+                    "SELECT s.public_id, l.resolved_at, l.archived_at
                  FROM sessions s JOIN session_lifecycle l ON l.session_id = s.id
                  WHERE s.id = ?1",
-                params![internal_id],
-                |row| {
-                    let session_id: String = row.get(0)?;
-                    let resolved_at: Option<String> = row.get(1)?;
-                    let archived_at: Option<String> = row.get(2)?;
-                    Ok(SessionLifecycle {
-                        session_id,
-                        resolved: resolved_at.is_some(),
-                        archived: archived_at.is_some(),
-                        resolved_at,
-                        archived_at,
-                    })
-                },
-            )?;
-            tx.commit()?;
+                    params![internal_id],
+                    |row| {
+                        let session_id: String = row.get(0)?;
+                        let resolved_at: Option<String> = row.get(1)?;
+                        let archived_at: Option<String> = row.get(2)?;
+                        Ok(SessionLifecycle {
+                            session_id,
+                            resolved: resolved_at.is_some(),
+                            archived: archived_at.is_some(),
+                            resolved_at,
+                            archived_at,
+                        })
+                    },
+                )
+                .db()?;
+            tx.commit().db()?;
             Ok(lifecycle)
         })
         .await
@@ -334,25 +349,29 @@ impl SessionStore for SqliteStorage {
                 let placeholders = std::iter::repeat_n("?", chunk.len())
                     .collect::<Vec<_>>()
                     .join(",");
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT s.public_id, l.resolved_at, l.archived_at
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT s.public_id, l.resolved_at, l.archived_at
                      FROM sessions s LEFT JOIN session_lifecycle l ON l.session_id = s.id
                      WHERE s.public_id IN ({placeholders})"
-                ))?;
-                let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
-                    let session_id: String = row.get(0)?;
-                    let resolved_at: Option<String> = row.get(1)?;
-                    let archived_at: Option<String> = row.get(2)?;
-                    Ok(SessionLifecycle {
-                        session_id,
-                        resolved: resolved_at.is_some(),
-                        archived: archived_at.is_some(),
-                        resolved_at,
-                        archived_at,
+                    ))
+                    .db()?;
+                let rows = stmt
+                    .query_map(params_from_iter(chunk.iter()), |row| {
+                        let session_id: String = row.get(0)?;
+                        let resolved_at: Option<String> = row.get(1)?;
+                        let archived_at: Option<String> = row.get(2)?;
+                        Ok(SessionLifecycle {
+                            session_id,
+                            resolved: resolved_at.is_some(),
+                            archived: archived_at.is_some(),
+                            resolved_at,
+                            archived_at,
+                        })
                     })
-                })?;
+                    .db()?;
                 for row in rows {
-                    let lifecycle = row?;
+                    let lifecycle = row.db()?;
                     lifecycles.insert(lifecycle.session_id.clone(), lifecycle);
                 }
             }
@@ -375,14 +394,17 @@ impl SessionStore for SqliteStorage {
     ) -> SessionResult<(crate::session::store::SessionPin, bool)> {
         let session_id = session_id.to_owned();
         self.run_blocking_session(move |conn| {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .db()?;
             let internal_id: Option<i64> = tx
                 .query_row(
                     "SELECT id FROM sessions WHERE public_id = ?1",
                     params![session_id],
                     |row| row.get(0),
                 )
-                .optional()?;
+                .optional()
+                .db()?;
             let Some(internal_id) = internal_id else {
                 return Err(SessionError::SessionNotFound(session_id));
             };
@@ -394,12 +416,14 @@ impl SessionStore for SqliteStorage {
                 tx.execute(
                     "INSERT OR IGNORE INTO session_pins (session_id, pinned_at) VALUES (?1, ?2)",
                     params![internal_id, pinned_at],
-                )?
+                )
+                .db()?
             } else {
                 tx.execute(
                     "DELETE FROM session_pins WHERE session_id = ?1",
                     params![internal_id],
-                )?
+                )
+                .db()?
             } > 0;
             let pinned_at = tx
                 .query_row(
@@ -407,8 +431,9 @@ impl SessionStore for SqliteStorage {
                     params![internal_id],
                     |row| row.get(0),
                 )
-                .optional()?;
-            tx.commit()?;
+                .optional()
+                .db()?;
+            tx.commit().db()?;
             Ok((
                 crate::session::store::SessionPin {
                     session_id,
@@ -435,22 +460,26 @@ impl SessionStore for SqliteStorage {
                 let placeholders = std::iter::repeat_n("?", chunk.len())
                     .collect::<Vec<_>>()
                     .join(",");
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT s.public_id, p.pinned_at
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT s.public_id, p.pinned_at
                      FROM sessions s LEFT JOIN session_pins p ON p.session_id = s.id
                      WHERE s.public_id IN ({placeholders})"
-                ))?;
-                let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
-                    let session_id: String = row.get(0)?;
-                    let pinned_at: Option<String> = row.get(1)?;
-                    Ok(crate::session::store::SessionPin {
-                        session_id,
-                        pinned: pinned_at.is_some(),
-                        pinned_at,
+                    ))
+                    .db()?;
+                let rows = stmt
+                    .query_map(params_from_iter(chunk.iter()), |row| {
+                        let session_id: String = row.get(0)?;
+                        let pinned_at: Option<String> = row.get(1)?;
+                        Ok(crate::session::store::SessionPin {
+                            session_id,
+                            pinned: pinned_at.is_some(),
+                            pinned_at,
+                        })
                     })
-                })?;
+                    .db()?;
                 for row in rows {
-                    let pin = row?;
+                    let pin = row.db()?;
                     pins.insert(pin.session_id.clone(), pin);
                 }
             }
@@ -1300,7 +1329,9 @@ impl SessionStore for SqliteStorage {
         let agent_id = agent_id.to_owned();
         self.run_blocking_session(move |conn| {
             // An immediate transaction protects the read/modify/write across independent connections.
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .db()?;
             let (id, mut state) = read_delegate_assignments(&tx, &session_id)?;
             if let Some(expected) = expected_revision
                 && expected != state.revision
@@ -1351,7 +1382,8 @@ impl SessionStore for SqliteStorage {
                 "INSERT INTO session_delegate_assignments (session_id, revision) VALUES (?1, ?2)
                  ON CONFLICT(session_id) DO UPDATE SET revision = excluded.revision",
                 params![id, revision],
-            )?;
+            )
+            .db()?;
             let current_model = state.overrides.get(&agent_id);
             let current_reasoning = state.reasoning_overrides.get(&agent_id);
             if current_model.is_none() && current_reasoning.is_none() {
@@ -1359,7 +1391,8 @@ impl SessionStore for SqliteStorage {
                     "DELETE FROM session_delegate_assignment_overrides
                      WHERE session_id = ?1 AND agent_id = ?2",
                     params![id, agent_id],
-                )?;
+                )
+                .db()?;
             } else {
                 let reasoning_effort = current_reasoning.map(|effort| effort.as_str());
                 tx.execute(
@@ -1377,9 +1410,10 @@ impl SessionStore for SqliteStorage {
                         current_model.and_then(|model| model.node_id.as_deref()),
                         reasoning_effort,
                     ],
-                )?;
+                )
+                .db()?;
             }
-            tx.commit()?;
+            tx.commit().db()?;
             Ok(DelegateAssignmentWrite {
                 assignments: state,
                 changed: true,
@@ -1397,14 +1431,14 @@ impl SessionStore for SqliteStorage {
         let session_id = session_id.to_string();
         let state = state.clone();
         self.run_blocking_session(move |conn| {
-                let tx = conn.transaction().map_err(SessionError::from)?;
+                let tx = conn.transaction().map_err(session_db_error)?;
                 let session_internal_id: i64 = tx
                     .query_row(
                         "SELECT id FROM sessions WHERE public_id = ?1",
                         params![session_id],
                         |row| row.get(0),
                     )
-                    .map_err(SessionError::from)?;
+                    .map_err(session_db_error)?;
                 let current_revision = tx
                     .query_row(
                         "SELECT revision FROM session_control_states WHERE session_id = ?1",
@@ -1412,7 +1446,7 @@ impl SessionStore for SqliteStorage {
                         |row| row.get::<_, i64>(0).map(|revision| revision as u64),
                     )
                     .optional()
-                    .map_err(SessionError::from)?
+                    .map_err(session_db_error)?
                     .unwrap_or(0);
                 if current_revision != expected_revision {
                     return Err(SessionError::SessionControlRevisionConflict {
@@ -1435,12 +1469,12 @@ impl SessionStore for SqliteStorage {
                         updated_at = excluded.updated_at",
                     params![session_internal_id, state.active_mode.as_str(), reasoning_effort, state.revision as i64, now],
                 )
-                .map_err(SessionError::from)?;
+                .map_err(session_db_error)?;
                 tx.execute(
                     "DELETE FROM session_mode_model_bindings WHERE session_id = ?1",
                     params![session_internal_id],
                 )
-                .map_err(SessionError::from)?;
+                .map_err(session_db_error)?;
                 for (mode, binding) in &state.mode_models {
                     tx.execute(
                         "INSERT INTO session_mode_model_bindings
@@ -1448,14 +1482,14 @@ impl SessionStore for SqliteStorage {
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                         params![session_internal_id, mode, binding.model_id, binding.provider, binding.model, binding.llm_config_id, binding.provider_node_id],
                     )
-                    .map_err(SessionError::from)?;
+                    .map_err(session_db_error)?;
                 }
                 tx.execute(
                     "UPDATE sessions SET llm_config_id = ?1, provider_node_id = ?2, updated_at = ?3 WHERE id = ?4",
                     params![state.effective_model.llm_config_id, state.effective_model.provider_node_id, now, session_internal_id],
                 )
-                .map_err(SessionError::from)?;
-                tx.commit().map_err(SessionError::from)?;
+                .map_err(session_db_error)?;
+                tx.commit().map_err(session_db_error)?;
                 Ok(state)
             })
             .await
@@ -2078,7 +2112,7 @@ impl SessionStore for SqliteStorage {
         })
         .await
         .map_err(|error| match error {
-            SessionError::Database(rusqlite::Error::QueryReturnedNoRows) => {
+            ref e @ SessionError::Database(_) if e.is_no_rows() => {
                 SessionError::SessionNotFound(session_id)
             }
             other => other,
@@ -2611,26 +2645,27 @@ impl SessionStore for SqliteStorage {
             let mut locations = HashMap::with_capacity(session_ids.len());
             for chunk in session_ids.chunks(400) {
                 let placeholders = vec!["?"; chunk.len()].join(", ");
-                let tx = conn.transaction()?;
+                let tx = conn.transaction().db()?;
                 let local_ids = {
                     let sql = format!(
                         "SELECT public_id FROM sessions WHERE public_id IN ({placeholders})"
                     );
-                    let mut stmt = tx.prepare(&sql)?;
+                    let mut stmt = tx.prepare(&sql).db()?;
                     stmt.query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
                         row.get::<_, String>(0)
-                    })?
-                    .collect::<Result<HashSet<_>, _>>()?
+                    })
+                    .db()?
+                    .collect::<Result<HashSet<_>, _>>()
+                    .db()?
                 };
                 let bookmarks = {
                     let sql = format!(
                         "SELECT session_id, node_id, peer_label, cwd, created_at, title
                          FROM remote_session_bookmarks WHERE session_id IN ({placeholders})"
                     );
-                    let mut stmt = tx.prepare(&sql)?;
-                    let rows = stmt.query_map(
-                        params_from_iter(chunk.iter().map(String::as_str)),
-                        |row| {
+                    let mut stmt = tx.prepare(&sql).db()?;
+                    let rows = stmt
+                        .query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
                             Ok(RemoteSessionBookmark {
                                 session_id: row.get(0)?,
                                 node_id: row.get(1)?,
@@ -2639,9 +2674,10 @@ impl SessionStore for SqliteStorage {
                                 created_at: row.get(4)?,
                                 title: row.get(5)?,
                             })
-                        },
-                    )?;
-                    rows.collect::<Result<Vec<_>, _>>()?
+                        })
+                        .db()?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                        .db()?
                         .into_iter()
                         .map(|bookmark| (bookmark.session_id.clone(), bookmark))
                         .collect::<HashMap<_, _>>()
@@ -2654,7 +2690,7 @@ impl SessionStore for SqliteStorage {
                     );
                     locations.insert(session_id.clone(), location);
                 }
-                tx.commit()?;
+                tx.commit().db()?;
             }
             Ok(locations)
         })

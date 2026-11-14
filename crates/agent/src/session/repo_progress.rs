@@ -42,7 +42,7 @@ impl SqliteProgressRepository {
         })
         .await
         .map_err(|err| match err {
-            SessionError::Database(rusqlite::Error::QueryReturnedNoRows) => {
+            ref e @ SessionError::Database(_) if e.is_no_rows() => {
                 SessionError::SessionNotFound(error_value)
             }
             other => other,
@@ -61,7 +61,7 @@ impl SqliteProgressRepository {
         })
         .await
         .map_err(|err| match err {
-            SessionError::Database(rusqlite::Error::QueryReturnedNoRows) => {
+            ref e @ SessionError::Database(_) if e.is_no_rows() => {
                 SessionError::TaskNotFound(error_value)
             }
             other => other,
