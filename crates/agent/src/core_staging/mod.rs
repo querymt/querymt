@@ -10,4 +10,5 @@ pub mod prompt_text;
 pub mod protocol;
 pub mod run_lease_path;
 pub mod stream_cursor;
+pub mod verification;
 pub mod worktree;
