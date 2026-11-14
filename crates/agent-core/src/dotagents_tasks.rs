@@ -1,7 +1,7 @@
 //! Protocol task identity, ownership, trust-decision records and the
 //! storage contract reconciliation needs, without any SQLite detail.
 //!
-//! The SQLite implementation lives in `sqlite_staging::repo_dotagents_tasks`;
+//! The SQLite implementation lives in `querymt_agent_sqlite::repo_dotagents_tasks`;
 //! planning and trust evaluation stay in `dotagents::tasks`.
 
 use crate::dotagents::layer::DotagentsLayer;

@@ -1,10 +1,10 @@
 //! SQLite implementation of TaskRepository
 
-use crate::session::domain::{Task, TaskKind, TaskStatus};
-use crate::session::error::{SessionError, SessionResult};
-use crate::session::repository::TaskRepository;
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use querymt_agent_core::session::domain::{Task, TaskKind, TaskStatus};
+use querymt_agent_core::session::error::{SessionError, SessionResult};
+use querymt_agent_core::session::repository::TaskRepository;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::str::FromStr;
 use std::sync::Arc;

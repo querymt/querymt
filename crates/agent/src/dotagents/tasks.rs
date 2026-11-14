@@ -8,8 +8,8 @@ pub use crate::core_staging::dotagents_tasks::{
     DotagentsAutomationBinding, DotagentsTaskApproval, DotagentsTaskApprovalDecision,
     DotagentsTaskIdentity, DotagentsTaskOwnership, DotagentsTaskStateRepository,
 };
-pub use crate::sqlite_staging::repo_dotagents_tasks::SqliteDotagentsTaskStateRepository;
 use async_trait::async_trait;
+pub use querymt_agent_sqlite::repo_dotagents_tasks::SqliteDotagentsTaskStateRepository;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

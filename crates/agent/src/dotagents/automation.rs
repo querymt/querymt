@@ -19,7 +19,7 @@ pub use crate::core_staging::dotagents_automation::{
     AUTOMATION_SESSION_KIND, DotagentsAutomationIdentity, DotagentsAutomationRepository,
 };
 use crate::session::error::SessionResult;
-pub use crate::sqlite_staging::repo_dotagents_automation::SqliteDotagentsAutomationRepository;
+pub use querymt_agent_sqlite::repo_dotagents_automation::SqliteDotagentsAutomationRepository;
 
 /// Bind the persisted automation session to a profile so scheduler execution
 /// routes through the profile runtime rather than the root agent.

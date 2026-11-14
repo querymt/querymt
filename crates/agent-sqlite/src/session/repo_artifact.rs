@@ -1,10 +1,10 @@
 //! SQLite implementation of ArtifactRepository
 
-use crate::session::domain::Artifact;
-use crate::session::error::{SessionError, SessionResult};
-use crate::session::repository::ArtifactRepository;
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use querymt_agent_core::session::domain::Artifact;
+use querymt_agent_core::session::error::{SessionError, SessionResult};
+use querymt_agent_core::session::repository::ArtifactRepository;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::sync::Arc;
 use time::OffsetDateTime;

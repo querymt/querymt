@@ -1,4 +1,4 @@
-use crate::session::store::LLMConfig;
+use querymt_agent_core::session::store::LLMConfig;
 use time::OffsetDateTime;
 
 pub(super) fn parse_llm_params(params: &str) -> Result<Option<serde_json::Value>, rusqlite::Error> {

@@ -4,11 +4,13 @@
 //! Follows the same pattern as `repo_task.rs`: async trait with a
 //! `run_blocking` helper that acquires the shared `Arc<Mutex<Connection>>`.
 
-use crate::session::domain_schedule::{Schedule, ScheduleConfig, ScheduleState, ScheduleTrigger};
-use crate::session::error::{SessionError, SessionResult};
-use crate::session::repository::ScheduleRepository;
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use querymt_agent_core::session::domain_schedule::{
+    Schedule, ScheduleConfig, ScheduleState, ScheduleTrigger,
+};
+use querymt_agent_core::session::error::{SessionError, SessionResult};
+use querymt_agent_core::session::repository::ScheduleRepository;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -348,8 +350,8 @@ impl ScheduleRepository for SqliteScheduleRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::domain_schedule::*;
     use crate::session::schema;
+    use querymt_agent_core::session::domain_schedule::*;
 
     /// Create an in-memory SQLite DB with schema initialized.
     fn setup_db() -> Arc<Mutex<Connection>> {

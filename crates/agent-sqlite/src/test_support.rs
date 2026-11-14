@@ -1,10 +1,9 @@
-//! SQLite fixtures (`#[cfg(test)]`; becomes the `test-support` module of
-//! `querymt-agent-sqlite`).
+//! SQLite fixtures (`cfg(any(test, feature = "test-support"))`).
 
-use crate::session::backend::StorageBackend;
 use crate::session::schema;
 use crate::session::sqlite_storage::SqliteStorage;
 use parking_lot::Mutex;
+use querymt_agent_core::session::backend::StorageBackend;
 use rusqlite::Connection;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -36,11 +35,11 @@ impl TestStorage {
         }
     }
 
-    pub fn session_store(&self) -> Arc<dyn crate::session::store::SessionStore> {
+    pub fn session_store(&self) -> Arc<dyn querymt_agent_core::session::store::SessionStore> {
         self.storage.session_store()
     }
 
-    pub fn event_journal(&self) -> Arc<dyn crate::session::projection::EventJournal> {
+    pub fn event_journal(&self) -> Arc<dyn querymt_agent_core::session::projection::EventJournal> {
         self.storage.event_journal()
     }
 }

@@ -1,14 +1,14 @@
 //! `StorageBackend` implementation for `SqliteStorage`.
 
-use crate::dotagents::DotagentsTaskStateRepository;
-use crate::knowledge::KnowledgeStore;
-use crate::session::backend::StorageBackend;
-use crate::session::error::SessionResult;
-use crate::session::projection::{EventJournal, ViewStore};
-use crate::session::repository::ScheduleRepository;
 use crate::session::sqlite_storage::SqliteStorage;
-use crate::session::store::SessionStore;
 use async_trait::async_trait;
+use querymt_agent_core::dotagents_tasks::DotagentsTaskStateRepository;
+use querymt_agent_core::knowledge::KnowledgeStore;
+use querymt_agent_core::session::backend::StorageBackend;
+use querymt_agent_core::session::error::SessionResult;
+use querymt_agent_core::session::projection::{EventJournal, ViewStore};
+use querymt_agent_core::session::repository::ScheduleRepository;
+use querymt_agent_core::session::store::SessionStore;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -32,21 +32,22 @@ impl StorageBackend for SqliteStorage {
 
     fn schedule_repository(&self) -> Option<Arc<dyn ScheduleRepository>> {
         Some(Arc::new(
-            crate::sqlite_staging::repo_schedule::SqliteScheduleRepository::new(self.conn()),
+            crate::repo_schedule::SqliteScheduleRepository::new(self.conn()),
         ))
     }
 
     fn dotagents_task_state_repository(&self) -> Option<Arc<dyn DotagentsTaskStateRepository>> {
         Some(Arc::new(
-            crate::dotagents::SqliteDotagentsTaskStateRepository::new(self.conn()),
+            crate::repo_dotagents_tasks::SqliteDotagentsTaskStateRepository::new(self.conn()),
         ))
     }
 
     fn dotagents_automation_repository(
         &self,
-    ) -> Option<Arc<dyn crate::dotagents::DotagentsAutomationRepository>> {
+    ) -> Option<Arc<dyn querymt_agent_core::dotagents_automation::DotagentsAutomationRepository>>
+    {
         Some(Arc::new(
-            crate::dotagents::SqliteDotagentsAutomationRepository::new(self.conn()),
+            crate::repo_dotagents_automation::SqliteDotagentsAutomationRepository::new(self.conn()),
         ))
     }
 
@@ -56,10 +57,12 @@ impl StorageBackend for SqliteStorage {
         ))
     }
 
-    fn workspace_repository(&self) -> Option<Arc<dyn crate::worktree::WorkspaceRepository>> {
-        Some(Arc::new(crate::worktree::SqliteWorkspaceRepository::new(
-            self.conn(),
-        )))
+    fn workspace_repository(
+        &self,
+    ) -> Option<Arc<dyn querymt_agent_core::worktree::repository::WorkspaceRepository>> {
+        Some(Arc::new(
+            crate::repo_workspace::SqliteWorkspaceRepository::new(self.conn()),
+        ))
     }
 
     fn run_lease_root(&self) -> Option<PathBuf> {

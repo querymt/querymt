@@ -1,10 +1,10 @@
 //! SQLite implementation of ProgressRepository
 
-use crate::session::domain::{ProgressEntry, ProgressKind};
-use crate::session::error::{SessionError, SessionResult};
-use crate::session::repository::ProgressRepository;
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use querymt_agent_core::session::domain::{ProgressEntry, ProgressKind};
+use querymt_agent_core::session::error::{SessionError, SessionResult};
+use querymt_agent_core::session::repository::ProgressRepository;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::str::FromStr;
 use std::sync::Arc;

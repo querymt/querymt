@@ -11978,6 +11978,7 @@ dependencies = [
  "querymt-agent-core",
  "querymt-agent-index",
  "querymt-agent-knowledge",
+ "querymt-agent-sqlite",
  "querymt-provider-common",
  "querymt-remote",
  "querymt-utils",
@@ -12132,6 +12133,24 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "querymt-agent-sqlite"
+version = "0.6.0"
+dependencies = [
+ "async-trait",
+ "log",
+ "parking_lot 0.13.0",
+ "querymt",
+ "querymt-agent-core",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid 1.29.0",
 ]
 
 [[package]]

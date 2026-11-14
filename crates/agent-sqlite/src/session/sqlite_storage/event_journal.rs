@@ -1,11 +1,11 @@
-use crate::sqlite_staging::error::{SqliteResultExt, session_db_error};
+use crate::error::{SqliteResultExt, session_db_error};
 use async_trait::async_trait;
 use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::events::{AgentEventKind, DurableEvent, EventOrigin};
-use crate::session::error::{SessionError, SessionResult};
-use crate::session::projection::{
+use querymt_agent_core::events::{AgentEventKind, DurableEvent, EventOrigin};
+use querymt_agent_core::session::error::{SessionError, SessionResult};
+use querymt_agent_core::session::projection::{
     EventJournal, HistoryPageDirection, NewDurableEvent, RunLifecycle, last_unfinished_run_in,
     slice_history_page,
 };
@@ -799,7 +799,7 @@ fn read_coverage(
     conn: &rusqlite::Connection,
     session_id: &str,
     source_node_id: &str,
-) -> Result<crate::session::ranges::RangeSet, rusqlite::Error> {
+) -> Result<querymt_agent_core::session::ranges::RangeSet, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT start_seq, end_seq FROM remote_session_coverage \
          WHERE session_id = ?1 AND source_node_id = ?2 ORDER BY start_seq",
@@ -809,7 +809,9 @@ fn read_coverage(
             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(crate::session::ranges::RangeSet::from_ranges(ranges))
+    Ok(querymt_agent_core::session::ranges::RangeSet::from_ranges(
+        ranges,
+    ))
 }
 
 /// Shared event-journal insertion: derives the storage columns from the event,

@@ -11,20 +11,20 @@ mod tests {
 
     use rusqlite::Connection;
 
-    use crate::session::domain::{
-        Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
-        DelegationClaim, DelegationStatus, ForkOrigin, ForkPointType, IntentSnapshot,
-        ProgressEntry, ProgressKind, Task, TaskKind, TaskStatus,
-    };
-    use crate::session::repository::{
-        ArtifactRepository, DecisionRepository, DelegationRepository, IntentRepository,
-        ProgressRepository, SessionRepository, TaskRepository,
-    };
     use crate::session::schema;
     use crate::session::{
         SqliteArtifactRepository, SqliteDecisionRepository, SqliteDelegationRepository,
         SqliteIntentRepository, SqliteProgressRepository, SqliteSessionRepository,
         SqliteTaskRepository,
+    };
+    use querymt_agent_core::session::domain::{
+        Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
+        DelegationClaim, DelegationStatus, ForkOrigin, ForkPointType, IntentSnapshot,
+        ProgressEntry, ProgressKind, Task, TaskKind, TaskStatus,
+    };
+    use querymt_agent_core::session::repository::{
+        ArtifactRepository, DecisionRepository, DelegationRepository, IntentRepository,
+        ProgressRepository, SessionRepository, TaskRepository,
     };
 
     fn open_db() -> Arc<Mutex<Connection>> {
@@ -204,7 +204,7 @@ mod tests {
 
         #[tokio::test]
         async fn unknown_session_or_task_ids_map_to_not_found() {
-            use crate::session::error::SessionError;
+            use querymt_agent_core::session::error::SessionError;
 
             let repo = make_repo();
             let result = repo.set_active_task("ghost-session", None).await;
@@ -844,7 +844,7 @@ mod tests {
 
     mod repo_delegation {
         use super::*;
-        use crate::hash::RapidHash;
+        use querymt_agent_core::hash::RapidHash;
 
         async fn make_session_and_repo() -> (String, i64, SqliteDelegationRepository) {
             let db = open_db();
@@ -917,7 +917,7 @@ mod tests {
         /// table, and legacy rows (NULL column) read as `inherit`.
         #[tokio::test]
         async fn delegation_isolation_round_trips_and_legacy_rows_inherit() {
-            use crate::worktree::DelegationIsolation;
+            use querymt_agent_core::worktree::domain::DelegationIsolation;
 
             let db = open_db();
             let session_repo = SqliteSessionRepository::new(db.clone());

@@ -1055,9 +1055,10 @@ pub struct RecentModelsView {
 /// Truncate `input` to at most `max_bytes` bytes, appending `"..."` when it is
 /// shortened. Always cuts on a UTF-8 char boundary.
 ///
-/// A private copy of `querymt_utils::str_utils::truncate_with_ellipsis`: the
+/// A copy of `querymt_utils::str_utils::truncate_with_ellipsis`: the
 /// core layer must not depend on `querymt-utils`.
-fn truncate_with_ellipsis(input: &str, max_bytes: usize) -> String {
+#[doc(hidden)]
+pub fn truncate_with_ellipsis(input: &str, max_bytes: usize) -> String {
     const ELLIPSIS: &str = "...";
     if input.len() <= max_bytes {
         return input.to_string();

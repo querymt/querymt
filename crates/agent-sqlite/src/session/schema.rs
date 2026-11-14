@@ -725,7 +725,7 @@ pub fn ensure_workspace_source_cwd(conn: &mut Connection) -> Result<(), rusqlite
     {
         let mut update = tx.prepare("UPDATE workspaces SET source_cwd = ?1 WHERE id = ?2")?;
         for (id, origin, relative) in missing {
-            let source_cwd = crate::worktree::source_cwd_from(
+            let source_cwd = querymt_agent_core::worktree::domain::source_cwd_from(
                 std::path::Path::new(&origin),
                 std::path::Path::new(&relative),
             );

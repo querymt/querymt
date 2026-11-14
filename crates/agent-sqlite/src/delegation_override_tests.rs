@@ -1,13 +1,13 @@
 //! Tests of `DelegateModelOverrideStore` that need a real SQLite session store
 //! (moved out of `core_staging/delegation/model_overrides.rs`, D6).
 
-use crate::core_staging::delegation::model_overrides::{
+use querymt_agent_core::delegation::model_overrides::{
     DelegateModelOverride, DelegateModelOverrideStore,
 };
 
 #[tokio::test]
 async fn durable_delegate_assignments_override_memory_and_propagate_failures() {
-    use crate::session::store::SessionStore;
+    use querymt_agent_core::session::store::SessionStore;
     let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
         .await
         .unwrap();
@@ -59,7 +59,7 @@ async fn durable_delegate_assignments_override_memory_and_propagate_failures() {
     );
     assert!(cache.resolve(&storage, "missing", "coder").await.is_err());
     // Existing custom storage implementations retain their explicit in-memory behavior.
-    let unsupported = crate::core_staging::test_support::MockSessionStore::new();
+    let unsupported = querymt_agent_core::test_support::MockSessionStore::new();
     assert_eq!(
         cache
             .resolve(&unsupported, &parent.public_id, "coder")

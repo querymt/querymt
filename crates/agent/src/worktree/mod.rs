@@ -42,7 +42,7 @@ pub mod prepare;
 pub mod protect;
 pub mod recover;
 pub mod repo_ops;
-pub use crate::sqlite_staging::repo_workspace;
+pub use querymt_agent_sqlite::repo_workspace;
 pub mod service;
 pub mod session_options;
 #[cfg(test)]

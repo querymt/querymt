@@ -1,11 +1,11 @@
 //! SQLite implementation of SessionRepository
 
-use crate::session::domain::{ForkInfo, ForkOrigin, ForkPointType};
-use crate::session::error::{SessionError, SessionResult};
-use crate::session::repository::SessionRepository;
-use crate::session::store::Session;
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use querymt_agent_core::session::domain::{ForkInfo, ForkOrigin, ForkPointType};
+use querymt_agent_core::session::error::{SessionError, SessionResult};
+use querymt_agent_core::session::repository::SessionRepository;
+use querymt_agent_core::session::store::Session;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -79,7 +79,7 @@ impl SqliteSessionRepository {
         cwd: Option<std::path::PathBuf>,
         parent_session_id: Option<String>,
         fork_origin: Option<ForkOrigin>,
-        intent: Option<crate::session::store::PendingForkIsolation>,
+        intent: Option<querymt_agent_core::session::store::PendingForkIsolation>,
     ) -> SessionResult<Session> {
         let cwd = cwd.map(|cwd| normalize_session_cwd(&cwd)).transpose()?;
         let now = OffsetDateTime::now_utc();

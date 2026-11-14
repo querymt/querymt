@@ -5,8 +5,8 @@
 //! rule forbids `From<rusqlite::Error>` for a core type from the sqlite
 //! package, so call sites use `.db()` / `.knowledge_db()` instead of a bare `?`.
 
-use crate::knowledge::KnowledgeError;
-use crate::session::error::{DbError, DbErrorKind, SessionError, SessionResult};
+use querymt_agent_core::knowledge::KnowledgeError;
+use querymt_agent_core::session::error::{DbError, DbErrorKind, SessionError, SessionResult};
 
 /// Classify a `rusqlite` error.
 pub fn classify(err: &rusqlite::Error) -> DbErrorKind {

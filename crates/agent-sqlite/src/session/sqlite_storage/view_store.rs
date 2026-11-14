@@ -1,18 +1,6 @@
 use async_trait::async_trait;
 use time::OffsetDateTime;
 
-use crate::events::AgentEvent;
-use crate::session::domain::TaskStatus;
-use crate::session::error::SessionResult;
-use crate::session::lifecycle::{
-    ArchiveFilter, ResolutionFilter, SessionLifecycle, SessionLifecycleFilter,
-};
-use crate::session::projection::{
-    AuditView, DefaultRedactor, EventJournal, FilterExpr, PredicateOp, RecentModelEntry,
-    RecentModelsView, RedactedArtifact, RedactedProgress, RedactedTask, RedactedView,
-    RedactionPolicy, Redactor, SessionGroup, SessionListFilter, SessionListItem,
-    SessionListMetaStats, SessionListView, SessionScope, SummaryView, ViewStore,
-};
 use crate::session::repo_artifact::SqliteArtifactRepository;
 use crate::session::repo_decision::SqliteDecisionRepository;
 use crate::session::repo_delegation::SqliteDelegationRepository;
@@ -20,12 +8,24 @@ use crate::session::repo_intent::SqliteIntentRepository;
 use crate::session::repo_progress::SqliteProgressRepository;
 use crate::session::repo_session::SqliteSessionRepository;
 use crate::session::repo_task::SqliteTaskRepository;
-use crate::session::repository::{
+use querymt::chat::FinishReason;
+use querymt_agent_core::events::AgentEvent;
+use querymt_agent_core::session::domain::TaskStatus;
+use querymt_agent_core::session::error::SessionResult;
+use querymt_agent_core::session::lifecycle::{
+    ArchiveFilter, ResolutionFilter, SessionLifecycle, SessionLifecycleFilter,
+};
+use querymt_agent_core::session::projection::{
+    AuditView, DefaultRedactor, EventJournal, FilterExpr, PredicateOp, RecentModelEntry,
+    RecentModelsView, RedactedArtifact, RedactedProgress, RedactedTask, RedactedView,
+    RedactionPolicy, Redactor, SessionGroup, SessionListFilter, SessionListItem,
+    SessionListMetaStats, SessionListView, SessionScope, SummaryView, ViewStore,
+};
+use querymt_agent_core::session::repository::{
     ArtifactRepository, DecisionRepository, DelegationRepository, IntentRepository,
     ProgressRepository, SessionRepository, TaskRepository,
 };
-use crate::session::store::{Session, SessionStore};
-use querymt::chat::FinishReason;
+use querymt_agent_core::session::store::{Session, SessionStore};
 use rusqlite::{OptionalExtension, params, params_from_iter};
 use std::collections::HashMap;
 
@@ -33,7 +33,7 @@ use super::SqliteStorage;
 
 /// Truncate a session title / intent summary to at most 80 bytes (UTF-8-safe).
 fn truncate_title(summary: String) -> String {
-    querymt_utils::str_utils::truncate_with_ellipsis(&summary, 80)
+    querymt_agent_core::session::projection::truncate_with_ellipsis(&summary, 80)
 }
 
 fn parse_rfc3339_option(raw: Option<String>) -> Option<OffsetDateTime> {
@@ -63,28 +63,33 @@ fn map_session_list_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sessio
 
 fn load_workspace_views(
     conn: &rusqlite::Connection,
-) -> rusqlite::Result<HashMap<String, crate::session::projection::SessionWorkspaceView>> {
+) -> rusqlite::Result<HashMap<String, querymt_agent_core::session::projection::SessionWorkspaceView>>
+{
     // Current owners, then previous owners (via the durable handoff markers):
     // a previous owner keeps its workspace view with `handedOffTo` naming the
     // session it gave the checkout to, so it stays in its project group.
     const COLUMNS: &str = "w.public_id, w.common_dir, w.project_name, w.checkout_path, w.branch, w.baseline_mode, w.baseline_commit, w.lifecycle, w.last_error, COALESCE(w.source_cwd, ''), w.owner_session_id";
     let map_row = |row: &rusqlite::Row<'_>,
                    handed_off_to: Option<String>|
-     -> rusqlite::Result<crate::session::projection::SessionWorkspaceView> {
-        Ok(crate::session::projection::SessionWorkspaceView {
-            workspace_id: row.get(0)?,
-            repository_id: row.get(1)?,
-            project_name: row.get(2)?,
-            checkout_path: row.get(3)?,
-            branch: row.get(4)?,
-            baseline_mode: row.get(5)?,
-            baseline_commit: row.get(6)?,
-            lifecycle: row.get(7)?,
-            last_error: row.get(8)?,
-            source_cwd: row.get(9)?,
-            owner_session_id: row.get(10)?,
-            handed_off_to,
-        })
+     -> rusqlite::Result<
+        querymt_agent_core::session::projection::SessionWorkspaceView,
+    > {
+        Ok(
+            querymt_agent_core::session::projection::SessionWorkspaceView {
+                workspace_id: row.get(0)?,
+                repository_id: row.get(1)?,
+                project_name: row.get(2)?,
+                checkout_path: row.get(3)?,
+                branch: row.get(4)?,
+                baseline_mode: row.get(5)?,
+                baseline_commit: row.get(6)?,
+                lifecycle: row.get(7)?,
+                last_error: row.get(8)?,
+                source_cwd: row.get(9)?,
+                owner_session_id: row.get(10)?,
+                handed_off_to,
+            },
+        )
     };
     let mut views = HashMap::new();
     let mut owners = conn.prepare(&format!(
@@ -1317,7 +1322,10 @@ impl ViewStore for SqliteStorage {
             .and_then(|cursor| cursor.parse::<i64>().ok())
             .filter(|offset| *offset >= 0)
             .unwrap_or(0);
-        let limit = limit.clamp(1, crate::session::projection::MAX_SESSION_ITEMS_PAGE);
+        let limit = limit.clamp(
+            1,
+            querymt_agent_core::session::projection::MAX_SESSION_ITEMS_PAGE,
+        );
         let scope_where = format!(
             "{} AND {} AND {}",
             session_scope_where(session_scope, "s"),
@@ -1480,7 +1488,7 @@ impl ViewStore for SqliteStorage {
                   AND session_id IN ({placeholders})
                 ORDER BY stream_seq DESC
                 "#,
-                kind = crate::events::AgentEventKind::LLM_REQUEST_END_TAG,
+                kind = querymt_agent_core::events::AgentEventKind::LLM_REQUEST_END_TAG,
             ))?;
             let rows = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
@@ -1694,7 +1702,7 @@ impl ViewStore for SqliteStorage {
                     )?;
 
                     let rows = stmt.query_map(
-                        [crate::events::AgentEventKind::PROVIDER_CHANGED_TAG],
+                        [querymt_agent_core::events::AgentEventKind::PROVIDER_CHANGED_TAG],
                         |row| {
                             Ok((
                                 row.get::<_, Option<String>>(0)?,
@@ -1782,7 +1790,7 @@ fn evaluate_session_filter(session: &Session, expr: &FilterExpr) -> bool {
 /// Evaluate a single predicate against a session
 fn evaluate_predicate(
     session: &Session,
-    pred: &crate::session::projection::FieldPredicate,
+    pred: &querymt_agent_core::session::projection::FieldPredicate,
 ) -> bool {
     use serde_json::json;
 

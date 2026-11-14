@@ -2,9 +2,9 @@
 //!
 //! They live in the sqlite layer because core cannot depend on `SqliteStorage`.
 
-use crate::session::location::{SessionLocation, resolve_session_location};
 use crate::session::sqlite_storage::SqliteStorage;
-use crate::session::store::{RemoteSessionBookmark, SessionStore};
+use querymt_agent_core::session::location::{SessionLocation, resolve_session_location};
+use querymt_agent_core::session::store::{RemoteSessionBookmark, SessionStore};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,7 +19,7 @@ impl Fixture {
         let storage = SqliteStorage::connect(PathBuf::from(":memory:".to_string()))
             .await
             .expect("connect in-memory sqlite");
-        let store = crate::session::backend::StorageBackend::session_store(&storage);
+        let store = querymt_agent_core::session::backend::StorageBackend::session_store(&storage);
         Self { store }
     }
 

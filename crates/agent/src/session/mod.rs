@@ -8,8 +8,7 @@ pub mod provider_config;
 pub use provider::{SessionHandle, SessionProvider};
 pub mod run_lease;
 pub mod run_reconcile;
-pub mod schema;
-pub mod sqlite_storage;
+pub use querymt_agent_sqlite::session::{schema, sqlite_storage};
 pub use sqlite_storage::SqliteStorage;
 pub mod task_service;
 pub use task_service::TaskService;
@@ -31,14 +30,11 @@ pub mod backend;
 pub use backend::StorageBackend;
 
 // Repository implementations
-pub mod repo_artifact;
-pub mod repo_decision;
-pub mod repo_delegation;
-pub mod repo_intent;
-pub mod repo_progress;
-pub use crate::sqlite_staging::repo_schedule;
-pub mod repo_session;
-pub mod repo_task;
+pub use querymt_agent_sqlite::repo_schedule;
+pub use querymt_agent_sqlite::session::{
+    repo_artifact, repo_decision, repo_delegation, repo_intent, repo_progress, repo_session,
+    repo_task,
+};
 
 pub use repo_artifact::SqliteArtifactRepository;
 pub use repo_decision::SqliteDecisionRepository;
@@ -74,7 +70,3 @@ pub use projection::{
 // Phase 3: Runtime integration
 pub mod runtime;
 pub use runtime::{RuntimeContext, SessionForkHelper};
-
-// Tests
-#[cfg(test)]
-mod repo_tests;

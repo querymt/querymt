@@ -13,7 +13,6 @@ pub mod config;
 pub mod control;
 pub(crate) use querymt_agent_core as core_staging;
 pub mod runner;
-pub(crate) mod sqlite_staging;
 pub mod template;
 
 pub mod auth;

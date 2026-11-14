@@ -1,12 +1,12 @@
 //! SQLite-backed automation binding repository.
 
-use crate::core_staging::dotagents_automation::{
-    AUTOMATION_SESSION_KIND, DotagentsAutomationIdentity, DotagentsAutomationRepository,
-};
-use crate::core_staging::dotagents_tasks::DotagentsAutomationBinding;
-use crate::session::error::SessionResult;
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use querymt_agent_core::dotagents_automation::{
+    AUTOMATION_SESSION_KIND, DotagentsAutomationIdentity, DotagentsAutomationRepository,
+};
+use querymt_agent_core::dotagents_tasks::DotagentsAutomationBinding;
+use querymt_agent_core::session::error::SessionResult;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::Arc;
 use time::OffsetDateTime;

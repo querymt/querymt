@@ -1,13 +1,13 @@
 //! SQLite implementation of protocol task ownership and trust persistence.
 
-use crate::core_staging::dotagents_tasks::{
-    DotagentsTaskApproval, DotagentsTaskApprovalDecision, DotagentsTaskOwnership,
-    DotagentsTaskStateRepository, normalize_id,
-};
-use crate::session::error::SessionResult;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use querymt_agent_core::dotagents::layer::DotagentsLayer;
+use querymt_agent_core::dotagents_tasks::{
+    DotagentsTaskApproval, DotagentsTaskApprovalDecision, DotagentsTaskOwnership,
+    DotagentsTaskStateRepository, normalize_id,
+};
+use querymt_agent_core::session::error::SessionResult;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

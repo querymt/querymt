@@ -4,20 +4,20 @@ use querymt::LLMParams;
 use querymt::chat::ChatRole;
 use rusqlite::Connection;
 
-use crate::acp::protocol::{ContentBlock, ImageContent, TextContent};
-use crate::agent::core::AgentMode;
-use crate::agent::session_control::{SessionControlState, SessionModelBinding};
-use crate::events::{AgentEventKind, DurableEvent, EventOrigin};
-use crate::model::{AgentMessage, MessagePart};
-use crate::session::domain::ForkOrigin;
-use crate::session::error::SessionResult;
-use crate::session::lifecycle::{
+use querymt_agent_core::agent_mode::AgentMode;
+use querymt_agent_core::events::{AgentEventKind, DurableEvent, EventOrigin};
+use querymt_agent_core::model::{AgentMessage, MessagePart};
+use querymt_agent_core::protocol::{ContentBlock, ImageContent, TextContent};
+use querymt_agent_core::session::domain::ForkOrigin;
+use querymt_agent_core::session::error::SessionResult;
+use querymt_agent_core::session::lifecycle::{
     ArchiveFilter, ResolutionFilter, SessionLifecycleFilter, SessionLifecyclePatch,
 };
-use crate::session::projection::{
+use querymt_agent_core::session::projection::{
     EventJournal, HistoryPageDirection, NewDurableEvent, RecentModelEntry, SessionScope, ViewStore,
 };
-use crate::session::store::{RemoteSessionBookmark, SessionStore};
+use querymt_agent_core::session::store::{RemoteSessionBookmark, SessionStore};
+use querymt_agent_core::session_control::{SessionControlState, SessionModelBinding};
 
 use super::SqliteStorage;
 use super::event_journal::LAST_UNFINISHED_RUN_SQL;
@@ -46,12 +46,12 @@ async fn fork_isolation_intent_is_atomic_and_survives_reopen() {
         .add_message(&source.public_id, message)
         .await
         .unwrap();
-    let intent = crate::session::store::PendingForkIsolation {
+    let intent = querymt_agent_core::session::store::PendingForkIsolation {
         source_session_id: source.public_id.clone(),
         source_cwd: dir.path().to_path_buf(),
-        options: crate::worktree::WorkspaceCreationOptions {
-            execution: crate::worktree::ExecutionMode::Worktree,
-            baseline: crate::worktree::BaselineMode::CurrentWorkingTree,
+        options: querymt_agent_core::worktree::domain::WorkspaceCreationOptions {
+            execution: querymt_agent_core::worktree::domain::ExecutionMode::Worktree,
+            baseline: querymt_agent_core::worktree::domain::BaselineMode::CurrentWorkingTree,
             base_ref: None,
         },
         handoff_workspace_id: None,
@@ -831,9 +831,12 @@ async fn structured_response_persist_reload_then_second_request_round_trips() {
         .map(|m| {
             m.to_chat_message_with_output_target(
                 Some(
-                    &crate::model::OutputTarget::new("openai".to_string(), "gpt-5".to_string())
-                        .with_protocol("responses")
-                        .with_endpoint("https://api.openai.com/v1/responses"),
+                    &querymt_agent_core::model::OutputTarget::new(
+                        "openai".to_string(),
+                        "gpt-5".to_string(),
+                    )
+                    .with_protocol("responses")
+                    .with_endpoint("https://api.openai.com/v1/responses"),
                 ),
                 None,
             )
@@ -934,9 +937,12 @@ async fn structured_response_persist_reload_then_second_request_round_trips() {
     let cross_endpoint = history[1]
         .to_chat_message_with_output_target(
             Some(
-                &crate::model::OutputTarget::new("openai".to_string(), "gpt-5".to_string())
-                    .with_protocol("responses")
-                    .with_endpoint("https://evil.example/v1/responses"),
+                &querymt_agent_core::model::OutputTarget::new(
+                    "openai".to_string(),
+                    "gpt-5".to_string(),
+                )
+                .with_protocol("responses")
+                .with_endpoint("https://evil.example/v1/responses"),
             ),
             None,
         )
@@ -954,9 +960,12 @@ async fn structured_response_persist_reload_then_second_request_round_trips() {
     let cross_protocol = history[1]
         .to_chat_message_with_output_target(
             Some(
-                &crate::model::OutputTarget::new("openai".to_string(), "gpt-5".to_string())
-                    .with_protocol("chat_completions")
-                    .with_endpoint("https://api.openai.com/v1/responses"),
+                &querymt_agent_core::model::OutputTarget::new(
+                    "openai".to_string(),
+                    "gpt-5".to_string(),
+                )
+                .with_protocol("chat_completions")
+                .with_endpoint("https://api.openai.com/v1/responses"),
             ),
             None,
         )
@@ -972,8 +981,8 @@ async fn structured_response_persist_reload_then_second_request_round_trips() {
 
 /// Build the exact projection target identity matching [`origin_turn`]'s
 /// recorded provenance (provider, protocol, model, endpoint).
-fn origin_target(provider: &str, model: &str) -> crate::model::OutputTarget {
-    crate::model::OutputTarget::new(provider.to_string(), model.to_string())
+fn origin_target(provider: &str, model: &str) -> querymt_agent_core::model::OutputTarget {
+    querymt_agent_core::model::OutputTarget::new(provider.to_string(), model.to_string())
         .with_protocol("responses")
         .with_endpoint(format!("https://{provider}.invalid/v1/responses"))
 }
@@ -1296,8 +1305,8 @@ fn migration_0023_persists_revert_workspace_provenance() {
 
 #[tokio::test]
 async fn revert_state_snapshot_id_round_trips_through_sqlite() {
-    use crate::session::domain::RevertState;
-    use crate::snapshot::SnapshotId;
+    use querymt_agent_core::session::domain::RevertState;
+    use querymt_agent_core::snapshot_id::SnapshotId;
 
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
     let session = storage
@@ -1561,8 +1570,8 @@ fn migration_0014_adds_session_control_tables() {
 
 #[tokio::test]
 async fn delegate_assignments_are_read_only_revisioned_and_session_scoped() {
-    use crate::delegation::DelegateModelOverride;
-    use crate::session::error::SessionError;
+    use querymt_agent_core::delegation::model_overrides::DelegateModelOverride;
+    use querymt_agent_core::session::error::SessionError;
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
     let first = storage
         .create_session(None, None, None, None)
@@ -1606,7 +1615,9 @@ async fn delegate_assignments_are_read_only_revisioned_and_session_scoped() {
             &first.public_id,
             "coder",
             Some(model.clone()),
-            Some(Some(crate::delegation::DelegateReasoningEffort::High)),
+            Some(Some(
+                querymt_agent_core::delegation::model_overrides::DelegateReasoningEffort::High,
+            )),
             Some(1),
         )
         .await
@@ -1614,7 +1625,7 @@ async fn delegate_assignments_are_read_only_revisioned_and_session_scoped() {
     assert_eq!(reasoning.assignments.revision, 2);
     assert_eq!(
         reasoning.assignments.reasoning_overrides["coder"],
-        crate::delegation::DelegateReasoningEffort::High
+        querymt_agent_core::delegation::model_overrides::DelegateReasoningEffort::High
     );
     let noop = storage
         .set_delegate_assignment(&first.public_id, "coder", Some(model.clone()), Some(2))
@@ -1743,7 +1754,7 @@ async fn delegate_assignments_are_read_only_revisioned_and_session_scoped() {
 
 #[tokio::test]
 async fn delegate_assignments_survive_reopen_and_detect_cross_connection_conflicts() {
-    use crate::delegation::DelegateModelOverride;
+    use querymt_agent_core::delegation::model_overrides::DelegateModelOverride;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sessions.db");
     let storage = SqliteStorage::connect(path.clone()).await.unwrap();
@@ -1789,7 +1800,7 @@ async fn delegate_assignments_survive_reopen_and_detect_cross_connection_conflic
     let error = a.err().or_else(|| b.err()).unwrap();
     assert!(matches!(
         error,
-        crate::session::error::SessionError::DelegateAssignmentRevisionConflict {
+        querymt_agent_core::session::error::SessionError::DelegateAssignmentRevisionConflict {
             expected: 1,
             found: 2
         }
@@ -1807,7 +1818,7 @@ async fn delegate_assignments_survive_reopen_and_detect_cross_connection_conflic
 
 #[tokio::test]
 async fn delegate_assignments_rollback_failed_writes_and_do_not_hide_corruption() {
-    use crate::delegation::DelegateModelOverride;
+    use querymt_agent_core::delegation::model_overrides::DelegateModelOverride;
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
     let parent = storage
         .create_session(None, None, None, None)
@@ -1892,7 +1903,7 @@ async fn delegate_assignments_user_forks_inherit_but_delegate_children_do_not() 
         .create_session(None, None, None, None)
         .await
         .unwrap();
-    let model = crate::delegation::DelegateModelOverride {
+    let model = querymt_agent_core::delegation::model_overrides::DelegateModelOverride {
         model_id: "provider/model".into(),
         node_id: None,
     };
@@ -1901,7 +1912,9 @@ async fn delegate_assignments_user_forks_inherit_but_delegate_children_do_not() 
             &parent.public_id,
             "coder",
             Some(model.clone()),
-            Some(Some(crate::delegation::DelegateReasoningEffort::Low)),
+            Some(Some(
+                querymt_agent_core::delegation::model_overrides::DelegateReasoningEffort::Low,
+            )),
             None,
         )
         .await
@@ -1948,7 +1961,7 @@ async fn delegate_assignments_user_forks_inherit_but_delegate_children_do_not() 
             .unwrap()
             .unwrap()
             .reasoning_overrides["coder"],
-        crate::delegation::DelegateReasoningEffort::Low
+        querymt_agent_core::delegation::model_overrides::DelegateReasoningEffort::Low
     );
     assert!(
         storage
@@ -2147,7 +2160,7 @@ async fn session_control_commit_is_revisioned_and_session_scoped() {
         .expect_err("stale revision must fail");
     assert!(matches!(
         stale,
-        crate::session::error::SessionError::SessionControlRevisionConflict {
+        querymt_agent_core::session::error::SessionError::SessionControlRevisionConflict {
             expected: 0,
             found: 1
         }
@@ -2215,8 +2228,8 @@ async fn set_session_llm_config_rejects_changes_after_control_initialization() {
 
 #[tokio::test]
 async fn fork_copies_session_control_bindings_independently() {
-    use crate::model::{AgentMessage, MessagePart};
     use querymt::chat::ChatRole;
+    use querymt_agent_core::model::{AgentMessage, MessagePart};
 
     let storage = SqliteStorage::connect(":memory:".into())
         .await
@@ -2828,20 +2841,20 @@ async fn provisioning_intent_migration_upgrades_existing_database() {
     }
 
     // The pre-migration row survives with NULL replay inputs.
-    use crate::worktree::WorkspaceRepository as _;
-    let store = crate::worktree::SqliteWorkspaceRepository::new(std::sync::Arc::new(
+    use querymt_agent_core::worktree::repository::WorkspaceRepository as _;
+    let store = crate::repo_workspace::SqliteWorkspaceRepository::new(std::sync::Arc::new(
         parking_lot::Mutex::new(conn),
     ));
-    let id = crate::worktree::WorkspaceId::from_raw("pre-27");
+    let id = querymt_agent_core::worktree::domain::WorkspaceId::from_raw("pre-27");
     let record = store.get_workspace(&id).await.unwrap().unwrap();
     assert_eq!(
         record.lifecycle,
-        crate::worktree::WorkspaceLifecycle::Provisioning
+        querymt_agent_core::worktree::domain::WorkspaceLifecycle::Provisioning
     );
     assert!(record.baseline.is_none(), "no fabricated baseline");
     assert_eq!(
         record.requested_baseline_mode,
-        crate::worktree::BaselineMode::CurrentWorkingTree
+        querymt_agent_core::worktree::domain::BaselineMode::CurrentWorkingTree
     );
     assert_eq!(record.requested_base_ref, None);
     assert_eq!(record.operation_id, "");
@@ -2852,7 +2865,8 @@ async fn provisioning_intent_migration_upgrades_existing_database() {
     let mut intent = record.clone();
     intent.requested_base_ref = Some("refs/heads/main".into());
     intent.operation_id = "op-first".into();
-    intent.provisioning_phase = Some(crate::worktree::ProvisioningPhase::IntentPersisted);
+    intent.provisioning_phase =
+        Some(querymt_agent_core::worktree::domain::ProvisioningPhase::IntentPersisted);
     store.update_workspace(intent.clone()).await.unwrap();
     let loaded = store.get_workspace(&id).await.unwrap().unwrap();
     assert_eq!(loaded, intent);
@@ -2860,8 +2874,8 @@ async fn provisioning_intent_migration_upgrades_existing_database() {
 
 #[tokio::test]
 async fn task_lifecycle_is_atomic_revisioned_and_explicit() {
-    use crate::session::domain::{TaskKind, TaskStatus};
-    use crate::session::store::TaskPatch;
+    use querymt_agent_core::session::domain::{TaskKind, TaskStatus};
+    use querymt_agent_core::session::store::TaskPatch;
 
     let storage = SqliteStorage::connect(":memory:".into())
         .await
@@ -2976,7 +2990,7 @@ async fn task_lifecycle_is_atomic_revisioned_and_explicit() {
 
 #[tokio::test]
 async fn intent_projection_insert_and_binding_are_atomic() {
-    use crate::session::domain::IntentSnapshot;
+    use querymt_agent_core::session::domain::IntentSnapshot;
     use time::OffsetDateTime;
 
     let storage = SqliteStorage::connect(":memory:".into())
@@ -3044,7 +3058,7 @@ async fn intent_projection_insert_and_binding_are_atomic() {
 
 #[tokio::test]
 async fn intent_projection_rolls_back_when_fts_refresh_fails() {
-    use crate::session::domain::IntentSnapshot;
+    use querymt_agent_core::session::domain::IntentSnapshot;
     use time::OffsetDateTime;
 
     let storage = SqliteStorage::connect(":memory:".into())
@@ -3217,7 +3231,7 @@ async fn session_runtime_binding_transaction_rolls_back_on_failure() {
 
 #[tokio::test]
 async fn custom_model_crud_round_trip() {
-    use crate::session::store::CustomModel;
+    use querymt_agent_core::session::store::CustomModel;
 
     let storage = SqliteStorage::connect(":memory:".into())
         .await
@@ -4146,11 +4160,11 @@ async fn journal_durable_event_never_replayed_for_ephemeral_kind() {
     // Verify that classify_durability correctly identifies ephemeral events;
     // the EventSink will use this to route. The journal itself doesn't filter.
     assert_eq!(
-        crate::events::classify_durability(&AgentEventKind::AssistantContentDelta {
+        querymt_agent_core::events::classify_durability(&AgentEventKind::AssistantContentDelta {
             content: "x".into(),
             message_id: "m".into(),
         }),
-        crate::events::Durability::Ephemeral
+        querymt_agent_core::events::Durability::Ephemeral
     );
 }
 
@@ -4637,7 +4651,7 @@ async fn seed_scoped_sessions(storage: &SqliteStorage) -> (String, String, Strin
     )
 }
 
-fn session_ids(groups: &[crate::session::projection::SessionGroup]) -> Vec<String> {
+fn session_ids(groups: &[querymt_agent_core::session::projection::SessionGroup]) -> Vec<String> {
     groups
         .iter()
         .flat_map(|group| {
@@ -4967,7 +4981,7 @@ async fn session_lifecycle_storage_defaults_patches_and_cascades() {
     assert_eq!(listed, batch);
     assert!(matches!(
         store.get_session_lifecycle("missing-session").await,
-        Err(crate::session::error::SessionError::SessionNotFound(_))
+        Err(querymt_agent_core::session::error::SessionError::SessionNotFound(_))
     ));
     assert!(
         store
@@ -5827,11 +5841,11 @@ fn knowledge_junction_migration_creates_tables_and_backfills_entries() {
         vec![
             (
                 "Serde".to_string(),
-                crate::knowledge::text_processing::normalize_term("Serde")
+                querymt_agent_core::knowledge::text_processing::normalize_term("Serde")
             ),
             (
                 "Tokio".to_string(),
-                crate::knowledge::text_processing::normalize_term("Tokio")
+                querymt_agent_core::knowledge::text_processing::normalize_term("Tokio")
             ),
         ]
     );
@@ -5846,7 +5860,7 @@ fn knowledge_junction_migration_creates_tables_and_backfills_entries() {
         topics,
         vec![(
             "Async Runtimes".to_string(),
-            crate::knowledge::text_processing::normalize_term("Async Runtimes")
+            querymt_agent_core::knowledge::text_processing::normalize_term("Async Runtimes")
         )]
     );
 }
@@ -5909,7 +5923,7 @@ fn knowledge_junction_migration_backfills_topics_when_entities_malformed() {
 #[tokio::test]
 async fn knowledge_query_finds_backfilled_entries_after_upgrade() {
     use crate::knowledge::sqlite::SqliteKnowledgeStore;
-    use crate::knowledge::{KnowledgeStore, QueryOpts, RetrievalMode};
+    use querymt_agent_core::knowledge::{KnowledgeStore, QueryOpts, RetrievalMode};
 
     let mut conn = legacy_db_without_knowledge_junctions();
     insert_knowledge_entry(&conn, "e1", r#"["tokio"]"#, r#"["async"]"#);
@@ -5977,7 +5991,9 @@ async fn storage_keeps_working_after_an_operation_returns_an_error() {
         .await;
     assert!(matches!(
         result,
-        Err(crate::session::error::SessionError::Database(_))
+        Err(querymt_agent_core::session::error::SessionError::Database(
+            _
+        ))
     ));
 
     assert_storage_still_serves(&storage, &session.public_id).await;
@@ -5994,7 +6010,10 @@ async fn panicked_storage_task_is_reported_as_a_task_failure() {
         .unwrap_err();
 
     assert!(
-        matches!(err, crate::session::error::SessionError::TaskFailed(_)),
+        matches!(
+            err,
+            querymt_agent_core::session::error::SessionError::TaskFailed(_)
+        ),
         "expected TaskFailed, got {err:?}"
     );
     let source = err.source().expect("task failure keeps its source");

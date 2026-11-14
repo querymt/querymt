@@ -1,10 +1,10 @@
 //! SQLite implementation of DelegationRepository
 
-use crate::session::domain::{Delegation, DelegationClaim, DelegationStatus};
-use crate::session::error::{SessionError, SessionResult};
-use crate::session::repository::DelegationRepository;
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use querymt_agent_core::session::domain::{Delegation, DelegationClaim, DelegationStatus};
+use querymt_agent_core::session::error::{SessionError, SessionResult};
+use querymt_agent_core::session::repository::DelegationRepository;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -281,13 +281,13 @@ fn map_row_to_delegation(row: &rusqlite::Row) -> Result<Delegation, rusqlite::Er
 
     // NOTE: Parse hash from TEXT (hex) - could switch to BLOB for efficiency
     let objective_hash_str: String = row.get(6)?;
-    let objective_hash = crate::hash::RapidHash::from_hex(&objective_hash_str)
+    let objective_hash = querymt_agent_core::hash::RapidHash::from_hex(&objective_hash_str)
         .map_err(|_| rusqlite::Error::InvalidQuery)?;
 
     // Legacy rows (NULL column) inherit the parent's execution mode.
     let isolation = row
         .get::<_, Option<String>>(11)?
-        .map(|s| crate::worktree::DelegationIsolation::from_str(&s))
+        .map(|s| querymt_agent_core::worktree::domain::DelegationIsolation::from_str(&s))
         .transpose()
         .map_err(|_| rusqlite::Error::InvalidQuery)?
         .unwrap_or_default();

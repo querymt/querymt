@@ -1,10 +1,10 @@
 //! SQLite implementation of IntentRepository
 
-use crate::session::domain::IntentSnapshot;
-use crate::session::error::{SessionError, SessionResult};
-use crate::session::repository::IntentRepository;
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use querymt_agent_core::session::domain::IntentSnapshot;
+use querymt_agent_core::session::error::{SessionError, SessionResult};
+use querymt_agent_core::session::repository::IntentRepository;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::sync::Arc;
 use time::OffsetDateTime;

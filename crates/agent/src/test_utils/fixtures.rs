@@ -8,9 +8,9 @@ use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::session::backend::StorageBackend;
 use crate::session::sqlite_storage::SqliteStorage;
-pub use crate::sqlite_staging::test_support::TestStorage;
 use crate::test_utils::helpers::empty_plugin_registry;
 use querymt::LLMParams;
+pub use querymt_agent_sqlite::test_support::TestStorage;
 use std::sync::Arc;
 use tempfile::TempDir;
 

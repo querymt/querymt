@@ -7,16 +7,16 @@
 //! never reused) are enforced by partial unique indexes in the schema and
 //! surfaced as explicit [`SessionError`] variants.
 
-use crate::core_staging::worktree::repository::WorkspaceRepository;
-use crate::session::error::{SessionError, SessionResult};
-use crate::sqlite_staging::error::session_db_error;
-use crate::worktree::domain::{
+use crate::error::session_db_error;
+use async_trait::async_trait;
+use parking_lot::Mutex;
+use querymt_agent_core::session::error::{SessionError, SessionResult};
+use querymt_agent_core::worktree::domain::{
     Baseline, BaselineMode, ExecutionMode, ManagedBranch, ProvisioningPhase, RepositoryIdentity,
     ResultProvenance, ResultVerificationStatus, WorkspaceId, WorkspaceLifecycle,
     WorkspaceOwnership, WorkspaceRecord,
 };
-use async_trait::async_trait;
-use parking_lot::Mutex;
+use querymt_agent_core::worktree::repository::WorkspaceRepository;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -136,7 +136,10 @@ fn row_to_workspace(row: &rusqlite::Row<'_>) -> Result<WorkspaceRecord, rusqlite
         checkout_path: PathBuf::from(checkout_path),
         branch: ManagedBranch::from_raw(branch),
         source_cwd: source_cwd.unwrap_or_else(|| {
-            crate::worktree::source_cwd_from(Path::new(&origin_path), Path::new(&relative_cwd))
+            querymt_agent_core::worktree::domain::source_cwd_from(
+                Path::new(&origin_path),
+                Path::new(&relative_cwd),
+            )
         }),
         relative_cwd: PathBuf::from(relative_cwd),
         execution: ExecutionMode::from_str(&execution)

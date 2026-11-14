@@ -1,6 +1,6 @@
 //! Protocol-owned automation identity and the repository contract that
 //! provisions the durable session each scope binds to (SQLite implementation:
-//! `sqlite_staging::repo_dotagents_automation`).
+//! `querymt_agent_sqlite::repo_dotagents_automation`).
 
 use super::dotagents_tasks::{DotagentsAutomationBinding, normalize_id};
 use crate::dotagents::layer::DotagentsLayer;

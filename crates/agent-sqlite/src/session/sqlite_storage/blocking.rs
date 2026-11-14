@@ -6,9 +6,9 @@
 //! not poison it: only that call fails, with [`SessionError::TaskFailed`],
 //! and later calls keep working.
 
-use crate::session::error::{SessionError, SessionResult};
-use crate::sqlite_staging::error::session_db_error;
+use crate::error::session_db_error;
 use parking_lot::Mutex;
+use querymt_agent_core::session::error::{SessionError, SessionResult};
 use rusqlite::Connection;
 use std::sync::Arc;
 

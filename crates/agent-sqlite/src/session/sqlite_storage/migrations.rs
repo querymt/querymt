@@ -271,7 +271,7 @@ fn migration_0035_knowledge_junction_tables(conn: &mut Connection) -> Result<(),
                 params![
                     id,
                     entity,
-                    crate::knowledge::text_processing::normalize_term(entity)
+                    querymt_agent_core::knowledge::text_processing::normalize_term(entity)
                 ],
             )?;
         }
@@ -282,7 +282,7 @@ fn migration_0035_knowledge_junction_tables(conn: &mut Connection) -> Result<(),
                 params![
                     id,
                     topic,
-                    crate::knowledge::text_processing::normalize_term(topic)
+                    querymt_agent_core::knowledge::text_processing::normalize_term(topic)
                 ],
             )?;
         }

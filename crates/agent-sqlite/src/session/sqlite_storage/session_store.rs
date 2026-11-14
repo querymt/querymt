@@ -1,4 +1,4 @@
-use crate::sqlite_staging::error::{SqliteResultExt, session_db_error};
+use crate::error::{SqliteResultExt, session_db_error};
 use async_trait::async_trait;
 use querymt::LLMParams;
 use querymt::chat::ChatRole;
@@ -7,16 +7,6 @@ use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::agent::core::AgentMode;
-use crate::agent::session_control::{SessionControlState, SessionModelBinding};
-use crate::model::{AgentMessage, MessagePart};
-use crate::session::domain::{
-    Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
-    DelegationStatus, ForkInfo, ForkOrigin, ForkPointType, IntentSnapshot, ProgressEntry,
-    ProgressKind, RevertState, Task, TaskKind, TaskStatus,
-};
-use crate::session::error::{SessionError, SessionResult};
-use crate::session::lifecycle::{SessionLifecycle, SessionLifecyclePatch};
 use crate::session::repo_artifact::SqliteArtifactRepository;
 use crate::session::repo_decision::SqliteDecisionRepository;
 use crate::session::repo_delegation::SqliteDelegationRepository;
@@ -24,19 +14,29 @@ use crate::session::repo_intent::SqliteIntentRepository;
 use crate::session::repo_progress::SqliteProgressRepository;
 use crate::session::repo_session::SqliteSessionRepository;
 use crate::session::repo_task::{SqliteTaskRepository, map_task_row};
-use crate::session::repository::{
+use querymt_agent_core::agent_mode::AgentMode;
+use querymt_agent_core::model::{AgentMessage, MessagePart};
+use querymt_agent_core::session::domain::{
+    Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
+    DelegationStatus, ForkInfo, ForkOrigin, ForkPointType, IntentSnapshot, ProgressEntry,
+    ProgressKind, RevertState, Task, TaskKind, TaskStatus,
+};
+use querymt_agent_core::session::error::{SessionError, SessionResult};
+use querymt_agent_core::session::lifecycle::{SessionLifecycle, SessionLifecyclePatch};
+use querymt_agent_core::session::repository::{
     ArtifactRepository, DecisionRepository, DelegationRepository, IntentRepository,
     ProgressRepository, SessionRepository, TaskRepository,
 };
-use crate::session::store::{
+use querymt_agent_core::session::store::{
     CustomModel, DelegateAssignmentWrite, DelegateAssignments, LLMConfig, RemoteSessionBookmark,
     Session, SessionExecutionConfig, SessionStore, TaskPatch, extract_llm_config_values,
 };
+use querymt_agent_core::session_control::{SessionControlState, SessionModelBinding};
 use std::collections::{HashMap, HashSet};
 
 use super::SqliteStorage;
 use super::row_parsers::{parse_llm_config_row, parse_llm_params};
-use crate::events::AgentEventKind;
+use querymt_agent_core::events::AgentEventKind;
 
 fn read_delegate_assignments(
     conn: &rusqlite::Connection,
@@ -83,7 +83,10 @@ fn read_delegate_assignments(
         if let Some(model_id) = model_id {
             overrides.insert(
                 agent_id.clone(),
-                crate::delegation::DelegateModelOverride { model_id, node_id },
+                querymt_agent_core::delegation::model_overrides::DelegateModelOverride {
+                    model_id,
+                    node_id,
+                },
             );
         }
         if let Some(reasoning_effort) = reasoning_effort {
@@ -112,10 +115,13 @@ fn read_delegate_assignments(
 }
 
 fn validate_delegate_assignments(
-    overrides: &std::collections::BTreeMap<String, crate::delegation::DelegateModelOverride>,
+    overrides: &std::collections::BTreeMap<
+        String,
+        querymt_agent_core::delegation::model_overrides::DelegateModelOverride,
+    >,
     reasoning_overrides: &std::collections::BTreeMap<
         String,
-        crate::delegation::DelegateReasoningEffort,
+        querymt_agent_core::delegation::model_overrides::DelegateReasoningEffort,
     >,
     error: impl Fn(String) -> SessionError,
 ) -> SessionResult<()> {
@@ -391,7 +397,7 @@ impl SessionStore for SqliteStorage {
         &self,
         session_id: &str,
         pinned: bool,
-    ) -> SessionResult<(crate::session::store::SessionPin, bool)> {
+    ) -> SessionResult<(querymt_agent_core::session::store::SessionPin, bool)> {
         let session_id = session_id.to_owned();
         self.run_blocking_session(move |conn| {
             let tx = conn
@@ -435,7 +441,7 @@ impl SessionStore for SqliteStorage {
                 .db()?;
             tx.commit().db()?;
             Ok((
-                crate::session::store::SessionPin {
+                querymt_agent_core::session::store::SessionPin {
                     session_id,
                     pinned,
                     pinned_at,
@@ -449,7 +455,7 @@ impl SessionStore for SqliteStorage {
     async fn get_session_pins(
         &self,
         session_ids: &[String],
-    ) -> SessionResult<HashMap<String, crate::session::store::SessionPin>> {
+    ) -> SessionResult<HashMap<String, querymt_agent_core::session::store::SessionPin>> {
         if session_ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -471,7 +477,7 @@ impl SessionStore for SqliteStorage {
                     .query_map(params_from_iter(chunk.iter()), |row| {
                         let session_id: String = row.get(0)?;
                         let pinned_at: Option<String> = row.get(1)?;
-                        Ok(crate::session::store::SessionPin {
+                        Ok(querymt_agent_core::session::store::SessionPin {
                             session_id,
                             pinned: pinned_at.is_some(),
                             pinned_at,
@@ -705,7 +711,7 @@ impl SessionStore for SqliteStorage {
         cwd: Option<std::path::PathBuf>,
         parent_session_id: Option<String>,
         fork_origin: Option<ForkOrigin>,
-        intent: Option<crate::session::store::PendingForkIsolation>,
+        intent: Option<querymt_agent_core::session::store::PendingForkIsolation>,
     ) -> SessionResult<Session> {
         let repo = SqliteSessionRepository::new(self.conn.clone());
         repo.create_session_with_isolation_intent(name, cwd, parent_session_id, fork_origin, intent)
@@ -730,7 +736,7 @@ impl SessionStore for SqliteStorage {
     async fn get_pending_fork_isolation(
         &self,
         session_id: &str,
-    ) -> SessionResult<Option<crate::session::store::PendingForkIsolation>> {
+    ) -> SessionResult<Option<querymt_agent_core::session::store::PendingForkIsolation>> {
         let session_id = session_id.to_string();
         let json: Option<String> = self
             .run_blocking(move |conn| {
@@ -783,7 +789,7 @@ impl SessionStore for SqliteStorage {
         source_session_id: &str,
         target_message_id: &str,
         fork_origin: ForkOrigin,
-        intent: Option<crate::session::store::PendingForkIsolation>,
+        intent: Option<querymt_agent_core::session::store::PendingForkIsolation>,
     ) -> SessionResult<String> {
         let intent_json = intent
             .map(|intent| serde_json::to_string(&intent))
@@ -960,10 +966,10 @@ impl SessionStore for SqliteStorage {
 
                     for (ptype, mut content, order) in parts {
                         if ptype == "turn_snapshot_start" || ptype == "turn_snapshot_patch" {
-                            let mut part: crate::model::MessagePart = serde_json::from_str(&content).map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+                            let mut part: querymt_agent_core::model::MessagePart = serde_json::from_str(&content).map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
                             match &mut part {
-                                crate::model::MessagePart::TurnSnapshotStart { inherited, workspace_root, .. } |
-                                crate::model::MessagePart::TurnSnapshotPatch { inherited, workspace_root, .. } => {
+                                querymt_agent_core::model::MessagePart::TurnSnapshotStart { inherited, workspace_root, .. } |
+                                querymt_agent_core::model::MessagePart::TurnSnapshotPatch { inherited, workspace_root, .. } => {
                                     *inherited = true;
                                     if workspace_root.is_none() { *workspace_root = parent_cwd.as_ref().map(PathBuf::from); }
                                 }
@@ -1287,7 +1293,7 @@ impl SessionStore for SqliteStorage {
         &self,
         session_id: &str,
         agent_id: &str,
-        model: Option<crate::delegation::DelegateModelOverride>,
+        model: Option<querymt_agent_core::delegation::model_overrides::DelegateModelOverride>,
         expected_revision: Option<u64>,
     ) -> SessionResult<DelegateAssignmentWrite> {
         self.set_delegate_assignment_with_reasoning(
@@ -1304,8 +1310,10 @@ impl SessionStore for SqliteStorage {
         &self,
         session_id: &str,
         agent_id: &str,
-        model: Option<crate::delegation::DelegateModelOverride>,
-        reasoning_effort: Option<Option<crate::delegation::DelegateReasoningEffort>>,
+        model: Option<querymt_agent_core::delegation::model_overrides::DelegateModelOverride>,
+        reasoning_effort: Option<
+            Option<querymt_agent_core::delegation::model_overrides::DelegateReasoningEffort>,
+        >,
         expected_revision: Option<u64>,
     ) -> SessionResult<DelegateAssignmentWrite> {
         let mut candidate = std::collections::BTreeMap::new();
@@ -1558,14 +1566,14 @@ impl SessionStore for SqliteStorage {
     async fn get_session_runtime_binding(
         &self,
         session_id: &str,
-    ) -> SessionResult<Option<crate::session::store::SessionRuntimeBinding>> {
+    ) -> SessionResult<Option<querymt_agent_core::session::store::SessionRuntimeBinding>> {
         let session_id = session_id.to_string();
         self.run_blocking(move |conn| {
             conn.query_row(
                 "SELECT profile_id, agent_id, profile_fingerprint, provider_lock_digest, provider_locks_json FROM profile_bindings WHERE session_id = ?1",
                 params![session_id],
                 |row| {
-                    Ok(crate::session::store::SessionRuntimeBinding {
+                    Ok(querymt_agent_core::session::store::SessionRuntimeBinding {
                         profile_id: row.get(0)?,
                         agent_id: row.get(1)?,
                         profile_fingerprint: row.get(2)?,
@@ -1641,7 +1649,7 @@ impl SessionStore for SqliteStorage {
     ) -> SessionResult<()> {
         let session_internal_id = self.resolve_session_internal_id(session_id).await?;
         let config_json = serde_json::to_string(config).map_err(|e| {
-            crate::session::error::SessionError::InvalidOperation(format!(
+            querymt_agent_core::session::error::SessionError::InvalidOperation(format!(
                 "Failed to serialize session execution config: {}",
                 e
             ))
@@ -2277,7 +2285,7 @@ impl SessionStore for SqliteStorage {
     async fn claim_delegation(
         &self,
         delegation_id: &str,
-    ) -> SessionResult<crate::session::domain::DelegationClaim> {
+    ) -> SessionResult<querymt_agent_core::session::domain::DelegationClaim> {
         let repo = SqliteDelegationRepository::new(self.conn.clone());
         repo.claim_delegation(delegation_id).await
     }
@@ -2319,7 +2327,7 @@ impl SessionStore for SqliteStorage {
                 |row| {
                     let public_id: String = row.get(0)?;
                     let message_id: String = row.get(1)?;
-                    let snapshot_id = crate::snapshot::SnapshotId::from(row.get::<_, String>(2)?);
+                    let snapshot_id = querymt_agent_core::snapshot_id::SnapshotId::from(row.get::<_, String>(2)?);
                     let backend_id: String = row.get(3)?;
                     let workspace_root: Option<String> = row.get(4)?;
                     let created_at_str: String = row.get(5)?;
@@ -2387,7 +2395,7 @@ impl SessionStore for SqliteStorage {
                         let public_id: String = row.get(1)?;
                         let message_id: String = row.get(2)?;
                         let snapshot_id =
-                            crate::snapshot::SnapshotId::from(row.get::<_, String>(3)?);
+                            querymt_agent_core::snapshot_id::SnapshotId::from(row.get::<_, String>(3)?);
                         let backend_id: String = row.get(4)?;
                         let workspace_root: Option<String> = row.get(5)?;
                         let created_at_str: String = row.get(6)?;
@@ -2438,7 +2446,7 @@ impl SessionStore for SqliteStorage {
             let rows = stmt.query_map(params![session_internal_id], |row| {
                 let public_id: String = row.get(0)?;
                 let message_id: String = row.get(1)?;
-                let snapshot_id = crate::snapshot::SnapshotId::from(row.get::<_, String>(2)?);
+                let snapshot_id = querymt_agent_core::snapshot_id::SnapshotId::from(row.get::<_, String>(2)?);
                 let backend_id: String = row.get(3)?;
                 let workspace_root: Option<String> = row.get(4)?;
                 let created_at_str: String = row.get(5)?;
@@ -2635,7 +2643,8 @@ impl SessionStore for SqliteStorage {
     async fn resolve_session_locations(
         &self,
         session_ids: &[String],
-    ) -> SessionResult<HashMap<String, crate::session::location::SessionLocation>> {
+    ) -> SessionResult<HashMap<String, querymt_agent_core::session::location::SessionLocation>>
+    {
         if session_ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -2684,7 +2693,7 @@ impl SessionStore for SqliteStorage {
                 };
 
                 for session_id in chunk {
-                    let location = crate::session::location::classify_session_location(
+                    let location = querymt_agent_core::session::location::classify_session_location(
                         local_ids.contains(session_id),
                         bookmarks.get(session_id).cloned(),
                     );

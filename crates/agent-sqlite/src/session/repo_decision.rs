@@ -1,10 +1,12 @@
 //! SQLite implementation of DecisionRepository
 
-use crate::session::domain::{Alternative, AlternativeStatus, Decision, DecisionStatus};
-use crate::session::error::{SessionError, SessionResult};
-use crate::session::repository::DecisionRepository;
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use querymt_agent_core::session::domain::{
+    Alternative, AlternativeStatus, Decision, DecisionStatus,
+};
+use querymt_agent_core::session::error::{SessionError, SessionResult};
+use querymt_agent_core::session::repository::DecisionRepository;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::str::FromStr;
 use std::sync::Arc;

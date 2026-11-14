@@ -22,13 +22,13 @@ mod view_store;
 #[cfg(test)]
 mod tests;
 
-use crate::sqlite_staging::error::session_db_error;
+use crate::error::session_db_error;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::session::error::{SessionError, SessionResult};
+use querymt_agent_core::session::error::{SessionError, SessionResult};
 
 use migrations::apply_migrations;
 
@@ -104,7 +104,7 @@ impl SqliteStorage {
     }
 
     /// Expose the raw connection for test assertions (e.g. querying legacy tables).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn conn_for_test(&self) -> Arc<Mutex<Connection>> {
         self.conn.clone()
     }
@@ -115,7 +115,7 @@ impl SqliteStorage {
     }
 
     /// Override the run lease root (tests opt in with a temp directory).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_run_lease_root(mut self, root: PathBuf) -> Self {
         self.run_lease_root = Some(root);
         self
@@ -132,7 +132,7 @@ impl SqliteStorage {
     /// export) that must not alter the existing data.
     pub async fn connect_with_options(path: PathBuf, migrate: bool) -> SessionResult<Self> {
         let db_path = path.clone();
-        let run_lease_root = crate::session::run_lease::run_lease_root_for_db(&path);
+        let run_lease_root = querymt_agent_core::run_lease_path::run_lease_root_for_db(&path);
         let conn = tokio::task::spawn_blocking(move || -> Result<Connection, rusqlite::Error> {
             let mut conn = Connection::open(&db_path)?;
             conn.execute("PRAGMA foreign_keys = ON;", [])?;

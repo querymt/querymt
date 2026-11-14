@@ -7,7 +7,7 @@
 
 pub mod host;
 pub use querymt_agent_knowledge as repository;
-pub mod sqlite;
+pub use querymt_agent_sqlite::knowledge::sqlite;
 
 pub use crate::core_staging::knowledge::text_processing;
 pub use crate::core_staging::knowledge::*;

@@ -13,7 +13,7 @@ path = "src/lib.rs"
 querymt-agent-core = { path = "../agent-core" }
 querymt-agent-index = { path = "../agent-index" }
 # Same version as querymt-agent: libsqlite3-sys may be linked only once.
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite.workspace = true
 tokio = { version = "1.0", features = ["rt", "sync"] }
 tracing.workspace = true
 serde.workspace = true

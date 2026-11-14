@@ -3,14 +3,14 @@
 //! Follows the same pattern as `repo_schedule.rs`: async trait with a
 //! `run_blocking` helper that acquires the shared `Arc<Mutex<Connection>>`.
 
-use crate::knowledge::{
+use crate::error::SqliteResultExt;
+use async_trait::async_trait;
+use parking_lot::Mutex;
+use querymt_agent_core::knowledge::{
     ConsolidateRequest, Consolidation, IngestRequest, KnowledgeEntry, KnowledgeError,
     KnowledgeFilter, KnowledgeQueryResult, KnowledgeStats, KnowledgeStore, ProtocolUpsertOutcome,
     QueryOpts, RetentionPolicy, RetentionResult, RetrievalMode,
 };
-use crate::sqlite_staging::error::SqliteResultExt;
-use async_trait::async_trait;
-use parking_lot::Mutex;
 use rusqlite::{Connection, params, types::Value};
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -222,7 +222,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 
                 // Populate junction tables with normalized forms for indexed matching
                 for entity in &entry.entities {
-                    let normalized = crate::knowledge::text_processing::normalize_term(entity);
+                    let normalized = querymt_agent_core::knowledge::text_processing::normalize_term(entity);
                     tx.execute(
                         "INSERT INTO knowledge_entry_entities (entry_id, entity, entity_normalized) \
                          VALUES (?, ?, ?)",
@@ -231,7 +231,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                     .knowledge_db()?;
                 }
                 for topic in &entry.topics {
-                    let normalized = crate::knowledge::text_processing::normalize_term(topic);
+                    let normalized = querymt_agent_core::knowledge::text_processing::normalize_term(topic);
                     tx.execute(
                         "INSERT INTO knowledge_entry_topics (entry_id, topic, topic_normalized) \
                          VALUES (?, ?, ?)",
@@ -322,7 +322,8 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                 let topic_conditions: Vec<String> = topics
                     .iter()
                     .map(|t| {
-                        let normalized = crate::knowledge::text_processing::normalize_term(t);
+                        let normalized =
+                            querymt_agent_core::knowledge::text_processing::normalize_term(t);
                         let cond = format!(
                             "EXISTS (SELECT 1 FROM knowledge_entry_topics \
                              WHERE entry_id = knowledge_entries.id AND topic_normalized = ?{})",
@@ -342,7 +343,8 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                 let entity_conditions: Vec<String> = entities
                     .iter()
                     .map(|e| {
-                        let normalized = crate::knowledge::text_processing::normalize_term(e);
+                        let normalized =
+                            querymt_agent_core::knowledge::text_processing::normalize_term(e);
                         let cond = format!(
                             "EXISTS (SELECT 1 FROM knowledge_entry_entities \
                              WHERE entry_id = knowledge_entries.id AND entity_normalized = ?{})",
@@ -780,7 +782,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                 };
 
                 for entity in &entry.entities {
-                    let normalized = crate::knowledge::text_processing::normalize_term(entity);
+                    let normalized = querymt_agent_core::knowledge::text_processing::normalize_term(entity);
                     tx.execute(
                         "INSERT INTO knowledge_entry_entities (entry_id, entity, entity_normalized) \
                          VALUES (?, ?, ?)",
@@ -789,7 +791,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                     .knowledge_db()?;
                 }
                 for topic in &entry.topics {
-                    let normalized = crate::knowledge::text_processing::normalize_term(topic);
+                    let normalized = querymt_agent_core::knowledge::text_processing::normalize_term(topic);
                     tx.execute(
                         "INSERT INTO knowledge_entry_topics (entry_id, topic, topic_normalized) \
                          VALUES (?, ?, ?)",
@@ -910,8 +912,9 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 /// does its own Porter stemming) and stemmed keywords for LIKE-based
 /// entity/topic matching where we need consistent normalization.
 fn extract_keywords(question: &str) -> (Vec<String>, Vec<String>) {
-    let (keywords, lang) = crate::knowledge::text_processing::extract_keywords(question);
-    let stemmed = crate::knowledge::text_processing::stem_keywords(&keywords, &lang);
+    let (keywords, lang) =
+        querymt_agent_core::knowledge::text_processing::extract_keywords(question);
+    let stemmed = querymt_agent_core::knowledge::text_processing::stem_keywords(&keywords, &lang);
     (keywords, stemmed)
 }
 
