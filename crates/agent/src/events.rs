@@ -2138,13 +2138,13 @@ mod tests {
             serde_json::json!({
                 "type": "llm_attempt_started",
                 "data": {
-                    "start": serde_json::to_value(crate::accounting::tests::sample_start()).unwrap()
+                    "start": serde_json::to_value(crate::core_staging::accounting::samples::sample_start()).unwrap()
                 }
             }),
             serde_json::json!({
                 "type": "llm_attempt_settled",
                 "data": {
-                    "settlement": serde_json::to_value(crate::accounting::tests::sample_settlement()).unwrap()
+                    "settlement": serde_json::to_value(crate::core_staging::accounting::samples::sample_settlement()).unwrap()
                 }
             }),
         ]

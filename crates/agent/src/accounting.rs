@@ -175,66 +175,11 @@ pub(crate) async fn test_ledger() -> DispatchLedger {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use querymt::Usage;
-    use querymt::providers::{BillingClass, ModelPricing, value_usage};
+    use querymt::providers::{BillingClass, value_usage};
 
-    pub(crate) fn sample_ref() -> AttemptRef {
-        AttemptRef {
-            operation_id: "op-1".into(),
-            attempt_id: "att-1".into(),
-            attempt_index: 0,
-            session_id: "sess-1".into(),
-            cycle_id: "cycle-1".into(),
-            purpose: AttemptPurpose::MainResponse,
-        }
-    }
-
-    pub(crate) fn sample_pricing() -> ModelPricing {
-        ModelPricing {
-            input: Some(3.0),
-            output: Some(15.0),
-            cache_read: Some(0.3),
-            cache_write: Some(3.75),
-            ..Default::default()
-        }
-    }
-
-    pub(crate) fn sample_start() -> AttemptStart {
-        AttemptStart {
-            attempt: sample_ref(),
-            mode: DispatchMode::Streaming,
-            provider: "anthropic".into(),
-            model: "claude-sonnet".into(),
-            route: non_secret_route("https://user:pw@api.example.com/v1/x?key=secret"),
-            billing: BillingClass::Metered,
-            pricing: Some(sample_pricing()),
-            budget_pricing: None,
-        }
-    }
-
-    pub(crate) fn sample_settlement() -> AttemptSettlement {
-        let usage = Usage {
-            input_tokens: 100,
-            output_tokens: 10,
-            reasoning_tokens: 5,
-            cache_read: 50,
-            cache_write: 20,
-            cache_write_tiers: None,
-        };
-        let pricing = sample_pricing();
-        AttemptSettlement {
-            attempt: sample_ref(),
-            disposition: UsageDisposition::Final,
-            outcome: AttemptOutcome::Succeeded,
-            valuation: value_usage(Some(&pricing), Some(&usage)),
-            usage: Some(usage),
-            effective_provider: None,
-            effective_model: Some("claude-sonnet".into()),
-            pricing_applicability: PricingApplicability::Selected,
-            pricing: Some(pricing),
-            budget_valuation: None,
-        }
-    }
+    pub(crate) use crate::core_staging::accounting::samples::{
+        sample_pricing, sample_ref, sample_settlement, sample_start,
+    };
 
     #[test]
     fn start_round_trips() {

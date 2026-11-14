@@ -7,6 +7,8 @@ pub mod backend;
 #[cfg(test)]
 mod delegation_override_tests;
 pub mod error;
+#[cfg(test)]
+mod location_tests;
 pub mod repo_dotagents_automation;
 pub mod repo_dotagents_tasks;
 pub mod repo_schedule;
