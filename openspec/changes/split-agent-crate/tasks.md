@@ -82,7 +82,7 @@ Shorthand used below:
 
 ## 2. Gate: merges before the cuts
 
-Branch strategy: `refact/split-agent` is the only integration branch and carries the whole refactor, including the kb work folded in by 1.9. It merges into `main` once, near the end, with a merge commit or rebase-merge (not squash), so the renames-only commits survive for `git log --follow`. When `main` moves, this branch is rebased onto it and pushed with `--force-with-lease`. A draft PR into `main` keeps `test-agent.yml` running on every push. `feat/kb` and `origin/feat/kb` are stale and must not be merged into `main`.
+Branch strategy: `refact/split-agent` is the only integration branch and carries the whole refactor, including the kb work folded in by 1.9. It merges into `main` once, near the end, with a merge commit or rebase-merge (not squash), so the renames-only commits survive for `git log --follow`. When `main` moves, this branch is rebased onto it and pushed with `--force-with-lease`. `feat/kb` and `origin/feat/kb` are stale and must not be merged into `main`.
 
 Tasks 0.2 and 0.3 (layering script and CI step) are done here, before 2.1, so they use the refreshed inventory. Rerun 0.4-style timing runs (cold test build, clippy) together with 2.1.
 
