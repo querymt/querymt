@@ -16,10 +16,10 @@ include = [
   "crates/agent/src/session/sqlite_storage/*.rs",
   "crates/agent/src/tools/*.rs",
   "crates/agent/src/tools/builtins/*.rs",
-  "crates/agent/src/knowledge/repository/*.rs",
+  "crates/agent-knowledge/src/*.rs",
 ]
 # The evaluation harness is not part of the subject matter being documented.
-exclude = ["crates/agent/src/knowledge/repository/evaluation.rs"]
+exclude = ["crates/agent-knowledge/src/evaluation.rs"]
 
 [orientation]
 entrypoints = ["crates/agent/knowledge/README.md"]

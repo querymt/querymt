@@ -17,6 +17,7 @@ typeshare \
   "$REPO_ROOT/crates/agent" \
   "$REPO_ROOT/crates/agent-core" \
   "$REPO_ROOT/crates/agent-index" \
+  "$REPO_ROOT/crates/agent-knowledge" \
   "$REPO_ROOT/crates/querymt" \
   "$REPO_ROOT/crates/querymt-remote" \
   --lang=typescript \

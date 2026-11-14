@@ -147,7 +147,7 @@ id = "ho-nav-budget"
 split = "held_out"
 class = "navigation"
 text = "where does the per-turn delivery budget for repository cards live"
-expect = ["crates/agent/src/knowledge/repository/budget.rs", "crates/agent/knowledge/repository-knowledge.md"]
+expect = ["crates/agent-knowledge/src/budget.rs", "crates/agent/knowledge/repository-knowledge.md"]
 
 [[question]]
 id = "ho-nav-compaction-boundary"
@@ -275,14 +275,14 @@ id = "ho-parallel"
 split = "held_out"
 kind = "parallel"
 prompt = "stop two processes from running the same session at once"
-files = ["crates/agent/src/session/run_lease.rs", "crates/agent/src/tools/args.rs", "crates/agent/src/knowledge/repository/gate.rs"]
+files = ["crates/agent/src/session/run_lease.rs", "crates/agent/src/tools/args.rs", "crates/agent-knowledge/src/gate.rs"]
 
 [[scenario]]
 id = "ho-repeat"
 split = "held_out"
 kind = "repeat"
 prompt = "avoid sending the same repository documentation card to the model twice after a resume"
-files = ["crates/agent/src/knowledge/repository/gate.rs"]
+files = ["crates/agent-knowledge/src/gate.rs"]
 
 [[scenario]]
 id = "ho-compaction"
