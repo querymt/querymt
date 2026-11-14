@@ -41,7 +41,7 @@ pub struct SessionLoadSnapshot {
     pub accounting: crate::accounting::AccountingSnapshot,
     #[serde(rename = "delegationUpdates")]
     pub delegation_updates:
-        Vec<crate::control::delegation_notifications::DelegationUpdateNotification>,
+        Vec<crate::core_staging::delegation_update::DelegationUpdateNotification>,
     #[serde(
         default,
         rename = "userPrompts",

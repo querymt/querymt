@@ -6,12 +6,14 @@
 
 pub mod dedup;
 pub mod delegation;
+pub mod delegation_update;
 pub mod elicitation;
 pub mod history;
 pub mod meta;
 pub mod prompt_text;
 pub mod protocol;
 pub mod run_lease_path;
+pub mod runtime_status;
 pub mod stream_cursor;
 pub mod verification;
 pub mod worktree;
