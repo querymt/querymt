@@ -284,8 +284,8 @@ pub enum ElicitationOutcome {
 
 impl ElicitationOutcome {
     /// Map a client's response action to an outcome.
-    pub fn from_action(action: &crate::elicitation::ElicitationAction) -> Self {
-        use crate::elicitation::ElicitationAction;
+    pub fn from_action(action: &crate::core_staging::elicitation::ElicitationAction) -> Self {
+        use crate::core_staging::elicitation::ElicitationAction;
         match action {
             ElicitationAction::Accept => Self::Accepted,
             ElicitationAction::Decline => Self::Declined,
