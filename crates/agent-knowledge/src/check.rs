@@ -440,8 +440,8 @@ pub fn dependency_exists(root: &std::path::Path, selector: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::acknowledge::{AcknowledgeRequest, Selection};
-    use crate::knowledge::repository::browse::tests::Fx;
+    use crate::acknowledge::{AcknowledgeRequest, Selection};
+    use crate::browse::tests::Fx;
     use std::fs;
     use std::path::Path;
 

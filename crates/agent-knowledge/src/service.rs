@@ -412,9 +412,9 @@ fn same_content(stored: &StoredSource, hash: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::reconcile::ReconcileStatus;
-    use crate::knowledge::repository::root::{RootRequest, resolve_root};
-    use crate::knowledge::repository::settings::RepositoryKnowledgeSettings;
+    use crate::reconcile::ReconcileStatus;
+    use crate::root::{RootRequest, resolve_root};
+    use crate::settings::RepositoryKnowledgeSettings;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -637,7 +637,7 @@ mod tests {
         assert_eq!(docs, fresh.service.store().export_logical().unwrap().1);
     }
 
-    const CHILD_TEST: &str = "knowledge::repository::service::tests::process_child";
+    const CHILD_TEST: &str = "service::tests::process_child";
 
     /// Body of the child processes spawned by the test below. Does nothing
     /// unless launched with the environment it sets.

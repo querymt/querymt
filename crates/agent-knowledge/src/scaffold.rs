@@ -424,7 +424,7 @@ impl ScaffoldPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::browse::tests::Fx;
+    use crate::browse::tests::Fx;
     use std::fs;
 
     fn fixture() -> Fx {

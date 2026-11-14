@@ -443,7 +443,7 @@ impl RepositoryService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::browse::tests::Fx;
+    use crate::browse::tests::Fx;
     use serde_json::json;
 
     const MANIFEST: &str = "version = 1\n[documents]\ninclude = [\"docs/**/*.md\", \"src/**/AGENTS.md\"]\n[code]\ninclude = [\"src/**/*.rs\"]\n";
@@ -793,7 +793,7 @@ mod tests {
     }
 
     fn acknowledge(fx: &Fx, document: &str) {
-        use crate::knowledge::repository::acknowledge::{AcknowledgeRequest, Selection};
+        use crate::acknowledge::{AcknowledgeRequest, Selection};
         let plan = fx
             .service
             .plan_acknowledge(&AcknowledgeRequest {
@@ -838,9 +838,9 @@ mod tests {
         assert_eq!(draft.document.status.as_deref(), Some("draft"));
         let hits = fx
             .service
-            .query(&crate::knowledge::repository::query::QueryRequest {
+            .query(&crate::query::QueryRequest {
                 question: "Notes draft".into(),
-                lane: crate::knowledge::repository::query::Lane::Documentation,
+                lane: crate::query::Lane::Documentation,
                 path: None,
                 limit: None,
             })
@@ -881,7 +881,7 @@ mod tests {
         assert_eq!(card.evidence, EvidenceState::Changed);
         assert!(card.summary.contains("relies on dep"));
         assert!(
-            crate::knowledge::repository::evidence_caution(card.evidence)
+            crate::evidence_caution(card.evidence)
                 .unwrap()
                 .contains("changed")
         );
@@ -898,7 +898,7 @@ mod tests {
 
     #[test]
     fn purpose_rows_carry_their_own_evidence_state() {
-        use crate::knowledge::repository::acknowledge::{AcknowledgeRequest, Selection};
+        use crate::acknowledge::{AcknowledgeRequest, Selection};
         let fx = fixture();
         // Directory rows cannot be acknowledged, so select the file row only.
         let plan = fx

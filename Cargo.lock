@@ -11977,6 +11977,7 @@ dependencies = [
  "querymt",
  "querymt-agent-core",
  "querymt-agent-index",
+ "querymt-agent-knowledge",
  "querymt-provider-common",
  "querymt-remote",
  "querymt-utils",
@@ -12011,7 +12012,6 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "typeshare",
- "unicode-normalization",
  "ureq 3.5.1",
  "url",
  "uuid 1.29.0",
@@ -12078,6 +12078,29 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-yaml",
  "typeshare",
+]
+
+[[package]]
+name = "querymt-agent-knowledge"
+version = "0.6.0"
+dependencies = [
+ "glob",
+ "hex",
+ "ignore",
+ "libc",
+ "querymt-agent-core",
+ "querymt-agent-index",
+ "rusqlite",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 1.2.1+spec-1.1.0",
+ "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]

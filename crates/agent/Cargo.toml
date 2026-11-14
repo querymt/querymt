@@ -41,6 +41,7 @@ querymt-provider-common = { path = "../provider-common" }
 querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "secret-store"] }
 querymt-agent-core = { path = "../agent-core" }
 querymt-agent-index = { path = "../agent-index" }
+querymt-agent-knowledge = { path = "../agent-knowledge" }
 agent-client-protocol = { version = "2.0", features = ["unstable"] }
 kameo = "0.22"
 rmp-serde = "1.3"
@@ -90,7 +91,6 @@ tokio-util = { version = "0.7", features = ["compat", "rt"] }
 base64.workspace = true
 hex = "0.4"
 sha2 = "0.11"
-unicode-normalization = "0.1"
 infer = "0.22"
 rayon = "1.11"
 

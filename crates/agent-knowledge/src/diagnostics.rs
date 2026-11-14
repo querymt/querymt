@@ -247,7 +247,7 @@ pub fn allocate_recorded(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::settings::RepositoryKnowledgeDeliverySettings;
+    use crate::settings::RepositoryKnowledgeDeliverySettings;
 
     fn native(handler: &str, id: &str) -> HookContextContribution {
         HookContextContribution {

@@ -647,7 +647,7 @@ impl RepositoryService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::browse::tests::Fx;
+    use crate::browse::tests::Fx;
 
     const NOTE: &str = "# Architecture\nThe scheduler dispatches tasks.\n";
 
@@ -952,8 +952,8 @@ mod tests {
             let peer = RepositoryService::open(
                 root,
                 &tmp.path().join("index.sqlite"),
-                crate::knowledge::repository::ReconcileOptions::from(
-                    &crate::knowledge::repository::settings::RepositoryKnowledgeSettings::default(),
+                crate::ReconcileOptions::from(
+                    &crate::settings::RepositoryKnowledgeSettings::default(),
                 ),
                 Default::default(),
             )
@@ -972,7 +972,7 @@ mod tests {
     fn indexing_and_fetching_never_acknowledge_anything() {
         let fx = fixture();
         fx.service.refresh().unwrap();
-        let _ = fx.service.get(&crate::knowledge::repository::GetRequest {
+        let _ = fx.service.get(&crate::GetRequest {
             path: Some("docs/arch.md".into()),
             max_bytes: 4096,
             ..Default::default()

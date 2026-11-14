@@ -38,9 +38,7 @@ use super::reconcile::ReconcileOptions;
 use super::root::{RootRequest, resolve_root};
 use super::service::{RefreshPolicy, RepositoryService};
 use super::store::SCHEMA_VERSION;
-use crate::knowledge::repository::settings::{
-    RepositoryKnowledgeDeliverySettings, RepositoryKnowledgeSettings,
-};
+use crate::settings::{RepositoryKnowledgeDeliverySettings, RepositoryKnowledgeSettings};
 use querymt_agent_core::HookContextContribution;
 use serde::{Deserialize, Serialize};
 use serde_json::json;

@@ -4,6 +4,7 @@ members = [
     "crates/agent",
     "crates/agent-core",
     "crates/agent-index",
+    "crates/agent-knowledge",
     "crates/querymt",
     "crates/querymt-remote",
     "crates/cli",
@@ -26,6 +27,9 @@ members = [
 # mrs). Use `--workspace` or `-p <package>` to select those explicitly.
 default-members = [
     "crates/agent",
+    "crates/agent-core",
+    "crates/agent-index",
+    "crates/agent-knowledge",
     "crates/querymt",
     "crates/querymt-remote",
     "crates/cli",

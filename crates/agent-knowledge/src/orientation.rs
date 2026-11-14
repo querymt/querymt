@@ -366,7 +366,7 @@ impl RepositoryService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::browse::tests::Fx;
+    use crate::browse::tests::Fx;
 
     const ARCH: &str = "# Architecture\n## Scheduling\nThe scheduler dispatches queued tasks to workers using a priority queue.\n## Storage\nRows live in SQLite.\n";
 
@@ -515,7 +515,7 @@ mod tests {
 
     #[test]
     fn evidence_labels_apply_and_missing_evidence_withholds_the_text() {
-        use crate::knowledge::repository::acknowledge::{AcknowledgeRequest, Selection};
+        use crate::acknowledge::{AcknowledgeRequest, Selection};
         let fx = Fx::new();
         fx.put("src/dep.rs", "pub fn dep() {}\n");
         fx.put(

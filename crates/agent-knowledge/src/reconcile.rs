@@ -62,7 +62,7 @@ use super::store::{
     GenerationUpdate, IndexDiagnostic, RepositoryStore, SCHEMA_VERSION, SourceRecord, SourceState,
     SourceTouch, StoreError, StoredSource,
 };
-use crate::knowledge::repository::settings::RepositoryKnowledgeSettings;
+use crate::settings::RepositoryKnowledgeSettings;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -655,8 +655,8 @@ pub(super) fn system_now_ns() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::root::{RootRequest, resolve_root};
-    use crate::knowledge::repository::store::StoredDocument;
+    use crate::root::{RootRequest, resolve_root};
+    use crate::store::StoredDocument;
     use std::fs;
     use std::path::{Path, PathBuf};
 

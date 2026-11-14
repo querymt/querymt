@@ -29,7 +29,7 @@
 
 use super::manifest::KnowledgeManifest;
 use super::root::ResolvedRoot;
-use crate::knowledge::repository::settings::RepositoryKnowledgeSettings;
+use crate::settings::RepositoryKnowledgeSettings;
 use glob::{MatchOptions, Pattern};
 use ignore::WalkBuilder;
 use std::collections::{BTreeMap, HashSet};
@@ -624,7 +624,7 @@ impl PruneIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::root::{RootRequest, resolve_root};
+    use crate::root::{RootRequest, resolve_root};
     use std::fs;
 
     fn write(root: &Path, rel: &str, content: &str) {

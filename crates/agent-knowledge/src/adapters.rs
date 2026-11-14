@@ -447,7 +447,7 @@ pub fn recent_task_contributions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::browse::tests::Fx;
+    use crate::browse::tests::Fx;
     use serde_json::json;
 
     fn fixture() -> Fx {

@@ -560,8 +560,8 @@ fn percent_decode(input: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::repository::document::parse_documents;
-    use crate::knowledge::repository::identity::normalize_documents;
+    use crate::document::parse_documents;
+    use crate::identity::normalize_documents;
     use std::fs;
     use std::path::PathBuf;
 
@@ -1026,9 +1026,9 @@ mod tests {
 
     #[test]
     fn links_never_select_additional_index_inputs() {
-        use crate::knowledge::repository::discovery::{DiscoveryOptions, discover};
-        use crate::knowledge::repository::manifest::KnowledgeManifest;
-        use crate::knowledge::repository::root::{RootRequest, resolve_root};
+        use crate::discovery::{DiscoveryOptions, discover};
+        use crate::manifest::KnowledgeManifest;
+        use crate::root::{RootRequest, resolve_root};
 
         let (tmp, repo) = repo();
         fs::create_dir_all(repo.join(".git")).unwrap();
