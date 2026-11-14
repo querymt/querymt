@@ -539,6 +539,20 @@ export type AgentEventKind =
 	requested_schema: any;
 	source: string;
 }}
+	/**
+	 * How a form question announced by `ElicitationRequested` ended.
+	 * 
+	 * Emitted exactly once per announced question. `selection` carries the
+	 * chosen option labels for built-in questions and skill approvals; it is
+	 * never set for MCP server elicitations, so submitted form content is
+	 * not recorded.
+	 */
+	| { type: "elicitation_resolved", data: {
+	elicitation_id: string;
+	session_id: string;
+	outcome: ElicitationOutcome;
+	selection?: string[];
+}}
 	| { type: "session_forked", data: {
 	parent_session_id: string;
 	child_session_id: string;
@@ -2257,6 +2271,16 @@ export enum Durability {
 	Durable = "durable",
 	/** Live-only; never written to journal, never replayed. */
 	Ephemeral = "ephemeral",
+}
+
+/** How a form question ended. */
+export enum ElicitationOutcome {
+	/** The user answered the form. */
+	Accepted = "accepted",
+	/** The user declined to answer. */
+	Declined = "declined",
+	/** The question ended without an answer (run cancelled, entry dropped). */
+	Cancelled = "cancelled",
 }
 
 /**

@@ -115,7 +115,7 @@ There are 81 distinct upward production items (lower bound). Most of them are re
 
 | From | Items | Notes |
 |---|---|---|
-| `agent/core.rs` | `AgentMode` | 9-line enum. `support-mcp-skills` edits `agent/core.rs`, so move it after that change lands |
+| `agent/core.rs` | `AgentMode` | 9-line enum. `support-mcp-skills` edited `agent/core.rs`; it is merged into this branch (task 2.2), so the move no longer conflicts with it |
 | `agent/session_control.rs` | `SessionControlState`, `SessionModelBinding` (whole file, 58 lines) | depends only on `AgentMode` |
 | `agent/messages.rs` | `SessionRuntimeStatus`, `SessionRuntimePhase`, `RuntimeObservation` | pulls in `DelegationUpdateNotification` |
 | `control/delegation_notifications.rs` | `DelegationStage`, `DelegationActivity`, `DelegationUpdateNotification` | the projector moves to services |
@@ -260,7 +260,7 @@ flowchart TD
   - `harden-agent-types-and-errors` merged, because it rewrites `session/error.rs` (the `SessionError` shape in D4.5), `session/sqlite_storage/*`, `event_sink.rs`, `session_event_stream.rs`, and changes typeshare output (`ScheduleInfo.state`, `PendingInputSummary.delivery`/`state` become enums).
 - **Phase 2 no longer waits for `feat/kb`.** The parts of `feat/kb` outside `knowledge/repository/` (`agent/*`, `config/*`, `tools/context*`, `api/*`) stay where they sit today and are moved by the phase that moves those directories. `harden-agent-types-and-errors` and `feat/kb` both edit 11 files in `agent/`, `api/`, `config/` and `tools/`; whichever merges second resolves those conflicts.
 - **Phase 3 (sqlite)** has no knowledge dependency. `fix/kb_db_migration` touches the `KnowledgeStore` SQLite half, not `knowledge/repository/`, so Phase 1b does not affect it.
-- **`support-mcp-skills`** (20 of 21 tasks done) will land before Phase 6; it edits `agent/core.rs`, so `AgentMode` moves after it. **`support-pi-lens-hooks`** (0 of 16 done) touches `hooks`, which stays in runtime, and should either land before Phase 6 or start after it.
+- **`support-mcp-skills`** (20 of 21 tasks done) is merged into this branch (task 2.2, merge commit `dad3bdb2`), before Phase 6 and before `AgentMode` moves. The `unify-agent-runtime` spec came in with it and is not implemented before the split. **`support-pi-lens-hooks`** (0 of 16 done) touches `hooks`, which stays in runtime, and starts after the split has merged.
 - **Each phase is one PR, or a short series:** in-place removals, then the `git mv` commit, then the glue. CI's path filters, per-package test and lint steps, and the `cargo nextest list` count check are updated in the same PR as the package they cover.
 
 ### D9. CI, tooling and docs
@@ -311,5 +311,5 @@ flowchart TD
 ## Open Questions
 
 - **Exact final size of core** after D3, estimated at 12–14k production lines. It is measured at the end of Phase 2 and does not change the plan.
-- **Whether `support-pi-lens-hooks` lands before Phase 6 or starts after it.** This is a coordination choice either way; it stays in runtime. `support-mcp-skills` is nearly done and lands first.
+- **`support-pi-lens-hooks` timing: decided.** It starts after the split has merged; it stays in runtime. `support-mcp-skills` is already merged into this branch.
 - **Whether the settings types stay in `querymt-agent-knowledge` once other crates need them.** If core code ever needs them, they can move down then. Today only `config` (re-export) and knowledge use them.
