@@ -52,6 +52,7 @@ Verification commands use the querymt-agent CI feature set. `QMT_UI_DIST` must p
 - [x] 3.1 Change the debug log in `SkillCatalog::publish_refresh` (`crates/agent/src/skills/catalog.rs`) to `… {count} local skills available`. No scenario. This is checked manually by re-running qmtcode with `RUST_LOG=querymt_agent::skills=debug` against an MCP skill server and confirming the line says "local skills".
 
   - Code change only; the manual `RUST_LOG=querymt_agent::skills=debug` check against an MCP skill server was not run (needs an interactive qmtcode session).
+  - Manual check done (see 6.6): with `RUST_LOG=querymt_agent::skills=debug` against mcpskills the line reads `Skill registry refreshed for /tmp/qmt-73/r2/ws: 0 local skills available` while the session lists `docs.guide`.
 ## 4. Journal form question outcomes
 
 - [x] 4.1 Add `AgentEventKind::ElicitationResolved { elicitation_id, session_id, outcome, selection }` with kind name `elicitation_resolved`. It is durable through the default arm of `classify_durability`. Extend the events serde round-trip test in `crates/agent/src/events.rs` with the new variant.
@@ -102,10 +103,18 @@ Verification commands use the querymt-agent CI feature set. `QMT_UI_DIST` must p
   - `cargo clippy -p querymt-agent --all-targets --features <CI set> -- -D warnings`: exit 0, no warnings or errors (no pre-existing failures observed on this tree).
 - [x] 6.5 Downstream: `cargo check -p querymt-mobile-ffi` and `cargo check -p querymt-agent-py`, with `PYO3_PYTHON` set to Python ≥ 3.10.
   - `cargo check -p querymt-mobile-ffi`: passed. `PYO3_PYTHON=/opt/homebrew/bin/python3.14 cargo check -p querymt-agent-py`: passed.
-- [ ] 6.6 Manual re-check with the 7.3 fixture (`/tmp/qmt-73`, mcpkit `mcpskills`):
+- [x] 6.6 Manual re-check with the 7.3 fixture (`/tmp/qmt-73`, mcpkit `mcpskills`):
   - choose "Allow for this session" for `docs.guide` and confirm that a second load and a `templates/checklist.md` read do not prompt;
   - confirm `../secrets.env` fails with no prompt;
   - confirm the session journal has an `elicitation_resolved` event after each `elicitation_requested`.
+
+  - Result (live, qmtcode from this branch + mcpskills v0.8.21, `claude-sonnet-5-5` over OAuth, answers sent with qmacp `--elicitation`; fixture `/tmp/qmt-73/r2`):
+    - Prompt shows three options (Allow / Allow for this session / Deny).
+    - "Allow for this session" (session `01a1d5dd-e94c-73c6-a036-796a820a7228`): six loads of `docs.guide` plus a `templates/checklist.md` read produced exactly one `elicitation`. A new session prompted again (`01a1d5de-5a18-7518-ba2b-18b76abb0b1b`).
+    - "Allow" (`01a1d5dd-bcb3-70f3-a8c4-adc6ea6fafc4`) and "Deny" (`01a1d5de-6201-7716-82d5-4d6c2bdcc2ce`) were not remembered (a prompt per load); decline is recorded as `declined`.
+    - `file=../secrets.env` (`01a1d5d7-e441-77fe-8029-9124c2128a81`): `Invalid request: invalid file path ... '.' and '..' segments are not allowed`, zero elicitations, no request to the server.
+    - Journal: every `elicitation_requested` has a matching `elicitation_resolved` after it (`cancelled`, `accepted` with the selected label, `declined`); no ordering violations; payload carries no form content.
+    - Also confirmed: `"docs.*" = "allow"` no prompt; `"*" = "deny"` blocked without prompt; `"*" = "allow"` still prompts; `mcp = false` hides and rejects the skill.
 - [x] 6.7 `openspec validate refine-mcp-skill-approval --strict`
 
   - `openspec validate refine-mcp-skill-approval --strict`: valid.
