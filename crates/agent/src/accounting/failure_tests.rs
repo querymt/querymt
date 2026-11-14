@@ -297,7 +297,10 @@ async fn settlement_arrives_in_a_history_chunk_and_over_the_live_relay() {
         )
         .await
         .unwrap();
-    assert!(relayed.is_none(), "the relayed settlement is a journal no-op");
+    assert!(
+        relayed.is_none(),
+        "the relayed settlement is a journal no-op"
+    );
     // The backfill then fills the older range, including the start, and a
     // repeated chunk over the same range changes nothing.
     assert!(persist(start.clone(), 1).await.is_some());

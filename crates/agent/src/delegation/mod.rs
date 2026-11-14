@@ -1,6 +1,6 @@
 // Delegation orchestration module
 mod core;
-mod model_overrides;
+use crate::core_staging::delegation::model_overrides;
 mod summarizer;
 
 // Re-export public items from core

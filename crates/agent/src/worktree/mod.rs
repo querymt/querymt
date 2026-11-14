@@ -23,7 +23,7 @@
 pub mod allocate;
 pub mod apply;
 pub mod capture;
-pub mod domain;
+pub use crate::core_staging::worktree::domain;
 pub mod error;
 pub mod finalize;
 pub mod gate;
