@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=QueryMT
+Comment=Native desktop control center for QueryMT
+Exec=querymt-gpui %U
+Icon=querymt-gpui
+Terminal=false
+Categories=Development;
+StartupWMClass=querymt-gpui
