@@ -257,6 +257,62 @@ async fn remote_redelivery_does_not_duplicate_the_charge() {
 }
 
 #[tokio::test]
+async fn settlement_arrives_in_a_history_chunk_and_over_the_live_relay() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal = storage.event_journal();
+    let sink = EventSink::new(journal.clone(), Arc::new(EventFanout::new()));
+    let start = AgentEventKind::LlmAttemptStarted {
+        start: sample_start(),
+    };
+    let settled = AgentEventKind::LlmAttemptSettled {
+        settlement: sample_settlement(),
+    };
+    let persist = |kind: AgentEventKind, seq: i64| {
+        let sink = &sink;
+        async move {
+            sink.persist_durable_from_source(
+                SESSION,
+                kind,
+                Some("host".into()),
+                "node-1".into(),
+                seq,
+                None,
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Tail-first history chunk: the settlement lands before its older start.
+    assert!(persist(settled.clone(), 2).await.is_some());
+    // The live relay delivers the same settlement while the backfill runs.
+    let relayed = sink
+        .emit_durable_from_source(
+            SESSION,
+            settled.clone(),
+            Some("host".into()),
+            "node-1".into(),
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(relayed.is_none(), "the relayed settlement is a journal no-op");
+    // The backfill then fills the older range, including the start, and a
+    // repeated chunk over the same range changes nothing.
+    assert!(persist(start.clone(), 1).await.is_some());
+    assert!(persist(start, 1).await.is_none());
+    assert!(persist(settled, 2).await.is_none());
+
+    assert_eq!(ledger(&journal).await.len(), 2);
+    let accounting = SessionAccounting::hydrate(SESSION, journal).await.unwrap();
+    let totals = accounting.read(|r| r.session().clone());
+    assert_eq!(totals.priced_attempts, 1, "charged once");
+    assert!((totals.known_subtotal_usd - cost()).abs() < 1e-12);
+    assert_eq!(totals.unresolved_attempts, 0);
+}
+
+#[tokio::test]
 async fn rewind_after_a_cancelled_attempt_keeps_its_incurred_state() {
     let f = fixture().await;
     let cancel = CancellationToken::new();

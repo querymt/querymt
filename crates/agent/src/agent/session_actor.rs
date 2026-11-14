@@ -4875,6 +4875,80 @@ mod tests {
 
     #[cfg(feature = "remote")]
     #[tokio::test]
+    async fn local_copy_replaced_after_the_owners_undo_keeps_retained_charges_once() {
+        use crate::accounting::SessionAccounting;
+        use crate::accounting::tests::{sample_settlement, sample_start};
+        use crate::events::AgentEventKind;
+
+        let rig = SyncRig::new(0).await;
+        let owner_journal = rig.owner.config.event_sink.journal();
+        let append = |kind: AgentEventKind| {
+            let journal = owner_journal.clone();
+            async move {
+                journal
+                    .append_durable(&NewDurableEvent {
+                        session_id: "test-session".into(),
+                        origin: crate::events::EventOrigin::Local,
+                        source_node: None,
+                        source_node_id: None,
+                        source_seq: None,
+                        session_seq: None,
+                        kind,
+                    })
+                    .await
+                    .unwrap();
+            }
+        };
+        // Two settled attempts the owner keeps (positions 1-4), then turns the
+        // owner later undoes (positions 5-14).
+        for id in ["att-1", "att-2"] {
+            let mut start = sample_start();
+            start.attempt.session_id = "test-session".into();
+            start.attempt.attempt_id = id.into();
+            start.attempt.operation_id = format!("op-{id}");
+            let mut settlement = sample_settlement();
+            settlement.attempt = start.attempt.clone();
+            append(AgentEventKind::LlmAttemptStarted { start }).await;
+            append(AgentEventKind::LlmAttemptSettled { settlement }).await;
+        }
+        rig.owner.append_owner_events(10).await;
+
+        let sync = rig.sync();
+        sync.sync_all(false, None).await.unwrap();
+        let before = SessionAccounting::hydrate("test-session", rig.journal.clone())
+            .await
+            .unwrap()
+            .read(|r| r.session().clone());
+        assert_eq!(before.priced_attempts, 2);
+
+        // The owner undoes everything after its second attempt (bumping the
+        // history epoch) and continues, so the attaching node replaces its copy.
+        owner_journal
+            .delete_session_events_from("test-session", 5)
+            .await
+            .unwrap();
+        rig.owner.append_owner_events(3).await;
+        sync.sync_all(false, None).await.unwrap();
+        assert_eq!(sync.state().epoch(), Some(1), "local copy was replaced");
+
+        let after = SessionAccounting::hydrate("test-session", rig.journal.clone())
+            .await
+            .unwrap()
+            .read(|r| r.session().clone());
+        assert_eq!(after.priced_attempts, 2, "retained charges counted once");
+        assert!((after.known_subtotal_usd - before.known_subtotal_usd).abs() < 1e-12);
+        assert_eq!(after.unresolved_attempts, 0);
+
+        let owner_totals = SessionAccounting::hydrate("test-session", owner_journal.clone())
+            .await
+            .unwrap()
+            .read(|r| r.session().clone());
+        assert_eq!(after.priced_attempts, owner_totals.priced_attempts);
+        assert!((after.known_subtotal_usd - owner_totals.known_subtotal_usd).abs() < 1e-12);
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
     async fn reopen_transfers_only_new_events() {
         let rig = SyncRig::new(100).await;
         let sync = rig.sync();
