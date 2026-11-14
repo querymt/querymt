@@ -1,0 +1,57 @@
+//! Generates the task 5.3 fixture database with the Phase 0 code.
+use querymt::chat::ChatRole;
+use querymt_agent::events::{AgentEventKind, EventOrigin};
+use querymt_agent::model::{AgentMessage, MessagePart};
+use querymt_agent::session::backend::StorageBackend;
+use querymt_agent::session::projection::{EventJournal, NewDurableEvent};
+use querymt_agent::session::sqlite_storage::SqliteStorage;
+use querymt_agent::session::store::SessionStore;
+
+#[tokio::main]
+async fn main() {
+    let path = std::env::args().nth(1).expect("db path");
+    let storage = SqliteStorage::connect(path.into()).await.expect("connect");
+    let session = storage
+        .create_session(Some("fixture".into()), None, None, None)
+        .await
+        .expect("create session");
+    println!("session_id={}", session.public_id);
+    for (i, (role, text)) in [(ChatRole::User, "hello fixture"), (ChatRole::Assistant, "hi there")]
+        .into_iter()
+        .enumerate()
+    {
+        storage
+            .add_message(
+                &session.public_id,
+                AgentMessage {
+                    id: format!("m{i}"),
+                    session_id: session.public_id.clone(),
+                    role,
+                    parts: vec![MessagePart::Text {
+                        content: text.to_string(),
+                    }],
+                    created_at: 1_700_000_000 + i as i64,
+                    parent_message_id: None,
+                    source_provider: None,
+                    source_model: None,
+                },
+            )
+            .await
+            .expect("add message");
+    }
+    let journal = storage.event_journal();
+    for kind in [AgentEventKind::SessionCreated, AgentEventKind::Cancelled] {
+        journal
+            .append_durable(&NewDurableEvent {
+                session_id: session.public_id.clone(),
+                origin: EventOrigin::Local,
+                source_node: None,
+                source_node_id: None,
+                source_seq: None,
+                session_seq: None,
+                kind,
+            })
+            .await
+            .expect("append event");
+    }
+}

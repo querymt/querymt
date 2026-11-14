@@ -90,11 +90,19 @@ jobs:
           cargo check --package querymt-agent-core --features test-support
           tree="$(cargo tree --package querymt-agent-core --edges normal)"
           for forbidden in rmcp querymt-utils rusqlite; do
-            if grep -q "^[^a-z]*${forbidden} " <<<"$tree"; then
+            if [[ "$tree" == *"── ${forbidden} v"* ]]; then
               echo "querymt-agent-core must not depend on ${forbidden}" >&2
               exit 1
             fi
           done
+
+      - name: Check querymt-agent-sqlite standalone
+        run: |
+          cargo check --package querymt-agent-sqlite --no-default-features
+          cargo check --package querymt-agent-sqlite --features test-support
+
+      - name: Run Clippy (querymt-agent-sqlite)
+        run: cargo clippy --package querymt-agent-sqlite --all-targets -- -D warnings
 
       - name: Run Clippy (querymt-agent-index)
         run: cargo clippy --package querymt-agent-index --all-targets -- -D warnings
@@ -144,6 +152,7 @@ jobs:
           cargo llvm-cov nextest \
             --package querymt-agent \
             --package querymt-agent-core \
+            --package querymt-agent-sqlite \
             --package querymt-agent-index \
             --package querymt-agent-knowledge \
             --lib --tests \

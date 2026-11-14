@@ -6022,3 +6022,71 @@ async fn panicked_storage_task_is_reported_as_a_task_failure() {
         "source must be the join error"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Compatibility with databases written before the crate split (task 5.3)
+// ══════════════════════════════════════════════════════════════════════
+
+/// `tests/fixtures/phase0_session.db` was written by the Phase 0 build
+/// (`1c26c972`, before the crate split): one session, two messages and two
+/// durable events. A build after the split must open it and read it back.
+#[tokio::test]
+async fn existing_database_opens_after_crate_split() {
+    use querymt_agent_core::session::backend::StorageBackend;
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/phase0_session.db");
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sessions.db");
+    std::fs::copy(&fixture, &db).expect("copy fixture database");
+
+    let storage = SqliteStorage::connect(db).await.expect("open old database");
+
+    let sessions = storage.list_sessions().await.expect("list sessions");
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    assert_eq!(session.public_id, "01a1dbe6-9276-7568-9390-0e4b4b9e3864");
+    assert_eq!(session.name.as_deref(), Some("fixture"));
+
+    let history = storage
+        .get_history(&session.public_id)
+        .await
+        .expect("read history");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].role, ChatRole::User);
+    assert_eq!(history[1].role, ChatRole::Assistant);
+    assert!(matches!(
+        &history[0].parts[0],
+        MessagePart::Text { content } if content == "hello fixture"
+    ));
+
+    let events = storage
+        .event_journal()
+        .load_session_stream(&session.public_id, None, None)
+        .await
+        .expect("read events");
+    assert_eq!(events.len(), 2);
+    assert!(matches!(events[0].kind, AgentEventKind::SessionCreated));
+    assert!(matches!(events[1].kind, AgentEventKind::Cancelled));
+    assert!(events[0].stream_seq < events[1].stream_seq);
+
+    // The old database is still writable through the new code.
+    storage
+        .event_journal()
+        .append_durable(&NewDurableEvent {
+            session_seq: None,
+            session_id: session.public_id.clone(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            source_node_id: None,
+            source_seq: None,
+            kind: AgentEventKind::Cancelled,
+        })
+        .await
+        .expect("append to old database");
+    let after = storage
+        .event_journal()
+        .load_session_stream(&session.public_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(after.len(), 3);
+}
