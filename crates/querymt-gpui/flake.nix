@@ -50,7 +50,100 @@
             hash = "sha256-j81sUf1m5yXU4FJfGj7GV+hdqVCV8mRmNb0QIsMCjqw=";
           };
         };
+        cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+        };
+
+        # build.rs embeds pinned IBM Plex fonts and downloads them when its cache
+        # is empty. The Nix sandbox has no network, so pre-fetch the same files
+        # (same revision and SHA-256 as build.rs) into the cache layout it reads:
+        # `$QMT_FONT_CACHE/<revision>/<file>`.
+        plexRevision = "383c681f015ed2626e919ec4e3cca16ccc204e9d";
+        plexFonts = [
+          ["Sans" "IBMPlexSans-Regular.ttf" "975dcda37d80f038dcd143c22e33ca2d97a0cc5a929aace1c749153b0fe1afa5"]
+          ["Sans" "IBMPlexSans-Medium.ttf" "331c8639d7598b2cde62a911a71db195e30cb655cd6bdf2e324a7e984955f907"]
+          ["Sans" "IBMPlexSans-SemiBold.ttf" "a20caf8286023a6a7a85e40b1d2a4ae9fc3e3b1f9eda8f4c542dd4986af67bb1"]
+          ["Sans" "IBMPlexSans-Bold.ttf" "9e6c74a889a700d707613d24548fe4ffa6bc59559a0689d2cf9e133bdcdafb2f"]
+          ["Mono" "IBMPlexMono-Regular.ttf" "fe11304a5fe956d5744e9b6a246cc83d90425245e75a62230044966ca96a7f50"]
+        ];
+        fontCache = pkgs.linkFarm "querymt-gpui-font-cache" (map (font: let
+            family = builtins.elemAt font 0;
+            name = builtins.elemAt font 1;
+          in {
+            name = "${plexRevision}/${name}";
+            path = pkgs.fetchurl {
+              url = "https://raw.githubusercontent.com/IBM/plex/${plexRevision}/IBM-Plex-${family}/fonts/complete/ttf/${name}";
+              sha256 = builtins.elemAt font 2;
+            };
+          })
+          plexFonts);
+
+        desktopItem = pkgs.makeDesktopItem {
+          name = "querymt-gpui";
+          desktopName = "QueryMT";
+          comment = "Native desktop control center for QueryMT";
+          exec = "querymt-gpui %U";
+          icon = "querymt-gpui";
+          categories = ["Development"];
+          # Matches the window's `app_id` so the shell groups it with this entry.
+          startupWMClass = "querymt-gpui";
+        };
+
+        querymt-gpui = rustPlatform.buildRustPackage {
+          pname = "querymt-gpui";
+          version = cargoToml.package.version;
+          src = lib.cleanSource ./.;
+
+          cargoLock.lockFile = ./Cargo.lock;
+
+          nativeBuildInputs = with pkgs; [pkg-config makeWrapper copyDesktopItems];
+          buildInputs = runtimeLibs ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.alsa-lib pkgs.zstd];
+
+          desktopItems = [desktopItem];
+
+          preBuild = ''
+            # build.rs writes into its cache directory, so give it a writable copy.
+            export QMT_FONT_CACHE="$TMPDIR/qmt-fonts"
+            cp -rL ${fontCache} "$QMT_FONT_CACHE"
+            chmod -R u+w "$QMT_FONT_CACHE"
+            export CARGO_NET_OFFLINE=true
+          '';
+
+          doCheck = false;
+
+          postInstall = ''
+            install -Dm644 assets/brand/querymt-stencil.svg \
+              $out/share/icons/hicolor/scalable/apps/querymt-gpui.svg
+          '';
+
+          # GPUI dlopens Vulkan, Wayland/X11 and xkbcommon at runtime.
+          postFixup = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+            wrapProgram $out/bin/querymt-gpui \
+              --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath runtimeLibs}"
+          '';
+
+          meta = {
+            description = "QueryMT GPUI desktop client";
+            homepage = "https://github.com/querymt/querymt-gpui";
+            license = lib.licenses.mit;
+            mainProgram = "querymt-gpui";
+            platforms = lib.platforms.linux ++ lib.platforms.darwin;
+          };
+        };
       in {
+        packages = {
+          default = querymt-gpui;
+          querymt-gpui = querymt-gpui;
+        };
+
+        apps.default = {
+          type = "app";
+          program = "${querymt-gpui}/bin/querymt-gpui";
+        };
+
         devShells.default = pkgs.mkShell {
           packages =
             [
