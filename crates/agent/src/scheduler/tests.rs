@@ -5,7 +5,8 @@
 use crate::session::domain_schedule::{
     EventTriggerFilter, Schedule, ScheduleConfig, ScheduleState, ScheduleTrigger,
 };
-use crate::session::repo_schedule::{ScheduleRepository, SqliteScheduleRepository};
+use crate::session::repo_schedule::SqliteScheduleRepository;
+use crate::session::repository::ScheduleRepository;
 use crate::session::schema;
 use parking_lot::Mutex;
 use rusqlite::Connection;

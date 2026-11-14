@@ -39,7 +39,7 @@ pub mod repo_decision;
 pub mod repo_delegation;
 pub mod repo_intent;
 pub mod repo_progress;
-pub mod repo_schedule;
+pub use crate::sqlite_staging::repo_schedule;
 pub mod repo_session;
 pub mod repo_task;
 
@@ -58,7 +58,7 @@ pub use domain_schedule::{
     EventTriggerFilter, Schedule, ScheduleConfig, ScheduleExecutionLimits, ScheduleState,
     ScheduleTrigger,
 };
-pub use repo_schedule::ScheduleRepository;
+pub use repository::ScheduleRepository;
 
 // Projection stores
 pub mod history_window;

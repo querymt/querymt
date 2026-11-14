@@ -9,6 +9,8 @@ pub mod config;
 pub mod dedup;
 pub mod delegation;
 pub mod delegation_update;
+pub mod dotagents_automation;
+pub mod dotagents_tasks;
 pub mod elicitation;
 pub mod history;
 pub mod knowledge;

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use crate::session::domain::{Task, TaskKind, TaskStatus};
 use crate::session::domain_schedule::{Schedule, ScheduleState, ScheduleTrigger};
 use crate::session::error::{SessionError, SessionResult};
-use crate::session::repo_schedule::ScheduleRepository;
+use crate::session::repository::ScheduleRepository;
 use crate::session::store::SessionStore;
 
 use super::tasks::{

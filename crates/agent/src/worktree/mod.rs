@@ -42,12 +42,13 @@ pub mod prepare;
 pub mod protect;
 pub mod recover;
 pub mod repo_ops;
-pub mod repo_workspace;
+pub use crate::sqlite_staging::repo_workspace;
 pub mod service;
 pub mod session_options;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use crate::core_staging::worktree::repository::WorkspaceRepository;
 pub use allocate::{BaselineSource, RecoveredWorkspace, WorkspaceAllocator, checkout_path_for};
 pub use capture::{
     CaptureRetryPolicy, CapturedState, capture_working_state, capture_working_state_validated,
@@ -88,7 +89,7 @@ pub use repo_ops::{
     CapturedWorkingState, CheckoutStatus, FailurePoint, FaultInjectingRepoOps, GixRepoOps,
     RegisteredWorktree, RepositoryOps, validate_ref_name,
 };
-pub use repo_workspace::{SqliteWorkspaceRepository, WorkspaceRepository};
+pub use repo_workspace::SqliteWorkspaceRepository;
 pub use service::{WorkspaceBinding, WorkspaceService};
 pub use session_options::{
     SESSION_WORKSPACE_META_KEY, SessionCreationOptions, apply_default_baseline,

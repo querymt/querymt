@@ -226,14 +226,7 @@ pub mod source_of {
     }
 }
 
-/// Normalize a raw protocol entry ID into its stable comparison key.
-///
-/// IDs are trimmed and lowercased so `Review` and `review` collide
-/// deterministically instead of producing two entries on case-sensitive
-/// filesystems and one on case-insensitive filesystems.
-pub fn normalize_id(raw: &str) -> String {
-    raw.trim().to_ascii_lowercase()
-}
+pub use crate::core_staging::dotagents_tasks::normalize_id;
 
 #[cfg(test)]
 mod tests {

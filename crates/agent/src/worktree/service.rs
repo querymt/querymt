@@ -12,6 +12,7 @@
 //!   never silently falls back to the original checkout.
 
 use crate::session::error::SessionResult;
+use crate::worktree::WorkspaceRepository;
 use crate::worktree::allocate::{AllocationRequest, WorkspaceAllocator};
 use crate::worktree::capture::{CaptureRetryPolicy, capture_working_state_validated};
 use crate::worktree::domain::{
@@ -23,7 +24,6 @@ use crate::worktree::gate::CheckoutMutationGate;
 use crate::worktree::identity::resolve_repository;
 use crate::worktree::lifecycle::WorkspaceManager;
 use crate::worktree::repo_ops::RepositoryOps;
-use crate::worktree::repo_workspace::WorkspaceRepository;
 use crate::worktree::session_options::SessionCreationOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

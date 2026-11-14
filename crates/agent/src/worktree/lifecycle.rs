@@ -19,13 +19,13 @@
 //! all removal decisions are re-validated from durable state inside that
 //! lock, so concurrent processes cannot interleave or double-remove.
 
+use crate::worktree::WorkspaceRepository;
 use crate::worktree::allocate::worktree_registered;
 use crate::worktree::domain::{
     ManagedBranch, WorkspaceId, WorkspaceLifecycle, WorkspaceRecord, baseline_ref_for,
 };
 use crate::worktree::error::{PathSample, WorktreeError, WorktreeResult};
 use crate::worktree::repo_ops::{RepositoryOps, validate_ref_name};
-use crate::worktree::repo_workspace::WorkspaceRepository;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

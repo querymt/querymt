@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use crate::worktree::repo_workspace::WorkspaceRepository;
+use crate::worktree::WorkspaceRepository;
 
 /// Initialize a non-bare repository with a commit identity in its config
 /// (mirroring the snapshot backend's config handling).

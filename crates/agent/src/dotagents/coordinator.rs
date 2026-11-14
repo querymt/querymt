@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::knowledge::KnowledgeStore;
-use crate::session::repo_schedule::ScheduleRepository;
+use crate::session::repository::ScheduleRepository;
 use crate::session::store::SessionStore;
 
 use super::automation::{DotagentsAutomationIdentity, DotagentsAutomationRepository};

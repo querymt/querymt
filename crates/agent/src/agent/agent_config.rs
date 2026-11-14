@@ -114,7 +114,7 @@ pub struct AgentConfig {
 
     // ── Scheduling & Knowledge (optional) ─────────────────────────
     /// Schedule repository for the scheduler actor.
-    pub schedule_repository: Option<Arc<dyn crate::session::repo_schedule::ScheduleRepository>>,
+    pub schedule_repository: Option<Arc<dyn crate::session::repository::ScheduleRepository>>,
     /// Knowledge store for the knowledge tools.
     pub knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
     /// Per-session todo lists for the `todowrite` / `todoread` tools.

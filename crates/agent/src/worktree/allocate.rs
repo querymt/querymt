@@ -17,6 +17,7 @@
 //! - a subdirectory session whose directory is absent from the selected
 //!   baseline fails explicitly and never attaches to the checkout root.
 
+use crate::worktree::WorkspaceRepository;
 use crate::worktree::domain::{
     Baseline, BaselineMode, ExecutionMode, ManagedBranch, ProvisioningPhase, WorkspaceId,
     WorkspaceLifecycle, WorkspaceOwnership, WorkspaceRecord, baseline_ref_for,
@@ -25,7 +26,6 @@ use crate::worktree::error::{WorktreeError, WorktreeResult};
 use crate::worktree::gate::CheckoutMutationGate;
 use crate::worktree::identity::{ResolvedRepository, ensure_relative_cwd_exists};
 use crate::worktree::repo_ops::{RepositoryOps, validate_ref_name};
-use crate::worktree::repo_workspace::WorkspaceRepository;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

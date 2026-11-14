@@ -70,7 +70,7 @@ pub struct AgentConfigBuilder {
     pending_elicitations: crate::elicitation::PendingElicitationMap,
     mcp_servers: Vec<McpServerConfig>,
     session_mcp_attachment_source: Arc<dyn SessionMcpAttachmentSource>,
-    schedule_repository: Option<Arc<dyn crate::session::repo_schedule::ScheduleRepository>>,
+    schedule_repository: Option<Arc<dyn crate::session::repository::ScheduleRepository>>,
     knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
     slash_command_registry: crate::slash_commands::SlashCommandRegistry,
     slash_commands_config: Option<crate::config::SlashCommandsConfig>,
@@ -484,7 +484,7 @@ impl AgentConfigBuilder {
     /// Set the schedule repository (from storage backend).
     pub fn with_schedule_repository(
         mut self,
-        repo: Arc<dyn crate::session::repo_schedule::ScheduleRepository>,
+        repo: Arc<dyn crate::session::repository::ScheduleRepository>,
     ) -> Self {
         self.schedule_repository = Some(repo);
         self

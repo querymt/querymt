@@ -2827,7 +2827,7 @@ async fn provisioning_intent_migration_upgrades_existing_database() {
     }
 
     // The pre-migration row survives with NULL replay inputs.
-    use crate::worktree::repo_workspace::WorkspaceRepository as _;
+    use crate::worktree::WorkspaceRepository as _;
     let store = crate::worktree::SqliteWorkspaceRepository::new(std::sync::Arc::new(
         parking_lot::Mutex::new(conn),
     ));

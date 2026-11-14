@@ -20,7 +20,7 @@ use crate::agent::session_registry::SessionRegistry;
 use crate::events::{AgentEventKind, EventEnvelope};
 use crate::session::domain_schedule::{Schedule, ScheduleState, ScheduleTrigger};
 use crate::session::error::SessionResult;
-use crate::session::repo_schedule::ScheduleRepository;
+use crate::session::repository::ScheduleRepository;
 use crate::session::store::SessionStore;
 use kameo::Actor;
 use kameo::actor::{ActorRef, Spawn};
@@ -1917,7 +1917,7 @@ mod unit_tests {
         schema::init_schema(&mut conn).unwrap();
         let db = std::sync::Arc::new(parking_lot::Mutex::new(conn));
         let schedule_store = Arc::new(SqliteScheduleRepository::new(db))
-            as Arc<dyn crate::session::repo_schedule::ScheduleRepository>;
+            as Arc<dyn crate::session::repository::ScheduleRepository>;
 
         let mut store = MockSessionStore::new();
         store
