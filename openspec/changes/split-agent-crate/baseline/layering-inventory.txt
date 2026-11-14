@@ -1,0 +1,115 @@
+files per layer (crates/agent/src):
+  core         16
+  index         0
+  knowledge     0
+  sqlite       20
+  services    105
+  runtime     258
+  top          21
+production upward references (distinct items per layer pair):
+  pair                    items  sites allowance
+  core->index                 1      1         1
+  core->sqlite                6      7         6
+  core->services              8      9         8
+  core->runtime              19     22        19
+  sqlite->services            5      7         5
+  sqlite->runtime             3      3         3
+  services->sqlite            1      3         1
+  services->runtime          21     33        21
+  runtime->sqlite             2      8         2
+  runtime->top                8      8         8
+  total: 74 (item, layer pair) entries, 65 distinct items
+
+core->index
+  <alias>::index::merkle  <- model.rs:3
+
+core->sqlite
+  knowledge/sqlite.rs::SqliteKnowledgeStore  <- session/backend.rs:158
+  session/repo_schedule.rs::ScheduleRepository  <- session/backend.rs:11
+  session/repo_schedule.rs::SqliteScheduleRepository  <- session/backend.rs:138
+  session/sqlite_storage/mod.rs::SqliteStorage  <- session/backend.rs:12
+  worktree/repo_workspace.rs::SqliteWorkspaceRepository  <- session/backend.rs:163
+  worktree/repo_workspace.rs::WorkspaceRepository  <- session/backend.rs:106, session/backend.rs:162
+
+core->services
+  accounting.rs::AttemptSettlement  <- events.rs:992
+  accounting.rs::AttemptStart  <- events.rs:988
+  accounting.rs::RequestAccounting  <- events.rs:510
+  control/delegation_notifications.rs::DelegationStage  <- events.rs:285
+  export/atif.rs::ATIF  <- session/projection.rs:648
+  export/atif.rs::AtifExportOptions  <- session/projection.rs:647
+  snapshot/backend.rs::SnapshotId  <- model.rs:4, session/domain.rs:337
+  verification/mod.rs::VerificationSpec  <- session/domain.rs:235
+
+core->runtime
+  acp/protocol.rs::ContentBlock  <- events.rs:1, model.rs:1
+  acp/protocol.rs::EmbeddedResourceResource  <- model.rs:1
+  acp/protocol.rs::RequestPermissionRequest  <- events.rs:764
+  acp/protocol.rs::StopReason  <- events.rs:1
+  agent/core.rs::AgentMode  <- events.rs:825, events.rs:832
+  agent/messages.rs::SessionRuntimeStatus  <- events.rs:281
+  agent/session_control.rs::SessionControlState  <- session/store.rs:3
+  agent/utils.rs::truncate_to_bytes  <- model.rs:2
+  config/execution.rs::CompactionConfig  <- session/store.rs:4
+  config/execution.rs::PruningConfig  <- session/store.rs:4
+  config/execution.rs::RateLimitConfig  <- session/store.rs:4
+  config/execution.rs::ToolOutputConfig  <- session/store.rs:4
+  config/mcp.rs::McpServerConfig  <- events.rs:8
+  dotagents/automation.rs::DotagentsAutomationRepository  <- session/backend.rs:94, session/backend.rs:150
+  dotagents/automation.rs::SqliteDotagentsAutomationRepository  <- session/backend.rs:152
+  dotagents/tasks.rs::DotagentsTaskStateRepository  <- session/backend.rs:7
+  dotagents/tasks.rs::SqliteDotagentsTaskStateRepository  <- session/backend.rs:144
+  middleware/dedup_check.rs::DuplicateWarning  <- events.rs:813
+  session/compaction.rs::filter_to_effective_history  <- session/store.rs:477
+
+sqlite->services
+  export/atif.rs::ATIF  <- session/sqlite_storage/view_store.rs:1664
+  export/atif.rs::ATIFBuilder  <- session/sqlite_storage/view_store.rs:1665
+  export/atif.rs::AtifExportOptions  <- session/sqlite_storage/view_store.rs:1663
+  session/run_lease.rs::run_lease_root_for_db  <- session/sqlite_storage/mod.rs:134
+  snapshot/backend.rs::SnapshotId  <- session/sqlite_storage/session_store.rs:2288, session/sqlite_storage/session_store.rs:2356, session/sqlite_storage/session_store.rs:2407
+
+sqlite->runtime
+  agent/core.rs::AgentMode  <- session/sqlite_storage/session_store.rs:9
+  agent/session_control.rs::SessionControlState  <- session/sqlite_storage/session_store.rs:10
+  agent/session_control.rs::SessionModelBinding  <- session/sqlite_storage/session_store.rs:10
+
+services->sqlite
+  worktree/repo_workspace.rs::WorkspaceRepository  <- worktree/allocate.rs:28, worktree/lifecycle.rs:28, worktree/service.rs:26
+
+services->runtime
+  acp/client_bridge.rs::ClientBridgeSender  <- tools/context.rs:134, tools/context_impl.rs:79, tools/context_impl.rs:162 (+1)
+  acp/protocol.rs::ContentBlock  <- session/history_window.rs:10
+  acp/shared.rs::QUERYMT_META_NAMESPACE  <- session/history_window.rs:79, worktree/session_options.rs:201, worktree/session_options.rs:291
+  agent/utils.rs::genai::shell_executable  <- tools/builtins/shell.rs:183
+  agent/utils.rs::genai::shell_exit_code  <- tools/builtins/shell.rs:201
+  agent/utils.rs::render_prompt_for_display  <- tools/builtins/session_history.rs:11
+  agent/utils.rs::truncate_to_bytes  <- tools/builtins/session_history.rs:11
+  config/execution.rs::OverflowStorage  <- tools/builtins/helpers.rs:2
+  config/execution.rs::SnapshotBackendConfig  <- snapshot/backend.rs:149, snapshot/backend.rs:150
+  config/permissions.rs::ApprovalNeed  <- tools/builtins/accept_delegation_result.rs:137, tools/builtins/accept_delegation_result.rs:141, tools/context.rs:441 (+1)
+  config/workspace.rs::WorkspaceSettings  <- worktree/service.rs:143
+  delegation/core.rs::AgentRegistry  <- tools/context.rs:104, tools/context_impl.rs:76, tools/context_impl.rs:95 (+1)
+  elicitation.rs::ElicitationAction  <- tools/context_impl.rs:11
+  elicitation.rs::ElicitationResponse  <- tools/context_impl.rs:11
+  session/load_snapshot.rs::StreamCursor  <- session/history_window.rs:17
+  session/load_snapshot.rs::observe_cursor  <- session/history_window.rs:17
+  session/provider.rs::BillingBasis  <- accounting/dispatch.rs:24
+  session/provider.rs::SessionProvider  <- accounting/dispatch.rs:41
+  tools/builtins/delegate.rs::DelegateTool  <- tools/builtins/mod.rs:45
+  tools/builtins/route_delegation_to_peer.rs::RouteDelegationToPeerTool  <- tools/builtins/mod.rs:39
+  tools/builtins/use_remote_provider.rs::UseRemoteProviderTool  <- tools/builtins/mod.rs:40
+
+runtime->sqlite
+  session/repo_schedule.rs::ScheduleRepository  <- agent/agent_config.rs:117, agent/agent_config_builder.rs:73, agent/agent_config_builder.rs:487 (+3)
+  session/sqlite_storage/blocking.rs::with_conn_sqlite  <- dotagents/automation.rs:146, dotagents/tasks.rs:188
+
+runtime->top
+  acp/websocket.rs::serve_websocket  <- acp/mod.rs:22
+  api/mesh/runtime.rs::start_shared_runtime  <- api/mesh/types.rs:19
+  api/profiles.rs::ProfileRuntimeHandle  <- elicitation.rs:273
+  api/session.rs::AgentSession  <- api/sessions.rs:1
+  profiles.rs::ProfileCatalog  <- agent/handle/mod.rs:62
+  profiles.rs::ProfileMetadata  <- agent/session_registry.rs:20
+  profiles.rs::ProfileRuntimeManager  <- agent/handle/mod.rs:62
+  profiles.rs::SessionProfileBinding  <- agent/handle/session_control.rs:58
