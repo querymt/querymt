@@ -3,11 +3,11 @@
   "pairs": {
     "core->sqlite": 6,
     "core->services": 6,
-    "core->runtime": 11,
+    "core->runtime": 6,
     "sqlite->services": 4,
     "sqlite->runtime": 3,
     "services->sqlite": 1,
-    "services->runtime": 13,
+    "services->runtime": 10,
     "runtime->sqlite": 2,
     "runtime->top": 8
   },

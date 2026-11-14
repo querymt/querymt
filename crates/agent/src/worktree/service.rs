@@ -153,8 +153,7 @@ impl WorkspaceService {
                     .to_string(),
             )
         })?;
-        let root = settings
-            .resolved_storage_root()
+        let root = crate::config::resolved_storage_root(settings)
             .map_err(|err| WorktreeError::InvalidOperation(format!("{err:#}")))?;
         crate::worktree::placement::ensure_local_filesystem_execution(&root)?;
         std::fs::create_dir_all(&root).map_err(|err| {

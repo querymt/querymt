@@ -1,4 +1,6 @@
-use super::*;
+use super::default_true;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // Compaction Configuration (3-Layer System)

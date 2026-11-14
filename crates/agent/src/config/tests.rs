@@ -1,4 +1,5 @@
 use super::*;
+use crate::acp::protocol::{McpServer, McpServerHttp};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

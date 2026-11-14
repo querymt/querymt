@@ -2,7 +2,6 @@
 //!
 //! Supports both single-agent and multi-agent (quorum) configurations from TOML files.
 
-use crate::acp::protocol::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerStdio};
 use anyhow::{Context, Result, anyhow};
 use regex::{Captures, Regex};
 use schemars::JsonSchema;
@@ -11,11 +10,9 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-mod execution;
 mod extensions;
 mod hooks;
 mod loader;
-mod mcp;
 mod mesh;
 mod permissions;
 mod prompt;
@@ -25,17 +22,18 @@ mod single;
 mod tools;
 mod workspace;
 
+pub use crate::core_staging::config::execution::*;
+pub use crate::core_staging::config::mcp::*;
+pub use crate::core_staging::config::workspace::WorkspaceSettings;
 pub use crate::knowledge::repository::settings::{
     REPOSITORY_KNOWLEDGE_MAX_DELIVERY_BYTES, REPOSITORY_KNOWLEDGE_MAX_DELIVERY_CARDS,
     REPOSITORY_KNOWLEDGE_MAX_DELIVERY_TOKENS, REPOSITORY_KNOWLEDGE_MAX_RESPONSE_BYTES,
     REPOSITORY_KNOWLEDGE_MAX_RESULT_LIMIT, REPOSITORY_KNOWLEDGE_MIN_RESPONSE_BYTES,
     RepositoryKnowledgeDeliverySettings, RepositoryKnowledgeSettings,
 };
-pub use execution::*;
 pub use extensions::*;
 pub use hooks::*;
 pub use loader::{ConfigSource, interpolate_env_vars, load_config};
-pub use mcp::*;
 pub use mesh::*;
 pub use permissions::*;
 pub use prompt::SystemPart;
@@ -44,7 +42,7 @@ pub use quorum::*;
 pub use schema::{schema_for_system_parts, schema_for_value};
 pub use single::*;
 pub use tools::*;
-pub use workspace::WorkspaceSettings;
+pub use workspace::resolved_storage_root;
 
 /// Top-level config discriminator
 #[derive(Debug)]

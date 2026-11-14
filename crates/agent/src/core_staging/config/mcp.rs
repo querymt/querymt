@@ -1,4 +1,13 @@
-use super::*;
+use super::default_true;
+use crate::core_staging::protocol::{
+    EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerStdio,
+};
+use anyhow::{Context, Result, anyhow};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// MCP (Model Context Protocol) server configuration.
 ///
