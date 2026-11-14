@@ -214,7 +214,7 @@ Section 18 validation notes (this session; no historical claims reused):
 - [x] 20.3 Refuse worktree creation for sparse sources (config or pattern file) and roll back sparse children; regressions `add_worktree_refuses_sparse_source_via_config`, `add_worktree_refuses_sparse_source_via_pattern_file`, `add_worktree_succeeds_for_non_sparse_source`.
 - [x] 20.4 Refuse creation that would upgrade the shared format via `worktree.useRelativePaths`; regression `add_worktree_refuses_relative_paths_format_upgrade`.
 - [x] 20.5 Update docs and artifacts for 0.90 and record the sparse regression.
-- [ ] 20.6 Follow-up (not in this change): lock managed worktrees (`set_lock`, unlock -> `Force::Never` -> relock, prune/recovery handling) and two-phase `prepare_add_worktree`.
+- [x] 20.6 Deferred to the `lock-managed-worktrees` change (not done here): lock managed worktrees (`set_lock`, unlock -> `Force::Never` -> relock, prune/recovery handling), two-phase `prepare_add_worktree`, and sparse-checkout support.
 
 ## 21. Configuration, simple API, and Python exposure (design decision 8)
 

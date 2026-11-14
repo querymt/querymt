@@ -147,6 +147,22 @@
 
 ### Added
 
+- **Git worktree isolation** (opt-in via `[agent.workspace]` /
+  `[quorum.workspace]`, `AgentBuilder`/`QuorumBuilder` and Python keyword
+  arguments). Sessions can be started in their own linked worktree and managed
+  branch (ACP `session/new` metadata, native `/worktree create`, simple API,
+  Python `agent.worktrees`), and delegates can run isolated through the
+  per-delegate `isolation` setting (`inherit` | `isolated` | `shared`). Isolated
+  delegates start from a private baseline that includes the parent's uncommitted
+  edits, results are reviewed baseline-relative, and
+  `accept_delegation_result` integrates a reviewed delta as one commit on
+  explicit request. Existing undo/redo works inside each workspace. Sessions
+  without an explicit isolation request keep running locally. Also adds
+  `querymt/worktree/*` ACP extensions, handoff to a fresh owner, archive from
+  any session, and recovery, with stable error codes on every surface. See
+  `docs/docs/agent/worktrees.md`. Typeshare/ACP additions need a querymt-desktop
+  follow-up (not done here). `gix` is upgraded to 0.90; isolation creation is
+  refused for sparse sources until sparse-checkout support lands.
 - **`accept_delegation_result` asks by default** before it integrates a
   delegate's result into the checkout, offering Allow once, Allow for this
   session and Reject. List it in `permissions.always_ask` to ask on every call.
