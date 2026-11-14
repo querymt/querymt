@@ -49,7 +49,11 @@ pub(super) fn fit_scale(natural: (f32, f32), stage: (f32, f32)) -> Option<f32> {
 }
 
 pub(super) fn step_zoom(zoom: f32, up: bool) -> f32 {
-    let next = if up { zoom + ZOOM_STEP } else { zoom - ZOOM_STEP };
+    let next = if up {
+        zoom + ZOOM_STEP
+    } else {
+        zoom - ZOOM_STEP
+    };
     ((next * 100.).round() / 100.).clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
@@ -57,44 +61,97 @@ pub(super) fn step_zoom(zoom: f32, up: bool) -> f32 {
 pub(super) fn user_attachment_image(a: &UserAttachment) -> Option<Arc<Image>> {
     let data = a.data.as_deref().filter(|_| a.is_image())?;
     let format = ImageFormat::from_mime_type(&a.mime)?;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
     Some(Arc::new(Image::from_bytes(format, bytes)))
 }
 
 impl QmtApp {
-    pub(super) fn open_preview(&mut self, images: Vec<PreviewImage>, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_preview(
+        &mut self,
+        images: Vec<PreviewImage>,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if images.is_empty() {
             return;
         }
         let index = index.min(images.len() - 1);
-        self.preview = Some(Preview { images, index, zoom: 1., wheel: 0., scroll: ScrollHandle::new() });
+        self.preview = Some(Preview {
+            images,
+            index,
+            zoom: 1.,
+            wheel: 0.,
+            scroll: ScrollHandle::new(),
+        });
         // Keys (arrows, Escape) go to the lightbox while it is open.
         self.preview_focus.focus(window, cx);
         cx.notify();
     }
 
     /// Open the composer's image attachment `id`, with the composer's images as the gallery.
-    fn open_composer_image(&mut self, session: bool, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let list = if session { &self.session_attachments } else { &self.attachments };
-        let images: Vec<_> = list.iter().filter_map(|a| Some((a.id.clone(), PreviewImage { name: a.name.clone(), image: a.image.clone()? }))).collect();
+    fn open_composer_image(
+        &mut self,
+        session: bool,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let list = if session {
+            &self.session_attachments
+        } else {
+            &self.attachments
+        };
+        let images: Vec<_> = list
+            .iter()
+            .filter_map(|a| {
+                Some((
+                    a.id.clone(),
+                    PreviewImage {
+                        name: a.name.clone(),
+                        image: a.image.clone()?,
+                    },
+                ))
+            })
+            .collect();
         let index = images.iter().position(|(aid, _)| aid == id).unwrap_or(0);
-        self.open_preview(images.into_iter().map(|(_, i)| i).collect(), index, window, cx);
+        self.open_preview(
+            images.into_iter().map(|(_, i)| i).collect(),
+            index,
+            window,
+            cx,
+        );
     }
 
     /// Open attachment `ix` of transcript item `key`; every inline image of
     /// the session's user messages is the gallery, like the desktop.
-    pub(super) fn open_chat_image(&mut self, key: &str, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_chat_image(
+        &mut self,
+        key: &str,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut images = Vec::new();
         let mut start = 0;
         if let Some(view) = self.store.read(cx).session.as_ref() {
             for item in &view.items {
-                let ItemKind::User { attachments, .. } = &item.kind else { continue };
+                let ItemKind::User { attachments, .. } = &item.kind else {
+                    continue;
+                };
                 for (i, a) in attachments.iter().enumerate() {
-                    let Some(image) = user_attachment_image(a) else { continue };
+                    let Some(image) = user_attachment_image(a) else {
+                        continue;
+                    };
                     if item.key == key && i == ix {
                         start = images.len();
                     }
-                    images.push(PreviewImage { name: a.name.clone(), image });
+                    images.push(PreviewImage {
+                        name: a.name.clone(),
+                        image,
+                    });
                 }
             }
         }
@@ -102,7 +159,9 @@ impl QmtApp {
     }
 
     fn preview_step(&mut self, offset: isize, cx: &mut Context<Self>) {
-        let Some(pv) = self.preview.as_mut() else { return };
+        let Some(pv) = self.preview.as_mut() else {
+            return;
+        };
         let n = pv.images.len() as isize;
         if n < 2 {
             return;
@@ -115,7 +174,9 @@ impl QmtApp {
     }
 
     fn preview_wheel(&mut self, dy: f32, cx: &mut Context<Self>) {
-        let Some(pv) = self.preview.as_mut() else { return };
+        let Some(pv) = self.preview.as_mut() else {
+            return;
+        };
         if dy == 0. {
             return;
         }
@@ -140,43 +201,88 @@ impl QmtApp {
     }
 
     /// Composer attachment strip: image thumbnails (click to preview) and file chips.
-    pub(super) fn attachment_strip(&self, session: bool, p: &Palette, cx: &mut Context<Self>) -> Option<Div> {
-        let list = if session { &self.session_attachments } else { &self.attachments };
+    pub(super) fn attachment_strip(
+        &self,
+        session: bool,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let list = if session {
+            &self.session_attachments
+        } else {
+            &self.attachments
+        };
         (!list.is_empty()).then(|| {
-            h_flex().flex_wrap().items_end().gap_1p5().px_1().children(list.iter().map(|a| {
-                let remove = {
-                    let id = a.id.clone();
-                    cx.listener(move |this: &mut Self, _: &ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        let list = if session { &mut this.session_attachments } else { &mut this.attachments };
-                        list.retain(|a| a.id != id);
-                        cx.notify();
-                    })
-                };
-                let tip = format!("{} · {}", a.name, human_size(a.size));
-                match a.image.clone() {
-                    Some(image) => composer_thumb(a, image, session, tip, remove, p, cx).into_any_element(),
-                    None => h_flex()
-                        .id(kit::keyed("att-file", a.id.clone()))
-                        .gap_1p5()
-                        .pl_2()
-                        .pr_1()
-                        .py_0p5()
-                        .rounded(px(8.))
-                        .bg(p.card)
-                        .text_xs()
-                        .child(kit::icon(if a.is_image() { IconName::Image } else { IconName::FileText }, 13., p.muted))
-                        .child(div().max_w(px(200.)).truncate().font_medium().child(a.name.clone()))
-                        .child(div().text_color(p.dim).child(human_size(a.size)))
-                        .child(remove_button(kit::keyed("rm-attach-file", a.id.clone()), 18., p.muted, remove, p))
-                        .into_any_element(),
-                }
-            }))
+            h_flex()
+                .flex_wrap()
+                .items_end()
+                .gap_1p5()
+                .px_1()
+                .children(list.iter().map(|a| {
+                    let remove = {
+                        let id = a.id.clone();
+                        cx.listener(move |this: &mut Self, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            let list = if session {
+                                &mut this.session_attachments
+                            } else {
+                                &mut this.attachments
+                            };
+                            list.retain(|a| a.id != id);
+                            cx.notify();
+                        })
+                    };
+                    let tip = format!("{} · {}", a.name, human_size(a.size));
+                    match a.image.clone() {
+                        Some(image) => {
+                            composer_thumb(a, image, session, tip, remove, p, cx).into_any_element()
+                        }
+                        None => h_flex()
+                            .id(kit::keyed("att-file", a.id.clone()))
+                            .gap_1p5()
+                            .pl_2()
+                            .pr_1()
+                            .py_0p5()
+                            .rounded(px(8.))
+                            .bg(p.card)
+                            .text_xs()
+                            .child(kit::icon(
+                                if a.is_image() {
+                                    IconName::Image
+                                } else {
+                                    IconName::FileText
+                                },
+                                13.,
+                                p.muted,
+                            ))
+                            .child(
+                                div()
+                                    .max_w(px(200.))
+                                    .truncate()
+                                    .font_medium()
+                                    .child(a.name.clone()),
+                            )
+                            .child(div().text_color(p.dim).child(human_size(a.size)))
+                            .child(remove_button(
+                                kit::keyed("rm-attach-file", a.id.clone()),
+                                18.,
+                                p.muted,
+                                remove,
+                                p,
+                            ))
+                            .into_any_element(),
+                    }
+                }))
         })
     }
 
     /// Full-window lightbox; `None` while no preview is open.
-    pub(super) fn render_preview(&mut self, radii: Corners<Pixels>, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_preview(
+        &mut self,
+        radii: Corners<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let pv = self.preview.as_ref()?;
         let current = pv.images.get(pv.index)?;
         let (count, index, zoom) = (pv.images.len(), pv.index, pv.zoom);
@@ -192,12 +298,23 @@ impl QmtApp {
         let viewport = window.viewport_size();
         let stage = (
             f32::from(viewport.width) - INSET * 2.,
-            f32::from(viewport.height) - f32::from(HEADER_HEIGHT) - INSET * 2. - TOP_BAR - BOTTOM_BAR,
+            f32::from(viewport.height)
+                - f32::from(HEADER_HEIGHT)
+                - INSET * 2.
+                - TOP_BAR
+                - BOTTOM_BAR,
         );
-        let rendered = natural.and_then(|n| fit_scale(n, stage).map(|f| (n.0 * f * zoom, n.1 * f * zoom)));
+        let rendered =
+            natural.and_then(|n| fit_scale(n, stage).map(|f| (n.0 * f * zoom, n.1 * f * zoom)));
 
         let weak = cx.entity().downgrade();
-        let pill = |el: Div| el.px_2p5().py_1p5().rounded(px(8.)).bg(rgba(0x18181bb3)).text_color(white());
+        let pill = |el: Div| {
+            el.px_2p5()
+                .py_1p5()
+                .rounded(px(8.))
+                .bg(rgba(0x18181bb3))
+                .text_color(white())
+        };
         let round = |id: &'static str, icon: IconName, tip: &'static str| {
             div()
                 .id(id)
@@ -245,49 +362,82 @@ impl QmtApp {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.close_preview(cx);
                     }))
-                    .child(div().min_w_full().min_h_full().flex().items_center().justify_center().child(picture)),
+                    .child(
+                        div()
+                            .min_w_full()
+                            .min_h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(picture),
+                    ),
             )
             .child(
-                h_flex()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right(px(48.))
-                    .child(pill(h_flex().max_w_full().min_w_0().gap_2().text_sm().font_medium())
-                        .child(div().min_w_0().truncate().child(name))
-                        .when(count > 1, |el| el.child(div().flex_none().text_color(white().opacity(0.7)).child(format!("{} / {count}", index + 1))))),
+                h_flex().absolute().top_0().left_0().right(px(48.)).child(
+                    pill(
+                        h_flex()
+                            .max_w_full()
+                            .min_w_0()
+                            .gap_2()
+                            .text_sm()
+                            .font_medium(),
+                    )
+                    .child(div().min_w_0().truncate().child(name))
+                    .when(count > 1, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_color(white().opacity(0.7))
+                                .child(format!("{} / {count}", index + 1)),
+                        )
+                    }),
+                ),
             )
-            .child(
-                div().absolute().top_0().right_0().child(round("preview-close", IconName::X, "Close image preview").on_click(cx.listener(|this, _, _, cx| {
-                    this.close_preview(cx);
-                }))),
-            )
+            .child(div().absolute().top_0().right_0().child(
+                round("preview-close", IconName::X, "Close image preview").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.close_preview(cx);
+                    },
+                )),
+            ))
             .when(count > 1, |el| {
                 el.child(
-                    div().absolute().left_0().top(px(TOP_BAR)).bottom(px(BOTTOM_BAR)).flex().items_center().child(
-                        round("preview-prev", IconName::ChevronLeft, "Previous image (←)").on_click(cx.listener(|this, _, _, cx| {
-                            // Sibling clicks also reach the backdrop, which closes.
-                            cx.stop_propagation();
-                            this.preview_step(-1, cx)
-                        })),
-                    ),
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(px(TOP_BAR))
+                        .bottom(px(BOTTOM_BAR))
+                        .flex()
+                        .items_center()
+                        .child(
+                            round("preview-prev", IconName::ChevronLeft, "Previous image (←)")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    // Sibling clicks also reach the backdrop, which closes.
+                                    cx.stop_propagation();
+                                    this.preview_step(-1, cx)
+                                })),
+                        ),
                 )
                 .child(
-                    div().absolute().right_0().top(px(TOP_BAR)).bottom(px(BOTTOM_BAR)).flex().items_center().child(
-                        round("preview-next", IconName::ChevronRight, "Next image (→)").on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.preview_step(1, cx)
-                        })),
-                    ),
+                    div()
+                        .absolute()
+                        .right_0()
+                        .top(px(TOP_BAR))
+                        .bottom(px(BOTTOM_BAR))
+                        .flex()
+                        .items_center()
+                        .child(
+                            round("preview-next", IconName::ChevronRight, "Next image (→)")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.preview_step(1, cx)
+                                })),
+                        ),
                 )
             })
-            .child(
-                div()
-                    .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .child(pill(div().text_xs().font_semibold()).child(format!("{}%", (zoom * 100.).round()))),
-            );
+            .child(div().absolute().bottom_0().left_0().child(
+                pill(div().text_xs().font_semibold()).child(format!("{}%", (zoom * 100.).round())),
+            ));
 
         Some(
             div()
@@ -311,7 +461,9 @@ impl QmtApp {
                             let weak = weak.clone();
                             let line = window.line_height();
                             window.on_mouse_event(move |ev: &ScrollEvent, phase, _, cx| {
-                                if phase != DispatchPhase::Capture || !(ev.modifiers.control || ev.modifiers.platform) {
+                                if phase != DispatchPhase::Capture
+                                    || !(ev.modifiers.control || ev.modifiers.platform)
+                                {
                                     return;
                                 }
                                 cx.stop_propagation();
@@ -323,14 +475,16 @@ impl QmtApp {
                     .absolute()
                     .size_0(),
                 )
-                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| match ev.keystroke.key.as_str() {
-                    "left" => this.preview_step(-1, cx),
-                    "right" => this.preview_step(1, cx),
-                    "escape" => {
-                        this.close_preview(cx);
-                        cx.stop_propagation();
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                    match ev.keystroke.key.as_str() {
+                        "left" => this.preview_step(-1, cx),
+                        "right" => this.preview_step(1, cx),
+                        "escape" => {
+                            this.close_preview(cx);
+                            cx.stop_propagation();
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.close_preview(cx);
@@ -366,11 +520,32 @@ fn composer_thumb(
         .cursor_pointer()
         .hover(move |s| s.border_color(hover))
         .tooltip(move |window, cx| kit::wrap_tip(tip.clone()).build(window, cx))
-        .on_click(cx.listener(move |this, _, window, cx| this.open_composer_image(session, &id, window, cx)))
-        .child(div().size_full().rounded(px(9.)).overflow_hidden().child(img(image).size_full().rounded(px(9.)).object_fit(ObjectFit::Cover)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.open_composer_image(session, &id, window, cx)
+        }))
+        .child(
+            div().size_full().rounded(px(9.)).overflow_hidden().child(
+                img(image)
+                    .size_full()
+                    .rounded(px(9.))
+                    .object_fit(ObjectFit::Cover),
+            ),
+        )
         // Desktop: inside the thumbnail's top-right corner, so the composer
         // never clips it; as the last child it paints over the image.
-        .child(div().absolute().top(px(2.)).right(px(2.)).child(remove_button(kit::keyed("att-thumb-rm", a.id.clone()), 18., p.text, remove, p)))
+        .child(
+            div()
+                .absolute()
+                .top(px(2.))
+                .right(px(2.))
+                .child(remove_button(
+                    kit::keyed("att-thumb-rm", a.id.clone()),
+                    18.,
+                    p.text,
+                    remove,
+                    p,
+                )),
+        )
 }
 
 /// Opaque round remove button (desktop `.session-attachment-remove`): a solid
@@ -395,7 +570,13 @@ fn remove_button(
         .bg(p.surface)
         .border_1()
         .border_color(p.border)
-        .shadow(vec![BoxShadow { color: hsla(0., 0., 0., 0.3), offset: point(px(0.), px(1.)), blur_radius: px(3.), spread_radius: px(0.), inset: false }])
+        .shadow(vec![BoxShadow {
+            color: hsla(0., 0., 0., 0.3),
+            offset: point(px(0.), px(1.)),
+            blur_radius: px(3.),
+            spread_radius: px(0.),
+            inset: false,
+        }])
         .text_color(fg)
         .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
         .child(gpui_kit::component::Icon::new(IconName::X).size(px(11.)))

@@ -96,7 +96,9 @@ impl HighlightedLines {
 
     /// Line `ix` (tabs expanded) as styled text.
     pub fn line(&self, ix: usize) -> AnyElement {
-        let Some(range) = self.lines.get(ix).cloned() else { return div().into_any_element() };
+        let Some(range) = self.lines.get(ix).cloned() else {
+            return div().into_any_element();
+        };
         let raw = &self.text[range.clone()];
         if raw.is_empty() {
             return div().child(" ").into_any_element();
@@ -107,13 +109,18 @@ impl HighlightedLines {
             if r.start >= range.end {
                 break;
             }
-            let (s, e) = (r.start.max(range.start) - range.start, r.end.min(range.end) - range.start);
+            let (s, e) = (
+                r.start.max(range.start) - range.start,
+                r.end.min(range.end) - range.start,
+            );
             if s < e && style.color.is_some() {
                 runs.push((s..e, *style));
             }
         }
         if !raw.contains('\t') {
-            return StyledText::new(raw.to_string()).with_highlights(runs).into_any_element();
+            return StyledText::new(raw.to_string())
+                .with_highlights(runs)
+                .into_any_element();
         }
         // Expanding tabs shifts byte offsets: rebuild runs against the new text.
         let mut out = String::with_capacity(raw.len() + 16);
@@ -123,20 +130,32 @@ impl HighlightedLines {
                 map.push(out.len());
             }
             map.push(out.len());
-            if ch == '\t' { out.push_str("    ") } else { out.push(ch) }
+            if ch == '\t' {
+                out.push_str("    ")
+            } else {
+                out.push(ch)
+            }
         }
         while map.len() <= raw.len() {
             map.push(out.len());
         }
-        let runs = runs.into_iter().map(|(r, s)| (map[r.start]..map[r.end], s)).filter(|(r, _)| !r.is_empty());
-        StyledText::new(out).with_highlights(runs).into_any_element()
+        let runs = runs
+            .into_iter()
+            .map(|(r, s)| (map[r.start]..map[r.end], s))
+            .filter(|(r, _)| !r.is_empty());
+        StyledText::new(out)
+            .with_highlights(runs)
+            .into_any_element()
     }
 }
 
 /// One piece of a read result: tool chatter (headers, notes) or numbered code.
 enum Segment {
     Meta(String),
-    Code { numbers: Vec<Option<u64>>, text: String },
+    Code {
+        numbers: Vec<Option<u64>>,
+        text: String,
+    },
 }
 
 /// `00197| code` → (197, "code").
@@ -156,7 +175,10 @@ fn segments(output: &str) -> Vec<Segment> {
     let mut any_numbered = false;
     for line in output.lines() {
         let trimmed = line.trim();
-        if matches!(trimmed, "<content>" | "</content>") || trimmed.starts_with("<type>") || trimmed.starts_with("<path>") {
+        if matches!(trimmed, "<content>" | "</content>")
+            || trimmed.starts_with("<type>")
+            || trimmed.starts_with("<path>")
+        {
             continue;
         }
         if let Some((n, code)) = numbered(line) {
@@ -167,7 +189,10 @@ fn segments(output: &str) -> Vec<Segment> {
                     text.push('\n');
                     text.push_str(code);
                 }
-                _ => out.push(Segment::Code { numbers: vec![Some(n)], text: code.to_string() }),
+                _ => out.push(Segment::Code {
+                    numbers: vec![Some(n)],
+                    text: code.to_string(),
+                }),
             }
         } else if !trimmed.is_empty() {
             out.push(Segment::Meta(trimmed.to_string()));
@@ -184,11 +209,25 @@ fn segments(output: &str) -> Vec<Segment> {
 
 /// Highlighted, line-numbered code card (`clamp` caps the total code lines).
 #[allow(clippy::too_many_arguments)]
-fn code_card(id: impl Into<ElementId>, numbers: &[Option<u64>], text: &str, lang: Option<&str>, clamp: usize, flat: bool, theme: &Arc<HighlightTheme>, p: &Palette) -> (AnyElement, usize) {
+fn code_card(
+    id: impl Into<ElementId>,
+    numbers: &[Option<u64>],
+    text: &str,
+    lang: Option<&str>,
+    clamp: usize,
+    flat: bool,
+    theme: &Arc<HighlightTheme>,
+    p: &Palette,
+) -> (AnyElement, usize) {
     let lines = HighlightedLines::new(text, lang, theme);
     let shown = lines.len().min(clamp);
     let numbered = numbers.iter().any(Option::is_some);
-    let width = numbers.iter().flatten().max().map_or(1, |n| n.to_string().len()).max(2);
+    let width = numbers
+        .iter()
+        .flatten()
+        .max()
+        .map_or(1, |n| n.to_string().len())
+        .max(2);
     let gutter = px(width as f32 * 7.5 + 16.);
     let rows = (0..shown).map(|ix| {
         h_flex()
@@ -202,10 +241,24 @@ fn code_card(id: impl Into<ElementId>, numbers: &[Option<u64>], text: &str, lang
                         .pr_3()
                         .text_right()
                         .text_color(p.dim.opacity(0.7))
-                        .child(numbers.get(ix).copied().flatten().map(|n| n.to_string()).unwrap_or_default()),
+                        .child(
+                            numbers
+                                .get(ix)
+                                .copied()
+                                .flatten()
+                                .map(|n| n.to_string())
+                                .unwrap_or_default(),
+                        ),
                 )
             })
-            .child(div().flex_1().min_w_0().pr_3().text_color(p.text).child(lines.line(ix)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .pr_3()
+                    .text_color(p.text)
+                    .child(lines.line(ix)),
+            )
             .into_any_element()
     });
     let card = div()
@@ -213,7 +266,9 @@ fn code_card(id: impl Into<ElementId>, numbers: &[Option<u64>], text: &str, lang
         .w_full()
         .bg(p.bg)
         // Flat: sits inside a tool card that already draws the frame.
-        .when(!flat, |el| el.rounded(px(8.)).border_1().border_color(p.border))
+        .when(!flat, |el| {
+            el.rounded(px(8.)).border_1().border_color(p.border)
+        })
         // Long lines wrap; no horizontal scrolling.
         .overflow_hidden()
         .child(
@@ -234,11 +289,28 @@ fn code_card(id: impl Into<ElementId>, numbers: &[Option<u64>], text: &str, lang
 /// Read-tool result: headers as dim labels, code as highlighted cards.
 /// `flat` renders only the code, borderless, to fill a card attached to the
 /// tool header (the tool's own notes like "(File has more lines…)" are dropped).
-pub fn read_output(id: &str, output: &str, path: Option<&str>, max_lines: usize, flat: bool, theme: &Arc<HighlightTheme>, p: &Palette) -> Div {
+pub fn read_output(
+    id: &str,
+    output: &str,
+    path: Option<&str>,
+    max_lines: usize,
+    flat: bool,
+    theme: &Arc<HighlightTheme>,
+    p: &Palette,
+) -> Div {
     let segments = segments(output);
     // A header naming a file sets the language of the code that follows it.
     let mut lang = path.and_then(language_for_path);
-    let total: usize = segments.iter().map(|s| if let Segment::Code { numbers, .. } = s { numbers.len() } else { 0 }).sum();
+    let total: usize = segments
+        .iter()
+        .map(|s| {
+            if let Segment::Code { numbers, .. } = s {
+                numbers.len()
+            } else {
+                0
+            }
+        })
+        .sum();
     let mut budget = max_lines;
     let mut body = v_flex().w_full().when(!flat, |el| el.gap_1p5());
     let pad = |el: Div| if flat { el.px_3().py_1() } else { el.px_1() };
@@ -252,14 +324,39 @@ pub fn read_output(id: &str, output: &str, path: Option<&str>, max_lines: usize,
                     lang = Some(l);
                 }
                 if !flat {
-                    body = body.child(pad(div()).text_xs().font_family(kit::MONO).text_color(p.dim).truncate().child(text.clone()));
+                    body = body.child(
+                        pad(div())
+                            .text_xs()
+                            .font_family(kit::MONO)
+                            .text_color(p.dim)
+                            .truncate()
+                            .child(text.clone()),
+                    );
                 }
             }
             Segment::Code { numbers, text } if budget > 0 => {
-                let (card, shown) = code_card(SharedString::from(format!("{id}-{ix}")), numbers, text, lang.as_deref(), budget, flat, theme, p);
+                let (card, shown) = code_card(
+                    SharedString::from(format!("{id}-{ix}")),
+                    numbers,
+                    text,
+                    lang.as_deref(),
+                    budget,
+                    flat,
+                    theme,
+                    p,
+                );
                 budget -= shown;
                 // Flat: separate the code of several files/ranges with a rule.
-                let card = if flat && code_seen { div().w_full().border_t_1().border_color(p.border).child(card).into_any_element() } else { card };
+                let card = if flat && code_seen {
+                    div()
+                        .w_full()
+                        .border_t_1()
+                        .border_color(p.border)
+                        .child(card)
+                        .into_any_element()
+                } else {
+                    card
+                };
                 code_seen = true;
                 body = body.child(card);
             }
@@ -267,7 +364,12 @@ pub fn read_output(id: &str, output: &str, path: Option<&str>, max_lines: usize,
         }
     }
     if total > max_lines && !flat {
-        body = body.child(pad(div()).text_xs().text_color(p.dim).child(format!("… {} more lines", total - max_lines)));
+        body = body.child(
+            pad(div())
+                .text_xs()
+                .text_color(p.dim)
+                .child(format!("… {} more lines", total - max_lines)),
+        );
     }
     body
 }
@@ -281,7 +383,9 @@ mod tests {
     fn parses_read_tool_and_get_function_output() {
         let read = "<path>/a/b.rs</path>\n<type>file</type>\n<content>\n00010| fn x() {\n00011| }\n\n(File has more lines.)\n</content>";
         let segs = segments(read);
-        assert!(matches!(&segs[0], Segment::Code { numbers, text } if numbers == &vec![Some(10), Some(11)] && text == "fn x() {\n}"));
+        assert!(
+            matches!(&segs[0], Segment::Code { numbers, text } if numbers == &vec![Some(10), Some(11)] && text == "fn x() {\n}")
+        );
         assert!(matches!(&segs[1], Segment::Meta(t) if t.starts_with("(File")));
 
         let getf = "/a/b.rs\n- f [1-2] hash=x\n00001| fn f() {}\n00002|";
@@ -292,12 +396,19 @@ mod tests {
 
     #[test]
     fn rust_gets_theme_colors() {
-        use gpui_kit::component::highlighter::HighlightTheme;
         use crate::highlight::highlight_code;
+        use gpui_kit::component::highlighter::HighlightTheme;
         let code = "fn main() { let x = \"hi\"; }";
-        for theme in [HighlightTheme::default_dark(), HighlightTheme::default_light()] {
+        for theme in [
+            HighlightTheme::default_dark(),
+            HighlightTheme::default_light(),
+        ] {
             let spans = highlight_code("rs", code, theme.as_ref());
-            let colored: Vec<&str> = spans.iter().filter(|(_, s)| s.color.is_some()).map(|(r, _)| &code[r.clone()]).collect();
+            let colored: Vec<&str> = spans
+                .iter()
+                .filter(|(_, s)| s.color.is_some())
+                .map(|(r, _)| &code[r.clone()])
+                .collect();
             assert!(colored.contains(&"fn"), "{colored:?}");
             assert!(colored.iter().any(|t| t.contains("hi")), "{colored:?}");
         }

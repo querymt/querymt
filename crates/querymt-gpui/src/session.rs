@@ -24,7 +24,14 @@ pub struct Diff {
 
 impl Diff {
     fn whole_file(path: String, old: Option<String>, new: String) -> Self {
-        Self { path, old, new, old_start: None, new_start: None, snippet: false }
+        Self {
+            path,
+            old,
+            new,
+            old_start: None,
+            new_start: None,
+            snippet: false,
+        }
     }
 }
 
@@ -58,8 +65,15 @@ fn parse_receipt(output: &str) -> HashMap<String, Vec<ReceiptHunk>> {
                 let (a, b) = v.split_once(',')?;
                 Some((a.parse().ok()?, b.parse().ok()?))
             };
-            if let (Some((old_start, old_count)), Some((new_start, new_count))) = (field("old="), field("new=")) {
-                files.entry(path.clone()).or_default().push(ReceiptHunk { old_start, old_count, new_start, new_count });
+            if let (Some((old_start, old_count)), Some((new_start, new_count))) =
+                (field("old="), field("new="))
+            {
+                files.entry(path.clone()).or_default().push(ReceiptHunk {
+                    old_start,
+                    old_count,
+                    new_start,
+                    new_count,
+                });
             }
         }
     }
@@ -71,7 +85,9 @@ fn normalize_path(path: &str) -> String {
 }
 
 fn str_field(v: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|k| v.get(*k).and_then(Value::as_str)).map(str::to_owned)
+    keys.iter()
+        .find_map(|k| v.get(*k).and_then(Value::as_str))
+        .map(str::to_owned)
 }
 
 fn tool_file_path(v: &Value) -> Option<String> {
@@ -80,8 +96,14 @@ fn tool_file_path(v: &Value) -> Option<String> {
 
 /// (old, new) of an edit-like object; `None` when it has neither side.
 fn replacement_pair(v: &Value) -> Option<(String, String)> {
-    let old = str_field(v, &["old_string", "oldString", "old_str", "oldText", "old_text"]);
-    let new = str_field(v, &["new_string", "newString", "new_str", "newText", "new_text"]);
+    let old = str_field(
+        v,
+        &["old_string", "oldString", "old_str", "oldText", "old_text"],
+    );
+    let new = str_field(
+        v,
+        &["new_string", "newString", "new_str", "newText", "new_text"],
+    );
     if old.is_none() && new.is_none() {
         return None;
     }
@@ -89,7 +111,11 @@ fn replacement_pair(v: &Value) -> Option<(String, String)> {
 }
 
 fn line_count(s: &str) -> usize {
-    if s.is_empty() { 0 } else { s.trim_end_matches('\n').split('\n').count() }
+    if s.is_empty() {
+        0
+    } else {
+        s.trim_end_matches('\n').split('\n').count()
+    }
 }
 
 /// Diffs for a completed edit tool call that returned no ACP `diff` block, built
@@ -99,7 +125,9 @@ fn synthesized_diffs(call: &ToolCall) -> Vec<Diff> {
     if call.running() || call.failed() || !EDIT_TOOLS.contains(&name.as_str()) {
         return vec![];
     }
-    let Some(input) = call.input.as_ref().filter(|v| v.is_object()) else { return vec![] };
+    let Some(input) = call.input.as_ref().filter(|v| v.is_object()) else {
+        return vec![];
+    };
     let result = call.output.trim();
     let ok = result.is_empty()
         || result.starts_with("OK ")
@@ -114,14 +142,33 @@ fn synthesized_diffs(call: &ToolCall) -> Vec<Diff> {
         if content.is_empty() {
             return vec![];
         }
-        return vec![Diff { path: parent, old: None, new: content, old_start: None, new_start: Some(1), snippet: true }];
+        return vec![Diff {
+            path: parent,
+            old: None,
+            new: content,
+            old_start: None,
+            new_start: Some(1),
+            snippet: true,
+        }];
     }
-    let items: Vec<(String, (String, String))> = match input.get("edits").or_else(|| input.get("replacements")).and_then(Value::as_array) {
+    let items: Vec<(String, (String, String))> = match input
+        .get("edits")
+        .or_else(|| input.get("replacements"))
+        .and_then(Value::as_array)
+    {
         Some(items) => items
             .iter()
-            .filter_map(|it| Some((tool_file_path(it).unwrap_or_else(|| parent.clone()), replacement_pair(it)?)))
+            .filter_map(|it| {
+                Some((
+                    tool_file_path(it).unwrap_or_else(|| parent.clone()),
+                    replacement_pair(it)?,
+                ))
+            })
             .collect(),
-        None => replacement_pair(input).map(|pair| (parent.clone(), pair)).into_iter().collect(),
+        None => replacement_pair(input)
+            .map(|pair| (parent.clone(), pair))
+            .into_iter()
+            .collect(),
     };
     let mut diffs: Vec<Diff> = items
         .into_iter()
@@ -138,12 +185,18 @@ fn synthesized_diffs(call: &ToolCall) -> Vec<Diff> {
     // with matching sizes (receipts are in file order; edits usually are too).
     let receipts = parse_receipt(result);
     for (path, hunks) in receipts {
-        let mine: Vec<usize> = diffs.iter().enumerate().filter(|(_, d)| normalize_path(&d.path) == path).map(|(i, _)| i).collect();
+        let mine: Vec<usize> = diffs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| normalize_path(&d.path) == path)
+            .map(|(i, _)| i)
+            .collect();
         if mine.len() != hunks.len() {
             continue;
         }
         let fits = mine.iter().zip(&hunks).all(|(&i, h)| {
-            line_count(diffs[i].old.as_deref().unwrap_or_default()) == h.old_count && line_count(&diffs[i].new) == h.new_count
+            line_count(diffs[i].old.as_deref().unwrap_or_default()) == h.old_count
+                && line_count(&diffs[i].new) == h.new_count
         });
         if !fits {
             continue;
@@ -199,7 +252,11 @@ impl ToolCall {
     /// Short tool name: `Run shell` -> `shell`.
     pub fn name(&self) -> String {
         let name = self.title.strip_prefix("Run ").unwrap_or(&self.title);
-        if name.is_empty() { "tool".into() } else { name.to_string() }
+        if name.is_empty() {
+            "tool".into()
+        } else {
+            name.to_string()
+        }
     }
 
     /// Exit code of a shell result, when the output is the usual JSON envelope.
@@ -208,12 +265,19 @@ impl ToolCall {
         if !trimmed.starts_with('{') {
             return None;
         }
-        serde_json::from_str::<Value>(trimmed).ok()?.get("exit_code")?.as_i64()
+        serde_json::from_str::<Value>(trimmed)
+            .ok()?
+            .get("exit_code")?
+            .as_i64()
     }
 
     /// Full shell command (all lines), when there is one.
     pub fn command(&self) -> Option<String> {
-        self.input.as_ref()?.get("command")?.as_str().map(str::to_owned)
+        self.input
+            .as_ref()?
+            .get("command")?
+            .as_str()
+            .map(str::to_owned)
     }
 
     /// The most telling argument: command, path, pattern, …
@@ -221,39 +285,62 @@ impl ToolCall {
         let Some(input) = &self.input else {
             return self.locations.first().cloned().unwrap_or_default();
         };
-        for key in ["command", "path", "file_path", "pattern", "query", "url", "name", "symbol", "prompt"] {
+        for key in [
+            "command",
+            "path",
+            "file_path",
+            "pattern",
+            "query",
+            "url",
+            "name",
+            "symbol",
+            "prompt",
+        ] {
             if let Some(v) = input.get(key).and_then(Value::as_str) {
                 return v.lines().next().unwrap_or_default().to_string();
             }
         }
         if let Some(paths) = input.get("paths").and_then(Value::as_array) {
-            return paths.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ");
+            return paths
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
         }
         let text = input.to_string();
-        if text == "{}" || text == "null" { String::new() } else { text.chars().take(160).collect() }
+        if text == "{}" || text == "null" {
+            String::new()
+        } else {
+            text.chars().take(160).collect()
+        }
     }
 
     /// Output prettified: shell JSON results become stdout + stderr.
     pub fn pretty_output(&self) -> String {
         let trimmed = self.output.trim();
         if trimmed.starts_with('{')
-            && let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-                let out = v.get("stdout").and_then(Value::as_str);
-                let err = v.get("stderr").and_then(Value::as_str);
-                if out.is_some() || err.is_some() {
-                    let mut text = out.unwrap_or_default().trim_end().to_string();
-                    if let Some(err) = err.filter(|e| !e.trim().is_empty()) {
-                        if !text.is_empty() {
-                            text.push('\n');
-                        }
-                        text.push_str(err.trim_end());
+            && let Ok(v) = serde_json::from_str::<Value>(trimmed)
+        {
+            let out = v.get("stdout").and_then(Value::as_str);
+            let err = v.get("stderr").and_then(Value::as_str);
+            if out.is_some() || err.is_some() {
+                let mut text = out.unwrap_or_default().trim_end().to_string();
+                if let Some(err) = err.filter(|e| !e.trim().is_empty()) {
+                    if !text.is_empty() {
+                        text.push('\n');
                     }
-                    if let Some(code) = v.get("exit_code").and_then(Value::as_i64).filter(|c| *c != 0) {
-                        text.push_str(&format!("\n[exit code {code}]"));
-                    }
-                    return text;
+                    text.push_str(err.trim_end());
                 }
+                if let Some(code) = v
+                    .get("exit_code")
+                    .and_then(Value::as_i64)
+                    .filter(|c| *c != 0)
+                {
+                    text.push_str(&format!("\n[exit code {code}]"));
+                }
+                return text;
             }
+        }
         self.output.clone()
     }
 }
@@ -307,9 +394,19 @@ impl UserAttachment {
                     .or_else(|| s("/uri"))
                     .unwrap_or_else(|| "file".into());
                 let name = uri.rsplit('/').next().unwrap_or(&uri).to_string();
-                let mime = s("/resource/mimeType").or_else(|| s("/mimeType")).unwrap_or_default();
-                let data = mime.starts_with("image/").then(|| s("/resource/blob")).flatten();
-                Some(Self { name, mime, size, data })
+                let mime = s("/resource/mimeType")
+                    .or_else(|| s("/mimeType"))
+                    .unwrap_or_default();
+                let data = mime
+                    .starts_with("image/")
+                    .then(|| s("/resource/blob"))
+                    .flatten();
+                Some(Self {
+                    name,
+                    mime,
+                    size,
+                    data,
+                })
             }
             _ => None,
         }
@@ -318,12 +415,21 @@ impl UserAttachment {
 
 #[derive(Clone, Debug)]
 pub enum ItemKind {
-    User { text: String, attachments: Vec<UserAttachment>, local: bool },
-    Agent { text: String },
+    User {
+        text: String,
+        attachments: Vec<UserAttachment>,
+        local: bool,
+    },
+    Agent {
+        text: String,
+    },
     /// Consecutive reasoning steps and tool calls between two replies, shown as
     /// one collapsible work group (like the desktop app).
     Work(Vec<WorkEntry>),
-    Notice { text: String, error: bool },
+    Notice {
+        text: String,
+        error: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -423,7 +529,11 @@ pub struct SelectOption {
 
 impl SelectOption {
     pub fn current_label(&self) -> String {
-        self.choices.iter().find(|(v, _)| *v == self.current).map(|(_, l)| l.clone()).unwrap_or_else(|| self.current.clone())
+        self.choices
+            .iter()
+            .find(|(v, _)| *v == self.current)
+            .map(|(_, l)| l.clone())
+            .unwrap_or_else(|| self.current.clone())
     }
 }
 
@@ -443,7 +553,10 @@ fn tool_kind(name: &str) -> &'static str {
 /// matching the agent's replay projection.
 fn replay_updates(ev: &Value) -> Vec<Value> {
     use serde_json::json;
-    let kind = ev.pointer("/kind/type").and_then(Value::as_str).unwrap_or_default();
+    let kind = ev
+        .pointer("/kind/type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let data = ev.pointer("/kind/data").cloned().unwrap_or(Value::Null);
     let s = |k: &str| data.get(k).and_then(Value::as_str).map(str::to_owned);
     match kind {
@@ -456,7 +569,12 @@ fn replay_updates(ev: &Value) -> Vec<Value> {
             let mut out = Vec::new();
             let message_id = s("message_id");
             if message_id.is_some() {
-                for part in data.get("reasoning_parts").and_then(Value::as_array).into_iter().flatten() {
+                for part in data
+                    .get("reasoning_parts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
                     let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
                     if !text.is_empty() {
                         out.push(json!({
@@ -482,7 +600,9 @@ fn replay_updates(ev: &Value) -> Vec<Value> {
             if name == "todowrite" {
                 return vec![];
             }
-            let args = s("arguments").and_then(|a| serde_json::from_str::<Value>(&a).ok()).unwrap_or(Value::Null);
+            let args = s("arguments")
+                .and_then(|a| serde_json::from_str::<Value>(&a).ok())
+                .unwrap_or(Value::Null);
             vec![json!({
                 "sessionUpdate": "tool_call",
                 "toolCallId": s("tool_call_id"),
@@ -497,7 +617,10 @@ fn replay_updates(ev: &Value) -> Vec<Value> {
             if name == "todowrite" {
                 return vec![];
             }
-            let failed = data.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+            let failed = data
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             vec![json!({
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": s("tool_call_id"),
@@ -513,7 +636,11 @@ fn replay_updates(ev: &Value) -> Vec<Value> {
 
 fn content_text(content: &Value) -> String {
     match content.get("type").and_then(Value::as_str) {
-        Some("text") => content.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
+        Some("text") => content
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         _ => String::new(),
     }
 }
@@ -552,7 +679,12 @@ impl SessionView {
         if let Some(a) = Accounting::read(snap.get("accounting")) {
             self.accounting = Some(a);
         }
-        let ts = |ev: &Value| ev.get("timestamp").and_then(Value::as_f64).filter(|t| *t >= 0.).map(|s| s * 1000.);
+        let ts = |ev: &Value| {
+            ev.get("timestamp")
+                .and_then(Value::as_f64)
+                .filter(|t| *t >= 0.)
+                .map(|s| s * 1000.)
+        };
         let mut started: Option<f64> = None;
         let mut missing = false;
         let settle = |started: &mut Option<f64>, end: Option<f64>, acc: &mut f64| {
@@ -567,13 +699,24 @@ impl SessionView {
         // Folded from scratch: replayed `usage_update`s may already have set an
         // agent-computed breakdown, which wins over this reconstruction.
         let mut folded: Option<Breakdown> = None;
-        let (mut used, mut size) = self.usage.map_or((None, None), |(u, s)| (Some(u), (s > 0).then_some(s)));
-        for ev in snap.pointer("/audit/events").and_then(Value::as_array).into_iter().flatten() {
+        let (mut used, mut size) = self
+            .usage
+            .map_or((None, None), |(u, s)| (Some(u), (s > 0).then_some(s)));
+        for ev in snap
+            .pointer("/audit/events")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             let data = ev.pointer("/kind/data");
             match ev.pointer("/kind/type").and_then(Value::as_str) {
                 Some("llm_request_start") => started = started.or(ts(ev)),
                 Some("provider_changed") => {
-                    if let Some(l) = data.and_then(|d| d.get("context_limit")).and_then(Value::as_u64).filter(|l| *l > 0) {
+                    if let Some(l) = data
+                        .and_then(|d| d.get("context_limit"))
+                        .and_then(Value::as_u64)
+                        .filter(|l| *l > 0)
+                    {
                         size = Some(l);
                     }
                 }
@@ -586,13 +729,19 @@ impl SessionView {
                     } else {
                         missing = true;
                     }
-                    if let Some(c) = data.and_then(|d| d.get("context_tokens")).and_then(Value::as_u64) {
+                    if let Some(c) = data
+                        .and_then(|d| d.get("context_tokens"))
+                        .and_then(Value::as_u64)
+                    {
                         used = Some(c);
                     }
                     settle(&mut started, ts(ev), &mut active);
                 }
                 Some("compaction_end") => {
-                    if let Some(c) = data.and_then(|d| d.get("context_tokens")).and_then(Value::as_u64) {
+                    if let Some(c) = data
+                        .and_then(|d| d.get("context_tokens"))
+                        .and_then(Value::as_u64)
+                    {
                         used = Some(c);
                     }
                 }
@@ -614,17 +763,28 @@ impl SessionView {
         {
             {
                 let u = summary.get("usage");
-                let side = |k: &str| u.and_then(|u| u.get(k)).and_then(|v| crate::usage::TokenUsage::read(v, false));
+                let side = |k: &str| {
+                    u.and_then(|u| u.get(k))
+                        .and_then(|v| crate::usage::TokenUsage::read(v, false))
+                };
                 let (latest, totals) = (side("latestRequest"), side("sessionTotals"));
                 self.breakdown = (latest.is_some() || totals.is_some()).then(|| Breakdown {
                     latest,
                     totals,
-                    partial: u.and_then(|u| u.get("partial")).and_then(Value::as_bool) == Some(true),
+                    partial: u.and_then(|u| u.get("partial")).and_then(Value::as_bool)
+                        == Some(true),
                 });
-                if let Some(c) = u.and_then(|u| u.get("contextTokens")).and_then(Value::as_u64) {
+                if let Some(c) = u
+                    .and_then(|u| u.get("contextTokens"))
+                    .and_then(Value::as_u64)
+                {
                     used = Some(c);
                 }
-                if let Some(l) = summary.pointer("/provider/contextLimit").and_then(Value::as_u64).filter(|l| *l > 0) {
+                if let Some(l) = summary
+                    .pointer("/provider/contextLimit")
+                    .and_then(Value::as_u64)
+                    .filter(|l| *l > 0)
+                {
                     size = Some(l);
                 }
             }
@@ -675,15 +835,23 @@ impl SessionView {
     /// Prepend an older-history page (raw agent events, ascending) to the
     /// transcript, projecting them the way the agent's replay does.
     pub fn prepend_events(&mut self, events: &[Value]) {
-        let mut older = SessionView { counter: self.counter, ..Default::default() };
+        let mut older = SessionView {
+            counter: self.counter,
+            ..Default::default()
+        };
         for ev in events {
             for update in replay_updates(ev) {
                 older.apply(&update);
             }
         }
         self.counter = older.counter;
-        let known: std::collections::HashSet<&str> = self.items.iter().map(|i| i.key.as_str()).collect();
-        let mut items: Vec<Item> = older.items.into_iter().filter(|i| !known.contains(i.key.as_str())).collect();
+        let known: std::collections::HashSet<&str> =
+            self.items.iter().map(|i| i.key.as_str()).collect();
+        let mut items: Vec<Item> = older
+            .items
+            .into_iter()
+            .filter(|i| !known.contains(i.key.as_str()))
+            .collect();
         if items.is_empty() {
             return;
         }
@@ -718,8 +886,18 @@ impl SessionView {
 
     pub fn push_local_user(&mut self, text: &str, attachments: Vec<UserAttachment>) {
         let key = format!("local-{}", self.counter + 1);
-        self.echo_pending = attachments.iter().map(|a| (a.name.clone(), a.mime.clone())).collect();
-        self.push(key, ItemKind::User { text: text.into(), attachments, local: true });
+        self.echo_pending = attachments
+            .iter()
+            .map(|a| (a.name.clone(), a.mime.clone()))
+            .collect();
+        self.push(
+            key,
+            ItemKind::User {
+                text: text.into(),
+                attachments,
+                local: true,
+            },
+        );
     }
 
     /// Apply a `runtimeChanged` / snapshot `runtime` object: phase and active run.
@@ -727,7 +905,10 @@ impl SessionView {
         if let Some(phase) = runtime.get("phase").and_then(Value::as_str) {
             self.phase = phase.into();
         }
-        self.run_id = runtime.get("active_run_id").and_then(Value::as_str).map(str::to_owned);
+        self.run_id = runtime
+            .get("active_run_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         if !self.running() {
             // Nothing can still be waiting once the session is idle.
             self.pending_inputs.retain(|i| i.state == "sending");
@@ -748,7 +929,11 @@ impl SessionView {
             self.pending_inputs.retain(|i| i.input_id != input_id);
             return;
         }
-        if let Some(i) = self.pending_inputs.iter_mut().find(|i| i.input_id == input_id) {
+        if let Some(i) = self
+            .pending_inputs
+            .iter_mut()
+            .find(|i| i.input_id == input_id)
+        {
             i.state = state.into();
             if !delivery.is_empty() {
                 i.delivery = delivery.into();
@@ -768,7 +953,13 @@ impl SessionView {
 
     pub fn push_notice(&mut self, text: impl Into<String>, error: bool) {
         let key = format!("notice-{}", self.counter + 1);
-        self.push(key, ItemKind::Notice { text: text.into(), error });
+        self.push(
+            key,
+            ItemKind::Notice {
+                text: text.into(),
+                error,
+            },
+        );
     }
 
     /// Concatenated agent text of the turn containing item `ix` (for copying).
@@ -776,8 +967,14 @@ impl SessionView {
         if items.is_empty() {
             return String::new();
         }
-        let start = items[..=ix.min(items.len() - 1)].iter().rposition(|i| matches!(i.kind, ItemKind::User { .. })).map_or(0, |u| u + 1);
-        let end = items[start..].iter().position(|i| matches!(i.kind, ItemKind::User { .. })).map_or(items.len(), |u| start + u);
+        let start = items[..=ix.min(items.len() - 1)]
+            .iter()
+            .rposition(|i| matches!(i.kind, ItemKind::User { .. }))
+            .map_or(0, |u| u + 1);
+        let end = items[start..]
+            .iter()
+            .position(|i| matches!(i.kind, ItemKind::User { .. }))
+            .map_or(items.len(), |u| start + u);
         items[start..end]
             .iter()
             .filter_map(|i| match &i.kind {
@@ -790,10 +987,18 @@ impl SessionView {
     }
 
     fn select_option(&self, aliases: &[&str]) -> Option<SelectOption> {
-        let norm = |v: Option<&Value>| v.and_then(Value::as_str).map(|s| s.to_lowercase().replace(['-', ' '], "_"));
+        let norm = |v: Option<&Value>| {
+            v.and_then(Value::as_str)
+                .map(|s| s.to_lowercase().replace(['-', ' '], "_"))
+        };
         let o = self.options.iter().find(|o| {
-            o.get("type").and_then(Value::as_str).is_none_or(|t| t == "select")
-                && ["id", "category", "name"].iter().filter_map(|k| norm(o.get(*k))).any(|v| aliases.contains(&v.as_str()))
+            o.get("type")
+                .and_then(Value::as_str)
+                .is_none_or(|t| t == "select")
+                && ["id", "category", "name"]
+                    .iter()
+                    .filter_map(|k| norm(o.get(*k)))
+                    .any(|v| aliases.contains(&v.as_str()))
         })?;
         let mut choices = Vec::new();
         let push = |choices: &mut Vec<(String, String)>, e: &Value| {
@@ -802,7 +1007,12 @@ impl SessionView {
                 choices.push((v.to_string(), label.to_string()));
             }
         };
-        for entry in o.get("options").and_then(Value::as_array).into_iter().flatten() {
+        for entry in o
+            .get("options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             match entry.get("options").and_then(Value::as_array) {
                 Some(group) => group.iter().for_each(|e| push(&mut choices, e)),
                 None => push(&mut choices, entry),
@@ -810,7 +1020,11 @@ impl SessionView {
         }
         Some(SelectOption {
             id: o.get("id")?.as_str()?.to_string(),
-            current: o.get("currentValue").and_then(Value::as_str).unwrap_or_default().to_string(),
+            current: o
+                .get("currentValue")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
             choices,
         })
     }
@@ -836,23 +1050,31 @@ impl SessionView {
     pub fn model_label(&self) -> Option<String> {
         let id = self.model.as_deref()?;
         if let Some(o) = self.select_option(&["model"])
-            && let Some((_, label)) = o.choices.iter().find(|(v, _)| v == id) {
-                return Some(label.clone());
-            }
+            && let Some((_, label)) = o.choices.iter().find(|(v, _)| v == id)
+        {
+            return Some(label.clone());
+        }
         Some(id.rsplit('/').next().unwrap_or(id).to_string())
     }
 
     /// Apply the `update` object of a `session/update` notification.
     pub fn apply(&mut self, update: &Value) {
-        let kind = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or_default();
-        let message_id = update.get("messageId").and_then(Value::as_str).map(str::to_owned);
+        let kind = update
+            .get("sessionUpdate")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let message_id = update
+            .get("messageId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         match kind {
             "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" => {
                 let content = update.get("content");
                 if kind == "user_message_chunk"
-                    && let Some(a) = content.and_then(UserAttachment::from_block) {
-                        return self.apply_user_attachment(message_id, a);
-                    }
+                    && let Some(a) = content.and_then(UserAttachment::from_block)
+                {
+                    return self.apply_user_attachment(message_id, a);
+                }
                 let text = content.map(content_text).unwrap_or_default();
                 self.apply_chunk(kind, message_id, text);
             }
@@ -865,8 +1087,16 @@ impl SessionView {
                     .into_iter()
                     .flatten()
                     .map(|e| PlanEntry {
-                        content: e.get("content").and_then(Value::as_str).unwrap_or_default().into(),
-                        status: e.get("status").and_then(Value::as_str).unwrap_or_default().into(),
+                        content: e
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .into(),
+                        status: e
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .into(),
                     })
                     .collect();
             }
@@ -889,15 +1119,26 @@ impl SessionView {
                 }
             }
             "current_mode_update" => {
-                self.mode = update.get("currentModeId").and_then(Value::as_str).map(str::to_owned);
-                if let Some(o) = self.options.iter_mut().find(|o| o.get("id").and_then(Value::as_str) == Some("mode"))
-                    && let Some(m) = &self.mode {
-                        o["currentValue"] = Value::String(m.clone());
-                    }
+                self.mode = update
+                    .get("currentModeId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let Some(o) = self
+                    .options
+                    .iter_mut()
+                    .find(|o| o.get("id").and_then(Value::as_str) == Some("mode"))
+                    && let Some(m) = &self.mode
+                {
+                    o["currentValue"] = Value::String(m.clone());
+                }
             }
             "available_commands_update" => {}
             "session_info_update" => {
-                if let Some(title) = update.get("title").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                if let Some(title) = update
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                {
                     self.title = title.into();
                 }
                 if let Some(a) = Accounting::from_meta(update.get("_meta")) {
@@ -910,10 +1151,15 @@ impl SessionView {
     }
 
     pub fn apply_config(&mut self, options: Option<&Value>) {
-        let Some(list) = options.and_then(Value::as_array) else { return };
+        let Some(list) = options.and_then(Value::as_array) else {
+            return;
+        };
         self.options = list.clone();
         for o in list {
-            let current = o.get("currentValue").and_then(Value::as_str).map(str::to_owned);
+            let current = o
+                .get("currentValue")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             match o.get("id").and_then(Value::as_str) {
                 Some("model") => self.model = current,
                 Some("mode") => self.mode = current,
@@ -935,7 +1181,11 @@ impl SessionView {
             .flatten()
             .filter_map(|m| {
                 let id = m.get("id")?.as_str()?.to_string();
-                let name = m.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
+                let name = m
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&id)
+                    .to_string();
                 Some((id, name))
             })
             .collect();
@@ -944,7 +1194,10 @@ impl SessionView {
     /// Total (added, removed, files) of the turn's edits up to item `ix`,
     /// counting from the preceding user message.
     pub fn turn_change_stats(items: &[Item], ix: usize) -> (usize, usize, usize) {
-        let start = items[..=ix].iter().rposition(|i| matches!(i.kind, ItemKind::User { .. })).map_or(0, |u| u + 1);
+        let start = items[..=ix]
+            .iter()
+            .rposition(|i| matches!(i.kind, ItemKind::User { .. }))
+            .map_or(0, |u| u + 1);
         let (mut adds, mut dels) = (0usize, 0usize);
         let mut files: Vec<&str> = Vec::new();
         for item in &items[start..=ix] {
@@ -969,12 +1222,20 @@ impl SessionView {
     /// message being built (or the local echo), or start a new user item.
     fn apply_user_attachment(&mut self, message_id: Option<String>, attachment: UserAttachment) {
         if let Some(ix) = self.items.len().checked_sub(1) {
-            let same = message_id.as_ref().is_none_or(|id| &self.items[ix].key == id);
+            let same = message_id
+                .as_ref()
+                .is_none_or(|id| &self.items[ix].key == id);
             let item = &mut self.items[ix];
-            if let ItemKind::User { attachments, local, .. } = &mut item.kind {
+            if let ItemKind::User {
+                attachments, local, ..
+            } = &mut item.kind
+            {
                 // Echo of our own prompt (before or after its text echo): the
                 // local copy already lists it.
-                let echoed = self.echo_pending.iter().position(|(n, m)| *n == attachment.name && *m == attachment.mime);
+                let echoed = self
+                    .echo_pending
+                    .iter()
+                    .position(|(n, m)| *n == attachment.name && *m == attachment.mime);
                 if *local || (same && echoed.is_some()) {
                     match echoed {
                         Some(at) => {
@@ -997,7 +1258,14 @@ impl SessionView {
         }
         self.echo_pending.clear();
         let key = message_id.unwrap_or_else(|| format!("msg-{}", self.counter + 1));
-        self.push(key, ItemKind::User { text: String::new(), attachments: vec![attachment], local: false });
+        self.push(
+            key,
+            ItemKind::User {
+                text: String::new(),
+                attachments: vec![attachment],
+                local: false,
+            },
+        );
     }
 
     fn apply_chunk(&mut self, kind: &str, message_id: Option<String>, text: String) {
@@ -1005,7 +1273,9 @@ impl SessionView {
             return self.apply_thought(message_id, text);
         }
         if let Some(ix) = self.items.len().checked_sub(1) {
-            let same = message_id.as_ref().is_none_or(|id| &self.items[ix].key == id);
+            let same = message_id
+                .as_ref()
+                .is_none_or(|id| &self.items[ix].key == id);
             let item = &mut self.items[ix];
             let merged = match (kind, &mut item.kind) {
                 ("user_message_chunk", ItemKind::User { text: t, local, .. }) if *local => {
@@ -1017,7 +1287,8 @@ impl SessionView {
                     }
                     true
                 }
-                ("user_message_chunk", ItemKind::User { text: t, .. }) | ("agent_message_chunk", ItemKind::Agent { text: t })
+                ("user_message_chunk", ItemKind::User { text: t, .. })
+                | ("agent_message_chunk", ItemKind::Agent { text: t })
                     if same =>
                 {
                     t.push_str(&text);
@@ -1035,7 +1306,11 @@ impl SessionView {
         }
         let key = message_id.unwrap_or_else(|| format!("msg-{}", self.counter + 1));
         let kind = match kind {
-            "user_message_chunk" => ItemKind::User { text, attachments: Vec::new(), local: false },
+            "user_message_chunk" => ItemKind::User {
+                text,
+                attachments: Vec::new(),
+                local: false,
+            },
             _ => ItemKind::Agent { text },
         };
         self.push(key, kind);
@@ -1043,30 +1318,37 @@ impl SessionView {
 
     fn apply_thought(&mut self, message_id: Option<String>, text: String) {
         if let Some(ix) = self.items.len().checked_sub(1)
-            && let ItemKind::Work(entries) = &mut self.items[ix].kind {
-                if let Some(WorkEntry::Thought { id, text: t }) = entries.last_mut()
-                    && message_id.as_ref().is_none_or(|m| m == id) {
-                        t.push_str(&text);
-                        self.touch(ix);
-                        return;
-                    }
-                if text.is_empty() {
-                    return;
-                }
-                let id = message_id.unwrap_or_else(|| format!("thought-{}", self.counter + 1));
-                entries.push(WorkEntry::Thought { id, text });
+            && let ItemKind::Work(entries) = &mut self.items[ix].kind
+        {
+            if let Some(WorkEntry::Thought { id, text: t }) = entries.last_mut()
+                && message_id.as_ref().is_none_or(|m| m == id)
+            {
+                t.push_str(&text);
                 self.touch(ix);
                 return;
             }
+            if text.is_empty() {
+                return;
+            }
+            let id = message_id.unwrap_or_else(|| format!("thought-{}", self.counter + 1));
+            entries.push(WorkEntry::Thought { id, text });
+            self.touch(ix);
+            return;
+        }
         if text.is_empty() {
             return;
         }
         let id = message_id.unwrap_or_else(|| format!("thought-{}", self.counter + 1));
-        self.push(format!("work-{id}"), ItemKind::Work(vec![WorkEntry::Thought { id, text }]));
+        self.push(
+            format!("work-{id}"),
+            ItemKind::Work(vec![WorkEntry::Thought { id, text }]),
+        );
     }
 
     fn apply_tool(&mut self, update: &Value, created: bool) {
-        let Some(id) = update.get("toolCallId").and_then(Value::as_str) else { return };
+        let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
+            return;
+        };
         let ix = match self.tool_index.get(id).copied() {
             Some(ix) => ix,
             None if created || !self.tool_index.contains_key(id) => {
@@ -1083,12 +1365,18 @@ impl SessionView {
                     synthesized: false,
                 };
                 let ix = match self.items.last_mut() {
-                    Some(Item { kind: ItemKind::Work(entries), .. }) => {
+                    Some(Item {
+                        kind: ItemKind::Work(entries),
+                        ..
+                    }) => {
                         entries.push(WorkEntry::Tool(Box::new(call)));
                         self.items.len() - 1
                     }
                     _ => {
-                        self.push(format!("work-{id}"), ItemKind::Work(vec![WorkEntry::Tool(Box::new(call))]));
+                        self.push(
+                            format!("work-{id}"),
+                            ItemKind::Work(vec![WorkEntry::Tool(Box::new(call))]),
+                        );
                         self.items.len() - 1
                     }
                 };
@@ -1097,7 +1385,9 @@ impl SessionView {
             }
             None => return,
         };
-        let ItemKind::Work(entries) = &mut self.items[ix].kind else { return };
+        let ItemKind::Work(entries) = &mut self.items[ix].kind else {
+            return;
+        };
         let Some(call) = entries.iter_mut().find_map(|e| match e {
             WorkEntry::Tool(c) if c.id == id => Some(c),
             _ => None,
@@ -1118,7 +1408,10 @@ impl SessionView {
             call.input = Some(v.clone());
         }
         if let Some(locs) = update.get("locations").and_then(Value::as_array) {
-            call.locations = locs.iter().filter_map(|l| l.get("path").and_then(Value::as_str).map(str::to_owned)).collect();
+            call.locations = locs
+                .iter()
+                .filter_map(|l| l.get("path").and_then(Value::as_str).map(str::to_owned))
+                .collect();
         }
         if let Some(content) = update.get("content").and_then(Value::as_array) {
             let mut output = String::new();
@@ -1134,9 +1427,15 @@ impl SessionView {
                         }
                     }
                     Some("diff") => diffs.push(Diff::whole_file(
-                        c.get("path").and_then(Value::as_str).unwrap_or_default().into(),
+                        c.get("path")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .into(),
                         c.get("oldText").and_then(Value::as_str).map(str::to_owned),
-                        c.get("newText").and_then(Value::as_str).unwrap_or_default().into(),
+                        c.get("newText")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .into(),
                     )),
                     _ => {}
                 }
@@ -1144,19 +1443,29 @@ impl SessionView {
             call.output = output;
             if !diffs.is_empty() {
                 call.synthesized = false;
-                call.stats = diffs.iter().map(diff_stats).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+                call.stats = diffs
+                    .iter()
+                    .map(diff_stats)
+                    .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
                 call.diffs = diffs;
             }
         } else if call.output.is_empty()
-            && let Some(raw) = update.get("rawOutput").filter(|v| !v.is_null()) {
-                call.output = raw.as_str().map(str::to_owned).unwrap_or_else(|| raw.to_string());
-            }
+            && let Some(raw) = update.get("rawOutput").filter(|v| !v.is_null())
+        {
+            call.output = raw
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| raw.to_string());
+        }
         // Edit tools report a receipt, not a diff: rebuild one from the arguments.
         if call.diffs.is_empty() || call.synthesized {
             let diffs = synthesized_diffs(call);
             if !diffs.is_empty() || call.synthesized {
                 call.synthesized = !diffs.is_empty();
-                call.stats = diffs.iter().map(diff_stats).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+                call.stats = diffs
+                    .iter()
+                    .map(diff_stats)
+                    .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
                 call.diffs = diffs;
             }
         }
@@ -1191,8 +1500,14 @@ mod diff_tests {
         };
         let diffs = synthesized_diffs(&call);
         assert_eq!(diffs.len(), 2);
-        assert_eq!((diffs[0].old_start, diffs[0].new_start), (Some(10), Some(10)));
-        assert_eq!((diffs[1].old_start, diffs[1].new_start), (Some(40), Some(41)));
+        assert_eq!(
+            (diffs[0].old_start, diffs[0].new_start),
+            (Some(10), Some(10))
+        );
+        assert_eq!(
+            (diffs[1].old_start, diffs[1].new_start),
+            (Some(40), Some(41))
+        );
         assert!(diffs.iter().all(|d| d.snippet));
     }
 
@@ -1231,7 +1546,12 @@ mod history_tests {
     #[test]
     fn echoed_images_are_not_duplicated_after_text_echo() {
         let mut view = SessionView::new("a", "s", "/", "t");
-        let img = |n: &str| super::UserAttachment { name: n.into(), mime: "image/png".into(), size: None, data: None };
+        let img = |n: &str| super::UserAttachment {
+            name: n.into(),
+            mime: "image/png".into(),
+            size: None,
+            data: None,
+        };
         view.push_local_user("hi", vec![img("a.png"), img("b.png")]);
         // Text echo first (clears `local`), then the image blocks.
         view.apply(&json!({ "sessionUpdate": "user_message_chunk", "messageId": "u1", "content": { "type": "text", "text": "hi" } }));
@@ -1239,10 +1559,14 @@ mod history_tests {
             view.apply(&json!({ "sessionUpdate": "user_message_chunk", "messageId": "u1",
                 "content": { "type": "image", "mimeType": "image/png", "data": "x", "_meta": { "querymt": { "filename": n } } } }));
         }
-        let users: Vec<_> = view.items.iter().filter_map(|i| match &i.kind {
-            ItemKind::User { attachments, .. } => Some(attachments.len()),
-            _ => None,
-        }).collect();
+        let users: Vec<_> = view
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::User { attachments, .. } => Some(attachments.len()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(users, vec![2]);
     }
 
@@ -1274,10 +1598,19 @@ mod history_tests {
             _ => None,
         });
         let tool = tool.expect("tool call");
-        assert_eq!((tool.status.as_str(), tool.output.as_str(), tool.kind.as_str()), ("completed", "ok", "execute"));
+        assert_eq!(
+            (
+                tool.status.as_str(),
+                tool.output.as_str(),
+                tool.kind.as_str()
+            ),
+            ("completed", "ok", "execute")
+        );
 
         // Live updates for an older tool still find it after the prepend.
-        view.apply(&json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "failed" }));
+        view.apply(
+            &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "failed" }),
+        );
         assert!(view.items.iter().any(|i| matches!(&i.kind, ItemKind::Work(e) if e.iter().any(|e| matches!(e, WorkEntry::Tool(c) if c.status == "failed")))));
     }
 }
@@ -1288,7 +1621,13 @@ mod input_tests {
     use serde_json::json;
 
     fn pending(id: &str) -> PendingInput {
-        PendingInput { input_id: id.into(), delivery: "steer".into(), state: "sending".into(), text: "hi".into(), ..Default::default() }
+        PendingInput {
+            input_id: id.into(),
+            delivery: "steer".into(),
+            state: "sending".into(),
+            text: "hi".into(),
+            ..Default::default()
+        }
     }
 
     #[test]

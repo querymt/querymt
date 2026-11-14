@@ -73,7 +73,13 @@ impl TokenUsage {
     }
 
     fn all(&self) -> [Option<u64>; 5] {
-        [self.input, self.output, self.reasoning, self.cache_read, self.cache_write]
+        [
+            self.input,
+            self.output,
+            self.reasoning,
+            self.cache_read,
+            self.cache_write,
+        ]
     }
 
     fn any_missing(&self) -> bool {
@@ -83,7 +89,10 @@ impl TokenUsage {
     /// Live (`inputTokens`, …) or historical audit (`input_tokens`, `cache_read`, …) shape.
     pub fn read(value: &Value, historical: bool) -> Option<Self> {
         let obj = value.as_object()?;
-        let n = |live: &str, hist: &str| obj.get(if historical { hist } else { live }).and_then(Value::as_u64);
+        let n = |live: &str, hist: &str| {
+            obj.get(if historical { hist } else { live })
+                .and_then(Value::as_u64)
+        };
         let usage = Self {
             input: n("inputTokens", "input_tokens"),
             output: n("outputTokens", "output_tokens"),
@@ -118,8 +127,16 @@ impl Breakdown {
             }
         };
         let (latest, totals) = (side("latestRequest").ok()?, side("sessionTotals").ok()?);
-        let partial = partial || [latest, totals].iter().flatten().any(TokenUsage::any_missing);
-        Some(Self { latest, totals, partial })
+        let partial = partial
+            || [latest, totals]
+                .iter()
+                .flatten()
+                .any(TokenUsage::any_missing);
+        Some(Self {
+            latest,
+            totals,
+            partial,
+        })
     }
 
     /// Fold one audit `llm_request_end.usage` (disjoint categories) into the totals.
@@ -127,11 +144,12 @@ impl Breakdown {
         let latest = value.and_then(|v| TokenUsage::read(v, true));
         let mut totals = prev.and_then(|p| p.totals);
         if let Some(l) = latest {
-            let add = |before: Option<u64>, count: Option<u64>, had_prev: bool| match (before, count) {
-                (_, None) => None,
-                (None, Some(_)) if had_prev => None,
-                (b, Some(c)) => b.unwrap_or(0).checked_add(c),
-            };
+            let add =
+                |before: Option<u64>, count: Option<u64>, had_prev: bool| match (before, count) {
+                    (_, None) => None,
+                    (None, Some(_)) if had_prev => None,
+                    (b, Some(c)) => b.unwrap_or(0).checked_add(c),
+                };
             let had = totals.is_some();
             let t = totals.unwrap_or_default();
             totals = Some(TokenUsage {
@@ -184,7 +202,11 @@ pub fn charts(counts: &TokenUsage, partial: bool) -> [Chart; 2] {
             .iter()
             .map(|&key| {
                 let count = counts.get(key);
-                let share = if total > 0 { count.unwrap_or(0) as f32 / total as f32 } else { 0. };
+                let share = if total > 0 {
+                    count.unwrap_or(0) as f32 / total as f32
+                } else {
+                    0.
+                };
                 Segment { key, count, share }
             })
             .collect();
@@ -196,11 +218,22 @@ pub fn charts(counts: &TokenUsage, partial: bool) -> [Chart; 2] {
             let pct = (counts.get(headline).unwrap_or(0) as f64 / total as f64 * 100.).round();
             format!("{pct}% {word}")
         };
-        Chart { label, segments, total, complete, takeaway }
+        Chart {
+            label,
+            segments,
+            total,
+            complete,
+            takeaway,
+        }
     };
     [
         build("Input", &TokenKey::INPUT, TokenKey::CacheRead, "reused"),
-        build("Output", &TokenKey::OUTPUT, TokenKey::Reasoning, "reasoning"),
+        build(
+            "Output",
+            &TokenKey::OUTPUT,
+            TokenKey::Reasoning,
+            "reasoning",
+        ),
     ]
 }
 
@@ -248,7 +281,10 @@ fn complete_total(obj: &serde_json::Map<String, Value>) -> Option<Option<f64>> {
 fn read_scope(v: Option<&Value>) -> Option<Scope> {
     let o = v?.as_object()?;
     let count = |k: &str| o.get(k).and_then(Value::as_u64);
-    let billing = o.get("billing").and_then(Value::as_str).filter(|b| ["empty", "metered", "excluded", "mixed"].contains(b))?;
+    let billing = o
+        .get("billing")
+        .and_then(Value::as_str)
+        .filter(|b| ["empty", "metered", "excluded", "mixed"].contains(b))?;
     let complete_total_usd = complete_total(o)?;
     for k in ["pricedAttempts", "excludedAttempts", "incompleteAttempts"] {
         count(k)?;
@@ -303,15 +339,17 @@ impl Accounting {
 }
 
 fn describe_reason(reason: &Value) -> String {
-    let category = |c: &str| match c {
-        "input" => "input",
-        "output" => "output",
-        "cache_read" => "cache read",
-        "cache_write" => "cache write",
-        "cache_write_1h" => "one-hour cache write",
-        other => other,
-    }
-    .to_string();
+    let category = |c: &str| {
+        match c {
+            "input" => "input",
+            "output" => "output",
+            "cache_read" => "cache read",
+            "cache_write" => "cache write",
+            "cache_write_1h" => "one-hour cache write",
+            other => other,
+        }
+        .to_string()
+    };
     match reason.get("kind").and_then(Value::as_str) {
         Some("unresolved_attempt") => "A request has no recorded outcome".into(),
         Some("partial_usage") => "An interrupted request reported only partial usage".into(),
@@ -327,10 +365,18 @@ fn describe_reason(reason: &Value) -> String {
                 Some("pricing_unavailable") => "No price is available for the model".into(),
                 Some("missing_rate") => format!("No {cat} rate is configured"),
                 Some("invalid_rate") => format!("The {cat} rate is invalid"),
-                Some("contradictory_write_detail") => "Cache-write usage details are contradictory".into(),
-                Some("unsupported_dimension") => format!("Pricing dimension '{}' is not supported", s("dimension").unwrap_or("unknown")),
+                Some("contradictory_write_detail") => {
+                    "Cache-write usage details are contradictory".into()
+                }
+                Some("unsupported_dimension") => format!(
+                    "Pricing dimension '{}' is not supported",
+                    s("dimension").unwrap_or("unknown")
+                ),
                 Some("amount_overflow") => "A charge was not representable".into(),
-                Some("pricing_inapplicable") => format!("No price applies to the served model '{}'", s("effective_model").unwrap_or("unknown")),
+                Some("pricing_inapplicable") => format!(
+                    "No price applies to the served model '{}'",
+                    s("effective_model").unwrap_or("unknown")
+                ),
                 _ => "A charge could not be priced".into(),
             }
         }
@@ -339,7 +385,11 @@ fn describe_reason(reason: &Value) -> String {
 }
 
 fn describe_reasons(reasons: &[Value], unresolved: u64, unaccounted: u64) -> String {
-    let has = |k: &str| reasons.iter().any(|r| r.get("kind").and_then(Value::as_str) == Some(k));
+    let has = |k: &str| {
+        reasons
+            .iter()
+            .any(|r| r.get("kind").and_then(Value::as_str) == Some(k))
+    };
     let mut out: Vec<String> = Vec::new();
     let mut push = |s: String| {
         if !out.contains(&s) {
@@ -350,12 +400,20 @@ fn describe_reasons(reasons: &[Value], unresolved: u64, unaccounted: u64) -> Str
         push(describe_reason(r));
     }
     if unresolved > 0 && !has("unresolved_attempt") {
-        push(describe_reason(&serde_json::json!({ "kind": "unresolved_attempt" })));
+        push(describe_reason(
+            &serde_json::json!({ "kind": "unresolved_attempt" }),
+        ));
     }
     if unaccounted > 0 && !has("unaccounted_history") {
-        push(describe_reason(&serde_json::json!({ "kind": "unaccounted_history" })));
+        push(describe_reason(
+            &serde_json::json!({ "kind": "unaccounted_history" }),
+        ));
     }
-    if out.is_empty() { "some charges are unknown".into() } else { out.join("; ") }
+    if out.is_empty() {
+        "some charges are unknown".into()
+    } else {
+        out.join("; ")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -398,8 +456,16 @@ pub fn cost_lines(accounting: Option<&Accounting>, standard_usd: Option<f64>) ->
             let s = &acc.session;
             let clean = s.reasons.is_empty() && s.unresolved == 0;
             let excl = s.billing == "mixed" || s.billing == "excluded";
-            let label = if excl { "API cost (excl. subscription)" } else { "API cost" };
-            let note = if excl { format!(". {SUBSCRIPTION_NOTE}") } else { String::new() };
+            let label = if excl {
+                "API cost (excl. subscription)"
+            } else {
+                "API cost"
+            };
+            let note = if excl {
+                format!(". {SUBSCRIPTION_NOTE}")
+            } else {
+                String::new()
+            };
             if s.billing == "empty" && clean {
             } else if s.billing == "excluded" && clean {
                 // All-excluded usage is never a known zero-dollar invoice.
@@ -408,7 +474,8 @@ pub fn cost_lines(accounting: Option<&Accounting>, standard_usd: Option<f64>) ->
                     value: "Subscription".into(),
                     prefix: None,
                     tone: Tone::Muted,
-                    title: "Subscription usage excluded: no metered API charges are reported".into(),
+                    title: "Subscription usage excluded: no metered API charges are reported"
+                        .into(),
                 });
             } else if let Some(total) = s.complete_total_usd.filter(|_| s.complete) {
                 lines.push(CostLine {
@@ -422,13 +489,20 @@ pub fn cost_lines(accounting: Option<&Accounting>, standard_usd: Option<f64>) ->
                 let known = format_cost(s.known_subtotal_usd);
                 lines.push(CostLine {
                     label,
-                    title: format!("At least {known} - incomplete: {}{note}", describe_reasons(&s.reasons, s.unresolved, s.unaccounted)),
+                    title: format!(
+                        "At least {known} - incomplete: {}{note}",
+                        describe_reasons(&s.reasons, s.unresolved, s.unaccounted)
+                    ),
                     value: known,
                     prefix: Some("≥"),
                     tone: Tone::Warn,
                 });
             }
-            if let Some(b) = acc.budget.as_ref().filter(|b| b.known_subtotal_usd > 0. || b.best_effort) {
+            if let Some(b) = acc
+                .budget
+                .as_ref()
+                .filter(|b| b.known_subtotal_usd > 0. || b.best_effort)
+            {
                 lines.push(CostLine {
                     label: "Cycle budget",
                     value: format_cost(b.complete_total_usd.unwrap_or(b.known_subtotal_usd)),
@@ -449,8 +523,12 @@ pub fn cost_lines(accounting: Option<&Accounting>, standard_usd: Option<f64>) ->
 /// Standard ACP `usage_update.cost` (`{ amount, currency: "USD" }`).
 pub fn read_cost_usd(v: Option<&Value>) -> Option<f64> {
     let v = v?;
-    v.get("currency").and_then(Value::as_str).filter(|c| c.eq_ignore_ascii_case("USD"))?;
-    v.get("amount").and_then(Value::as_f64).filter(|a| a.is_finite())
+    v.get("currency")
+        .and_then(Value::as_str)
+        .filter(|c| c.eq_ignore_ascii_case("USD"))?;
+    v.get("amount")
+        .and_then(Value::as_f64)
+        .filter(|a| a.is_finite())
 }
 
 // ---- formatting -------------------------------------------------------------
@@ -546,7 +624,13 @@ mod tests {
 
     #[test]
     fn charts_match_desktop_takeaways() {
-        let counts = TokenUsage { input: Some(1_000), cache_read: Some(99_000), cache_write: Some(0), output: Some(116), reasoning: Some(0) };
+        let counts = TokenUsage {
+            input: Some(1_000),
+            cache_read: Some(99_000),
+            cache_write: Some(0),
+            output: Some(116),
+            reasoning: Some(0),
+        };
         let [input, output] = charts(&counts, false);
         assert_eq!(input.total, 100_000);
         assert_eq!(input.takeaway, "99% reused");
@@ -563,19 +647,29 @@ mod tests {
 
     #[test]
     fn cost_lines_follow_accounting_states() {
-        let read = |s: Value| Accounting::read(Some(&json!({ "version": 1, "session": s, "cycle": null }))).unwrap();
+        let read = |s: Value| {
+            Accounting::read(Some(&json!({ "version": 1, "session": s, "cycle": null }))).unwrap()
+        };
         let sub = cost_lines(Some(&read(scope("excluded", false, Value::Null))), None);
-        assert_eq!((sub[0].label, sub[0].value.as_str(), sub[0].tone), ("API cost", "Subscription", Tone::Muted));
+        assert_eq!(
+            (sub[0].label, sub[0].value.as_str(), sub[0].tone),
+            ("API cost", "Subscription", Tone::Muted)
+        );
         let est = cost_lines(Some(&read(scope("metered", true, json!(2.345)))), Some(9.));
         assert_eq!((est[0].value.as_str(), est[0].prefix), ("$2.35", None));
         let inc = cost_lines(Some(&read(scope("mixed", false, Value::Null))), None);
-        assert_eq!((inc[0].label, inc[0].prefix, inc[0].tone), ("API cost (excl. subscription)", Some("≥"), Tone::Warn));
+        assert_eq!(
+            (inc[0].label, inc[0].prefix, inc[0].tone),
+            ("API cost (excl. subscription)", Some("≥"), Tone::Warn)
+        );
         assert!(cost_lines(Some(&read(scope("empty", false, Value::Null))), None).is_empty());
         assert_eq!(cost_lines(None, Some(0.004))[0].value, "$0.0040");
         // Omitting `completeTotalUsd` is malformed.
         let mut s = scope("metered", true, json!(1));
         s.as_object_mut().unwrap().remove("completeTotalUsd");
-        assert!(Accounting::read(Some(&json!({ "version": 1, "session": s, "cycle": null }))).is_none());
+        assert!(
+            Accounting::read(Some(&json!({ "version": 1, "session": s, "cycle": null }))).is_none()
+        );
     }
 
     #[test]

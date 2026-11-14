@@ -29,7 +29,6 @@ pub fn parse_rfc3339_ms(s: &str) -> Option<f64> {
     Some(((days * 86400 + h * 3600 + mi * 60 + sec) * 1000) as f64)
 }
 
-
 pub fn workspace_name(cwd: &str) -> String {
     cwd.trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])
@@ -38,10 +37,11 @@ pub fn workspace_name(cwd: &str) -> String {
         .to_string()
 }
 
-
 /// Compact age like the Svelte app: `now`, `5m`, `2h`, `3d`, then `Oct 31`.
 pub fn short_time(timestamp: &str) -> String {
-    let Some(ms) = parse_rfc3339_ms(timestamp) else { return String::new() };
+    let Some(ms) = parse_rfc3339_ms(timestamp) else {
+        return String::new();
+    };
     let secs = ((now_ms() - ms) / 1000.0).max(0.0) as u64;
     match secs {
         0..60 => "now".into(),
@@ -49,9 +49,17 @@ pub fn short_time(timestamp: &str) -> String {
         3600..86400 => format!("{}h", secs / 3600),
         86400..604800 => format!("{}d", secs / 86400),
         _ => {
-            const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-            let month = timestamp.get(5..7).and_then(|m| m.parse::<usize>().ok()).unwrap_or(1);
-            let day = timestamp.get(8..10).and_then(|d| d.parse::<u32>().ok()).unwrap_or(1);
+            const MONTHS: [&str; 12] = [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+            ];
+            let month = timestamp
+                .get(5..7)
+                .and_then(|m| m.parse::<usize>().ok())
+                .unwrap_or(1);
+            let day = timestamp
+                .get(8..10)
+                .and_then(|d| d.parse::<u32>().ok())
+                .unwrap_or(1);
             format!("{} {day}", MONTHS[(month.clamp(1, 12)) - 1])
         }
     }

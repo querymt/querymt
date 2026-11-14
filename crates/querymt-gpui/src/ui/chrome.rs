@@ -41,12 +41,20 @@ fn window_control(control: Control, p: &Palette) -> impl IntoElement {
     let (id, icon, area) = match control {
         Control::Minimize => ("win-min", IconName::WindowMinimize, WindowControlArea::Min),
         Control::Maximize => ("win-max", IconName::WindowMaximize, WindowControlArea::Max),
-        Control::Restore => ("win-restore", IconName::WindowRestore, WindowControlArea::Max),
+        Control::Restore => (
+            "win-restore",
+            IconName::WindowRestore,
+            WindowControlArea::Max,
+        ),
         Control::Close => ("win-close", IconName::WindowClose, WindowControlArea::Close),
     };
     let close = matches!(control, Control::Close);
     let hover_bg = if close { p.danger } else { p.card_hover };
-    let hover_fg = if close { if p.dark { p.bg } else { hsla(0., 0., 1., 1.) } } else { p.text };
+    let hover_fg = if close {
+        if p.dark { p.bg } else { hsla(0., 0., 1., 1.) }
+    } else {
+        p.text
+    };
     div()
         .id(id)
         .flex()
@@ -84,8 +92,12 @@ impl QmtApp {
             Page::Start => {
                 let cwd = self.cwd.read(cx).value().trim().to_string();
                 let store = self.store.read(cx);
-                let agent = store.primary_agent().and_then(|id| store.config(&id).map(|c| c.name.clone()));
-                let model = store.primary_agent().and_then(|id| store.launch_model(&id).map(|m| m.label.clone()));
+                let agent = store
+                    .primary_agent()
+                    .and_then(|id| store.config(&id).map(|c| c.name.clone()));
+                let model = store
+                    .primary_agent()
+                    .and_then(|id| store.launch_model(&id).map(|m| m.label.clone()));
                 let mut out = vec![
                     h_flex()
                         .gap_1p5()
@@ -95,12 +107,18 @@ impl QmtApp {
                         .bg(p.card)
                         .text_xs()
                         .child(kit::icon(IconName::FolderOpen, 12., p.dim))
-                        .child(div().text_color(if cwd.is_empty() { p.dim } else { p.text }).child(if cwd.is_empty() {
-                            "No workspace".to_string()
-                        } else {
-                            workspace_name(&cwd)
-                        }))
-                        .when_some(agent, |el, a| el.child(div().text_color(p.dim).child(format!("on {a}"))))
+                        .child(
+                            div()
+                                .text_color(if cwd.is_empty() { p.dim } else { p.text })
+                                .child(if cwd.is_empty() {
+                                    "No workspace".to_string()
+                                } else {
+                                    workspace_name(&cwd)
+                                }),
+                        )
+                        .when_some(agent, |el, a| {
+                            el.child(div().text_color(p.dim).child(format!("on {a}")))
+                        })
                         .into_any_element(),
                 ];
                 if let Some(model) = model {
@@ -111,7 +129,8 @@ impl QmtApp {
             Page::Agents => {
                 let store = self.store.read(cx);
                 let refreshing = store.configs.iter().any(|c| {
-                    store.state(&c.id) == ConnState::Connecting || store.runtime(&c.id).is_some_and(|r| r.busy)
+                    store.state(&c.id) == ConnState::Connecting
+                        || store.runtime(&c.id).is_some_and(|r| r.busy)
                 });
                 vec![
                     kit::button("hdr-add-agent")
@@ -119,18 +138,32 @@ impl QmtApp {
                         .small()
                         .icon(IconName::Plus)
                         .label("Add agent")
-                        .on_click(cx.listener(|this, _, window, cx| this.open_add_dialog(window, cx)))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_add_dialog(window, cx)),
+                        )
                         .into_any_element(),
-                    kit::loading_icon_button("hdr-refresh", IconName::RefreshCw, "Refresh agents", refreshing, 24.)
-                        .on_click(cx.listener(|this, _, _, cx| this.store.update(cx, |s, cx| s.refresh_all(cx))))
-                        .into_any_element(),
+                    kit::loading_icon_button(
+                        "hdr-refresh",
+                        IconName::RefreshCw,
+                        "Refresh agents",
+                        refreshing,
+                        24.,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.store.update(cx, |s, cx| s.refresh_all(cx))
+                    }))
+                    .into_any_element(),
                 ]
             }
             _ => vec![],
         }
     }
 
-    pub(super) fn render_header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_header(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let p = *palette(cx);
         let dark = p.dark;
         let client_decorated = client_tiling(window).is_some();
@@ -150,7 +183,10 @@ impl QmtApp {
         // The open session owns the title bar: back + status + title centred,
         // its actions on the right where the connection status used to be.
         let (session_title, session_actions) = match self.page {
-            Page::Session => self.session_chrome(&p, cx).map(|(t, r)| (Some(t), r)).unwrap_or((None, vec![])),
+            Page::Session => self
+                .session_chrome(&p, cx)
+                .map(|(t, r)| (Some(t), r))
+                .unwrap_or((None, vec![])),
             _ => (None, vec![]),
         };
         let is_session = session_title.is_some();
@@ -158,7 +194,8 @@ impl QmtApp {
         let page_title_left = div().text_sm().text_color(p.muted).child(page_title);
         let narrow = window.viewport_size().width < px(760.);
         // Interactive widgets swallow mouse-down so clicks never turn into window drags.
-        let no_drag = |el: Div| el.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let no_drag =
+            |el: Div| el.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
 
         let brand = h_flex()
             .gap_2()
@@ -173,15 +210,27 @@ impl QmtApp {
                     .justify_center()
                     .child(
                         svg()
-                            .path(if dark { "brand/querymt-dark.svg" } else { "brand/querymt.svg" })
+                            .path(if dark {
+                                "brand/querymt-dark.svg"
+                            } else {
+                                "brand/querymt.svg"
+                            })
                             .size(px(19.))
                             // GPUI renders SVGs as masks, so the tint must match the theme too.
-                            .text_color(if dark { rgb(0xfff7ed).into() } else { hsla(0., 0., 0.08, 1.) }),
+                            .text_color(if dark {
+                                rgb(0xfff7ed).into()
+                            } else {
+                                hsla(0., 0., 0.08, 1.)
+                            }),
                     ),
             )
             // Narrow session windows drop the wordmark to give the title room.
-            .when(!(is_session && narrow), |el| el.child(div().text_sm().font_semibold().child("QueryMT")))
-            .when(!is_session, |el| el.child(div().text_sm().text_color(p.border_strong).child("/")));
+            .when(!(is_session && narrow), |el| {
+                el.child(div().text_sm().font_semibold().child("QueryMT"))
+            })
+            .when(!is_session, |el| {
+                el.child(div().text_sm().text_color(p.border_strong).child("/"))
+            });
 
         h_flex()
             .id("app-header")
@@ -190,14 +239,24 @@ impl QmtApp {
             .w_full()
             .gap_3()
             .pr_2()
-            .pl(if IS_MACOS && !window.is_fullscreen() { px(80.) } else { px(14.) })
+            .pl(if IS_MACOS && !window.is_fullscreen() {
+                px(80.)
+            } else {
+                px(14.)
+            })
             // No background here: the root paints a rounded `p.bg` underneath,
             // and GPUI's overflow mask is rectangular, so a square quad flush
             // with the top would overpaint the frame's rounded corners.
             .when(!IS_WEB, |el| {
                 el.window_control_area(WindowControlArea::Drag)
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| this.header_drag = true))
-                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.header_drag = false))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| this.header_drag = true),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| this.header_drag = false),
+                    )
                     .on_mouse_down_out(cx.listener(|this, _, _, _| this.header_drag = false))
                     .on_mouse_move(cx.listener(|this, _, window, _| {
                         if this.header_drag {
@@ -214,7 +273,9 @@ impl QmtApp {
                     })
             })
             .when(IS_LINUX && client_decorated, |el| {
-                el.on_mouse_down(MouseButton::Right, |ev, window, _| window.show_window_menu(ev.position))
+                el.on_mouse_down(MouseButton::Right, |ev, window, _| {
+                    window.show_window_menu(ev.position)
+                })
             })
             // Session: three columns whose outer two share one flex basis, so
             // the title is centred on the window rather than on leftover space.
@@ -232,7 +293,13 @@ impl QmtApp {
             )
             // The title stays a drag handle; it truncates before the sides shrink.
             .children(page_title_center.map(|title| {
-                h_flex().flex_initial().max_w(relative(0.5)).min_w_0().overflow_hidden().justify_center().child(title)
+                h_flex()
+                    .flex_initial()
+                    .max_w(relative(0.5))
+                    .min_w_0()
+                    .overflow_hidden()
+                    .justify_center()
+                    .child(title)
             }))
             .child(no_drag(
                 h_flex()
@@ -241,11 +308,18 @@ impl QmtApp {
                     .gap_1()
                     .children(session_actions)
                     .child(
-                        kit::title_icon_button("hdr-theme", if dark { IconName::Sun } else { IconName::Moon }, "Toggle theme", &p)
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                        kit::title_icon_button(
+                            "hdr-theme",
+                            if dark { IconName::Sun } else { IconName::Moon },
+                            "Toggle theme",
+                            &p,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
                                 this.store.update(cx, |s, _| s.set_dark(!dark));
                                 this.apply_theme(window, cx);
-                            })),
+                            },
+                        )),
                     )
                     .when(show_controls, |el| {
                         el.child(
@@ -253,9 +327,18 @@ impl QmtApp {
                                 .gap_1()
                                 // 8px before minimise (gap 4 + 4), +50% → 12px.
                                 .pl_2()
-                                .when(controls.minimize, |el| el.child(window_control(Control::Minimize, &p)))
+                                .when(controls.minimize, |el| {
+                                    el.child(window_control(Control::Minimize, &p))
+                                })
                                 .when(controls.maximize, |el| {
-                                    el.child(window_control(if maximized { Control::Restore } else { Control::Maximize }, &p))
+                                    el.child(window_control(
+                                        if maximized {
+                                            Control::Restore
+                                        } else {
+                                            Control::Maximize
+                                        },
+                                        &p,
+                                    ))
                                 })
                                 .child(window_control(Control::Close, &p)),
                         )

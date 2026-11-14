@@ -1,15 +1,26 @@
 //! Minimal JSON-RPC 2.0 client on top of a [`crate::transport::Connection`].
 //! The owner runs the read loop and feeds every inbound line to [`RpcClient::handle`].
 
-use std::{cell::{Cell, RefCell}, collections::HashMap, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    rc::Rc,
+};
 
 use async_channel::Sender;
 use futures::channel::oneshot;
 use serde_json::{Value, json};
 
 pub enum Incoming {
-    Notification { method: String, params: Value },
-    Request { id: Value, method: String, params: Value },
+    Notification {
+        method: String,
+        params: Value,
+    },
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
 }
 
 type Pending = oneshot::Sender<Result<Value, String>>;
@@ -22,18 +33,30 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub fn new(outgoing: Sender<String>) -> Rc<Self> {
-        Rc::new(Self { outgoing, next_id: Cell::new(1), pending: RefCell::new(HashMap::new()) })
+        Rc::new(Self {
+            outgoing,
+            next_id: Cell::new(1),
+            pending: RefCell::new(HashMap::new()),
+        })
     }
 
-    pub fn request(&self, method: &str, params: Value) -> impl Future<Output = Result<Value, String>> + 'static {
+    pub fn request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> impl Future<Output = Result<Value, String>> + 'static {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         let (tx, rx) = oneshot::channel();
         self.pending.borrow_mut().insert(id, tx);
-        let text = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
+        let text =
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
         let outgoing = self.outgoing.clone();
         async move {
-            outgoing.send(text).await.map_err(|_| "Connection closed.".to_string())?;
+            outgoing
+                .send(text)
+                .await
+                .map_err(|_| "Connection closed.".to_string())?;
             rx.await.map_err(|_| "Connection closed.".to_string())?
         }
     }
@@ -47,7 +70,9 @@ impl RpcClient {
     pub fn respond(&self, id: Value, result: Result<Value, (i64, String)>) {
         let message = match result {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            Err((code, message)) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
+            Err((code, message)) => {
+                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+            }
         };
         let _ = self.outgoing.try_send(message.to_string());
     }
@@ -62,15 +87,26 @@ impl RpcClient {
         if let Some(method) = message.get("method").and_then(Value::as_str) {
             let params = message.get("params").cloned().unwrap_or(Value::Null);
             return Some(match message.get("id") {
-                Some(id) if !id.is_null() => Incoming::Request { id: id.clone(), method: method.into(), params },
-                _ => Incoming::Notification { method: method.into(), params },
+                Some(id) if !id.is_null() => Incoming::Request {
+                    id: id.clone(),
+                    method: method.into(),
+                    params,
+                },
+                _ => Incoming::Notification {
+                    method: method.into(),
+                    params,
+                },
             });
         }
         let id = message.get("id").and_then(Value::as_u64)?;
         let pending = self.pending.borrow_mut().remove(&id)?;
         let result = match message.get("error") {
             Some(error) => {
-                let mut text = error.get("message").and_then(Value::as_str).unwrap_or("Request failed").to_string();
+                let mut text = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Request failed")
+                    .to_string();
                 if let Some(detail) = error.pointer("/data/error").and_then(Value::as_str) {
                     text = format!("{text}: {detail}");
                 }

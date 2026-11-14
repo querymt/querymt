@@ -8,8 +8,8 @@ use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::{AgentDialog, QmtApp, kit};
 use super::kit::ButtonExt as _;
+use super::{AgentDialog, QmtApp, kit};
 use crate::store::{AgentConfig, ConnState, Endpoint, normalize_address};
 use crate::theme::{Palette, palette};
 
@@ -22,27 +22,46 @@ impl QmtApp {
         for input in [&self.d_name, &self.d_command, &self.d_address] {
             input.update(cx, |s, cx| s.set_value(SharedString::default(), window, cx));
         }
-        self.d_command.update(cx, |s, cx| s.set_value("qmtcode --acp", window, cx));
-        self.dialog = Some(AgentDialog { editing: None, websocket: !CAN_SPAWN, error: None });
+        self.d_command
+            .update(cx, |s, cx| s.set_value("qmtcode --acp", window, cx));
+        self.dialog = Some(AgentDialog {
+            editing: None,
+            websocket: !CAN_SPAWN,
+            error: None,
+        });
         self.d_name.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
     }
 
-    fn open_edit_dialog(&mut self, config: &AgentConfig, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_edit_dialog(
+        &mut self,
+        config: &AgentConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (command, address) = match &config.endpoint {
             Endpoint::Process { command } => (command.clone(), String::new()),
             Endpoint::WebSocket { .. } => (String::new(), config.endpoint_label()),
         };
-        self.d_name.update(cx, |s, cx| s.set_value(config.name.clone(), window, cx));
-        self.d_command.update(cx, |s, cx| s.set_value(command, window, cx));
-        self.d_address.update(cx, |s, cx| s.set_value(address, window, cx));
+        self.d_name
+            .update(cx, |s, cx| s.set_value(config.name.clone(), window, cx));
+        self.d_command
+            .update(cx, |s, cx| s.set_value(command, window, cx));
+        self.d_address
+            .update(cx, |s, cx| s.set_value(address, window, cx));
         self.details = None;
-        self.dialog = Some(AgentDialog { editing: Some(config.id.clone()), websocket: config.is_websocket(), error: None });
+        self.dialog = Some(AgentDialog {
+            editing: Some(config.id.clone()),
+            websocket: config.is_websocket(),
+            error: None,
+        });
         cx.notify();
     }
 
     pub(super) fn save_dialog(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = &mut self.dialog else { return };
+        let Some(dialog) = &mut self.dialog else {
+            return;
+        };
         let name = self.d_name.read(cx).value().trim().to_string();
         let endpoint = if dialog.websocket {
             match normalize_address(&self.d_address.read(cx).value()) {
@@ -65,7 +84,11 @@ impl QmtApp {
         let name = if name.is_empty() {
             match &endpoint {
                 Endpoint::WebSocket { address, .. } => address.clone(),
-                Endpoint::Process { command } => command.split_whitespace().next().unwrap_or("agent").to_string(),
+                Endpoint::Process { command } => command
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("agent")
+                    .to_string(),
             }
         } else {
             name
@@ -108,9 +131,17 @@ impl QmtApp {
 
         let summary = h_flex()
             .gap_3()
-            .child(kit::count_pill(format!("{connected}/{}", configs.len()), "connected", &p))
+            .child(kit::count_pill(
+                format!("{connected}/{}", configs.len()),
+                "connected",
+                &p,
+            ))
             .when(!attention.is_empty(), |el| {
-                el.child(kit::count_pill(attention.len().to_string(), "need attention", &p))
+                el.child(kit::count_pill(
+                    attention.len().to_string(),
+                    "need attention",
+                    &p,
+                ))
             });
 
         let list = if configs.is_empty() {
@@ -150,7 +181,12 @@ impl QmtApp {
                 .child(
                     v_flex()
                         .child(div().font_semibold().child("Needs attention"))
-                        .child(div().text_sm().text_color(p.muted).child("Agents with connection or runtime issues.")),
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(p.muted)
+                                .child("Agents with connection or runtime issues."),
+                        ),
                 )
                 .children(attention.into_iter().map(|(c, reason)| {
                     let id = c.id.clone();
@@ -168,13 +204,21 @@ impl QmtApp {
                                 .flex_1()
                                 .min_w_0()
                                 .child(div().text_sm().font_medium().child(c.name.clone()))
-                                .child(div().text_xs().text_color(p.muted).truncate().child(reason)),
+                                .child(
+                                    div().text_xs().text_color(p.muted).truncate().child(reason),
+                                ),
                         )
                         .child(
                             kit::button(kit::keyed("attention-retry", id.clone()))
                                 .small()
-                                .label(if c.is_websocket() { "Reconnect" } else { "Restart" })
-                                .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.connect(&id, cx)))),
+                                .label(if c.is_websocket() {
+                                    "Reconnect"
+                                } else {
+                                    "Restart"
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.store.update(cx, |s, cx| s.connect(&id, cx))
+                                })),
                         )
                 }))
         });
@@ -195,8 +239,12 @@ impl QmtApp {
         let store = self.store.read(cx);
         let state = store.state(&c.id);
         let rt = store.runtime(&c.id);
-        let sessions = rt.map_or(0, |r| r.sessions.iter().filter(|s| s.root && s.open).count());
-        let running = rt.map_or(0, |r| r.sessions.iter().filter(|s| s.root && s.running()).count());
+        let sessions = rt.map_or(0, |r| {
+            r.sessions.iter().filter(|s| s.root && s.open).count()
+        });
+        let running = rt.map_or(0, |r| {
+            r.sessions.iter().filter(|s| s.root && s.running()).count()
+        });
         let models = rt.map_or(0, |r| r.models.len());
         let version = rt.and_then(|r| r.agent_version.clone());
         let host = rt.and_then(|r| r.mesh.as_ref()?.hostname.clone());
@@ -207,8 +255,14 @@ impl QmtApp {
         let status = kit::status_color(&state, p);
         let hover_border = p.border_strong;
 
-        let (id_details, id_edit, id_toggle, id_restart, id_auto, id_delete) =
-            (c.id.clone(), c.clone(), c.id.clone(), c.id.clone(), c.id.clone(), c.id.clone());
+        let (id_details, id_edit, id_toggle, id_restart, id_auto, id_delete) = (
+            c.id.clone(),
+            c.clone(),
+            c.id.clone(),
+            c.id.clone(),
+            c.id.clone(),
+            c.id.clone(),
+        );
         let websocket = c.is_websocket();
 
         // Avatar tile with the status dot in its corner.
@@ -221,7 +275,15 @@ impl QmtApp {
             .flex()
             .items_center()
             .justify_center()
-            .child(kit::icon(if websocket { IconName::Globe } else { IconName::Terminal }, 18., if connected { p.accent } else { p.dim }))
+            .child(kit::icon(
+                if websocket {
+                    IconName::Globe
+                } else {
+                    IconName::Terminal
+                },
+                18.,
+                if connected { p.accent } else { p.dim },
+            ))
             .child(
                 div()
                     .absolute()
@@ -238,25 +300,49 @@ impl QmtApp {
 
         let title = h_flex()
             .gap_2()
-            .child(div().text_sm().font_semibold().truncate().child(c.name.clone()))
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .truncate()
+                    .child(c.name.clone()),
+            )
             .child(kit::tone_chip(kit::state_label(&state), status))
-            .when(is_primary && connected, |el| el.child(kit::tone_chip("default", p.accent)))
+            .when(is_primary && connected, |el| {
+                el.child(kit::tone_chip("default", p.accent))
+            })
             .when(c.host_managed, |el| el.child(kit::chip("host managed", p)));
 
         let meta = h_flex()
             .gap_1p5()
             .text_xs()
             .text_color(p.dim)
-            .child(div().font_family(kit::MONO).truncate().child(c.endpoint_label()))
+            .child(
+                div()
+                    .font_family(kit::MONO)
+                    .truncate()
+                    .child(c.endpoint_label()),
+            )
             .when_some(host, |el, h| el.child("·").child(format!("on {h}")))
-            .when_some(version, |el, v| el.child("·").child(div().font_family(kit::MONO).child(format!("v{v}"))))
-            .when(c.auto_start && !c.host_managed, |el| el.child("·").child("auto-start"));
+            .when_some(version, |el, v| {
+                el.child("·")
+                    .child(div().font_family(kit::MONO).child(format!("v{v}")))
+            })
+            .when(c.auto_start && !c.host_managed, |el| {
+                el.child("·").child("auto-start")
+            });
 
         let stat = |value: String, label: &'static str, color: Hsla| {
             v_flex()
                 .w(px(68.))
                 .items_end()
-                .child(div().text_sm().font_semibold().text_color(color).child(value))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(color)
+                        .child(value),
+                )
                 .child(div().text_xs().text_color(p.dim).child(label))
         };
         let stats = connected.then(|| {
@@ -264,9 +350,15 @@ impl QmtApp {
                 .flex_none()
                 .gap_1()
                 .child(stat(sessions.to_string(), "open", p.text))
-                .child(stat(running.to_string(), "running", if running > 0 { p.success } else { p.text }))
+                .child(stat(
+                    running.to_string(),
+                    "running",
+                    if running > 0 { p.success } else { p.text },
+                ))
                 .child(stat(models.to_string(), "models", p.text))
-                .when_some(peers, |el, n| el.child(stat(n.to_string(), "peers", p.text)))
+                .when_some(peers, |el, n| {
+                    el.child(stat(n.to_string(), "peers", p.text))
+                })
         });
 
         // Primary actions always visible; config actions appear on hover.
@@ -277,7 +369,11 @@ impl QmtApp {
             .child(
                 kit::icon_button(
                     kit::keyed("toggle", c.id.clone()),
-                    if live { IconName::Square } else { IconName::Play },
+                    if live {
+                        IconName::Square
+                    } else {
+                        IconName::Play
+                    },
                     match (live, websocket) {
                         (true, true) => "Disconnect",
                         (true, false) => "Stop",
@@ -286,42 +382,90 @@ impl QmtApp {
                     },
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.store.update(cx, |s, cx| if live { s.disconnect(&id_toggle, cx) } else { s.connect(&id_toggle, cx) })
+                    this.store.update(cx, |s, cx| {
+                        if live {
+                            s.disconnect(&id_toggle, cx)
+                        } else {
+                            s.connect(&id_toggle, cx)
+                        }
+                    })
                 })),
             )
             .when(live, |el| {
                 el.child(
-                    kit::icon_button(kit::keyed("restart", c.id.clone()), IconName::RotateCcw, if websocket { "Reconnect" } else { "Restart" })
-                        .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.connect(&id_restart, cx)))),
+                    kit::icon_button(
+                        kit::keyed("restart", c.id.clone()),
+                        IconName::RotateCcw,
+                        if websocket { "Reconnect" } else { "Restart" },
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store.update(cx, |s, cx| s.connect(&id_restart, cx))
+                    })),
                 )
             })
-            .child(kit::icon_button(kit::keyed("details", c.id.clone()), IconName::Info, "Details").on_click(cx.listener(move |this, _, _, cx| {
-                this.details = Some(id_details.clone());
-                cx.notify();
-            })))
+            .child(
+                kit::icon_button(
+                    kit::keyed("details", c.id.clone()),
+                    IconName::Info,
+                    "Details",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.details = Some(id_details.clone());
+                    cx.notify();
+                })),
+            )
             .when(!c.host_managed, |el| {
                 el.child(
                     h_flex()
                         .gap_0p5()
                         .opacity(0.)
                         .group_hover("arow", |s| s.opacity(1.))
-                        .child(kit::icon_button(kit::keyed("edit", c.id.clone()), IconName::Pencil, "Edit").on_click(cx.listener(
-                            move |this, _, window, cx| this.open_edit_dialog(&id_edit, window, cx),
-                        )))
+                        .child(
+                            kit::icon_button(
+                                kit::keyed("edit", c.id.clone()),
+                                IconName::Pencil,
+                                "Edit",
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.open_edit_dialog(&id_edit, window, cx)
+                                },
+                            )),
+                        )
                         .child(
                             kit::icon_button(
                                 kit::keyed("auto", c.id.clone()),
-                                if c.auto_start { IconName::ToggleRight } else { IconName::ToggleLeft },
-                                if c.auto_start { "Disable auto-start" } else { "Enable auto-start" },
+                                if c.auto_start {
+                                    IconName::ToggleRight
+                                } else {
+                                    IconName::ToggleLeft
+                                },
+                                if c.auto_start {
+                                    "Disable auto-start"
+                                } else {
+                                    "Enable auto-start"
+                                },
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.toggle_auto_start(&id_auto, cx)))),
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.store
+                                        .update(cx, |s, cx| s.toggle_auto_start(&id_auto, cx))
+                                },
+                            )),
                         )
-                        .child(kit::icon_button(kit::keyed("delete", c.id.clone()), IconName::Trash, "Delete").on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.confirm_delete = Some(id_delete.clone());
-                                cx.notify();
-                            },
-                        ))),
+                        .child(
+                            kit::icon_button(
+                                kit::keyed("delete", c.id.clone()),
+                                IconName::Trash,
+                                "Delete",
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.confirm_delete = Some(id_delete.clone());
+                                    cx.notify();
+                                },
+                            )),
+                        ),
                 )
             });
 
@@ -355,7 +499,9 @@ impl QmtApp {
                             ConnState::Failed(reason) => Some(reason.clone()),
                             _ => None,
                         },
-                        |el, reason| el.child(div().text_xs().text_color(p.warn).truncate().child(reason)),
+                        |el, reason| {
+                            el.child(div().text_xs().text_color(p.warn).truncate().child(reason))
+                        },
                     ),
             )
             .children(stats)
@@ -364,7 +510,11 @@ impl QmtApp {
 
     // ---- overlays -----------------------------------------------------------
 
-    pub(super) fn render_overlay(&mut self, radii: Corners<Pixels>, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_overlay(
+        &mut self,
+        radii: Corners<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let p = *palette(cx);
         let scrim = |id: &'static str| {
             div()
@@ -380,10 +530,21 @@ impl QmtApp {
         };
 
         if let Some(id) = self.confirm_delete.clone() {
-            let name = self.store.read(cx).config(&id).map(|c| c.name.clone()).unwrap_or_default();
-            let card = self.modal_card(&p)
+            let name = self
+                .store
+                .read(cx)
+                .config(&id)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            let card = self
+                .modal_card(&p)
                 .w(px(420.))
-                .child(div().text_lg().font_semibold().child(format!("Delete {name}?")))
+                .child(
+                    div()
+                        .text_lg()
+                        .font_semibold()
+                        .child(format!("Delete {name}?")),
+                )
                 .child(div().text_sm().text_color(p.muted).child(
                     "The configuration is removed from this app. Sessions stay on the agent.",
                 ))
@@ -391,19 +552,23 @@ impl QmtApp {
                     h_flex()
                         .justify_end()
                         .gap_2()
-                        .child(kit::button("del-cancel").label("Cancel").on_click(cx.listener(|this, _, _, cx| {
-                            this.confirm_delete = None;
-                            cx.notify();
-                        })))
-                        .child(kit::button("del-ok").danger().label("Delete").on_click(cx.listener(
-                            move |this, _, _, cx| {
+                        .child(
+                            kit::button("del-cancel")
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_delete = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(kit::button("del-ok").danger().label("Delete").on_click(
+                            cx.listener(move |this, _, _, cx| {
                                 this.confirm_delete = None;
                                 if this.details.as_deref() == Some(id.as_str()) {
                                     this.details = None;
                                 }
                                 this.store.update(cx, |s, cx| s.delete_config(&id, cx));
-                            },
-                        ))),
+                            }),
+                        )),
                 );
             return Some(self.centered(scrim("scrim-delete"), card, cx));
         }
@@ -534,32 +699,66 @@ impl QmtApp {
                 this.close_topmost();
                 cx.notify();
             }))
-            .child(card.id("modal-card").on_click(|_, _, cx| cx.stop_propagation()))
+            .child(
+                card.id("modal-card")
+                    .on_click(|_, _, cx| cx.stop_propagation()),
+            )
             .into_any_element()
     }
 
-    fn render_details(&self, id: &str, scrim: Stateful<Div>, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+    fn render_details(
+        &self,
+        id: &str,
+        scrim: Stateful<Div>,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let store = self.store.read(cx);
-        let Some(c) = store.config(id).cloned() else { return div().into_any_element() };
+        let Some(c) = store.config(id).cloned() else {
+            return div().into_any_element();
+        };
         let state = store.state(id);
         let rt = store.runtime(id);
         let tone = |ok: bool| if ok { p.success } else { p.status_muted };
 
         let sessions = rt.map_or(0, |r| r.sessions.len());
-        let open = rt.map_or(0, |r| r.sessions.iter().filter(|s| s.root && s.open).count());
+        let open = rt.map_or(0, |r| {
+            r.sessions.iter().filter(|s| s.root && s.open).count()
+        });
         let control = rt.and_then(|r| r.control_version());
-        let transports = rt.map(|r| r.capability_flags("transport")).unwrap_or_default();
-        let features = rt.map(|r| r.capability_flags("features")).unwrap_or_default();
+        let transports = rt
+            .map(|r| r.capability_flags("transport"))
+            .unwrap_or_default();
+        let features = rt
+            .map(|r| r.capability_flags("features"))
+            .unwrap_or_default();
         let methods = rt.map_or(0, |r| r.method_count());
-        let logs: Vec<String> = rt.map(|r| r.logs.iter().rev().take(80).cloned().collect()).unwrap_or_default();
+        let logs: Vec<String> = rt
+            .map(|r| r.logs.iter().rev().take(80).cloned().collect())
+            .unwrap_or_default();
         let mesh = rt.and_then(|r| r.mesh.clone());
 
         let row = |label: &'static str, value: String, mono: bool| {
             h_flex()
                 .gap_4()
                 .py_1p5()
-                .child(div().w(px(120.)).flex_none().text_sm().text_color(p.dim).child(label))
-                .child(div().flex_1().min_w_0().text_sm().truncate().when(mono, |el| el.font_family(kit::MONO)).child(value))
+                .child(
+                    div()
+                        .w(px(120.))
+                        .flex_none()
+                        .text_sm()
+                        .text_color(p.dim)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .truncate()
+                        .when(mono, |el| el.font_family(kit::MONO))
+                        .child(value),
+                )
         };
         let section = |title: &'static str, desc: &'static str| {
             v_flex()
@@ -568,7 +767,10 @@ impl QmtApp {
                 .child(div().text_xs().text_color(p.dim).child(desc))
         };
         let chips = |items: Vec<String>| {
-            h_flex().flex_wrap().gap_1().children(items.into_iter().map(|t| kit::chip(t, p)))
+            h_flex()
+                .flex_wrap()
+                .gap_1()
+                .children(items.into_iter().map(|t| kit::chip(t, p)))
         };
 
         let refresh_id = c.id.clone();
@@ -596,16 +798,33 @@ impl QmtApp {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(div().text_lg().font_semibold().truncate().child(c.name.clone()))
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_semibold()
+                                    .truncate()
+                                    .child(c.name.clone()),
+                            )
                             .child(div().text_xs().text_color(p.dim).child(c.transport_label())),
                     )
-                    .child(kit::icon_button("details-refresh", IconName::RefreshCw, "Refresh capabilities").on_click(
-                        cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.refresh(&refresh_id, cx))),
-                    ))
-                    .child(kit::icon_button("details-close", IconName::X, "Close").on_click(cx.listener(|this, _, _, cx| {
-                        this.details = None;
-                        cx.notify();
-                    }))),
+                    .child(
+                        kit::icon_button(
+                            "details-refresh",
+                            IconName::RefreshCw,
+                            "Refresh capabilities",
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.store.update(cx, |s, cx| s.refresh(&refresh_id, cx))
+                        })),
+                    )
+                    .child(
+                        kit::icon_button("details-close", IconName::X, "Close").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.details = None;
+                                cx.notify();
+                            }),
+                        ),
+                    ),
             )
             .child(
                 v_flex()
@@ -618,8 +837,18 @@ impl QmtApp {
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(kit::stat_card("Connection", kit::state_label(&state), kit::status_color(&state, p), p))
-                            .child(kit::stat_card("Sessions", format!("{open} / {sessions}"), p.text, p))
+                            .child(kit::stat_card(
+                                "Connection",
+                                kit::state_label(&state),
+                                kit::status_color(&state, p),
+                                p,
+                            ))
+                            .child(kit::stat_card(
+                                "Sessions",
+                                format!("{open} / {sessions}"),
+                                p.text,
+                                p,
+                            ))
                             .child(kit::stat_card(
                                 "Control API",
                                 control.map_or("—".into(), |v| format!("v{v}")),
@@ -650,35 +879,99 @@ impl QmtApp {
                         v_flex()
                             .child(row("Endpoint", c.endpoint_label(), true))
                             .when(c.is_websocket(), |el| {
-                                el.child(row("ACP URL", match &c.endpoint {
-                                    Endpoint::WebSocket { address, secure } => {
-                                        format!("{}://{address}/acp/ws", if *secure { "wss" } else { "ws" })
-                                    }
-                                    _ => String::new(),
-                                }, true))
-                            })
-                            .when_some(rt.and_then(|r| r.pid), |el, pid| el.child(row("Process ID", pid.to_string(), true)))
-                            .child(row("Agent", rt.and_then(|r| r.agent_title.clone()).unwrap_or("—".into()), false))
-                            .child(row("Version", rt.and_then(|r| r.agent_version.clone()).unwrap_or("—".into()), true))
-                            .child(row("Auto-start", if c.auto_start { "On".into() } else { "Off".into() }, false))
-                            .when_some(mesh, |el, m| {
-                                el.child(row("Mesh host", m.hostname.unwrap_or("—".into()), false)).child(row(
-                                    "Mesh peers",
-                                    format!("{} via {}", m.peers, m.transport.unwrap_or("?".into())),
-                                    false,
+                                el.child(row(
+                                    "ACP URL",
+                                    match &c.endpoint {
+                                        Endpoint::WebSocket { address, secure } => {
+                                            format!(
+                                                "{}://{address}/acp/ws",
+                                                if *secure { "wss" } else { "ws" }
+                                            )
+                                        }
+                                        _ => String::new(),
+                                    },
+                                    true,
                                 ))
+                            })
+                            .when_some(rt.and_then(|r| r.pid), |el, pid| {
+                                el.child(row("Process ID", pid.to_string(), true))
+                            })
+                            .child(row(
+                                "Agent",
+                                rt.and_then(|r| r.agent_title.clone()).unwrap_or("—".into()),
+                                false,
+                            ))
+                            .child(row(
+                                "Version",
+                                rt.and_then(|r| r.agent_version.clone())
+                                    .unwrap_or("—".into()),
+                                true,
+                            ))
+                            .child(row(
+                                "Auto-start",
+                                if c.auto_start {
+                                    "On".into()
+                                } else {
+                                    "Off".into()
+                                },
+                                false,
+                            ))
+                            .when_some(mesh, |el, m| {
+                                el.child(row("Mesh host", m.hostname.unwrap_or("—".into()), false))
+                                    .child(row(
+                                        "Mesh peers",
+                                        format!(
+                                            "{} via {}",
+                                            m.peers,
+                                            m.transport.unwrap_or("?".into())
+                                        ),
+                                        false,
+                                    ))
                             }),
                     )
-                    .child(section("Capabilities", "Transports and product features reported by the agent."))
+                    .child(section(
+                        "Capabilities",
+                        "Transports and product features reported by the agent.",
+                    ))
                     .child(if control.is_some() {
                         v_flex()
                             .gap_2()
-                            .child(h_flex().gap_3().items_start().child(div().w(px(120.)).flex_none().text_sm().text_color(p.dim).child("Transport")).child(chips(transports)))
-                            .child(h_flex().gap_3().items_start().child(div().w(px(120.)).flex_none().text_sm().text_color(p.dim).child("Features")).child(chips(features)))
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .items_start()
+                                    .child(
+                                        div()
+                                            .w(px(120.))
+                                            .flex_none()
+                                            .text_sm()
+                                            .text_color(p.dim)
+                                            .child("Transport"),
+                                    )
+                                    .child(chips(transports)),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .items_start()
+                                    .child(
+                                        div()
+                                            .w(px(120.))
+                                            .flex_none()
+                                            .text_sm()
+                                            .text_color(p.dim)
+                                            .child("Features"),
+                                    )
+                                    .child(chips(features)),
+                            )
                             .child(row("Methods", methods.to_string(), false))
                             .into_any_element()
                     } else {
-                        div().text_sm().text_color(p.dim).child("Not loaded. Connect the agent to read its capabilities.").into_any_element()
+                        div()
+                            .text_sm()
+                            .text_color(p.dim)
+                            .child("Not loaded. Connect the agent to read its capabilities.")
+                            .into_any_element()
                     })
                     .child(section("Log", "Most recent first."))
                     .child(

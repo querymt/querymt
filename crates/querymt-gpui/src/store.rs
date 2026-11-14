@@ -46,21 +46,29 @@ impl AgentConfig {
     pub fn endpoint_label(&self) -> String {
         match &self.endpoint {
             Endpoint::Process { command } => command.clone(),
-            Endpoint::WebSocket { address, secure: true } => format!("wss://{address}"),
+            Endpoint::WebSocket {
+                address,
+                secure: true,
+            } => format!("wss://{address}"),
             Endpoint::WebSocket { address, .. } => address.clone(),
         }
     }
 
     pub fn transport_label(&self) -> &'static str {
-        if self.is_websocket() { "WebSocket endpoint" } else { "Local process" }
+        if self.is_websocket() {
+            "WebSocket endpoint"
+        } else {
+            "Local process"
+        }
     }
 
     fn target(&self) -> Target {
         match &self.endpoint {
             Endpoint::Process { command } => Target::Command(command.clone()),
-            Endpoint::WebSocket { address, secure } => {
-                Target::WebSocket(format!("{}://{address}/acp/ws", if *secure { "wss" } else { "ws" }))
-            }
+            Endpoint::WebSocket { address, secure } => Target::WebSocket(format!(
+                "{}://{address}/acp/ws",
+                if *secure { "wss" } else { "ws" }
+            )),
         }
     }
 }
@@ -112,8 +120,7 @@ fn slug(name: &str) -> String {
 // ---------------------------------------------------------------------------
 // Runtime data
 
-#[derive(Clone, Debug, PartialEq)]
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub enum ConnState {
     #[default]
     Idle,
@@ -171,7 +178,11 @@ impl SessionSummary {
     }
 
     pub fn display_title(&self) -> String {
-        if self.title.trim().is_empty() { "Untitled session".into() } else { self.title.clone() }
+        if self.title.trim().is_empty() {
+            "Untitled session".into()
+        } else {
+            self.title.clone()
+        }
     }
 
     /// `01a1b838-d3f2` style short id (first two UUID groups).
@@ -201,7 +212,14 @@ impl Attachment {
             .then(|| ImageFormat::from_mime_type(&mime))
             .flatten()
             .map(|format| std::sync::Arc::new(Image::from_bytes(format, bytes.to_vec())));
-        Self { id, name, mime, size: bytes.len() as u64, data: base64::engine::general_purpose::STANDARD.encode(bytes), image }
+        Self {
+            id,
+            name,
+            mime,
+            size: bytes.len() as u64,
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            image,
+        }
     }
 
     pub fn is_image(&self) -> bool {
@@ -317,8 +335,17 @@ pub struct ElicitField {
 
 #[derive(Clone, Debug)]
 pub enum RequestKind {
-    Permission { title: String, summary: String, kind: String, options: Vec<PermOption> },
-    Elicitation { message: String, fields: Vec<ElicitField>, url: Option<String> },
+    Permission {
+        title: String,
+        summary: String,
+        kind: String,
+        options: Vec<PermOption>,
+    },
+    Elicitation {
+        message: String,
+        fields: Vec<ElicitField>,
+        url: Option<String>,
+    },
 }
 
 /// A permission or input request from an agent, waiting for the user.
@@ -333,9 +360,17 @@ pub struct PendingRequest {
     pub kind: RequestKind,
 }
 
-fn parse_request(agent_id: &str, rpc_id: Value, method: &str, params: &Value) -> Option<PendingRequest> {
+fn parse_request(
+    agent_id: &str,
+    rpc_id: Value,
+    method: &str,
+    params: &Value,
+) -> Option<PendingRequest> {
     let text = |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or_default().to_string();
-    let session_id = params.get("sessionId").and_then(Value::as_str).map(str::to_owned);
+    let session_id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let kind = if method == "session/request_permission" {
         let tool = params.get("toolCall").cloned().unwrap_or(Value::Null);
         let mut call = crate::session::SessionView::default();
@@ -345,10 +380,14 @@ fn parse_request(agent_id: &str, rpc_id: Value, method: &str, params: &Value) ->
         }
         call.apply(&update);
         let (title, summary, kind) = match call.items.first().map(|i| &i.kind) {
-            Some(crate::session::ItemKind::Work(entries)) if !entries.is_empty() => match &entries[0] {
-                crate::session::WorkEntry::Tool(c) => (c.title.clone(), c.summary(), c.kind.clone()),
-                _ => (text(tool.get("title")), String::new(), String::new()),
-            },
+            Some(crate::session::ItemKind::Work(entries)) if !entries.is_empty() => {
+                match &entries[0] {
+                    crate::session::WorkEntry::Tool(c) => {
+                        (c.title.clone(), c.summary(), c.kind.clone())
+                    }
+                    _ => (text(tool.get("title")), String::new(), String::new()),
+                }
+            }
             _ => (text(tool.get("title")), String::new(), String::new()),
         };
         let options = params
@@ -362,7 +401,16 @@ fn parse_request(agent_id: &str, rpc_id: Value, method: &str, params: &Value) ->
                 kind: text(o.get("kind")),
             })
             .collect();
-        RequestKind::Permission { title: if title.is_empty() { "Tool call".into() } else { title }, summary, kind, options }
+        RequestKind::Permission {
+            title: if title.is_empty() {
+                "Tool call".into()
+            } else {
+                title
+            },
+            summary,
+            kind,
+            options,
+        }
     } else if method.contains("elicitation") {
         let schema = params.get("requestedSchema");
         let required: Vec<String> = schema
@@ -373,7 +421,10 @@ fn parse_request(agent_id: &str, rpc_id: Value, method: &str, params: &Value) ->
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect();
         let mut fields = Vec::new();
-        if let Some(props) = schema.and_then(|s| s.get("properties")).and_then(Value::as_object) {
+        if let Some(props) = schema
+            .and_then(|s| s.get("properties"))
+            .and_then(Value::as_object)
+        {
             for (key, prop) in props {
                 let enum_values: Vec<String> = prop
                     .get("enum")
@@ -389,7 +440,13 @@ fn parse_request(agent_id: &str, rpc_id: Value, method: &str, params: &Value) ->
                     .flatten()
                     .filter_map(|o| {
                         let v = o.get("const")?.as_str()?.to_string();
-                        Some((v.clone(), o.get("title").and_then(Value::as_str).unwrap_or(&v).to_string()))
+                        Some((
+                            v.clone(),
+                            o.get("title")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&v)
+                                .to_string(),
+                        ))
                     })
                     .collect();
                 let names: Vec<String> = prop
@@ -403,7 +460,11 @@ fn parse_request(agent_id: &str, rpc_id: Value, method: &str, params: &Value) ->
                     FieldKind::Enum(one_of)
                 } else if !enum_values.is_empty() {
                     FieldKind::Enum(
-                        enum_values.iter().enumerate().map(|(i, v)| (v.clone(), names.get(i).cloned().unwrap_or(v.clone()))).collect(),
+                        enum_values
+                            .iter()
+                            .enumerate()
+                            .map(|(i, v)| (v.clone(), names.get(i).cloned().unwrap_or(v.clone())))
+                            .collect(),
                     )
                 } else {
                     match prop.get("type").and_then(Value::as_str) {
@@ -415,7 +476,11 @@ fn parse_request(agent_id: &str, rpc_id: Value, method: &str, params: &Value) ->
                 };
                 fields.push(ElicitField {
                     key: key.clone(),
-                    title: prop.get("title").and_then(Value::as_str).unwrap_or(key).to_string(),
+                    title: prop
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or(key)
+                        .to_string(),
                     description: text(prop.get("description")),
                     kind,
                     required: required.contains(key),
@@ -490,7 +555,6 @@ pub struct AgentRuntime {
     refresh_scheduled: bool,
 }
 
-
 impl AgentRuntime {
     fn log(&mut self, line: impl Into<String>) {
         let line = line.into();
@@ -510,7 +574,10 @@ impl AgentRuntime {
 
     /// `querymt_control_version` reported by `_querymt/capabilities`.
     pub fn control_version(&self) -> Option<u64> {
-        self.capabilities.as_ref()?.get("querymt_control_version")?.as_u64()
+        self.capabilities
+            .as_ref()?
+            .get("querymt_control_version")?
+            .as_u64()
     }
 
     /// Enabled flags of a capabilities object, e.g. `transport` or `features`.
@@ -518,7 +585,10 @@ impl AgentRuntime {
         let Some(Value::Object(map)) = self.capabilities.as_ref().and_then(|c| c.get(group)) else {
             return vec![];
         };
-        map.iter().filter(|(_, v)| v.as_bool() == Some(true)).map(|(k, _)| k.replace('_', " ")).collect()
+        map.iter()
+            .filter(|(_, v)| v.as_bool() == Some(true))
+            .map(|(k, _)| k.replace('_', " "))
+            .collect()
     }
 
     /// Whether `_querymt/capabilities` lists a logical method (`querymt/session/steer`).
@@ -531,7 +601,11 @@ impl AgentRuntime {
     }
 
     pub fn feature(&self, name: &str) -> bool {
-        self.capabilities.as_ref().and_then(|c| c.pointer(&format!("/features/{name}"))).and_then(Value::as_bool) == Some(true)
+        self.capabilities
+            .as_ref()
+            .and_then(|c| c.pointer(&format!("/features/{name}")))
+            .and_then(Value::as_bool)
+            == Some(true)
     }
 
     /// The agent can take input mid-turn (steer / queue), like the desktop app checks.
@@ -592,11 +666,19 @@ pub struct Prefs {
 
 impl Prefs {
     pub fn mode(&self) -> &str {
-        if self.launch_mode.is_empty() { "build" } else { &self.launch_mode }
+        if self.launch_mode.is_empty() {
+            "build"
+        } else {
+            &self.launch_mode
+        }
     }
 
     pub fn reasoning(&self) -> &str {
-        if self.launch_reasoning.is_empty() { "auto" } else { &self.launch_reasoning }
+        if self.launch_reasoning.is_empty() {
+            "auto"
+        } else {
+            &self.launch_reasoning
+        }
     }
 }
 
@@ -616,12 +698,18 @@ fn load_persisted() -> Option<Persisted> {
     #[cfg(not(target_family = "wasm"))]
     let text = std::fs::read_to_string(state_path()?).ok()?;
     #[cfg(target_family = "wasm")]
-    let text = web_sys::window()?.local_storage().ok()??.get_item("querymt-gpui:state").ok()??;
+    let text = web_sys::window()?
+        .local_storage()
+        .ok()??
+        .get_item("querymt-gpui:state")
+        .ok()??;
     serde_json::from_str(&text).ok()
 }
 
 fn save_persisted(state: &Persisted) {
-    let Ok(text) = serde_json::to_string_pretty(state) else { return };
+    let Ok(text) = serde_json::to_string_pretty(state) else {
+        return;
+    };
     #[cfg(not(target_family = "wasm"))]
     if let Some(path) = state_path() {
         // Write a sibling file and rename it over the old one, so a crash or a
@@ -653,17 +741,21 @@ fn seed_configs() -> Vec<AgentConfig> {
     {
         // `--agent host:port` or QMT_AGENT=host:port adds a WebSocket agent.
         let args: Vec<String> = std::env::args().collect();
-        let from_arg = args.iter().position(|a| a == "--agent").and_then(|i| args.get(i + 1).cloned());
+        let from_arg = args
+            .iter()
+            .position(|a| a == "--agent")
+            .and_then(|i| args.get(i + 1).cloned());
         if let Some(address) = from_arg.or_else(|| std::env::var("QMT_AGENT").ok())
-            && let Ok((address, secure)) = normalize_address(&address) {
-                seeds.push(AgentConfig {
-                    id: format!("ws-{address}"),
-                    name: address.clone(),
-                    endpoint: Endpoint::WebSocket { address, secure },
-                    auto_start: true,
-                    host_managed: false,
-                });
-            }
+            && let Ok((address, secure)) = normalize_address(&address)
+        {
+            seeds.push(AgentConfig {
+                id: format!("ws-{address}"),
+                name: address.clone(),
+                endpoint: Endpoint::WebSocket { address, secure },
+                auto_start: true,
+                host_managed: false,
+            });
+        }
         let on_path = std::env::var_os("PATH").is_some_and(|paths| {
             std::env::split_paths(&paths).any(|dir| dir.join("qmtcode").is_file())
         });
@@ -671,7 +763,9 @@ fn seed_configs() -> Vec<AgentConfig> {
             seeds.push(AgentConfig {
                 id: "local-qmtcode".into(),
                 name: "Local qmtcode".into(),
-                endpoint: Endpoint::Process { command: "qmtcode --acp".into() },
+                endpoint: Endpoint::Process {
+                    command: "qmtcode --acp".into(),
+                },
                 auto_start: true,
                 host_managed: false,
             });
@@ -686,7 +780,12 @@ fn seed_configs() -> Vec<AgentConfig> {
             .trim_start_matches('?')
             .split('&')
             .find_map(|kv| kv.strip_prefix("agent="))
-            .map(|v| js_sys::decode_uri_component(v).ok().and_then(|s| s.as_string()).unwrap_or(v.into()));
+            .map(|v| {
+                js_sys::decode_uri_component(v)
+                    .ok()
+                    .and_then(|s| s.as_string())
+                    .unwrap_or(v.into())
+            });
         let protocol = location.protocol().unwrap_or_default();
         let (address, secure, host_managed) = match requested {
             Some(addr) => match normalize_address(&addr) {
@@ -701,7 +800,11 @@ fn seed_configs() -> Vec<AgentConfig> {
         if let Some(address) = address {
             seeds.push(AgentConfig {
                 id: format!("ws-{address}"),
-                name: if host_managed { "This server".into() } else { address.clone() },
+                name: if host_managed {
+                    "This server".into()
+                } else {
+                    address.clone()
+                },
                 endpoint: Endpoint::WebSocket { address, secure },
                 auto_start: true,
                 host_managed,
@@ -738,7 +841,10 @@ impl AgentsStore {
         let persisted = load_persisted().unwrap_or_default();
         let mut configs = persisted.configs;
         for seed in seed_configs() {
-            if !configs.iter().any(|c| c.id == seed.id || c.endpoint == seed.endpoint) {
+            if !configs
+                .iter()
+                .any(|c| c.id == seed.id || c.endpoint == seed.endpoint)
+            {
                 configs.insert(0, seed);
             }
         }
@@ -752,7 +858,12 @@ impl AgentsStore {
             _launch_task: None,
         };
         this.save();
-        let auto: Vec<String> = this.configs.iter().filter(|c| c.auto_start).map(|c| c.id.clone()).collect();
+        let auto: Vec<String> = this
+            .configs
+            .iter()
+            .filter(|c| c.auto_start)
+            .map(|c| c.id.clone())
+            .collect();
         for id in auto {
             this.connect(&id, cx);
         }
@@ -760,7 +871,10 @@ impl AgentsStore {
     }
 
     pub fn save(&self) {
-        save_persisted(&Persisted { configs: self.configs.clone(), prefs: self.prefs.clone() });
+        save_persisted(&Persisted {
+            configs: self.configs.clone(),
+            prefs: self.prefs.clone(),
+        });
     }
 
     // ---- queries ------------------------------------------------------------
@@ -774,13 +888,20 @@ impl AgentsStore {
     }
 
     pub fn state(&self, id: &str) -> ConnState {
-        self.runtime.get(id).map(|r| r.state.clone()).unwrap_or_default()
+        self.runtime
+            .get(id)
+            .map(|r| r.state.clone())
+            .unwrap_or_default()
     }
 
     pub fn connected_ids(&self) -> Vec<String> {
         self.configs
             .iter()
-            .filter(|c| self.runtime.get(&c.id).is_some_and(AgentRuntime::is_connected))
+            .filter(|c| {
+                self.runtime
+                    .get(&c.id)
+                    .is_some_and(AgentRuntime::is_connected)
+            })
             .map(|c| c.id.clone())
             .collect()
     }
@@ -797,7 +918,11 @@ impl AgentsStore {
     }
 
     pub fn all_sessions(&self) -> Vec<&SessionSummary> {
-        self.runtime.values().filter(|r| r.is_connected()).flat_map(|r| r.sessions.iter()).collect()
+        self.runtime
+            .values()
+            .filter(|r| r.is_connected())
+            .flat_map(|r| r.sessions.iter())
+            .collect()
     }
 
     pub fn models(&self, id: &str) -> &[Model] {
@@ -822,16 +947,35 @@ impl AgentsStore {
 
     // ---- config mutations ---------------------------------------------------
 
-    pub fn add_config(&mut self, name: String, endpoint: Endpoint, cx: &mut Context<Self>) -> String {
+    pub fn add_config(
+        &mut self,
+        name: String,
+        endpoint: Endpoint,
+        cx: &mut Context<Self>,
+    ) -> String {
         let id = slug(&name);
-        self.configs.push(AgentConfig { id: id.clone(), name, endpoint, auto_start: true, host_managed: false });
+        self.configs.push(AgentConfig {
+            id: id.clone(),
+            name,
+            endpoint,
+            auto_start: true,
+            host_managed: false,
+        });
         self.save();
         self.connect(&id, cx);
         id
     }
 
-    pub fn update_config(&mut self, id: &str, name: String, endpoint: Endpoint, cx: &mut Context<Self>) {
-        let Some(config) = self.configs.iter_mut().find(|c| c.id == id) else { return };
+    pub fn update_config(
+        &mut self,
+        id: &str,
+        name: String,
+        endpoint: Endpoint,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(config) = self.configs.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
         let endpoint_changed = config.endpoint != endpoint;
         config.name = name;
         config.endpoint = endpoint;
@@ -889,8 +1033,16 @@ impl AgentsStore {
     }
 
     /// Pin or unpin a session (`_querymt/session/setPinned`), optimistically.
-    pub fn set_pinned(&mut self, agent_id: &str, session_id: &str, pinned: bool, cx: &mut Context<Self>) {
-        let Some(rt) = self.runtime.get_mut(agent_id) else { return };
+    pub fn set_pinned(
+        &mut self,
+        agent_id: &str,
+        session_id: &str,
+        pinned: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rt) = self.runtime.get_mut(agent_id) else {
+            return;
+        };
         let Some(rpc) = rt.rpc.clone() else { return };
         if let Some(s) = rt.sessions.iter_mut().find(|s| s.id == session_id) {
             s.pinned = pinned;
@@ -899,7 +1051,10 @@ impl AgentsStore {
         let (agent_id, session_id) = (agent_id.to_string(), session_id.to_string());
         cx.spawn(async move |this, cx| {
             let result = rpc
-                .request("_querymt/session/setPinned", json!({ "session_id": session_id, "pinned": pinned }))
+                .request(
+                    "_querymt/session/setPinned",
+                    json!({ "session_id": session_id, "pinned": pinned }),
+                )
                 .await;
             if let Err(err) = result {
                 let _ = this.update(cx, |s, cx| {
@@ -907,7 +1062,10 @@ impl AgentsStore {
                         if let Some(sess) = rt.sessions.iter_mut().find(|x| x.id == session_id) {
                             sess.pinned = !pinned;
                         }
-                        rt.log(format!("Could not {} session: {err}", if pinned { "pin" } else { "unpin" }));
+                        rt.log(format!(
+                            "Could not {} session: {err}",
+                            if pinned { "pin" } else { "unpin" }
+                        ));
                     }
                     cx.notify();
                 });
@@ -917,11 +1075,17 @@ impl AgentsStore {
     }
 
     pub fn set_launch_model(&mut self, agent_id: &str, model_id: String, cx: &mut Context<Self>) {
-        let recent = self.prefs.recent_models.entry(agent_id.to_string()).or_default();
+        let recent = self
+            .prefs
+            .recent_models
+            .entry(agent_id.to_string())
+            .or_default();
         recent.retain(|id| id != &model_id);
         recent.insert(0, model_id.clone());
         recent.truncate(5);
-        self.prefs.launch_models.insert(agent_id.to_string(), model_id);
+        self.prefs
+            .launch_models
+            .insert(agent_id.to_string(), model_id);
         self.save();
         cx.notify();
     }
@@ -963,7 +1127,9 @@ impl AgentsStore {
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Self, &str, Result<Value, String>, &mut Context<Self>) + 'static,
     ) {
-        let Some(rt) = self.runtime.get_mut(id) else { return };
+        let Some(rt) = self.runtime.get_mut(id) else {
+            return;
+        };
         let Some(rpc) = rt.rpc.clone() else {
             rt.action_error = Some("The agent is not connected.".into());
             cx.notify();
@@ -990,7 +1156,9 @@ impl AgentsStore {
     }
 
     pub fn is_pending(&self, id: &str, tag: &str) -> bool {
-        self.runtime.get(id).is_some_and(|r| r.pending.contains(tag))
+        self.runtime
+            .get(id)
+            .is_some_and(|r| r.pending.contains(tag))
     }
 
     pub fn clear_action_error(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -1002,13 +1170,22 @@ impl AgentsStore {
 
     /// Ask the agent to rebuild its model catalog, then reload the list and capabilities.
     pub fn refresh_models(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(rt) = self.runtime.get_mut(id) else { return };
-        let Some(rpc) = rt.rpc.clone().filter(|_| rt.is_connected()) else { return };
+        let Some(rt) = self.runtime.get_mut(id) else {
+            return;
+        };
+        let Some(rpc) = rt.rpc.clone().filter(|_| rt.is_connected()) else {
+            return;
+        };
         let (generation, id) = (rt.generation, id.to_string());
         rt.pending.insert("models".into());
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
-            let refreshed = rpc.request("_querymt/refreshModels", json!({ "wait_for_completion": true })).await;
+            let refreshed = rpc
+                .request(
+                    "_querymt/refreshModels",
+                    json!({ "wait_for_completion": true }),
+                )
+                .await;
             let models = match refreshed {
                 Ok(v) if v.get("models").is_some() => Ok(v),
                 _ => rpc.request("_querymt/models", json!({})).await,
@@ -1040,9 +1217,18 @@ impl AgentsStore {
 
     /// Re-fetch mesh, providers and profiles (not sessions/models).
     pub fn refresh_extras(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(rt) = self.runtime.get_mut(id) else { return };
-        let Some(rpc) = rt.rpc.clone().filter(|_| rt.is_connected()) else { return };
-        let has_mesh = rt.capabilities.as_ref().and_then(|c| c.pointer("/features/mesh")).and_then(Value::as_bool) == Some(true);
+        let Some(rt) = self.runtime.get_mut(id) else {
+            return;
+        };
+        let Some(rpc) = rt.rpc.clone().filter(|_| rt.is_connected()) else {
+            return;
+        };
+        let has_mesh = rt
+            .capabilities
+            .as_ref()
+            .and_then(|c| c.pointer("/features/mesh"))
+            .and_then(Value::as_bool)
+            == Some(true);
         let (generation, id) = (rt.generation, id.to_string());
         rt.pending.insert("extras".into());
         cx.notify();
@@ -1058,7 +1244,14 @@ impl AgentsStore {
         rt.tasks.push(task);
     }
 
-    pub fn create_invite(&mut self, id: &str, ttl: &str, max_uses: Option<u64>, mesh_name: Option<String>, cx: &mut Context<Self>) {
+    pub fn create_invite(
+        &mut self,
+        id: &str,
+        ttl: &str,
+        max_uses: Option<u64>,
+        mesh_name: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let mut params = json!({ "ttl": ttl });
         if let Some(n) = max_uses {
             params["max_uses"] = json!(n);
@@ -1066,19 +1259,31 @@ impl AgentsStore {
         if let Some(name) = mesh_name.filter(|n| !n.trim().is_empty()) {
             params["mesh_name"] = json!(name);
         }
-        self.ext(id, "invite", "_querymt/mesh/createInvite", params, cx, |s, id, res, cx| {
-            if let (Ok(v), Some(rt)) = (&res, s.runtime.get_mut(id)) {
-                rt.last_invite = v.get("url").and_then(Value::as_str).map(str::to_owned);
-            }
-            s.refresh_extras(id, cx);
-        });
+        self.ext(
+            id,
+            "invite",
+            "_querymt/mesh/createInvite",
+            params,
+            cx,
+            |s, id, res, cx| {
+                if let (Ok(v), Some(rt)) = (&res, s.runtime.get_mut(id)) {
+                    rt.last_invite = v.get("url").and_then(Value::as_str).map(str::to_owned);
+                }
+                s.refresh_extras(id, cx);
+            },
+        );
     }
 
     pub fn revoke_invite(&mut self, id: &str, invite_id: &str, cx: &mut Context<Self>) {
         let params = json!({ "invite_id": invite_id });
-        self.ext(id, &format!("revoke:{invite_id}"), "_querymt/mesh/revokeInvite", params, cx, |s, id, _, cx| {
-            s.refresh_extras(id, cx)
-        });
+        self.ext(
+            id,
+            &format!("revoke:{invite_id}"),
+            "_querymt/mesh/revokeInvite",
+            params,
+            cx,
+            |s, id, _, cx| s.refresh_extras(id, cx),
+        );
     }
 
     pub fn dismiss_invite(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -1090,24 +1295,45 @@ impl AgentsStore {
 
     pub fn set_api_key(&mut self, id: &str, provider: &str, key: String, cx: &mut Context<Self>) {
         let params = json!({ "provider": provider, "api_key": key });
-        self.ext(id, &format!("key:{provider}"), "_querymt/auth/setApiToken", params, cx, |s, id, _, cx| {
-            s.refresh_extras(id, cx)
-        });
+        self.ext(
+            id,
+            &format!("key:{provider}"),
+            "_querymt/auth/setApiToken",
+            params,
+            cx,
+            |s, id, _, cx| s.refresh_extras(id, cx),
+        );
     }
 
     pub fn clear_api_key(&mut self, id: &str, provider: &str, cx: &mut Context<Self>) {
         let params = json!({ "provider": provider });
-        self.ext(id, &format!("key:{provider}"), "_querymt/auth/clearApiToken", params, cx, |s, id, _, cx| {
-            s.refresh_extras(id, cx)
-        });
+        self.ext(
+            id,
+            &format!("key:{provider}"),
+            "_querymt/auth/clearApiToken",
+            params,
+            cx,
+            |s, id, _, cx| s.refresh_extras(id, cx),
+        );
     }
 
     /// Preferred credential source (`querymt/auth/setMethod`); `auto` clears it.
-    pub fn set_auth_method(&mut self, id: &str, provider: &str, method: &str, cx: &mut Context<Self>) {
+    pub fn set_auth_method(
+        &mut self,
+        id: &str,
+        provider: &str,
+        method: &str,
+        cx: &mut Context<Self>,
+    ) {
         let params = json!({ "provider": provider, "method": if method == "auto" { Value::Null } else { json!(method) } });
-        self.ext(id, &format!("method:{provider}"), "_querymt/auth/setMethod", params, cx, |s, id, _, cx| {
-            s.refresh_extras(id, cx)
-        });
+        self.ext(
+            id,
+            &format!("method:{provider}"),
+            "_querymt/auth/setMethod",
+            params,
+            cx,
+            |s, id, _, cx| s.refresh_extras(id, cx),
+        );
     }
 
     /// Update provider plugins (`querymt/updatePlugins`); the outcome lands in `maintenance`.
@@ -1115,63 +1341,127 @@ impl AgentsStore {
         if let Some(rt) = self.runtime.get_mut(id) {
             rt.maintenance = None;
         }
-        self.ext(id, "plugins", "_querymt/updatePlugins", json!({}), cx, |s, id, res, cx| {
-            let Some(rt) = s.runtime.get_mut(id) else { return };
-            if let Ok(v) = res {
-                let results = v.get("results").and_then(Value::as_array).cloned().unwrap_or_default();
-                let failed: Vec<(String, String)> = results
-                    .iter()
-                    .filter(|r| r.get("success").and_then(Value::as_bool) != Some(true))
-                    .map(|r| (r.get("plugin_name").and_then(Value::as_str).map(str::to_owned).unwrap_or_default(), r.get("message").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| "Update failed.".into())))
-                    .collect();
-                let ok = results.len() - failed.len();
-                rt.maintenance = Some(if failed.is_empty() {
-                    (format!("Updated {ok} plugin{}.", if ok == 1 { "" } else { "s" }), false)
-                } else {
-                    (format!("{} of {} plugin updates failed.", failed.len(), results.len()), true)
-                });
-                rt.failed_plugins = failed;
-            }
-            s.refresh_models(id, cx);
-        });
+        self.ext(
+            id,
+            "plugins",
+            "_querymt/updatePlugins",
+            json!({}),
+            cx,
+            |s, id, res, cx| {
+                let Some(rt) = s.runtime.get_mut(id) else {
+                    return;
+                };
+                if let Ok(v) = res {
+                    let results = v
+                        .get("results")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let failed: Vec<(String, String)> = results
+                        .iter()
+                        .filter(|r| r.get("success").and_then(Value::as_bool) != Some(true))
+                        .map(|r| {
+                            (
+                                r.get("plugin_name")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                                    .unwrap_or_default(),
+                                r.get("message")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| "Update failed.".into()),
+                            )
+                        })
+                        .collect();
+                    let ok = results.len() - failed.len();
+                    rt.maintenance = Some(if failed.is_empty() {
+                        (
+                            format!("Updated {ok} plugin{}.", if ok == 1 { "" } else { "s" }),
+                            false,
+                        )
+                    } else {
+                        (
+                            format!(
+                                "{} of {} plugin updates failed.",
+                                failed.len(),
+                                results.len()
+                            ),
+                            true,
+                        )
+                    });
+                    rt.failed_plugins = failed;
+                }
+                s.refresh_models(id, cx);
+            },
+        );
     }
 
     pub fn logout_provider(&mut self, id: &str, provider: &str, cx: &mut Context<Self>) {
         let params = json!({ "provider": provider });
-        self.ext(id, &format!("oauth:{provider}"), "_querymt/auth/logout", params, cx, |s, id, _, cx| {
-            s.refresh_extras(id, cx)
-        });
+        self.ext(
+            id,
+            &format!("oauth:{provider}"),
+            "_querymt/auth/logout",
+            params,
+            cx,
+            |s, id, _, cx| s.refresh_extras(id, cx),
+        );
     }
 
     /// Start OAuth: opens the authorization URL; redirect flows then wait for a pasted code.
     pub fn start_oauth(&mut self, id: &str, provider: &str, cx: &mut Context<Self>) {
         let provider_name = provider.to_string();
         let params = json!({ "provider": provider });
-        self.ext(id, &format!("oauth:{provider}"), "_querymt/auth/start", params, cx, move |s, id, res, cx| {
-            let Ok(v) = res else { return };
-            if let Some(url) = v.get("authorization_url").and_then(Value::as_str) {
-                cx.open_url(url);
-            }
-            let flow_id = v.get("flow_id").and_then(Value::as_str).unwrap_or_default().to_string();
-            let needs_code = v.get("flow_kind").and_then(Value::as_str) != Some("device_poll");
-            if let Some(rt) = s.runtime.get_mut(id) {
-                rt.oauth = Some(OAuthFlow { provider: provider_name, flow_id, needs_code });
-            }
-        });
+        self.ext(
+            id,
+            &format!("oauth:{provider}"),
+            "_querymt/auth/start",
+            params,
+            cx,
+            move |s, id, res, cx| {
+                let Ok(v) = res else { return };
+                if let Some(url) = v.get("authorization_url").and_then(Value::as_str) {
+                    cx.open_url(url);
+                }
+                let flow_id = v
+                    .get("flow_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let needs_code = v.get("flow_kind").and_then(Value::as_str) != Some("device_poll");
+                if let Some(rt) = s.runtime.get_mut(id) {
+                    rt.oauth = Some(OAuthFlow {
+                        provider: provider_name,
+                        flow_id,
+                        needs_code,
+                    });
+                }
+            },
+        );
     }
 
     /// Finish OAuth with the pasted callback URL/code (empty for device flows).
     pub fn complete_oauth(&mut self, id: &str, response: String, cx: &mut Context<Self>) {
-        let Some(flow) = self.runtime.get(id).and_then(|r| r.oauth.clone()) else { return };
+        let Some(flow) = self.runtime.get(id).and_then(|r| r.oauth.clone()) else {
+            return;
+        };
         let params = json!({ "flow_id": flow.flow_id, "response": response });
         let tag = format!("oauth:{}", flow.provider);
-        self.ext(id, &tag, "_querymt/auth/complete", params, cx, |s, id, res, cx| {
-            if res.is_ok()
-                && let Some(rt) = s.runtime.get_mut(id) {
+        self.ext(
+            id,
+            &tag,
+            "_querymt/auth/complete",
+            params,
+            cx,
+            |s, id, res, cx| {
+                if res.is_ok()
+                    && let Some(rt) = s.runtime.get_mut(id)
+                {
                     rt.oauth = None;
                 }
-            s.refresh_extras(id, cx);
-        });
+                s.refresh_extras(id, cx);
+            },
+        );
     }
 
     pub fn cancel_oauth(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -1184,7 +1474,9 @@ impl AgentsStore {
     // ---- connection lifecycle ----------------------------------------------
 
     pub fn connect(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(config) = self.config(id).cloned() else { return };
+        let Some(config) = self.config(id).cloned() else {
+            return;
+        };
         let config_id = config.id.clone();
         let rt = self.runtime.entry(id.to_string()).or_default();
         if let Some(rpc) = rt.rpc.take() {
@@ -1308,12 +1600,17 @@ impl AgentsStore {
 
     /// Re-fetch capabilities, models, sessions and mesh status of a connected agent.
     pub fn refresh(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(rt) = self.runtime.get_mut(id) else { return };
-        let Some(rpc) = rt.rpc.clone().filter(|_| rt.is_connected()) else { return };
+        let Some(rt) = self.runtime.get_mut(id) else {
+            return;
+        };
+        let Some(rpc) = rt.rpc.clone().filter(|_| rt.is_connected()) else {
+            return;
+        };
         let (generation, id) = (rt.generation, id.to_string());
         rt.busy = true;
         cx.notify();
-        let task = cx.spawn(async move |this, cx| load_details(this, id, generation, rpc, cx).await);
+        let task =
+            cx.spawn(async move |this, cx| load_details(this, id, generation, rpc, cx).await);
         rt.tasks.push(task);
     }
 
@@ -1347,7 +1644,11 @@ impl AgentsStore {
         let model = self.launch_model(agent_id).cloned();
         let mode = self.prefs.mode().to_string();
         let reasoning = self.prefs.reasoning().to_string();
-        self.launch = LaunchState { busy: true, error: None, last_started: None };
+        self.launch = LaunchState {
+            busy: true,
+            error: None,
+            last_started: None,
+        };
         self.session = None;
         self.set_cwd(cwd.clone());
         cx.notify();
@@ -1480,12 +1781,23 @@ impl AgentsStore {
     // ---- session view -------------------------------------------------------
 
     /// Open a session in the transcript view: `session/load` replays it as updates.
-    pub fn open_session(&mut self, agent_id: &str, session_id: &str, cwd: &str, title: &str, cx: &mut Context<Self>) {
-        if self.session.as_ref().is_some_and(|v| v.agent_id == agent_id && v.session_id == session_id && v.error.is_none()) {
+    pub fn open_session(
+        &mut self,
+        agent_id: &str,
+        session_id: &str,
+        cwd: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session.as_ref().is_some_and(|v| {
+            v.agent_id == agent_id && v.session_id == session_id && v.error.is_none()
+        }) {
             return;
         }
         let mut view = SessionView::new(agent_id, session_id, cwd, title);
-        let Some(rt) = self.runtime.get(agent_id) else { return };
+        let Some(rt) = self.runtime.get(agent_id) else {
+            return;
+        };
         if let Some(s) = rt.sessions.iter().find(|s| s.id == session_id) {
             view.phase = s.phase.clone();
         }
@@ -1513,7 +1825,13 @@ impl AgentsStore {
         cx.spawn(async move |this, cx| {
             let result = rpc.request("session/load", params).await;
             let _ = this.update(cx, |s, cx| {
-                let Some(view) = s.session.as_mut().filter(|v| v.agent_id == agent_id && v.session_id == session_id) else { return };
+                let Some(view) = s
+                    .session
+                    .as_mut()
+                    .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
+                else {
+                    return;
+                };
                 view.loading = false;
                 match result {
                     Ok(v) => {
@@ -1527,8 +1845,10 @@ impl AgentsStore {
                             view.apply_load_snapshot(snap);
                         }
                         view.sync_work(crate::util::now_ms());
-                        view.history_more =
-                            snap.and_then(|s| s.pointer("/history/complete")).and_then(Value::as_bool) == Some(false);
+                        view.history_more = snap
+                            .and_then(|s| s.pointer("/history/complete"))
+                            .and_then(Value::as_bool)
+                            == Some(false);
                         view.history_before = snap
                             .and_then(|s| s.pointer("/history/before"))
                             .and_then(Value::as_str)
@@ -1547,12 +1867,18 @@ impl AgentsStore {
     /// and prepend them. One page in flight at a time; triggered when the user
     /// scrolls near the top.
     pub fn load_older_history(&mut self, cx: &mut Context<Self>) {
-        let Some(view) = self.session.as_mut() else { return };
+        let Some(view) = self.session.as_mut() else {
+            return;
+        };
         if view.history_loading || view.history_error.is_some() {
             return;
         }
-        let Some(before) = view.history_before.clone() else { return };
-        let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) else { return };
+        let Some(before) = view.history_before.clone() else {
+            return;
+        };
+        let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) else {
+            return;
+        };
         view.history_loading = true;
         let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
         cx.notify();
@@ -1567,13 +1893,26 @@ impl AgentsStore {
         cx.spawn(async move |this, cx| {
             let result = req.await;
             let _ = this.update(cx, |s, cx| {
-                let Some(view) = s.session.as_mut().filter(|v| v.agent_id == agent_id && v.session_id == session_id) else { return };
+                let Some(view) = s
+                    .session
+                    .as_mut()
+                    .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
+                else {
+                    return;
+                };
                 view.history_loading = false;
                 match result {
                     Ok(page) => {
-                        let events = page.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                        let events = page
+                            .get("events")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
                         view.prepend_events(&events);
-                        let complete = page.pointer("/history/complete").and_then(Value::as_bool).unwrap_or(true);
+                        let complete = page
+                            .pointer("/history/complete")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true);
                         view.history_before = page
                             .pointer("/history/before")
                             .and_then(Value::as_str)
@@ -1605,20 +1944,33 @@ impl AgentsStore {
 
     /// Close and load the open session again.
     pub fn reload_session(&mut self, cx: &mut Context<Self>) {
-        let Some(view) = self.session.take() else { return };
+        let Some(view) = self.session.take() else {
+            return;
+        };
         self.open_session(&view.agent_id, &view.session_id, &view.cwd, &view.title, cx);
     }
 
     /// Whether the open session's agent supports steering / queueing input.
     pub fn session_can_control_run(&self) -> bool {
-        self.session.as_ref().and_then(|v| self.runtime.get(&v.agent_id)).is_some_and(AgentRuntime::can_control_run)
+        self.session
+            .as_ref()
+            .and_then(|v| self.runtime.get(&v.agent_id))
+            .is_some_and(AgentRuntime::can_control_run)
     }
 
     /// Send a prompt to the open session. While a turn runs on an agent with
     /// turn control, `delivery` (`steer` / `queue`) picks the QueryMT extension.
-    pub fn send_prompt(&mut self, text: String, attachments: Vec<Attachment>, delivery: &str, cx: &mut Context<Self>) {
+    pub fn send_prompt(
+        &mut self,
+        text: String,
+        attachments: Vec<Attachment>,
+        delivery: &str,
+        cx: &mut Context<Self>,
+    ) {
         let control = self.session_can_control_run();
-        let Some(view) = self.session.as_mut() else { return };
+        let Some(view) = self.session.as_mut() else {
+            return;
+        };
         let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) else {
             view.push_notice("The agent is not connected.", true);
             cx.notify();
@@ -1628,7 +1980,12 @@ impl AgentsStore {
         let content = prompt_content(&text, &attachments);
         if view.running() && control {
             // Like desktop: slash commands can't steer, they always queue.
-            let wanted: &'static str = if text.trim_start().starts_with('/') || delivery == "queue" { "queue" } else { "steer" };
+            let wanted: &'static str = if text.trim_start().starts_with('/') || delivery == "queue"
+            {
+                "queue"
+            } else {
+                "steer"
+            };
             let input_id = format!("gpui-{}", now_ms() as u64);
             // The message waits in the activity dock; the agent echoes it into
             // the transcript once it is applied (steer) or started (queue).
@@ -1710,41 +2067,79 @@ impl AgentsStore {
             .detach();
             return;
         }
-        view.push_local_user(&text, attachments.iter().map(Attachment::to_user_attachment).collect());
+        view.push_local_user(
+            &text,
+            attachments
+                .iter()
+                .map(Attachment::to_user_attachment)
+                .collect(),
+        );
         view.prompting = true;
         view.sync_work(crate::util::now_ms());
-        let turn = rpc.request("session/prompt", json!({ "sessionId": session_id, "prompt": content }));
+        let turn = rpc.request(
+            "session/prompt",
+            json!({ "sessionId": session_id, "prompt": content }),
+        );
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = turn.await;
-            let _ = this.update(cx, |s, cx| s.finish_prompt(&agent_id, &session_id, result, cx));
+            let _ = this.update(cx, |s, cx| {
+                s.finish_prompt(&agent_id, &session_id, result, cx)
+            });
         })
         .detach();
     }
 
     /// Remove a queued message before it starts (`querymt/session/discardQueuedInput`).
     pub fn discard_queued_input(&mut self, input_id: &str, cx: &mut Context<Self>) {
-        let Some(view) = self.session.as_mut() else { return };
-        let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) else { return };
-        let Some(input) = view.pending_inputs.iter_mut().find(|i| i.input_id == input_id && i.state == "queued" && !i.discard_pending)
+        let Some(view) = self.session.as_mut() else {
+            return;
+        };
+        let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) else {
+            return;
+        };
+        let Some(input) = view
+            .pending_inputs
+            .iter_mut()
+            .find(|i| i.input_id == input_id && i.state == "queued" && !i.discard_pending)
         else {
             return;
         };
         input.discard_pending = true;
-        let (agent_id, session_id, input_id) = (view.agent_id.clone(), view.session_id.clone(), input_id.to_string());
-        let req = rpc.request("_querymt/session/discardQueuedInput", json!({ "session_id": session_id, "input_id": input_id }));
+        let (agent_id, session_id, input_id) = (
+            view.agent_id.clone(),
+            view.session_id.clone(),
+            input_id.to_string(),
+        );
+        let req = rpc.request(
+            "_querymt/session/discardQueuedInput",
+            json!({ "session_id": session_id, "input_id": input_id }),
+        );
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = req.await;
             let _ = this.update(cx, |s, cx| {
-                let Some(view) = s.session.as_mut().filter(|v| v.agent_id == agent_id && v.session_id == session_id) else { return };
+                let Some(view) = s
+                    .session
+                    .as_mut()
+                    .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
+                else {
+                    return;
+                };
                 match result {
                     Ok(_) => view.set_input_state(&input_id, "queue", "discarded"),
                     Err(err) => {
-                        if let Some(i) = view.pending_inputs.iter_mut().find(|i| i.input_id == input_id) {
+                        if let Some(i) = view
+                            .pending_inputs
+                            .iter_mut()
+                            .find(|i| i.input_id == input_id)
+                        {
                             i.discard_pending = false;
                         }
-                        view.push_notice(format!("Could not remove the queued message: {err}"), true);
+                        view.push_notice(
+                            format!("Could not remove the queued message: {err}"),
+                            true,
+                        );
                     }
                 }
                 cx.notify();
@@ -1764,29 +2159,46 @@ impl AgentsStore {
     /// Change a session config option (`session/set_config_option`); an empty
     /// `config_id` means the mode of an agent that only has `session/set_mode`.
     pub fn set_session_option(&mut self, config_id: &str, value: &str, cx: &mut Context<Self>) {
-        let Some(view) = self.session.as_mut() else { return };
-        let Some(rt) = self.runtime.get(&view.agent_id) else { return };
+        let Some(view) = self.session.as_mut() else {
+            return;
+        };
+        let Some(rt) = self.runtime.get(&view.agent_id) else {
+            return;
+        };
         let Some(rpc) = rt.rpc.clone() else { return };
         let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
-        let key = if config_id.is_empty() { "mode".to_string() } else { config_id.to_string() };
+        let key = if config_id.is_empty() {
+            "mode".to_string()
+        } else {
+            config_id.to_string()
+        };
         view.pending_options.insert(key.clone());
         let req = if config_id.is_empty() {
-            rpc.request("session/set_mode", json!({ "sessionId": session_id, "modeId": value }))
+            rpc.request(
+                "session/set_mode",
+                json!({ "sessionId": session_id, "modeId": value }),
+            )
         } else {
-            let mut params = json!({ "sessionId": session_id, "configId": config_id, "value": value });
+            let mut params =
+                json!({ "sessionId": session_id, "configId": config_id, "value": value });
             if config_id == "model"
-                && let Some(model) = rt.models.iter().find(|m| m.id == value) {
-                    let mut entry = model.raw.clone();
-                    if let Some(obj) = entry.as_object_mut() {
-                        obj.remove("availability");
-                    }
-                    params["_meta"] = json!({ "querymt": { "modelEntry": entry } });
+                && let Some(model) = rt.models.iter().find(|m| m.id == value)
+            {
+                let mut entry = model.raw.clone();
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.remove("availability");
                 }
+                params["_meta"] = json!({ "querymt": { "modelEntry": entry } });
+            }
             rpc.request("session/set_config_option", params)
         };
         let (config_id, value) = (config_id.to_string(), value.to_string());
         if config_id == "model" {
-            let recent = self.prefs.recent_models.entry(agent_id.clone()).or_default();
+            let recent = self
+                .prefs
+                .recent_models
+                .entry(agent_id.clone())
+                .or_default();
             recent.retain(|id| id != &value);
             recent.insert(0, value.clone());
             recent.truncate(5);
@@ -1795,37 +2207,65 @@ impl AgentsStore {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = req.await;
-            let _ = this.update(cx, |s, cx| {
-                let Some(view) = s.session.as_mut().filter(|v| v.agent_id == agent_id && v.session_id == session_id) else { return };
-                view.pending_options.remove(&key);
-                match result {
-                    Ok(resp) => {
-                        if config_id.is_empty() {
-                            view.mode = Some(value.clone());
-                        } else if resp.get("configOptions").is_some() {
-                            view.apply_config(resp.get("configOptions"));
-                        } else {
-                            if let Some(o) = view.options.iter_mut().find(|o| o.get("id").and_then(Value::as_str) == Some(&config_id)) {
-                                o["currentValue"] = Value::String(value.clone());
-                            }
-                            match config_id.as_str() {
-                                "model" => view.model = Some(value.clone()),
-                                "mode" => view.mode = Some(value.clone()),
-                                _ => {}
+            let _ =
+                this.update(cx, |s, cx| {
+                    let Some(view) = s
+                        .session
+                        .as_mut()
+                        .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
+                    else {
+                        return;
+                    };
+                    view.pending_options.remove(&key);
+                    match result {
+                        Ok(resp) => {
+                            if config_id.is_empty() {
+                                view.mode = Some(value.clone());
+                            } else if resp.get("configOptions").is_some() {
+                                view.apply_config(resp.get("configOptions"));
+                            } else {
+                                if let Some(o) = view.options.iter_mut().find(|o| {
+                                    o.get("id").and_then(Value::as_str) == Some(&config_id)
+                                }) {
+                                    o["currentValue"] = Value::String(value.clone());
+                                }
+                                match config_id.as_str() {
+                                    "model" => view.model = Some(value.clone()),
+                                    "mode" => view.mode = Some(value.clone()),
+                                    _ => {}
+                                }
                             }
                         }
+                        Err(err) => view.push_notice(
+                            format!(
+                                "Could not change {}: {err}",
+                                if config_id.is_empty() {
+                                    "mode"
+                                } else {
+                                    &config_id
+                                }
+                            ),
+                            true,
+                        ),
                     }
-                    Err(err) => view.push_notice(format!("Could not change {}: {err}", if config_id.is_empty() { "mode" } else { &config_id }), true),
-                }
-                cx.notify();
-            });
+                    cx.notify();
+                });
         })
         .detach();
     }
 
     /// Resolve / archive flags (`_querymt/session/setLifecycle`), optimistically.
-    pub fn set_lifecycle(&mut self, agent_id: &str, session_id: &str, resolved: Option<bool>, archived: Option<bool>, cx: &mut Context<Self>) {
-        let Some(rt) = self.runtime.get_mut(agent_id) else { return };
+    pub fn set_lifecycle(
+        &mut self,
+        agent_id: &str,
+        session_id: &str,
+        resolved: Option<bool>,
+        archived: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rt) = self.runtime.get_mut(agent_id) else {
+            return;
+        };
         let Some(rpc) = rt.rpc.clone() else { return };
         if let Some(s) = rt.sessions.iter_mut().find(|s| s.id == session_id) {
             if let Some(r) = resolved {
@@ -1864,7 +2304,9 @@ impl AgentsStore {
 
     /// `session/cancel` for the open session's running turn.
     pub fn cancel_turn(&mut self, cx: &mut Context<Self>) {
-        let Some(view) = self.session.as_ref() else { return };
+        let Some(view) = self.session.as_ref() else {
+            return;
+        };
         if let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) {
             rpc.notify("session/cancel", json!({ "sessionId": view.session_id }));
         }
@@ -1882,15 +2324,27 @@ impl AgentsStore {
         cx.notify();
     }
 
-    fn finish_prompt(&mut self, agent_id: &str, session_id: &str, result: Result<Value, String>, cx: &mut Context<Self>) {
-        if let Some(view) = self.session.as_mut().filter(|v| v.agent_id == agent_id && v.session_id == session_id) {
+    fn finish_prompt(
+        &mut self,
+        agent_id: &str,
+        session_id: &str,
+        result: Result<Value, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .session
+            .as_mut()
+            .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
+        {
             view.prompting = false;
             view.sync_work(crate::util::now_ms());
             match &result {
                 Err(err) => view.push_notice(format!("Prompt failed: {err}"), true),
                 Ok(v) => match v.get("stopReason").and_then(Value::as_str) {
                     Some("cancelled") => view.push_notice("Stopped.", false),
-                    Some("max_tokens") => view.push_notice("Stopped: the model hit its token limit.", true),
+                    Some("max_tokens") => {
+                        view.push_notice("Stopped: the model hit its token limit.", true)
+                    }
                     Some("refusal") => view.push_notice("The model refused to continue.", true),
                     _ => {}
                 },
@@ -1906,7 +2360,9 @@ impl AgentsStore {
     // ---- inbox --------------------------------------------------------------
 
     fn respond_request(&mut self, key: &str, result: Value, cx: &mut Context<Self>) {
-        let Some(ix) = self.requests.iter().position(|r| r.key == key) else { return };
+        let Some(ix) = self.requests.iter().position(|r| r.key == key) else {
+            return;
+        };
         let req = self.requests.remove(ix);
         if let Some(rpc) = self.runtime.get(&req.agent_id).and_then(|r| r.rpc.clone()) {
             rpc.respond(req.rpc_id, Ok(result));
@@ -1915,11 +2371,21 @@ impl AgentsStore {
     }
 
     pub fn answer_permission(&mut self, key: &str, option_id: &str, cx: &mut Context<Self>) {
-        self.respond_request(key, json!({ "outcome": { "outcome": "selected", "optionId": option_id } }), cx);
+        self.respond_request(
+            key,
+            json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
+            cx,
+        );
     }
 
     /// `action`: `accept` (with `content`), `decline` or `cancel`.
-    pub fn answer_elicitation(&mut self, key: &str, action: &str, content: Option<Value>, cx: &mut Context<Self>) {
+    pub fn answer_elicitation(
+        &mut self,
+        key: &str,
+        action: &str,
+        content: Option<Value>,
+        cx: &mut Context<Self>,
+    ) {
         let mut result = json!({ "action": action });
         if let Some(content) = content {
             result["content"] = content;
@@ -1928,7 +2394,11 @@ impl AgentsStore {
     }
 
     pub fn session_summary(&self, agent_id: &str, session_id: &str) -> Option<&SessionSummary> {
-        self.runtime.get(agent_id)?.sessions.iter().find(|s| s.id == session_id)
+        self.runtime
+            .get(agent_id)?
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
     }
 
     pub fn clear_launch_error(&mut self, cx: &mut Context<Self>) {
@@ -1940,11 +2410,15 @@ impl AgentsStore {
 
     /// Runtime of `id` if `generation` is still the current connection.
     fn live(&mut self, id: &str, generation: u64) -> Option<&mut AgentRuntime> {
-        self.runtime.get_mut(id).filter(|rt| rt.generation == generation)
+        self.runtime
+            .get_mut(id)
+            .filter(|rt| rt.generation == generation)
     }
 
     fn fail(&mut self, id: &str, generation: u64, reason: String, cx: &mut Context<Self>) {
-        let Some(rt) = self.live(id, generation) else { return };
+        let Some(rt) = self.live(id, generation) else {
+            return;
+        };
         if let Some(rpc) = rt.rpc.take() {
             rpc.close();
         }
@@ -1955,48 +2429,108 @@ impl AgentsStore {
         cx.notify();
     }
 
-    fn on_incoming(&mut self, id: &str, generation: u64, incoming: Incoming, cx: &mut Context<Self>) {
+    fn on_incoming(
+        &mut self,
+        id: &str,
+        generation: u64,
+        incoming: Incoming,
+        cx: &mut Context<Self>,
+    ) {
         match incoming {
-            Incoming::Request { id: request_id, method, params } => {
-                let Some(rpc) = self.live(id, generation).and_then(|rt| rt.rpc.clone()) else { return };
+            Incoming::Request {
+                id: request_id,
+                method,
+                params,
+            } => {
+                let Some(rpc) = self.live(id, generation).and_then(|rt| rt.rpc.clone()) else {
+                    return;
+                };
                 match parse_request(id, request_id.clone(), &method, &params) {
                     Some(request) => {
                         self.requests.retain(|r| r.key != request.key);
                         self.requests.push(request);
                         cx.notify();
                     }
-                    None => rpc.respond(request_id, Err((-32601, format!("Method not supported by this client: {method}")))),
+                    None => rpc.respond(
+                        request_id,
+                        Err((
+                            -32601,
+                            format!("Method not supported by this client: {method}"),
+                        )),
+                    ),
                 }
             }
             Incoming::Notification { method, params } => {
                 if method == "session/update" {
-                    let session_id = params.get("sessionId").and_then(Value::as_str).unwrap_or_default();
-                    if let Some(view) = self.session.as_mut().filter(|v| v.agent_id == id && v.session_id == session_id)
-                        && let Some(update) = params.get("update") {
-                            view.apply(update);
-                            cx.notify();
-                        }
+                    let session_id = params
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if let Some(view) = self
+                        .session
+                        .as_mut()
+                        .filter(|v| v.agent_id == id && v.session_id == session_id)
+                        && let Some(update) = params.get("update")
+                    {
+                        view.apply(update);
+                        cx.notify();
+                    }
                 }
                 if method.ends_with("session/runtimeChanged") {
-                    let sid = params.get("session_id").and_then(Value::as_str).unwrap_or_default().to_string();
-                    let phase = params.pointer("/runtime/phase").and_then(Value::as_str).unwrap_or_default().to_string();
-                    if let Some(view) = self.session.as_mut().filter(|v| v.agent_id == id && v.session_id == sid) {
+                    let sid = params
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let phase = params
+                        .pointer("/runtime/phase")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if let Some(view) = self
+                        .session
+                        .as_mut()
+                        .filter(|v| v.agent_id == id && v.session_id == sid)
+                    {
                         if let Some(rt) = params.get("runtime") {
                             view.apply_runtime(rt);
                         }
                         view.sync_work(crate::util::now_ms());
                     }
-                    if let Some(s) = self.runtime.get_mut(id).and_then(|rt| rt.sessions.iter_mut().find(|s| s.id == sid)) {
+                    if let Some(s) = self
+                        .runtime
+                        .get_mut(id)
+                        .and_then(|rt| rt.sessions.iter_mut().find(|s| s.id == sid))
+                    {
                         s.phase = phase;
                     }
                     cx.notify();
                 }
                 if method.ends_with("session/inputState") {
-                    let sid = params.get("session_id").and_then(Value::as_str).unwrap_or_default();
-                    if let Some(view) = self.session.as_mut().filter(|v| v.agent_id == id && v.session_id == sid) {
-                        let input_id = params.get("input_id").and_then(Value::as_str).unwrap_or_default().to_string();
-                        let delivery = params.get("delivery").and_then(Value::as_str).unwrap_or_default().to_string();
-                        let state = params.get("state").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let sid = params
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if let Some(view) = self
+                        .session
+                        .as_mut()
+                        .filter(|v| v.agent_id == id && v.session_id == sid)
+                    {
+                        let input_id = params
+                            .get("input_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let delivery = params
+                            .get("delivery")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let state = params
+                            .get("state")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
                         if view.pending_inputs.iter().any(|i| i.input_id == input_id) {
                             view.set_input_state(&input_id, &delivery, &state);
                         } else {
@@ -2013,10 +2547,14 @@ impl AgentsStore {
                         .or_else(|| params.get("elicitationId"))
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    self.requests.retain(|r| r.agent_id != id || r.elicitation_id.as_deref() != Some(eid));
+                    self.requests
+                        .retain(|r| r.agent_id != id || r.elicitation_id.as_deref() != Some(eid));
                     cx.notify();
                 }
-                if method.contains("runtimeChanged") || method.contains("lifecycle") || method.ends_with("session/update") {
+                if method.contains("runtimeChanged")
+                    || method.contains("lifecycle")
+                    || method.ends_with("session/update")
+                {
                     self.schedule_sessions_refresh(id, Duration::from_millis(1200), cx);
                 } else if method.contains("models/changed") || method.contains("nodesChanged") {
                     self.refresh(id, cx);
@@ -2027,7 +2565,9 @@ impl AgentsStore {
 
     /// Debounced `session/list` refresh after runtime notifications.
     fn schedule_sessions_refresh(&mut self, id: &str, delay: Duration, cx: &mut Context<Self>) {
-        let Some(rt) = self.runtime.get_mut(id) else { return };
+        let Some(rt) = self.runtime.get_mut(id) else {
+            return;
+        };
         let Some(rpc) = rt.rpc.clone() else { return };
         if rt.refresh_scheduled {
             return;
@@ -2039,10 +2579,13 @@ impl AgentsStore {
             // The first page holds everything that changed recently; merge it in.
             let sessions = fetch_sessions(&rpc, &id, 1).await;
             let _ = this.update(cx, |s, cx| {
-                let Some(rt) = s.live(&id, generation) else { return };
+                let Some(rt) = s.live(&id, generation) else {
+                    return;
+                };
                 rt.refresh_scheduled = false;
                 if let Ok(fresh) = sessions {
-                    let ids: std::collections::HashSet<String> = fresh.iter().map(|s| s.id.clone()).collect();
+                    let ids: std::collections::HashSet<String> =
+                        fresh.iter().map(|s| s.id.clone()).collect();
                     let mut merged = fresh;
                     merged.extend(rt.sessions.drain(..).filter(|s| !ids.contains(&s.id)));
                     merged.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -2057,7 +2600,11 @@ impl AgentsStore {
     }
 }
 
-async fn fetch_sessions(rpc: &RpcClient, agent_id: &str, max_pages: usize) -> Result<Vec<SessionSummary>, String> {
+async fn fetch_sessions(
+    rpc: &RpcClient,
+    agent_id: &str,
+    max_pages: usize,
+) -> Result<Vec<SessionSummary>, String> {
     let mut sessions = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..max_pages {
@@ -2066,12 +2613,26 @@ async fn fetch_sessions(rpc: &RpcClient, agent_id: &str, max_pages: usize) -> Re
             None => json!({}),
         };
         let page = rpc.request("session/list", params).await?;
-        for s in page.get("sessions").and_then(Value::as_array).into_iter().flatten() {
-            let text = |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or_default().to_string();
+        for s in page
+            .get("sessions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let text =
+                |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or_default().to_string();
             let meta = s.get("_meta");
             let lifecycle = meta.and_then(|m| m.pointer("/querymt/lifecycle"));
-            let flag = |k: &str| lifecycle.and_then(|l| l.get(k)).and_then(Value::as_bool).unwrap_or(false);
-            let pinned = meta.and_then(|m| m.pointer("/querymt/pin/pinned")).and_then(Value::as_bool).unwrap_or(false);
+            let flag = |k: &str| {
+                lifecycle
+                    .and_then(|l| l.get(k))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            };
+            let pinned = meta
+                .and_then(|m| m.pointer("/querymt/pin/pinned"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             sessions.push(SessionSummary {
                 agent_id: agent_id.to_string(),
                 id: text(s.get("sessionId")),
@@ -2079,15 +2640,23 @@ async fn fetch_sessions(rpc: &RpcClient, agent_id: &str, max_pages: usize) -> Re
                 title: text(s.get("title")),
                 updated_at: text(s.get("updatedAt")),
                 phase: text(meta.and_then(|m| m.pointer("/runtimeStatus/phase"))),
-                root: meta.and_then(|m| m.get("parentSessionId")).is_none_or(Value::is_null),
+                root: meta
+                    .and_then(|m| m.get("parentSessionId"))
+                    .is_none_or(Value::is_null),
                 open: !flag("resolved") && !flag("archived"),
                 resolved: flag("resolved"),
                 archived: flag("archived"),
                 pinned,
-                messages: meta.and_then(|m| m.get("messageCount")).and_then(Value::as_u64).unwrap_or(0),
+                messages: meta
+                    .and_then(|m| m.get("messageCount"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
             });
         }
-        cursor = page.get("nextCursor").and_then(Value::as_str).map(str::to_owned);
+        cursor = page
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         if cursor.is_none() {
             break;
         }
@@ -2096,7 +2665,13 @@ async fn fetch_sessions(rpc: &RpcClient, agent_id: &str, max_pages: usize) -> Re
 }
 
 /// Capabilities, models, sessions, mesh — each applied as soon as it arrives.
-async fn load_details(this: WeakEntity<AgentsStore>, id: String, generation: u64, rpc: Rc<RpcClient>, cx: &mut AsyncApp) {
+async fn load_details(
+    this: WeakEntity<AgentsStore>,
+    id: String,
+    generation: u64,
+    rpc: Rc<RpcClient>,
+    cx: &mut AsyncApp,
+) {
     macro_rules! apply {
         ($f:expr) => {
             if this
@@ -2119,7 +2694,12 @@ async fn load_details(this: WeakEntity<AgentsStore>, id: String, generation: u64
     }
 
     let caps = rpc.request("_querymt/capabilities", json!({})).await;
-    let has_mesh = caps.as_ref().ok().and_then(|c| c.pointer("/features/mesh")).and_then(Value::as_bool) == Some(true);
+    let has_mesh = caps
+        .as_ref()
+        .ok()
+        .and_then(|c| c.pointer("/features/mesh"))
+        .and_then(Value::as_bool)
+        == Some(true);
     apply!(|rt: &mut AgentRuntime| match caps {
         Ok(caps) => rt.capabilities = Some(caps),
         Err(err) => rt.log(format!("Capabilities unavailable: {err}")),
@@ -2152,7 +2732,15 @@ async fn load_details(this: WeakEntity<AgentsStore>, id: String, generation: u64
         Err(err) => rt.log(format!("Sessions unavailable: {err}")),
     });
 
-    load_extras(this.clone(), id.clone(), generation, rpc.clone(), has_mesh, cx).await;
+    load_extras(
+        this.clone(),
+        id.clone(),
+        generation,
+        rpc.clone(),
+        has_mesh,
+        cx,
+    )
+    .await;
     apply!(|rt: &mut AgentRuntime| {
         rt.busy = false;
         let summary = format!(
@@ -2174,7 +2762,8 @@ fn parse_models(v: &Value) -> Vec<Model> {
         .filter_map(|m| {
             let s = |k: &str| m.get(k).and_then(Value::as_str).map(str::to_owned);
             let id = s("id")?;
-            let model = s("model").unwrap_or_else(|| id.rsplit('/').next().unwrap_or(&id).to_string());
+            let model =
+                s("model").unwrap_or_else(|| id.rsplit('/').next().unwrap_or(&id).to_string());
             Some(Model {
                 label: s("label").unwrap_or_else(|| model.clone()),
                 provider: s("provider").unwrap_or_default(),
@@ -2197,16 +2786,30 @@ async fn hydrate_model_info(rpc: &RpcClient, mut models: Vec<Model>) -> Vec<Mode
         .filter(|m| seen.insert(format!("{}/{}", m.provider, m.model)))
         .map(|m| json!({ "provider": m.provider, "model": m.model }))
         .collect();
-    let Ok(resp) = rpc.request("_querymt/modelInfo", json!({ "models": identities })).await else { return models };
-    let Some(infos) = resp.get("models").and_then(Value::as_object) else { return models };
+    let Ok(resp) = rpc
+        .request("_querymt/modelInfo", json!({ "models": identities }))
+        .await
+    else {
+        return models;
+    };
+    let Some(infos) = resp.get("models").and_then(Value::as_object) else {
+        return models;
+    };
     for m in &mut models {
-        let Some(info) = infos.get(&format!("{}/{}", m.provider, m.model)).filter(|i| !i.is_null()) else { continue };
+        let Some(info) = infos
+            .get(&format!("{}/{}", m.provider, m.model))
+            .filter(|i| !i.is_null())
+        else {
+            continue;
+        };
         // The wire shape is flat (`limit`, `modalities`) but older agents nest it.
         m.context = info
             .pointer("/limit/context")
             .or_else(|| info.pointer("/limits/context"))
             .and_then(Value::as_u64);
-        let input = info.pointer("/modalities/input").or_else(|| info.pointer("/capabilities/modalities/input"));
+        let input = info
+            .pointer("/modalities/input")
+            .or_else(|| info.pointer("/capabilities/modalities/input"));
         m.modalities = input
             .and_then(Value::as_array)
             .into_iter()
@@ -2224,7 +2827,11 @@ async fn hydrate_model_info(rpc: &RpcClient, mut models: Vec<Model>) -> Vec<Mode
 // Session config helpers
 
 fn config_options(response: &Value) -> Vec<Value> {
-    response.get("configOptions").and_then(Value::as_array).cloned().unwrap_or_default()
+    response
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn update_options(options: &mut Vec<Value>, response: &Value) {
@@ -2236,7 +2843,10 @@ fn update_options(options: &mut Vec<Value>, response: &Value) {
 
 /// Find a select config option by id/category/name alias; returns its id and choice values.
 fn find_option(options: &[Value], aliases: &[&str]) -> Option<(String, Vec<String>)> {
-    let norm = |v: Option<&Value>| v.and_then(Value::as_str).map(|s| s.to_lowercase().replace(['-', ' '], "_"));
+    let norm = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .map(|s| s.to_lowercase().replace(['-', ' '], "_"))
+    };
     let option = options.iter().find(|o| {
         ["id", "category", "name"]
             .iter()
@@ -2245,10 +2855,24 @@ fn find_option(options: &[Value], aliases: &[&str]) -> Option<(String, Vec<Strin
     })?;
     let id = option.get("id")?.as_str()?.to_string();
     let mut values = Vec::new();
-    for entry in option.get("options").and_then(Value::as_array).into_iter().flatten() {
+    for entry in option
+        .get("options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         match entry.get("options").and_then(Value::as_array) {
-            Some(group) => values.extend(group.iter().filter_map(|e| e.get("value")?.as_str().map(str::to_owned))),
-            None => values.extend(entry.get("value").and_then(Value::as_str).map(str::to_owned)),
+            Some(group) => values.extend(
+                group
+                    .iter()
+                    .filter_map(|e| e.get("value")?.as_str().map(str::to_owned)),
+            ),
+            None => values.extend(
+                entry
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            ),
         }
     }
     Some((id, values))
@@ -2257,7 +2881,9 @@ fn find_option(options: &[Value], aliases: &[&str]) -> Option<(String, Vec<Strin
 fn percent_encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
             _ => format!("%{b:02X}"),
         })
         .collect()
@@ -2270,9 +2896,12 @@ fn prompt_content(prompt: &str, attachments: &[Attachment]) -> Vec<Value> {
         content.push(json!({ "type": "text", "text": prompt }));
     }
     for a in attachments {
-        let meta = json!({ "querymt": { "attachment_id": a.id, "filename": a.name, "size": a.size } });
+        let meta =
+            json!({ "querymt": { "attachment_id": a.id, "filename": a.name, "size": a.size } });
         if a.is_image() {
-            content.push(json!({ "type": "image", "data": a.data, "mimeType": a.mime, "_meta": meta }));
+            content.push(
+                json!({ "type": "image", "data": a.data, "mimeType": a.mime, "_meta": meta }),
+            );
         } else {
             content.push(json!({
                 "type": "resource",
@@ -2290,7 +2919,11 @@ fn prompt_content(prompt: &str, attachments: &[Attachment]) -> Vec<Value> {
 }
 
 fn strs(v: Option<&Value>) -> Vec<String> {
-    v.and_then(Value::as_array).into_iter().flatten().filter_map(|x| x.as_str().map(str::to_owned)).collect()
+    v.and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// Mesh status/nodes/invites, provider auth and profiles; each applied as it arrives.
@@ -2304,7 +2937,9 @@ async fn load_extras(
 ) {
     let apply = |f: Box<dyn FnOnce(&mut AgentRuntime)>, cx: &mut AsyncApp| -> bool {
         this.update(cx, |s, cx| {
-            let Some(rt) = s.live(&id, generation) else { return false };
+            let Some(rt) = s.live(&id, generation) else {
+                return false;
+            };
             f(rt);
             cx.notify();
             true
@@ -2325,7 +2960,10 @@ async fn load_extras(
                         .flatten()
                         .map(|r| {
                             (
-                                r.get("url").and_then(Value::as_str).unwrap_or_default().to_string(),
+                                r.get("url")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
                                 r.get("connected").and_then(Value::as_bool).unwrap_or(false),
                             )
                         })
@@ -2334,8 +2972,14 @@ async fn load_extras(
                         enabled: m.get("enabled").and_then(Value::as_bool).unwrap_or(false),
                         peer_id: m.get("peer_id").and_then(Value::as_str).map(str::to_owned),
                         hostname: m.get("hostname").and_then(Value::as_str).map(str::to_owned),
-                        peers: m.get("known_peer_count").and_then(Value::as_u64).unwrap_or(0),
-                        transport: m.get("transport").and_then(Value::as_str).map(str::to_owned),
+                        peers: m
+                            .get("known_peer_count")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        transport: m
+                            .get("transport")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
                         relays,
                     });
                 }
@@ -2359,7 +3003,10 @@ async fn load_extras(
                             Some(MeshNode {
                                 id: text(n, "id")?,
                                 label: text(n, "label").unwrap_or_default(),
-                                active_sessions: n.get("active_sessions").and_then(Value::as_u64).unwrap_or(0),
+                                active_sessions: n
+                                    .get("active_sessions")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0),
                                 capabilities: strs(n.get("capabilities")),
                                 transport: text(n, "transport").unwrap_or_default(),
                             })
@@ -2408,7 +3055,8 @@ async fn load_extras(
                     .filter_map(|p| {
                         let provider = text(p, "provider")?;
                         Some(ProviderAuth {
-                            display_name: text(p, "display_name").unwrap_or_else(|| provider.clone()),
+                            display_name: text(p, "display_name")
+                                .unwrap_or_else(|| provider.clone()),
                             provider,
                             oauth_status: text(p, "oauth_status"),
                             has_stored_api_key: flag(p, "has_stored_api_key"),

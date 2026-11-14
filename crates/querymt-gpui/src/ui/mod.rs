@@ -141,16 +141,27 @@ impl QmtApp {
                 .submit_on_enter(true)
                 .placeholder("Ask QueryMT to inspect, change, debug, explain, or plan something.")
         });
-        let model_query = cx.new(|cx| InputState::new(window, cx).placeholder("Search models, providers, nodes…"));
-        let session_query = cx.new(|cx| InputState::new(window, cx).placeholder("Search sessions, workspaces, agents…"));
+        let model_query = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Search models, providers, nodes…"));
+        let session_query = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Search sessions, workspaces, agents…")
+        });
         let d_name = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Build server"));
         let d_command = cx.new(|cx| InputState::new(window, cx).placeholder("qmtcode --acp"));
         let d_address = cx.new(|cx| InputState::new(window, cx).placeholder("127.0.0.1:42069"));
         let invite_uses = cx.new(|cx| InputState::new(window, cx).placeholder("Unlimited"));
-        let key_input = cx.new(|cx| InputState::new(window, cx).placeholder("Paste API key").masked(true));
-        let oauth_code = cx.new(|cx| InputState::new(window, cx).placeholder("Callback URL or code"));
+        let key_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Paste API key")
+                .masked(true)
+        });
+        let oauth_code =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Callback URL or code"));
         let session_prompt = cx.new(|cx| {
-            TextareaState::new(window, cx).auto_grow(2, 12).submit_on_enter(true).placeholder("Reply to the agent…")
+            TextareaState::new(window, cx)
+                .auto_grow(2, 12)
+                .submit_on_enter(true)
+                .placeholder("Reply to the agent…")
         });
 
         let mut subs = vec![
@@ -164,27 +175,41 @@ impl QmtApp {
                     this.apply_theme(window, cx);
                 }
             }),
-            cx.subscribe_in(&prompt, window, |this, _, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { shift: false, .. } => this.start_session(window, cx),
-                InputEvent::Change => cx.notify(),
-                _ => {}
-            }),
+            cx.subscribe_in(
+                &prompt,
+                window,
+                |this, _, ev: &InputEvent, window, cx| match ev {
+                    InputEvent::PressEnter { shift: false, .. } => this.start_session(window, cx),
+                    InputEvent::Change => cx.notify(),
+                    _ => {}
+                },
+            ),
             cx.subscribe_in(&cwd, window, |_, _, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify();
                 }
             }),
-            cx.subscribe_in(&model_query, window, |this, _, ev: &InputEvent, _, cx| match ev {
-                InputEvent::PressEnter { .. } => this.pick_first_model(cx),
-                InputEvent::Change => cx.notify(),
-                _ => {}
-            }),
-            cx.subscribe_in(&session_prompt, window, |this, _, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { shift: false, .. } => this.send_session_prompt(window, cx),
-                InputEvent::PressEnter { shift: true, .. } => {}
-                InputEvent::Change => cx.notify(),
-                _ => {}
-            }),
+            cx.subscribe_in(
+                &model_query,
+                window,
+                |this, _, ev: &InputEvent, _, cx| match ev {
+                    InputEvent::PressEnter { .. } => this.pick_first_model(cx),
+                    InputEvent::Change => cx.notify(),
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &session_prompt,
+                window,
+                |this, _, ev: &InputEvent, window, cx| match ev {
+                    InputEvent::PressEnter { shift: false, .. } => {
+                        this.send_session_prompt(window, cx)
+                    }
+                    InputEvent::PressEnter { shift: true, .. } => {}
+                    InputEvent::Change => cx.notify(),
+                    _ => {}
+                },
+            ),
             cx.subscribe_in(&session_query, window, |_, _, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify();
@@ -192,11 +217,13 @@ impl QmtApp {
             }),
         ];
         for input in [&d_name, &d_command, &d_address] {
-            subs.push(cx.subscribe_in(input, window, |this, _, ev: &InputEvent, _, cx| match ev {
-                InputEvent::PressEnter { .. } => this.save_dialog(cx),
-                InputEvent::Change => cx.notify(),
-                _ => {}
-            }));
+            subs.push(
+                cx.subscribe_in(input, window, |this, _, ev: &InputEvent, _, cx| match ev {
+                    InputEvent::PressEnter { .. } => this.save_dialog(cx),
+                    InputEvent::Change => cx.notify(),
+                    _ => {}
+                }),
+            );
         }
 
         let (page, details) = initial_view(&store, cx);
@@ -262,8 +289,16 @@ impl QmtApp {
     /// Open the deep-linked session (`?session=` / `QMT_SESSION`) once the
     /// store knows about it. Driven by store notifications, not by `render`.
     fn open_pending_session(&mut self, cx: &mut Context<Self>) {
-        let Some(sid) = self.pending_open.as_deref() else { return };
-        let found = self.store.read(cx).all_sessions().into_iter().find(|s| s.id == sid).cloned();
+        let Some(sid) = self.pending_open.as_deref() else {
+            return;
+        };
+        let found = self
+            .store
+            .read(cx)
+            .all_sessions()
+            .into_iter()
+            .find(|s| s.id == sid)
+            .cloned();
         if let Some(summary) = found {
             self.pending_open = None;
             self.open_summary(&summary, cx);
@@ -277,24 +312,30 @@ impl QmtApp {
         self.session_menu_open = false;
         // Mesh and Settings show live server data: refresh it on entry.
         if matches!(page, Page::Mesh | Page::Settings)
-            && let Some(agent) = self.store.read(cx).primary_agent() {
-                self.store.update(cx, |s, cx| s.refresh_extras(&agent, cx));
-            }
+            && let Some(agent) = self.store.read(cx).primary_agent()
+        {
+            self.store.update(cx, |s, cx| s.refresh_extras(&agent, cx));
+        }
         cx.notify();
     }
 
     /// Re-apply theme mode + accent from preferences.
     pub(crate) fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prefs = self.store.read(cx).prefs.clone();
-        let dark = prefs
-            .dark
-            .unwrap_or_else(|| matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark));
+        let dark = prefs.dark.unwrap_or_else(|| {
+            matches!(
+                window.appearance(),
+                WindowAppearance::Dark | WindowAppearance::VibrantDark
+            )
+        });
         theme::apply(dark, &prefs.accent, cx);
         cx.notify();
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.store.update(cx, |s, cx| s.update_prefs(|p| p.sidebar_collapsed = !p.sidebar_collapsed, cx));
+        self.store.update(cx, |s, cx| {
+            s.update_prefs(|p| p.sidebar_collapsed = !p.sidebar_collapsed, cx)
+        });
     }
 
     /// Close the top-most overlay. Returns whether one was open.
@@ -312,7 +353,10 @@ impl QmtApp {
         {
             return true;
         }
-        if self.confirm_delete.take().is_some() || self.dialog.take().is_some() || self.details.take().is_some() {
+        if self.confirm_delete.take().is_some()
+            || self.dialog.take().is_some()
+            || self.details.take().is_some()
+        {
             return true;
         }
         false
@@ -321,22 +365,27 @@ impl QmtApp {
     fn start_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = self.prompt.read(cx).value().trim().to_string();
         let cwd = self.cwd.read(cx).value().trim().to_string();
-        let Some(agent) = self.store.read(cx).primary_agent() else { return };
+        let Some(agent) = self.store.read(cx).primary_agent() else {
+            return;
+        };
         if (prompt.is_empty() && self.attachments.is_empty()) || self.store.read(cx).launch.busy {
             return;
         }
         if cwd.is_empty() {
             self.store.update(cx, |s, cx| {
-                s.launch.error = Some("Choose a workspace: an absolute path on the agent's machine.".into());
+                s.launch.error =
+                    Some("Choose a workspace: an absolute path on the agent's machine.".into());
                 cx.notify();
             });
             return;
         }
         let attachments = std::mem::take(&mut self.attachments);
         self.attach_error = None;
-        self.store.update(cx, |s, cx| s.launch(&agent, cwd, prompt, attachments, cx));
+        self.store
+            .update(cx, |s, cx| s.launch(&agent, cwd, prompt, attachments, cx));
         self.page = Page::Session;
-        self.prompt.update(cx, |s, cx| s.set_value(SharedString::default(), window, cx));
+        self.prompt
+            .update(cx, |s, cx| s.set_value(SharedString::default(), window, cx));
     }
 
     // ---- shell ---------------------------------------------------------------
@@ -377,11 +426,19 @@ impl QmtApp {
                     .text_size(px(10.))
                     .font_semibold()
                     .text_color(p.on_accent)
-                    .child(if count > 99 { "99+".to_string() } else { count.to_string() })
+                    .child(if count > 99 {
+                        "99+".to_string()
+                    } else {
+                        count.to_string()
+                    })
             });
             return kit::rail_button(label, active, p)
                 .tooltip(move |window, cx| kit::wrap_tip(label).build(window, cx))
-                .child(kit::icon(icon, 18., if active { p.accent } else { p.muted }))
+                .child(kit::icon(
+                    icon,
+                    18.,
+                    if active { p.accent } else { p.muted },
+                ))
                 .children(badge)
                 .on_click(cx.listener(move |this, _, _, cx| this.go(page, cx)));
         }
@@ -399,7 +456,11 @@ impl QmtApp {
             .text_color(if active { p.text } else { p.muted })
             .when(active, |el| el.bg(p.accent_dim).font_medium())
             .when(!active, |el| el.hover(move |el| el.bg(hover_bg)))
-            .child(kit::icon(icon, 16., if active { p.accent } else { p.muted }))
+            .child(kit::icon(
+                icon,
+                16.,
+                if active { p.accent } else { p.muted },
+            ))
             .child(div().flex_1().child(label))
             .children(trailing)
             .on_click(cx.listener(move |this, _, _, cx| this.go(page, cx)))
@@ -414,19 +475,33 @@ impl QmtApp {
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
                 .into_any_element();
         }
-        kit::icon_button("sidebar-toggle", IconName::PanelLeftClose, "Collapse sidebar (Ctrl+B)")
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
-            .into_any_element()
+        kit::icon_button(
+            "sidebar-toggle",
+            IconName::PanelLeftClose,
+            "Collapse sidebar (Ctrl+B)",
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+        .into_any_element()
     }
 
     fn render_sidebar_rail(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = *palette(cx);
         let store = self.store.read(cx);
-        let mut open: Vec<SessionSummary> =
-            store.all_sessions().into_iter().filter(|s| s.root && s.open).cloned().collect();
+        let mut open: Vec<SessionSummary> = store
+            .all_sessions()
+            .into_iter()
+            .filter(|s| s.root && s.open)
+            .cloned()
+            .collect();
         open.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         open.truncate(10);
-        let separator = || div().flex_none().w(px(28.)).py_0p5().child(kit::divider(&p));
+        let separator = || {
+            div()
+                .flex_none()
+                .w(px(28.))
+                .py_0p5()
+                .child(kit::divider(&p))
+        };
         // Flat, transparent rail like the desktop app's collapsed sidebar: no
         // card, no borders; tiles are ghost buttons that only fill on hover.
         div()
@@ -441,9 +516,30 @@ impl QmtApp {
                     .items_center()
                     .pt_1()
                     .gap_1p5()
-                    .child(self.nav_item(Page::Start, IconName::LayoutDashboard, "Start", None, &p, cx))
-                    .child(self.nav_item(Page::Inbox, IconName::Inbox, "Inbox", inbox_badge(self.store.read(cx).requests.len(), &p), &p, cx))
-                    .child(self.nav_item(Page::Sessions, IconName::MessagesSquare, "Sessions", None, &p, cx))
+                    .child(self.nav_item(
+                        Page::Start,
+                        IconName::LayoutDashboard,
+                        "Start",
+                        None,
+                        &p,
+                        cx,
+                    ))
+                    .child(self.nav_item(
+                        Page::Inbox,
+                        IconName::Inbox,
+                        "Inbox",
+                        inbox_badge(self.store.read(cx).requests.len(), &p),
+                        &p,
+                        cx,
+                    ))
+                    .child(self.nav_item(
+                        Page::Sessions,
+                        IconName::MessagesSquare,
+                        "Sessions",
+                        None,
+                        &p,
+                        cx,
+                    ))
                     .child(separator())
                     .child(self.nav_item(Page::Agents, IconName::Bot, "Agents", None, &p, cx))
                     .child(self.nav_item(Page::Mesh, IconName::Network, "Mesh", None, &p, cx))
@@ -459,30 +555,53 @@ impl QmtApp {
                             .gap_1p5()
                             .children(open.into_iter().map(|s| {
                                 let current = self.page == Page::Session
-                                    && store.session.as_ref().is_some_and(|v| v.agent_id == s.agent_id && v.session_id == s.id);
-                                let title = format!("{}\n{}", s.display_title(), workspace_name(&s.cwd));
-                                kit::rail_button(SharedString::from(format!("rail-session-{}-{}", s.agent_id, s.id)), current, &p)
-                                    .tooltip(move |window, cx| {
-                                        kit::wrap_tip(title.clone()).build(window, cx)
-                                    })
-                                    .child(kit::identicon(&s.id, 30.))
-                                    .when(s.running(), |el| {
-                                        el.child(
-                                            div()
-                                                .absolute()
-                                                .top(px(-1.))
-                                                .right(px(-1.))
-                                                .p_0p5()
-                                                .rounded_full()
-                                                .bg(p.bg)
-                                                .child(kit::spinner(kit::keyed("rail-spin", s.id.clone()), 10., p.success)),
-                                        )
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| this.open_summary(&s, cx)))
+                                    && store.session.as_ref().is_some_and(|v| {
+                                        v.agent_id == s.agent_id && v.session_id == s.id
+                                    });
+                                let title =
+                                    format!("{}\n{}", s.display_title(), workspace_name(&s.cwd));
+                                kit::rail_button(
+                                    SharedString::from(format!(
+                                        "rail-session-{}-{}",
+                                        s.agent_id, s.id
+                                    )),
+                                    current,
+                                    &p,
+                                )
+                                .tooltip(move |window, cx| {
+                                    kit::wrap_tip(title.clone()).build(window, cx)
+                                })
+                                .child(kit::identicon(&s.id, 30.))
+                                .when(s.running(), |el| {
+                                    el.child(
+                                        div()
+                                            .absolute()
+                                            .top(px(-1.))
+                                            .right(px(-1.))
+                                            .p_0p5()
+                                            .rounded_full()
+                                            .bg(p.bg)
+                                            .child(kit::spinner(
+                                                kit::keyed("rail-spin", s.id.clone()),
+                                                10.,
+                                                p.success,
+                                            )),
+                                    )
+                                })
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.open_summary(&s, cx)),
+                                )
                             })),
                     )
                     .child(separator())
-                    .child(self.nav_item(Page::Settings, IconName::Settings, "Settings", None, &p, cx))
+                    .child(self.nav_item(
+                        Page::Settings,
+                        IconName::Settings,
+                        "Settings",
+                        None,
+                        &p,
+                        cx,
+                    ))
                     .child(self.collapse_button(true, cx)),
             )
             .into_any_element()
@@ -495,8 +614,12 @@ impl QmtApp {
         let p = *palette(cx);
         let show_pinned = self.store.read(cx).prefs.show_pinned_sidebar;
         let store = self.store.read(cx);
-        let mut pinned: Vec<SessionSummary> =
-            store.all_sessions().into_iter().filter(|s| s.root && s.pinned && !s.archived).cloned().collect();
+        let mut pinned: Vec<SessionSummary> = store
+            .all_sessions()
+            .into_iter()
+            .filter(|s| s.root && s.pinned && !s.archived)
+            .cloned()
+            .collect();
         pinned.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         let connected = store.connected_ids();
         let total = store.configs.len();
@@ -515,7 +638,9 @@ impl QmtApp {
         open.truncate(16);
         let any_connecting = store.configs.iter().any(|c| {
             store.state(&c.id) == ConnState::Connecting
-                || store.runtime(&c.id).is_some_and(|r| r.is_connected() && !r.sessions_loaded)
+                || store
+                    .runtime(&c.id)
+                    .is_some_and(|r| r.is_connected() && !r.sessions_loaded)
         });
 
         // Quiet group labels: small caps in the dim tone, no widget-heading weight.
@@ -532,7 +657,16 @@ impl QmtApp {
         let hairline = || div().mx_2().child(kit::divider(&p));
         let agents_count = h_flex()
             .text_xs()
-            .child(div().font_semibold().text_color(if connected.is_empty() { p.dim } else { p.success }).child(connected.len().to_string()))
+            .child(
+                div()
+                    .font_semibold()
+                    .text_color(if connected.is_empty() {
+                        p.dim
+                    } else {
+                        p.success
+                    })
+                    .child(connected.len().to_string()),
+            )
             .child(div().text_color(p.dim).child(format!(" / {total}")))
             .into_any_element();
 
@@ -544,87 +678,125 @@ impl QmtApp {
                 .cursor_pointer()
                 .child(section("Open sessions").flex_1())
                 .when(open_total > 0, |el| {
-                    el.child(div().pt_3().pb_1().pr_2().text_size(px(11.)).text_color(p.dim).child(open_total.to_string()))
+                    el.child(
+                        div()
+                            .pt_3()
+                            .pb_1()
+                            .pr_2()
+                            .text_size(px(11.))
+                            .text_color(p.dim)
+                            .child(open_total.to_string()),
+                    )
                 })
                 .on_click(cx.listener(|this, _, _, cx| this.go(Page::Sessions, cx)))
         };
 
-        let sessions_list = v_flex()
-            .id("sidebar-sessions")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .gap_px()
-            .when(open.is_empty(), |el| {
-                el.child(div().px_2().py_1().text_xs().text_color(p.dim).child(if any_connecting {
-                    "Loading sessions…"
-                } else if connected.is_empty() {
-                    "Connect an agent to see sessions."
-                } else {
-                    "No open sessions."
-                }))
-            })
-            .when(show_pinned && !pinned.is_empty(), |el| {
-                el.child(section("Pinned")).children(pinned.iter().map(|s| {
+        let sessions_list =
+            v_flex()
+                .id("sidebar-sessions")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .gap_px()
+                .when(open.is_empty(), |el| {
+                    el.child(div().px_2().py_1().text_xs().text_color(p.dim).child(
+                        if any_connecting {
+                            "Loading sessions…"
+                        } else if connected.is_empty() {
+                            "Connect an agent to see sessions."
+                        } else {
+                            "No open sessions."
+                        },
+                    ))
+                })
+                .when(show_pinned && !pinned.is_empty(), |el| {
+                    el.child(section("Pinned"))
+                        .children(pinned.iter().map(|s| {
+                            let hover_bg = p.card_hover;
+                            h_flex()
+                                .id(kit::keyed("pinned-session", s.id.clone()))
+                                .gap_2()
+                                .px_2()
+                                .h(px(28.))
+                                .rounded(px(8.))
+                                .text_color(p.muted)
+                                .hover(move |el| el.bg(hover_bg))
+                                .cursor_pointer()
+                                .on_click({
+                                    let s = s.clone();
+                                    cx.listener(move |this, _, _, cx| this.open_summary(&s, cx))
+                                })
+                                .child(kit::identicon(&s.id, 14.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .truncate()
+                                        .child(s.display_title()),
+                                )
+                                .when(s.running(), |el| {
+                                    el.child(kit::spinner(
+                                        kit::keyed("pin-spin", s.id.clone()),
+                                        12.,
+                                        p.success,
+                                    ))
+                                })
+                        }))
+                        .child(open_header())
+                })
+                .children(open.into_iter().map(|s| {
                     let hover_bg = p.card_hover;
-                    h_flex()
-                        .id(kit::keyed("pinned-session", s.id.clone()))
-                        .gap_2()
-                        .px_2()
-                        .h(px(28.))
-                        .rounded(px(8.))
-                        .text_color(p.muted)
-                        .hover(move |el| el.bg(hover_bg))
+                    let current = self.page == Page::Session
+                        && store.session.as_ref().is_some_and(|v| v.session_id == s.id);
+                    let s2 = s.clone();
+                    v_flex()
+                        .id(kit::keyed("open-session", s.id.clone()))
                         .cursor_pointer()
-                        .on_click({
-                            let s = s.clone();
-                            cx.listener(move |this, _, _, cx| this.open_summary(&s, cx))
-                        })
-                        .child(kit::identicon(&s.id, 14.))
-                        .child(div().flex_1().min_w_0().text_sm().truncate().child(s.display_title()))
-                        .when(s.running(), |el| el.child(kit::spinner(kit::keyed("pin-spin", s.id.clone()), 12., p.success)))
-                }))
-                .child(open_header())
-            })
-            .children(open.into_iter().map(|s| {
-                let hover_bg = p.card_hover;
-                let current = self.page == Page::Session && store.session.as_ref().is_some_and(|v| v.session_id == s.id);
-                let s2 = s.clone();
-                v_flex()
-                    .id(kit::keyed("open-session", s.id.clone()))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.open_summary(&s2, cx)))
-                    .px_2()
-                    .py_1p5()
-                    .gap_0p5()
-                    .rounded(px(8.))
-                    .when(current, |el| el.bg(p.accent_dim))
-                    .when(!current, |el| el.hover(move |el| el.bg(hover_bg)))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_sm()
-                                    .text_color(if current { p.text } else { p.muted })
-                                    .when(current, |el| el.font_medium())
-                                    .truncate()
-                                    .child(s.display_title()),
-                            )
-                            .when(s.running(), |el| el.child(kit::spinner(kit::keyed("sb-spin", s.id.clone()), 13., p.success))),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_1p5()
-                            .text_xs()
-                            .text_color(p.dim)
-                            .child(kit::identicon(&s.id, 14.))
-                            .child(div().flex_1().min_w_0().truncate().child(workspace_name(&s.cwd)))
-                            .child(div().flex_none().child(short_time(&s.updated_at))),
-                    )
-            }));
+                        .on_click(cx.listener(move |this, _, _, cx| this.open_summary(&s2, cx)))
+                        .px_2()
+                        .py_1p5()
+                        .gap_0p5()
+                        .rounded(px(8.))
+                        .when(current, |el| el.bg(p.accent_dim))
+                        .when(!current, |el| el.hover(move |el| el.bg(hover_bg)))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .text_color(if current { p.text } else { p.muted })
+                                        .when(current, |el| el.font_medium())
+                                        .truncate()
+                                        .child(s.display_title()),
+                                )
+                                .when(s.running(), |el| {
+                                    el.child(kit::spinner(
+                                        kit::keyed("sb-spin", s.id.clone()),
+                                        13.,
+                                        p.success,
+                                    ))
+                                }),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .text_xs()
+                                .text_color(p.dim)
+                                .child(kit::identicon(&s.id, 14.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .child(workspace_name(&s.cwd)),
+                                )
+                                .child(div().flex_none().child(short_time(&s.updated_at))),
+                        )
+                }));
 
         // No card: the sidebar is a column of the window chrome, on the same
         // `p.bg` plane as the title bar and the collapsed rail. The 9px gutter
@@ -643,42 +815,93 @@ impl QmtApp {
                     .pb_2()
                     .gap_0p5()
                     .child(section("Work"))
-                    .child(self.nav_item(Page::Start, IconName::LayoutDashboard, "Start", None, &p, cx))
-                    .child(self.nav_item(Page::Inbox, IconName::Inbox, "Inbox", inbox_badge(self.store.read(cx).requests.len(), &p), &p, cx))
-                    .child(self.nav_item(Page::Sessions, IconName::MessagesSquare, "Sessions", None, &p, cx))
+                    .child(self.nav_item(
+                        Page::Start,
+                        IconName::LayoutDashboard,
+                        "Start",
+                        None,
+                        &p,
+                        cx,
+                    ))
+                    .child(self.nav_item(
+                        Page::Inbox,
+                        IconName::Inbox,
+                        "Inbox",
+                        inbox_badge(self.store.read(cx).requests.len(), &p),
+                        &p,
+                        cx,
+                    ))
+                    .child(self.nav_item(
+                        Page::Sessions,
+                        IconName::MessagesSquare,
+                        "Sessions",
+                        None,
+                        &p,
+                        cx,
+                    ))
                     .child(section("Manage"))
-                    .child(self.nav_item(Page::Agents, IconName::Bot, "Agents", Some(agents_count), &p, cx))
+                    .child(self.nav_item(
+                        Page::Agents,
+                        IconName::Bot,
+                        "Agents",
+                        Some(agents_count),
+                        &p,
+                        cx,
+                    ))
                     .child(self.nav_item(
                         Page::Mesh,
                         IconName::Network,
                         "Mesh",
-                        peers.map(|n| div().text_xs().text_color(p.dim).child(n.to_string()).into_any_element()),
+                        peers.map(|n| {
+                            div()
+                                .text_xs()
+                                .text_color(p.dim)
+                                .child(n.to_string())
+                                .into_any_element()
+                        }),
                         &p,
                         cx,
                     ))
                     .child(div().pt_3().child(hairline()))
-                    .when(!(show_pinned && !pinned.is_empty()), |el| el.child(open_header()))
+                    .when(!(show_pinned && !pinned.is_empty()), |el| {
+                        el.child(open_header())
+                    })
                     .child(sessions_list)
                     .child(div().pt_1().pb_1().child(hairline()))
                     .child(
                         h_flex()
                             .gap_1()
-                            .child(self.nav_item(Page::Settings, IconName::Settings, "Settings", None, &p, cx).flex_1())
+                            .child(
+                                self.nav_item(
+                                    Page::Settings,
+                                    IconName::Settings,
+                                    "Settings",
+                                    None,
+                                    &p,
+                                    cx,
+                                )
+                                .flex_1(),
+                            )
                             .child(self.collapse_button(false, cx)),
                     ),
             )
             .child(div().flex_none().w(px(1.)).my_3().bg(p.border))
             .into_any_element()
     }
-
 }
 
 /// `?session=<id>` on the web, `QMT_SESSION=<id>` natively.
 fn deep_link_session() -> Option<String> {
     #[cfg(target_family = "wasm")]
     {
-        let search = web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default();
-        search.trim_start_matches('?').split('&').find_map(|kv| kv.strip_prefix("session=")).map(str::to_owned)
+        let search = web_sys::window()
+            .and_then(|w| w.location().search().ok())
+            .unwrap_or_default();
+        search
+            .trim_start_matches('?')
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("session="))
+            .map(str::to_owned)
     }
     #[cfg(not(target_family = "wasm"))]
     {
@@ -695,7 +918,9 @@ fn inbox_badge(n: usize, p: &Palette) -> Option<AnyElement> {
 fn initial_view(store: &Entity<AgentsStore>, cx: &App) -> (Page, Option<String>) {
     #[cfg(target_family = "wasm")]
     let (page, details) = {
-        let search = web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default();
+        let search = web_sys::window()
+            .and_then(|w| w.location().search().ok())
+            .unwrap_or_default();
         let mut page = None;
         let mut details = false;
         for kv in search.trim_start_matches('?').split('&') {
@@ -726,7 +951,9 @@ fn initial_view(store: &Entity<AgentsStore>, cx: &App) -> (Page, Option<String>)
 
         _ => Page::Start,
     };
-    let details = details.then(|| store.read(cx).configs.first().map(|c| c.id.clone())).flatten();
+    let details = details
+        .then(|| store.read(cx).configs.first().map(|c| c.id.clone()))
+        .flatten();
     (page, details)
 }
 
@@ -764,7 +991,13 @@ impl Render for QmtApp {
             // First child: its capture listener must precede every scroll container's.
             .child({
                 let prefs = &self.store.read(cx).prefs;
-                let or = |v: &str, default: &'static str| if v.is_empty() { default.to_string() } else { v.to_string() };
+                let or = |v: &str, default: &'static str| {
+                    if v.is_empty() {
+                        default.to_string()
+                    } else {
+                        v.to_string()
+                    }
+                };
                 let preset = or(&prefs.scroll_smoothing, smooth_scroll::DEFAULT_PRESET);
                 let curve = or(&prefs.scroll_curve, smooth_scroll::DEFAULT_CURVE);
                 let inertia = or(&prefs.scroll_inertia, smooth_scroll::DEFAULT_INERTIA);
@@ -783,13 +1016,22 @@ impl Render for QmtApp {
                     return;
                 }
                 // Desktop: a second Escape within 700ms stops the running turn.
-                let running = this.page == Page::Session && this.store.read(cx).session.as_ref().is_some_and(|v| v.running());
+                let running = this.page == Page::Session
+                    && this
+                        .store
+                        .read(cx)
+                        .session
+                        .as_ref()
+                        .is_some_and(|v| v.running());
                 if !running {
                     this.last_escape = None;
                     return;
                 }
                 let now = std::time::Instant::now();
-                if this.last_escape.is_some_and(|t| now.duration_since(t) <= std::time::Duration::from_millis(700)) {
+                if this
+                    .last_escape
+                    .is_some_and(|t| now.duration_since(t) <= std::time::Duration::from_millis(700))
+                {
                     this.last_escape = None;
                     this.store.update(cx, |s, cx| s.cancel_turn(cx));
                     cx.stop_propagation();
@@ -807,7 +1049,13 @@ impl Render for QmtApp {
                     .child(if self.page == Page::Session {
                         div().id("page").flex_1().min_w_0().h_full().child(body)
                     } else {
-                        div().id("page").flex_1().min_w_0().h_full().overflow_y_scroll().child(body)
+                        div()
+                            .id("page")
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_y_scroll()
+                            .child(body)
                     }),
             )
             .children(overlay)

@@ -40,7 +40,12 @@ pub const DEFAULT_PRESET: &str = "normal";
 
 /// Time constant for a preset id; unknown ids fall back to the default.
 pub fn tau_for(preset: &str) -> Option<Duration> {
-    let find = |id: &str| PRESETS.iter().find(|(p, _, _)| *p == id).map(|(_, _, tau)| *tau);
+    let find = |id: &str| {
+        PRESETS
+            .iter()
+            .find(|(p, _, _)| *p == id)
+            .map(|(_, _, tau)| *tau)
+    };
     find(preset).unwrap_or_else(|| find(DEFAULT_PRESET).flatten())
 }
 
@@ -58,12 +63,19 @@ pub enum Curve {
 }
 
 /// Curve choices: (pref id, label).
-pub const CURVES: [(&str, &str, Curve); 2] = [("ease_out", "Ease out", Curve::EaseOut), ("ease_in_out", "Ease in-out", Curve::EaseInOut)];
+pub const CURVES: [(&str, &str, Curve); 2] = [
+    ("ease_out", "Ease out", Curve::EaseOut),
+    ("ease_in_out", "Ease in-out", Curve::EaseInOut),
+];
 
 pub const DEFAULT_CURVE: &str = "ease_out";
 
 pub fn curve_for(id: &str) -> Curve {
-    CURVES.iter().find(|(c, _, _)| *c == id).map(|(_, _, curve)| *curve).unwrap_or_default()
+    CURVES
+        .iter()
+        .find(|(c, _, _)| *c == id)
+        .map(|(_, _, curve)| *curve)
+        .unwrap_or_default()
 }
 
 /// Browser-like wheel inertia, independent of duration and curve:
@@ -88,14 +100,35 @@ pub struct Inertia {
 /// Inertia choices: (pref id, label, params); `None` = no inertia.
 pub const INERTIAS: [(&str, &str, Option<Inertia>); 3] = [
     ("off", "Off", None),
-    ("light", "Light", Some(Inertia { accel: 0.15, accel_max: 2.0, carry: 0.35, friction: Duration::from_millis(220) })),
-    ("strong", "Strong", Some(Inertia { accel: 0.3, accel_max: 4.0, carry: 0.6, friction: Duration::from_millis(420) })),
+    (
+        "light",
+        "Light",
+        Some(Inertia {
+            accel: 0.15,
+            accel_max: 2.0,
+            carry: 0.35,
+            friction: Duration::from_millis(220),
+        }),
+    ),
+    (
+        "strong",
+        "Strong",
+        Some(Inertia {
+            accel: 0.3,
+            accel_max: 4.0,
+            carry: 0.6,
+            friction: Duration::from_millis(420),
+        }),
+    ),
 ];
 
 pub const DEFAULT_INERTIA: &str = "off";
 
 pub fn inertia_for(id: &str) -> Option<Inertia> {
-    INERTIAS.iter().find(|(i, _, _)| *i == id).and_then(|(_, _, inertia)| *inertia)
+    INERTIAS
+        .iter()
+        .find(|(i, _, _)| *i == id)
+        .and_then(|(_, _, inertia)| *inertia)
 }
 
 /// Notches closer together than this count as one continuous spin; a longer
@@ -141,7 +174,11 @@ pub struct SmoothScroll(Rc<RefCell<State>>);
 
 impl Default for SmoothScroll {
     fn default() -> Self {
-        Self(Rc::new(RefCell::new(State { tau: tau_for(DEFAULT_PRESET), stretch: 1., ..Default::default() })))
+        Self(Rc::new(RefCell::new(State {
+            tau: tau_for(DEFAULT_PRESET),
+            stretch: 1.,
+            ..Default::default()
+        })))
     }
 }
 
@@ -175,7 +212,12 @@ impl SmoothScroll {
     /// listener runs before any scroll container's.
     pub fn element(&self) -> impl IntoElement {
         let this = self.clone();
-        canvas(|_, _, _| (), move |_, _, window, cx| this.install(window, cx)).absolute().size_0()
+        canvas(
+            |_, _, _| (),
+            move |_, _, window, cx| this.install(window, cx),
+        )
+        .absolute()
+        .size_0()
     }
 
     fn install(&self, window: &mut Window, cx: &mut App) {
@@ -190,7 +232,10 @@ impl SmoothScroll {
             }
             // Precise devices (trackpads), touch pans and our own injected
             // events pass through untouched.
-            if state.borrow().injecting || event.delta.precise() || event.source != ScrollSource::Pointer {
+            if state.borrow().injecting
+                || event.delta.precise()
+                || event.source != ScrollSource::Pointer
+            {
                 return;
             }
             let delta = event.delta.pixel_delta(line_height);
@@ -203,7 +248,9 @@ impl SmoothScroll {
                 if let Some(inertia) = s.inertia {
                     let gap = s.spin.last_notch.map(|t| now.saturating_duration_since(t));
                     let same_dir = |v: f32, d: f32| d == 0. || v == 0. || (v >= 0.) == (d >= 0.);
-                    let continuous = gap.is_some_and(|g| g < SPIN_GAP) && same_dir(s.spin.speed.x, dx) && same_dir(s.spin.speed.y, dy);
+                    let continuous = gap.is_some_and(|g| g < SPIN_GAP)
+                        && same_dir(s.spin.speed.x, dx)
+                        && same_dir(s.spin.speed.y, dy);
                     s.spin.streak = if continuous { s.spin.streak + 1 } else { 0 };
                     let factor = (1. + s.spin.streak as f32 * inertia.accel).min(inertia.accel_max);
                     dx *= factor;
@@ -252,7 +299,9 @@ impl SmoothScroll {
     /// motion by the coast distance and stretch its duration to match, so the
     /// current speed carries on and then decays. Fires once per spin.
     fn maybe_coast(s: &mut State, now: Instant) {
-        let (Some(inertia), Some(last)) = (s.inertia, s.spin.last_notch) else { return };
+        let (Some(inertia), Some(last)) = (s.inertia, s.spin.last_notch) else {
+            return;
+        };
         if now.saturating_duration_since(last) < SPIN_GAP {
             return;
         }
@@ -267,7 +316,10 @@ impl SmoothScroll {
             return;
         }
         let reach = inertia.carry * inertia.friction.as_secs_f32();
-        s.remaining = point(s.remaining.x + speed.x * reach, s.remaining.y + speed.y * reach);
+        s.remaining = point(
+            s.remaining.x + speed.x * reach,
+            s.remaining.y + speed.y * reach,
+        );
         // Ease-out speed is `remaining / (tau * stretch)`: growing both by the
         // same ratio keeps the current speed and only lengthens the tail.
         let after = s.remaining.x.abs().max(s.remaining.y.abs());
@@ -282,7 +334,10 @@ impl SmoothScroll {
         let now = cx.background_executor().now();
         let step = {
             let mut s = state.borrow_mut();
-            let dt = s.last_tick.map_or(MAX_DT, |t| now.saturating_duration_since(t)).min(MAX_DT);
+            let dt = s
+                .last_tick
+                .map_or(MAX_DT, |t| now.saturating_duration_since(t))
+                .min(MAX_DT);
             s.last_tick = Some(now);
             let dt_s = dt.as_secs_f32();
             Self::maybe_coast(&mut s, now);
@@ -345,8 +400,11 @@ impl SmoothScroll {
             let s = state.borrow();
             let settled = |rem: f32, v: f32| rem.abs() < 0.5 && v.abs() < 10.;
             // Keep ticking while a fast spin may still turn into a coast.
-            let coast_pending = s.inertia.is_some() && s.spin.last_notch.is_some() && s.spin.streak >= 2;
-            settled(s.remaining.x, s.velocity.x) && settled(s.remaining.y, s.velocity.y) && !coast_pending
+            let coast_pending =
+                s.inertia.is_some() && s.spin.last_notch.is_some() && s.spin.streak >= 2;
+            settled(s.remaining.x, s.velocity.x)
+                && settled(s.remaining.y, s.velocity.y)
+                && !coast_pending
         };
         if done {
             let mut s = state.borrow_mut();
@@ -380,10 +438,15 @@ mod tests {
 
     #[test]
     fn ease_step_never_panics_or_overshoots() {
-        for rem in [0.0, 0.3, 0.5, 0.69999695, 0.99, 1.0, 1.4, 7.0, -0.7, -0.5, -3.2, 500.] {
+        for rem in [
+            0.0, 0.3, 0.5, 0.69999695, 0.99, 1.0, 1.4, 7.0, -0.7, -0.5, -3.2, 500.,
+        ] {
             for f in [0.0, 0.01, 0.2, 0.9, 1.0] {
                 let step = ease_step(rem, f);
-                assert!(step.abs() <= rem.abs() + f32::EPSILON, "rem {rem} f {f} step {step}");
+                assert!(
+                    step.abs() <= rem.abs() + f32::EPSILON,
+                    "rem {rem} f {f} step {step}"
+                );
                 assert!(step == 0. || step.signum() == rem.signum());
             }
         }
@@ -426,7 +489,12 @@ mod tests {
         let inout = steps(Curve::EaseInOut, 90., 60., 120);
         // Ease-out: biggest step first. Ease in-out: speed builds, peaks later.
         assert!(out[0] >= out[1]);
-        let peak = inout.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).unwrap();
+        let peak = inout
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .unwrap();
         assert!(peak >= 2, "peak at frame {peak}: {inout:?}");
         assert!(inout[0] < inout[peak]);
         // Both cover the distance without overshooting, in a similar time.
@@ -434,7 +502,10 @@ mod tests {
         assert!((total - 60.).abs() < 1., "{total}");
         assert!(inout.iter().all(|s| *s >= -0.01), "no overshoot: {inout:?}");
         let (a, b) = (out.len() as f32, inout.len() as f32);
-        assert!((a / b) > 0.5 && (a / b) < 2., "ease-out {a} frames vs in-out {b}");
+        assert!(
+            (a / b) > 0.5 && (a / b) < 2.,
+            "ease-out {a} frames vs in-out {b}"
+        );
     }
 }
 
@@ -452,7 +523,11 @@ mod inertia_tests {
         let t0 = Instant::now();
         // Mid-spin: 60px left, wheel was turning at 2000 px/s, 3 notches in a row.
         s.remaining = point(0., 60.);
-        s.spin = Spin { last_notch: Some(t0), streak: 3, speed: point(0., 2000.) };
+        s.spin = Spin {
+            last_notch: Some(t0),
+            streak: 3,
+            speed: point(0., 2000.),
+        };
         let tau = s.tau.unwrap().as_secs_f32();
         let speed_before = 60. / tau;
 
@@ -464,11 +539,18 @@ mod inertia_tests {
         SmoothScroll::maybe_coast(&mut s, t0 + SPIN_GAP);
         let inertia = INERTIAS[1].2.unwrap();
         let reach = 2000. * inertia.carry * inertia.friction.as_secs_f32();
-        assert!((s.remaining.y - (60. + reach)).abs() < 0.01, "{}", s.remaining.y);
+        assert!(
+            (s.remaining.y - (60. + reach)).abs() < 0.01,
+            "{}",
+            s.remaining.y
+        );
         assert!(s.stretch > 1.);
         // No kick: the coast continues at the speed the view already had.
         let speed_after = s.remaining.y / (tau * s.stretch);
-        assert!((speed_after - speed_before).abs() < speed_before * 0.01, "{speed_after} vs {speed_before}");
+        assert!(
+            (speed_after - speed_before).abs() < speed_before * 0.01,
+            "{speed_after} vs {speed_before}"
+        );
         // Fires once per spin.
         let rem = s.remaining.y;
         SmoothScroll::maybe_coast(&mut s, t0 + SPIN_GAP * 2);
@@ -482,7 +564,11 @@ mod inertia_tests {
         let mut s: State = std::mem::take(&mut *ss.0.borrow_mut());
         let t0 = Instant::now();
         s.remaining = point(0., 60.);
-        s.spin = Spin { last_notch: Some(t0), streak: 3, speed: point(0., 300.) };
+        s.spin = Spin {
+            last_notch: Some(t0),
+            streak: 3,
+            speed: point(0., 300.),
+        };
         SmoothScroll::maybe_coast(&mut s, t0 + SPIN_GAP);
         // Too slow to coast: target and duration are untouched.
         assert_eq!((s.remaining.y, s.stretch), (60., 1.));
