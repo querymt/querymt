@@ -1,0 +1,71 @@
+{
+  "schema_version": "ATIF-v1.5",
+  "session_id": "PARENT",
+  "agent": {
+    "name": "golden",
+    "version": "0.0.0",
+    "model_name": "claude-opus-4-6"
+  },
+  "steps": [
+    {
+      "step_id": 1,
+      "timestamp": "<timestamp>",
+      "source": "user",
+      "message": "read test.rs"
+    },
+    {
+      "step_id": 2,
+      "timestamp": "<timestamp>",
+      "source": "agent",
+      "model_name": "claude-opus-4-6",
+      "message": "It is an empty main.",
+      "tool_calls": [
+        {
+          "tool_call_id": "call-1",
+          "function_name": "read_tool",
+          "arguments": {
+            "path": "test.rs"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "call-1",
+            "content": "fn main() {}"
+          }
+        ]
+      }
+    }
+  ],
+  "notes": "fixture",
+  "final_metrics": {
+    "total_prompt_tokens": 0,
+    "total_completion_tokens": 0,
+    "total_cached_tokens": 0,
+    "total_steps": 2,
+    "extra": {
+      "accounting": {
+        "version": 1,
+        "session": {
+          "knownSubtotalUsd": 0.0,
+          "completeTotalUsd": null,
+          "complete": false,
+          "billing": "empty",
+          "reasons": [
+            {
+              "kind": "unaccounted_history"
+            }
+          ],
+          "pricedAttempts": 0,
+          "excludedAttempts": 0,
+          "unresolvedAttempts": 0,
+          "incompleteAttempts": 0,
+          "unaccountedGenerations": 1
+        },
+        "cycle": null
+      },
+      "attempts": []
+    }
+  }
+}

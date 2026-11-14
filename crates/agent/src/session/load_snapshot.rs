@@ -726,14 +726,6 @@ mod tests {
             unimplemented!()
         }
 
-        async fn get_atif(
-            &self,
-            _session_id: &str,
-            _options: &crate::export::AtifExportOptions,
-        ) -> SessionResult<crate::export::ATIF> {
-            unimplemented!()
-        }
-
         async fn get_recent_models_view(
             &self,
             _limit_per_workspace: usize,

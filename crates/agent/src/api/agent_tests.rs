@@ -169,14 +169,6 @@ impl ViewStore for DefaultLifecycleViewStore {
             .await
     }
 
-    async fn get_atif(
-        &self,
-        session_id: &str,
-        options: &crate::export::AtifExportOptions,
-    ) -> crate::session::error::SessionResult<crate::export::ATIF> {
-        self.0.get_atif(session_id, options).await
-    }
-
     async fn get_recent_models_view(
         &self,
         limit_per_workspace: usize,

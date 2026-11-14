@@ -640,13 +640,6 @@ pub trait ViewStore: Send + Sync {
         limit: usize,
     ) -> SessionResult<(SessionGroup, usize)>;
 
-    /// Export session as ATIF (Agent Trajectory Interchange Format)
-    async fn get_atif(
-        &self,
-        session_id: &str,
-        options: &crate::export::AtifExportOptions,
-    ) -> SessionResult<crate::export::ATIF>;
-
     /// Get recent models from full event history, grouped by workspace
     /// Returns all models ever used, sorted by last_used descending
     ///

@@ -1657,25 +1657,6 @@ impl ViewStore for SqliteStorage {
         .await
     }
 
-    async fn get_atif(
-        &self,
-        session_id: &str,
-        options: &crate::export::AtifExportOptions,
-    ) -> SessionResult<crate::export::ATIF> {
-        use crate::export::ATIFBuilder;
-
-        // Get the full audit view which contains all events and domain data
-        // Include child sessions for complete trajectory export
-        let audit_view = self.get_audit_view(session_id, true).await?;
-
-        // Build the ATIF trajectory from the audit view
-        // Tool definitions will be extracted from ToolsAvailable events
-        let builder = ATIFBuilder::from_audit_view(&audit_view, options);
-        let trajectory = builder.build();
-
-        Ok(trajectory)
-    }
-
     async fn get_recent_models_view(
         &self,
         limit_per_workspace: usize,
