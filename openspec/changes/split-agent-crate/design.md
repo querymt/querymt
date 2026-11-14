@@ -133,7 +133,7 @@ There are 81 distinct upward production items (lower bound). Most of them are re
 | `index/merkle.rs` | `DiffPaths` | |
 | `acp/shared.rs` | `QUERYMT_META_NAMESPACE` | |
 | `acp/protocol.rs` | whole file (a re-export of `agent_client_protocol`) | core takes the `agent-client-protocol` dependency |
-| `elicitation.rs` | `ElicitationAction`, `ElicitationResponse` | |
+| `elicitation.rs` | `ElicitationAction`, `ElicitationResponse` | The two `From` impls between `ElicitationAction` and `rmcp::model::ElicitationAction` do **not** move. Core must not depend on `rmcp` (D7); they become two private conversion functions in runtime `elicitation.rs` (one production call site, `ElicitResult::new(..)`, plus six tests). The unknown-upstream-action fallback to `Cancel` is kept. The public `From` impls disappear; nothing outside `crates/agent/src` uses them (task 4.0) |
 | `session/compaction.rs` | `filter_to_effective_history` | pure function over `AgentMessage` |
 | `session/load_snapshot.rs` | `StreamCursor`, `observe_cursor` | |
 | `session/run_lease.rs` | `run_lease_root_for_db` | pure path function |
@@ -148,6 +148,8 @@ There are 81 distinct upward production items (lower bound). Most of them are re
 - `SessionProvider::get_pricing` becomes a free function in `accounting`, together with `is_non_billable_oauth_provider`. `SessionProvider::get_pricing` delegates to it.
 - `shell_executable` and `shell_exit_code` (tracing helpers in `agent/utils.rs`) move to services next to `tools/builtins/shell.rs`.
 - `impl StorageBackend for SqliteStorage` (`session/backend.rs`) moves to the sqlite package.
+- `default_agent_db_path`, `resolve_agent_db_path` and `QMT_SESSIONS_DB_ENV` (in `session/backend.rs`) use `querymt_utils::providers::config_dir`, which core must not depend on (D7). They move to a new runtime file `session/db_path.rs`, with their four tests. `session::backend::{default_agent_db_path, resolve_agent_db_path, QMT_SESSIONS_DB_ENV}` stays a valid public path (`querymt-mobile-ffi`, `examples/export_sft.rs` and `api/*` use it): While the code is still one crate, `session/backend.rs` becomes a directory: `git mv` to `session/backend/contract.rs` (the `StorageBackend` trait, core), a pure re-export hub `session/backend/mod.rs`, and `session/backend/db_path.rs` (runtime). The layering script maps `contract.rs` to core and treats the hub as a facade. In 4.1, `contract.rs` becomes `session/backend.rs` in the core crate, and the `querymt-agent` facade `session::backend` glob-re-exports it together with runtime's `db_path`, which is the final facade shape from D5.
+- `session::projection::DefaultRedactor` calls `querymt_utils::str_utils::truncate_with_ellipsis`. Core gets a small private copy of that helper (about 20 lines, with a test) instead of a dependency on `querymt-utils`, which always pulls in opentelemetry, tonic and oauth2 (the same reason 1.9 kept it out of knowledge).
 
 ### D4. The five behaviour edges
 
@@ -232,6 +234,7 @@ The same applies to `acp`, `config`, `tools`, `worktree`, `knowledge`, `dotagent
 
 - **Standalone builds.** Each package declares the `querymt` features its own code needs, so `cargo check -p <pkg> --no-default-features` passes without feature unification from `querymt-agent`. For example, runtime uses `querymt::mcp` unconditionally.
 - **Build version.** `env!("QMT_BUILD_VERSION")` in `mcp_auth.rs`, `agent/mcp.rs`, `agent/handle/send_agent_lifecycle.rs` and `export/atif.rs` becomes `querymt_utils::BUILD_VERSION`. `crates/querymt-utils/build.rs` already produces it with the same `QMT_VERSION` / `git describe` logic. `crates/agent/build.rs` keeps only the dashboard preparation. No other package gets a build script.
+- **Core's external dependencies and exclusions.** Core takes only what its code uses: `serde`, `serde_json`, `schemars`, `typeshare`, `async-trait`, `thiserror`, `anyhow`, `time`, `uuid`, `base64`, `hex`, `sha2`, `rapidhash`, `dunce`, `tokio` (`sync` and `rt`, for `RwLock` and `JoinError`), `agent-client-protocol`, `rust-stemmers`, `whatlang`, `stop-words`, and `querymt` with `default-features = false` (it uses only `chat`, `providers` and `error`, which are not feature-gated; this keeps `querymt/mcp` and `rmcp` out). `mockall` is optional behind `test-support`; `rmp-serde` and `tempfile` are dev-dependencies. `unicode-normalization` is not used by core. **Core must not depend on** `rmcp`, `querymt-utils` or `rusqlite`; the layering script rejects mentions of them in core files from task 4.0, and Cargo enforces it after 4.1 (`cargo tree -p querymt-agent-core -e normal` shows none of the three).
 - **No new external dependencies.**
   - `http` is already a workspace dependency.
   - Versions shared by several agent packages move into `[workspace.dependencies]` so they stay identical: `tokio`, `rusqlite` (bundled), `kameo`, `agent-client-protocol`, `rmcp`, `thiserror`, `anyhow`, `time`, `uuid`, `parking_lot`, `arc-swap`, `tree-sitter*`, `rust-stemmers`, `unicode-normalization`, `mockall`.
