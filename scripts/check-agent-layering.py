@@ -130,6 +130,10 @@ ALIASES: Dict[Tuple[str, ...], str] = {
 SQLITE_FREE_DIRS = ("core_staging/",)
 SQLITE_MENTION = re.compile(r"\brusqlite\b|Sqlite")
 
+# Core must not depend on these crates (design D7, task 4.0d). Checked in every
+# file mapped to the core layer, outside tests and comments.
+CORE_FORBIDDEN = re.compile(r"\b(rmcp|querymt_utils|rusqlite)\b")
+
 
 def closure(layer: str) -> Set[str]:
     seen: Set[str] = set()
@@ -590,6 +594,7 @@ class Report:
         self.prod: Dict[str, Dict[str, List[Site]]] = defaultdict(lambda: defaultdict(list))
         self.test: Dict[str, Dict[str, List[Site]]] = defaultdict(lambda: defaultdict(list))
         self.sqlite_mentions: List[Site] = []
+        self.core_forbidden: List[Tuple[str, int, str]] = []
         self.layer_files: Dict[str, int] = defaultdict(int)
 
     def counts(self, which: str = "prod") -> Dict[str, int]:
@@ -617,6 +622,12 @@ def analyze(src: Path) -> Report:
         if any(info.rel.startswith(d) for d in SQLITE_FREE_DIRS) and not info.is_test_file:
             for m in SQLITE_MENTION.finditer(info.prod):
                 report.sqlite_mentions.append(Site(info.rel, _line_of(info.prod, m.start())))
+        if info.layer == "core" and not info.is_test_file:
+            for lineno, line in enumerate(info.prod.split("\n"), start=1):
+                if line.lstrip().startswith("//"):
+                    continue
+                for m in CORE_FORBIDDEN.finditer(line):
+                    report.core_forbidden.append((info.rel, lineno, m.group(1)))
         if info.facade:
             continue
         for text, is_test in ((info.prod, False), (info.test, True)):
@@ -647,12 +658,14 @@ def load_allowance(path: Path) -> Dict[str, int]:
     data = json.loads(path.read_text())
     out = dict(data.get("pairs", {}))
     out["core_staging_sqlite_mentions"] = data.get("core_staging_sqlite_mentions", 0)
+    out["core_forbidden_mentions"] = data.get("core_forbidden_mentions", 0)
     return out
 
 
 def current_counts(report: Report) -> Dict[str, int]:
     counts = dict(report.counts())
     counts["core_staging_sqlite_mentions"] = len(report.sqlite_mentions)
+    counts["core_forbidden_mentions"] = len(report.core_forbidden)
     return counts
 
 
@@ -699,6 +712,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             "_comment": "Distinct upward production items per layer pair, from scripts/check-agent-layering.py. Lower these as cuts land; never raise.",
             "pairs": pairs,
             "core_staging_sqlite_mentions": counts["core_staging_sqlite_mentions"],
+            "core_forbidden_mentions": counts["core_forbidden_mentions"],
         }
         args.allowance.write_text(json.dumps(payload, indent=2) + "\n")
         print("wrote %s" % args.allowance)
@@ -720,6 +734,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             print("SQLite mentioned in core_staging/: %d site(s)" % len(report.sqlite_mentions))
             for site in report.sqlite_mentions[:20]:
                 print("    %s:%d" % site)
+        if report.core_forbidden:
+            print("rmcp, querymt_utils or rusqlite used in core files: %d site(s)" % len(report.core_forbidden))
+            for rel, lineno, name in report.core_forbidden[:20]:
+                print("    %s:%d  %s" % (rel, lineno, name))
         if args.verbose:
             for pair in sorted(report.prod, key=pair_order):
                 print("\n%s" % pair)
