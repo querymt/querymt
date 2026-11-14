@@ -1,4 +1,4 @@
-use crate::core_staging::worktree::domain::BaselineMode;
+use crate::worktree::domain::BaselineMode;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

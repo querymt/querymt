@@ -64,6 +64,13 @@ typeshare = "1.0"
 dirs = "7"
 hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"] }
 toml = "1"
+thiserror = "2.0"
+anyhow = "1.0"
+time = { version = "0.3", features = ["serde", "formatting", "macros", "local-offset"] }
+uuid = { version = "1.18", features = ["v4", "v5", "v7"] }
+agent-client-protocol = { version = "2.0", features = ["unstable"] }
+rust-stemmers = "1.2"
+mockall = "0.15"
 
 [profile.dev]
 debug = "line-tables-only"

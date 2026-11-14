@@ -1,7 +1,7 @@
 //! Pure prompt-text helpers: rendering `ContentBlock`s for display and
 //! truncating text to a byte budget.
 
-use crate::core_staging::protocol::ContentBlock;
+use crate::protocol::ContentBlock;
 
 const ATTACHMENTS_DISPLAY_FALLBACK: &str = "(attachments included)";
 const IMAGE_DISPLAY_FALLBACK: &str = "(image attached)";
@@ -59,7 +59,7 @@ pub fn truncate_to_bytes(input: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::protocol::TextContent;
+    use crate::protocol::TextContent;
 
     #[test]
     fn render_prompt_for_display_prefers_user_text() {

@@ -6,7 +6,6 @@ use crate::session::repository::DecisionRepository;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -66,48 +65,6 @@ impl SqliteDecisionRepository {
             }
             other => other,
         })
-    }
-}
-
-impl fmt::Display for DecisionStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DecisionStatus::Accepted => write!(f, "accepted"),
-            DecisionStatus::Rejected => write!(f, "rejected"),
-        }
-    }
-}
-
-impl FromStr for DecisionStatus {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "accepted" => Ok(DecisionStatus::Accepted),
-            "rejected" => Ok(DecisionStatus::Rejected),
-            _ => Err(format!("Unknown decision status: {}", s)),
-        }
-    }
-}
-
-impl fmt::Display for AlternativeStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AlternativeStatus::Active => write!(f, "active"),
-            AlternativeStatus::Discarded => write!(f, "discarded"),
-        }
-    }
-}
-
-impl FromStr for AlternativeStatus {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "active" => Ok(AlternativeStatus::Active),
-            "discarded" => Ok(AlternativeStatus::Discarded),
-            _ => Err(format!("Unknown alternative status: {}", s)),
-        }
     }
 }
 

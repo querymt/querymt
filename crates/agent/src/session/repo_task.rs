@@ -6,7 +6,6 @@ use crate::session::repository::TaskRepository;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -28,54 +27,6 @@ impl SqliteTaskRepository {
         R: Send + 'static,
     {
         crate::session::sqlite_storage::blocking::with_conn_sqlite(&self.conn, f).await
-    }
-}
-
-impl fmt::Display for TaskKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TaskKind::Finite => write!(f, "finite"),
-            TaskKind::Recurring => write!(f, "recurring"),
-            TaskKind::Evolving => write!(f, "evolving"),
-        }
-    }
-}
-
-impl FromStr for TaskKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "finite" => Ok(TaskKind::Finite),
-            "recurring" => Ok(TaskKind::Recurring),
-            "evolving" => Ok(TaskKind::Evolving),
-            _ => Err(format!("Unknown task kind: {}", s)),
-        }
-    }
-}
-
-impl fmt::Display for TaskStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TaskStatus::Active => write!(f, "active"),
-            TaskStatus::Paused => write!(f, "paused"),
-            TaskStatus::Done => write!(f, "done"),
-            TaskStatus::Cancelled => write!(f, "cancelled"),
-        }
-    }
-}
-
-impl FromStr for TaskStatus {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "active" => Ok(TaskStatus::Active),
-            "paused" => Ok(TaskStatus::Paused),
-            "done" => Ok(TaskStatus::Done),
-            "cancelled" => Ok(TaskStatus::Cancelled),
-            _ => Err(format!("Unknown task status: {}", s)),
-        }
     }
 }
 

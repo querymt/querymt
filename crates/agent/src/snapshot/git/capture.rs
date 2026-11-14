@@ -3,6 +3,7 @@
 
 use super::super::backend::{SnapshotError, SnapshotId, SnapshotResult, io_err};
 use super::gc::note_captured;
+use super::snapshot_id;
 use super::{GitSnapshotBackend, SnapshotLock};
 use gix::objs::Write as _;
 use serde::{Deserialize, Serialize};
@@ -502,7 +503,7 @@ impl GitSnapshotBackend {
             && head.tree_id().ok().map(|id| id.detach()) == Some(tree_id)
         {
             stats.reused = true;
-            return Ok((head.id().detach().into(), stats));
+            return Ok((snapshot_id(head.id().detach()), stats));
         }
         let parent_ids: Vec<gix::ObjectId> = head.iter().map(|c| c.id().detach()).collect();
 
@@ -512,7 +513,7 @@ impl GitSnapshotBackend {
             .commit("HEAD", message, tree_id, parent_ids)
             .map_err(|e| SnapshotError::Repository(format!("Failed to create commit: {}", e)))?;
 
-        Ok((commit_id.detach().into(), stats))
+        Ok((snapshot_id(commit_id.detach()), stats))
     }
 
     /// Capture the current content of `path` as a blob.

@@ -5,8 +5,8 @@
 //! set, snapshots beyond the window are pruned and, once enough of them are
 //! pruned, the content only they referenced is deleted from disk.
 
-use super::object_id;
 use super::{GitSnapshotBackend, Limits, SnapshotLock};
+use super::{object_id, snapshot_id};
 use crate::snapshot::backend::{
     GcConfig, GcResult, SnapshotError, SnapshotId, SnapshotResult, io_err,
 };
@@ -39,7 +39,7 @@ impl GitSnapshotBackend {
             match repo.find_commit(oid) {
                 Ok(commit) => {
                     let timestamp = commit.time().map_or(0, |t| t.seconds);
-                    commits.push((SnapshotId::from(oid), timestamp));
+                    commits.push((snapshot_id(oid), timestamp));
                     current = commit.parent_ids().next().map(gix::Id::detach);
                 }
                 Err(e) => {

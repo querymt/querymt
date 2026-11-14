@@ -64,7 +64,8 @@ pub async fn resolve_session_location(
     Ok(classify_session_location(local_exists, bookmark))
 }
 
-pub(crate) fn classify_session_location(
+#[doc(hidden)]
+pub fn classify_session_location(
     local_exists: bool,
     bookmark: Option<RemoteSessionBookmark>,
 ) -> SessionLocation {

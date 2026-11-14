@@ -6,7 +6,6 @@ use crate::session::repository::DelegationRepository;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -47,57 +46,6 @@ impl SqliteDelegationRepository {
             Ok(id) => Ok(id),
             Err(ref e) if e.is_no_rows() => Err(SessionError::SessionNotFound(error_value)),
             Err(e) => Err(e),
-        }
-    }
-}
-
-impl fmt::Display for DelegationStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DelegationStatus::Requested => write!(f, "requested"),
-            DelegationStatus::Running => write!(f, "running"),
-            DelegationStatus::Complete => write!(f, "complete"),
-            DelegationStatus::Failed => write!(f, "failed"),
-            DelegationStatus::Cancelled => write!(f, "cancelled"),
-        }
-    }
-}
-
-impl FromStr for DelegationStatus {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "requested" => Ok(DelegationStatus::Requested),
-            "running" => Ok(DelegationStatus::Running),
-            "complete" => Ok(DelegationStatus::Complete),
-            "failed" => Ok(DelegationStatus::Failed),
-            "cancelled" => Ok(DelegationStatus::Cancelled),
-            _ => Err(format!("Unknown delegation status: {}", s)),
-        }
-    }
-}
-
-impl fmt::Display for crate::worktree::DelegationIsolation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            crate::worktree::DelegationIsolation::Inherit => "inherit",
-            crate::worktree::DelegationIsolation::Shared => "shared",
-            crate::worktree::DelegationIsolation::Isolated => "isolated",
-        };
-        f.write_str(s)
-    }
-}
-
-impl FromStr for crate::worktree::DelegationIsolation {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "inherit" => Ok(crate::worktree::DelegationIsolation::Inherit),
-            "shared" => Ok(crate::worktree::DelegationIsolation::Shared),
-            "isolated" => Ok(crate::worktree::DelegationIsolation::Isolated),
-            _ => Err(format!("Unknown delegation isolation: {}", s)),
         }
     }
 }

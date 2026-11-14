@@ -4,9 +4,9 @@
 //! The SQLite implementation lives in `sqlite_staging::repo_dotagents_tasks`;
 //! planning and trust evaluation stay in `dotagents::tasks`.
 
+use crate::dotagents::layer::DotagentsLayer;
 use crate::session::error::SessionResult;
 use async_trait::async_trait;
-use querymt_agent_core::dotagents::layer::DotagentsLayer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};

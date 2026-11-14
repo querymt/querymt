@@ -230,7 +230,7 @@ pub enum AccountingReason {
 }
 
 /// Sample values for tests in this layer and the layers above it.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod samples {
     use super::*;
     use querymt::providers::value_usage;

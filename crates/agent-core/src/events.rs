@@ -1,11 +1,11 @@
-use crate::acp::protocol::{ContentBlock, StopReason};
+use crate::protocol::{ContentBlock, StopReason};
 use querymt::Usage;
 use querymt::chat::FinishReason;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf};
 use typeshare::typeshare;
 
-use crate::config::McpServerConfig;
+use crate::config::mcp::McpServerConfig;
 use crate::hash::RapidHash;
 use crate::session::domain::{
     Alternative, Artifact, Decision, Delegation, ForkOrigin, ForkPointType, IntentSnapshot,
@@ -284,8 +284,8 @@ pub enum ElicitationOutcome {
 
 impl ElicitationOutcome {
     /// Map a client's response action to an outcome.
-    pub fn from_action(action: &crate::core_staging::elicitation::ElicitationAction) -> Self {
-        use crate::core_staging::elicitation::ElicitationAction;
+    pub fn from_action(action: &crate::elicitation::ElicitationAction) -> Self {
+        use crate::elicitation::ElicitationAction;
         match action {
             ElicitationAction::Accept => Self::Accepted,
             ElicitationAction::Decline => Self::Declined,
@@ -303,11 +303,11 @@ impl ElicitationOutcome {
 pub enum AgentEventKind {
     SessionCreated,
     RuntimeChanged {
-        runtime: crate::agent::messages::SessionRuntimeStatus,
+        runtime: crate::runtime_status::SessionRuntimeStatus,
     },
     DelegationStageChanged {
         delegation_id: String,
-        stage: Option<crate::control::delegation_notifications::DelegationStage>,
+        stage: Option<crate::delegation_update::DelegationStage>,
         source_epoch: String,
     },
     SessionWorkspaceBound {
@@ -786,7 +786,7 @@ pub enum AgentEventKind {
         /// pending interaction.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[typeshare(serialized_as = "any")]
-        request: Option<crate::acp::protocol::RequestPermissionRequest>,
+        request: Option<crate::protocol::RequestPermissionRequest>,
     },
     PermissionGranted {
         permission_id: String,
@@ -848,7 +848,7 @@ pub enum AgentEventKind {
     /// Emitted when duplicate/similar code is detected in newly written code
     DuplicateCodeDetected {
         /// Compacted list of duplicate code warnings (body_text stripped, matches capped)
-        warnings: Vec<crate::core_staging::dedup::DuplicateWarning>,
+        warnings: Vec<crate::dedup::DuplicateWarning>,
         /// Path to the full overflow report file (if written), readable via read_file
         overflow_path: Option<String>,
     },
@@ -860,14 +860,14 @@ pub enum AgentEventKind {
     /// Emitted when a session's mode changes (per-session mode in actor model)
     SessionModeChanged {
         #[typeshare(serialized_as = "string")]
-        mode: crate::agent::core::AgentMode,
+        mode: crate::agent_mode::AgentMode,
     },
     /// Emitted after a session-control transition commits successfully, carrying
     /// the authoritative post-commit configuration snapshot values. Consumers
     /// derive the complete configuration-option set from these values.
     SessionConfigChanged {
         #[typeshare(serialized_as = "string")]
-        mode: crate::agent::core::AgentMode,
+        mode: crate::agent_mode::AgentMode,
         /// Current reasoning effort as its wire string; `None` means auto.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
@@ -2138,13 +2138,13 @@ mod tests {
             serde_json::json!({
                 "type": "llm_attempt_started",
                 "data": {
-                    "start": serde_json::to_value(crate::core_staging::accounting::samples::sample_start()).unwrap()
+                    "start": serde_json::to_value(crate::accounting::samples::sample_start()).unwrap()
                 }
             }),
             serde_json::json!({
                 "type": "llm_attempt_settled",
                 "data": {
-                    "settlement": serde_json::to_value(crate::core_staging::accounting::samples::sample_settlement()).unwrap()
+                    "settlement": serde_json::to_value(crate::accounting::samples::sample_settlement()).unwrap()
                 }
             }),
         ]
@@ -2944,8 +2944,8 @@ mod tests {
         serde_json::from_value::<AgentEventKind>(json).unwrap();
     }
 
-    fn sample_permission_request() -> crate::acp::protocol::RequestPermissionRequest {
-        use crate::acp::protocol::{
+    fn sample_permission_request() -> crate::protocol::RequestPermissionRequest {
+        use crate::protocol::{
             PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionRequest,
             ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
         };

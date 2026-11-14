@@ -3,6 +3,6 @@ pub mod execution;
 pub mod mcp;
 pub mod workspace;
 
-pub(in crate::core_staging) fn default_true() -> bool {
+pub(crate) fn default_true() -> bool {
     true
 }

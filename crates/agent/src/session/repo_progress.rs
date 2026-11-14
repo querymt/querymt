@@ -6,7 +6,6 @@ use crate::session::repository::ProgressRepository;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -66,31 +65,6 @@ impl SqliteProgressRepository {
             }
             other => other,
         })
-    }
-}
-
-impl fmt::Display for ProgressKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ProgressKind::ToolCall => write!(f, "tool_call"),
-            ProgressKind::Artifact => write!(f, "artifact"),
-            ProgressKind::Note => write!(f, "note"),
-            ProgressKind::Checkpoint => write!(f, "checkpoint"),
-        }
-    }
-}
-
-impl FromStr for ProgressKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "tool_call" => Ok(ProgressKind::ToolCall),
-            "artifact" => Ok(ProgressKind::Artifact),
-            "note" => Ok(ProgressKind::Note),
-            "checkpoint" => Ok(ProgressKind::Checkpoint),
-            _ => Err(format!("Unknown progress kind: {}", s)),
-        }
     }
 }
 

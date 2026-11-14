@@ -1,7 +1,8 @@
 //! Defines the generic storage interface for session persistence.
 
-use crate::agent::session_control::SessionControlState;
-use crate::config::{CompactionConfig, PruningConfig, RateLimitConfig, ToolOutputConfig};
+use crate::config::execution::{
+    CompactionConfig, PruningConfig, RateLimitConfig, ToolOutputConfig,
+};
 use crate::model::AgentMessage;
 use crate::session::domain::{
     Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
@@ -10,6 +11,7 @@ use crate::session::domain::{
 };
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::lifecycle::{SessionLifecycle, SessionLifecyclePatch};
+use crate::session_control::SessionControlState;
 use async_trait::async_trait;
 use querymt::LLMParams;
 use serde::{Deserialize, Serialize};
@@ -85,7 +87,7 @@ impl RemoteSessionBookmark {
 pub struct PendingForkIsolation {
     pub source_session_id: String,
     pub source_cwd: std::path::PathBuf,
-    pub options: crate::worktree::WorkspaceCreationOptions,
+    pub options: crate::worktree::domain::WorkspaceCreationOptions,
     /// Set when the barrier belongs to an ownership handoff: the successor
     /// must adopt this existing workspace (completing the transfer from
     /// `source_session_id`) instead of allocating a fresh one on recovery.
@@ -190,9 +192,14 @@ pub struct TaskPatch {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegateAssignments {
     pub revision: u64,
-    pub overrides: std::collections::BTreeMap<String, crate::delegation::DelegateModelOverride>,
-    pub reasoning_overrides:
-        std::collections::BTreeMap<String, crate::delegation::DelegateReasoningEffort>,
+    pub overrides: std::collections::BTreeMap<
+        String,
+        crate::delegation::model_overrides::DelegateModelOverride,
+    >,
+    pub reasoning_overrides: std::collections::BTreeMap<
+        String,
+        crate::delegation::model_overrides::DelegateReasoningEffort,
+    >,
 }
 
 /// Atomic assignment-write result, including whether the transaction changed state.
@@ -231,7 +238,8 @@ impl Default for SessionExecutionConfig {
 }
 
 /// Helper to extract config values from LLMParams for storage
-pub(crate) fn extract_llm_config_values(
+#[doc(hidden)]
+pub fn extract_llm_config_values(
     params: &LLMParams,
 ) -> Result<(String, String, Option<Value>), SessionError> {
     let provider = params
@@ -434,7 +442,7 @@ pub trait SessionStore: Send + Sync {
         &self,
         _session_id: &str,
         _agent_id: &str,
-        _model: Option<crate::delegation::DelegateModelOverride>,
+        _model: Option<crate::delegation::model_overrides::DelegateModelOverride>,
         _expected_revision: Option<u64>,
     ) -> SessionResult<DelegateAssignmentWrite> {
         Err(SessionError::InvalidOperation(
@@ -447,8 +455,10 @@ pub trait SessionStore: Send + Sync {
         &self,
         session_id: &str,
         agent_id: &str,
-        model: Option<crate::delegation::DelegateModelOverride>,
-        reasoning_effort: Option<Option<crate::delegation::DelegateReasoningEffort>>,
+        model: Option<crate::delegation::model_overrides::DelegateModelOverride>,
+        reasoning_effort: Option<
+            Option<crate::delegation::model_overrides::DelegateReasoningEffort>,
+        >,
         expected_revision: Option<u64>,
     ) -> SessionResult<DelegateAssignmentWrite> {
         if reasoning_effort.is_some() {
@@ -474,9 +484,7 @@ pub trait SessionStore: Send + Sync {
     /// session messages for LLM consumption and delegation handoff.
     async fn get_effective_history(&self, session_id: &str) -> SessionResult<Vec<AgentMessage>> {
         let messages = self.get_history(session_id).await?;
-        Ok(crate::session::compaction::filter_to_effective_history(
-            messages,
-        ))
+        Ok(crate::history::filter_to_effective_history(messages))
     }
 
     /// Appends a rich agent message to the session.

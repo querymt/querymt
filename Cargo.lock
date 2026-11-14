@@ -12022,12 +12022,30 @@ dependencies = [
 name = "querymt-agent-core"
 version = "0.6.0"
 dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "async-trait",
+ "base64 0.23.1",
  "dunce",
+ "hex",
+ "mockall",
+ "qmt-openai",
+ "querymt",
  "rapidhash",
+ "rmp-serde",
+ "rust-stemmers",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "stop-words 0.10.1",
  "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "typeshare",
+ "uuid 1.29.0",
+ "whatlang",
 ]
 
 [[package]]

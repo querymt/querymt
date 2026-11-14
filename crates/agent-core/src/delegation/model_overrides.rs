@@ -23,7 +23,8 @@ pub enum DelegateReasoningEffort {
 }
 
 impl DelegateReasoningEffort {
-    pub(crate) const fn as_str(self) -> &'static str {
+    #[doc(hidden)]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::Low => "low",
@@ -33,7 +34,8 @@ impl DelegateReasoningEffort {
         }
     }
 
-    pub(crate) fn session_effort(self) -> Option<querymt::chat::ReasoningEffort> {
+    #[doc(hidden)]
+    pub fn session_effort(self) -> Option<querymt::chat::ReasoningEffort> {
         use querymt::chat::ReasoningEffort;
         match self {
             Self::Auto => None,
@@ -61,7 +63,8 @@ impl std::str::FromStr for DelegateReasoningEffort {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct DelegateRouteOverrides {
+#[doc(hidden)]
+pub struct DelegateRouteOverrides {
     pub model: Option<DelegateModelOverride>,
     pub reasoning_effort: Option<DelegateReasoningEffort>,
 }
@@ -115,7 +118,8 @@ impl DelegateModelOverrideStore {
             .reasoning_effort
     }
 
-    pub(crate) async fn get_route(
+    #[doc(hidden)]
+    pub async fn get_route(
         &self,
         parent_session_id: &str,
         agent_id: &str,
@@ -129,7 +133,8 @@ impl DelegateModelOverrideStore {
             .unwrap_or_default()
     }
 
-    pub(crate) async fn update_route(
+    #[doc(hidden)]
+    pub async fn update_route(
         &self,
         parent_session_id: &str,
         agent_id: &str,
@@ -155,7 +160,8 @@ impl DelegateModelOverrideStore {
         (true, next)
     }
 
-    pub(crate) async fn list_parent_routes(
+    #[doc(hidden)]
+    pub async fn list_parent_routes(
         &self,
         parent_session_id: &str,
     ) -> BTreeMap<String, DelegateRouteOverrides> {
@@ -170,7 +176,8 @@ impl DelegateModelOverrideStore {
     }
 
     /// Durable storage wins even when it contains no override; never resurrect stale cache entries.
-    pub(crate) async fn resolve(
+    #[doc(hidden)]
+    pub async fn resolve(
         &self,
         store: &dyn crate::session::store::SessionStore,
         parent_session_id: &str,

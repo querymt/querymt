@@ -1,7 +1,6 @@
 //! Mocks of core traits (`#[cfg(test)]`; becomes the `test-support` module of
 //! `querymt-agent-core`).
 
-use crate::agent::session_control::SessionControlState;
 use crate::session::domain::{
     Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
     DelegationStatus, ForkInfo, ForkOrigin, IntentSnapshot, ProgressEntry, ProgressKind, Task,
@@ -11,6 +10,7 @@ use crate::session::error::SessionResult;
 use crate::session::store::{
     CustomModel, LLMConfig, RemoteSessionBookmark, Session, SessionExecutionConfig, SessionStore,
 };
+use crate::session_control::SessionControlState;
 use async_trait::async_trait;
 use mockall::mock;
 use querymt::LLMParams;

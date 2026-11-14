@@ -211,10 +211,12 @@ impl GitSnapshotBackend {
     }
 }
 
-impl From<gix::ObjectId> for SnapshotId {
-    fn from(id: gix::ObjectId) -> Self {
-        SnapshotId::from(id.to_string())
-    }
+/// Wrap a git object id as a snapshot id.
+///
+/// A free function, not a `From` impl: `SnapshotId` lives in the core crate,
+/// which must not depend on `gix`.
+pub(super) fn snapshot_id(id: gix::ObjectId) -> SnapshotId {
+    SnapshotId::from(id.to_string())
 }
 
 /// Parse a snapshot id into a git object id. The single place a stored id is

@@ -141,7 +141,8 @@ pub enum HistoryPageDirection {
 }
 
 /// Select one page out of position-ordered history (ascending result).
-pub(crate) fn slice_history_page(
+#[doc(hidden)]
+pub fn slice_history_page(
     mut history: Vec<(i64, DurableEvent)>,
     direction: HistoryPageDirection,
     limit: usize,
@@ -162,14 +163,16 @@ pub(crate) fn slice_history_page(
 
 /// Run lifecycle marker used by [`last_unfinished_run_in`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RunLifecycle {
+#[doc(hidden)]
+pub enum RunLifecycle {
     Started,
     Completed,
 }
 
 /// Fold run lifecycle events (in journal order) to the latest run that was
 /// started and never completed.
-pub(crate) fn last_unfinished_run_in(
+#[doc(hidden)]
+pub fn last_unfinished_run_in(
     events: impl IntoIterator<Item = (RunLifecycle, String)>,
 ) -> Option<String> {
     let mut open: Vec<String> = Vec::new();

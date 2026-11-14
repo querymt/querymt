@@ -4,7 +4,7 @@
 //! enabling clean separation between session persistence (command side)
 //! and event/projection handling (query side).
 
-use crate::dotagents::DotagentsTaskStateRepository;
+use crate::dotagents_tasks::DotagentsTaskStateRepository;
 use crate::knowledge::KnowledgeStore;
 use crate::session::projection::{EventJournal, ViewStore};
 use crate::session::repository::ScheduleRepository;
@@ -51,7 +51,7 @@ pub trait StorageBackend: Send + Sync {
     /// protocol repeat tasks bind their schedules to.
     fn dotagents_automation_repository(
         &self,
-    ) -> Option<Arc<dyn crate::dotagents::DotagentsAutomationRepository>> {
+    ) -> Option<Arc<dyn crate::dotagents_automation::DotagentsAutomationRepository>> {
         None
     }
 
@@ -63,7 +63,9 @@ pub trait StorageBackend: Send + Sync {
 
     /// Managed worktree workspace registry (isolated Git execution workspaces).
     /// Returns None if the backend cannot persist workspace records.
-    fn workspace_repository(&self) -> Option<Arc<dyn crate::worktree::WorkspaceRepository>> {
+    fn workspace_repository(
+        &self,
+    ) -> Option<Arc<dyn crate::worktree::repository::WorkspaceRepository>> {
         None
     }
 

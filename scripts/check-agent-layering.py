@@ -124,6 +124,22 @@ ALIASES: Dict[Tuple[str, ...], str] = {
     ("hash",): "core",
     ("index",): "index",
     ("knowledge", "repository"): "knowledge",
+    # Since task 4.1 the core layer is the crate `querymt-agent-core`; these
+    # paths are facade aliases of it inside `querymt-agent`.
+    ("core_staging",): "core",
+    ("querymt_agent_core",): "core",
+    ("events",): "core",
+    ("model",): "core",
+    ("session", "domain"): "core",
+    ("session", "domain_schedule"): "core",
+    ("session", "error"): "core",
+    ("session", "lifecycle"): "core",
+    ("session", "location"): "core",
+    ("session", "projection"): "core",
+    ("session", "ranges"): "core",
+    ("session", "repository"): "core",
+    ("session", "store"): "core",
+    ("session", "backend"): "core",
 }
 
 # Files in these directories must not mention SQLite at all (task 3.6).
@@ -522,6 +538,13 @@ class Tree:
                 target = self.modules.get(tuple(absolute))
                 if target and self._has_item(target, item, depth + 1):
                     return self.resolve(absolute + [item], depth + 1)
+        # A glob re-export of the core crate (`pub use crate::core_staging::x::*`):
+        # the item is not defined here, so it comes from there.
+        for absolute, bound in info.bindings:
+            if bound == "*":
+                for alias, layer in ALIASES.items():
+                    if tuple(absolute[: len(alias)]) == alias:
+                        return Target(None, item, layer)
         if info.facade:
             return None
         return Target(rel, item, info.layer)

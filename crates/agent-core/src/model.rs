@@ -1,6 +1,7 @@
-use crate::acp::protocol::{ContentBlock, EmbeddedResourceResource};
-use crate::core_staging::prompt_text::truncate_to_bytes;
-use crate::snapshot::SnapshotId;
+use crate::DiffPaths;
+use crate::prompt_text::truncate_to_bytes;
+use crate::protocol::{ContentBlock, EmbeddedResourceResource};
+use crate::snapshot_id::SnapshotId;
 use base64::Engine as _;
 use querymt::chat::{
     ChatInputPart, ChatOutput, ChatOutputItem, MediaKind, MediaPart, MediaSource, MediaType,
@@ -9,7 +10,6 @@ use querymt::{
     ToolCall,
     chat::{ChatMessage, ChatRole},
 };
-use querymt_agent_core::DiffPaths;
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read};
 
@@ -1002,7 +1002,8 @@ impl AgentMessage {
 /// Normalize tool-result batches across intervening user messages and synthesize
 /// cancellations only for calls unanswered before the next assistant turn or EOF.
 /// This repairs request history in memory without changing the stored transcript.
-pub(crate) fn repair_unmatched_tool_calls(messages: &mut Vec<AgentMessage>) -> usize {
+#[doc(hidden)]
+pub fn repair_unmatched_tool_calls(messages: &mut Vec<AgentMessage>) -> usize {
     let mut repaired = 0;
     let mut history = std::mem::take(messages).into_iter().peekable();
 
@@ -1070,9 +1071,8 @@ const CANCELLED_RESULT_TEXT: &str = "Error: Cancelled before the tool returned a
 /// Returns the call ids that had to be answered; empty for a valid request.
 /// This is a safety net for request integrity: the stored transcript is not
 /// touched.
-pub(crate) fn answer_unanswered_tool_calls(
-    messages: &mut Vec<querymt::chat::ChatMessage>,
-) -> Vec<String> {
+#[doc(hidden)]
+pub fn answer_unanswered_tool_calls(messages: &mut Vec<querymt::chat::ChatMessage>) -> Vec<String> {
     use querymt::chat::{ChatInputPart, ChatMessage};
 
     let mut repaired = Vec::new();
@@ -1152,7 +1152,7 @@ mod tests {
     use super::{
         AgentMessage, MessagePart, OutputTarget, PromptContentError, repair_unmatched_tool_calls,
     };
-    use crate::acp::protocol::{
+    use crate::protocol::{
         BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
         ImageContent, TextContent, TextResourceContents,
     };
@@ -1177,7 +1177,7 @@ mod tests {
             assert_eq!(again, literal, "round trip must keep the released JSON");
         }
 
-        let snapshot = crate::snapshot::SnapshotId::from(PRE);
+        let snapshot = crate::snapshot_id::SnapshotId::from(PRE);
         let turn = super::TurnId::from_stored(TURN);
         assert_eq!(
             rmp_serde::to_vec_named(&snapshot).unwrap(),
@@ -1765,8 +1765,8 @@ mod tests {
     /// interleaved between them.
     #[test]
     fn to_chat_message_tool_results_before_snapshot_text() {
+        use crate::DiffPaths;
         use crate::hash::RapidHash;
-        use querymt_agent_core::DiffPaths;
 
         let msg = AgentMessage {
             id: "m1".to_string(),

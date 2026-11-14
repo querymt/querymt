@@ -3,9 +3,9 @@
 //! `sqlite_staging::repo_dotagents_automation`).
 
 use super::dotagents_tasks::{DotagentsAutomationBinding, normalize_id};
+use crate::dotagents::layer::DotagentsLayer;
 use crate::session::error::SessionResult;
 use async_trait::async_trait;
-use querymt_agent_core::dotagents::layer::DotagentsLayer;
 use std::path::{Path, PathBuf};
 
 /// The `sessions.session_kind` value used for protocol automation sessions.

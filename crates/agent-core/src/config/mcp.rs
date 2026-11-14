@@ -1,7 +1,5 @@
 use super::default_true;
-use crate::core_staging::protocol::{
-    EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerStdio,
-};
+use crate::protocol::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerStdio};
 use anyhow::{Context, Result, anyhow};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

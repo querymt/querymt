@@ -2,6 +2,8 @@
 //! These entities represent intent, tasks, decisions, and progress as first-class concepts.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 use time::OffsetDateTime;
 use typeshare::typeshare;
 
@@ -241,7 +243,7 @@ pub struct Delegation {
     /// without the column deserialize as `inherit`.
     #[serde(default)]
     #[typeshare(serialized_as = "string")]
-    pub isolation: crate::worktree::DelegationIsolation,
+    pub isolation: crate::worktree::domain::DelegationIsolation,
     pub status: DelegationStatus,
     /// Number of retry attempts for this objective
     pub retry_count: u32,
@@ -334,7 +336,7 @@ pub struct RevertState {
     /// The message ID we reverted to
     pub message_id: String,
     /// Snapshot taken before the undo (for redo)
-    pub snapshot_id: crate::snapshot::SnapshotId,
+    pub snapshot_id: crate::snapshot_id::SnapshotId,
     /// Backend type used (e.g., "git")
     pub backend_id: String,
     /// Workspace provenance: the checkout the snapshot was captured
@@ -364,6 +366,149 @@ pub struct ForkInfo {
     pub fork_point_type: Option<ForkPointType>,
     pub fork_point_ref: Option<String>,
     pub fork_instructions: Option<String>,
+}
+
+// String conversions used by the SQLite layer and the wire formats.
+impl fmt::Display for DecisionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DecisionStatus::Accepted => write!(f, "accepted"),
+            DecisionStatus::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
+impl FromStr for DecisionStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "accepted" => Ok(DecisionStatus::Accepted),
+            "rejected" => Ok(DecisionStatus::Rejected),
+            _ => Err(format!("Unknown decision status: {}", s)),
+        }
+    }
+}
+
+impl fmt::Display for AlternativeStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AlternativeStatus::Active => write!(f, "active"),
+            AlternativeStatus::Discarded => write!(f, "discarded"),
+        }
+    }
+}
+
+impl FromStr for AlternativeStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(AlternativeStatus::Active),
+            "discarded" => Ok(AlternativeStatus::Discarded),
+            _ => Err(format!("Unknown alternative status: {}", s)),
+        }
+    }
+}
+
+impl fmt::Display for DelegationStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DelegationStatus::Requested => write!(f, "requested"),
+            DelegationStatus::Running => write!(f, "running"),
+            DelegationStatus::Complete => write!(f, "complete"),
+            DelegationStatus::Failed => write!(f, "failed"),
+            DelegationStatus::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
+impl FromStr for DelegationStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "requested" => Ok(DelegationStatus::Requested),
+            "running" => Ok(DelegationStatus::Running),
+            "complete" => Ok(DelegationStatus::Complete),
+            "failed" => Ok(DelegationStatus::Failed),
+            "cancelled" => Ok(DelegationStatus::Cancelled),
+            _ => Err(format!("Unknown delegation status: {}", s)),
+        }
+    }
+}
+
+impl fmt::Display for ProgressKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProgressKind::ToolCall => write!(f, "tool_call"),
+            ProgressKind::Artifact => write!(f, "artifact"),
+            ProgressKind::Note => write!(f, "note"),
+            ProgressKind::Checkpoint => write!(f, "checkpoint"),
+        }
+    }
+}
+
+impl FromStr for ProgressKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "tool_call" => Ok(ProgressKind::ToolCall),
+            "artifact" => Ok(ProgressKind::Artifact),
+            "note" => Ok(ProgressKind::Note),
+            "checkpoint" => Ok(ProgressKind::Checkpoint),
+            _ => Err(format!("Unknown progress kind: {}", s)),
+        }
+    }
+}
+
+impl fmt::Display for TaskKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TaskKind::Finite => write!(f, "finite"),
+            TaskKind::Recurring => write!(f, "recurring"),
+            TaskKind::Evolving => write!(f, "evolving"),
+        }
+    }
+}
+
+impl FromStr for TaskKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "finite" => Ok(TaskKind::Finite),
+            "recurring" => Ok(TaskKind::Recurring),
+            "evolving" => Ok(TaskKind::Evolving),
+            _ => Err(format!("Unknown task kind: {}", s)),
+        }
+    }
+}
+
+impl fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TaskStatus::Active => write!(f, "active"),
+            TaskStatus::Paused => write!(f, "paused"),
+            TaskStatus::Done => write!(f, "done"),
+            TaskStatus::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
+impl FromStr for TaskStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(TaskStatus::Active),
+            "paused" => Ok(TaskStatus::Paused),
+            "done" => Ok(TaskStatus::Done),
+            "cancelled" => Ok(TaskStatus::Cancelled),
+            _ => Err(format!("Unknown task status: {}", s)),
+        }
+    }
 }
 
 #[cfg(test)]

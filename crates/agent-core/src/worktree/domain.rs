@@ -801,6 +801,30 @@ impl WorkspaceRecord {
 // Tests
 // ---------------------------------------------------------------------------
 
+impl fmt::Display for DelegationIsolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            DelegationIsolation::Inherit => "inherit",
+            DelegationIsolation::Shared => "shared",
+            DelegationIsolation::Isolated => "isolated",
+        };
+        f.write_str(s)
+    }
+}
+
+impl FromStr for DelegationIsolation {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "inherit" => Ok(DelegationIsolation::Inherit),
+            "shared" => Ok(DelegationIsolation::Shared),
+            "isolated" => Ok(DelegationIsolation::Isolated),
+            _ => Err(format!("Unknown delegation isolation: {}", s)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

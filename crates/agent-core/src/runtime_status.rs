@@ -16,8 +16,7 @@ pub struct SessionRuntimeStatus {
     pub run_started_at_ms: Option<u64>,
     pub observation: RuntimeObservation,
     #[serde(default)]
-    pub delegation_activity:
-        Vec<crate::core_staging::delegation_update::DelegationUpdateNotification>,
+    pub delegation_activity: Vec<crate::delegation_update::DelegationUpdateNotification>,
 }
 
 #[typeshare]
