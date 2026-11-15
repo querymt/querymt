@@ -105,7 +105,7 @@ RULES: List[Tuple[str, str]] = [
     (r"^control/delegation_notifications\.rs$", "services"),
     (r"^(accounting|worktree|snapshot|export|tools|verification)(/|\.rs$)", "services"),
     (
-        r"^(workspace_query|model_heuristics|event_fanout|event_sink|"
+        r"^(workspace_query|model_heuristics|model_info|event_fanout|event_sink|"
         r"session_event_stream|tasks)\.rs$",
         "services",
     ),

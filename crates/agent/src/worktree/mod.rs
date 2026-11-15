@@ -45,6 +45,7 @@ pub mod repo_ops;
 pub use querymt_agent_sqlite::repo_workspace;
 pub mod service;
 pub mod session_options;
+pub mod storage_root;
 #[cfg(test)]
 pub(crate) mod test_support;
 

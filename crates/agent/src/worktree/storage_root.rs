@@ -1,4 +1,4 @@
-use super::WorkspaceSettings;
+use crate::core_staging::config::workspace::WorkspaceSettings;
 use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 

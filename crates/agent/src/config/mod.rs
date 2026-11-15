@@ -20,7 +20,6 @@ mod quorum;
 mod schema;
 mod single;
 mod tools;
-mod workspace;
 
 pub use crate::core_staging::config::execution::*;
 pub use crate::core_staging::config::mcp::*;
@@ -31,6 +30,7 @@ pub use crate::knowledge::repository::settings::{
     REPOSITORY_KNOWLEDGE_MAX_RESULT_LIMIT, REPOSITORY_KNOWLEDGE_MIN_RESPONSE_BYTES,
     RepositoryKnowledgeDeliverySettings, RepositoryKnowledgeSettings,
 };
+pub use crate::worktree::storage_root::resolved_storage_root;
 pub use extensions::*;
 pub use hooks::*;
 pub use loader::{ConfigSource, interpolate_env_vars, load_config};
@@ -42,7 +42,6 @@ pub use quorum::*;
 pub use schema::{schema_for_system_parts, schema_for_value};
 pub use single::*;
 pub use tools::*;
-pub use workspace::resolved_storage_root;
 
 /// Top-level config discriminator
 #[derive(Debug)]
