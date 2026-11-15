@@ -4,6 +4,25 @@
 
 ### Behavior changes
 
+- **BREAKING (log filtering):** the agent is split into `querymt-agent-core`,
+  `-index`, `-knowledge`, `-sqlite`, `-services` and `-runtime`, with
+  `querymt-agent` as the facade. `log` and `tracing` targets come from module
+  paths, so they gain the crate prefix: `querymt_agent::agent::remote` is now
+  `querymt_agent_runtime::agent::remote`. A filter on the bare crate name
+  (`RUST_LOG=querymt_agent=debug`) is a string-prefix match and still covers
+  every agent crate; a filter on a deeper old path matches nothing. Update
+  deeper filters (see `docs/docs/agent/mesh.md`).
+- **BREAKING (Rust API):** `ViewStore` loses `get_atif`. ATIF export is a
+  function over the existing audit-view query.
+- **BREAKING (Rust API):** `SessionError::Database` holds a database-neutral
+  `DbError` (boxed source plus a `NoRows` / `Busy` / `Other` kind) instead of
+  `rusqlite::Error`, and `From<rusqlite::Error>` for `SessionError` and
+  `KnowledgeError` is removed. `is_no_rows()`, `is_transient()` and the
+  `source()` chain behave as before.
+- Existing `querymt_agent::…` module paths keep working through the facade.
+  `querymt-agent` features (`remote`, `oauth`, `plugin-loaders`, `api`) forward
+  to `querymt-agent-runtime`. Session database schema, config, hooks, ACP wire
+  shapes and typeshare output are unchanged.
 - **BREAKING (Rust API, journal):** `querymt_agent::events::AgentEventKind` gains
   `ElicitationResolved { elicitation_id, session_id, outcome, selection }`
   (kind `elicitation_resolved`, durable) and the `ElicitationOutcome` enum

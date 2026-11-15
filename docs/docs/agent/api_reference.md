@@ -227,7 +227,7 @@ pub struct EventEnvelope {
 
 ### AgentEventKind
 
-The concrete event enum evolves over time; consult `crates/agent/src/events.rs` for the canonical Rust definition. Common event families include session lifecycle, prompts/messages, tool execution, permissions, compaction, delegation, and hook diagnostics.
+The concrete event enum evolves over time; consult `crates/agent-core/src/events.rs` for the canonical Rust definition. Common event families include session lifecycle, prompts/messages, tool execution, permissions, compaction, delegation, and hook diagnostics.
 
 Hook-related diagnostics are surfaced as:
 

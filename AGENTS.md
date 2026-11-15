@@ -16,7 +16,19 @@
 
 - Workspace members and toolchain are defined in `Cargo.toml` and `rust-toolchain.toml`.
 - `querymt`: core library; `querymt-cli`: the `qmt` CLI.
-- `querymt-agent`: agent runtime and optional embedded dashboard.
+- Agent packages, bottom to top (Cargo enforces the layering):
+  - `querymt-agent-core`: plain types, events, config contracts, storage traits.
+  - `querymt-agent-index`, `querymt-agent-knowledge`: code index and repository knowledge.
+  - `querymt-agent-sqlite`: SQLite session and knowledge storage (the only `rusqlite` user).
+  - `querymt-agent-services`: accounting, worktrees, snapshots, export, built-in tools.
+  - `querymt-agent-runtime`: agent handle, session actors, ACP, mesh, auth, config, hooks.
+    Features: `remote`, `oauth`, `plugin-loaders`, `api`, `test-support`.
+  - `querymt-agent`: facade that re-exports the old `querymt_agent::…` paths, plus the
+    runner, quorum, profiles, WebSocket server, examples and the embedded dashboard. Its
+    features forward to the runtime.
+- Test the package you changed. For facade or downstream changes (`querymt-agent-py`,
+  `querymt-mobile-ffi`, examples) also test `querymt-agent`. Log targets carry the crate
+  prefix (`querymt_agent_runtime::…`); `RUST_LOG=querymt_agent=debug` covers every agent crate.
 - `querymt-remote`: shared mesh and remote-provider primitives.
 - `querymt-service-client`: service OAuth and API client primitives, not a server.
 - Provider crates live under `crates/providers/`.
@@ -77,8 +89,8 @@
 - Implement backward compatibility only when explicitly requested by the user.
   Do not add compatibility layers or preserve legacy behavior by default. If a change
   appears to require backward compatibility, flag it for user review before implementing it.
-- SQLite schema changes (`crates/agent/src/session/schema.rs`) need a new migration in
-  `crates/agent/src/session/sqlite_storage/migrations.rs`; `init_schema` only covers fresh
+- SQLite schema changes (`crates/agent-sqlite/src/session/schema.rs`) need a new migration in
+  `crates/agent-sqlite/src/session/sqlite_storage/migrations.rs`; `init_schema` only covers fresh
   installs. Never edit a released migration. The schema drift test enforces this.
 - Draw diagrams (flows, sequences, state machines, architecture) as ` ```mermaid `
   code blocks, never as ASCII art or box drawings. This applies to docs, OpenSpec

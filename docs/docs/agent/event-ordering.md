@@ -45,7 +45,7 @@ LLM attempt accounting reuses this journal. `llm_attempt_started` is appended th
 - Because file databases use `synchronous=NORMAL`, the most recent commits can be lost after a power loss. Accounting is a supported token-cost estimate, not an invoice, and cannot promise exact billing after an unobservable crash.
 - Do not run an older binary against a journal containing these event kinds. Roll back by restoring a preserved pre-upgrade database copy with the matching binary.
 
-See the module documentation of `crates/agent/src/accounting.rs` for identity, retry, pricing-snapshot and uncertainty semantics.
+See the module documentation of `crates/agent-services/src/accounting.rs` for identity, retry, pricing-snapshot and uncertainty semantics.
 
 ### Retention, forks and historical coverage
 

@@ -34,7 +34,7 @@ include = [".agents/memories/*.md", "docs/architecture/**/*.md", "crates/agent/*
 exclude = ["openspec/changes/archive/**"]
 
 [code]
-include = ["crates/agent/src/**/*.rs"]
+include = ["crates/agent-*/src/**/*.rs"]
 ```
 
 - Patterns are relative to the knowledge root; `exclude` wins over `include`.

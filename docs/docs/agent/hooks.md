@@ -402,28 +402,28 @@ Generated schemas are committed in the repository and define the stdin/stdout co
 
 Relevant files include:
 
-- `crates/agent/src/hooks/schema/generated/pre-tool-use.command.input.schema.json`
-- `crates/agent/src/hooks/schema/generated/pre-tool-use.command.output.schema.json`
-- `crates/agent/src/hooks/schema/generated/permission-request.command.input.schema.json`
-- `crates/agent/src/hooks/schema/generated/permission-request.command.output.schema.json`
-- `crates/agent/src/hooks/schema/generated/context.command.input.schema.json`
-- `crates/agent/src/hooks/schema/generated/context.command.output.schema.json`
-- `crates/agent/src/hooks/schema/generated/pre-compaction.command.input.schema.json`
-- `crates/agent/src/hooks/schema/generated/pre-compaction.command.output.schema.json`
-- `crates/agent/src/hooks/schema/generated/post-compaction.command.input.schema.json`
-- `crates/agent/src/hooks/schema/generated/post-compaction.command.output.schema.json`
-- `crates/agent/src/hooks/schema/generated/pre-delegation.command.input.schema.json`
-- `crates/agent/src/hooks/schema/generated/pre-delegation.command.output.schema.json`
-- `crates/agent/src/hooks/schema/generated/delegation-start.command.input.schema.json`
-- `crates/agent/src/hooks/schema/generated/delegation-start.command.output.schema.json`
-- `crates/agent/src/hooks/schema/generated/post-delegation.command.input.schema.json`
-- `crates/agent/src/hooks/schema/generated/post-delegation.command.output.schema.json`
-- `crates/agent/src/hooks/schema/generated/delegation-failure.command.input.schema.json`
-- `crates/agent/src/hooks/schema/generated/delegation-failure.command.output.schema.json`
-- `crates/agent/src/hooks/schema/generated/session-end.command.input.schema.json`
-- `crates/agent/src/hooks/schema/generated/session-end.command.output.schema.json`
-- `crates/agent/src/hooks/schema/generated/stop.command.input.schema.json`
-- `crates/agent/src/hooks/schema/generated/stop.command.output.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/pre-tool-use.command.input.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/pre-tool-use.command.output.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/permission-request.command.input.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/permission-request.command.output.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/context.command.input.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/context.command.output.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/pre-compaction.command.input.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/pre-compaction.command.output.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/post-compaction.command.input.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/post-compaction.command.output.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/pre-delegation.command.input.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/pre-delegation.command.output.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/delegation-start.command.input.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/delegation-start.command.output.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/post-delegation.command.input.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/post-delegation.command.output.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/delegation-failure.command.input.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/delegation-failure.command.output.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/session-end.command.input.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/session-end.command.output.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/stop.command.input.schema.json`
+- `crates/agent-runtime/src/hooks/schema/generated/stop.command.output.schema.json`
 
 ## Hooks vs Middleware
 

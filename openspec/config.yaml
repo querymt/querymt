@@ -6,7 +6,8 @@ context: |
 
   Packages (names for -p):
   - querymt (crates/querymt): core LLM, provider, plugin-host and MCP library. Almost everything depends on it.
-  - querymt-agent (crates/agent): agent runtime, ACP, SQLite sessions, tools, hooks, middleware, optional dashboard. Depends on querymt, querymt-remote, querymt-utils, querymt-provider-common.
+  - Agent packages, bottom to top: querymt-agent-core (crates/agent-core: plain types, events, config contracts, storage traits), querymt-agent-index, querymt-agent-knowledge, querymt-agent-sqlite (SQLite storage, the only rusqlite user), querymt-agent-services (accounting, worktrees, snapshots, export, built-in tools), querymt-agent-runtime (crates/agent-runtime: agent handle, session actors, ACP, mesh, auth, config, hooks, middleware), querymt-agent (crates/agent: facade re-exporting the old querymt_agent paths, runner, quorum, profiles, WebSocket server, examples, optional dashboard). Cargo enforces the layering; a lower crate must not depend on a higher one.
+  - Test the package you changed, plus querymt-agent for facade or downstream changes (querymt-agent-py, querymt-mobile-ffi, examples).
   - querymt-remote (mesh, remote providers), querymt-utils (shared utils, OAuth, secret store), querymt-service-client (service OAuth/API client).
   - querymt-cli (crates/cli, the qmt binary), querymt-py and querymt-agent-py (crates/py, PyO3), querymt-mobile-ffi (over querymt-agent).
   - qmt-<name> (crates/providers/<name>): providers. Many build on qmt-openai, which is also a dev-dependency of querymt-agent and querymt-remote.
@@ -23,20 +24,20 @@ context: |
   - Never run `cargo nextest run --workspace`, or `--all-features` on querymt-agent. Default-feature (extism) provider test builds can fail to link, and native providers are expensive.
 
   Features (mirror .github/workflows):
-  - querymt-agent CI features: dashboard,oauth,zbus-secret-service,systemd-credentials,remote. Mesh code needs remote. The zbus/systemd features only take effect on Linux, so those paths stay unverified on macOS; say so.
+  - querymt-agent-runtime CI features: remote,oauth,plugin-loaders,api (plus test-support for downstream tests). querymt-agent forwards its features to it. querymt-agent CI features: dashboard,oauth,zbus-secret-service,systemd-credentials,remote. Mesh code needs remote. The zbus/systemd features only take effect on Linux, so those paths stay unverified on macOS; say so.
   - dashboard builds need QMT_UI_DIST pointing at the minimal fixture from test-agent.yml, outside target/. Without it build.rs downloads the UI from GitHub.
   - querymt and querymt-remote CI use --all-features.
   - Providers default to the extism (wasm plugin) feature. Test them with --no-default-features --features native. qmt-mrs tests download models; skip them unless the change targets mrs.
   - Python crates need PYO3_PYTHON pointing at Python 3.10 or newer (abi3-py310).
   - querymt-remote network-timing tests can flake when several packages share one nextest run. Rerun them alone before blaming the change.
 
-  Agent configuration (crates/agent/src/config):
+  Agent configuration (crates/agent-runtime/src/config):
   - TOML/JSON via serde, with schemars JsonSchema. Most structs use deny_unknown_fields, so an unknown key is a load error, not a warning.
   - A new key needs an explicit default, a JsonSchema entry, parse tests in config/tests.rs (default, valid value, rejected value) and docs in docs/docs/agent/configuration.md.
   - crates/agent/examples/confs/*.toml are embedded and tested; single_coder.toml is the default qmtcode profile.
 
   Contracts:
-  - Session DB migrations (crates/agent/src/session/sqlite_storage/migrations.rs) are forward-only. Never edit a released migration; append one. legacy_baseline_upgrade_matches_fresh_install guards this.
+  - Session DB migrations (crates/agent-sqlite/src/session/sqlite_storage/migrations.rs) are forward-only. Never edit a released migration; append one. legacy_baseline_upgrade_matches_fresh_install guards this.
   - Changing the Extism host/plugin interface means bumping ITEM_AWARE_CHAT_CONTRACT_VERSION or PREPARED_CHAT_CONTRACT_VERSION and checking `cargo build -p qmt-<name> --release --target wasm32-wasip1`.
   - #[typeshare] types and ACP payloads are consumed by querymt-desktop. Changes need a reported UI follow-up, not UI work here.
   - Any behaviour change to config, hooks, middleware, tools or ACP is marked **BREAKING** in the proposal and gets an entry under "Unreleased" in CHANGELOG.md.
@@ -57,7 +58,7 @@ rules:
     - For every config key, state its full TOML path, type, default, limits or units, and what happens on an invalid value.
     - Give every scenario a unique, descriptive name within its capability. Tasks and tests refer to scenarios by that name.
   design:
-    - Cite the existing code the change builds on as file path plus symbol (for example crates/agent/src/config/single.rs SingleAgentConfig). Add a line number only as a hint; symbols survive edits, line numbers do not.
+    - Cite the existing code the change builds on as file path plus symbol (for example crates/agent-runtime/src/config/single.rs SingleAgentConfig). Add a line number only as a hint; symbols survive edits, line numbers do not.
     - Name the crates, modules and cfg(feature) paths that change, and which special builds are affected (wasm32-wasip1 provider plugins, Python, mobile-ffi).
     - For new dependencies, state workspace vs crate-local, default-features and feature gating, and confirm provider crates still build for wasm32-wasip1.
     - For persistence changes, describe the new forward-only migration and how existing databases upgrade.
