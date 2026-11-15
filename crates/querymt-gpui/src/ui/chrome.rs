@@ -193,9 +193,6 @@ impl QmtApp {
         let page_title_center = session_title;
         let page_title_left = div().text_sm().text_color(p.muted).child(page_title);
         let narrow = window.viewport_size().width < px(760.);
-        // Interactive widgets swallow mouse-down so clicks never turn into window drags.
-        let no_drag =
-            |el: Div| el.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
 
         let brand = h_flex()
             .gap_2()
@@ -247,11 +244,17 @@ impl QmtApp {
             // No background here: the root paints a rounded `p.bg` underneath,
             // and GPUI's overflow mask is rectangular, so a square quad flush
             // with the top would overpaint the frame's rounded corners.
+            // The whole bar is the drag handle. Controls inside it claim their
+            // press with `prevent_default` (as GPUI Kit's `Button` does) instead
+            // of stopping propagation, and the bar ignores claimed presses.
             .when(!IS_WEB, |el| {
                 el.window_control_area(WindowControlArea::Drag)
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, _| this.header_drag = true),
+                        cx.listener(|this, _, window: &mut Window, _| {
+                            this.header_press_claimed = window.default_prevented();
+                            this.header_drag = !this.header_press_claimed;
+                        }),
                     )
                     .on_mouse_up(
                         MouseButton::Left,
@@ -264,13 +267,17 @@ impl QmtApp {
                             window.start_window_move();
                         }
                     }))
-                    .on_double_click(|_, window, _| {
+                    // Clicks on controls bubble here too; only the bar itself zooms.
+                    .on_double_click(cx.listener(|this, _, window, _| {
+                        if this.header_press_claimed {
+                            return;
+                        }
                         if IS_MACOS {
                             window.titlebar_double_click();
                         } else {
                             window.zoom_window();
                         }
-                    })
+                    }))
             })
             .when(IS_LINUX && client_decorated, |el| {
                 el.on_mouse_down(MouseButton::Right, |ev, window, _| {
@@ -289,7 +296,7 @@ impl QmtApp {
                     .gap_3()
                     .child(brand)
                     .when(!is_session, |el| el.child(page_title_left))
-                    .child(no_drag(h_flex().gap_1p5().children(slot))),
+                    .child(h_flex().gap_1p5().children(slot)),
             )
             // The title stays a drag handle; it truncates before the sides shrink.
             .children(page_title_center.map(|title| {
@@ -301,7 +308,7 @@ impl QmtApp {
                     .justify_center()
                     .child(title)
             }))
-            .child(no_drag(
+            .child(
                 h_flex()
                     .flex_1()
                     .justify_end()
@@ -343,6 +350,6 @@ impl QmtApp {
                                 .child(window_control(Control::Close, &p)),
                         )
                     }),
-            ))
+            )
     }
 }
