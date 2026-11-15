@@ -10,10 +10,10 @@ pub(crate) mod trace;
 pub mod validation;
 
 pub use builtins::{
-    BrowseTool, CompleteTaskTool, CreateTaskTool, DelegateTool, DeleteFileTool, GetFunctionTool,
-    GetSymbolTool, KnowledgeConsolidateTool, KnowledgeIngestTool, KnowledgeListTool,
-    KnowledgeQueryTool, KnowledgeStatsTool, ReadTaskTool, ReadTool, SearchTextTool, ShellTool,
-    UpdateTaskTool, WebFetchTool, WriteFileTool,
+    BrowseTool, CompleteTaskTool, CreateTaskTool, DeleteFileTool, GetFunctionTool, GetSymbolTool,
+    KnowledgeConsolidateTool, KnowledgeIngestTool, KnowledgeListTool, KnowledgeQueryTool,
+    KnowledgeStatsTool, ReadTaskTool, ReadTool, SearchTextTool, ShellTool, UpdateTaskTool,
+    WebFetchTool, WriteFileTool,
 };
 pub use context::{
     AliasScope, ArgAlias, CapabilityRequirement, FileAccess, QuestionOption, Tool, ToolContext,

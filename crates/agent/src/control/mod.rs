@@ -1,6 +1,8 @@
 pub mod capabilities;
 pub mod delegate_models;
 pub mod delegation_notifications;
+#[cfg(test)]
+mod delegation_notifications_load_tests;
 pub mod elicitation_recovery;
 pub mod mesh;
 pub mod notifications;

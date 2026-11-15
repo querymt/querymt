@@ -134,10 +134,7 @@ pub(crate) mod llm_metrics {
 
 /// Trace-only mapping pinned to semantic-conventions-genai e07f4ebacb08f56db8c4c882d117720333fbca04.
 pub(crate) mod genai {
-    use opentelemetry::{
-        Array, Value,
-        trace::Status,
-    };
+    use opentelemetry::{Array, Value, trace::Status};
     use querymt::chat::{ChatMessage, ChatOutput, ChatOutputStatus, ChatRole, FinishReason};
     use querymt::error::LLMError;
     use tracing::Span;

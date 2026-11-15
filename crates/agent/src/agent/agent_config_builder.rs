@@ -96,7 +96,7 @@ impl AgentConfigBuilder {
         ));
         let event_journal = storage.event_journal();
         let mut tool_registry = ToolRegistry::new();
-        tool_registry.extend(crate::tools::builtins::all_builtin_tools());
+        tool_registry.extend(crate::agent::builtin_tools::all_builtin_tools());
 
         Self {
             storage: storage.clone(),
@@ -281,7 +281,7 @@ impl AgentConfigBuilder {
         // Remove old DelegateTool and add new one with registry
         self.tool_registry.remove("delegate");
         self.tool_registry
-            .add(Arc::new(crate::tools::builtins::DelegateTool::new()));
+            .add(Arc::new(crate::agent::builtin_tools::DelegateTool::new()));
 
         if self.delegation_context_config.auto_inject && !registry.list_agents().is_empty() {
             let middleware = DelegationMiddleware::new(

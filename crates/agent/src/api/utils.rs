@@ -1,9 +1,9 @@
 //! Shared utility functions for the simple API
 
+use crate::agent::builtin_tools::all_builtin_tools;
 use crate::agent::utils::render_prompt_for_display;
 use crate::model::{AgentMessage, MessagePart};
 use crate::tools::CapabilityRequirement;
-use crate::tools::builtins::all_builtin_tools;
 use anyhow::{Result, anyhow};
 use once_cell::sync::Lazy;
 use querymt::LLMParams;

@@ -15,6 +15,7 @@ use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
 use crate::delegation::AgentInfo;
 
 use crate::acp::protocol::{ContentBlock, PromptRequest, TextContent};
+use crate::agent::builtin_tools::all_builtin_tools;
 use crate::agent::handle::AgentHandle as AgentHandleTrait;
 use crate::runner::ChatSession;
 use crate::session::backend::resolve_agent_db_path;
@@ -23,7 +24,6 @@ use crate::session::store::SessionStore;
 use crate::session::{SqliteStorage, StorageBackend};
 use crate::snapshot::GitSnapshotBackend;
 use crate::tools::CapabilityRequirement;
-use crate::tools::builtins::all_builtin_tools;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 #[cfg(feature = "remote")]
@@ -889,7 +889,7 @@ impl QuorumBuilder {
             // Register routing planner tools if RoutingActor is available.
             #[cfg(feature = "remote")]
             if let Some(actor_ref) = routing_actor_for_planner {
-                use crate::tools::builtins::{RouteDelegationToPeerTool, UseRemoteProviderTool};
+                use crate::agent::builtin_tools::{RouteDelegationToPeerTool, UseRemoteProviderTool};
                 b.extend_tool_registry([
                     Arc::new(RouteDelegationToPeerTool::new(actor_ref.clone()))
                         as Arc<dyn crate::tools::Tool>,

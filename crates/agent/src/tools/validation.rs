@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn report_fixture_messages_match_the_real_pipeline() {
         use crate::tools::args::normalize_arguments;
-        use crate::tools::builtins::all_builtin_tools;
+        use crate::tools::builtins::base_builtin_tools as all_builtin_tools;
 
         let rows = include_str!("../../../../scripts/testdata/new_format_failures.tsv");
         let tools = all_builtin_tools();

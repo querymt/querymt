@@ -4395,7 +4395,7 @@ mod prepared_call_tests {
         log: &Arc<Mutex<Vec<(String, Value)>>>,
     ) -> crate::agent::agent_config::AgentConfig {
         let mut registry = ToolRegistry::new();
-        for tool in crate::tools::builtins::all_builtin_tools() {
+        for tool in crate::agent::builtin_tools::all_builtin_tools() {
             registry.add(Arc::new(Replay {
                 inner: tool,
                 invocations: log.clone(),

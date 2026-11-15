@@ -407,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn test_all_builtin_tools_registered() {
         // Verify that all tools from all_builtin_tools() are registered
-        let all_tools = crate::tools::builtins::all_builtin_tools();
+        let all_tools = crate::agent::builtin_tools::all_builtin_tools();
 
         use crate::agent::agent_config_builder::AgentConfigBuilder;
         use crate::session::sqlite_storage::SqliteStorage;

@@ -1045,7 +1045,7 @@ fn dotagents_settings_are_present_in_generated_schemas() {
 /// know exactly which values are valid.
 #[test]
 fn test_schema_tools_description_covers_all_builtins() {
-    use crate::tools::builtins::all_builtin_tools;
+    use crate::agent::builtin_tools::all_builtin_tools;
 
     let schema = schemars::schema_for!(SingleAgentConfig);
     let schema_json = serde_json::to_value(&schema).unwrap();
