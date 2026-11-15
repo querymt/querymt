@@ -348,17 +348,71 @@ impl ToolCall {
 /// One entry of a work group: a reasoning step or a tool call.
 #[derive(Clone, Debug)]
 pub enum WorkEntry {
-    Thought { id: String, text: String },
+    Thought(Thought),
     Tool(Box<ToolCall>),
 }
 
 impl WorkEntry {
     pub fn id(&self) -> &str {
         match self {
-            WorkEntry::Thought { id, .. } => id,
+            WorkEntry::Thought(t) => &t.id,
             WorkEntry::Tool(call) => &call.id,
         }
     }
+}
+
+/// One reasoning part of an assistant message. The agent tags each provider
+/// summary with its own part id (`<item>:summary:<n>`); chunks of the same
+/// part append, a new part starts a new thought (desktop `canMergeStreamChunk`).
+#[derive(Clone, Debug)]
+pub struct Thought {
+    /// Unique key: the message id, plus the part id when there is one.
+    pub id: String,
+    pub message: String,
+    pub part: Option<String>,
+    pub text: String,
+}
+
+impl Thought {
+    fn new(message: String, part: Option<String>, text: String) -> Self {
+        let id = match &part {
+            Some(part) => format!("{message}/{part}"),
+            None => message.clone(),
+        };
+        Self {
+            id,
+            message,
+            part,
+            text,
+        }
+    }
+
+    /// A provider reasoning summary rather than raw reasoning (desktop
+    /// `isReasoningSummaryPart`: a `summary` segment in the part id).
+    pub fn is_summary(&self) -> bool {
+        self.part.as_deref().is_some_and(|part| {
+            part.split([':', '/'])
+                .any(|seg| seg.eq_ignore_ascii_case("summary"))
+        })
+    }
+}
+
+/// `reasoning_part_id` of a thought chunk: on the update itself or nested in
+/// its `_meta` / `metadata` / `querymt` / `content` (desktop `readReasoningPartId`).
+fn reasoning_part_id(value: &Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let direct = obj
+        .get("reasoning_part_id")
+        .or_else(|| obj.get("reasoningPartId"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    if let Some(id) = direct {
+        return Some(id.to_string());
+    }
+    ["_meta", "metadata", "querymt", "content"]
+        .into_iter()
+        .filter_map(|k| obj.get(k))
+        .find_map(reasoning_part_id)
 }
 
 /// A file or image the user sent with a prompt (image bytes are kept for thumbnails).
@@ -1484,7 +1538,7 @@ impl SessionView {
                         .unwrap_or(fallback);
                     last_assistant = Some(id.clone());
                     if let Some(text) = s("content") {
-                        self.apply_thought(Some(id), text);
+                        self.apply_thought(Some(id), s("part_id"), text);
                     }
                 }
                 "assistant_message_stored" => {
@@ -1494,22 +1548,29 @@ impl SessionView {
                     last_assistant = Some(id.clone());
                     // Streamed reasoning already covers the stored parts.
                     if !self.has_thought(&id) {
-                        let parts: Vec<String> = data
+                        let parts: Vec<(Option<String>, String)> = data
                             .get("reasoning_parts")
                             .and_then(Value::as_array)
                             .into_iter()
                             .flatten()
-                            .filter_map(|p| p.get("text").and_then(Value::as_str))
-                            .filter(|t| !t.is_empty())
-                            .map(str::to_owned)
+                            .filter_map(|p| {
+                                let text = p.get("text").and_then(Value::as_str)?;
+                                let part = p.get("id").and_then(Value::as_str);
+                                (!text.is_empty()).then(|| {
+                                    (
+                                        part.filter(|s| !s.is_empty()).map(str::to_owned),
+                                        text.to_owned(),
+                                    )
+                                })
+                            })
                             .collect();
                         let parts = if parts.is_empty() {
-                            s("thinking").into_iter().collect()
+                            s("thinking").map(|t| (None, t)).into_iter().collect()
                         } else {
                             parts
                         };
-                        for text in parts {
-                            self.apply_thought(Some(id.clone()), text);
+                        for (part, text) in parts {
+                            self.apply_thought(Some(id.clone()), part, text);
                         }
                     }
                     if let Some(text) = s("content") {
@@ -1593,7 +1654,7 @@ impl SessionView {
         self.items.iter().any(|i| match &i.kind {
             ItemKind::Work(entries) => entries
                 .iter()
-                .any(|e| matches!(e, WorkEntry::Thought { id, .. } if id == message_id)),
+                .any(|e| matches!(e, WorkEntry::Thought(t) if t.message == message_id)),
             _ => false,
         })
     }
@@ -1817,6 +1878,9 @@ impl SessionView {
                     return self.apply_user_attachment(message_id, a);
                 }
                 let text = content.map(content_text).unwrap_or_default();
+                if kind == "agent_thought_chunk" {
+                    return self.apply_thought(message_id, reasoning_part_id(update), text);
+                }
                 self.apply_chunk(kind, message_id, text);
             }
             "tool_call" => self.apply_tool(update, true),
@@ -2014,7 +2078,7 @@ impl SessionView {
 
     fn apply_chunk(&mut self, kind: &str, message_id: Option<String>, text: String) {
         if kind == "agent_thought_chunk" {
-            return self.apply_thought(message_id, text);
+            return self.apply_thought(message_id, None, text);
         }
         if let Some(ix) = self.items.len().checked_sub(1) {
             let same = message_id
@@ -2060,32 +2124,36 @@ impl SessionView {
         self.push(key, kind);
     }
 
-    fn apply_thought(&mut self, message_id: Option<String>, text: String) {
+    /// Append a reasoning chunk: to the last thought when it is the same
+    /// message and part, otherwise as a new thought.
+    fn apply_thought(&mut self, message_id: Option<String>, part: Option<String>, text: String) {
         if let Some(ix) = self.items.len().checked_sub(1)
             && let ItemKind::Work(entries) = &mut self.items[ix].kind
         {
-            if let Some(WorkEntry::Thought { id, text: t }) = entries.last_mut()
-                && message_id.as_ref().is_none_or(|m| m == id)
+            if let Some(WorkEntry::Thought(t)) = entries.last_mut()
+                && message_id.as_ref().is_none_or(|m| *m == t.message)
+                && part == t.part
             {
-                t.push_str(&text);
+                t.text.push_str(&text);
                 self.touch(ix);
                 return;
             }
             if text.is_empty() {
                 return;
             }
-            let id = message_id.unwrap_or_else(|| format!("thought-{}", self.counter + 1));
-            entries.push(WorkEntry::Thought { id, text });
+            let message = message_id.unwrap_or_else(|| format!("thought-{}", self.counter + 1));
+            entries.push(WorkEntry::Thought(Thought::new(message, part, text)));
             self.touch(ix);
             return;
         }
         if text.is_empty() {
             return;
         }
-        let id = message_id.unwrap_or_else(|| format!("thought-{}", self.counter + 1));
+        let message = message_id.unwrap_or_else(|| format!("thought-{}", self.counter + 1));
+        let thought = Thought::new(message, part, text);
         self.push(
-            format!("work-{id}"),
-            ItemKind::Work(vec![WorkEntry::Thought { id, text }]),
+            format!("work-{}", thought.id),
+            ItemKind::Work(vec![WorkEntry::Thought(thought)]),
         );
     }
 
@@ -2285,6 +2353,78 @@ mod history_tests {
 
     fn ev(kind: &str, data: serde_json::Value) -> serde_json::Value {
         json!({ "kind": { "type": kind, "data": data } })
+    }
+
+    /// (part, text, is_summary) of every thought, in order.
+    fn thoughts(view: &SessionView) -> Vec<(Option<String>, String, bool)> {
+        view.items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::Work(e) => Some(e),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|e| match e {
+                WorkEntry::Thought(t) => Some((t.part.clone(), t.text.clone(), t.is_summary())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn live_reasoning_summaries_stay_separate_parts() {
+        let mut view = SessionView::new("a", "s", "/w", "t");
+        let chunk = |part: &str, text: &str| {
+            json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "m1",
+                "content": { "type": "text", "text": text },
+                "_meta": { "querymt": { "reasoning_part_id": part } } })
+        };
+        view.apply(&chunk("rs_1:summary:0", "**Inspecting "));
+        view.apply(&chunk("rs_1:summary:0", "fixtures**"));
+        view.apply(&chunk("rs_1:summary:1", "**Adding checks**"));
+        // Untagged reasoning of the same message is its own (raw) thought.
+        view.apply(
+            &json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "m1",
+            "content": { "type": "text", "text": "raw" } }),
+        );
+        assert_eq!(
+            thoughts(&view),
+            [
+                (
+                    Some("rs_1:summary:0".into()),
+                    "**Inspecting fixtures**".into(),
+                    true
+                ),
+                (
+                    Some("rs_1:summary:1".into()),
+                    "**Adding checks**".into(),
+                    true
+                ),
+                (None, "raw".into(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn stored_reasoning_parts_keep_their_ids() {
+        let mut view = SessionView::new("a", "s", "/w", "t");
+        view.apply_history_events(
+            &[ev(
+                "assistant_message_stored",
+                json!({ "message_id": "m1", "content": "done", "reasoning_parts": [
+                    { "id": "rs_1:summary:0", "text": "**One**" },
+                    { "id": "rs_1:summary:1", "text": "**Two**" },
+                ] }),
+            )],
+            &[],
+        );
+        assert_eq!(
+            thoughts(&view),
+            [
+                (Some("rs_1:summary:0".into()), "**One**".into(), true),
+                (Some("rs_1:summary:1".into()), "**Two**".into(), true),
+            ]
+        );
     }
 
     #[test]
@@ -2654,7 +2794,7 @@ mod snapshot_tests {
             .filter_map(|i| match &i.kind {
                 ItemKind::Work(e) => Some(
                     e.iter()
-                        .filter(|e| matches!(e, WorkEntry::Thought { .. }))
+                        .filter(|e| matches!(e, WorkEntry::Thought(_)))
                         .count(),
                 ),
                 _ => None,

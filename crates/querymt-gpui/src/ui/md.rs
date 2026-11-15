@@ -168,9 +168,40 @@ impl RenderOnce for CopyButton {
     }
 }
 
+/// Text of `source` with the markdown syntax removed and whitespace collapsed,
+/// e.g. `**Checking scope**` → `Checking scope` (desktop `stripHtml` of the
+/// rendered markdown).
+pub fn plain_text(source: &str) -> String {
+    let text = match markdown::to_mdast(source, &markdown::ParseOptions::gfm()) {
+        Ok(root) => match root.children() {
+            Some(blocks) => blocks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" "),
+            None => root.to_string(),
+        },
+        Err(_) => source.to_string(),
+    };
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_LANG, code_lang};
+    use super::{DEFAULT_LANG, code_lang, plain_text};
+
+    #[test]
+    fn plain_text_drops_markdown() {
+        assert_eq!(
+            plain_text("**Checking scope filters**"),
+            "Checking scope filters"
+        );
+        assert_eq!(
+            plain_text("**Title**\n\nSome `code` and a [link](https://x.y)."),
+            "Title Some code and a link."
+        );
+        assert_eq!(plain_text("  "), "");
+    }
 
     #[test]
     fn fences_without_a_language_are_text() {

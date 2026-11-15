@@ -27,7 +27,7 @@ use super::start::{badged_tone, mode_tone, model_toolbar_button, reasoning_color
 use super::{Page, QmtApp, kit};
 use crate::session::{
     COMPACTING_LABEL, Compaction, CompactionStatus, Diff, Item, ItemKind, SelectOption,
-    SessionView, ToolCall, UserAttachment, WorkEntry, is_compact_command,
+    SessionView, Thought, ToolCall, UserAttachment, WorkEntry, is_compact_command,
 };
 use crate::store::SessionSummary;
 use crate::theme::{Palette, palette};
@@ -1544,20 +1544,71 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
         .into_any_element()
 }
 
-fn render_thought(id: &str, text: &str, live: bool, rc: &RenderCtx) -> AnyElement {
+/// Longest reasoning title, in chars (desktop `previewMaxLength`).
+const REASONING_TITLE_MAX: usize = 122;
+/// Source bytes parsed for a raw-reasoning title; the title only shows its start.
+const REASONING_TITLE_SOURCE: usize = 2048;
+
+/// Plain-text title of a reasoning entry, without markdown syntax.
+fn reasoning_title(text: &str) -> String {
+    let mut end = text.len().min(REASONING_TITLE_SOURCE);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let plain = md::plain_text(&text[..end]);
+    if plain.chars().count() > REASONING_TITLE_MAX {
+        let cut: String = plain.chars().take(REASONING_TITLE_MAX - 3).collect();
+        format!("{cut}...")
+    } else {
+        plain
+    }
+}
+
+/// Splits work entries into tools and reasoning blocks: consecutive summary
+/// thoughts form one block, any other thought is a block of its own
+/// (desktop `groupConsecutiveReasoning`).
+fn group_work(entries: &[WorkEntry]) -> Vec<WorkBlock<'_>> {
+    let mut out: Vec<WorkBlock> = Vec::new();
+    for e in entries {
+        match e {
+            WorkEntry::Tool(call) => out.push(WorkBlock::Tool(call)),
+            WorkEntry::Thought(t) => match out.last_mut() {
+                Some(WorkBlock::Reasoning(run))
+                    if t.is_summary() && run.iter().all(|r| r.is_summary()) =>
+                {
+                    run.push(t)
+                }
+                _ => out.push(WorkBlock::Reasoning(vec![t])),
+            },
+        }
+    }
+    out
+}
+
+enum WorkBlock<'a> {
+    Tool(&'a ToolCall),
+    Reasoning(Vec<&'a Thought>),
+}
+
+/// A reasoning block (desktop `SessionReasoningBlock`). A run of provider
+/// summaries is titled by the latest one and opens as a `-` list; a single
+/// summary is a plain row. Raw reasoning opens as markdown.
+fn render_reasoning(thoughts: &[&Thought], live: bool, rc: &RenderCtx) -> AnyElement {
     let p = &rc.p;
+    let Some(first) = thoughts.first() else {
+        return div().into_any_element();
+    };
+    let id = first.id.as_str();
     let hover = p.card_hover.opacity(0.55);
-    let open = rc.expanded.contains(id);
-    let preview: String = text
-        .trim()
-        .lines()
+    let summary_run = thoughts.iter().all(|t| t.is_summary());
+    let expandable = !summary_run || thoughts.len() > 1;
+    let open = expandable && rc.expanded.contains(id);
+    let title = thoughts
+        .iter()
         .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("Thinking")
-        .trim_start_matches(['*', '#', '-', ' '])
-        .chars()
-        .take(122)
-        .collect();
+        .map(|t| reasoning_title(&t.text))
+        .find(|t| !t.is_empty())
+        .unwrap_or_else(|| "Thinking".into());
     let (key, weak) = (id.to_string(), rc.weak.clone());
     let row = h_flex()
         .id(SharedString::from(format!("thought-{id}")))
@@ -1565,8 +1616,6 @@ fn render_thought(id: &str, text: &str, live: bool, rc: &RenderCtx) -> AnyElemen
         .px_1p5()
         .min_h(px(29.))
         .rounded(px(8.))
-        .cursor_pointer()
-        .hover(move |s| s.bg(hover))
         .text_xs()
         .child(
             div()
@@ -1588,33 +1637,60 @@ fn render_thought(id: &str, text: &str, live: bool, rc: &RenderCtx) -> AnyElemen
                 .truncate()
                 .font_medium()
                 .text_color(p.muted)
-                .child(preview),
+                .child(title),
         )
-        .child(kit::icon(
-            if open {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            },
-            13.,
-            p.dim,
-        ))
-        .on_click(move |_, _, cx| toggle_expanded(&weak, key.clone(), cx));
+        .when(expandable, |el| {
+            el.cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .child(kit::icon(
+                    if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    },
+                    13.,
+                    p.dim,
+                ))
+                .on_click(move |_, _, cx| toggle_expanded(&weak, key.clone(), cx))
+        });
+    if !open {
+        return row.into_any_element();
+    }
+    let body = if summary_run {
+        // Desktop `.session-reasoning-summary-list`: one `-` line per summary.
+        v_flex()
+            .gap_0p5()
+            .children(thoughts.iter().map(|t| {
+                h_flex()
+                    .items_start()
+                    .gap_1p5()
+                    .child(div().flex_none().child("-"))
+                    .child(div().flex_1().min_w_0().child(md::markdown(
+                        format!("th-md-{}", t.id),
+                        t.text.trim().to_string(),
+                        p,
+                    )))
+            }))
+            .into_any_element()
+    } else {
+        v_flex()
+            .gap_2()
+            .children(
+                thoughts
+                    .iter()
+                    .map(|t| md::markdown(format!("th-md-{}", t.id), t.text.trim().to_string(), p)),
+            )
+            .into_any_element()
+    };
     v_flex()
         .child(row)
-        .when(open, |el| {
-            el.child(
-                detail_well(p)
-                    .opacity(0.78)
-                    .text_xs()
-                    .text_color(p.muted)
-                    .child(md::markdown(
-                        format!("th-md-{id}"),
-                        text.trim().to_string(),
-                        p,
-                    )),
-            )
-        })
+        .child(
+            detail_well(p)
+                .opacity(0.78)
+                .text_xs()
+                .text_color(p.muted)
+                .child(body),
+        )
         .into_any_element()
 }
 
@@ -1690,13 +1766,15 @@ fn render_work(ix: usize, item: &Item, entries: &[WorkEntry], rc: &RenderCtx) ->
             .into_any_element();
     }
 
-    let show_all = settled || open || entries.len() <= 3;
-    let visible: &[WorkEntry] = if show_all {
-        entries
+    // Summary runs show as one block, so collapsing counts blocks, not entries.
+    let blocks = group_work(entries);
+    let show_all = settled || open || blocks.len() <= 3;
+    let visible: &[WorkBlock] = if show_all {
+        &blocks
     } else {
-        &entries[entries.len() - 2..]
+        &blocks[blocks.len() - 2..]
     };
-    let hidden = entries.len() - visible.len();
+    let hidden = blocks.len() - visible.len();
     let last_live = rc.running && ix >= rc.last_turn_start;
     let header: Option<AnyElement> = if settled {
         Some(
@@ -1730,7 +1808,7 @@ fn render_work(ix: usize, item: &Item, entries: &[WorkEntry], rc: &RenderCtx) ->
                 .on_click(move |_, _, cx| toggle_expanded(&weak, key.clone(), cx))
                 .into_any_element(),
         )
-    } else if hidden > 0 || open && entries.len() > 3 {
+    } else if hidden > 0 || open && blocks.len() > 3 {
         Some(
             h_flex()
                 .id(SharedString::from(format!("work-{}", item.key)))
@@ -1769,10 +1847,10 @@ fn render_work(ix: usize, item: &Item, entries: &[WorkEntry], rc: &RenderCtx) ->
     v_flex()
         .w_full()
         .children(header)
-        .children(visible.iter().enumerate().map(|(i, e)| match e {
-            WorkEntry::Tool(call) => render_tool(call, rc),
-            WorkEntry::Thought { id, text } => {
-                render_thought(id, text, last_live && i + 1 == n, rc)
+        .children(visible.iter().enumerate().map(|(i, b)| match b {
+            WorkBlock::Tool(call) => render_tool(call, rc),
+            WorkBlock::Reasoning(thoughts) => {
+                render_reasoning(thoughts, last_live && i + 1 == n, rc)
             }
         }))
         .into_any_element()
@@ -2258,7 +2336,7 @@ fn activity(view: &SessionView) -> (String, Option<String>) {
                 };
                 (title, (!preview.is_empty()).then_some(preview))
             }
-            Some(WorkEntry::Thought { .. }) => ("Thinking…".into(), None),
+            Some(WorkEntry::Thought(_)) => ("Thinking…".into(), None),
             _ => ("Working…".into(), None),
         },
         Some(ItemKind::Agent { .. }) => ("Responding…".into(), None),
@@ -4214,6 +4292,48 @@ mod tests {
         SCROLLBAR_FADE_IN_MS, SCROLLBAR_FADE_OUT_MS, ScrollbarFade, humanize_tool_name, is_read,
         is_shell, link_ranges, tool_label, workspace_relative,
     };
+    use super::{WorkBlock, group_work, reasoning_title};
+    use crate::session::{Thought, WorkEntry};
+
+    fn thought(id: &str, part: Option<&str>) -> WorkEntry {
+        WorkEntry::Thought(Thought {
+            id: id.into(),
+            message: "m".into(),
+            part: part.map(Into::into),
+            text: format!("**{id}**"),
+        })
+    }
+
+    #[test]
+    fn summary_runs_group_into_one_block() {
+        let entries = [
+            thought("a", Some("rs:summary:0")),
+            thought("b", Some("rs:summary:1")),
+            thought("raw", None),
+            thought("c", Some("rs:summary:2")),
+        ];
+        let sizes: Vec<usize> = group_work(&entries)
+            .iter()
+            .map(|b| match b {
+                WorkBlock::Reasoning(t) => t.len(),
+                WorkBlock::Tool(_) => 0,
+            })
+            .collect();
+        // Raw reasoning breaks a run and is never joined.
+        assert_eq!(sizes, [2, 1, 1]);
+    }
+
+    #[test]
+    fn reasoning_title_is_plain_and_clipped() {
+        assert_eq!(
+            reasoning_title("**Checking scope filters**"),
+            "Checking scope filters"
+        );
+        let long = "word ".repeat(60);
+        let title = reasoning_title(&long);
+        assert_eq!(title.chars().count(), 122);
+        assert!(title.ends_with("..."));
+    }
 
     #[test]
     fn link_ranges_find_urls_without_markup() {

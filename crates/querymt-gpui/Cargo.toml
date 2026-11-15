@@ -22,6 +22,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 similar = "2"
+# Already built for gpui-kit's TextView; used to turn markdown into plain text.
+markdown = "1.0.0"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 dirs = "6"

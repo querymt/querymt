@@ -4871,6 +4871,7 @@ dependencies = [
  "futures",
  "gpui-kit",
  "js-sys",
+ "markdown",
  "rustls",
  "serde",
  "serde_json",
