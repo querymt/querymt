@@ -5,7 +5,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
-use gpui_kit::component::input::{IndentInline, Input, OutdentInline, Textarea};
+use gpui_kit::component::input::{Enter, IndentInline, Input, OutdentInline, Textarea};
 use gpui_kit::component::{Selectable as _, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -883,6 +883,13 @@ impl QmtApp {
                 div()
                     .min_h(px(96.))
                     .px_1()
+                    .capture_action(cx.listener(|this, a: &Enter, window, cx| {
+                        let send = this.store.read(cx).prefs.send_shortcut;
+                        if send.submits(a.shift, a.secondary) {
+                            cx.stop_propagation();
+                            this.start_session(window, cx);
+                        }
+                    }))
                     .capture_action(cx.listener(|this, _: &IndentInline, _, cx| {
                         cx.stop_propagation();
                         this.cycle_launch_mode(false, cx);

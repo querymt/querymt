@@ -569,6 +569,60 @@ impl QmtApp {
             return Some(self.centered(scrim("scrim-reset"), card, cx));
         }
 
+        if let Some(message_id) = self.confirm_undo.clone() {
+            let affected = self
+                .store
+                .read(cx)
+                .session
+                .as_ref()
+                .and_then(|v| v.undo_affected_turns(&message_id))
+                .unwrap_or(1);
+            let body = if affected > 1 {
+                format!(
+                    "This rolls back this turn and {} later turn{}. You can use Redo afterward.",
+                    affected - 1,
+                    if affected == 2 { "" } else { "s" }
+                )
+            } else {
+                "This rolls back the latest turn. You can use Redo afterward.".to_string()
+            };
+            let card =
+                self.modal_card(&p)
+                    .w(px(460.))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_semibold()
+                            .child("Undo workspace changes?"),
+                    )
+                    .child(div().text_sm().text_color(p.muted).child(body))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(kit::button("undo-cancel").label("Cancel").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.confirm_undo = None;
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                kit::button("undo-ok")
+                                    .danger()
+                                    .label("Undo changes")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(message_id) = this.confirm_undo.take() {
+                                            this.store.update(cx, |s, cx| {
+                                                s.undo_workspace_to(message_id, cx)
+                                            });
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    );
+            return Some(self.centered(scrim("scrim-undo"), card, cx));
+        }
+
         if let Some(id) = self.confirm_delete.clone() {
             let name = self
                 .store
