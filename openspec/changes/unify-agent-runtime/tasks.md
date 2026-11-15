@@ -43,7 +43,8 @@ Conventions used below. They are reference text, not tracked tasks.
 
 ## 2. Move the member build path into runtime (no behaviour change)
 
-- [ ] 2.1 Move the scripted-provider helpers out of runtime `agent/delegation_loop_tests.rs` (`TestHarness`, `build_delegate_handle`, `agent_info`, `DelegateBehavior` and the middleware stubs they need) into a new runtime `test_utils/delegation.rs`, gated on `cfg(any(test, feature = "test-support"))`. `delegation_loop_tests.rs` keeps its tests and imports the helpers. Verify: Run-R `delegation_loop` and Run-T `delegation` pass; the test list equals the 1.3 list.
+- [x] 2.1 Move the scripted-provider helpers out of runtime `agent/delegation_loop_tests.rs` (`TestHarness`, `build_delegate_handle`, `agent_info`, `DelegateBehavior` and the middleware stubs they need) into a new runtime `test_utils/delegation.rs`, gated on `cfg(any(test, feature = "test-support"))`. `delegation_loop_tests.rs` keeps its tests and imports the helpers. Verify: Run-R `delegation_loop` and Run-T `delegation` pass; the test list equals the 1.3 list.
+  - Done: Run-R `delegation_loop` 28 passed; Run-T `delegation` 4 passed; sorted `cargo nextest list` over runtime/top/services equals `baseline/nextest-list.txt`. `test_utils` is already gated by `cfg(any(test, feature = "test-support"))` in `lib.rs`. `TestHarness.exec_ctx` is `pub(crate)` because `ExecutionContext` is.
 - [ ] 2.2 Move the member build code (design D0). Verify:
   - `git show --stat` of the move commit shows renames only;
   - both packages' full nextest runs pass and the test list equals the 1.3 list except for the moved tests' paths (name them below this task);
