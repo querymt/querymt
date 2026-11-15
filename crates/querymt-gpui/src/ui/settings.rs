@@ -11,7 +11,7 @@ use gpui_kit::*;
 use super::mesh::panel;
 use super::{QmtApp, kit};
 use crate::store::{ImageSendMode, ProviderAuth};
-use crate::theme::{ACCENTS, Palette, accent_color, palette};
+use crate::theme::{ACCENTS, Palette, accent_color, accent_dim, palette};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
@@ -64,27 +64,6 @@ const KEYBINDINGS: [(&str, &[&str], &str); 7] = [
     ("Model picker", &["Enter"], "Pick the first match"),
     ("Model picker", &["Esc"], "Close"),
 ];
-
-fn setting_row(
-    title: &'static str,
-    desc: &'static str,
-    control: impl IntoElement,
-    p: &Palette,
-) -> Div {
-    h_flex()
-        .gap_4()
-        .px_4()
-        .py_3()
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_0p5()
-                .child(div().text_sm().font_semibold().child(title))
-                .child(div().text_xs().text_color(p.muted).child(desc)),
-        )
-        .child(control)
-}
 
 /// Rounded card that groups [`simple_row`]s (desktop `.settings-simple-row` list).
 fn settings_card(p: &Palette) -> Div {
@@ -187,6 +166,124 @@ fn disclosure(
         .children(content.map(|c| c.mt(px(5.6))))
 }
 
+/// Title and help above a group of settings that is not a card row.
+fn section_heading(title: &'static str, desc: &'static str, p: &Palette) -> Div {
+    v_flex()
+        .child(
+            div()
+                .text_size(px(13.4))
+                .font_semibold()
+                .text_color(p.text)
+                .child(title),
+        )
+        .child(
+            div()
+                .mt(px(3.2))
+                .text_size(px(12.))
+                .text_color(p.muted)
+                .child(desc),
+        )
+}
+
+const THEME_PREVIEW_H: f32 = 112.;
+
+/// Miniature app window drawn in `pal`: sidebar, header, text lines and a
+/// composer with the accent dot.
+fn theme_mock(pal: &Palette, accent: &str) -> Div {
+    let bar = |w: f32| div().h(px(6.)).w(px(w)).rounded_full().bg(pal.border);
+    // One turn, like the transcript: the user bubble sits right on the accent
+    // tint (`Palette::accent_dim`), the assistant reply is plain text lines.
+    let user_bubble = h_flex().justify_end().child(
+        h_flex()
+            .h(px(12.))
+            .w(px(48.))
+            .rounded(px(4.))
+            .bg(accent_dim(accent, pal.dark)),
+    );
+    h_flex()
+        .size_full()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(pal.border)
+        .bg(pal.bg)
+        .overflow_hidden()
+        .child(
+            v_flex()
+                .h_full()
+                .w(relative(0.26))
+                .flex_none()
+                .gap(px(6.))
+                .p(px(8.))
+                .bg(pal.card)
+                .child(div().size(px(6.)).rounded(px(2.)).bg(pal.border))
+                .child(bar(34.))
+                .child(bar(26.))
+                .child(bar(22.)),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .gap(px(6.))
+                .p(px(8.))
+                .child(user_bubble)
+                .child(bar(72.))
+                .child(bar(52.))
+                .child(div().flex_1())
+                .child(
+                    h_flex()
+                        .h(px(18.))
+                        .justify_end()
+                        .pr(px(5.))
+                        .rounded(px(5.))
+                        .border_1()
+                        .border_color(pal.border)
+                        .bg(pal.surface)
+                        .child(
+                            div()
+                                .size(px(7.))
+                                .rounded_full()
+                                .bg(accent_color(accent, pal.dark)),
+                        ),
+                ),
+        )
+}
+
+/// Preview for a theme mode: light, dark, or (System) light with its right
+/// half shown in dark.
+fn theme_preview(mode: Option<bool>, accent: &str, p: &Palette) -> Div {
+    let (light, dark) = (Palette::light(), Palette::dark());
+    let base = div().relative().w_full().h(px(THEME_PREVIEW_H));
+    match mode {
+        Some(true) => base.child(theme_mock(&dark, accent)),
+        Some(false) => base.child(theme_mock(&light, accent)),
+        None => base.child(theme_mock(&light, accent)).child(
+            // The dark mock is twice the half's width and anchored right,
+            // so only its right half shows.
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right_0()
+                .w(relative(0.5))
+                .overflow_hidden()
+                .rounded_r(px(8.))
+                .border_l_1()
+                .border_color(p.border_strong)
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right_0()
+                        .w(relative(2.))
+                        .child(theme_mock(&dark, accent)),
+                ),
+        ),
+    }
+}
+
 /// [`action_btn`] in the destructive tone (Clear API key, Reset app data).
 fn danger_btn(id: impl Into<ElementId>, enabled: bool, p: &Palette) -> Stateful<Div> {
     let danger = p.danger;
@@ -218,11 +315,7 @@ fn keycap(k: &str, p: &Palette) -> Div {
 }
 
 impl QmtApp {
-    pub(super) fn render_settings(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    pub(super) fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *palette(cx);
         let tab = self.settings_tab;
 
@@ -265,7 +358,7 @@ impl QmtApp {
 
         let body = match tab {
             SettingsTab::General => self.settings_general(&p, cx).into_any_element(),
-            SettingsTab::Appearance => self.settings_appearance(&p, window, cx).into_any_element(),
+            SettingsTab::Appearance => self.settings_appearance(&p, cx).into_any_element(),
             SettingsTab::Keybindings => self.settings_keys(&p).into_any_element(),
             SettingsTab::Providers => self.settings_providers(&p, cx).into_any_element(),
             SettingsTab::Profiles => self.settings_profiles(&p, cx).into_any_element(),
@@ -450,144 +543,203 @@ impl QmtApp {
             .child(danger)
     }
 
-    fn settings_appearance(
-        &self,
-        p: &Palette,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn settings_appearance(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let prefs = self.store.read(cx).prefs.clone();
         let accent = if prefs.accent.is_empty() {
             "orange".to_string()
         } else {
             prefs.accent.clone()
         };
+
+        // ---- Application theme: one preview card per mode.
         let modes = [
-            (None, "System"),
-            (Some(false), "Light"),
-            (Some(true), "Dark"),
+            (None, "theme-system", "System"),
+            (Some(false), "theme-light", "Light"),
+            (Some(true), "theme-dark", "Dark"),
         ];
-        let dark_now = p.dark;
-        let _ = window;
+        let (hover, accent_dim, accent_fg) = (p.card_hover, p.accent_dim, p.accent);
+        let theme_cards =
+            h_flex()
+                .gap(px(12.))
+                .children(modes.into_iter().map(|(mode, id, label)| {
+                    let selected = prefs.dark == mode;
+                    v_flex()
+                        .id(id)
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(8.))
+                        .p(px(8.))
+                        .rounded(px(12.))
+                        .border_1()
+                        .cursor_pointer()
+                        .map(|el| {
+                            if selected {
+                                el.bg(accent_dim).border_color(accent_fg)
+                            } else {
+                                el.bg(p.card)
+                                    .border_color(transparent_black())
+                                    .hover(move |s| s.bg(hover))
+                            }
+                        })
+                        .child(theme_preview(mode, &accent, p))
+                        .child(
+                            div()
+                                .text_center()
+                                .text_size(px(12.5))
+                                .font_semibold()
+                                .text_color(if selected { p.text } else { p.muted })
+                                .child(label),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.store.update(cx, |s, cx| s.set_theme_mode(mode, cx));
+                            this.apply_theme(window, cx);
+                        }))
+                }));
 
-        let theme_seg = kit::segment_bar(p).children(modes.into_iter().enumerate().map(
-            |(ix, (mode, label))| {
-                kit::segment(("theme-mode", ix), prefs.dark == mode, p)
-                    .label(label)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.store.update(cx, |s, cx| s.set_theme_mode(mode, cx));
-                        this.apply_theme(window, cx);
-                    }))
-            },
+        // ---- Accent color
+        let swatches =
+            h_flex()
+                .flex_none()
+                .gap_2()
+                .children(ACCENTS.iter().map(|(id, label, _, _)| {
+                    let id: &'static str = id;
+                    let color = accent_color(id, p.dark);
+                    let selected = accent == id;
+                    div()
+                        .id(id)
+                        .size(px(26.))
+                        .rounded_full()
+                        .p(px(3.))
+                        .border_2()
+                        .border_color(if selected { color } else { transparent_black() })
+                        .cursor_pointer()
+                        .tooltip(move |window, cx| kit::wrap_tip(*label).build(window, cx))
+                        .child(div().size_full().rounded_full().bg(color))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.store.update(cx, |s, cx| {
+                                s.update_prefs(|p| p.accent = id.to_string(), cx)
+                            });
+                            this.apply_theme(window, cx);
+                        }))
+                }));
+        let accent_card = settings_card(p).child(simple_row(
+            "Accent color",
+            "Highlights buttons, prompts and selections. Applies instantly.",
+            swatches,
+            true,
+            p,
         ));
-        let swatches = h_flex()
-            .gap_2()
-            .children(ACCENTS.iter().map(|(id, label, _, _)| {
-                let id: &'static str = id;
-                let color = accent_color(id, dark_now);
-                let selected = accent == id;
-                div()
-                    .id(id)
-                    .size(px(26.))
-                    .rounded_full()
-                    .p(px(3.))
-                    .border_2()
-                    .border_color(if selected { color } else { transparent_black() })
-                    .cursor_pointer()
-                    .tooltip(move |window, cx| kit::wrap_tip(*label).build(window, cx))
-                    .child(div().size_full().rounded_full().bg(color))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.store.update(cx, |s, cx| {
-                            s.update_prefs(|p| p.accent = id.to_string(), cx)
-                        });
-                        this.apply_theme(window, cx);
-                    }))
-            }));
 
-        let smoothing = if prefs.scroll_smoothing.is_empty() {
-            super::smooth_scroll::DEFAULT_PRESET
-        } else {
-            prefs.scroll_smoothing.as_str()
-        };
-        let scroll_seg =
-            kit::segment_bar(p).children(super::smooth_scroll::PRESETS.iter().enumerate().map(
-                |(ix, (id, label, _))| {
-                    let id: &'static str = id;
-                    kit::segment(("scroll-smoothing", ix), smoothing == id, p)
-                        .label(*label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.store.update(cx, |s, cx| {
-                                s.update_prefs(|p| p.scroll_smoothing = id.to_string(), cx)
-                            })
-                        }))
-                },
-            ));
+        // ---- Mouse-wheel scrolling (collapsible: rarely changed).
+        let scroll_open = self.appearance_scroll_open;
+        let scroll = scroll_open.then(|| {
+            let smoothing = if prefs.scroll_smoothing.is_empty() {
+                super::smooth_scroll::DEFAULT_PRESET
+            } else {
+                prefs.scroll_smoothing.as_str()
+            };
+            let scroll_seg =
+                kit::segment_bar(p).children(super::smooth_scroll::PRESETS.iter().enumerate().map(
+                    |(ix, (id, label, _))| {
+                        let id: &'static str = id;
+                        kit::segment(("scroll-smoothing", ix), smoothing == id, p)
+                            .label(*label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.store.update(cx, |s, cx| {
+                                    s.update_prefs(|p| p.scroll_smoothing = id.to_string(), cx)
+                                })
+                            }))
+                    },
+                ));
 
-        let curve = if prefs.scroll_curve.is_empty() {
-            super::smooth_scroll::DEFAULT_CURVE
-        } else {
-            prefs.scroll_curve.as_str()
-        };
-        let curve_seg =
-            kit::segment_bar(p).children(super::smooth_scroll::CURVES.iter().enumerate().map(
-                |(ix, (id, label, _))| {
-                    let id: &'static str = id;
-                    kit::segment(("scroll-curve", ix), curve == id, p)
-                        .label(*label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.store.update(cx, |s, cx| {
-                                s.update_prefs(|p| p.scroll_curve = id.to_string(), cx)
-                            })
-                        }))
-                },
-            ));
+            let curve = if prefs.scroll_curve.is_empty() {
+                super::smooth_scroll::DEFAULT_CURVE
+            } else {
+                prefs.scroll_curve.as_str()
+            };
+            let curve_seg =
+                kit::segment_bar(p).children(super::smooth_scroll::CURVES.iter().enumerate().map(
+                    |(ix, (id, label, _))| {
+                        let id: &'static str = id;
+                        kit::segment(("scroll-curve", ix), curve == id, p)
+                            .label(*label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.store.update(cx, |s, cx| {
+                                    s.update_prefs(|p| p.scroll_curve = id.to_string(), cx)
+                                })
+                            }))
+                    },
+                ));
 
-        let inertia = if prefs.scroll_inertia.is_empty() {
-            super::smooth_scroll::DEFAULT_INERTIA
-        } else {
-            prefs.scroll_inertia.as_str()
-        };
-        let inertia_seg =
-            kit::segment_bar(p).children(super::smooth_scroll::INERTIAS.iter().enumerate().map(
-                |(ix, (id, label, _))| {
-                    let id: &'static str = id;
-                    kit::segment(("scroll-inertia", ix), inertia == id, p)
-                        .label(*label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.store.update(cx, |s, cx| {
-                                s.update_prefs(|p| p.scroll_inertia = id.to_string(), cx)
-                            })
-                        }))
-                },
-            ));
+            let inertia = if prefs.scroll_inertia.is_empty() {
+                super::smooth_scroll::DEFAULT_INERTIA
+            } else {
+                prefs.scroll_inertia.as_str()
+            };
+            let inertia_seg =
+                kit::segment_bar(p).children(super::smooth_scroll::INERTIAS.iter().enumerate().map(
+                    |(ix, (id, label, _))| {
+                        let id: &'static str = id;
+                        kit::segment(("scroll-inertia", ix), inertia == id, p)
+                            .label(*label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.store.update(cx, |s, cx| {
+                                    s.update_prefs(|p| p.scroll_inertia = id.to_string(), cx)
+                                })
+                            }))
+                    },
+                ));
 
-        // Small live preview of the accent on real widgets.
-        let preview = h_flex()
-            .gap_3()
-            .px_4()
-            .py_3()
+            settings_card(p)
+                .child(simple_row(
+                    "Smoothing",
+                    "How long mouse-wheel steps take to settle.",
+                    scroll_seg,
+                    true,
+                    p,
+                ))
+                .child(simple_row(
+                    "Curve",
+                    "Ease out starts at full speed and slows. Ease in-out ramps up first, like browsers.",
+                    curve_seg,
+                    false,
+                    p,
+                ))
+                .child(simple_row(
+                    "Inertia",
+                    "Fast wheel spins scroll further, and the view coasts briefly after you stop.",
+                    inertia_seg,
+                    false,
+                    p,
+                ))
+        });
+        let scroll = disclosure(
+            "appearance-scroll",
+            "Mouse-wheel scrolling",
+            "Smoothing, curve and inertia. Trackpads are unaffected.",
+            scroll_open,
+            cx.listener(|this, _, _, cx| {
+                this.appearance_scroll_open = !this.appearance_scroll_open;
+                cx.notify();
+            }),
+            scroll,
+            p,
+        );
+
+        v_flex()
+            .gap(px(12.8))
             .child(
-                kit::button("pv-primary")
-                    .primary()
-                    .icon(IconName::SendHorizontal)
-                    .label("Start"),
+                v_flex()
+                    .gap(px(8.))
+                    .child(section_heading(
+                        "Application theme",
+                        "Follow the system or pick a fixed theme.",
+                        p,
+                    ))
+                    .child(theme_cards),
             )
-            .child(kit::tone_chip("build", p.accent))
-            .child(kit::count_pill("1/1", "agent connected", p))
-            .child(Switch::new("pv-switch").checked(true));
-
-        panel(p)
-            .child(setting_row("Theme", "Follow the system, or force light or dark.", theme_seg, p))
-            .child(kit::divider(p))
-            .child(setting_row("Accent color", "Highlights buttons, prompts, and selections across the app.", swatches, p))
-            .child(kit::divider(p))
-            .child(preview)
-            .child(kit::divider(p))
-            .child(setting_row("Scroll smoothing", "How long mouse-wheel steps take to settle. Trackpads are unaffected.", scroll_seg, p))
-            .child(kit::divider(p))
-            .child(setting_row("Scroll curve", "Ease out starts at full speed and slows. Ease in-out ramps up first, like browsers.", curve_seg, p))
-            .child(kit::divider(p))
-            .child(setting_row("Scroll inertia", "Fast wheel spins scroll further, and the view coasts briefly after you stop.", inertia_seg, p))
+            .child(accent_card)
+            .child(scroll)
     }
 
     fn settings_keys(&self, p: &Palette) -> impl IntoElement {

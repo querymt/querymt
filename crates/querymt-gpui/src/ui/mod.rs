@@ -92,6 +92,8 @@ pub struct QmtApp {
     general_advanced_open: bool,
     general_danger_open: bool,
     confirm_reset: bool,
+    /// Appearance settings: the mouse-wheel scrolling disclosure.
+    appearance_scroll_open: bool,
     key_input: Entity<InputState>,
     oauth_code: Entity<InputState>,
     session_prompt: Entity<TextareaState>,
@@ -265,6 +267,7 @@ impl QmtApp {
             general_advanced_open: false,
             general_danger_open: false,
             confirm_reset: false,
+            appearance_scroll_open: false,
             key_input,
             oauth_code,
             session_prompt,
@@ -973,7 +976,7 @@ impl Render for QmtApp {
             Page::Sessions => self.render_sessions(cx).into_any_element(),
             Page::Agents => self.render_agents(cx).into_any_element(),
             Page::Mesh => self.render_mesh(cx).into_any_element(),
-            Page::Settings => self.render_settings(window, cx).into_any_element(),
+            Page::Settings => self.render_settings(cx).into_any_element(),
             Page::Inbox => self.render_inbox(window, cx).into_any_element(),
             Page::Session => self.render_session(window, cx).into_any_element(),
         };
