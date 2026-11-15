@@ -124,9 +124,13 @@ pub trait ToolContext: Send + Sync {
         }
     }
 
-    /// Get access to the agent registry for delegation tools
-    fn agent_registry(&self) -> Option<Arc<dyn crate::delegation::AgentRegistry>> {
-        None
+    /// Typed extension slots for host-provided services that tools in this
+    /// layer must not name (for example the agent registry read by `delegate`).
+    ///
+    /// The default is an empty set.
+    fn extensions(&self) -> &http::Extensions {
+        static EMPTY: std::sync::OnceLock<http::Extensions> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(http::Extensions::new)
     }
 
     /// Managed worktree workspace service, when the runtime has one.

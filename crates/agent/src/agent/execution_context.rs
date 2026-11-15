@@ -314,9 +314,9 @@ impl ExecutionContext {
         let mut ctx = AgentToolContext::new(
             self.session_id.clone(),
             self.cwd().map(|p| p.to_path_buf()),
-            Some(agent_registry),
             elicitation_tx,
         )
+        .with_extension(agent_registry)
         .with_cancellation_token(self.cancellation_token.clone());
 
         if let Some(gate) = self.runtime.mutation_gate.get() {

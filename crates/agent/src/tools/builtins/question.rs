@@ -189,7 +189,7 @@ mod tests {
     /// the headers the user would have been shown.
     async fn shown_headers(args: Value) -> Vec<String> {
         let (tx, mut rx) = mpsc::channel(4);
-        let context = AgentToolContext::new("test".to_string(), None, None, Some(tx));
+        let context = AgentToolContext::new("test".to_string(), None, Some(tx));
         let responder = tokio::spawn(async move {
             let mut headers = Vec::new();
             while let Some(request) = rx.recv().await {
@@ -269,7 +269,7 @@ mod tests {
             "options": [{"label": "A label that is quite long indeed", "description": "d"}],
         }]});
         let (tx, mut rx) = mpsc::channel(1);
-        let context = AgentToolContext::new("test".to_string(), None, None, Some(tx));
+        let context = AgentToolContext::new("test".to_string(), None, Some(tx));
         let responder = tokio::spawn(async move {
             let request = rx.recv().await.unwrap();
             let seen = (

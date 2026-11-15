@@ -115,9 +115,13 @@ impl ToolTrait for DelegateTool {
         }
 
         // Get agent registry from context to validate target agent exists
-        let registry = context.agent_registry().ok_or_else(|| {
-            ToolError::ProviderError("No agent registry available in context".into())
-        })?;
+        let registry = context
+            .extensions()
+            .get::<std::sync::Arc<dyn crate::delegation::AgentRegistry>>()
+            .cloned()
+            .ok_or_else(|| {
+                ToolError::ProviderError("No agent registry available in context".into())
+            })?;
 
         // Validate target agent exists and check capability requirements
         let target_info = registry
@@ -235,12 +239,14 @@ mod tests {
     }
 
     struct TestContext {
-        registry: Option<Arc<dyn crate::delegation::AgentRegistry>>,
+        extensions: http::Extensions,
     }
 
     impl TestContext {
         fn without_registry() -> Self {
-            Self { registry: None }
+            Self {
+                extensions: http::Extensions::new(),
+            }
         }
 
         fn with_registry() -> Self {
@@ -257,9 +263,10 @@ mod tests {
                 },
                 StubAgentHandle::new(),
             );
-            Self {
-                registry: Some(Arc::new(registry)),
-            }
+            let registry: Arc<dyn crate::delegation::AgentRegistry> = Arc::new(registry);
+            let mut extensions = http::Extensions::new();
+            extensions.insert(registry);
+            Self { extensions }
         }
     }
 
@@ -273,8 +280,8 @@ mod tests {
             None
         }
 
-        fn agent_registry(&self) -> Option<Arc<dyn crate::delegation::AgentRegistry>> {
-            self.registry.clone()
+        fn extensions(&self) -> &http::Extensions {
+            &self.extensions
         }
 
         async fn record_progress(
