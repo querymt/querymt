@@ -619,6 +619,77 @@ fn is_read(call: &ToolCall) -> bool {
     READ_FILE_TOOLS.contains(&concrete_tool_name(call).as_str())
 }
 
+/// URL fetches (`browse`, `web_fetch`, or the ACP `fetch` kind).
+fn is_fetch(call: &ToolCall) -> bool {
+    strip_run(&call.kind) == "fetch"
+        || WEB_TOOLS.contains(&concrete_tool_name(call).as_str())
+        || WEB_TOOLS.contains(&normalized_tool_name(call).as_str())
+}
+
+/// The URL a fetch asked for.
+fn fetch_url(call: &ToolCall) -> Option<String> {
+    let url = call.input.as_ref()?.get("url")?.as_str()?.trim();
+    (!url.is_empty()).then(|| url.to_string())
+}
+
+/// Byte ranges of `http(s)://` links in `text`, without trailing punctuation
+/// or the brackets and quotes around them (markdown `[a](url)`, `<url>`).
+fn link_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(off) = text[at..].find("http") {
+        let start = at + off;
+        let rest = &text[start..];
+        let scheme = ["https://", "http://"]
+            .into_iter()
+            .find(|s| rest.starts_with(s))
+            .map(str::len);
+        let glued = text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+        let Some(scheme) = scheme.filter(|_| !glued) else {
+            at = start + 4;
+            continue;
+        };
+        let len = rest
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '`' | ')' | ']' | '}')
+            })
+            .unwrap_or(rest.len());
+        let mut end = start + len;
+        while end > start + scheme && text[..end].ends_with(['.', ',', ';', ':', '!', '?']) {
+            end -= 1;
+        }
+        if end > start + scheme {
+            out.push(start..end);
+        }
+        at = start + len.max(4);
+    }
+    out
+}
+
+/// `text` with its links underlined in the accent color, opening on click.
+fn linked_text(id: impl Into<ElementId>, text: String, p: &Palette) -> InteractiveText {
+    let ranges = link_ranges(&text);
+    let urls: Vec<String> = ranges.iter().map(|r| text[r.clone()].to_string()).collect();
+    let link = HighlightStyle {
+        color: Some(p.accent),
+        underline: Some(UnderlineStyle {
+            thickness: px(1.),
+            color: Some(p.accent.opacity(0.6)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let styled = StyledText::new(text).with_highlights(ranges.iter().map(|r| (r.clone(), link)));
+    InteractiveText::new(id, styled).on_click(ranges, move |ix, _, cx| {
+        if let Some(url) = urls.get(ix) {
+            cx.open_url(url);
+        }
+    })
+}
+
 fn clipped(text: &str, max: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= max {
@@ -911,11 +982,11 @@ fn render_diff_file(
 /// Diffs, file reads and shell output open as one card attached to the tool
 /// row (desktop `session-tool-block-attached`); other tools use the indented well.
 fn attaches_to_header(call: &ToolCall) -> bool {
-    !call.diffs.is_empty() || is_shell(call) || is_read(call)
+    !call.diffs.is_empty() || is_shell(call) || is_read(call) || is_fetch(call)
 }
 
-/// Borderless output block inside an attached tool card.
-fn flat_block(text: String, p: &Palette) -> Div {
+/// Frame of a borderless output block inside an attached tool card.
+fn flat_frame(p: &Palette) -> Div {
     div()
         .w_full()
         .px_3()
@@ -925,7 +996,46 @@ fn flat_block(text: String, p: &Palette) -> Div {
         .text_xs()
         .line_height(px(TOOL_LINE_H))
         .text_color(p.muted)
-        .child(text)
+}
+
+/// Borderless output block inside an attached tool card.
+fn flat_block(text: String, p: &Palette) -> Div {
+    flat_frame(p).child(text)
+}
+
+/// First line of an attached card (the shell command, the fetched URL):
+/// a dim prefix, the full value, and the desktop's thin rule
+/// (`.session-tool-terminal-command-line::after`) under it.
+fn card_heading(prefix: &'static str, value: impl IntoElement, p: &Palette) -> Div {
+    v_flex()
+        .w_full()
+        .child(
+            h_flex()
+                .items_start()
+                .gap_2()
+                .px_3()
+                .pt_2()
+                .bg(p.bg)
+                .font_family(kit::MONO)
+                .text_xs()
+                .child(div().flex_none().text_color(p.dim).child(prefix))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_semibold()
+                        .text_color(p.text.opacity(0.88))
+                        .child(value),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .bg(p.bg)
+                .px(px(17.6))
+                .pt(px(6.4))
+                .child(div().w_full().h(px(1.)).bg(p.dim.opacity(0.35))),
+        )
 }
 
 /// Fixed-height scroll block of an attached card, with always-visible
@@ -1108,37 +1218,7 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
         // The header shows the command truncated; the full one heads the output.
         let cmd = call.command().unwrap_or_default();
         return body
-            .when(!cmd.is_empty(), |el| {
-                el.child(
-                    h_flex()
-                        .items_start()
-                        .gap_2()
-                        .px_3()
-                        .pt_2()
-                        .bg(p.bg)
-                        .font_family(kit::MONO)
-                        .text_xs()
-                        .child(div().flex_none().text_color(p.dim).child("$"))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .font_semibold()
-                                .text_color(p.text.opacity(0.88))
-                                .child(cmd),
-                        ),
-                )
-                // Desktop `.session-tool-terminal-command-line::after`: a thin
-                // rule between the command and its output.
-                .child(
-                    div()
-                        .w_full()
-                        .bg(p.bg)
-                        .px(px(17.6))
-                        .pt(px(6.4))
-                        .child(div().w_full().h(px(1.)).bg(p.dim.opacity(0.35))),
-                )
-            })
+            .when(!cmd.is_empty(), |el| el.child(card_heading("$", cmd, p)))
             .child(if output.trim().is_empty() {
                 flat_note(
                     if call.running() {
@@ -1161,6 +1241,39 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
                 )
                 .into_any_element()
             });
+    }
+    if is_fetch(call) {
+        // The URL is the (clickable) row header; the parameters only repeat
+        // it, so the card shows just the page, with clickable links.
+        let id = &call.id;
+        return body.child(if output.trim().is_empty() {
+            flat_note(
+                if call.running() {
+                    "Fetching…"
+                } else {
+                    "No content."
+                },
+                p,
+            )
+            .into_any_element()
+        } else {
+            let text = clipped(&output, READ_LINES);
+            let block = flat_frame(p)
+                .when(call.failed(), |el| el.text_color(p.danger))
+                .child(linked_text(
+                    SharedString::from(format!("fetch-out-{id}")),
+                    text,
+                    p,
+                ));
+            scroll_area(
+                format!("fetch-scroll-{id}"),
+                READ_BLOCK_MAX_H,
+                ScrollbarAxis::Vertical,
+                block,
+                rc,
+            )
+            .into_any_element()
+        });
     }
     if output.trim().is_empty() {
         return body.child(flat_note(
@@ -1313,15 +1426,37 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
                 .text_color(p.text.opacity(0.88))
                 .child(tool_label(call)),
         )
-        .child(
-            div()
+        .child(match fetch_url(call).filter(|_| is_fetch(call)) {
+            // A fetch's URL opens in the browser; the rest of the row toggles.
+            Some(url) => h_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("fetch-link-{}", call.id)))
+                        .min_w_0()
+                        .truncate()
+                        .font_family(kit::MONO)
+                        .text_color(p.dim)
+                        .cursor_pointer()
+                        .hover(|s| s.underline())
+                        .child(compact(&url))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            cx.open_url(&url);
+                        }),
+                )
+                .into_any_element(),
+            None => div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
                 .font_family(kit::MONO)
                 .text_color(p.dim)
-                .child(compact(&tool_preview(call, &rc.cwd))),
-        )
+                .child(compact(&tool_preview(call, &rc.cwd)))
+                .into_any_element(),
+        })
         .when(adds > 0 || dels > 0, |el| {
             el.child(
                 h_flex()
@@ -4077,8 +4212,25 @@ mod tests {
     // Not `super::*`: the gpui glob brings a `test` macro that shadows `#[test]`.
     use super::{
         SCROLLBAR_FADE_IN_MS, SCROLLBAR_FADE_OUT_MS, ScrollbarFade, humanize_tool_name, is_read,
-        is_shell, tool_label, workspace_relative,
+        is_shell, link_ranges, tool_label, workspace_relative,
     };
+
+    #[test]
+    fn link_ranges_find_urls_without_markup() {
+        let text = "see [llms.txt](https://a.com/llms.txt). Or <http://b.org/x?y=1>, \
+                    \"https://c.io/p\" and https://d.dev/page.";
+        let found: Vec<&str> = link_ranges(text).into_iter().map(|r| &text[r]).collect();
+        assert_eq!(
+            found,
+            [
+                "https://a.com/llms.txt",
+                "http://b.org/x?y=1",
+                "https://c.io/p",
+                "https://d.dev/page"
+            ]
+        );
+        assert!(link_ranges("https:// nothing, xhttps://glued.com").is_empty());
+    }
 
     #[test]
     fn scrollbar_fade_eases_and_reverses_midway() {
