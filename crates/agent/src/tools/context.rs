@@ -155,7 +155,7 @@ pub trait ToolContext: Send + Sync {
     /// Returns `Some` when connected to a client that supports workspace queries
     /// (e.g., VS Code extension). Returns `None` in CLI mode or when the client
     /// does not advertise workspace query support.
-    fn workspace_query_bridge(&self) -> Option<&crate::acp::client_bridge::ClientBridgeSender> {
+    fn workspace_query_bridge(&self) -> Option<&dyn crate::workspace_query::WorkspaceQueryBridge> {
         None
     }
 

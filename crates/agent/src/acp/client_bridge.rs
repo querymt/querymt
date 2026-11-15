@@ -167,6 +167,16 @@ pub struct ClientBridgeSender {
     connection_state: Option<Arc<ClientBridgeConnectionState>>,
 }
 
+#[async_trait::async_trait]
+impl crate::workspace_query::WorkspaceQueryBridge for ClientBridgeSender {
+    async fn workspace_query(
+        &self,
+        query: crate::workspace_query::WorkspaceQueryRequest,
+    ) -> Result<crate::workspace_query::WorkspaceQueryResponse, Error> {
+        ClientBridgeSender::workspace_query(self, query).await
+    }
+}
+
 impl ClientBridgeSender {
     /// Create a new bridge sender wrapping the channel.
     ///

@@ -201,7 +201,7 @@ impl ToolTrait for LanguageQueryTool {
     ) -> Result<Vec<ToolResultPart>, ToolError> {
         // Check if workspace query bridge is available
         let bridge = match context.workspace_query_bridge() {
-            Some(bridge) => bridge.clone(),
+            Some(bridge) => bridge,
             None => {
                 return Ok(vec![ToolResultPart::text(
                     "language_query is not available in this mode. \

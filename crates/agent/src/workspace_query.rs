@@ -23,6 +23,7 @@
 //!   → tool formats result as string for LLM
 //! ```
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -147,6 +148,31 @@ pub enum WorkspaceQueryResponse {
     Locations { locations: Vec<LocationInfo> },
     Symbols { symbols: Vec<SymbolInfo> },
     Hover { contents: String },
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  Bridge trait
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Channel to the connected editor client that answers workspace language
+/// queries.
+///
+/// `ToolContext` hands this to the `language_query` tool instead of a concrete
+/// transport type, so the tool layer does not depend on the ACP bridge. The
+/// runtime implements it for `ClientBridgeSender`.
+#[async_trait]
+pub trait WorkspaceQueryBridge: Send + Sync {
+    /// Send `query` to the client and wait for its response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bridge channel is closed, the client
+    /// disconnects before responding, or the client does not support
+    /// workspace queries.
+    async fn workspace_query(
+        &self,
+        query: WorkspaceQueryRequest,
+    ) -> Result<WorkspaceQueryResponse, querymt_agent_core::protocol::Error>;
 }
 
 // ══════════════════════════════════════════════════════════════════════════

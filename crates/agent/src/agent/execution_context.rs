@@ -330,7 +330,7 @@ impl ExecutionContext {
             ctx.with_event_sink(sink.clone());
         }
         if let Some(ref bridge) = self.workspace_query_bridge {
-            ctx = ctx.with_workspace_query_bridge(bridge.clone());
+            ctx = ctx.with_workspace_query_bridge(Arc::new(bridge.clone()));
         }
 
         ctx

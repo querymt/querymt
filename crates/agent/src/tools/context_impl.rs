@@ -76,7 +76,7 @@ pub struct AgentToolContext {
     agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry>>,
     elicitation_tx: Option<mpsc::Sender<ElicitationRequest>>,
     cancellation_token: CancellationToken,
-    workspace_query_bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
+    workspace_query_bridge: Option<Arc<dyn crate::workspace_query::WorkspaceQueryBridge>>,
     knowledge_store: Option<Arc<dyn KnowledgeStore>>,
     scope_policy: Arc<dyn ScopePolicy>,
     event_sink: Option<Arc<EventSink>>,
@@ -167,7 +167,7 @@ impl AgentToolContext {
     /// (diagnostics, references, definitions, etc.) through this bridge.
     pub fn with_workspace_query_bridge(
         mut self,
-        bridge: crate::acp::client_bridge::ClientBridgeSender,
+        bridge: Arc<dyn crate::workspace_query::WorkspaceQueryBridge>,
     ) -> Self {
         self.workspace_query_bridge = Some(bridge);
         self
@@ -327,8 +327,8 @@ impl ToolContext for AgentToolContext {
         }
     }
 
-    fn workspace_query_bridge(&self) -> Option<&crate::acp::client_bridge::ClientBridgeSender> {
-        self.workspace_query_bridge.as_ref()
+    fn workspace_query_bridge(&self) -> Option<&dyn crate::workspace_query::WorkspaceQueryBridge> {
+        self.workspace_query_bridge.as_deref()
     }
 
     fn cancellation_token(&self) -> CancellationToken {
