@@ -11,6 +11,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.config/nextest.toml'
+      - '.github/actions/rust-setup/**'
       - '.github/workflows/test-querymt-remote.yml'
   pull_request:
     paths:
@@ -21,26 +22,14 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.config/nextest.toml'
+      - '.github/actions/rust-setup/**'
       - '.github/workflows/test-querymt-remote.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  # Job 1: Check formatting (fast, fails first)
-  format:
-    name: Check formatting
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-  # Job 2: Run Clippy (parallel with format)
   # FIXME: make sure that clippy passes
   #clippy:
   #  name: Clippy lints
@@ -66,19 +55,16 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
-    needs: [format]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo dependencies
-        uses: swatinem/rust-cache@v2
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
         with:
-          key: querymt-remote-test
+          components: llvm-tools-preview
+          cache-key: querymt-remote-test
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov

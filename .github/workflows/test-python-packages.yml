@@ -23,6 +23,10 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/test-python-packages.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_TARGET_DIR: target/python-ci

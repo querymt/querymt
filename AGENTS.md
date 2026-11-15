@@ -50,8 +50,8 @@
   (config in `.config/hakari.toml`); it unifies third-party features across the agent
   stack so switching between the aliases below does not recompile dependencies. After
   changing dependencies or features, run `cargo hakari generate` and
-  `cargo hakari manage-deps` (`cargo install cargo-hakari --locked`); CI runs
-  `cargo hakari verify`. Provider crates and `querymt` must not depend on it (wasm32).
+  `cargo hakari manage-deps` (`cargo install cargo-hakari --locked`); the `Lint`
+  workflow runs `cargo hakari verify` on every pull request. Provider crates and `querymt` must not depend on it (wasm32).
 - `querymt-agent` has a dev-dependency on `querymt-agent-runtime` with `test-support`
   (122 references in 22 facade files, mostly `runtime_tests/` and `acp/websocket_tests.rs`,
   which sit in the facade because they need top-layer types). That is why the runtime is
@@ -97,6 +97,13 @@
   11 traits), against 10-16 s once it has its own file. Keep new `dyn` traits out of
   files with other frequently edited code, and do not add code above them in their file;
   editing the trait itself still rebuilds everything above it.
+- CI (`.github/workflows/test-agent.yml`) tests only the agent packages a change
+  reaches: `scripts/ci-agent-affected.sh` maps changed paths to packages through the
+  dependency edges (sqlite is a dev-dependency of services and runtime, so a sqlite
+  change retests both). Mirror that locally. Standalone builds run with the
+  workspace-hack disabled (`cargo hakari disable`, never commit the result) so a
+  package that forgets a feature it needs fails. `querymt-mobile-ffi` is not built
+  in CI yet (deferred while it is under heavy development).
 - Expand validation to affected consumers and feature combinations. Consult the
   relevant `.github/workflows/` file for CI commands/features and `.config/nextest.toml`
   for test timeouts.
@@ -111,7 +118,7 @@
 - UI implementation and testing belong to the separate `querymt-desktop` repository.
   Report required UI follow-up rather than expanding backend work into that repo.
 - For backend-only checks with `dashboard` enabled, use the `QMT_UI_DIST` fixture
-  in `.github/workflows/test-agent.yml` instead of rebuilding the frontend.
+  from `.github/actions/rust-setup/action.yml` instead of rebuilding the frontend.
 
 ## Code Conventions
 

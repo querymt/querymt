@@ -14,7 +14,7 @@ context: |
   Use `cargo tree -i <package> --workspace --depth 1` to find downstream packages before choosing validation scope.
 
   Tests:
-  - Run tests with cargo-nextest, not `cargo test`. CI runs `cargo llvm-cov nextest`, and .config/nextest.toml timeouts only apply under nextest.
+  - Run tests with cargo-nextest, not `cargo test`. CI runs `cargo nextest run --profile ci` on an llvm-cov instrumented build (plus `cargo test --doc`, since nextest skips doctests), and .config/nextest.toml timeouts only apply under nextest.
       cargo nextest run -p <package> [--features <f>] [<name-substring>]
       cargo nextest run -p <package> -E 'test(/regex/)'
     Translations from libtest: `-- --ignored` -> `--run-ignored only`, `-- --nocapture` -> `--no-capture`.
@@ -26,7 +26,7 @@ context: |
 
   Features (mirror .github/workflows):
   - querymt-agent-runtime CI features: remote,oauth,plugin-loaders,api (plus test-support for downstream tests). querymt-agent forwards its features to it. querymt-agent CI features: dashboard,oauth,zbus-secret-service,systemd-credentials,remote. Mesh code needs remote. The zbus/systemd features only take effect on Linux, so those paths stay unverified on macOS; say so.
-  - dashboard builds need QMT_UI_DIST pointing at the minimal fixture from test-agent.yml, outside target/. Without it build.rs downloads the UI from GitHub.
+  - dashboard builds need QMT_UI_DIST pointing at the minimal fixture from .github/actions/rust-setup/action.yml, outside target/. Without it build.rs downloads the UI from GitHub.
   - querymt and querymt-remote CI use --all-features.
   - Providers default to the extism (wasm plugin) feature. Test them with --no-default-features --features native. qmt-mrs tests download models; skip them unless the change targets mrs.
   - Python crates need PYO3_PYTHON pointing at Python 3.10 or newer (abi3-py310).

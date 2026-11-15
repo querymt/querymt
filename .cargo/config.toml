@@ -1,0 +1,30 @@
+# Standard local commands for the agent packages. They use the same package and
+# feature sets as CI (.github/workflows/test-agent.yml: `features` and
+# `runtime_features`), so local builds share artifacts with each other and
+# with CI's flags. Keep the feature lists below in sync with that file.
+#
+#   AGENT_FEATURES   = dashboard,oauth,zbus-secret-service,systemd-credentials,remote
+#   RUNTIME_FEATURES = remote,oauth,plugin-loaders,api
+#
+# Aliases cannot set environment variables: `dashboard` builds (t-agent,
+# cl-agent) still need QMT_UI_DIST pointing at the minimal UI fixture from
+# test-agent.yml. Extra arguments are appended, for example
+#   cargo t-runtime -E 'test(/compaction/)'
+#   cargo t-agent --no-run
+
+[alias]
+t-agent = "nextest run -p querymt-agent --features dashboard,oauth,zbus-secret-service,systemd-credentials,remote"
+t-runtime = "nextest run -p querymt-agent-runtime --features remote,oauth,plugin-loaders,api"
+t-services = "nextest run -p querymt-agent-services"
+t-sqlite = "nextest run -p querymt-agent-sqlite"
+t-knowledge = "nextest run -p querymt-agent-knowledge"
+t-index = "nextest run -p querymt-agent-index"
+t-core = "nextest run -p querymt-agent-core"
+
+cl-agent = "clippy -p querymt-agent --all-targets --features dashboard,oauth,zbus-secret-service,systemd-credentials,remote -- -D warnings"
+cl-runtime = "clippy -p querymt-agent-runtime --all-targets --features remote,oauth,plugin-loaders,api -- -D warnings"
+cl-services = "clippy -p querymt-agent-services --all-targets -- -D warnings"
+cl-sqlite = "clippy -p querymt-agent-sqlite --all-targets -- -D warnings"
+cl-knowledge = "clippy -p querymt-agent-knowledge --all-targets -- -D warnings"
+cl-index = "clippy -p querymt-agent-index --all-targets -- -D warnings"
+cl-core = "clippy -p querymt-agent-core --all-targets -- -D warnings"
