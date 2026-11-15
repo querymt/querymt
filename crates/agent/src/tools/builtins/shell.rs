@@ -399,8 +399,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn shell_with_pending_identity(cancelled: bool) {
-        use crate::agent::utils::genai;
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use crate::tools::trace::tool_scope;
+        use crate::tools::trace_support::genai_trace::{assert_private, attr, capture};
         use std::time::Duration;
         use tracing::Instrument;
 
@@ -448,7 +448,7 @@ mod tests {
                     gen_ai.tool.name = "shell"
                 );
                 let mut future = Box::pin(
-                    genai::tool_scope(
+                    tool_scope(
                         span.clone(),
                         tool.call(json!({"command": "sh", "args": ["-c", command]}), &context),
                     )
@@ -519,8 +519,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn genai_shell_cancel_and_drop_retain_identity_without_exit_or_scope_leaks() {
-        use crate::agent::utils::genai;
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use crate::tools::trace::tool_scope;
+        use crate::tools::trace_support::genai_trace::{assert_private, attr, capture};
         use std::time::Duration;
         use tracing::Instrument;
 
@@ -541,9 +541,8 @@ mod tests {
                     gen_ai.operation.name = "execute_tool",
                     gen_ai.tool.name = "shell"
                 );
-                let mut future = Box::pin(
-                    genai::tool_scope(span.clone(), tool.call(args, &context)).instrument(span),
-                );
+                let mut future =
+                    Box::pin(tool_scope(span.clone(), tool.call(args, &context)).instrument(span));
                 let pid = tokio::select! {
                     result = &mut future => panic!("shell finished prematurely: {result:?}"),
                     pid = wait_for_pid(&pid_file) => pid,

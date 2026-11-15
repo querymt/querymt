@@ -7,6 +7,8 @@ pub mod read_scope;
 pub mod registry;
 pub mod tool_set;
 pub(crate) mod trace;
+#[cfg(test)]
+pub(crate) mod trace_support;
 pub mod validation;
 
 pub use builtins::{
