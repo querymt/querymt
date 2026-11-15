@@ -979,8 +979,7 @@ fn hunk_marker(d: &Diff, first: bool, p: &Palette) -> AnyElement {
         .px_3()
         .py_1()
         .when(!first, |el| {
-            el.mt_1()
-                .border_t_1()
+            el.border_t_1()
                 .border_dashed()
                 .border_color(p.border_strong)
         })
@@ -1042,12 +1041,14 @@ fn render_diff_file(
                             .text_color(p.success)
                             .child(format!("+{adds}")),
                     )
-                    .child(
-                        div()
-                            .font_semibold()
-                            .text_color(p.danger)
-                            .child(format!("-{dels}")),
-                    ),
+                    .when(dels > 0, |el| {
+                        el.child(
+                            div()
+                                .font_semibold()
+                                .text_color(p.danger)
+                                .child(format!("-{dels}")),
+                        )
+                    }),
             )
         })
         // A fixed-height block that scrolls vertically only, flush to the card's bottom edge.
@@ -1386,7 +1387,6 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
     let output = call.pretty_output();
     let body = v_flex().w_full();
     if !call.diffs.is_empty() {
-        let shown_path = tool_preview(call, &rc.cwd);
         // Group hunks by file, keeping first-seen order.
         let mut files: Vec<(&str, Vec<&Diff>)> = Vec::new();
         for d in &call.diffs {
@@ -1395,8 +1395,8 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
                 None => files.push((d.path.as_str(), vec![d])),
             }
         }
-        let with_header =
-            files.len() > 1 || files.first().is_some_and(|(path, _)| *path != shown_path);
+        // A single edited file is already named by the tool row.
+        let with_header = files.len() > 1;
         return body
             .children(files.iter().enumerate().map(|(ix, (path, hunks))| {
                 render_diff_file(
@@ -2148,7 +2148,9 @@ fn turn_actions(
                         el.child(div().text_color(p.muted).child(files.to_string()))
                     })
                     .child(div().text_color(p.success).child(format!("+{adds}")))
-                    .child(div().text_color(p.danger).child(format!("-{dels}"))),
+                    .when(dels > 0, |el| {
+                        el.child(div().text_color(p.danger).child(format!("-{dels}")))
+                    }),
             )
         })
         .into_any_element()
