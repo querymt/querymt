@@ -10,7 +10,7 @@ use gpui_kit::*;
 
 use super::mesh::panel;
 use super::{QmtApp, kit};
-use crate::store::{ImageSendMode, ProviderAuth};
+use crate::store::{ImageSendMode, ProviderAuth, SendShortcut};
 use crate::theme::{ACCENTS, Palette, accent_color, accent_dim, palette};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,16 +53,6 @@ const TABS: [(SettingsTab, IconName, &str, &str); 5] = [
         "Profiles",
         "Agent profiles on the server",
     ),
-];
-
-const KEYBINDINGS: [(&str, &[&str], &str); 7] = [
-    ("Global", &["Ctrl", "B"], "Toggle sidebar"),
-    ("Global", &["Ctrl", "Q"], "Quit"),
-    ("Global", &["Esc"], "Close dialog or popover"),
-    ("Composer", &["Enter"], "Start session"),
-    ("Composer", &["Shift", "Enter"], "New line in prompt"),
-    ("Model picker", &["Enter"], "Pick the first match"),
-    ("Model picker", &["Esc"], "Close"),
 ];
 
 /// Rounded card that groups [`simple_row`]s (desktop `.settings-simple-row` list).
@@ -299,6 +289,9 @@ fn danger_btn(id: impl Into<ElementId>, enabled: bool, p: &Palette) -> Stateful<
         })
 }
 
+/// Key combination and what it does, for the Keybindings tab.
+type Binding = (Vec<&'static str>, &'static str);
+
 fn keycap(k: &str, p: &Palette) -> Div {
     div()
         .px_1p5()
@@ -359,7 +352,7 @@ impl QmtApp {
         let body = match tab {
             SettingsTab::General => self.settings_general(&p, cx).into_any_element(),
             SettingsTab::Appearance => self.settings_appearance(&p, cx).into_any_element(),
-            SettingsTab::Keybindings => self.settings_keys(&p).into_any_element(),
+            SettingsTab::Keybindings => self.settings_keys(&p, cx).into_any_element(),
             SettingsTab::Providers => self.settings_providers(&p, cx).into_any_element(),
             SettingsTab::Profiles => self.settings_profiles(&p, cx).into_any_element(),
         };
@@ -742,39 +735,133 @@ impl QmtApp {
             .child(scroll)
     }
 
-    fn settings_keys(&self, p: &Palette) -> impl IntoElement {
-        let mut out = v_flex().gap_3();
-        for scope in ["Global", "Composer", "Model picker"] {
-            out = out.child(
+    fn settings_keys(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let mac = cx.platform_info().is_mac();
+        let m: &'static str = if mac { "Cmd" } else { "Ctrl" };
+        let send = self.store.read(cx).prefs.send_shortcut;
+        let send_keys: Vec<&'static str> = match send {
+            SendShortcut::Enter => vec!["Enter"],
+            SendShortcut::ShiftEnter => vec!["Shift", "Enter"],
+            SendShortcut::SecondaryEnter => vec![m, "Enter"],
+        };
+        let newline_keys: Vec<&'static str> = match send {
+            SendShortcut::Enter => vec!["Shift", "Enter"],
+            _ => vec!["Enter"],
+        };
+        let groups: [(&str, Vec<Binding>); 3] = [
+            (
+                "Global",
+                vec![
+                    (vec![m, "N"], "New session"),
+                    (vec![m, "P"], "Toggle command palette"),
+                    (vec![m, "B"], "Toggle sidebar"),
+                    (vec![m, "1-9"], "Open sidebar session 1-9"),
+                    (vec![m, "0"], "Open sidebar session 10"),
+                    (vec!["Esc"], "Close dialog or popover"),
+                    (vec![m, "Q"], "Quit"),
+                ],
+            ),
+            (
+                "Session view",
+                vec![
+                    (vec!["Esc", "Esc"], "Cancel the running agent"),
+                    (vec![m, "Z"], "Undo workspace to latest turn"),
+                    (vec![m, "Shift", "Z"], "Redo workspace change"),
+                ],
+            ),
+            (
+                "Composer",
+                vec![
+                    (vec![m, "M"], "Open model quick picker"),
+                    (vec![m, "T"], "Cycle reasoning option"),
+                    (vec!["Tab"], "Cycle mode option"),
+                    (send_keys, "Send prompt"),
+                    (newline_keys, "New line in prompt"),
+                ],
+            ),
+        ];
+        let (subtle_border, _) = subtle(p);
+        let row = |first: bool| {
+            h_flex()
+                .gap_4()
+                .px(px(14.4))
+                .py_2p5()
+                .when(!first, |el| el.border_t_1().border_color(subtle_border))
+        };
+        let label = |text: &'static str| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .font_semibold()
+                .text_color(p.text)
+                .child(text)
+        };
+        let keys = |keys: &[&str]| {
+            h_flex()
+                .flex_none()
+                .gap_1()
+                .text_xs()
+                .text_color(p.dim)
+                .children(keys.iter().enumerate().flat_map(|(ix, k)| {
+                    let plus = (ix > 0).then(|| div().child("+").into_any_element());
+                    plus.into_iter()
+                        .chain(std::iter::once(keycap(k, p).into_any_element()))
+                }))
+        };
+
+        let send_options = [
+            (SendShortcut::Enter, "send-enter", "Enter"),
+            (SendShortcut::ShiftEnter, "send-shift-enter", "Shift+Enter"),
+            (
+                SendShortcut::SecondaryEnter,
+                "send-secondary-enter",
+                if mac { "Cmd+Enter" } else { "Ctrl+Enter" },
+            ),
+        ];
+        let mut send_picker = Some(kit::segment_bar(p).children(send_options.into_iter().map(
+            |(value, id, text)| {
+                kit::segment(id, send == value, p)
+                    .label(text)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .update(cx, |s, cx| s.update_prefs(|p| p.send_shortcut = value, cx))
+                    }))
+            },
+        )));
+
+        v_flex()
+            .gap(px(12.8))
+            .children(groups.into_iter().map(|(title, entries)| {
+                let composer = title == "Composer";
                 v_flex()
                     .gap_1p5()
                     .child(
                         div()
                             .px_1()
-                            .text_xs()
+                            .text_size(px(13.4))
                             .font_semibold()
-                            .text_color(p.dim)
-                            .child(scope),
+                            .text_color(p.text)
+                            .child(title),
                     )
-                    .child(panel(p).children(
-                        KEYBINDINGS.iter().filter(|k| k.0 == scope).enumerate().map(
-                            |(ix, (_, keys, label))| {
-                                h_flex()
-                                    .px_4()
-                                    .py_2p5()
-                                    .when(ix > 0, |el| el.border_t_1().border_color(p.border))
-                                    .child(div().flex_1().text_sm().child(*label))
-                                    .child(
-                                        h_flex()
-                                            .gap_1()
-                                            .children(keys.iter().map(|k| keycap(k, p))),
+                    .child(
+                        settings_card(p)
+                            .children(entries.into_iter().enumerate().map(|(ix, (combo, text))| {
+                                row(ix == 0).child(label(text)).child(keys(&combo))
+                            }))
+                            .when_some(
+                                composer.then(|| send_picker.take()).flatten(),
+                                |el, picker| {
+                                    el.child(
+                                        row(false)
+                                            .py_1()
+                                            .child(label("Send messages with"))
+                                            .child(picker),
                                     )
-                            },
-                        ),
-                    )),
-            );
-        }
-        out
+                                },
+                            ),
+                    )
+            }))
     }
 
     fn settings_providers(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {

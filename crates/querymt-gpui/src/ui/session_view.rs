@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
-use gpui_kit::component::input::{IndentInline, OutdentInline, Textarea};
+use gpui_kit::component::input::{Enter, IndentInline, OutdentInline, Textarea};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarMode};
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
@@ -141,6 +141,16 @@ struct RenderCtx {
     block_scrolls: Rc<RefCell<HashMap<String, ScrollHandle>>>,
     /// Workspace of the session: paths inside it are shown relative.
     cwd: String,
+    /// Items that close a turn → message id of that turn's user prompt.
+    turn_user: HashMap<usize, String>,
+    /// Workspace undo/redo can be offered now (supported, idle, nothing pending).
+    undo_ready: bool,
+    /// User turns a workspace undo can go back to.
+    undoable: HashSet<String>,
+    /// User turn that redo restores (top of the undo stack).
+    redo_target: Option<String>,
+    /// Items from this index on were rolled back by an undo (shown dimmed).
+    reverted_from: Option<usize>,
 }
 
 impl RenderCtx {
@@ -166,6 +176,12 @@ impl RenderCtx {
             _ => self.expanded.contains(&item.key).hash(&mut h),
         }
         self.turn_end.get(&ix).hash(&mut h);
+        if let Some(user) = self.turn_user.get(&ix) {
+            self.undo_ready.hash(&mut h);
+            self.undoable.contains(user).hash(&mut h);
+            (self.redo_target.as_ref() == Some(user)).hash(&mut h);
+        }
+        self.reverted_from.is_some_and(|r| ix >= r).hash(&mut h);
         (self.copied.as_deref() == Some(item.key.as_str())).hash(&mut h);
         (std::sync::Arc::as_ptr(&self.syntax) as usize).hash(&mut h);
         h.finish()
@@ -1630,6 +1646,9 @@ fn turn_actions(
     let (adds, dels, files) = stats;
     let key = item.key.clone();
     let weak = rc.weak.clone();
+    let user = rc.turn_user.get(&ix).filter(|_| rc.undo_ready);
+    let undo_to = user.filter(|u| rc.undoable.contains(*u)).cloned();
+    let redo = user.is_some_and(|u| rc.redo_target.as_ref() == Some(u));
     h_flex()
         .gap_1()
         .pl_1()
@@ -1651,6 +1670,37 @@ fn turn_actions(
                 let _ = weak.update(cx, |this, cx| this.copy_turn(ix, key, cx));
             }),
         )
+        .when_some(undo_to, |el, message_id| {
+            let weak = rc.weak.clone();
+            el.child(
+                kit::icon_button(
+                    SharedString::from(format!("undo-{}", item.key)),
+                    IconName::Undo2,
+                    "Undo workspace to this prompt",
+                )
+                .xsmall()
+                .on_click(move |_, _, cx| {
+                    let message_id = message_id.clone();
+                    let _ = weak.update(cx, |this, cx| this.request_undo(message_id, cx));
+                }),
+            )
+        })
+        .when(redo, |el| {
+            let weak = rc.weak.clone();
+            el.child(
+                kit::icon_button(
+                    SharedString::from(format!("redo-{}", item.key)),
+                    IconName::Redo2,
+                    "Redo workspace changes for this turn",
+                )
+                .xsmall()
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.store.update(cx, |s, cx| s.redo_workspace(cx))
+                    });
+                }),
+            )
+        })
         .child(div().flex_1())
         .when(adds > 0 || dels > 0, |el| {
             // Desktop `.session-turn-diff-pill`: 0.28rem/0.5rem padding,
@@ -1862,6 +1912,8 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
             .child(text.clone())
             .into_any_element(),
     };
+    // Turns rolled back by an undo stay visible, dimmed, until the next prompt.
+    let reverted = rc.reverted_from.is_some_and(|r| ix >= r);
     // Center the column like a document; the list itself spans the page.
     div()
         .w_full()
@@ -1869,8 +1921,33 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
         .justify_center()
         .px_6()
         .py_1()
+        .when(reverted, |el| el.opacity(0.5))
         .child(div().w_full().max_w(px(CHAT_MAX)).child(body))
         .into_any_element()
+}
+
+/// For each turn's closing Agent/Work item, the message id of its user prompt.
+fn turn_users(items: &[Item]) -> HashMap<usize, String> {
+    let mut out = HashMap::new();
+    let mut user: Option<&str> = None;
+    let mut last: Option<usize> = None;
+    let mut flush = |user: Option<&str>, last: &mut Option<usize>| {
+        if let (Some(u), Some(ix)) = (user, last.take()) {
+            out.insert(ix, u.to_string());
+        }
+    };
+    for (ix, item) in items.iter().enumerate() {
+        match item.kind {
+            ItemKind::User { .. } => {
+                flush(user, &mut last);
+                user = Some(&item.key);
+            }
+            ItemKind::Agent { .. } | ItemKind::Work(_) => last = Some(ix),
+            ItemKind::Notice { .. } => {}
+        }
+    }
+    flush(user, &mut last);
+    out
 }
 
 /// Turn boundaries: for each turn, the last Agent/Work item and the turn's change stats.
@@ -2162,6 +2239,20 @@ impl QmtApp {
             });
         })
         .detach();
+    }
+
+    /// Ask before rolling the workspace back to `message_id` (desktop
+    /// "Undo workspace changes?" dialog).
+    pub(super) fn request_undo(&mut self, message_id: String, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let ok = store.session_supports_undo()
+            && store.session.as_ref().is_some_and(|v| {
+                !v.running() && !v.undo_pending && v.undo_affected_turns(&message_id).is_some()
+            });
+        if ok {
+            self.confirm_undo = Some(message_id);
+            cx.notify();
+        }
     }
 
     fn copy_turn(&mut self, ix: usize, key: String, cx: &mut Context<Self>) {
@@ -3106,6 +3197,13 @@ impl QmtApp {
                 div()
                     .px_1()
                     .min_h(px(64.))
+                    .capture_action(cx.listener(|this, a: &Enter, window, cx| {
+                        let send = this.store.read(cx).prefs.send_shortcut;
+                        if send.submits(a.shift, a.secondary) {
+                            cx.stop_propagation();
+                            this.send_session_prompt(window, cx);
+                        }
+                    }))
                     .capture_action(cx.listener(|this, _: &IndentInline, _, cx| {
                         cx.stop_propagation();
                         this.cycle_session_mode(false, cx);
@@ -3215,6 +3313,21 @@ impl QmtApp {
             copied: self.copied.clone(),
             block_scrolls: self.transcript.block_scrolls.clone(),
             cwd: view.cwd.clone(),
+            turn_user: turn_users(&view.items),
+            undo_ready: store.session_supports_undo() && !running && !loading && !view.undo_pending,
+            undoable: view
+                .items
+                .iter()
+                .filter(|i| matches!(i.kind, ItemKind::User { .. }))
+                .filter(|i| view.undo_affected_turns(&i.key).is_some())
+                .map(|i| i.key.clone())
+                .collect(),
+            redo_target: view.redo_target().map(str::to_owned),
+            reverted_from: view.reverted_from().and_then(|id| {
+                view.items
+                    .iter()
+                    .position(|i| i.key == id && matches!(i.kind, ItemKind::User { .. }))
+            }),
         });
         self.transcript.sync(&key, &view.items, &rc);
         if !self.transcript.scroll_hooked {

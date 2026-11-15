@@ -510,12 +510,49 @@ pub struct SessionView {
     /// `inputState` notifications that arrived while their submit was in
     /// flight, keyed by input id: (delivery, state).
     pub input_notes: HashMap<String, (String, String)>,
+    /// Workspace undo frames (`querymt/session/undoStack`), oldest first.
+    pub undo_stack: Vec<UndoFrame>,
+    /// A workspace undo or redo is in flight.
+    pub undo_pending: bool,
+    /// Notice to append once the transcript has (re)loaded, e.g. after an undo.
+    pub after_load_notice: Option<String>,
     tool_index: HashMap<String, usize>,
     counter: u64,
     /// (name, mime) of local-prompt attachments whose agent echo hasn't
     /// arrived yet. The text echo can come first and clear `local`, so the
     /// echoed images must be matched against this instead.
     echo_pending: Vec<(String, String)>,
+}
+
+/// One frame of the workspace undo stack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndoFrame {
+    /// User turn the undo went back to.
+    pub message_id: String,
+    /// The undo that produced this frame failed part-way: it deleted no
+    /// history, and redo only recovers the state from before it.
+    pub restore_failed: bool,
+}
+
+impl UndoFrame {
+    /// Frames of an `undo_stack` array in an undo/redo/undoStack response.
+    pub fn parse_stack(response: &Value) -> Vec<Self> {
+        response
+            .get("undo_stack")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|f| {
+                Some(Self {
+                    message_id: f.get("message_id")?.as_str()?.to_string(),
+                    restore_failed: f
+                        .get("restore_failed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            })
+            .collect()
+    }
 }
 
 /// A `select` config option, flattened for the composer.
@@ -658,6 +695,59 @@ impl SessionView {
 
     pub fn running(&self) -> bool {
         self.prompting || (!self.phase.is_empty() && self.phase != "idle")
+    }
+
+    /// Message id of the user turn a workspace undo would go back to: the
+    /// latest turn before the newest completed undo, like the desktop app.
+    /// Only turns the agent has identified (not local echoes) qualify.
+    pub fn undo_target(&self) -> Option<String> {
+        let turns = self.undo_turns();
+        let end = self.undo_frontier(&turns).unwrap_or(turns.len());
+        turns[..end].last().map(|t| t.to_string())
+    }
+
+    /// Agent-identified user turns, in transcript order.
+    fn undo_turns(&self) -> Vec<&str> {
+        let mut turns: Vec<&str> = Vec::new();
+        for item in &self.items {
+            if let ItemKind::User { local: false, .. } = item.kind
+                && !item.key.starts_with("local-")
+                && !item.key.starts_with("msg-")
+                && !turns.contains(&item.key.as_str())
+            {
+                turns.push(&item.key);
+            }
+        }
+        turns
+    }
+
+    /// Position (in `turns`) of the newest completed undo's turn.
+    fn undo_frontier(&self, turns: &[&str]) -> Option<usize> {
+        self.undo_stack
+            .iter()
+            .rev()
+            .find(|f| !f.restore_failed)
+            .and_then(|f| turns.iter().position(|t| *t == f.message_id))
+    }
+
+    /// Turns a workspace undo to `message_id` rolls back (that turn and every
+    /// later live turn), or `None` when that turn is already undone.
+    pub fn undo_affected_turns(&self, message_id: &str) -> Option<usize> {
+        let turns = self.undo_turns();
+        let at = turns.iter().position(|t| *t == message_id)?;
+        let end = self.undo_frontier(&turns).unwrap_or(turns.len());
+        (at < end).then_some(end - at)
+    }
+
+    /// First user turn rolled back by the newest completed undo, if any.
+    pub fn reverted_from(&self) -> Option<&str> {
+        let turns = self.undo_turns();
+        self.undo_frontier(&turns).map(|at| turns[at])
+    }
+
+    /// User turn that redo would restore (top of the undo stack).
+    pub fn redo_target(&self) -> Option<&str> {
+        self.undo_stack.last().map(|f| f.message_id.as_str())
     }
 
     /// Start or settle the active-work clock to match `running()`.
@@ -826,6 +916,9 @@ impl SessionView {
             run_id: self.run_id.clone(),
             pending_inputs: self.pending_inputs.clone(),
             input_notes: HashMap::new(),
+            undo_stack: self.undo_stack.clone(),
+            undo_pending: self.undo_pending,
+            after_load_notice: None,
             tool_index: HashMap::new(),
             counter: 0,
             echo_pending: Vec::new(),
@@ -1652,5 +1745,63 @@ mod input_tests {
         assert_eq!(view.pending_inputs[0].state, "queued");
         view.set_input_state("i1", "queue", "started");
         assert!(view.pending_inputs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod undo_tests {
+    use super::{SessionView, UndoFrame};
+    use serde_json::json;
+
+    fn view_with_turns(ids: &[&str]) -> SessionView {
+        let mut view = SessionView::new("a", "s", "/w", "t");
+        for id in ids {
+            view.apply(
+                &json!({ "sessionUpdate": "user_message_chunk", "messageId": id,
+                "content": { "type": "text", "text": "prompt" } }),
+            );
+            view.apply(
+                &json!({ "sessionUpdate": "agent_message_chunk", "messageId": format!("r-{id}"),
+                "content": { "type": "text", "text": "reply" } }),
+            );
+        }
+        view
+    }
+
+    #[test]
+    fn undo_targets_the_latest_turn_before_the_undo_frontier() {
+        let mut view = view_with_turns(&["u1", "u2", "u3"]);
+        assert_eq!(view.undo_target().as_deref(), Some("u3"));
+        assert_eq!(view.undo_affected_turns("u1"), Some(3));
+
+        view.undo_stack = vec![UndoFrame {
+            message_id: "u3".into(),
+            restore_failed: false,
+        }];
+        assert_eq!(view.undo_target().as_deref(), Some("u2"));
+
+        // A failed undo deleted nothing: its turn can be undone again.
+        view.undo_stack = vec![UndoFrame {
+            message_id: "u2".into(),
+            restore_failed: true,
+        }];
+        assert_eq!(view.undo_target().as_deref(), Some("u3"));
+
+        view.undo_stack = vec![UndoFrame {
+            message_id: "u1".into(),
+            restore_failed: false,
+        }];
+        assert_eq!(view.undo_target(), None);
+    }
+
+    #[test]
+    fn undo_stack_is_parsed_from_responses() {
+        let frames = UndoFrame::parse_stack(&json!({ "undo_stack": [
+            { "message_id": "u1", "restore_failed": false },
+            { "message_id": "u2", "restore_failed": true },
+            { "restore_failed": false },
+        ] }));
+        assert_eq!(frames.len(), 2);
+        assert!(frames[1].restore_failed);
     }
 }

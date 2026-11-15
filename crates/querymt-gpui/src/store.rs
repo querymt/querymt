@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::rpc::{Incoming, RpcClient};
-use crate::session::{SessionView, UserAttachment};
+use crate::session::{SessionView, UndoFrame, UserAttachment};
 use crate::transport::{self, Inbound, Target};
 use crate::util::now_ms;
 
@@ -665,6 +665,31 @@ pub struct Prefs {
     /// How image attachments are sent in prompts.
     #[serde(default)]
     pub image_send_mode: ImageSendMode,
+    /// Shortcut that sends a prompt from the composers.
+    #[serde(default)]
+    pub send_shortcut: SendShortcut,
+}
+
+/// Key combination that sends a prompt; the others insert a new line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendShortcut {
+    #[default]
+    Enter,
+    ShiftEnter,
+    /// Ctrl+Enter, or Cmd+Enter on macOS.
+    SecondaryEnter,
+}
+
+impl SendShortcut {
+    /// Whether an Enter press with these modifiers sends the prompt.
+    pub fn submits(self, shift: bool, secondary: bool) -> bool {
+        match self {
+            Self::Enter => !shift,
+            Self::ShiftEnter => shift,
+            Self::SecondaryEnter => secondary,
+        }
+    }
 }
 
 /// ACP encoding of image attachments in a prompt.
@@ -1897,9 +1922,13 @@ impl AgentsStore {
                             .and_then(Value::as_str)
                             .filter(|_| view.history_more)
                             .map(str::to_owned);
+                        if let Some(notice) = view.after_load_notice.take() {
+                            view.push_notice(notice, false);
+                        }
                     }
                     Err(err) => view.error = Some(format!("Could not load the session: {err}")),
                 }
+                s.refresh_undo_stack(cx);
                 cx.notify();
             });
         })
@@ -1986,6 +2015,170 @@ impl AgentsStore {
     }
 
     /// Close and load the open session again.
+    /// Agent of the open session supports workspace undo and redo.
+    pub fn session_supports_undo(&self) -> bool {
+        self.session
+            .as_ref()
+            .and_then(|v| self.runtime.get(&v.agent_id))
+            .is_some_and(|rt| {
+                [
+                    "querymt/session/undoStack",
+                    "querymt/session/undo",
+                    "querymt/session/redo",
+                ]
+                .iter()
+                .all(|m| rt.supports_method(m))
+            })
+    }
+
+    /// Fetch the open session's workspace undo stack (`querymt/session/undoStack`).
+    pub fn refresh_undo_stack(&mut self, cx: &mut Context<Self>) {
+        if !self.session_supports_undo() {
+            return;
+        }
+        let Some(view) = self.session.as_ref() else {
+            return;
+        };
+        let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) else {
+            return;
+        };
+        let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
+        let req = rpc.request(
+            "_querymt/session/undoStack",
+            json!({ "session_id": session_id }),
+        );
+        cx.spawn(async move |this, cx| {
+            let Ok(resp) = req.await else { return };
+            let _ = this.update(cx, |s, cx| {
+                if let Some(view) = s
+                    .session
+                    .as_mut()
+                    .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
+                {
+                    view.undo_stack = UndoFrame::parse_stack(&resp);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Revert the workspace to before the latest undoable turn
+    /// (`querymt/session/undo`), then reload the transcript.
+    /// Revert the workspace to before the user turn `message_id` (and every
+    /// later turn), then reload the transcript.
+    pub fn undo_workspace_to(&mut self, message_id: String, cx: &mut Context<Self>) {
+        self.start_undo_op(Some(message_id), cx);
+    }
+
+    /// Re-apply the most recently undone turn (`querymt/session/redo`).
+    pub fn redo_workspace(&mut self, cx: &mut Context<Self>) {
+        self.start_undo_op(None, cx);
+    }
+
+    /// `target`: undo to that turn; `None`: redo.
+    fn start_undo_op(&mut self, target: Option<String>, cx: &mut Context<Self>) {
+        let undo = target.is_some();
+        let supported = self.session_supports_undo();
+        let Some(view) = self.session.as_mut() else {
+            return;
+        };
+        if view.loading || view.running() || view.undo_pending {
+            return;
+        }
+        if !supported {
+            view.push_notice("This agent does not support workspace undo and redo.", true);
+            cx.notify();
+            return;
+        }
+        let (method, params) = if let Some(target) = target {
+            if view.undo_affected_turns(&target).is_none() {
+                return;
+            }
+            (
+                "_querymt/session/undo",
+                json!({ "session_id": view.session_id, "message_id": target }),
+            )
+        } else {
+            if view.undo_stack.is_empty() {
+                return;
+            }
+            (
+                "_querymt/session/redo",
+                json!({ "session_id": view.session_id }),
+            )
+        };
+        let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) else {
+            return;
+        };
+        view.undo_pending = true;
+        let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
+        cx.notify();
+        let req = rpc.request(method, params);
+        cx.spawn(async move |this, cx| {
+            let result = req.await;
+            let _ = this.update(cx, |s, cx| {
+                s.finish_undo_op(&agent_id, &session_id, undo, result, cx)
+            });
+        })
+        .detach();
+    }
+
+    fn finish_undo_op(
+        &mut self,
+        agent_id: &str,
+        session_id: &str,
+        undo: bool,
+        result: Result<Value, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self
+            .session
+            .as_mut()
+            .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
+        else {
+            return;
+        };
+        view.undo_pending = false;
+        let what = if undo { "Undo" } else { "Redo" };
+        let resp = match result {
+            Ok(resp) => resp,
+            Err(err) => {
+                view.push_notice(format!("{what} failed: {err}"), true);
+                cx.notify();
+                return;
+            }
+        };
+        view.undo_stack = UndoFrame::parse_stack(&resp);
+        if resp.get("success").and_then(Value::as_bool) != Some(true) {
+            let msg = resp
+                .get("message")
+                .and_then(Value::as_str)
+                .map_or_else(|| format!("{what} failed."), str::to_owned);
+            view.push_notice(msg, true);
+            cx.notify();
+            return;
+        }
+        let notice = if undo {
+            let n = resp
+                .get("reverted_files")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            match n {
+                0 => "Turn undone.".to_string(),
+                1 => "Undid 1 changed file.".to_string(),
+                n => format!("Undid {n} changed files."),
+            }
+        } else {
+            "Turn restored.".to_string()
+        };
+        // History changed: reload the transcript, then show the result.
+        self.reload_session(cx);
+        if let Some(view) = self.session.as_mut() {
+            view.after_load_notice = Some(notice);
+        }
+    }
+
     pub fn reload_session(&mut self, cx: &mut Context<Self>) {
         let Some(view) = self.session.take() else {
             return;
@@ -2395,6 +2588,14 @@ impl AgentsStore {
         }
         if let (Err(err), Some(rt)) = (&result, self.runtime.get_mut(agent_id)) {
             rt.log(format!("Prompt failed: {err}"));
+        }
+        // A finished turn adds an undo target and drops stale redo frames.
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|v| v.agent_id == agent_id && v.session_id == session_id)
+        {
+            self.refresh_undo_stack(cx);
         }
         self.schedule_sessions_refresh(agent_id, Duration::from_millis(300), cx);
         cx.notify();
@@ -3172,6 +3373,16 @@ mod tests {
             kinds(ImageSendMode::Resource),
             ["text", "resource", "resource"]
         );
+    }
+
+    #[test]
+    fn send_shortcut_decides_which_enter_sends() {
+        assert!(SendShortcut::Enter.submits(false, false));
+        assert!(!SendShortcut::Enter.submits(true, false));
+        assert!(SendShortcut::ShiftEnter.submits(true, false));
+        assert!(!SendShortcut::ShiftEnter.submits(false, false));
+        assert!(SendShortcut::SecondaryEnter.submits(false, true));
+        assert!(!SendShortcut::SecondaryEnter.submits(false, false));
     }
 
     #[test]

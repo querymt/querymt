@@ -155,9 +155,9 @@ pub fn run(app: Application) {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([
             KeyBinding::new("ctrl-q", Quit, None),
-            KeyBinding::new("ctrl-b", ui::ToggleSidebar, None),
-            KeyBinding::new("cmd-b", ui::ToggleSidebar, None),
+            KeyBinding::new("cmd-q", Quit, None),
         ]);
+        ui::bind_keys(cx);
 
         let options = if cfg!(target_family = "wasm") {
             WindowOptions::default()
@@ -243,6 +243,8 @@ mod web {
             ExternalLink,
             Brain,
             RotateCcw,
+            Undo2,
+            Redo2,
             ToggleLeft,
             ToggleRight,
             Trash,

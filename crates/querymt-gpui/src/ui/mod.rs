@@ -4,6 +4,7 @@ mod agents;
 mod chrome;
 mod code;
 mod inbox;
+mod keys;
 mod kit;
 mod mesh;
 mod preview;
@@ -16,6 +17,7 @@ mod start;
 use gpui_kit::assets::IconName;
 use std::collections::{HashMap, HashSet};
 
+use gpui_kit::component::command::CommandState;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -27,6 +29,7 @@ use settings::SettingsTab;
 
 gpui_kit::actions!(querymt, [ToggleSidebar]);
 use crate::util::{short_time, workspace_name};
+pub use keys::bind_keys;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Page {
@@ -92,6 +95,8 @@ pub struct QmtApp {
     general_advanced_open: bool,
     general_danger_open: bool,
     confirm_reset: bool,
+    /// Workspace undo awaiting confirmation: user turn to go back to.
+    confirm_undo: Option<String>,
     /// Appearance settings: the mouse-wheel scrolling disclosure.
     appearance_scroll_open: bool,
     key_input: Entity<InputState>,
@@ -130,6 +135,12 @@ pub struct QmtApp {
     form_errors: HashMap<String, String>,
     /// Session id to open once its agent has listed it (deep link).
     pending_open: Option<String>,
+    /// Focus of the app shell: keeps global shortcuts working when no
+    /// control is focused.
+    app_focus: FocusHandle,
+    /// Command palette (Ctrl/Cmd+P).
+    palette: Entity<CommandState>,
+    palette_open: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -144,7 +155,6 @@ impl QmtApp {
         let prompt = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(4, 14)
-                .submit_on_enter(true)
                 .placeholder("Ask QueryMT to inspect, change, debug, explain, or plan something.")
         });
         let model_query = cx
@@ -166,7 +176,6 @@ impl QmtApp {
         let session_prompt = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(2, 12)
-                .submit_on_enter(true)
                 .placeholder("Reply to the agent…")
         });
 
@@ -181,15 +190,11 @@ impl QmtApp {
                     this.apply_theme(window, cx);
                 }
             }),
-            cx.subscribe_in(
-                &prompt,
-                window,
-                |this, _, ev: &InputEvent, window, cx| match ev {
-                    InputEvent::PressEnter { shift: false, .. } => this.start_session(window, cx),
-                    InputEvent::Change => cx.notify(),
-                    _ => {}
-                },
-            ),
+            cx.subscribe_in(&prompt, window, |_, _, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
             cx.subscribe_in(&cwd, window, |_, _, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify();
@@ -204,18 +209,11 @@ impl QmtApp {
                     _ => {}
                 },
             ),
-            cx.subscribe_in(
-                &session_prompt,
-                window,
-                |this, _, ev: &InputEvent, window, cx| match ev {
-                    InputEvent::PressEnter { shift: false, .. } => {
-                        this.send_session_prompt(window, cx)
-                    }
-                    InputEvent::PressEnter { shift: true, .. } => {}
-                    InputEvent::Change => cx.notify(),
-                    _ => {}
-                },
-            ),
+            cx.subscribe_in(&session_prompt, window, |_, _, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
             cx.subscribe_in(&session_query, window, |_, _, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify();
@@ -231,6 +229,13 @@ impl QmtApp {
                 }),
             );
         }
+
+        let app_focus = cx.focus_handle();
+        app_focus.focus(window, cx);
+        // Removing a focused control (closing a popover, the palette, …)
+        // returns focus to the shell so shortcuts keep working.
+        subs.push(cx.on_focus_lost(window, |this, window, cx| this.app_focus.focus(window, cx)));
+        let palette = cx.new(|cx| CommandState::new(window, cx));
 
         let (page, details) = initial_view(&store, cx);
         Self {
@@ -267,6 +272,7 @@ impl QmtApp {
             general_advanced_open: false,
             general_danger_open: false,
             confirm_reset: false,
+            confirm_undo: None,
             appearance_scroll_open: false,
             key_input,
             oauth_code,
@@ -292,6 +298,9 @@ impl QmtApp {
             form_values: HashMap::new(),
             form_errors: HashMap::new(),
             pending_open: deep_link_session(),
+            app_focus,
+            palette,
+            palette_open: false,
             _subs: subs,
         }
     }
@@ -350,7 +359,7 @@ impl QmtApp {
 
     /// Close the top-most overlay. Returns whether one was open.
     fn close_topmost(&mut self) -> bool {
-        if self.preview.take().is_some() {
+        if self.preview.take().is_some() || std::mem::take(&mut self.palette_open) {
             return true;
         }
         if std::mem::take(&mut self.options_open) || std::mem::take(&mut self.model_open) {
@@ -364,6 +373,7 @@ impl QmtApp {
             return true;
         }
         if std::mem::take(&mut self.confirm_reset)
+            || self.confirm_undo.take().is_some()
             || self.confirm_delete.take().is_some()
             || self.dialog.take().is_some()
             || self.details.take().is_some()
@@ -985,11 +995,13 @@ impl Render for QmtApp {
         // rectangular, so the frame's `overflow_hidden` can't clip their corners.
         let overlay = self
             .render_preview(radii, window, cx)
+            .or_else(|| self.render_palette(radii, cx))
             .or_else(|| self.render_model_modal(radii, cx))
             .or_else(|| self.render_overlay(radii, cx));
         let header = self.render_header(window, cx).into_any_element();
 
-        v_flex()
+        let root = v_flex()
+            .track_focus(&self.app_focus)
             .relative()
             .size_full()
             .rounded_tl(radii.top_left)
@@ -998,7 +1010,8 @@ impl Render for QmtApp {
             .rounded_br(radii.bottom_right)
             .bg(p.bg)
             .text_color(p.text)
-            .font_family("IBM Plex Sans")
+            .font_family("IBM Plex Sans");
+        self.on_shortcuts(root, cx)
             // First child: its capture listener must precede every scroll container's.
             .child({
                 let prefs = &self.store.read(cx).prefs;
@@ -1015,7 +1028,6 @@ impl Render for QmtApp {
                 self.smooth_scroll.set_preset(&preset, &curve, &inertia);
                 self.smooth_scroll.element()
             })
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
                 if ev.keystroke.key != "escape" {
                     return;
