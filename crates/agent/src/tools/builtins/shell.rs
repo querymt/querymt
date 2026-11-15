@@ -9,6 +9,25 @@ use crate::tools::{CapabilityRequirement, FileAccess, Tool as ToolTrait, ToolCon
 
 pub struct ShellTool;
 
+/// Record the executable name on the current tool span and rename it.
+fn shell_executable(name: &str) {
+    crate::tools::trace::with_tool_span(|span| {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        span.set_attribute("process.executable.name", name.to_owned());
+        crate::tools::trace::rename_tool(span, format!("execute_tool shell {name}"));
+    });
+}
+
+/// Record the process exit code on the current tool span.
+fn shell_exit_code(code: Option<i32>) {
+    if let Some(code) = code {
+        crate::tools::trace::with_tool_span(|span| {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            span.set_attribute("process.exit.code", i64::from(code));
+        });
+    }
+}
+
 #[cfg(unix)]
 fn detach_session() -> std::io::Result<()> {
     // SAFETY: `setsid` only changes process-local session state.
@@ -180,7 +199,7 @@ impl ToolTrait for ShellTool {
                     if let Some(executable) = executable
                         && let Some(name) = executable.file_name().and_then(|name| name.to_str())
                     {
-                        crate::agent::utils::genai::shell_executable(name);
+                        shell_executable(name);
                     }
                 }
                 result = &mut wait => {
@@ -198,7 +217,7 @@ impl ToolTrait for ShellTool {
             }
         };
 
-        crate::agent::utils::genai::shell_exit_code(output.status.code());
+        shell_exit_code(output.status.code());
         let result = json!({
             "exit_code": output.status.code().unwrap_or(-1),
             "stdout": String::from_utf8_lossy(&output.stdout),
@@ -540,8 +559,8 @@ mod tests {
                     token.cancel();
                     assert!(future.await.is_err());
                 }
-                genai::shell_executable("must-not-leak");
-                genai::shell_exit_code(Some(77));
+                shell_executable("must-not-leak");
+                shell_exit_code(Some(77));
                 pid
             })
             .await;

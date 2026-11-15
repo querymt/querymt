@@ -136,7 +136,7 @@ pub(crate) mod llm_metrics {
 pub(crate) mod genai {
     use opentelemetry::{
         Array, Value,
-        trace::{Status, TraceContextExt},
+        trace::Status,
     };
     use querymt::chat::{ChatMessage, ChatOutput, ChatOutputStatus, ChatRole, FinishReason};
     use querymt::error::LLMError;
@@ -151,44 +151,13 @@ pub(crate) mod genai {
         }
     }
 
-    tokio::task_local! {
-        // Only the built-in invocation future carries the existing semantic tool span.
-        static TOOL_SPAN: Span;
-    }
-
-    pub(crate) async fn tool_scope<T>(
-        span: Span,
-        future: impl std::future::Future<Output = T>,
-    ) -> T {
-        TOOL_SPAN.scope(span, future).await
-    }
-
-    fn rename_tool(span: &Span, name: String) {
-        span.record("otel.name", &name);
-        // Updating the tracing field alone cannot rename the started OTel span in 0.33.
-        span.context().span().update_name(name);
-    }
+    pub(crate) use crate::tools::trace::tool_scope;
 
     pub(crate) fn skill_name(name: &str) {
-        let _ = TOOL_SPAN.try_with(|span| {
+        crate::tools::trace::with_tool_span(|span| {
             span.set_attribute("gen_ai.skill.name", name.to_owned());
-            rename_tool(span, format!("execute_tool skill {name}"));
+            crate::tools::trace::rename_tool(span, format!("execute_tool skill {name}"));
         });
-    }
-
-    pub(crate) fn shell_executable(name: &str) {
-        let _ = TOOL_SPAN.try_with(|span| {
-            span.set_attribute("process.executable.name", name.to_owned());
-            rename_tool(span, format!("execute_tool shell {name}"));
-        });
-    }
-
-    pub(crate) fn shell_exit_code(code: Option<i32>) {
-        if let Some(code) = code {
-            let _ = TOOL_SPAN.try_with(|span| {
-                span.set_attribute("process.exit.code", i64::from(code));
-            });
-        }
     }
 
     /// Keep only typed successful summaries, projected alongside the effective history.

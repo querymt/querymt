@@ -6,6 +6,7 @@ pub mod path;
 pub mod read_scope;
 pub mod registry;
 pub mod tool_set;
+pub(crate) mod trace;
 pub mod validation;
 
 pub use builtins::{
