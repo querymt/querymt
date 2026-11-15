@@ -11,7 +11,9 @@
 //! * declared `knowledge_sources` / `knowledge_paths` that are invalid;
 //! * evidence drift for acknowledged records, stale evidence entries, and
 //!   orphaned evidence files;
-//! * manifest `[orientation]` entrypoints that do not resolve.
+//! * manifest `[orientation]` entrypoints that do not resolve;
+//! * manifest include patterns and `knowledge_paths` globs that match no
+//!   indexed file (reported only when coverage is complete).
 //!
 //! Checks are strictly non-mutating and offline: nothing is rewritten, no rows
 //! are pruned, no link is followed over the network, and no rename is inferred
@@ -34,7 +36,7 @@ use super::evidence::{
     parse_selector, record_specs, resolve_dependency,
 };
 use super::maintenance::{Finding, MaintenanceError};
-use super::manifest::{MANIFEST_RELATIVE_PATH, ManifestOutcome, load_manifest};
+use super::manifest::{KnowledgeManifest, MANIFEST_RELATIVE_PATH, ManifestOutcome, load_manifest};
 use super::query::normalize_relative_path;
 use super::reconcile::ReconcileStatus;
 use super::references::{
@@ -43,7 +45,7 @@ use super::references::{
 };
 use super::service::RepositoryService;
 use super::signals::EvidenceState;
-use super::store::{CorpusEntry, SourceState, path_in_scope};
+use super::store::{CorpusEntry, SourceState, StoredSource, path_in_scope};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -62,6 +64,8 @@ pub mod codes {
     pub const EVIDENCE_FILE_ORPHANED: &str = "evidence_file_orphaned";
     pub const ENTRYPOINT_INVALID: &str = "entrypoint_invalid";
     pub const SCOPE_INVALID: &str = "exhaustive_scope_invalid";
+    pub const SELECTION_UNMATCHED: &str = "selection_pattern_unmatched";
+    pub const PATH_UNMATCHED: &str = "knowledge_path_unmatched";
 }
 
 /// What to check.
@@ -241,6 +245,78 @@ fn declaration_findings(
     }
 }
 
+/// Manifest include patterns and `knowledge_paths` globs that match no
+/// indexed file. A selection that selects nothing is almost always a stale
+/// path (files moved or renamed), and it fails silently otherwise.
+fn selection_findings(
+    manifest: &KnowledgeManifest,
+    sources: &[StoredSource],
+    corpus: &[CorpusEntry],
+    out: &mut Vec<Finding>,
+) {
+    let documents: Vec<&str> = sources
+        .iter()
+        .filter(|s| s.is_document)
+        .map(|s| s.path.as_str())
+        .collect();
+    let code: Vec<&str> = sources
+        .iter()
+        .filter(|s| s.is_code)
+        .map(|s| s.path.as_str())
+        .collect();
+    let indexed: Vec<&str> = sources
+        .iter()
+        .filter(|s| s.state != SourceState::Excluded)
+        .map(|s| s.path.as_str())
+        .collect();
+    let tables: [(&str, &super::manifest::SourceSelection, &[&str]); 3] = [
+        ("[documents]", &manifest.documents, &documents),
+        ("[code]", &manifest.code, &code),
+        (
+            "[orientation] retrieval_only",
+            &manifest.retrieval_only,
+            &documents,
+        ),
+    ];
+    for (table, selection, paths) in tables {
+        for pattern in selection.unmatched_includes(paths) {
+            out.push(Finding::new(
+                Some(MANIFEST_RELATIVE_PATH),
+                codes::SELECTION_UNMATCHED,
+                Warning,
+                format!("{table} include `{}` matches no file", shown(pattern)),
+            ));
+        }
+    }
+    for entry in corpus {
+        for pattern in &entry.document.knowledge_paths {
+            if !valid_applicability(pattern) {
+                continue; // already reported as invalid
+            }
+            let matches = glob::Pattern::new(pattern.trim()).is_ok_and(|glob| {
+                indexed.iter().any(|path| {
+                    glob.matches_with(
+                        path,
+                        glob::MatchOptions {
+                            case_sensitive: true,
+                            require_literal_separator: true,
+                            require_literal_leading_dot: false,
+                        },
+                    )
+                })
+            });
+            if !matches {
+                out.push(Finding::new(
+                    Some(entry.document.path.as_str()),
+                    codes::PATH_UNMATCHED,
+                    Warning,
+                    format!("`{}` matches no indexed file", shown(pattern)),
+                ));
+            }
+        }
+    }
+}
+
 fn evidence_findings(
     root: &std::path::Path,
     entry: &CorpusEntry,
@@ -375,6 +451,11 @@ impl RepositoryService {
                         format!("orientation entrypoint `{}` {problem}", shown(&label)),
                     ));
                 }
+            }
+            // A crawl cut short by a budget only saw a prefix of the tree, so
+            // "matches nothing" would be a guess; stay silent then.
+            if report.is_complete() {
+                selection_findings(&manifest, &sources, &corpus, &mut findings);
             }
         }
 
@@ -732,6 +813,69 @@ mod tests {
     }
 
     #[test]
+    fn selections_and_knowledge_paths_that_match_nothing_are_reported() {
+        let fx = Fx::new();
+        fx.put("src/a.rs", "pub fn a() {}\n");
+        fx.put(
+            "docs/arch.md",
+            "---\nknowledge_paths: src/**, moved/**\n---\n# Arch\nText.\n",
+        );
+        fx.put(
+            ".qmt/knowledge.toml",
+            "version = 1\n[documents]\ninclude = [\"docs/**/*.md\", \"old-docs/*.md\"]\n[code]\ninclude = [\"src/**/*.rs\", \"gone/src/*.rs\"]\n[orientation]\nretrieval_only = [\"specs/**\"]\n",
+        );
+        let report = check(&fx);
+        let unmatched: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.code == codes::SELECTION_UNMATCHED)
+            .map(|f| f.message.as_str())
+            .collect();
+        assert_eq!(unmatched.len(), 3, "{unmatched:?}");
+        assert!(
+            unmatched
+                .iter()
+                .any(|m| m.contains("[documents]") && m.contains("old-docs/*.md"))
+        );
+        assert!(
+            unmatched
+                .iter()
+                .any(|m| m.contains("[code]") && m.contains("gone/src/*.rs"))
+        );
+        assert!(
+            unmatched
+                .iter()
+                .any(|m| m.contains("retrieval_only") && m.contains("specs/**"))
+        );
+        let paths: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.code == codes::PATH_UNMATCHED)
+            .collect();
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert_eq!(paths[0].path.as_deref(), Some("docs/arch.md"));
+        assert!(paths[0].message.contains("moved/**"));
+        assert!(report.is_failing());
+    }
+
+    #[test]
+    fn patterns_that_match_are_not_reported() {
+        let fx = Fx::new();
+        fx.put("src/a.rs", "pub fn a() {}\n");
+        fx.put(
+            "docs/arch.md",
+            "---\nknowledge_paths: src/**\n---\n# Arch\n",
+        );
+        let report = check(&fx);
+        assert!(
+            !codes_of(&report).contains(&codes::SELECTION_UNMATCHED)
+                && !codes_of(&report).contains(&codes::PATH_UNMATCHED),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    #[test]
     fn orientation_entrypoints_must_resolve() {
         let fx = Fx::new();
         fx.put("docs/arch.md", "# Arch\n## Repository map\nText.\n");
@@ -766,6 +910,7 @@ mod tests {
     #[test]
     fn json_is_stable_relative_and_machine_independent() {
         let fx = Fx::new();
+        fx.put("src/a.rs", "pub fn a() {}\n");
         fx.put("docs/arch.md", "# Arch\n[b](gone.md)\n");
         let first = check(&fx).to_json();
         let second = check(&fx).to_json();

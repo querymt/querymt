@@ -178,6 +178,21 @@ impl SourceSelection {
         self.include.iter().map(|p| p.source.as_str())
     }
 
+    /// Include patterns that match none of `paths` (before excludes), in
+    /// declaration order. Used by checks to report selections that select
+    /// nothing, for example after files moved.
+    pub fn unmatched_includes<'a>(&'a self, paths: &[&str]) -> Vec<&'a str> {
+        self.include
+            .iter()
+            .filter(|p| {
+                !paths
+                    .iter()
+                    .any(|path| p.pattern.matches_with(path, MATCH_OPTIONS))
+            })
+            .map(|p| p.source.as_str())
+            .collect()
+    }
+
     /// Normalized exclude patterns in declaration order, duplicates removed.
     pub fn exclude_patterns(&self) -> impl Iterator<Item = &str> {
         self.exclude.iter().map(|p| p.source.as_str())

@@ -3,7 +3,7 @@ id: pilot-repository-knowledge
 title: Repository knowledge delivery
 description: How repository documentation is indexed, retrieved, and delivered as orientation and index-context cards.
 tags: knowledge, retrieval, delivery, orientation, gate
-knowledge_paths: ["crates/agent-knowledge/src/**", "crates/agent/src/agent/repository_delivery.rs"]
+knowledge_paths: ["crates/agent-knowledge/src/**", "crates/agent-runtime/src/agent/repository_delivery.rs"]
 knowledge_sources: ["crates/agent-knowledge/src/gate.rs"]
 ---
 
@@ -25,13 +25,13 @@ and serves whole generations only.
 
 `query.rs` ranks two lanes: navigation (exact path and symbol matches, file and purpose
 rows) and documentation (BM25 over authored sections). `browse.rs` implements get, list
-and stats. The `repo_knowledge_*` tools in `src/tools/builtins/repo_knowledge.rs` are thin
+and stats. The `repo_knowledge_*` tools in `crates/agent-services/src/tools/builtins/repo_knowledge.rs` are thin
 wrappers with bounded output.
 
 ## Automatic delivery
 
 Two independent host-enabled stages push short cited cards through the typed hook
-contribution path (`adapters.rs`, `src/agent/repository_delivery.rs`):
+contribution path (`adapters.rs`, `crates/agent-runtime/src/agent/repository_delivery.rs`):
 
 - **Orientation** runs at an accepted user prompt. `gate.rs` applies relevance gate v1:
   NFKC and lowercase, a 2 KiB cap, identifier splitting, at most 64 tokens, fixed
@@ -52,8 +52,8 @@ suppressed and fetched counters.
 ## Maintenance
 
 `check.rs`, `scaffold.rs`, `acknowledge.rs`, `evidence.rs` and `export.rs` implement the
-deterministic maintenance operations behind `examples/repository_knowledge.rs`. Evidence
+deterministic maintenance operations behind `crates/agent/examples/repository_knowledge.rs`. Evidence
 hashes report drift, never truth.
 
-Related: [execution.md](execution.md) for the hooks these adapters join, and
-[sessions.md](sessions.md) for the effective-history and compaction rules delivery uses.
+Related: [execution.md](../../agent-runtime/knowledge/execution.md) for the hooks these adapters join, and
+[sessions.md](../../agent-services/knowledge/sessions.md) for the effective-history and compaction rules delivery uses.

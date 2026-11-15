@@ -218,7 +218,7 @@ Exit status: `0` success, `1` the check found problems, `2` the operation could 
 
 ### `check`
 
-Reports, with stable codes and repository-relative paths: malformed or conflicting documents and incomplete coverage (including budgets); broken or unsafe relative links; File/Purpose rows naming missing files; invalid `knowledge_sources`/`knowledge_paths`; evidence drift, stale evidence entries and orphaned evidence files; and unresolvable manifest `[orientation]` entrypoints. It never rewrites content, prunes rows, makes network requests or guesses renames.
+Reports, with stable codes and repository-relative paths: malformed or conflicting documents and incomplete coverage (including budgets); broken or unsafe relative links; File/Purpose rows naming missing files; invalid `knowledge_sources`/`knowledge_paths`; evidence drift, stale evidence entries and orphaned evidence files; unresolvable manifest `[orientation]` entrypoints; and manifest include patterns or `knowledge_paths` globs that match no indexed file (`selection_pattern_unmatched`, `knowledge_path_unmatched`, typically after files moved; skipped when a budget cut the crawl short). It never rewrites content, prunes rows, makes network requests or guesses renames.
 
 Curated corpora pass: missing listings, missing per-file rows, unknown frontmatter keys and never-acknowledged notes are not findings. Per-file rows are required only for directories you name with `--exhaustive`. JSON output contains no generation numbers, timestamps or machine-local paths, so equal repositories give identical output:
 

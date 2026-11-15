@@ -87,6 +87,9 @@ pub struct QuestionSet {
     /// Corpus fingerprint per arm recorded at freeze time (optional).
     #[serde(default)]
     pub frozen_corpus: BTreeMap<String, String>,
+    /// Repository-relative directories whose rendered map size is reported.
+    #[serde(default)]
+    pub map_scopes: Vec<String>,
     #[serde(default)]
     pub arm: Vec<Arm>,
     #[serde(default)]
@@ -966,28 +969,25 @@ pub fn replay(
         .map(|s| run_scenario(service, checkout, s, &settings))
         .collect();
 
-    let maps = [
-        "crates/agent/src/agent/execution",
-        "crates/agent/src/session",
-        "crates/agent/src/tools",
-    ]
-    .iter()
-    .filter_map(|scope| {
-        service
-            .map(&MapRequest {
-                path: Some((*scope).to_string()),
-                max_bytes: None,
-            })
-            .ok()
-            .map(|out| MapSize {
-                scope: (*scope).to_string(),
-                files_total: out.map.files_total,
-                files_shown: out.map.files_shown,
-                bytes: out.map.text.len(),
-                truncated: out.map.truncated,
-            })
-    })
-    .collect();
+    let maps = set
+        .map_scopes
+        .iter()
+        .filter_map(|scope| {
+            service
+                .map(&MapRequest {
+                    path: Some(scope.clone()),
+                    max_bytes: None,
+                })
+                .ok()
+                .map(|out| MapSize {
+                    scope: scope.clone(),
+                    files_total: out.map.files_total,
+                    files_shown: out.map.files_shown,
+                    bytes: out.map.text.len(),
+                    truncated: out.map.truncated,
+                })
+        })
+        .collect();
 
     let zero = RefreshCost {
         millis: 0,

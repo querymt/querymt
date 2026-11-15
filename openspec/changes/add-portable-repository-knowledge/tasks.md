@@ -72,6 +72,15 @@
 - [x] 7.3 After stage-specific gates pass, publish an opt-in coder example demonstrating browse/query/get, document/source citations, maintenance, and optional delivery; validate documented configuration and rollback by disabling the feature and discarding only its cache.
 - [x] 7.4 Record deferred work (OKF bundles, nested-YAML metadata, review/expiry declarations, claim-footnote attribution) as a follow-up proposal outline; verify M1 contracts do not need to change to accommodate it.
 
+## 8. Re-home the pilot corpus after split-agent-crate
+
+- [x] 8.1 Move the reviewed notes next to the crate they describe (`crates/agent-runtime/knowledge/{README,execution}.md`, `crates/agent-services/knowledge/{tools,sessions}.md`, `crates/agent-knowledge/knowledge/repository-knowledge.md`) and the pilot harness inputs to `crates/agent-knowledge/pilot/`; rewrite note frontmatter and text to full repository-relative paths; fix cross-crate links.
+- [x] 8.2 Rewrite `.qmt/knowledge.toml`: documents from the three `knowledge/` directories plus main specs, a narrow `[code]` selection of the files the notes explain, entrypoint `crates/agent-runtime/knowledge/README.md`.
+- [x] 8.3 Replace the old evidence file with `.qmt/knowledge/evidence/crates/agent-runtime/knowledge/execution.md.json` (acknowledged whole document).
+- [x] 8.4 Re-point the pilot: `questions.toml` expectations, the `--questions` default in `examples/repository_knowledge.rs`, `scripts/kb-blind.py`; `map_scopes` in the question set replaces three hard-coded paths in `evaluation.rs`; refreeze the corpus fingerprint (`029288a8...`, gate unchanged); document the move in `pilot/README.md`.
+- [x] 8.5 `check` reports manifest include patterns and `knowledge_paths` globs that match no indexed file (`selection_pattern_unmatched`, `knowledge_path_unmatched`; silent when coverage is incomplete); spec delta, docs and a CI step running `check` on this repository.
+- [x] 8.6 Verify: `check --json` clean, 162 files selected; dev replay 6/8 cue hits, 0/5 gated false positives, 3/3 scenarios (same as before the move); held-out replay documentation recall@5 0.91, cue hits 9/11, 0/6 false positives; `cargo test -p querymt-agent-knowledge` 445 passed.
+
 ## Verification record (7.2)
 
 Run from the repository root on `feat/kb`; CI feature set `dashboard,oauth,remote`.

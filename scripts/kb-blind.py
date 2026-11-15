@@ -27,7 +27,7 @@ from pathlib import Path
 
 LEAK = re.compile(
     r"repo_knowledge|repository[- ]knowledge|knowledge (?:note|doc|map)|"
-    r"(?:the )?(?:repo|repository) (?:note|doc)s?\b|crates/agent/knowledge/|"
+    r"(?:the )?(?:repo|repository) (?:note|doc)s?\b|crates/[^/\\s]+/knowledge/|"
     r"marked\s+\"?unverified|docs section", re.I)
 
 

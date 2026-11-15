@@ -1,8 +1,9 @@
 # Repository-knowledge pilot (M5)
 
 Controlled, opt-in pilot of concept-first repository knowledge for three
-`crates/agent/src` subtrees: `agent/execution`, `session` and `tools`, plus the
-repository-knowledge delivery code that hooks into them. It does not enable
+subtrees of the agent crates: `agent-runtime` `agent/execution`, the `session/` modules in
+`agent-core`, `agent-runtime`, `agent-services` and `agent-sqlite`, and `agent-services` `tools`,
+plus the repository-knowledge delivery code that hooks into them. It does not enable
 anything by default and does not add per-directory inventories.
 
 ## Corpus arms
@@ -10,8 +11,8 @@ anything by default and does not add per-directory inventories.
 | Arm | What is indexed | Status |
 |-----|-----------------|--------|
 | `baseline` | Nothing (current source-navigation workflow). | Defined; only a model-backed trial can score it. |
-| `curated` | Five reviewed notes in `crates/agent/knowledge/` (one map listing, four concept notes) plus source records for the pilot subtrees, selected by `.qmt/knowledge.toml`. | Replayed offline (below). |
-| `exhaustive` | The curated corpus plus a File/Purpose row for every file. | **Not built.** Scaffolding only creates empty purpose cells (`scaffold crates/agent/src/tools` previews 8 empty rows, nothing applied); the purposes must be written and reviewed by a person. Root `AGENTS.md` is unchanged. |
+| `curated` | Five reviewed notes kept next to their crates (`crates/agent-runtime/knowledge/` map and `execution.md`, `crates/agent-services/knowledge/` `tools.md` and `sessions.md`, `crates/agent-knowledge/knowledge/repository-knowledge.md`) plus source records for the pilot subtrees, selected by `.qmt/knowledge.toml`. | Replayed offline (below). |
+| `exhaustive` | The curated corpus plus a File/Purpose row for every file. | **Not built.** Scaffolding only creates empty purpose cells (`scaffold crates/agent-services/src/tools` previews 8 empty rows, nothing applied); the purposes must be written and reviewed by a person. Root `AGENTS.md` is unchanged. |
 
 Maps are generated on demand (`map --path <dir>`) and not exported: the default
 byte budget truncates each subtree (execution 4 of 7 files shown, session 5 of
@@ -20,9 +21,10 @@ directory. No map is committed.
 
 ## Frozen inputs (`pilot/questions.toml`)
 
-- Question set version 1, refrozen 2026-11-13 at commit `b856dc8c`. The pin that
-  identifies the inputs is the corpus fingerprint:
-  `curated = 8173a8ad722347e6edb1c5e7c0cd1ced`,
+- Question set version 1, refrozen 2026-11-15 at commit `735f45d9` plus a
+  working tree (see "Re-homing after split-agent-crate"); before that 2026-11-13 at
+  `b856dc8c`. The pin that identifies the inputs is the corpus fingerprint:
+  `curated = 029288a88834b1a1cd448271e1f9831d`,
   `baseline = 354b3ec283921d37d4440b343e86c542`. The first freeze
   (`curated = b7c75bf6ae632fa484e8c5add77ff80f`, revision `42823824+worktree`)
   predates the changes listed under "Order of events".
@@ -54,6 +56,32 @@ selection changed (section choice for `index` cards, description shown only
 for a top-level citation). The gate did not change (`985e6fcb...`, v1).
 Treat the held-out figures below as a regression check on a corpus that was
 tuned after seeing live behaviour, not as an unbiased estimate.
+
+## Re-homing after split-agent-crate (2026-11-15)
+
+`querymt-agent` was split into several crates, so the notes, the code selection,
+the question expectations and the evidence file moved:
+
+- Notes now live next to the crate they describe (see the arm table). The manifest
+  selects `crates/*/knowledge/*.md` for those three crates, and the map is the
+  orientation entrypoint.
+- `[code]` selects only the files the notes explain (narrow on purpose), in
+  `agent-runtime`, `agent-core`, `agent-services`, `agent-sqlite` and
+  `agent-knowledge`.
+- The corpus fingerprint changed (`8173a8ad...` to `029288a8...`) because paths and
+  note text changed; the gate did not (`985e6fcb...`, v1).
+- `map_scopes` in `questions.toml` replaces the three directories that the harness
+  used to hard-code.
+- Dev replay after the move: default lane recall@5 0.25, cue hits 6/8, gated false
+  positives 0/5, scenarios 3/3, 162 files selected (the same as before the move).
+- Held-out replay after the move (`curated`, k = 5, one run, `--no-timing`):
+  documentation lane recall@5 0.91, MRR 0.67, wrong top hit 5 of 11; default lane
+  recall@5 0.27, MRR 0.06; cue hits 9/11, gated false positives 0/6, entrypoint
+  fallbacks 6/6, 13 gated cards (4 wrong), 2,773 added tokens; scenarios 3/3.
+  The figures in the next section are from before the move. The move changed
+  paths, note text and the corpus fingerprint, so the two sets are close but not
+  the same experiment; the new set is a regression check, not a fresh held-out
+  estimate, because the corpus was already tuned after the first held-out run.
 
 ## Commands
 

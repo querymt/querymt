@@ -79,7 +79,7 @@ enum Command {
 #[derive(Debug, Args)]
 struct EvalArgs {
     /// Frozen question set, relative to --root.
-    #[arg(long, default_value = "crates/agent/knowledge/pilot/questions.toml")]
+    #[arg(long, default_value = "crates/agent-knowledge/pilot/questions.toml")]
     questions: String,
     /// Questions to use.
     #[arg(long, value_parser = ["dev", "held-out", "all"], default_value = "dev")]

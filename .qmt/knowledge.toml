@@ -1,28 +1,41 @@
 version = 1
 
-# M5 pilot corpus: reviewed concept notes for selected crates/agent subtrees.
-# No exhaustive per-file inventory is selected here; that is an optional
-# comparison arm (see crates/agent/knowledge/pilot/README.md).
+# Pilot corpus: reviewed concept notes kept next to the crate they describe, plus
+# the source files those notes explain. No exhaustive per-file inventory is
+# selected here; that is an optional comparison arm (see
+# crates/agent-knowledge/pilot/README.md).
+#
+# Code is selected narrowly on purpose: a selected source file is what lets a
+# note attach to `index` results for that file, but broad selection fills search
+# results with symbol hits that bury the notes.
 
 [documents]
-include = ["crates/agent/knowledge/*.md", "openspec/specs/*/spec.md"]
+include = [
+  "crates/agent-runtime/knowledge/*.md",
+  "crates/agent-services/knowledge/*.md",
+  "crates/agent-knowledge/knowledge/*.md",
+  "openspec/specs/*/spec.md",
+]
 exclude = []
 
 [code]
 include = [
-  "crates/agent/src/agent/execution/*.rs",
-  "crates/agent/src/agent/repository_delivery.rs",
-  "crates/agent/src/session/*.rs",
-  "crates/agent/src/session/sqlite_storage/*.rs",
-  "crates/agent/src/tools/*.rs",
-  "crates/agent/src/tools/builtins/*.rs",
+  "crates/agent-runtime/src/agent/execution/*.rs",
+  "crates/agent-runtime/src/agent/repository_delivery.rs",
+  "crates/agent-runtime/src/knowledge/*.rs",
+  "crates/agent-runtime/src/session/*.rs",
+  "crates/agent-core/src/session/*.rs",
+  "crates/agent-services/src/session/*.rs",
+  "crates/agent-services/src/tools/*.rs",
+  "crates/agent-services/src/tools/builtins/*.rs",
+  "crates/agent-sqlite/src/session/sqlite_storage/*.rs",
   "crates/agent-knowledge/src/*.rs",
 ]
 # The evaluation harness is not part of the subject matter being documented.
 exclude = ["crates/agent-knowledge/src/evaluation.rs"]
 
 [orientation]
-entrypoints = ["crates/agent/knowledge/README.md"]
+entrypoints = ["crates/agent-runtime/knowledge/README.md"]
 # Specs stay searchable but are never attached unasked: their normative
 # wording matches ordinary requests and produced false cards.
 retrieval_only = ["openspec/specs/**"]

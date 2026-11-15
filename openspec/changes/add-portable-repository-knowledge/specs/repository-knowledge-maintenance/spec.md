@@ -67,12 +67,17 @@ The system SHALL support previewing and explicitly applying acknowledgements for
 
 ### Requirement: Maintenance checks are deterministic and non-mutating
 
-The system SHALL provide read-only checks for malformed/conflicting documents, source coverage, broken relative references, orphan file-table rows, evidence drift, orphaned evidence files, invalid entrypoints or `knowledge_paths`, and configured limits. Checking SHALL NOT rewrite content, delete rows, follow remote links, or infer a definite rename from similarity.
+The system SHALL provide read-only checks for malformed/conflicting documents, source coverage, broken relative references, orphan file-table rows, evidence drift, orphaned evidence files, invalid entrypoints or `knowledge_paths`, manifest include patterns and `knowledge_paths` globs that match no indexed file, and configured limits. Checking SHALL NOT rewrite content, delete rows, follow remote links, or infer a definite rename from similarity.
 
 #### Scenario: File is moved
 - **WHEN** a file-table row or relative Markdown reference points to a path no longer present
 - **THEN** checking reports the orphan or broken reference
 - **AND** preserves the authored row and reference for review
+
+#### Scenario: Selection no longer matches any file
+- **WHEN** a manifest include pattern or a `knowledge_paths` glob matches no indexed file, for example after files moved between directories or crates
+- **THEN** checking reports the pattern with a stable code
+- **AND** reports nothing when the crawl was cut short by a budget, because coverage is then incomplete
 
 #### Scenario: Document includes unknown metadata and an external URL
 - **WHEN** an otherwise valid document has unknown frontmatter keys and links to an external URL
