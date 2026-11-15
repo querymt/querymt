@@ -1,17 +1,17 @@
 //! Multi-agent quorum implementation
 
-use super::config::{AgentConfig, DelegateConfigBuilder, PlannerConfigBuilder};
-use super::utils::{
-    build_llm_config, default_registry, infer_required_capabilities, latest_assistant_message,
-    to_absolute_path,
-};
+use super::config::{DelegateConfigBuilder, PlannerConfigBuilder};
+use super::utils::{default_registry, latest_assistant_message, to_absolute_path};
 use crate::AgentQuorumBuilder;
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::SnapshotPolicy;
-use crate::agent::core::ToolPolicy;
-use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
+use crate::config::{QuorumConfig, resolve_tools};
 use crate::delegation::AgentInfo;
+use crate::delegation::member::{
+    DelegateBuildParams, MemberBuildSpec as AgentConfig, apply_middleware_from_config,
+    configure_delegate_builder, infer_required_capabilities,
+};
 use querymt_agent_runtime::api::callbacks::EventCallbacksState;
 
 use crate::acp::protocol::{ContentBlock, PromptRequest, TextContent};
@@ -571,6 +571,16 @@ impl QuorumBuilder {
             .iter()
             .map(|delegate| delegate.id.clone())
             .collect();
+        let delegate_params = Arc::new(DelegateBuildParams {
+            plugin_registry: registry.clone(),
+            snapshot_policy: self.snapshot_policy,
+            skills_project_root: skills_project_root.clone(),
+            wait_policy: self.delegation_wait_policy.clone(),
+            wait_timeout_secs: self.delegation_wait_timeout_secs,
+            cancel_grace_secs: self.delegation_cancel_grace_secs,
+            workspace_service: workspace_service.clone(),
+            repository_knowledge: repository_knowledge.clone(),
+        });
         for delegate in self.delegates {
             let agent_info = AgentInfo {
                 isolation: delegate.isolation,
@@ -581,81 +591,12 @@ impl QuorumBuilder {
                 required_capabilities: delegate.required_capabilities.clone(),
                 meta: None,
             };
-            let llm_config = build_llm_config(&delegate)?;
-            let tools = delegate.tools.clone();
-            let delegate_mcp_servers = delegate.mcp_servers.clone();
-            let middleware_entries = delegate.middleware.clone();
-            let delegate_mode = delegate.mode;
-            let exec = delegate.execution.clone();
-            let skills = delegate.skills.clone();
-            let skills_project_root_for_delegate = skills_project_root.clone();
-            let delegate_permissions = delegate.permissions.clone();
-            let registry = registry.clone();
-            let delegate_agent_id = delegate.id.clone();
-            let snapshot_policy_for_delegate = self.snapshot_policy;
-            let delegation_wait_policy_for_delegate = self.delegation_wait_policy.clone();
-            let delegation_wait_timeout_for_delegate = self.delegation_wait_timeout_secs;
-            let delegation_cancel_grace_for_delegate = self.delegation_cancel_grace_secs;
-            let workspace_for_delegate = workspace_service.clone();
-            let repository_for_delegate = repository_knowledge.clone();
+            delegate.llm_params()?;
+            let params = delegate_params.clone();
             builder = builder.add_delegate_agent(agent_info, move |storage, event_fanout| {
-                let mut b =
-                    AgentConfigBuilder::new(registry.clone(), storage.clone(), llm_config.clone())
-                        .with_agent_id(delegate_agent_id.clone())
-                        .with_tool_policy(ToolPolicy::BuiltInOnly)
-                        .with_snapshot_policy(snapshot_policy_for_delegate)
-                        .with_event_fanout(event_fanout);
-
-                if snapshot_policy_for_delegate != SnapshotPolicy::None {
-                    b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
-                }
-
-                if let Some(skills) = skills.as_ref()
-                    && skills.enabled
-                    && (tools.is_empty()
-                        || tools
-                            .iter()
-                            .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME)))
-                {
-                    b = b.with_skill_catalog(crate::skills::SkillCatalog::from_config(
-                        skills,
-                        &skills_project_root_for_delegate,
-                    ));
-                }
-
-                // Infer the policy like the single-agent path: any external
-                // tool spec, resolved MCP selection or attached MCP server
-                // needs BuiltInAndProvider so MCP tools and skills reach the
-                // LLM, even when the tool list is empty; otherwise
-                // BuiltInOnly is sufficient.
-                let policy = crate::agent::tools::infer_restricted_tool_policy(
-                    &tools,
-                    &delegate_mcp_servers,
+                let config = Arc::new(
+                    configure_delegate_builder(&delegate, &params, storage, event_fanout)?.build(),
                 );
-                b = b.with_tool_policy(policy);
-                if !tools.is_empty() {
-                    b = b.with_allowed_tools(tools.clone());
-                }
-
-                // Attach resolved MCP servers through the existing lifecycle.
-                if !delegate_mcp_servers.is_empty() {
-                    b = b.with_mcp_servers(delegate_mcp_servers.clone());
-                }
-
-                b = b
-                    .with_agent_mode(delegate_mode)
-                    .with_snapshot_from_execution(&exec)
-                    .with_delegation_wait_policy(delegation_wait_policy_for_delegate.clone())
-                    .with_delegation_wait_timeout_secs(delegation_wait_timeout_for_delegate)
-                    .with_delegation_cancel_grace_secs(delegation_cancel_grace_for_delegate)
-                    .with_permissions(delegate_permissions.clone());
-                apply_middleware_from_config(&mut b, &middleware_entries)?;
-                if let Some(service) = workspace_for_delegate.clone() {
-                    b = b.with_workspace_service(service);
-                }
-                b = b.with_repository_knowledge(repository_for_delegate.clone());
-
-                let config = Arc::new(b.build());
                 Ok(Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>)
             });
         }
@@ -708,27 +649,14 @@ impl QuorumBuilder {
             for plan in plans.plans.values() {
                 let info = plan.info.clone();
                 let target_plan = plan.clone();
-                let factory: Arc<dyn crate::dotagents::ProtocolTargetFactory> = Arc::new(
+                let factory = Arc::new(
                     super::DotagentsTargetFactory::new(registry.clone(), backend.clone())
                         .with_skills(planner_config.skills.clone(), skills_project_root.clone()),
                 );
-                let registry_for_fallback = registry.clone();
                 builder = builder.add_delegate_agent(
                     info,
-                    move |_storage: Arc<dyn StorageBackend>, _event_fanout| match factory
-                        .create(&target_plan)
-                    {
-                        Some(handle) => Ok(handle),
-                        None => Ok(Arc::new(AgentHandle::from_config(Arc::new(
-                            AgentConfigBuilder::new(
-                                registry_for_fallback.clone(),
-                                _storage.clone(),
-                                querymt::LLMParams::new(),
-                            )
-                            .with_agent_id(target_plan.id.clone())
-                            .with_event_fanout(_event_fanout)
-                            .build(),
-                        ))) as Arc<dyn AgentHandleTrait>),
+                    move |storage: Arc<dyn StorageBackend>, event_fanout| {
+                        Ok(factory.create_or_bare(&target_plan, storage, event_fanout))
                     },
                 );
             }
@@ -813,7 +741,7 @@ impl QuorumBuilder {
         let schedule_repo_for_planner = backend.schedule_repository();
         let knowledge_store_for_planner = backend.knowledge_store();
 
-        let planner_llm = build_llm_config(&planner_config)?;
+        let planner_llm = planner_config.llm_params()?;
         let planner_tools = planner_config.tools.clone();
         let planner_mcp_servers = planner_config.mcp_servers.clone();
         let planner_middleware = planner_config.middleware.clone();
@@ -1429,48 +1357,10 @@ fn merge_dotagents_mcp_servers(
     diagnostics
 }
 
-/// Applies middleware from config entries (plus the shared defaults) to a builder.
-///
-/// Uses the same assembly path as `AgentBuilder::build`, so an invalid entry
-/// fails identically for single agents, planners and delegates.
-///
-/// # Errors
-///
-/// Fails when an entry has an unknown type or invalid configuration.
-fn apply_middleware_from_config(
-    builder: &mut AgentConfigBuilder,
-    entries: &[MiddlewareEntry],
-) -> anyhow::Result<()> {
-    use crate::agent::agent_config_builder::AgentConfigBuilder;
-    use crate::config::RuntimeExecutionPolicy;
-
-    // Lightweight snapshot of the config built so far: factories only read the
-    // compaction policy, event journal/sink and tool registry from it.
-    let ephemeral_policy = RuntimeExecutionPolicy {
-        compaction: builder.compaction_config().clone(),
-        ..Default::default()
-    };
-    let factory_config = AgentConfigBuilder::from_provider(
-        builder.storage().clone(),
-        builder.provider().clone(),
-        builder.event_journal(),
-    )
-    .with_agent_registry(builder.agent_registry())
-    .with_execution_policy(ephemeral_policy)
-    .with_tool_registry(builder.tool_registry_snapshot())
-    .build();
-
-    let existing = builder.middleware_snapshot();
-    for driver in crate::middleware::build_from_entries(entries, &existing, &factory_config)? {
-        builder.push_middleware(driver);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::core::AgentMode;
+    use crate::agent::core::{AgentMode, ToolPolicy};
     #[cfg(feature = "remote")]
     use crate::agent::remote::test_helpers::fixtures::{get_test_mesh, random_node_id};
     use crate::config::McpServerConfig;

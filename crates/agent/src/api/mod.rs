@@ -60,7 +60,6 @@
 mod agent;
 mod config;
 mod dotagents_runtime;
-mod dotagents_targets;
 mod profiles;
 mod quorum;
 mod utils;
@@ -72,7 +71,6 @@ pub use querymt_agent_runtime::api::{mesh, sessions};
 // Re-export public API types
 pub use agent::{Agent, AgentBuilder, AgentInfra};
 pub use config::{DelegateConfigBuilder, PlannerConfigBuilder};
-pub use dotagents_targets::DotagentsTargetFactory;
 pub use profiles::{AgentProfiles, ProfileRuntimeHandle};
 pub use querymt_agent_runtime::api::AgentSession;
 pub use querymt_agent_runtime::api::sessions::AcpSessionListError;
@@ -84,6 +82,7 @@ pub use querymt_agent_runtime::api::sessions::{
     SessionListPageWithLifecycle, SessionMeta, SessionSummary, SessionSummaryWithLifecycle,
 };
 pub use querymt_agent_runtime::api::{AgentMesh, Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec};
+pub use querymt_agent_runtime::dotagents::DotagentsTargetFactory;
 pub use quorum::QuorumBuilder;
 pub use worktrees::{AgentWorktrees, SessionOptions};
 

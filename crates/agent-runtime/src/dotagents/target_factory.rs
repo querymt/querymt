@@ -90,6 +90,32 @@ impl DotagentsTargetFactory {
     }
 }
 
+impl DotagentsTargetFactory {
+    /// Builds the target, or a bare handle for the plan's ID when the target
+    /// cannot be built (a preset that failed was diagnosed at plan time).
+    /// The handle is built on the given storage and event stream.
+    pub fn create_or_bare(
+        &self,
+        plan: &DotagentsSubAgentPlan,
+        storage: Arc<dyn StorageBackend>,
+        event_fanout: Arc<querymt_agent_services::event_fanout::EventFanout>,
+    ) -> Arc<dyn AgentHandleTrait> {
+        match self.create(plan) {
+            Some(handle) => handle,
+            None => Arc::new(LocalAgentHandle::from_config(Arc::new(
+                AgentConfigBuilder::new(
+                    self.plugin_registry.clone(),
+                    storage,
+                    querymt::LLMParams::new(),
+                )
+                .with_agent_id(plan.id.clone())
+                .with_event_fanout(event_fanout)
+                .build(),
+            ))),
+        }
+    }
+}
+
 impl ProtocolTargetFactory for DotagentsTargetFactory {
     fn create(&self, plan: &DotagentsSubAgentPlan) -> Option<Arc<dyn AgentHandleTrait>> {
         let mut params = querymt::LLMParams::new();

@@ -229,7 +229,7 @@ impl AgentBuilder {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        (self.tools, self.tool_error) = super::config::parse_tool_specs(tools);
+        (self.tools, self.tool_error) = crate::delegation::member::parse_tool_specs(tools);
         self
     }
 

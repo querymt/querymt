@@ -18,6 +18,9 @@ files it names.
 | [execution.md](execution.md) | How one prompt turns into model requests, tool calls, compaction and a final stop (`crates/agent-runtime/src/agent/execution`). |
 | [tools.md](../../agent-services/knowledge/tools.md) | How tools are defined, normalized, validated, scheduled and permitted (`crates/agent-services/src/tools`). |
 | [sessions.md](../../agent-services/knowledge/sessions.md) | How sessions, events and history are stored, pruned, compacted and leased (`session/` in `agent-core`, `agent-runtime`, `agent-services` and `agent-sqlite`). |
+| [config.md](config.md) | How an agent TOML config is loaded, interpolated, validated and anchored; tool selectors, permissions and quorum settings (`crates/agent-runtime/src/config`, `crates/agent-core/src/config`). |
+| [delegation.md](delegation.md) | How a delegation is claimed, run in a child session or isolated worktree, summarized, verified, completed or cancelled (`crates/agent-runtime/src/delegation`). |
+| [profiles.md](../../agent/knowledge/profiles.md) | How named agent profiles are cataloged, validated, materialized into runtimes, hot-reloaded and bound to sessions (`crates/agent/src/profiles.rs`, `crates/agent-runtime/src/profile_host.rs`). |
 | [repository-knowledge.md](../../agent-knowledge/knowledge/repository-knowledge.md) | How repository knowledge is wired into prompts and `index` results (`crates/agent-knowledge`, `crates/agent-runtime/src/agent/repository_delivery.rs`). |
 
 Conventions used by the notes:

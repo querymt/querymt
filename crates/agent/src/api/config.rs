@@ -1,90 +1,21 @@
 //! Agent configuration types for the simple builder API
 
-use super::utils::infer_required_capabilities;
 use crate::agent::core::AgentMode;
-use crate::config::{
-    ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, Permissions, SkillsConfig,
-    ToolSpec, ToolSpecError,
-};
-use crate::tools::CapabilityRequirement;
+use crate::config::{Permissions, SkillsConfig};
+use crate::delegation::member::{MemberBuildSpec, infer_required_capabilities, parse_tool_specs};
 use crate::worktree::DelegationIsolation;
 use querymt::{LLMParams, chat::ReasoningEffort};
 use serde_json::Value;
 
-/// Parses tool selectors; keeps the valid ones and the first error.
-pub(super) fn parse_tool_specs<I, S>(tools: I) -> (Vec<ToolSpec>, Option<ToolSpecError>)
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let mut specs = Vec::new();
-    let mut error = None;
-    for tool in tools {
-        match tool.as_ref().parse() {
-            Ok(spec) => specs.push(spec),
-            Err(e) => {
-                error.get_or_insert(e);
-            }
-        }
-    }
-    (specs, error)
-}
-
-/// Internal configuration for building agents
-#[derive(Clone)]
-pub(super) struct AgentConfig {
-    pub id: String,
-    pub llm_config: Option<LLMParams>,
-    pub capabilities: Vec<String>,
-    pub tools: Vec<ToolSpec>,
-    /// First malformed selector passed to `tools(..)`; reported by `build()`.
-    pub tool_error: Option<ToolSpecError>,
-    pub description: Option<String>,
-    pub required_capabilities: Vec<CapabilityRequirement>,
-    pub middleware: Vec<MiddlewareEntry>,
-    pub execution: ExecutionPolicy,
-    pub skills: Option<SkillsConfig>,
-    pub mode: AgentMode,
-    pub permissions: Permissions,
-    pub hooks: HooksConfig,
-    /// MCP servers resolved for this agent, attached to its runtime through the
-    /// existing stdio and streamable-http transports.
-    pub mcp_servers: Vec<McpServerConfig>,
-    /// Configured isolation for tasks delegated to this agent.
-    pub isolation: DelegationIsolation,
-}
-
-impl AgentConfig {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            llm_config: None,
-            capabilities: Vec::new(),
-            tools: Vec::new(),
-            tool_error: None,
-            description: None,
-            required_capabilities: Vec::new(),
-            middleware: Vec::new(),
-            execution: ExecutionPolicy::default(),
-            skills: None,
-            mode: AgentMode::default(),
-            permissions: Permissions::default(),
-            hooks: HooksConfig::default(),
-            mcp_servers: Vec::new(),
-            isolation: DelegationIsolation::default(),
-        }
-    }
-}
-
 /// Builder for configuring a planner agent
 pub struct PlannerConfigBuilder {
-    pub(super) config: AgentConfig,
+    pub(super) config: MemberBuildSpec,
 }
 
 impl PlannerConfigBuilder {
     pub(super) fn new() -> Self {
         Self {
-            config: AgentConfig::new("planner"),
+            config: MemberBuildSpec::new("planner"),
         }
     }
 
@@ -168,20 +99,20 @@ impl PlannerConfigBuilder {
         self
     }
 
-    pub(super) fn build(self) -> AgentConfig {
+    pub(super) fn build(self) -> MemberBuildSpec {
         self.config
     }
 }
 
 /// Builder for configuring a delegate agent
 pub struct DelegateConfigBuilder {
-    pub(super) config: AgentConfig,
+    pub(super) config: MemberBuildSpec,
 }
 
 impl DelegateConfigBuilder {
     pub(super) fn new(id: impl Into<String>) -> Self {
         Self {
-            config: AgentConfig::new(id),
+            config: MemberBuildSpec::new(id),
         }
     }
 
@@ -286,7 +217,7 @@ impl DelegateConfigBuilder {
         self
     }
 
-    pub(super) fn build(mut self) -> AgentConfig {
+    pub(super) fn build(mut self) -> MemberBuildSpec {
         // Auto-infer required_capabilities from tools
         self.config.required_capabilities = infer_required_capabilities(&self.config.tools)
             .into_iter()
@@ -297,12 +228,11 @@ impl DelegateConfigBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::super::utils::build_llm_config;
     use super::*;
 
     #[test]
     fn test_delegate_system_prompt_stored() {
-        let mut config = AgentConfig::new("test-delegate");
+        let mut config = MemberBuildSpec::new("test-delegate");
         config.llm_config = Some(
             LLMParams::new()
                 .provider("openai")
@@ -310,7 +240,7 @@ mod tests {
                 .system("You are a helpful assistant."),
         );
 
-        let result = build_llm_config(&config).unwrap();
+        let result = config.llm_params().unwrap();
         assert_eq!(
             result.system,
             vec!["You are a helpful assistant.".to_string()]
