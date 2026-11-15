@@ -26,7 +26,8 @@ use super::kit::ButtonExt as _;
 use super::start::{badged_tone, mode_tone, model_toolbar_button, reasoning_color, toolbar_button};
 use super::{Page, QmtApp, kit};
 use crate::session::{
-    Diff, Item, ItemKind, SelectOption, SessionView, ToolCall, UserAttachment, WorkEntry,
+    COMPACTING_LABEL, Compaction, CompactionStatus, Diff, Item, ItemKind, SelectOption,
+    SessionView, ToolCall, UserAttachment, WorkEntry, is_compact_command,
 };
 use crate::store::SessionSummary;
 use crate::theme::{Palette, palette};
@@ -61,6 +62,9 @@ const COPIED_TITLE_PATH: &str = "@title-path";
 const COPIED_TITLE_ID: &str = "@title-id";
 const COPIED_MENU_PATH: &str = "@menu-path";
 const COPIED_MENU_ID: &str = "@menu-id";
+/// Copied flash key and expanded-state key of the load-error report.
+const COPIED_ERROR_DETAILS: &str = "@load-error-details";
+const ERROR_DETAILS_KEY: &str = "@load-error-details-open";
 
 /// Desktop `.copy-chip-copied`: an accent check + "copied" laid over the chip,
 /// at least as wide as it (so it hides the label), growing if the label is shorter.
@@ -1911,6 +1915,7 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
             })
             .child(text.clone())
             .into_any_element(),
+        ItemKind::Compaction(c) => render_compaction(item, c, rc),
     };
     // Turns rolled back by an undo stay visible, dimmed, until the next prompt.
     let reverted = rc.reverted_from.is_some_and(|r| ix >= r);
@@ -1943,7 +1948,7 @@ fn turn_users(items: &[Item]) -> HashMap<usize, String> {
                 user = Some(&item.key);
             }
             ItemKind::Agent { .. } | ItemKind::Work(_) => last = Some(ix),
-            ItemKind::Notice { .. } => {}
+            ItemKind::Notice { .. } | ItemKind::Compaction(_) => {}
         }
     }
     flush(user, &mut last);
@@ -1963,16 +1968,137 @@ fn turn_ends(items: &[Item]) -> HashMap<usize, (usize, usize, usize)> {
         match item.kind {
             ItemKind::User { .. } => flush(&mut last, &mut out),
             ItemKind::Agent { .. } | ItemKind::Work(_) => last = Some(ix),
-            ItemKind::Notice { .. } => {}
+            ItemKind::Notice { .. } | ItemKind::Compaction(_) => {}
         }
     }
     flush(&mut last, &mut out);
     out
 }
 
+/// Context-compaction divider (desktop `SessionCompactionDivider`): a rule
+/// with status, token counts and an expandable summary.
+fn render_compaction(item: &Item, c: &Compaction, rc: &RenderCtx) -> AnyElement {
+    let p = &rc.p;
+    let running = c.status == CompactionStatus::InProgress;
+    let (tone, mark): (Hsla, AnyElement) = match c.status {
+        CompactionStatus::InProgress => (
+            p.muted,
+            kit::spinner(SharedString::from(format!("cspin-{}", c.id)), 13., p.accent)
+                .into_any_element(),
+        ),
+        CompactionStatus::Failed => (
+            p.danger,
+            kit::icon(IconName::TriangleAlert, 13., p.danger).into_any_element(),
+        ),
+        CompactionStatus::Cancelled => (
+            p.dim,
+            kit::icon(IconName::FoldVertical, 13., p.dim).into_any_element(),
+        ),
+        CompactionStatus::Completed => (
+            p.muted,
+            kit::icon(IconName::FoldVertical, 13., p.muted).into_any_element(),
+        ),
+    };
+    let has_summary = !c.summary.trim().is_empty();
+    let open = has_summary && rc.expanded.contains(&item.key);
+    let rule = || div().flex_1().h(px(1.)).bg(p.border);
+    let (hover_fg, weak, key) = (p.text, rc.weak.clone(), item.key.clone());
+    let header = h_flex()
+        .w_full()
+        .gap_2()
+        .child(rule())
+        .child(
+            h_flex()
+                .flex_none()
+                .max_w(relative(0.8))
+                .gap_1p5()
+                .text_xs()
+                .child(mark)
+                .child(
+                    div()
+                        .font_semibold()
+                        .text_color(if running { p.text } else { tone })
+                        .child(c.title()),
+                )
+                .children(c.detail().map(|d| {
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(if c.status == CompactionStatus::Failed {
+                            p.danger
+                        } else {
+                            p.dim
+                        })
+                        .child(d)
+                }))
+                .when(has_summary, |el| {
+                    el.child(
+                        h_flex()
+                            .id(SharedString::from(format!("ctoggle-{}", item.key)))
+                            .gap_0p5()
+                            .px_1()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .text_color(p.dim)
+                            .hover(move |s| s.text_color(hover_fg))
+                            .child(if open { "Hide summary" } else { "Show summary" })
+                            .child(kit::icon(
+                                if open {
+                                    IconName::ChevronUp
+                                } else {
+                                    IconName::ChevronDown
+                                },
+                                12.,
+                                p.dim,
+                            ))
+                            .on_click(move |_, _, cx| toggle_expanded(&weak, key.clone(), cx)),
+                    )
+                }),
+        )
+        .child(rule());
+    // Streaming summaries stay plain text until settled, like live replies.
+    let summary = open.then(|| {
+        let body = if running {
+            div()
+                .text_sm()
+                .text_color(p.muted)
+                .child(c.summary.clone())
+                .into_any_element()
+        } else {
+            div()
+                .text_sm()
+                .child(TextView::markdown(
+                    SharedString::from(format!("cmd-{}", item.key)),
+                    c.summary.clone(),
+                ))
+                .into_any_element()
+        };
+        div()
+            .mt_2()
+            .px_4()
+            .py_3()
+            .rounded(px(10.))
+            .bg(p.card)
+            .child(body)
+    });
+    v_flex()
+        .w_full()
+        .py_1()
+        .child(header)
+        .children(summary)
+        .into_any_element()
+}
+
 /// What the agent is doing right now, for the activity bar.
 fn activity(view: &SessionView) -> (String, Option<String>) {
+    // The runtime only knows the turn is busy; the compaction knows why.
+    if view.active_compaction().is_some() {
+        return (COMPACTING_LABEL.into(), None);
+    }
     match view.items.last().map(|i| &i.kind) {
+        Some(ItemKind::User {
+            text, local: true, ..
+        }) if is_compact_command(text) => (COMPACTING_LABEL.into(), None),
         Some(ItemKind::Work(entries)) => match entries.last() {
             Some(WorkEntry::Tool(call)) if call.running() => {
                 let more = entries
@@ -3272,6 +3398,7 @@ impl QmtApp {
         let running = view.running();
         let loading = view.loading;
         let error = view.error.clone();
+        let error_details = view.error_details.clone();
         let history_more = view.history_more;
         let history_loading = view.history_loading;
         let history_error = view.history_error.clone();
@@ -3379,6 +3506,69 @@ impl QmtApp {
                 .child("Loading transcript…")
                 .into_any_element()
         } else if let Some(err) = error.clone().filter(|_| empty) {
+            let details_open = self.expanded_items.contains(ERROR_DETAILS_KEY);
+            let copied = self.copied.as_deref() == Some(COPIED_ERROR_DETAILS);
+            let details_panel = error_details.clone().filter(|_| details_open).map(|text| {
+                div()
+                    .id("load-error-details")
+                    .w_full()
+                    .max_w(px(CHAT_MAX))
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .px_4()
+                    .py_3()
+                    .rounded(px(10.))
+                    .bg(p.card)
+                    .border_1()
+                    .border_color(p.border)
+                    .font_family(kit::MONO)
+                    .text_xs()
+                    .text_color(p.muted)
+                    .whitespace_normal()
+                    .children(
+                        text.lines()
+                            .map(|l| div().min_h(px(14.)).child(l.to_string()))
+                            .collect::<Vec<_>>(),
+                    )
+            });
+            let actions = h_flex()
+                .gap_2()
+                .child(
+                    kit::button("retry-load")
+                        .label("Retry")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.store.update(cx, |s, cx| s.reload_session(cx))
+                        })),
+                )
+                .when_some(error_details.clone(), |el, text| {
+                    el.child(
+                        kit::button("toggle-load-error-details")
+                            .label(if details_open {
+                                "Hide details"
+                            } else {
+                                "Show details"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if !this.expanded_items.remove(ERROR_DETAILS_KEY) {
+                                    this.expanded_items.insert(ERROR_DETAILS_KEY.into());
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        kit::button("copy-load-error-details")
+                            .icon(if copied {
+                                IconName::Check
+                            } else {
+                                IconName::Copy
+                            })
+                            .label(if copied { "Copied" } else { "Copy details" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                                this.flash_copied(COPIED_ERROR_DETAILS.into(), cx);
+                            })),
+                    )
+                });
             v_flex()
                 .flex_1()
                 .items_center()
@@ -3389,13 +3579,8 @@ impl QmtApp {
                 .text_color(p.danger)
                 .child(kit::icon(IconName::CircleAlert, 18., p.danger))
                 .child(div().text_center().child(err))
-                .child(
-                    kit::button("retry-load")
-                        .label("Retry")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.store.update(cx, |s, cx| s.reload_session(cx))
-                        })),
-                )
+                .child(actions)
+                .children(details_panel)
                 .into_any_element()
         } else if empty {
             v_flex()

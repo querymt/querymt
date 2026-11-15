@@ -430,6 +430,221 @@ pub enum ItemKind {
         text: String,
         error: bool,
     },
+    /// Context-compaction boundary (desktop `SessionCompactionDivider`).
+    Compaction(Box<Compaction>),
+}
+
+/// Lifecycle of a context compaction (ACP `compaction_update.status`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CompactionStatus {
+    #[default]
+    InProgress,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl CompactionStatus {
+    fn parse(status: Option<&str>) -> Self {
+        match status {
+            Some("completed") => Self::Completed,
+            Some("failed") => Self::Failed,
+            Some("cancelled") => Self::Cancelled,
+            _ => Self::InProgress,
+        }
+    }
+}
+
+/// One context compaction, shown as a divider in the transcript.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Compaction {
+    pub id: String,
+    pub status: CompactionStatus,
+    /// Summary that replaced the compacted context (streams while running).
+    pub summary: String,
+    pub error: Option<String>,
+    /// Context tokens when the compaction started.
+    pub tokens_before: Option<u64>,
+    /// Context tokens after it completed.
+    pub tokens_after: Option<u64>,
+    /// Completed live: the next `usage_update` carries the reduced context size.
+    awaiting_usage: bool,
+}
+
+pub const COMPACTING_LABEL: &str = "Compacting context…";
+
+/// True for the native `/compact [instructions]` command.
+pub fn is_compact_command(prompt: &str) -> bool {
+    let p = prompt.trim_start();
+    p.get(..8)
+        .is_some_and(|head| head.eq_ignore_ascii_case("/compact"))
+        && p[8..].chars().next().is_none_or(char::is_whitespace)
+}
+
+/// `12`, `950`, `12.5k`, `120k` (desktop `formatTokens`).
+fn format_tokens(value: u64) -> String {
+    if value < 1000 {
+        return value.to_string();
+    }
+    let k = value as f64 / 1000.;
+    if k >= 100. {
+        format!("{}k", k.round())
+    } else {
+        let k = (k * 10.).round() / 10.;
+        if k.fract() == 0. {
+            format!("{k:.0}k")
+        } else {
+            format!("{k:.1}k")
+        }
+    }
+}
+
+impl Compaction {
+    pub fn title(&self) -> &'static str {
+        match self.status {
+            CompactionStatus::InProgress => COMPACTING_LABEL,
+            CompactionStatus::Completed => "Context compacted",
+            CompactionStatus::Failed => "Compaction failed",
+            CompactionStatus::Cancelled => "Compaction cancelled",
+        }
+    }
+
+    /// Secondary text next to the title: token counts, or the failure reason.
+    pub fn detail(&self) -> Option<String> {
+        match self.status {
+            CompactionStatus::InProgress => self
+                .tokens_before
+                .map(|b| format!("{} tokens in context", format_tokens(b))),
+            CompactionStatus::Failed => self.error.clone().filter(|e| !e.is_empty()),
+            CompactionStatus::Cancelled => None,
+            CompactionStatus::Completed => match (self.tokens_before, self.tokens_after) {
+                (Some(b), Some(a)) => Some(format!(
+                    "{} → {} tokens",
+                    format_tokens(b),
+                    format_tokens(a)
+                )),
+                (None, Some(a)) => Some(format!("{} tokens remaining", format_tokens(a))),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// Where a compaction from the history audit sits in the transcript: after
+/// the item it followed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CompactionAnchor {
+    /// User or agent message item key.
+    Item(String),
+    /// Tool call id (resolved to its work group).
+    Tool(String),
+}
+
+/// Fold the compaction lifecycle events of a raw history (`compaction_start`,
+/// `compaction_summary_chunk`, `compaction_end`, `compaction_failed`), each
+/// with the transcript item it followed. Legacy records without an id pair
+/// their terminal with the latest open start, like the desktop app.
+fn fold_compactions(events: &[Value]) -> Vec<(Option<CompactionAnchor>, Compaction)> {
+    let mut out: Vec<(Option<CompactionAnchor>, Compaction)> = Vec::new();
+    let mut anchor: Option<CompactionAnchor> = None;
+    let mut used: Option<u64> = None;
+    let mut open_legacy: Option<String> = None;
+    for (n, ev) in events.iter().enumerate() {
+        let kind = ev
+            .pointer("/kind/type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let data = ev.pointer("/kind/data").unwrap_or(&Value::Null);
+        let s = |k: &str| {
+            data.get(k)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+        };
+        match kind {
+            "prompt_received" | "assistant_message_stored" => {
+                if let Some(id) = s("message_id") {
+                    anchor = Some(CompactionAnchor::Item(id.to_string()));
+                }
+            }
+            "tool_call_start" | "tool_call_end" => {
+                if let Some(id) = s("tool_call_id") {
+                    anchor = Some(CompactionAnchor::Tool(id.to_string()));
+                }
+            }
+            "llm_request_end" => {
+                if let Some(c) = data.get("context_tokens").and_then(Value::as_u64) {
+                    used = Some(c);
+                }
+            }
+            "compaction_start"
+            | "compaction_summary_chunk"
+            | "compaction_end"
+            | "compaction_failed" => {
+                let id = match s("compaction_id") {
+                    Some(id) => id.to_string(),
+                    None => {
+                        if kind == "compaction_start" || open_legacy.is_none() {
+                            let seq = ev.get("seq").and_then(Value::as_i64).unwrap_or(n as i64);
+                            open_legacy = Some(format!("querymt-compaction-legacy-{seq}"));
+                        }
+                        open_legacy.clone().unwrap_or_default()
+                    }
+                };
+                let at = match out.iter().position(|(_, c)| c.id == id) {
+                    Some(at) => at,
+                    None => {
+                        out.push((
+                            anchor.clone(),
+                            Compaction {
+                                id: id.clone(),
+                                tokens_before: used,
+                                ..Default::default()
+                            },
+                        ));
+                        out.len() - 1
+                    }
+                };
+                let c = &mut out[at].1;
+                match kind {
+                    "compaction_summary_chunk" => {
+                        c.summary.push_str(s("content").unwrap_or_default())
+                    }
+                    "compaction_end" => {
+                        c.status = CompactionStatus::Completed;
+                        if let Some(summary) = s("summary") {
+                            c.summary = summary.to_string();
+                        }
+                        if let Some(after) = data.get("context_tokens").and_then(Value::as_u64) {
+                            c.tokens_after = Some(after);
+                            used = Some(after);
+                        }
+                    }
+                    "compaction_failed" => {
+                        let cancelled = data
+                            .get("cancelled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if cancelled {
+                            c.status = CompactionStatus::Cancelled;
+                            c.error = None;
+                        } else {
+                            c.status = CompactionStatus::Failed;
+                            c.error = s("reason").map(str::to_owned);
+                        }
+                    }
+                    _ => {}
+                }
+                if kind != "compaction_start"
+                    && kind != "compaction_summary_chunk"
+                    && s("compaction_id").is_none()
+                {
+                    open_legacy = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug)]
@@ -469,6 +684,8 @@ pub struct SessionView {
     pub items: Vec<Item>,
     pub loading: bool,
     pub error: Option<String>,
+    /// Copyable diagnostic report behind `error` (request, raw agent error).
+    pub error_details: Option<String>,
     /// Runtime phase reported by the agent (`idle`, `running`, …).
     pub phase: String,
     /// A prompt sent from this client is in flight.
@@ -597,44 +814,9 @@ fn replay_updates(ev: &Value) -> Vec<Value> {
     let data = ev.pointer("/kind/data").cloned().unwrap_or(Value::Null);
     let s = |k: &str| data.get(k).and_then(Value::as_str).map(str::to_owned);
     match kind {
-        "prompt_received" => vec![json!({
-            "sessionUpdate": "user_message_chunk",
-            "messageId": s("message_id"),
-            "content": { "type": "text", "text": s("content").unwrap_or_default() },
-        })],
-        "assistant_message_stored" => {
-            let mut out = Vec::new();
-            let message_id = s("message_id");
-            if message_id.is_some() {
-                for part in data
-                    .get("reasoning_parts")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
-                    if !text.is_empty() {
-                        out.push(json!({
-                            "sessionUpdate": "agent_thought_chunk",
-                            "messageId": message_id,
-                            "content": { "type": "text", "text": text },
-                        }));
-                    }
-                }
-            }
-            let content = s("content").unwrap_or_default();
-            if !content.is_empty() {
-                out.push(json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "messageId": message_id,
-                    "content": { "type": "text", "text": content },
-                }));
-            }
-            out
-        }
         "tool_call_start" => {
             let name = s("tool_name").unwrap_or_default();
-            if name == "todowrite" {
+            if is_todo_write(&name) {
                 return vec![];
             }
             let args = s("arguments")
@@ -651,7 +833,7 @@ fn replay_updates(ev: &Value) -> Vec<Value> {
         }
         "tool_call_end" => {
             let name = s("tool_name").unwrap_or_default();
-            if name == "todowrite" {
+            if is_todo_write(&name) {
                 return vec![];
             }
             let failed = data
@@ -669,6 +851,53 @@ fn replay_updates(ev: &Value) -> Vec<Value> {
         }
         _ => vec![],
     }
+}
+
+fn is_todo_write(name: &str) -> bool {
+    matches!(name, "todowrite" | "mcp_todowrite")
+}
+
+/// Plan entries of a `todowrite` call's arguments (cancelled entries omitted,
+/// as in the agent's ACP projection).
+fn todo_plan(arguments: &str) -> Option<Vec<PlanEntry>> {
+    let parsed: Value = serde_json::from_str(arguments).ok()?;
+    Some(
+        parsed
+            .get("todos")?
+            .as_array()?
+            .iter()
+            .filter_map(|t| {
+                let status = t.get("status")?.as_str()?;
+                matches!(status, "pending" | "in_progress" | "completed").then(|| PlanEntry {
+                    content: t
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .into(),
+                    status: status.into(),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Text and attachments of a user prompt's content blocks.
+fn prompt_parts(blocks: &[Value]) -> (String, Vec<UserAttachment>) {
+    let mut text = String::new();
+    let mut attachments = Vec::new();
+    for block in blocks {
+        if let Some(a) = UserAttachment::from_block(block) {
+            attachments.push(a);
+        } else if block.get("type").and_then(Value::as_str) == Some("text") {
+            text.push_str(
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    (text, attachments)
 }
 
 fn content_text(content: &Value) -> String {
@@ -695,6 +924,184 @@ impl SessionView {
 
     pub fn running(&self) -> bool {
         self.prompting || (!self.phase.is_empty() && self.phase != "idle")
+    }
+
+    /// The compaction currently running, if any.
+    pub fn active_compaction(&self) -> Option<&Compaction> {
+        self.items.iter().rev().find_map(|i| match &i.kind {
+            ItemKind::Compaction(c) if c.status == CompactionStatus::InProgress => Some(&**c),
+            _ => None,
+        })
+    }
+
+    /// Index of the compaction item `id`, created (in progress) when unseen.
+    fn ensure_compaction(&mut self, id: &str) -> usize {
+        let key = format!("compaction-{id}");
+        if let Some(ix) = self.items.iter().position(|i| i.key == key) {
+            return ix;
+        }
+        let compaction = Compaction {
+            id: id.to_string(),
+            tokens_before: self.usage.map(|u| u.0),
+            ..Default::default()
+        };
+        self.push(key, ItemKind::Compaction(Box::new(compaction)));
+        self.items.len() - 1
+    }
+
+    /// Live `compaction_update`. `summary` and `error` patch: omitted keeps the
+    /// value, null clears it. A settled compaction is never reopened.
+    fn apply_compaction_update(&mut self, update: &Value) {
+        let Some(id) = update.get("compactionId").and_then(Value::as_str) else {
+            return;
+        };
+        let status = CompactionStatus::parse(update.get("status").and_then(Value::as_str));
+        let ix = self.ensure_compaction(id);
+        let ItemKind::Compaction(c) = &mut self.items[ix].kind else {
+            return;
+        };
+        if c.status != CompactionStatus::InProgress && status == CompactionStatus::InProgress {
+            return;
+        }
+        c.status = status;
+        if let Some(summary) = update.get("summary") {
+            c.summary = summary
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(content_text)
+                .collect();
+        }
+        if let Some(error) = update.get("error") {
+            c.error = error.as_str().map(str::to_owned);
+        }
+        c.awaiting_usage = status == CompactionStatus::Completed;
+        self.touch(ix);
+    }
+
+    /// Live `compaction_summary_chunk`: append to a running compaction.
+    fn apply_compaction_chunk(&mut self, update: &Value) {
+        let Some(id) = update.get("compactionId").and_then(Value::as_str) else {
+            return;
+        };
+        let text = update.get("content").map(content_text).unwrap_or_default();
+        let ix = self.ensure_compaction(id);
+        if let ItemKind::Compaction(c) = &mut self.items[ix].kind
+            && c.status == CompactionStatus::InProgress
+        {
+            c.summary.push_str(&text);
+            self.touch(ix);
+        }
+    }
+
+    /// The usage update right after a completed compaction carries its
+    /// post-compaction context size; any other update ends that window.
+    fn settle_compaction_usage(&mut self, used: Option<u64>) {
+        for ix in 0..self.items.len() {
+            if let ItemKind::Compaction(c) = &mut self.items[ix].kind
+                && c.awaiting_usage
+            {
+                c.awaiting_usage = false;
+                if used.is_some() {
+                    c.tokens_after = used;
+                }
+                self.touch(ix);
+            }
+        }
+    }
+
+    /// Place compactions folded from a history audit after the items they
+    /// followed. Ones whose anchor isn't loaded belong to older history and
+    /// are skipped unless the history is complete (then they lead).
+    fn insert_compactions(
+        &mut self,
+        folded: Vec<(Option<CompactionAnchor>, Compaction)>,
+        history_complete: bool,
+    ) {
+        for (anchor, mut compaction) in folded {
+            let key = format!("compaction-{}", compaction.id);
+            // A replayed `compaction_update` arrives before the conversation it
+            // belongs to: move it into place, keeping a summary only it carries.
+            if let Some(ix) = self.items.iter().position(|i| i.key == key) {
+                let old = self.items.remove(ix);
+                if let ItemKind::Compaction(old) = old.kind {
+                    if compaction.summary.is_empty() {
+                        compaction.summary = old.summary;
+                    }
+                    if compaction.error.is_none() {
+                        compaction.error = old.error;
+                    }
+                    if compaction.status == CompactionStatus::InProgress {
+                        compaction.status = old.status;
+                    }
+                }
+                self.reindex_tools();
+            }
+            let anchored = anchor.as_ref().and_then(|a| match a {
+                CompactionAnchor::Item(k) => self
+                    .items
+                    .iter()
+                    .position(|i| &i.key == k || i.key == format!("work-{k}")),
+                CompactionAnchor::Tool(id) => self.tool_index.get(id).copied(),
+            });
+            let mut at = match (anchored, anchor.is_some()) {
+                (Some(ix), _) => ix + 1,
+                (None, false) => 0,
+                (None, true) if history_complete => 0,
+                (None, true) => continue,
+            };
+            // Successive compactions after the same item keep their order.
+            while self
+                .items
+                .get(at)
+                .is_some_and(|i| matches!(i.kind, ItemKind::Compaction(_)))
+            {
+                at += 1;
+            }
+            let rev = self.next_rev();
+            self.items.insert(
+                at,
+                Item {
+                    key,
+                    rev,
+                    kind: ItemKind::Compaction(Box::new(compaction)),
+                },
+            );
+            self.reindex_tools();
+        }
+    }
+
+    fn reindex_tools(&mut self) {
+        self.tool_index.clear();
+        for (ix, item) in self.items.iter().enumerate() {
+            if let ItemKind::Work(entries) = &item.kind {
+                for e in entries {
+                    if let WorkEntry::Tool(c) = e {
+                        self.tool_index.insert(c.id.clone(), ix);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rebuild compactions from the load snapshot's audit (the replayed
+    /// updates carry no position), then mark ones still open after the run
+    /// ended as interrupted.
+    fn rebuild_compactions(&mut self, events: &[Value], history_complete: bool) {
+        self.insert_compactions(fold_compactions(events), history_complete);
+        if !self.running() {
+            for ix in 0..self.items.len() {
+                if let ItemKind::Compaction(c) = &mut self.items[ix].kind
+                    && c.status == CompactionStatus::InProgress
+                {
+                    c.status = CompactionStatus::Failed;
+                    c.error.get_or_insert_with(|| {
+                        "Compaction was interrupted before it finished.".into()
+                    });
+                    self.touch(ix);
+                }
+            }
+        }
     }
 
     /// Message id of the user turn a workspace undo would go back to: the
@@ -768,6 +1175,23 @@ impl SessionView {
     pub fn apply_load_snapshot(&mut self, snap: &Value) {
         if let Some(a) = Accounting::read(snap.get("accounting")) {
             self.accounting = Some(a);
+        }
+        // The client advertises snapshot history, so the agent skips the
+        // `session/update` replay and the transcript is built from the audit.
+        // (An agent that replays anyway already filled it.)
+        if self.items.is_empty() {
+            let events: &[Value] = snap
+                .pointer("/audit/events")
+                .and_then(Value::as_array)
+                .map_or(&[], Vec::as_slice);
+            let prompts: &[Value] = snap
+                .get("userPrompts")
+                .and_then(Value::as_array)
+                .map_or(&[], Vec::as_slice);
+            self.apply_history_events(events, prompts);
+            if !self.running() {
+                self.fail_unfinished_tools();
+            }
         }
         let ts = |ev: &Value| {
             ev.get("timestamp")
@@ -882,6 +1306,12 @@ impl SessionView {
         if let Some(u) = used {
             self.usage = Some((u, size.unwrap_or(0)));
         }
+        let events: &[Value] = snap
+            .pointer("/audit/events")
+            .and_then(Value::as_array)
+            .map_or(&[], Vec::as_slice);
+        let complete = snap.pointer("/history/complete").and_then(Value::as_bool) != Some(false);
+        self.rebuild_compactions(events, complete);
     }
 
     /// Copy of everything except the transcript items and plan (cheap; for
@@ -895,6 +1325,7 @@ impl SessionView {
             items: Vec::new(),
             loading: self.loading,
             error: self.error.clone(),
+            error_details: self.error_details.clone(),
             phase: self.phase.clone(),
             prompting: self.prompting,
             plan: Vec::new(),
@@ -927,16 +1358,13 @@ impl SessionView {
 
     /// Prepend an older-history page (raw agent events, ascending) to the
     /// transcript, projecting them the way the agent's replay does.
-    pub fn prepend_events(&mut self, events: &[Value]) {
+    pub fn prepend_events(&mut self, events: &[Value], prompts: &[Value]) {
         let mut older = SessionView {
             counter: self.counter,
             ..Default::default()
         };
-        for ev in events {
-            for update in replay_updates(ev) {
-                older.apply(&update);
-            }
-        }
+        older.apply_history_events(events, prompts);
+        older.insert_compactions(fold_compactions(events), true);
         self.counter = older.counter;
         let known: std::collections::HashSet<&str> =
             self.items.iter().map(|i| i.key.as_str()).collect();
@@ -960,6 +1388,226 @@ impl SessionView {
                 }
             }
         }
+    }
+
+    /// Build transcript items from raw history events, like the desktop app's
+    /// `activeSessionFromLoadResponse`: prompts (with their structured blocks
+    /// from `userPrompts`, so attachments survive), assistant messages and
+    /// reasoning, tool calls and the todo plan. Structured prompts with no
+    /// `prompt_received` event (e.g. steering) are placed by timestamp.
+    pub fn apply_history_events(&mut self, events: &[Value], prompts: &[Value]) {
+        let mut structured: Vec<(u64, String, i64, &[Value])> = prompts
+            .iter()
+            .filter_map(|p| {
+                let id = p
+                    .get("message_id")
+                    .or_else(|| p.get("messageId"))?
+                    .as_str()?;
+                let blocks = p.get("blocks")?.as_array()?;
+                let order = p
+                    .get("message_order")
+                    .or_else(|| p.get("messageOrder"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(u64::MAX);
+                let ts = p.get("timestamp").and_then(Value::as_i64).unwrap_or(0);
+                Some((order, id.to_string(), ts, blocks.as_slice()))
+            })
+            .collect();
+        structured.sort_by_key(|p| (p.0, p.2));
+        let mut restored: std::collections::HashSet<String> = Default::default();
+        // Event timestamp of each item this build added, for placing prompts.
+        let mut stamps: HashMap<String, i64> = HashMap::new();
+        let mut last_assistant: Option<String> = None;
+        for (n, ev) in events.iter().enumerate() {
+            let kind = ev
+                .pointer("/kind/type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let data = ev.pointer("/kind/data").unwrap_or(&Value::Null);
+            let s = |k: &str| {
+                data.get(k)
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned)
+            };
+            let fallback = format!(
+                "snapshot-{}",
+                ev.get("seq").and_then(Value::as_i64).unwrap_or(n as i64)
+            );
+            let before = self.items.len();
+            match kind {
+                "prompt_received" => {
+                    let id = s("message_id")
+                        .or_else(|| s("messageId"))
+                        .unwrap_or(fallback);
+                    if self.items.iter().any(|i| i.key == id) {
+                        continue;
+                    }
+                    let (text, attachments) =
+                        match structured.iter().find(|p| p.1 == id && !p.3.is_empty()) {
+                            Some(p) => {
+                                restored.insert(id.clone());
+                                prompt_parts(p.3)
+                            }
+                            None => match data.get("content") {
+                                Some(Value::Array(blocks)) => prompt_parts(blocks),
+                                Some(Value::String(t)) => (t.clone(), Vec::new()),
+                                _ => (String::new(), Vec::new()),
+                            },
+                        };
+                    if text.is_empty() && attachments.is_empty() {
+                        continue;
+                    }
+                    self.push(
+                        id,
+                        ItemKind::User {
+                            text,
+                            attachments,
+                            local: false,
+                        },
+                    );
+                }
+                "assistant_content_delta" => {
+                    let id = s("message_id")
+                        .or_else(|| last_assistant.clone())
+                        .unwrap_or(fallback);
+                    last_assistant = Some(id.clone());
+                    self.apply_chunk(
+                        "agent_message_chunk",
+                        Some(id),
+                        s("content").unwrap_or_default(),
+                    );
+                }
+                "assistant_thinking_delta" => {
+                    let id = s("message_id")
+                        .or_else(|| last_assistant.clone())
+                        .unwrap_or(fallback);
+                    last_assistant = Some(id.clone());
+                    if let Some(text) = s("content") {
+                        self.apply_thought(Some(id), text);
+                    }
+                }
+                "assistant_message_stored" => {
+                    let id = s("message_id")
+                        .or_else(|| last_assistant.clone())
+                        .unwrap_or(fallback);
+                    last_assistant = Some(id.clone());
+                    // Streamed reasoning already covers the stored parts.
+                    if !self.has_thought(&id) {
+                        let parts: Vec<String> = data
+                            .get("reasoning_parts")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|p| p.get("text").and_then(Value::as_str))
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_owned)
+                            .collect();
+                        let parts = if parts.is_empty() {
+                            s("thinking").into_iter().collect()
+                        } else {
+                            parts
+                        };
+                        for text in parts {
+                            self.apply_thought(Some(id.clone()), text);
+                        }
+                    }
+                    if let Some(text) = s("content") {
+                        self.set_agent_text(id, text);
+                    }
+                }
+                "tool_call_start" | "tool_call_end" => {
+                    if kind == "tool_call_start"
+                        && s("tool_name").as_deref().is_some_and(is_todo_write)
+                        && let Some(plan) = s("arguments").as_deref().and_then(todo_plan)
+                    {
+                        self.plan = plan;
+                    }
+                    for update in replay_updates(ev) {
+                        self.apply(&update);
+                    }
+                }
+                _ => {}
+            }
+            if let Some(ts) = ev.get("timestamp").and_then(Value::as_i64) {
+                for item in &self.items[before.min(self.items.len())..] {
+                    stamps.entry(item.key.clone()).or_insert(ts);
+                }
+            }
+        }
+        // Prompts the events don't mention go before the first later item.
+        for (_, id, ts, blocks) in structured {
+            if restored.contains(&id) || self.items.iter().any(|i| i.key == id) {
+                continue;
+            }
+            let (text, attachments) = prompt_parts(blocks);
+            if text.is_empty() && attachments.is_empty() {
+                continue;
+            }
+            let at = self
+                .items
+                .iter()
+                .position(|i| stamps.get(&i.key).is_some_and(|t| *t > ts))
+                .unwrap_or(self.items.len());
+            let rev = self.next_rev();
+            self.items.insert(
+                at,
+                Item {
+                    key: id,
+                    rev,
+                    kind: ItemKind::User {
+                        text,
+                        attachments,
+                        local: false,
+                    },
+                },
+            );
+            self.reindex_tools();
+        }
+    }
+
+    /// The run is over: tools still marked running never got a result.
+    fn fail_unfinished_tools(&mut self) {
+        for ix in 0..self.items.len() {
+            let mut changed = false;
+            if let ItemKind::Work(entries) = &mut self.items[ix].kind {
+                for e in entries.iter_mut() {
+                    if let WorkEntry::Tool(call) = e
+                        && call.running()
+                    {
+                        call.status = "failed".into();
+                        if call.output.is_empty() {
+                            call.output = "Run ended before a tool result was recorded.".into();
+                        }
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                self.touch(ix);
+            }
+        }
+    }
+
+    fn has_thought(&self, message_id: &str) -> bool {
+        self.items.iter().any(|i| match &i.kind {
+            ItemKind::Work(entries) => entries
+                .iter()
+                .any(|e| matches!(e, WorkEntry::Thought { id, .. } if id == message_id)),
+            _ => false,
+        })
+    }
+
+    /// Final text of assistant message `id` (replaces streamed deltas).
+    fn set_agent_text(&mut self, id: String, text: String) {
+        if let Some(ix) = self.items.iter().position(|i| i.key == id)
+            && let ItemKind::Agent { text: t } = &mut self.items[ix].kind
+        {
+            *t = text;
+            self.touch(ix);
+            return;
+        }
+        self.apply_chunk("agent_message_chunk", Some(id), text);
     }
 
     fn next_rev(&mut self) -> u64 {
@@ -1210,7 +1858,10 @@ impl SessionView {
                 if let Some(a) = Accounting::from_meta(meta) {
                     self.accounting = Some(a);
                 }
+                self.settle_compaction_usage(n("used"));
             }
+            "compaction_update" => self.apply_compaction_update(update),
+            "compaction_summary_chunk" => self.apply_compaction_chunk(update),
             "current_mode_update" => {
                 self.mode = update
                     .get("currentModeId")
@@ -1677,7 +2328,7 @@ mod history_tests {
             ev("assistant_message_stored", json!({ "content": "reply 1", "message_id": "a1" })),
             // Overlap with the loaded window is dropped.
             ev("prompt_received", json!({ "content": "second", "message_id": "u2" })),
-        ]);
+        ], &[]);
 
         let keys: Vec<&str> = view.items.iter().map(|i| i.key.as_str()).collect();
         assert_eq!(keys.first(), Some(&"u1"));
@@ -1803,5 +2454,236 @@ mod undo_tests {
         ] }));
         assert_eq!(frames.len(), 2);
         assert!(frames[1].restore_failed);
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::{
+        COMPACTING_LABEL, CompactionStatus, ItemKind, SessionView, format_tokens,
+        is_compact_command,
+    };
+    use serde_json::{Value, json};
+
+    fn compaction(view: &SessionView, id: &str) -> super::Compaction {
+        view.items
+            .iter()
+            .find_map(|i| match &i.kind {
+                ItemKind::Compaction(c) if c.id == id => Some((**c).clone()),
+                _ => None,
+            })
+            .expect("compaction item")
+    }
+
+    fn ev(kind: &str, data: Value) -> Value {
+        json!({ "kind": { "type": kind, "data": data } })
+    }
+
+    #[test]
+    fn live_compaction_updates_stream_summary_and_settle_usage() {
+        let mut view = SessionView::new("a", "s", "/w", "t");
+        view.apply(&json!({ "sessionUpdate": "usage_update", "used": 120000, "size": 200000 }));
+        view.apply(&json!({ "sessionUpdate": "compaction_update", "compactionId": "c1", "status": "in_progress" }));
+        view.apply(
+            &json!({ "sessionUpdate": "compaction_summary_chunk", "compactionId": "c1",
+            "content": { "type": "text", "text": "Summary " } }),
+        );
+        view.apply(
+            &json!({ "sessionUpdate": "compaction_summary_chunk", "compactionId": "c1",
+            "content": { "type": "text", "text": "text" } }),
+        );
+        let c = compaction(&view, "c1");
+        assert_eq!(c.status, CompactionStatus::InProgress);
+        assert_eq!(c.summary, "Summary text");
+        assert_eq!(c.title(), COMPACTING_LABEL);
+        assert_eq!(c.detail().as_deref(), Some("120k tokens in context"));
+        assert!(view.active_compaction().is_some());
+
+        view.apply(&json!({ "sessionUpdate": "compaction_update", "compactionId": "c1", "status": "completed" }));
+        view.apply(&json!({ "sessionUpdate": "usage_update", "used": 18000, "size": 200000 }));
+        let c = compaction(&view, "c1");
+        assert_eq!(c.status, CompactionStatus::Completed);
+        assert_eq!(c.detail().as_deref(), Some("120k → 18k tokens"));
+        assert!(view.active_compaction().is_none());
+
+        // A settled compaction is never reopened.
+        view.apply(&json!({ "sessionUpdate": "compaction_update", "compactionId": "c1", "status": "in_progress" }));
+        assert_eq!(compaction(&view, "c1").status, CompactionStatus::Completed);
+    }
+
+    #[test]
+    fn failed_compaction_shows_reason() {
+        let mut view = SessionView::new("a", "s", "/w", "t");
+        view.apply(
+            &json!({ "sessionUpdate": "compaction_update", "compactionId": "c1",
+            "status": "failed", "error": "model refused" }),
+        );
+        let c = compaction(&view, "c1");
+        assert_eq!(c.title(), "Compaction failed");
+        assert_eq!(c.detail().as_deref(), Some("model refused"));
+    }
+
+    #[test]
+    fn load_snapshot_places_compactions_after_their_turn() {
+        let mut view = SessionView::new("a", "s", "/w", "t");
+        view.apply(
+            &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u1",
+            "content": { "type": "text", "text": "hi" } }),
+        );
+        view.apply(
+            &json!({ "sessionUpdate": "agent_message_chunk", "messageId": "a1",
+            "content": { "type": "text", "text": "reply" } }),
+        );
+        view.apply(
+            &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u2",
+            "content": { "type": "text", "text": "next" } }),
+        );
+        let snap = json!({ "audit": { "events": [
+            ev("prompt_received", json!({ "message_id": "u1", "content": "hi" })),
+            ev("llm_request_end", json!({ "context_tokens": 90000 })),
+            ev("assistant_message_stored", json!({ "message_id": "a1", "content": "reply" })),
+            // Legacy record without an id: start and end pair up.
+            ev("compaction_start", json!({})),
+            ev("compaction_summary_chunk", json!({ "content": "short" })),
+            ev("compaction_end", json!({ "summary": "Final summary", "context_tokens": 9000 })),
+            ev("compaction_start", json!({ "compaction_id": "c2" })),
+            ev("prompt_received", json!({ "message_id": "u2", "content": "next" })),
+        ] } });
+        view.apply_load_snapshot(&snap);
+        let kinds: Vec<&str> = view
+            .items
+            .iter()
+            .map(|i| match &i.kind {
+                ItemKind::Compaction(_) => "compaction",
+                ItemKind::User { .. } => "user",
+                ItemKind::Agent { .. } => "agent",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["user", "agent", "compaction", "compaction", "user"]);
+        let legacy = match &view.items[2].kind {
+            ItemKind::Compaction(c) => (**c).clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(legacy.summary, "Final summary");
+        assert_eq!(legacy.detail().as_deref(), Some("90k → 9k tokens"));
+        // Still open after the run ended: interrupted.
+        let open = compaction(&view, "c2");
+        assert_eq!(open.status, CompactionStatus::Failed);
+        assert!(open.error.unwrap().contains("interrupted"));
+    }
+
+    #[test]
+    fn compact_command_and_token_format() {
+        assert!(is_compact_command("/compact"));
+        assert!(is_compact_command("  /COMPACT keep the plan"));
+        assert!(!is_compact_command("/compactly"));
+        assert!(!is_compact_command("compact"));
+        assert_eq!(format_tokens(950), "950");
+        assert_eq!(format_tokens(12500), "12.5k");
+        assert_eq!(format_tokens(18000), "18k");
+        assert_eq!(format_tokens(120400), "120k");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::{ItemKind, SessionView, WorkEntry};
+    use serde_json::{Value, json};
+
+    fn ev(seq: i64, ts: i64, kind: &str, data: Value) -> Value {
+        json!({ "seq": seq, "timestamp": ts, "kind": { "type": kind, "data": data } })
+    }
+
+    #[test]
+    fn transcript_is_built_from_the_load_snapshot() {
+        let mut view = SessionView::new("a", "s", "/w", "t");
+        view.phase = "idle".into();
+        let snap = json!({
+            "audit": { "events": [
+                ev(1, 100, "prompt_received", json!({ "message_id": "u1", "content": "hi" })),
+                ev(2, 101, "assistant_thinking_delta", json!({ "message_id": "a1", "content": "hmm" })),
+                ev(3, 102, "tool_call_start", json!({ "tool_call_id": "t1", "tool_name": "shell", "arguments": "{\"command\":\"ls\"}" })),
+                ev(4, 103, "tool_call_end", json!({ "tool_call_id": "t1", "tool_name": "shell", "is_error": false, "result": "ok" })),
+                ev(5, 104, "tool_call_start", json!({ "tool_call_id": "td", "tool_name": "todowrite",
+                    "arguments": "{\"todos\":[{\"content\":\"a\",\"status\":\"pending\"},{\"content\":\"b\",\"status\":\"cancelled\"}]}" })),
+                ev(6, 105, "assistant_content_delta", json!({ "message_id": "a1", "content": "partial" })),
+                ev(7, 106, "assistant_message_stored", json!({ "message_id": "a1", "content": "final reply",
+                    "reasoning_parts": [{ "id": "p", "text": "hmm" }] })),
+                ev(8, 200, "tool_call_start", json!({ "tool_call_id": "t2", "tool_name": "read_tool", "arguments": "{}" })),
+                ev(9, 300, "assistant_message_stored", json!({ "message_id": "a2", "content": "later" })),
+            ] },
+            // u1 has an image block; s1 is a steering prompt with no event.
+            "userPrompts": [
+                { "message_id": "u1", "message_order": 0, "timestamp": 100, "blocks": [
+                    { "type": "text", "text": "hi" },
+                    { "type": "image", "mimeType": "image/png", "data": "AAA" } ] },
+                { "message_id": "s1", "message_order": 3, "timestamp": 250, "blocks": [
+                    { "type": "text", "text": "steer" } ] },
+            ],
+        });
+        view.apply_load_snapshot(&snap);
+
+        let shape: Vec<String> = view
+            .items
+            .iter()
+            .map(|i| match &i.kind {
+                ItemKind::User {
+                    text, attachments, ..
+                } => format!("user:{text}:{}", attachments.len()),
+                ItemKind::Agent { text } => format!("agent:{text}"),
+                ItemKind::Work(e) => format!("work:{}", e.len()),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                "user:hi:1",
+                "work:2",
+                "agent:final reply",
+                "work:1",
+                "user:steer:0",
+                "agent:later"
+            ]
+        );
+        // Reasoning is not duplicated by the stored parts.
+        let thoughts = view
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::Work(e) => Some(
+                    e.iter()
+                        .filter(|e| matches!(e, WorkEntry::Thought { .. }))
+                        .count(),
+                ),
+                _ => None,
+            })
+            .sum::<usize>();
+        assert_eq!(thoughts, 1);
+        // The todo plan is restored without cancelled entries.
+        assert_eq!(view.plan.len(), 1);
+        // The run is over: the tool without a result failed.
+        let unfinished = view.items.iter().find_map(|i| match &i.kind {
+            ItemKind::Work(e) => e.iter().find_map(|e| match e {
+                WorkEntry::Tool(c) if c.id == "t2" => Some(c.status.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(unfinished.as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn replayed_transcript_is_not_duplicated() {
+        let mut view = SessionView::new("a", "s", "/w", "t");
+        view.apply(
+            &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u1",
+            "content": { "type": "text", "text": "hi" } }),
+        );
+        view.apply_load_snapshot(&json!({ "audit": { "events": [
+            ev(1, 100, "prompt_received", json!({ "message_id": "u1", "content": "hi" })),
+        ] } }));
+        assert_eq!(view.items.len(), 1);
     }
 }

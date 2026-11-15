@@ -23,7 +23,35 @@ pub enum Incoming {
     },
 }
 
-type Pending = oneshot::Sender<Result<Value, String>>;
+/// A failed request: the short text callers show, plus the raw JSON-RPC
+/// `error` object (code, message, data) for diagnostics.
+#[derive(Clone, Debug)]
+pub struct RpcError {
+    message: String,
+    raw: Option<Value>,
+}
+
+impl RpcError {
+    fn local(message: &str) -> Self {
+        Self {
+            message: message.to_string(),
+            raw: None,
+        }
+    }
+
+    /// The `error` object of the response; `None` for transport failures.
+    pub fn raw(&self) -> Option<&Value> {
+        self.raw.as_ref()
+    }
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+type Pending = oneshot::Sender<Result<Value, RpcError>>;
 
 pub struct RpcClient {
     outgoing: Sender<String>,
@@ -45,6 +73,16 @@ impl RpcClient {
         method: &str,
         params: Value,
     ) -> impl Future<Output = Result<Value, String>> + 'static {
+        let request = self.request_detailed(method, params);
+        async move { request.await.map_err(|e| e.to_string()) }
+    }
+
+    /// [`Self::request`], keeping the raw JSON-RPC error for diagnostics.
+    pub fn request_detailed(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> impl Future<Output = Result<Value, RpcError>> + 'static {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         let (tx, rx) = oneshot::channel();
@@ -56,8 +94,9 @@ impl RpcClient {
             outgoing
                 .send(text)
                 .await
-                .map_err(|_| "Connection closed.".to_string())?;
-            rx.await.map_err(|_| "Connection closed.".to_string())?
+                .map_err(|_| RpcError::local("Connection closed."))?;
+            rx.await
+                .map_err(|_| RpcError::local("Connection closed."))?
         }
     }
 
@@ -114,7 +153,10 @@ impl RpcClient {
                 if let Some(code) = error.pointer("/data/code").and_then(Value::as_str) {
                     text = format!("{text} [{code}]");
                 }
-                Err(text)
+                Err(RpcError {
+                    message: text,
+                    raw: Some(error.clone()),
+                })
             }
             None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
         };
@@ -124,7 +166,7 @@ impl RpcClient {
 
     pub fn fail_all(&self, reason: &str) {
         for (_, pending) in self.pending.borrow_mut().drain() {
-            let _ = pending.send(Err(reason.to_string()));
+            let _ = pending.send(Err(RpcError::local(reason)));
         }
     }
 

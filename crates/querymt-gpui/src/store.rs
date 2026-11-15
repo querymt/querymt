@@ -1614,7 +1614,17 @@ impl AgentsStore {
                     json!({
                         "protocolVersion": 1,
                         "clientInfo": { "name": "QueryMT GPUI", "version": env!("CARGO_PKG_VERSION") },
-                        "clientCapabilities": { "fs": {}, "terminal": false },
+                        // `session.compaction`: the agent sends ID-addressed
+                        // `compaction_update` / `compaction_summary_chunk` only when advertised.
+                        // `_meta.querymt.sessionLoadSnapshot.epoch` (as the desktop app): the
+                        // transcript is built from the `session/load` snapshot, so the agent
+                        // skips the historical `session/update` replay.
+                        "clientCapabilities": {
+                            "fs": {},
+                            "terminal": false,
+                            "session": { "compaction": {} },
+                            "_meta": { "querymt": { "sessionLoadSnapshot": { "epoch": 1 } } },
+                        },
                     }),
                 )
                 .await;
@@ -1848,7 +1858,7 @@ impl AgentsStore {
 
     // ---- session view -------------------------------------------------------
 
-    /// Open a session in the transcript view: `session/load` replays it as updates.
+    /// Open a session in the transcript view, built from the `session/load` snapshot.
     pub fn open_session(
         &mut self,
         agent_id: &str,
@@ -1889,9 +1899,23 @@ impl AgentsStore {
         if windowed {
             params["_meta"] = json!({ "querymt": { "loadWindow": { "maxTurns": 20, "maxBytes": 1048576, "truncateBytes": 32768 } } });
         }
+        // Context for the diagnostic report, captured before the request.
+        let agent_line = {
+            let config = self.configs.iter().find(|c| c.id == agent_id);
+            format!(
+                "{} ({}) · {} {}",
+                config.map_or(agent_id, |c| c.name.as_str()),
+                config.map(AgentConfig::endpoint_label).unwrap_or_default(),
+                rt.agent_title.as_deref().unwrap_or("unknown agent"),
+                rt.agent_version.as_deref().unwrap_or(""),
+            )
+        };
+        let request_params = params.clone();
         let (agent_id, session_id) = (agent_id.to_string(), session_id.to_string());
         cx.spawn(async move |this, cx| {
-            let result = rpc.request("session/load", params).await;
+            let started = now_ms();
+            let result = rpc.request_detailed("session/load", params).await;
+            let elapsed_ms = now_ms() - started;
             let _ = this.update(cx, |s, cx| {
                 let Some(view) = s
                     .session
@@ -1926,7 +1950,15 @@ impl AgentsStore {
                             view.push_notice(notice, false);
                         }
                     }
-                    Err(err) => view.error = Some(format!("Could not load the session: {err}")),
+                    Err(err) => {
+                        view.error = Some(format!("Could not load the session: {err}"));
+                        view.error_details = Some(load_error_report(
+                            &agent_line,
+                            &request_params,
+                            &err,
+                            elapsed_ms,
+                        ));
+                    }
                 }
                 s.refresh_undo_stack(cx);
                 cx.notify();
@@ -1980,7 +2012,12 @@ impl AgentsStore {
                             .and_then(Value::as_array)
                             .cloned()
                             .unwrap_or_default();
-                        view.prepend_events(&events);
+                        let prompts = page
+                            .get("userPrompts")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        view.prepend_events(&events, &prompts);
                         let complete = page
                             .pointer("/history/complete")
                             .and_then(Value::as_bool)
@@ -3131,6 +3168,40 @@ fn percent_encode(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+/// Copyable report for a failed `session/load`: what was asked, of whom, and
+/// the agent's raw JSON-RPC error (its `data` usually carries the real cause).
+fn load_error_report(
+    agent: &str,
+    params: &Value,
+    err: &crate::rpc::RpcError,
+    elapsed_ms: f64,
+) -> String {
+    let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
+    let raw = err.raw().map_or_else(
+        || "(none: the request failed before the agent answered)".to_string(),
+        pretty,
+    );
+    format!(
+        "QueryMT GPUI {version} · session/load failed\n\
+         Session: {session}\n\
+         Workspace: {cwd}\n\
+         Agent: {agent}\n\
+         Time: {time} ({elapsed:.0} ms)\n\
+         Error: {err}\n\n\
+         Agent error (JSON-RPC):\n{raw}\n\n\
+         Request params:\n{params}\n",
+        version = env!("CARGO_PKG_VERSION"),
+        session = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or("?"),
+        cwd = params.get("cwd").and_then(Value::as_str).unwrap_or("?"),
+        time = crate::util::rfc3339_now(),
+        elapsed = elapsed_ms,
+        params = pretty(params),
+    )
 }
 
 /// ACP prompt blocks: text plus attachments. Images are native `image` blocks
