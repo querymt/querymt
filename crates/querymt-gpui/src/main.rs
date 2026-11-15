@@ -274,6 +274,7 @@ mod web {
             EllipsisVertical,
             Sparkles,
             FilePenLine,
+            FileCog,
             ListTodo,
             MessageCircleQuestionMark,
             Navigation,

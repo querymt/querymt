@@ -8,6 +8,7 @@ use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::kit::action_btn;
 use super::mesh::panel;
 use super::{QmtApp, kit};
 use crate::store::{ImageSendMode, ProviderAuth, SendShortcut};
@@ -1724,37 +1725,4 @@ fn provider_summary(pr: &ProviderAuth) -> String {
             _ => "Authentication required".into(),
         },
     }
-}
-
-/// Desktop `.action-btn` (`compact`: `.action-btn-compact`): bordered card
-/// fill, stronger border + hover fill when enabled, dimmed when not.
-fn action_btn(
-    id: impl Into<ElementId>,
-    enabled: bool,
-    compact: bool,
-    p: &Palette,
-) -> Stateful<Div> {
-    let (hover_border, hover_bg) = (p.border_strong, p.card_hover);
-    h_flex()
-        .id(id)
-        .flex_none()
-        .justify_center()
-        .gap(px(if compact { 6.4 } else { 8. }))
-        .h(px(if compact { 32. } else { 36. }))
-        .px(px(if compact { 12. } else { 15.2 }))
-        .rounded(px(8.))
-        .border_1()
-        .border_color(p.border)
-        .bg(p.card)
-        .text_color(p.text)
-        .text_size(px(if compact { 12. } else { 13.1 }))
-        .font_weight(FontWeight(550.))
-        .map(|el| {
-            if enabled {
-                el.cursor_pointer()
-                    .hover(move |s| s.border_color(hover_border).bg(hover_bg))
-            } else {
-                el.opacity(0.5)
-            }
-        })
 }

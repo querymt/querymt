@@ -297,6 +297,18 @@ pub struct ProviderAuth {
     pub preferred_method: Option<String>,
 }
 
+/// Profile id that lets the agent use its active profile.
+pub const DEFAULT_PROFILE: &str = "default";
+
+/// `session/new` params; a non-default profile goes in `_meta.querymt.profile_id`.
+fn new_session_params(cwd: &str, profile: &str) -> Value {
+    let mut params = json!({ "cwd": cwd, "mcpServers": [] });
+    if profile != DEFAULT_PROFILE {
+        params["_meta"] = json!({ "querymt": { "profile_id": profile } });
+    }
+    params
+}
+
 #[derive(Clone, Debug)]
 pub struct Profile {
     pub id: String,
@@ -650,6 +662,9 @@ pub struct Prefs {
     /// Reasoning effort for new sessions (`auto`, `low`, …).
     #[serde(default)]
     pub launch_reasoning: String,
+    /// Agent id -> profile id for new sessions; absent means the agent default.
+    #[serde(default)]
+    pub launch_profiles: HashMap<String, String>,
     /// Agent id -> most recently picked model ids (newest first).
     #[serde(default)]
     pub recent_models: HashMap<String, Vec<String>>,
@@ -968,6 +983,33 @@ impl AgentsStore {
         self.runtime.get(id).map_or(&[], |r| &r.models)
     }
 
+    pub fn profiles(&self, id: &str) -> &[Profile] {
+        self.runtime.get(id).map_or(&[], |r| &r.profiles)
+    }
+
+    /// Profile for new sessions on `agent_id`: the saved choice while the agent
+    /// still offers it, otherwise [`DEFAULT_PROFILE`].
+    pub fn launch_profile(&self, agent_id: &str) -> &str {
+        let profiles = self.profiles(agent_id);
+        self.prefs
+            .launch_profiles
+            .get(agent_id)
+            .filter(|id| profiles.iter().any(|p| &p.id == *id))
+            .map_or(DEFAULT_PROFILE, String::as_str)
+    }
+
+    pub fn set_launch_profile(&mut self, agent_id: &str, profile_id: &str, cx: &mut Context<Self>) {
+        if profile_id == DEFAULT_PROFILE {
+            self.prefs.launch_profiles.remove(agent_id);
+        } else {
+            self.prefs
+                .launch_profiles
+                .insert(agent_id.to_string(), profile_id.to_string());
+        }
+        self.save();
+        cx.notify();
+    }
+
     pub fn launch_model(&self, agent_id: &str) -> Option<&Model> {
         let models = self.models(agent_id);
         self.prefs
@@ -1030,6 +1072,7 @@ impl AgentsStore {
         self.runtime.remove(id);
         self.configs.retain(|c| c.id != id);
         self.prefs.launch_models.remove(id);
+        self.prefs.launch_profiles.remove(id);
         self.save();
         cx.notify();
     }
@@ -1719,6 +1762,7 @@ impl AgentsStore {
             return;
         };
         let model = self.launch_model(agent_id).cloned();
+        let params = new_session_params(&cwd, self.launch_profile(agent_id));
         let image_mode = self.prefs.image_send_mode;
         let mode = self.prefs.mode().to_string();
         let reasoning = self.prefs.reasoning().to_string();
@@ -1734,7 +1778,7 @@ impl AgentsStore {
         let agent_id = agent_id.to_string();
         self._launch_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<String, String> = async {
-                let created = rpc.request("session/new", json!({ "cwd": cwd, "mcpServers": [] })).await?;
+                let created = rpc.request("session/new", params).await?;
                 let session_id = created
                     .get("sessionId")
                     .and_then(Value::as_str)
@@ -3415,6 +3459,17 @@ async fn load_extras(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_session_params_send_only_non_default_profiles() {
+        let plain = new_session_params("/w", DEFAULT_PROFILE);
+        assert_eq!(plain, json!({ "cwd": "/w", "mcpServers": [] }));
+        let bound = new_session_params("/w", "review");
+        assert_eq!(
+            bound.pointer("/_meta/querymt/profile_id"),
+            Some(&json!("review"))
+        );
+    }
 
     fn attachment(name: &str, mime: &str) -> Attachment {
         Attachment {

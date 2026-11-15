@@ -1,7 +1,8 @@
 //! Start page: launch a session on the connected agent, pick up recent work.
 //!
 //! Composer: workspace path, prompt, attachments (`+`), model picker (modal,
-//! grouped by provider with recents, reasoning effort), Options (mode, agent).
+//! grouped by provider with recents, reasoning effort), Options (mode, profile,
+//! agent).
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
@@ -12,7 +13,9 @@ use gpui_kit::*;
 
 use super::kit::ButtonExt as _;
 use super::{Page, QmtApp, kit};
-use crate::store::{Attachment, ConnState, LAUNCH_MODES, LAUNCH_REASONING, Model, SessionSummary};
+use crate::store::{
+    Attachment, ConnState, DEFAULT_PROFILE, LAUNCH_MODES, LAUNCH_REASONING, Model, SessionSummary,
+};
 use crate::theme::{Palette, palette};
 use crate::util::{now_ms, short_time, workspace_name};
 
@@ -685,6 +688,15 @@ impl QmtApp {
             .iter()
             .filter_map(|id| store.config(id).map(|c| (id.clone(), c.name.clone())))
             .collect();
+        // Like the desktop Options button: name a non-default profile next to it.
+        let profile_summary = agent.as_deref().and_then(|a| {
+            let id = store.launch_profile(a);
+            store
+                .profiles(a)
+                .iter()
+                .find(|p| p.id == id && id != DEFAULT_PROFILE)
+                .map(|p| p.name.clone())
+        });
 
         let sessions = store.all_sessions();
         let running = sessions.iter().filter(|s| s.root && s.running()).count();
@@ -829,8 +841,17 @@ impl QmtApp {
         let options_button = toolbar_button("options-button", &p)
             .child(kit::icon(IconName::Settings2, 14., p.muted))
             .child("Options")
+            .children(profile_summary.map(|name| {
+                div()
+                    .max_w(px(140.))
+                    .truncate()
+                    .text_xs()
+                    .text_color(p.dim)
+                    .child(name)
+            }))
             .child(kit::icon(IconName::ChevronDown, 13., p.dim))
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.close_profile_menu(window, cx);
                 this.options_open = true;
                 cx.notify();
             }));
@@ -1177,6 +1198,8 @@ impl QmtApp {
             })
             .collect();
 
+        let profile_picker = self.profile_picker(p, cx);
+
         v_flex()
             .id("options-panel")
             .absolute()
@@ -1192,6 +1215,10 @@ impl QmtApp {
             .shadow_lg()
             .occlude()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                // The profile menu overhangs the panel and closes itself first.
+                if this.profile_menu_open {
+                    return;
+                }
                 this.options_open = false;
                 cx.notify();
             }))
@@ -1203,6 +1230,11 @@ impl QmtApp {
                     .text_color(p.muted)
                     .child(describe(&LAUNCH_MODES, mode)),
             )
+            .when_some(profile_picker, |el, picker| {
+                el.child(div().pt_1().child(kit::divider(p)))
+                    .child(section("Profile"))
+                    .child(picker)
+            })
             .when(agents.len() > 1, |el| {
                 el.child(div().pt_1().child(kit::divider(p)))
                     .child(section("Agent"))
