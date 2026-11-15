@@ -102,8 +102,6 @@ mod dispatch;
 #[cfg(test)]
 mod dispatch_coverage_tests;
 #[cfg(test)]
-mod e2e_tests;
-#[cfg(test)]
 mod failure_tests;
 mod pricing;
 mod projection;

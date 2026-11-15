@@ -12,6 +12,8 @@
 //! - `SessionRegistry`: Manages session actors (server layer)
 //! - Messages: Type-safe message structs for actor communication
 
+#[cfg(test)]
+mod accounting_e2e_tests;
 pub mod agent_config;
 pub mod agent_config_builder;
 pub mod builtin_tools;
