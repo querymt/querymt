@@ -32,6 +32,7 @@ permissions:
 
 env:
   features: 'dashboard,oauth,zbus-secret-service,systemd-credentials,remote'
+  runtime_features: 'remote,oauth,plugin-loaders,api'
 
 jobs:
   # Job 1: Check formatting (fast, fails first)
@@ -118,6 +119,19 @@ jobs:
       - name: Run Clippy (querymt-agent-knowledge)
         run: cargo clippy --package querymt-agent-knowledge --all-targets -- -D warnings
 
+      # The runtime has its own feature set; it must build without the facade.
+      - name: Check querymt-agent-runtime standalone
+        run: |
+          cargo check --package querymt-agent-runtime --no-default-features
+          cargo check --package querymt-agent-runtime --features test-support
+          cargo check --package querymt-agent-runtime --features "${runtime_features}"
+
+      - name: Run Clippy (querymt-agent-runtime)
+        run: cargo clippy --package querymt-agent-runtime --all-targets --features "${runtime_features}" -- -D warnings
+
+      - name: Check querymt-agent facade without default features
+        run: cargo check --package querymt-agent --lib --no-default-features
+
       - name: Run Clippy
         run: cargo clippy --package querymt-agent --all-targets --features "${features}" -- -D warnings
 
@@ -164,6 +178,7 @@ jobs:
             --package querymt-agent-index \
             --package querymt-agent-knowledge \
             --package querymt-agent-services \
+            --package querymt-agent-runtime \
             --lib --tests \
             --features "${features}" \
             --codecov --output-path ./coverage/codecov.json
