@@ -163,3 +163,6 @@ pub use tasks::{
 mod target_registry_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod repo_knowledge_independence_tests;

@@ -69,12 +69,10 @@ mod tests {
     use super::*;
     use crate::accounting::tests::{sample_settlement, sample_start};
     use crate::accounting::{AttemptRecorder, AttemptSettlement, AttemptStart};
-    use crate::agent::core::{McpToolState, SessionRuntime};
     use crate::event_fanout::EventFanout;
     use crate::session::backend::StorageBackend;
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::session_event_stream::SessionEventStream;
-    use std::collections::HashMap;
 
     fn cost() -> f64 {
         (100.0 * 3.0 + 15.0 * 15.0 + 50.0 * 0.3 + 20.0 * 3.75) / 1e6
@@ -115,13 +113,12 @@ mod tests {
     }
 
     async fn runtime_cycle(storage: &SqliteStorage) -> CycleAccounting {
-        // A fresh runtime models a restart or a newly loaded session.
-        let runtime = SessionRuntime::new(None, HashMap::new(), McpToolState::empty());
+        // A fresh sink models a restart or a newly loaded session.
         let sink = crate::event_sink::EventSink::new(
             storage.event_journal(),
             Arc::new(EventFanout::new()),
         );
-        let accounting = runtime.accounting("sess-1", &sink).await.unwrap();
+        let accounting = sink.session_accounting("sess-1").await.unwrap();
         CycleAccounting::begin(accounting)
     }
 

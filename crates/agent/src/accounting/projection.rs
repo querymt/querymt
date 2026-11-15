@@ -372,36 +372,4 @@ mod tests {
         assert_eq!(reopened.read(|r| r.session().clone()), live_session);
         assert_eq!(reopened.read(|r| r.unresolved().len()), 1);
     }
-
-    #[tokio::test]
-    async fn session_runtime_owns_the_projection_and_retirement_releases_it() {
-        use crate::agent::core::{McpToolState, SessionRuntime};
-        use std::collections::HashMap;
-
-        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
-        record_history(&storage, None).await;
-
-        let runtime = SessionRuntime::new(None, HashMap::new(), McpToolState::empty());
-        let sink = crate::event_sink::EventSink::new(
-            storage.event_journal(),
-            Arc::new(EventFanout::new()),
-        );
-        let first = runtime.accounting("sess-1", &sink).await.unwrap();
-        let again = runtime.accounting("sess-1", &sink).await.unwrap();
-        assert!(Arc::ptr_eq(&first, &again), "hydrated once per runtime");
-        assert_eq!(first.records_scanned(), 8);
-        assert_eq!(first.read(|r| r.attempt_count()), 3);
-
-        let weak = Arc::downgrade(&first);
-        drop((first, again));
-        assert!(weak.upgrade().is_some(), "runtime still owns it");
-        drop(runtime);
-        // The sink's shared registry also holds it until the session retires.
-        assert!(weak.upgrade().is_some(), "sink keeps the shared projection");
-        sink.retire_session_stream("sess-1").await;
-        assert!(
-            weak.upgrade().is_none(),
-            "retiring the session releases the projection"
-        );
-    }
 }

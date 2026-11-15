@@ -315,3 +315,92 @@ async fn mixed_scenario_agrees_across_runtime_restart_acp_and_export() {
         serde_json::to_value(&after_restart).unwrap()
     );
 }
+
+// ── SessionRuntime ownership of the accounting projection ──
+
+mod runtime_projection {
+    use crate::accounting::tests::{sample_settlement, sample_start};
+    use crate::accounting::{AttemptRecorder, SessionAccounting};
+    use crate::event_fanout::EventFanout;
+    use crate::events::AgentEventKind;
+    use crate::session::backend::StorageBackend;
+    use crate::session::sqlite_storage::SqliteStorage;
+    use crate::session_event_stream::SessionEventStream;
+    use std::sync::Arc;
+
+    fn start_for(id: &str, cycle: &str) -> crate::accounting::AttemptStart {
+        let mut s = sample_start();
+        s.attempt.attempt_id = id.into();
+        s.attempt.cycle_id = cycle.into();
+        s
+    }
+
+    fn settlement_for(id: &str, cycle: &str) -> crate::accounting::AttemptSettlement {
+        let mut s = sample_settlement();
+        s.attempt.attempt_id = id.into();
+        s.attempt.cycle_id = cycle.into();
+        s
+    }
+
+    fn noise() -> AgentEventKind {
+        AgentEventKind::UserMessageStored {
+            content: "hello".into(),
+        }
+    }
+
+    /// Records three attempts (one left unresolved) interleaved with noise.
+    async fn record_history(
+        storage: &SqliteStorage,
+        projection: Option<Arc<SessionAccounting>>,
+    ) -> Arc<SessionEventStream> {
+        let stream = SessionEventStream::new(
+            "sess-1",
+            storage.event_journal(),
+            Arc::new(EventFanout::new()),
+        );
+        let recorder = match projection {
+            Some(p) => AttemptRecorder::with_projection(stream.clone(), p),
+            None => AttemptRecorder::new(stream.clone()),
+        };
+        for (id, cycle) in [("a1", "c1"), ("a2", "c1"), ("a3", "c2")] {
+            stream.emit_persisted(noise()).await.unwrap();
+            let h = recorder.begin(start_for(id, cycle)).await.unwrap();
+            if id != "a3" {
+                recorder.settle(h, settlement_for(id, cycle)).await.unwrap();
+            }
+        }
+        stream
+    }
+
+    #[tokio::test]
+    async fn session_runtime_owns_the_projection_and_retirement_releases_it() {
+        use crate::agent::core::{McpToolState, SessionRuntime};
+        use std::collections::HashMap;
+
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        record_history(&storage, None).await;
+
+        let runtime = SessionRuntime::new(None, HashMap::new(), McpToolState::empty());
+        let sink = crate::event_sink::EventSink::new(
+            storage.event_journal(),
+            Arc::new(EventFanout::new()),
+        );
+        let first = runtime.accounting("sess-1", &sink).await.unwrap();
+        let again = runtime.accounting("sess-1", &sink).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "hydrated once per runtime");
+        assert_eq!(first.records_scanned(), 8);
+        assert_eq!(first.read(|r| r.attempt_count()), 3);
+
+        let weak = Arc::downgrade(&first);
+        drop((first, again));
+        assert!(weak.upgrade().is_some(), "runtime still owns it");
+        drop(runtime);
+        // The sink's shared registry also holds it until the session retires.
+        assert!(weak.upgrade().is_some(), "sink keeps the shared projection");
+        sink.retire_session_stream("sess-1").await;
+        assert!(
+            weak.upgrade().is_none(),
+            "retiring the session releases the projection"
+        );
+    }
+}
