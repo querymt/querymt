@@ -156,6 +156,8 @@ struct RenderCtx {
     redo_target: Option<String>,
     /// Items from this index on were rolled back by an undo (shown dimmed).
     reverted_from: Option<usize>,
+    /// Agent of the open session; delegated child sessions live on it too.
+    agent_id: String,
 }
 
 impl RenderCtx {
@@ -175,11 +177,9 @@ impl RenderCtx {
                 self.expanded.contains(&item.key).hash(&mut h);
                 for e in entries {
                     self.expanded.contains(e.id()).hash(&mut h);
-                    if let WorkEntry::Tool(call) = e
-                        && is_skill(call)
-                    {
+                    if let WorkEntry::Tool(call) = e {
                         self.expanded
-                            .contains(&skill_content_key(&call.id))
+                            .contains(&tool_details_key(&call.id))
                             .hash(&mut h);
                     }
                 }
@@ -393,7 +393,7 @@ fn tool_label(call: &ToolCall) -> String {
         "language_query" => "Query language server",
         "browse" | "web_fetch" => "Fetch URL",
         "question" => "Ask question",
-        n if is_delegate(n) => "Delegate task",
+        n if is_delegate(n) => "Delegate",
         "create_task" => "Create task",
         "todowrite" => "Update tasks",
         "todoread" => "Read tasks",
@@ -559,11 +559,8 @@ fn tool_preview_raw(call: &ToolCall) -> String {
             .unwrap_or_default(),
         "skill" => s("name").unwrap_or_default(),
         "browse" | "web_fetch" => s("url").unwrap_or_default(),
-        n if is_delegate(n) => [s("target_agent_id").or_else(|| s("peer")), s("objective")]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" - "),
+        // The target is the pill at the end of the row.
+        n if is_delegate(n) => s("objective").unwrap_or_default(),
         "replace_symbol" => {
             let reps = args
                 .get("replacements")
@@ -701,8 +698,51 @@ impl<'a> SkillContent<'a> {
     }
 }
 
-fn skill_content_key(id: &str) -> String {
-    format!("skill-instructions-{id}")
+/// Nested disclosure inside an open tool card (skill instructions, delegation details).
+fn tool_details_key(id: &str) -> String {
+    format!("tool-details-{id}")
+}
+
+fn is_delegate_call(call: &ToolCall) -> bool {
+    is_delegate(&concrete_tool_name(call)) || is_delegate(&normalized_tool_name(call))
+}
+
+/// A delegation's arguments: the objective up front, the rest behind a disclosure.
+#[derive(Debug, PartialEq)]
+struct DelegateBrief {
+    target: Option<String>,
+    objective: String,
+    /// Remaining arguments as (label, text), in the order the agent sent them.
+    details: Vec<(String, String)>,
+}
+
+impl DelegateBrief {
+    fn parse(call: &ToolCall) -> Option<Self> {
+        if !is_delegate_call(call) {
+            return None;
+        }
+        let args = call.input.as_ref()?.as_object()?;
+        let text = |v: &serde_json::Value| match v {
+            serde_json::Value::String(s) => s.trim().to_string(),
+            other => serde_json::to_string_pretty(other).unwrap_or_default(),
+        };
+        let target = ["target_agent_id", "peer"]
+            .iter()
+            .filter_map(|k| args.get(*k).map(text))
+            .find(|t| !t.is_empty());
+        let objective = args.get("objective").map(text).unwrap_or_default();
+        let details = args
+            .iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "target_agent_id" | "peer" | "objective"))
+            .map(|(k, v)| (humanize_tool_name(k), text(v)))
+            .filter(|(_, t)| !t.is_empty() && t != "null")
+            .collect();
+        Some(Self {
+            target,
+            objective,
+            details,
+        })
+    }
 }
 
 /// URL fetches (`browse`, `web_fetch`, or the ACP `fetch` kind).
@@ -1074,6 +1114,7 @@ fn attaches_to_header(call: &ToolCall) -> bool {
         || is_read(call)
         || is_fetch(call)
         || (is_skill(call) && !call.failed() && SkillContent::parse(&call.output).is_some())
+        || (!call.failed() && DelegateBrief::parse(call).is_some())
 }
 
 /// Frame of a borderless output block inside an attached tool card.
@@ -1272,7 +1313,7 @@ fn flat_note(text: &'static str, p: &Palette) -> Div {
 /// instructions use a second disclosure, like the compaction summary.
 fn render_skill_content(call: &ToolCall, skill: &SkillContent<'_>, rc: &RenderCtx) -> Div {
     let p = &rc.p;
-    let key = skill_content_key(&call.id);
+    let key = tool_details_key(&call.id);
     let open = rc.expanded.contains(&key);
     let weak = rc.weak.clone();
     let copy_label = if skill.incomplete {
@@ -1375,6 +1416,99 @@ fn render_skill_content(call: &ToolCall, skill: &SkillContent<'_>, rc: &RenderCt
         })
 }
 
+/// Delegation card: the objective, with context, constraints and the rest of
+/// the brief behind a disclosure. The result is a generic "queued" notice and
+/// is not shown.
+fn render_delegate_content(call: &ToolCall, brief: &DelegateBrief, rc: &RenderCtx) -> Div {
+    let p = &rc.p;
+    let key = tool_details_key(&call.id);
+    let open = rc.expanded.contains(&key);
+    let weak = rc.weak.clone();
+    v_flex()
+        .min_w_0()
+        .gap_3()
+        .p_3()
+        .child(if brief.objective.is_empty() {
+            div()
+                .text_sm()
+                .text_color(p.dim)
+                .child("No objective.")
+                .into_any_element()
+        } else {
+            div()
+                .min_w_0()
+                .text_sm()
+                .child(md::markdown(
+                    format!("delegate-objective-{}", call.id),
+                    brief.objective.clone(),
+                    p,
+                ))
+                .into_any_element()
+        })
+        .when(!brief.details.is_empty(), |el| {
+            el.child(
+                h_flex().child(
+                    kit::button(kit::keyed("delegate-toggle", call.id.clone()))
+                        .ghost()
+                        .xsmall()
+                        .label(if open { "Hide details" } else { "Show details" })
+                        .icon(if open {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .on_click(move |_, _, cx| toggle_expanded(&weak, key.clone(), cx)),
+                ),
+            )
+            .when(open, |el| {
+                el.children(brief.details.iter().enumerate().map(|(ix, (label, text))| {
+                    v_flex()
+                        .gap_1()
+                        .child(div().text_xs().text_color(p.dim).child(label.clone()))
+                        .child(div().min_w_0().text_sm().child(md::markdown(
+                            format!("delegate-detail-{}-{ix}", call.id),
+                            text.clone(),
+                            p,
+                        )))
+                }))
+            })
+        })
+}
+
+/// Desktop `session-tool-session-pill`: arrow + delegate name; opens the
+/// delegated child session when the agent has reported it.
+fn delegate_pill(call: &ToolCall, target: String, rc: &RenderCtx) -> AnyElement {
+    let p = &rc.p;
+    let pill = h_flex()
+        .id(SharedString::from(format!("delegate-pill-{}", call.id)))
+        .flex_none()
+        .gap_1()
+        .px_2()
+        .py(px(1.))
+        .rounded_full()
+        .bg(p.chip)
+        .font_family(kit::MONO)
+        .text_xs()
+        .text_color(p.muted)
+        .child(kit::icon(IconName::ArrowUpRight, 12., p.muted))
+        .child(target.clone());
+    let Some(child) = call.child_session.clone() else {
+        return pill.into_any_element();
+    };
+    let (hover_bg, hover_fg) = (p.card_hover, p.text);
+    let tip = format!("Open {target}");
+    let (weak, agent) = (rc.weak.clone(), rc.agent_id.clone());
+    pill.cursor_pointer()
+        .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
+        .tooltip(move |window, cx| kit::wrap_tip(tip.clone()).build(window, cx))
+        // The rest of the row toggles the card; the pill only navigates.
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            let _ = weak.update(cx, |this, cx| this.open_child_session(&agent, &child, cx));
+        })
+        .into_any_element()
+}
+
 /// Body of an attached tool card, flush with the header.
 fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
     let p = &rc.p;
@@ -1383,6 +1517,11 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
         && let Some(skill) = SkillContent::parse(&call.output)
     {
         return render_skill_content(call, &skill, rc);
+    }
+    if !call.failed()
+        && let Some(brief) = DelegateBrief::parse(call)
+    {
+        return render_delegate_content(call, &brief, rc);
     }
     let output = call.pretty_output();
     let body = v_flex().w_full();
@@ -1676,6 +1815,12 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
         .when_some(exit, |el, code| {
             el.child(kit::tone_chip(format!("exit {code}"), p.danger))
         })
+        // The delegate's name lives only here (desktop session pill); once the
+        // child session is known, the pill opens it.
+        .when_some(
+            DelegateBrief::parse(call).and_then(|b| b.target),
+            |el, target| el.child(delegate_pill(call, target, rc)),
+        )
         // The trailing slot shows the status; hovering an expandable row swaps
         // it for the expand chevron, in the same place.
         .map(|el| {
@@ -2704,6 +2849,29 @@ fn usage_ring(
 }
 
 impl QmtApp {
+    /// Open a delegated child session; Back returns to the current one.
+    fn open_child_session(&mut self, agent: &str, child: &str, cx: &mut Context<Self>) {
+        self.store
+            .update(cx, |s, cx| s.open_child_session(agent, child, cx));
+        self.page = Page::Session;
+        self.session_options_open = false;
+        self.session_details_open = false;
+        self.session_menu_open = false;
+        cx.notify();
+    }
+
+    /// Back: to the parent of a delegated session, else to the session list.
+    fn go_back_from_session(&mut self, cx: &mut Context<Self>) {
+        if self.store.update(cx, |s, cx| s.open_parent_session(cx)) {
+            self.session_options_open = false;
+            self.session_details_open = false;
+            self.session_menu_open = false;
+            cx.notify();
+        } else {
+            self.go(Page::Sessions, cx);
+        }
+    }
+
     pub(super) fn open_session(
         &mut self,
         agent: &str,
@@ -2851,10 +3019,12 @@ impl QmtApp {
         };
         let summary = summary.as_ref();
         let running = view.running();
-        let title = if view.title.is_empty() {
-            "Untitled session".to_string()
-        } else {
+        // A delegated session opened before the list knew it has no title
+        // yet; take the list's once it refreshes.
+        let title = if !view.title.trim().is_empty() {
             view.title.clone()
+        } else {
+            summary.map_or_else(|| "Untitled session".to_string(), |s| s.display_title())
         };
         let (status_label, status_color) = if view.loading {
             ("Loading", p.status_muted)
@@ -2868,9 +3038,17 @@ impl QmtApp {
         let usage = view.usage;
         let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
 
-        let back =
-            kit::title_icon_button("session-back", IconName::ArrowLeft, "Back to sessions", p)
-                .on_click(cx.listener(|this, _, _, cx| this.go(Page::Sessions, cx)));
+        let back = kit::title_icon_button(
+            "session-back",
+            IconName::ArrowLeft,
+            if view.parent.is_some() {
+                "Back to parent session"
+            } else {
+                "Back to sessions"
+            },
+            p,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.go_back_from_session(cx)));
         // Copy feedback follows the desktop's copy chips: for 1.2s the chip shows
         // an accent check + "copied" over itself and the tooltip says "Copied".
         let copied = |key: &str| self.copied.as_deref() == Some(key);
@@ -3894,6 +4072,7 @@ impl QmtApp {
                     .iter()
                     .position(|i| i.key == id && matches!(i.kind, ItemKind::User { .. }))
             }),
+            agent_id: view.agent_id.clone(),
         });
         self.transcript.sync(&key, &view.items, &rc);
         if !self.transcript.scroll_hooked {
@@ -4588,7 +4767,29 @@ mod tests {
             locations: Vec::new(),
             stats: (0, 0),
             synthesized: false,
+            child_session: None,
         }
+    }
+
+    #[test]
+    fn delegate_brief_keeps_objective_and_hides_the_rest() {
+        let mut c = call("delegate", "other");
+        c.input = Some(serde_json::json!({
+            "target_agent_id": "cedar",
+            "objective": " Cross-examine willow ",
+            "context": "evidence",
+            "constraints": "",
+            "expected_output": "report",
+        }));
+        let brief = super::DelegateBrief::parse(&c).expect("delegate");
+        assert_eq!(brief.target.as_deref(), Some("cedar"));
+        assert_eq!(brief.objective, "Cross-examine willow");
+        let labels: Vec<&str> = brief.details.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(labels.contains(&"Context") && labels.contains(&"Expected output"));
+        assert!(!labels.contains(&"Constraints"), "empty fields are dropped");
+        assert_eq!(tool_label(&c), "Delegate");
+        assert_eq!(super::tool_preview_raw(&c), "Cross-examine willow");
+        assert!(super::DelegateBrief::parse(&call("shell", "execute")).is_none());
     }
 
     #[test]

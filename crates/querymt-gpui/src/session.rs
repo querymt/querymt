@@ -223,6 +223,8 @@ pub struct ToolCall {
     pub stats: (usize, usize),
     /// `diffs` were derived from the arguments rather than sent by the agent.
     pub synthesized: bool,
+    /// Session a delegation spawned, once the agent reports it.
+    pub child_session: Option<String>,
 }
 
 /// Line counts of a diff: (added, removed).
@@ -735,6 +737,8 @@ pub struct SessionView {
     pub session_id: String,
     pub cwd: String,
     pub title: String,
+    /// Session this one was opened from through a delegation pill; Back returns there.
+    pub parent: Option<Box<ParentSession>>,
     pub items: Vec<Item>,
     pub loading: bool,
     pub error: Option<String>,
@@ -788,11 +792,24 @@ pub struct SessionView {
     /// Notice to append once the transcript has (re)loaded, e.g. after an undo.
     pub after_load_notice: Option<String>,
     tool_index: HashMap<String, usize>,
+    /// Child sessions of tool calls not loaded yet (e.g. older history pages).
+    child_links: HashMap<String, String>,
     counter: u64,
     /// (name, mime) of local-prompt attachments whose agent echo hasn't
     /// arrived yet. The text echo can come first and clear `local`, so the
     /// echoed images must be matched against this instead.
     echo_pending: Vec<(String, String)>,
+}
+
+/// Where Back goes from a delegated child session.
+#[derive(Clone, Debug, Default)]
+pub struct ParentSession {
+    pub agent_id: String,
+    pub session_id: String,
+    pub cwd: String,
+    pub title: String,
+    /// The parent's own parent, so Back walks up a delegation chain.
+    pub parent: Option<Box<ParentSession>>,
 }
 
 /// One frame of the workspace undo stack.
@@ -1247,6 +1264,11 @@ impl SessionView {
                 self.fail_unfinished_tools();
             }
         }
+        for key in ["/summary/childSessions", "/delegationUpdates"] {
+            if let Some(links) = snap.pointer(key).and_then(Value::as_array) {
+                self.apply_child_links(links);
+            }
+        }
         let ts = |ev: &Value| {
             ev.get("timestamp")
                 .and_then(Value::as_f64)
@@ -1376,6 +1398,7 @@ impl SessionView {
             session_id: self.session_id.clone(),
             cwd: self.cwd.clone(),
             title: self.title.clone(),
+            parent: self.parent.clone(),
             items: Vec::new(),
             loading: self.loading,
             error: self.error.clone(),
@@ -1405,6 +1428,7 @@ impl SessionView {
             undo_pending: self.undo_pending,
             after_load_notice: None,
             tool_index: HashMap::new(),
+            child_links: HashMap::new(),
             counter: 0,
             echo_pending: Vec::new(),
         }
@@ -1415,11 +1439,13 @@ impl SessionView {
     pub fn prepend_events(&mut self, events: &[Value], prompts: &[Value]) {
         let mut older = SessionView {
             counter: self.counter,
+            child_links: std::mem::take(&mut self.child_links),
             ..Default::default()
         };
         older.apply_history_events(events, prompts);
         older.insert_compactions(fold_compactions(events), true);
         self.counter = older.counter;
+        self.child_links = std::mem::take(&mut older.child_links);
         let known: std::collections::HashSet<&str> =
             self.items.iter().map(|i| i.key.as_str()).collect();
         let mut items: Vec<Item> = older
@@ -1472,6 +1498,10 @@ impl SessionView {
         // Event timestamp of each item this build added, for placing prompts.
         let mut stamps: HashMap<String, i64> = HashMap::new();
         let mut last_assistant: Option<String> = None;
+        // Delegation public id → requesting tool call, and → forked child
+        // session (the fork can be journaled before the request).
+        let mut delegation_tools: HashMap<String, String> = HashMap::new();
+        let mut delegation_children: HashMap<String, String> = HashMap::new();
         for (n, ev) in events.iter().enumerate() {
             let kind = ev
                 .pointer("/kind/type")
@@ -1588,6 +1618,32 @@ impl SessionView {
                         self.apply(&update);
                     }
                 }
+                "delegation_requested" => {
+                    let public = data
+                        .pointer("/delegation/public_id")
+                        .and_then(Value::as_str);
+                    if let (Some(tool), Some(public)) = (s("tool_call_id"), public) {
+                        if let Some(child) = delegation_children.get(public) {
+                            self.link_child_session(&tool, child);
+                        }
+                        delegation_tools.insert(public.to_string(), tool);
+                    }
+                }
+                "session_forked" => {
+                    if let Some(child) = s("child_session_id") {
+                        let fork = s("fork_point_ref").unwrap_or_default();
+                        if let Some(tool) = delegation_tools
+                            .get(&fork)
+                            .cloned()
+                            .or_else(|| s("tool_call_id"))
+                        {
+                            self.link_child_session(&tool, &child);
+                        }
+                        if !fork.is_empty() {
+                            delegation_children.insert(fork, child);
+                        }
+                    }
+                }
                 _ => {}
             }
             if let Some(ts) = ev.get("timestamp").and_then(Value::as_i64) {
@@ -1646,6 +1702,50 @@ impl SessionView {
             }
             if changed {
                 self.touch(ix);
+            }
+        }
+    }
+
+    /// Record the child session a delegation tool call spawned.
+    pub fn link_child_session(&mut self, tool_call_id: &str, child: &str) {
+        let Some(ix) = self.tool_index.get(tool_call_id).copied() else {
+            self.child_links
+                .insert(tool_call_id.to_string(), child.to_string());
+            return;
+        };
+        let mut changed = false;
+        if let ItemKind::Work(entries) = &mut self.items[ix].kind {
+            for e in entries.iter_mut() {
+                if let WorkEntry::Tool(call) = e
+                    && call.id == tool_call_id
+                    && call.child_session.as_deref() != Some(child)
+                {
+                    call.child_session = Some(child.to_string());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.touch(ix);
+        }
+    }
+
+    /// Child links carried outside the events: a windowed load's summary
+    /// (`childSessions`) and delegation updates (`delegationUpdates`, or a live
+    /// `querymt/session/delegationUpdate`).
+    pub fn apply_child_links(&mut self, links: &[Value]) {
+        for link in links {
+            let get = |a: &str, b: &str| {
+                link.get(a)
+                    .or_else(|| link.get(b))
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+            };
+            if let (Some(tool), Some(child)) = (
+                get("toolCallId", "tool_call_id"),
+                get("childSessionId", "child_session_id"),
+            ) {
+                self.link_child_session(tool, child);
             }
         }
     }
@@ -2175,6 +2275,7 @@ impl SessionView {
                     locations: vec![],
                     stats: (0, 0),
                     synthesized: false,
+                    child_session: self.child_links.remove(id),
                 };
                 let ix = match self.items.last_mut() {
                     Some(Item {
@@ -2309,6 +2410,7 @@ mod diff_tests {
             locations: vec![],
             stats: (0, 0),
             synthesized: false,
+            child_session: None,
         };
         let diffs = synthesized_diffs(&call);
         assert_eq!(diffs.len(), 2);
@@ -2336,6 +2438,7 @@ mod diff_tests {
             locations: vec![],
             stats: (0, 0),
             synthesized: false,
+            child_session: None,
         };
         assert!(synthesized_diffs(&call).is_empty());
         call.output = String::new();
@@ -2369,6 +2472,61 @@ mod history_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn child_of(view: &SessionView, tool: &str) -> Option<String> {
+        view.items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::Work(e) => Some(e),
+                _ => None,
+            })
+            .flatten()
+            .find_map(|e| match e {
+                WorkEntry::Tool(c) if c.id == tool => c.child_session.clone(),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn delegation_tool_calls_link_their_child_session() {
+        let start = |id: &str| {
+            ev(
+                "tool_call_start",
+                json!({ "tool_call_id": id, "tool_name": "delegate", "arguments": "{}" }),
+            )
+        };
+        let requested = |id: &str, public: &str| {
+            ev(
+                "delegation_requested",
+                json!({ "tool_call_id": id, "delegation": { "public_id": public } }),
+            )
+        };
+        let forked = |public: &str, child: &str| {
+            ev(
+                "session_forked",
+                json!({ "child_session_id": child, "fork_point_ref": public }),
+            )
+        };
+        let mut view = SessionView::new("a", "s", "/w", "t");
+        view.apply_history_events(
+            &[
+                start("t1"),
+                requested("t1", "d1"),
+                forked("d1", "c1"),
+                // Fork journaled before the request.
+                start("t2"),
+                forked("d2", "c2"),
+                requested("t2", "d2"),
+                start("t3"),
+            ],
+            &[],
+        );
+        assert_eq!(child_of(&view, "t1").as_deref(), Some("c1"));
+        assert_eq!(child_of(&view, "t2").as_deref(), Some("c2"));
+        // Live `delegationUpdate` / windowed summary links.
+        view.apply_child_links(&[json!({ "toolCallId": "t3", "childSessionId": "c3" })]);
+        assert_eq!(child_of(&view, "t3").as_deref(), Some("c3"));
     }
 
     #[test]

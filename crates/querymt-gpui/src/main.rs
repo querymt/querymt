@@ -281,6 +281,7 @@ mod web {
             Settings2,
             Diff,
             ArrowDown,
+            ArrowUpRight,
             // model picker
             Gauge,
             Type,
