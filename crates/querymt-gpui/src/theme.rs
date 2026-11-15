@@ -116,6 +116,11 @@ pub fn accent_color(id: &str, dark: bool) -> Hsla {
     hex(if dark { d } else { l })
 }
 
+/// Accent tint behind user message bubbles (`Palette::accent_dim`).
+pub fn accent_dim(id: &str, dark: bool) -> Hsla {
+    accent_color(id, dark).opacity(if dark { 0.16 } else { 0.12 })
+}
+
 /// Switch light/dark/accent and re-apply QueryMT colors over the component theme.
 pub fn apply(dark: bool, accent: &str, cx: &mut App) {
     let mut p = if dark {
@@ -130,7 +135,7 @@ pub fn apply(dark: bool, accent: &str, cx: &mut App) {
             l: (a.l + if dark { 0.08 } else { -0.08 }).clamp(0., 1.),
             ..a
         };
-        p.accent_dim = a.opacity(if dark { 0.16 } else { 0.12 });
+        p.accent_dim = accent_dim(accent, dark);
     }
     cx.set_global(p);
     Theme::change(
