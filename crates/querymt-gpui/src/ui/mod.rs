@@ -8,6 +8,7 @@ mod keys;
 mod kit;
 mod mesh;
 mod preview;
+mod profile_select;
 mod session_view;
 mod sessions;
 mod settings;
@@ -141,6 +142,14 @@ pub struct QmtApp {
     /// Command palette (Ctrl/Cmd+P).
     palette: Entity<CommandState>,
     palette_open: bool,
+    /// Profile select of the Start Options: menu, search, highlighted row.
+    profile_menu_open: bool,
+    profile_query: Entity<InputState>,
+    profile_cursor: usize,
+    profile_scroll: ScrollHandle,
+    /// Last painted trigger bounds and window height, to place the menu.
+    profile_trigger: Bounds<Pixels>,
+    profile_viewport_h: Pixels,
     _subs: Vec<Subscription>,
 }
 
@@ -236,6 +245,21 @@ impl QmtApp {
         // returns focus to the shell so shortcuts keep working.
         subs.push(cx.on_focus_lost(window, |this, window, cx| this.app_focus.focus(window, cx)));
         let palette = cx.new(|cx| CommandState::new(window, cx));
+        let profile_query = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Search by name, ID or description"));
+        subs.push(cx.subscribe_in(
+            &profile_query,
+            window,
+            |this, _, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } => this.pick_profile_at_cursor(window, cx),
+                InputEvent::Change => {
+                    this.profile_cursor = 0;
+                    this.profile_scroll.scroll_to_item(0);
+                    cx.notify();
+                }
+                _ => {}
+            },
+        ));
 
         let (page, details) = initial_view(&store, cx);
         Self {
@@ -301,6 +325,12 @@ impl QmtApp {
             app_focus,
             palette,
             palette_open: false,
+            profile_menu_open: false,
+            profile_query,
+            profile_cursor: 0,
+            profile_scroll: ScrollHandle::new(),
+            profile_trigger: Bounds::default(),
+            profile_viewport_h: px(0.),
             _subs: subs,
         }
     }

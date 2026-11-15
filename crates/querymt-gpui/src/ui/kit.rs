@@ -46,6 +46,40 @@ impl ButtonExt for Button {
 pub const SEGMENT_H: f32 = 32.;
 
 /// Track of a segmented picker; fill it with [`segment`] buttons.
+/// Desktop `.action-btn` (`compact`: `.action-btn-compact`): bordered card
+/// fill, stronger border + hover fill when enabled, dimmed when not. Also the
+/// trigger of the app's pill selects.
+pub fn action_btn(
+    id: impl Into<ElementId>,
+    enabled: bool,
+    compact: bool,
+    p: &Palette,
+) -> Stateful<Div> {
+    let (hover_border, hover_bg) = (p.border_strong, p.card_hover);
+    h_flex()
+        .id(id)
+        .flex_none()
+        .justify_center()
+        .gap(px(if compact { 6.4 } else { 8. }))
+        .h(px(if compact { 32. } else { 36. }))
+        .px(px(if compact { 12. } else { 15.2 }))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(p.border)
+        .bg(p.card)
+        .text_color(p.text)
+        .text_size(px(if compact { 12. } else { 13.1 }))
+        .font_weight(FontWeight(550.))
+        .map(|el| {
+            if enabled {
+                el.cursor_pointer()
+                    .hover(move |s| s.border_color(hover_border).bg(hover_bg))
+            } else {
+                el.opacity(0.5)
+            }
+        })
+}
+
 pub fn segment_bar(p: &Palette) -> Div {
     h_flex()
         .flex_none()

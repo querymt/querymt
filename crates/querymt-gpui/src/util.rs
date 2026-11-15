@@ -98,9 +98,64 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// Fuzzy match of `query` against `fields` (most important first); higher is
+/// better, `None` when some query word matches no field. Each word must match
+/// a field as a subsequence; contiguous runs, word starts and earlier fields
+/// score higher. An empty query matches with score 0.
+pub fn fuzzy_score(query: &str, fields: &[&str]) -> Option<u32> {
+    let mut total = 0;
+    for word in query.split_whitespace() {
+        let word: Vec<char> = word.to_lowercase().chars().collect();
+        let weights = (1..=fields.len() as u32).rev();
+        total += fields
+            .iter()
+            .zip(weights)
+            .filter_map(|(field, weight)| Some(word_score(&word, field)? * weight))
+            .max()?;
+    }
+    Some(total)
+}
+
+fn word_score(word: &[char], text: &str) -> Option<u32> {
+    let text: Vec<char> = text.to_lowercase().chars().collect();
+    let (mut score, mut at, mut prev) = (0u32, 0usize, None::<usize>);
+    for &c in word {
+        let ix = at + text[at..].iter().position(|&t| t == c)?;
+        score += 1;
+        // A contiguous run outweighs letters scattered over word starts.
+        if prev.is_some_and(|p| p + 1 == ix) {
+            score += 10;
+        } else if ix == 0 || !text[ix - 1].is_alphanumeric() {
+            score += 6;
+        }
+        prev = Some(ix);
+        at = ix + 1;
+    }
+    Some(score)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_rfc3339, parse_rfc3339_ms};
+    use super::{format_rfc3339, fuzzy_score, parse_rfc3339_ms};
+
+    #[test]
+    fn fuzzy_score_ranks_contiguous_and_earlier_fields_higher() {
+        assert_eq!(fuzzy_score("", &["anything"]), Some(0));
+        assert_eq!(fuzzy_score("xyz", &["coder", "delegate"]), None);
+        // Subsequence across a word boundary.
+        assert!(fuzzy_score("cdl", &["Coder Delegate"]).is_some());
+        // Every word must match some field.
+        assert!(fuzzy_score("cod speech", &["Coder", "cdr", "Speech helper"]).is_some());
+        assert_eq!(fuzzy_score("cod zzz", &["Coder", "cdr"]), None);
+        // Contiguous beats scattered; a name hit beats a description hit.
+        let tight = fuzzy_score("def", &["def-qmcp"]).unwrap();
+        let loose = fuzzy_score("def", &["Default (Speech)"]).unwrap();
+        assert!(fuzzy_score("def", &["d-e-f"]).unwrap() < tight);
+        assert!(loose <= tight);
+        let in_name = fuzzy_score("review", &["Review", "x", "y"]).unwrap();
+        let in_desc = fuzzy_score("review", &["x", "y", "Review"]).unwrap();
+        assert!(in_name > in_desc);
+    }
 
     #[test]
     fn rfc3339_round_trips() {
