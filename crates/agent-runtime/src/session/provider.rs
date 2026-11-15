@@ -1,7 +1,7 @@
-#[cfg(feature = "remote")]
 use crate::accounting::{
     BillingBasis, is_non_billable_oauth_provider, pricing_for, resolve_billing_basis,
 };
+#[cfg(feature = "remote")]
 use crate::agent::remote::NodeId;
 use crate::middleware::ModelProfile;
 use crate::model::{AgentMessage, MessagePart, OutputTarget};

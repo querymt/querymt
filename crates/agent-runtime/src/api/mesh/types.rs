@@ -131,19 +131,23 @@ impl Mesh {
         self
     }
 
-    pub(crate) fn remote_agents(&self) -> &[RemoteAgentConfig] {
+    #[doc(hidden)]
+    pub fn remote_agents(&self) -> &[RemoteAgentConfig] {
         &self.remote_agents
     }
 
-    pub(crate) fn spec_for_internal_use(&self) -> &MeshSpec {
+    #[doc(hidden)]
+    pub fn spec_for_internal_use(&self) -> &MeshSpec {
         &self.spec
     }
 
-    pub(crate) fn node_name(&self) -> Option<String> {
+    #[doc(hidden)]
+    pub fn node_name(&self) -> Option<String> {
         self.spec.node_name()
     }
 
-    pub(crate) fn is_disabled(&self) -> bool {
+    #[doc(hidden)]
+    pub fn is_disabled(&self) -> bool {
         matches!(self.spec, MeshSpec::Disabled)
     }
 
@@ -241,7 +245,8 @@ impl MeshRuntime {
 
 #[cfg(feature = "remote")]
 impl AgentMesh {
-    pub(crate) fn new(runtime: MeshRuntimeHandle, agent: Arc<LocalAgentHandle>) -> Self {
+    #[doc(hidden)]
+    pub fn new(runtime: MeshRuntimeHandle, agent: Arc<LocalAgentHandle>) -> Self {
         Self { runtime, agent }
     }
 

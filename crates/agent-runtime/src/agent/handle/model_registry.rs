@@ -254,7 +254,8 @@ impl LocalAgentHandle {
     /// Build the load snapshot of a remote session from the local journal,
     /// after the sync barrier (see [`Self::load_remote_snapshot`]).
     #[cfg(feature = "remote")]
-    pub(crate) async fn build_remote_attach_snapshot_with_budget(
+    #[doc(hidden)]
+    pub async fn build_remote_attach_snapshot_with_budget(
         &self,
         session_id: &str,
         window: Option<crate::session::history_window::LoadWindow>,

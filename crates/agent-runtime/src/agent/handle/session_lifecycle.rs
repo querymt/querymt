@@ -51,7 +51,8 @@ impl super::LocalAgentHandle {
             && view_store.supports_session_lifecycle_filtering()
     }
 
-    pub(crate) async fn get_session_lifecycle_unloaded(
+    #[doc(hidden)]
+    pub async fn get_session_lifecycle_unloaded(
         &self,
         session_id: &str,
     ) -> SessionResult<SessionLifecycle> {
@@ -112,7 +113,8 @@ impl super::LocalAgentHandle {
         }
     }
 
-    pub(crate) async fn patch_session_lifecycle_unloaded(
+    #[doc(hidden)]
+    pub async fn patch_session_lifecycle_unloaded(
         &self,
         session_id: &str,
         patch: &SessionLifecyclePatch,

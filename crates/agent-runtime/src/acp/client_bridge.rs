@@ -130,21 +130,25 @@ impl NotificationForwardingState {
 }
 
 /// Per-connection state shared by every clone of a connection's sender.
-pub(crate) struct ClientBridgeConnectionState {
+#[doc(hidden)]
+pub struct ClientBridgeConnectionState {
     active: AtomicBool,
     attachment_lock: Mutex<()>,
 }
 
 impl ClientBridgeConnectionState {
-    pub(crate) async fn lock_attachment(&self) -> tokio::sync::MutexGuard<'_, ()> {
+    #[doc(hidden)]
+    pub async fn lock_attachment(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.attachment_lock.lock().await
     }
 
-    pub(crate) fn is_active(&self) -> bool {
+    #[doc(hidden)]
+    pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
     }
 
-    pub(crate) fn deactivate(&self) {
+    #[doc(hidden)]
+    pub fn deactivate(&self) {
         self.active.store(false, Ordering::Release);
     }
 }
@@ -189,7 +193,8 @@ impl ClientBridgeSender {
         }
     }
 
-    pub(crate) fn for_connection(
+    #[doc(hidden)]
+    pub fn for_connection(
         tx: mpsc::Sender<ClientBridgeMessage>,
         connection_id: impl Into<Arc<str>>,
     ) -> Self {
@@ -203,11 +208,13 @@ impl ClientBridgeSender {
         }
     }
 
-    pub(crate) fn connection_id(&self) -> Option<&str> {
+    #[doc(hidden)]
+    pub fn connection_id(&self) -> Option<&str> {
         self.connection_id.as_deref()
     }
 
-    pub(crate) fn connection_state(&self) -> Option<Arc<ClientBridgeConnectionState>> {
+    #[doc(hidden)]
+    pub fn connection_state(&self) -> Option<Arc<ClientBridgeConnectionState>> {
         self.connection_state.clone()
     }
 

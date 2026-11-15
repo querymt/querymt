@@ -759,7 +759,8 @@ pub fn u32_from_usize(value: usize, field_name: &str, session_id: Option<&str>) 
     }
 }
 
-pub(crate) fn latest_assistant_message(messages: &[AgentMessage]) -> Option<String> {
+#[doc(hidden)]
+pub fn latest_assistant_message(messages: &[AgentMessage]) -> Option<String> {
     messages
         .iter()
         .rev()

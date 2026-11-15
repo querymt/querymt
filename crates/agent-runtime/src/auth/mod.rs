@@ -20,7 +20,8 @@
 //!
 //! The OAuth tokens are automatically used when building providers:
 //!
-//! ```rust,no_run
+//! ```rust,ignore
+//! # // `Agent` is defined in the `querymt-agent` facade crate.
 //! # use querymt_agent::prelude::*;
 //! # async fn example() -> anyhow::Result<()> {
 //! // Tokens from `qmt auth login anthropic` are automatically used
@@ -76,7 +77,7 @@ use std::pin::Pin;
 /// # Example
 ///
 /// ```rust,no_run
-/// use querymt_agent::auth::OAuthKeyResolver;
+/// use querymt_agent_runtime::auth::OAuthKeyResolver;
 ///
 /// let resolver = OAuthKeyResolver::new("anthropic", "sk-ant-oat01-initial-token");
 /// // resolver.resolve() will refresh the token when called

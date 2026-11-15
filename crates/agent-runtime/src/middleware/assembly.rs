@@ -44,7 +44,7 @@ fn has_driver(drivers: &[Arc<dyn MiddlewareDriver>], name: &str) -> bool {
 ///
 /// Fails on the first entry with an unknown type or invalid configuration,
 /// naming the middleware type.
-pub(crate) fn build_from_entries(
+pub fn build_from_entries(
     entries: &[MiddlewareEntry],
     existing: &[Arc<dyn MiddlewareDriver>],
     config: &AgentConfig,

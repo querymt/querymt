@@ -61,16 +61,18 @@ pub mod remote_setup;
 #[cfg(feature = "remote")]
 mod remote_actor_impl;
 
-#[cfg(test)]
-pub(crate) mod tests;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod tests;
 
 #[cfg(test)]
 mod actor_ref_tests;
 
 // ── Test modules (remote feature) ────────────────────────────────────────────
 
-#[cfg(all(test, feature = "remote"))]
-pub(crate) mod test_helpers;
+#[cfg(all(any(test, feature = "test-support"), feature = "remote"))]
+#[doc(hidden)]
+pub mod test_helpers;
 
 #[cfg(all(test, feature = "remote"))]
 mod provider_host_tests;

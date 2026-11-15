@@ -9,6 +9,8 @@ pub use crate::core_staging::dotagents_tasks::{
     DotagentsTaskIdentity, DotagentsTaskOwnership, DotagentsTaskStateRepository,
 };
 use async_trait::async_trait;
+#[cfg(any(test, feature = "test-support"))]
+#[allow(unused_imports)]
 pub use querymt_agent_sqlite::repo_dotagents_tasks::SqliteDotagentsTaskStateRepository;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

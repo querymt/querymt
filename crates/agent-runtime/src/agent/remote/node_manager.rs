@@ -487,7 +487,8 @@ mod remote_impl {
         }
 
         /// Share the live profile slot so profiles installed after mesh startup are visible.
-        pub(crate) fn with_profiles_slot(
+        #[doc(hidden)]
+        pub fn with_profiles_slot(
             mut self,
             profiles: crate::agent::handle::ProfileRuntimeSlot,
         ) -> Self {

@@ -9,7 +9,9 @@ pub use provider::{SessionHandle, SessionProvider};
 pub use querymt_agent_services::session::run_lease;
 pub mod run_reconcile;
 pub use querymt_agent_services::session::task_service;
+#[cfg(any(test, feature = "test-support"))]
 pub use querymt_agent_sqlite::session::{schema, sqlite_storage};
+#[cfg(any(test, feature = "test-support"))]
 pub use sqlite_storage::SqliteStorage;
 pub use task_service::TaskService;
 
@@ -29,20 +31,31 @@ pub use querymt_agent_services::session::pruning;
 pub mod backend;
 pub use backend::StorageBackend;
 
-// Repository implementations
+// Repository implementations (SQLite; test and `test-support` only, the top crate
+// re-exports them for applications).
+#[cfg(any(test, feature = "test-support"))]
 pub use querymt_agent_sqlite::repo_schedule;
+#[cfg(any(test, feature = "test-support"))]
 pub use querymt_agent_sqlite::session::{
     repo_artifact, repo_decision, repo_delegation, repo_intent, repo_progress, repo_session,
     repo_task,
 };
 
+#[cfg(any(test, feature = "test-support"))]
 pub use repo_artifact::SqliteArtifactRepository;
+#[cfg(any(test, feature = "test-support"))]
 pub use repo_decision::SqliteDecisionRepository;
+#[cfg(any(test, feature = "test-support"))]
 pub use repo_delegation::SqliteDelegationRepository;
+#[cfg(any(test, feature = "test-support"))]
 pub use repo_intent::SqliteIntentRepository;
+#[cfg(any(test, feature = "test-support"))]
 pub use repo_progress::SqliteProgressRepository;
+#[cfg(any(test, feature = "test-support"))]
 pub use repo_schedule::SqliteScheduleRepository;
+#[cfg(any(test, feature = "test-support"))]
 pub use repo_session::SqliteSessionRepository;
+#[cfg(any(test, feature = "test-support"))]
 pub use repo_task::SqliteTaskRepository;
 
 // Schedule domain types

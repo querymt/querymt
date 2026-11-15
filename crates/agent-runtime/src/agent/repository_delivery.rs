@@ -62,7 +62,8 @@ fn fetch_available(config: &AgentConfig, exec_ctx: &ExecutionContext) -> bool {
 /// enabled and both `repo_knowledge_query` and `repo_knowledge_get` are
 /// registered and allowed by the tool policy. Explicit allowlists stay
 /// authoritative; this never grants a tool.
-pub(crate) fn policy_applies(config: &AgentConfig) -> bool {
+#[doc(hidden)]
+pub fn policy_applies(config: &AgentConfig) -> bool {
     config.repository_knowledge().is_some()
         && crate::knowledge::repository::policy::should_attach(|name| {
             config.tool_registry.find(name).is_some()

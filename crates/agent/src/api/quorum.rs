@@ -1,6 +1,5 @@
 //! Multi-agent quorum implementation
 
-use super::callbacks::EventCallbacksState;
 use super::config::{AgentConfig, DelegateConfigBuilder, PlannerConfigBuilder};
 use super::utils::{
     build_llm_config, default_registry, infer_required_capabilities, latest_assistant_message,
@@ -13,6 +12,7 @@ use crate::agent::core::SnapshotPolicy;
 use crate::agent::core::ToolPolicy;
 use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
 use crate::delegation::AgentInfo;
+use querymt_agent_runtime::api::callbacks::EventCallbacksState;
 
 use crate::acp::protocol::{ContentBlock, PromptRequest, TextContent};
 use crate::agent::builtin_tools::all_builtin_tools;

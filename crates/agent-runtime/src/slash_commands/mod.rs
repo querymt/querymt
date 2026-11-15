@@ -40,7 +40,8 @@ pub mod registry;
 pub mod script;
 pub mod types;
 
-pub(crate) use discovery::search_paths;
+#[doc(hidden)]
+pub use discovery::search_paths;
 pub use discovery::{default_search_paths, discover_all, discover_from_source};
 pub use expander::{expand_invocation, try_expand, try_parse_invocation};
 pub use parser::parse_command_file;

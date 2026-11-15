@@ -25,7 +25,8 @@ pub struct TestAgent {
 }
 
 impl TestAgent {
-    pub(crate) async fn with_mock_provider(provider: crate::test_utils::SharedLlmProvider) -> Self {
+    #[doc(hidden)]
+    pub async fn with_mock_provider(provider: crate::test_utils::SharedLlmProvider) -> Self {
         let (registry, tempdir) = crate::test_utils::mock_plugin_registry(Arc::new(
             crate::test_utils::TestProviderFactory::new(provider),
         ))

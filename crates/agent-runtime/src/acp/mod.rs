@@ -1,21 +1,22 @@
 // Core ACP infrastructure
 pub mod shutdown;
 pub mod transport;
-pub mod websocket;
 
 // Internal modules
-pub(crate) mod client_bridge;
+#[doc(hidden)]
+pub mod client_bridge;
 pub mod cwd;
-pub(crate) mod delivery;
+#[doc(hidden)]
+pub mod delivery;
 pub use crate::core_staging::protocol;
 pub mod shared;
-pub(crate) mod stdio;
-pub(crate) mod trace_context;
+#[doc(hidden)]
+pub mod stdio;
+#[doc(hidden)]
+pub mod trace_context;
 
 #[cfg(test)]
 mod session_load_snapshot_tests;
-#[cfg(test)]
-pub(crate) mod websocket_tests;
 
 // Public re-exports
 pub use transport::AcpTransport;
@@ -29,7 +30,6 @@ use crate::acp::shared::{
 };
 use crate::event_fanout::EventFanout;
 
-use axum::Router;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
@@ -89,10 +89,6 @@ impl AcpServer {
             event_sources,
             session_owners,
         }
-    }
-
-    pub fn router(self) -> Router {
-        websocket::router(self.agent)
     }
 
     pub async fn run_stdio(self) -> anyhow::Result<()> {

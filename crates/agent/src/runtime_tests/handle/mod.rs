@@ -513,12 +513,8 @@ impl RealStorageHandleFixture {
     }
 }
 
-impl LocalAgentHandle {
-    fn should_return_without_force_stop(
-        status: crate::agent::messages::SessionRuntimeStatus,
-    ) -> bool {
-        status.phase == crate::agent::messages::SessionRuntimePhase::Idle
-    }
+fn should_return_without_force_stop(status: crate::agent::messages::SessionRuntimeStatus) -> bool {
+    status.phase == crate::agent::messages::SessionRuntimePhase::Idle
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────

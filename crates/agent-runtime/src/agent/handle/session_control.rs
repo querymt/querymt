@@ -91,7 +91,8 @@ impl LocalAgentHandle {
         Ok(Some((session_handle, binding)))
     }
 
-    pub(crate) async fn session_ref_for_agent_session(
+    #[doc(hidden)]
+    pub async fn session_ref_for_agent_session(
         &self,
         session_id: &str,
     ) -> Result<SessionActorRef, Error> {
@@ -159,7 +160,8 @@ impl LocalAgentHandle {
     /// The guard is per session, so creating sessions and materializing other
     /// sessions are never blocked. Teardown is best-effort (failures are
     /// logged); the guard is returned regardless.
-    pub(crate) async fn terminate_for_delete(
+    #[doc(hidden)]
+    pub async fn terminate_for_delete(
         &self,
         session_id: &str,
     ) -> crate::agent::session_materializer::SessionSingleFlightGuard {
@@ -225,7 +227,8 @@ impl LocalAgentHandle {
     /// cancelling anything. Returns `Ok(true)` when the session is busy (a
     /// running turn, queued or steered input, or a remote host) and was left
     /// untouched, `Ok(false)` when it is now unloaded or never was loaded.
-    pub(crate) async fn unload_session_if_idle(&self, session_id: &str) -> Result<bool, Error> {
+    #[doc(hidden)]
+    pub async fn unload_session_if_idle(&self, session_id: &str) -> Result<bool, Error> {
         if let Some((session_handle, _)) = self.bound_session_handle(session_id).await?
             && let Some(local) = session_handle.as_any().downcast_ref::<LocalAgentHandle>()
         {
@@ -278,7 +281,8 @@ impl LocalAgentHandle {
         Ok(false)
     }
 
-    pub(crate) async fn stop_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {
+    #[doc(hidden)]
+    pub async fn stop_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {
         use crate::agent::messages::{SessionRuntimePhase, SessionRuntimeStatus};
 
         const STOP_ESCALATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);

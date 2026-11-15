@@ -1478,7 +1478,7 @@ async fn output_limit_recovery_example_loads_with_the_documented_defaults() {
     use crate::middleware::OutputLimitConfig;
 
     let config = load_config(ConfigSource::Toml(
-        include_str!("../../examples/confs/output_limit_recovery.toml").into(),
+        include_str!("../../../agent/examples/confs/output_limit_recovery.toml").into(),
     ))
     .await
     .unwrap();
@@ -1501,7 +1501,7 @@ async fn output_limit_recovery_example_loads_with_the_documented_defaults() {
 #[tokio::test]
 async fn oauth_mcp_example_loads_with_an_oauth_server() {
     let config = load_config(ConfigSource::Toml(
-        include_str!("../../examples/confs/oauth_mcp.toml").into(),
+        include_str!("../../../agent/examples/confs/oauth_mcp.toml").into(),
     ))
     .await
     .unwrap();
@@ -1528,11 +1528,11 @@ async fn oauth_mcp_example_loads_with_an_oauth_server() {
 /// delegate on the default `inherit` isolation.
 #[tokio::test]
 async fn example_profiles_keep_workspace_disabled_and_delegates_inheriting() {
-    let single = include_str!("../../examples/confs/single_coder.toml");
+    let single = include_str!("../../../agent/examples/confs/single_coder.toml");
     // `coder_agent.toml` has been invalid TOML since before this change (a
     // commented-out `[delegates.parameters]` header leaves duplicate keys), so
     // it can only be checked textually.
-    let coder_agent = include_str!("../../examples/confs/coder_agent.toml");
+    let coder_agent = include_str!("../../../agent/examples/confs/coder_agent.toml");
     assert!(
         coder_agent
             .lines()
@@ -1540,7 +1540,9 @@ async fn example_profiles_keep_workspace_disabled_and_delegates_inheriting() {
             .all(|l| l.trim_start().starts_with('#')),
         "workspace/isolation blocks in coder_agent.toml must stay commented out"
     );
-    let quorums = [include_str!("../../examples/confs/coder_delegate.toml")];
+    let quorums = [include_str!(
+        "../../../agent/examples/confs/coder_delegate.toml"
+    )];
     // File-relative prompt references need a real path; only the sections
     // under test matter, so parse them as raw TOML tables first.
     let mut table: toml::Value = toml::from_str(single).unwrap();
@@ -1774,7 +1776,7 @@ auth = { type = "oauth" }
 #[tokio::test]
 #[ignore = "trading example profiles are disabled in tests"]
 async fn trading_examples_load_with_split_scopes_and_a_disarmed_desk() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/confs");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent/examples/confs");
     let load = |name: &str| load_config(dir.join(name));
     let (Config::Single(analyst), Config::Single(desk)) = (
         load("trading_analyst.toml").await.unwrap(),

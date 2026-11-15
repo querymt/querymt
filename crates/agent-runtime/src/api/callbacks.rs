@@ -13,7 +13,8 @@ pub type DelegationCallback = Box<dyn Fn(String, String) + Send + Sync>;
 pub type ErrorCallback = Box<dyn Fn(String) + Send + Sync>;
 
 #[derive(Default)]
-pub(super) struct EventCallbacks {
+#[doc(hidden)]
+pub struct EventCallbacks {
     pub on_tool_call: Option<ToolCallCallback>,
     pub on_tool_complete: Option<ToolCompleteCallback>,
     pub on_message: Option<MessageCallback>,
@@ -21,7 +22,8 @@ pub(super) struct EventCallbacks {
     pub on_error: Option<ErrorCallback>,
 }
 
-pub(super) struct EventCallbacksState {
+#[doc(hidden)]
+pub struct EventCallbacksState {
     pub callbacks: Arc<Mutex<EventCallbacks>>,
     task: Mutex<Option<JoinHandle<()>>>,
     session_filter: Option<String>,

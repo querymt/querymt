@@ -48,7 +48,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 ///
 /// Contains everything needed to insert into the registry's in-memory maps,
 /// but hasn't been registered yet.
-pub(crate) struct SessionSingleFlightGuard {
+#[doc(hidden)]
+pub struct SessionSingleFlightGuard {
     session_id: String,
     lock: Arc<tokio::sync::Mutex<()>>,
     inflight: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -485,7 +486,8 @@ impl SessionMaterializer {
     /// # Errors
     /// `owner_transferred` (naming the current owner) or `workspace_archived`;
     /// an internal error when the registry cannot be read.
-    pub(crate) async fn ensure_writable(&self, session_id: &str) -> Result<(), Error> {
+    #[doc(hidden)]
+    pub async fn ensure_writable(&self, session_id: &str) -> Result<(), Error> {
         match self.read_only_reason(session_id).await? {
             Some(reason) => Err(reason.error(session_id)),
             None => Ok(()),

@@ -20,7 +20,8 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
-    pub(crate) fn new(agent: Arc<AgentHandle>, session_id: String) -> Self {
+    #[doc(hidden)]
+    pub fn new(agent: Arc<AgentHandle>, session_id: String) -> Self {
         let callbacks = Arc::new(EventCallbacksState::new(Some(session_id.clone())));
         Self {
             agent,
@@ -31,7 +32,8 @@ impl AgentSession {
     }
 
     /// Attach the workspace binding disclosed when the session was created.
-    pub(crate) fn with_workspace(mut self, workspace: Option<Value>) -> Self {
+    #[doc(hidden)]
+    pub fn with_workspace(mut self, workspace: Option<Value>) -> Self {
         self.workspace = workspace;
         self
     }

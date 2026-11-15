@@ -93,7 +93,8 @@ impl ElicitationRecoveryRegistry {
 
     /// Authorize the selected live owner without rotating a pending authority.
     /// Session observation alone is not sufficient to acquire this authorization.
-    pub(crate) async fn authorize_live_owner(
+    #[doc(hidden)]
+    pub async fn authorize_live_owner(
         &self,
         owners: &crate::acp::shared::SessionOwnerMap,
         connection_id: &str,
@@ -409,7 +410,8 @@ impl ElicitationRecoveryRegistry {
         })
     }
 
-    pub(crate) async fn retire_session_if_idle(
+    #[doc(hidden)]
+    pub async fn retire_session_if_idle(
         &self,
         session_id: &str,
         agent: &crate::agent::LocalAgentHandle,

@@ -164,7 +164,7 @@ fn assemble_resolved_layer(
 }
 
 /// Resolve builder protocol inputs without triggering runtime side effects.
-pub(crate) fn resolve_for_builder(
+pub fn resolve_for_builder(
     supplied: Option<DotagentsManifest>,
     options: Option<DotagentsLoadOptions>,
     workspace: Option<&Path>,
@@ -188,7 +188,7 @@ pub(crate) fn resolve_for_builder(
 }
 
 /// Append protocol singleton bodies in the required order.
-pub(crate) fn compose_prompt(params: &mut querymt::LLMParams, manifest: &DotagentsManifest) {
+pub fn compose_prompt(params: &mut querymt::LLMParams, manifest: &DotagentsManifest) {
     if let Some(prompt) = &manifest.system_prompt
         && !prompt.is_empty()
     {

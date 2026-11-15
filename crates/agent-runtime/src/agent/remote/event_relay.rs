@@ -22,7 +22,8 @@ use tokio::sync::mpsc;
 /// Durable events are persisted to the local journal with Remote origin.
 /// Ephemeral events are published to fanout only.
 #[derive(Clone, Debug)]
-pub(crate) struct RemoteSessionDisconnect {
+#[doc(hidden)]
+pub struct RemoteSessionDisconnect {
     pub session_id: String,
     pub relay_actor_id: u64,
     pub remote_node_id: Option<String>,
@@ -100,7 +101,8 @@ impl Actor for EventRelayActor {
 
 impl EventRelayActor {
     /// Create a new event relay actor that routes through EventSink.
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         event_sink: Arc<EventSink>,
         session_id: String,
         source_label: String,

@@ -48,11 +48,13 @@ impl SessionOwnerMap {
     }
 
     /// Live human-input requests follow the input submitter, not every observer.
-    pub(crate) async fn owns_interactions(&self, session_id: &str, conn_id: &str) -> bool {
+    #[doc(hidden)]
+    pub async fn owns_interactions(&self, session_id: &str, conn_id: &str) -> bool {
         self.interaction_owner(session_id).await.as_deref() == Some(conn_id)
     }
 
-    pub(crate) async fn interaction_owner(&self, session_id: &str) -> Option<String> {
+    #[doc(hidden)]
+    pub async fn interaction_owner(&self, session_id: &str) -> Option<String> {
         let owners = self.owners.lock().await;
         let subscribers = owners.get(session_id)?;
         let mut interaction_owners = self.interaction_owners.lock().await;
@@ -69,7 +71,8 @@ impl SessionOwnerMap {
         interaction_owners.get(session_id).cloned()
     }
 
-    pub(crate) async fn forget_interaction_owner(&self, session_id: &str, conn_id: &str) {
+    #[doc(hidden)]
+    pub async fn forget_interaction_owner(&self, session_id: &str, conn_id: &str) {
         let mut owners = self.interaction_owners.lock().await;
         if owners.get(session_id).is_some_and(|owner| owner == conn_id) {
             owners.remove(session_id);
@@ -139,7 +142,8 @@ async fn unsubscribe_connection(session_owners: &SessionOwnerMap, session_id: &s
 /// Type alias for pending elicitation requests (elicitation_id -> response sender)
 pub type PendingElicitationMap = crate::elicitation::PendingElicitationMap;
 
-pub(crate) fn create_elicitation_request(
+#[doc(hidden)]
+pub fn create_elicitation_request(
     elicitation_id: String,
     session_id: String,
     message: String,
@@ -201,7 +205,8 @@ pub(crate) fn convert_elicitation_response(
 /// Only an explicitly selected option is an answer. A client-side `cancelled`
 /// outcome is not a decision (`Ok(None)`: the delivery ends, the request stays
 /// pending) and anything unparseable is an error handled as undelivered.
-pub(crate) fn convert_permission_response_value(
+#[doc(hidden)]
+pub fn convert_permission_response_value(
     value: serde_json::Value,
 ) -> Result<Option<crate::elicitation::ElicitationResponse>, Error> {
     let response: crate::acp::protocol::RequestPermissionResponse = serde_json::from_value(value)
@@ -219,7 +224,8 @@ pub(crate) fn convert_permission_response_value(
     }
 }
 
-pub(crate) fn convert_elicitation_response_value(
+#[doc(hidden)]
+pub fn convert_elicitation_response_value(
     value: serde_json::Value,
 ) -> Result<crate::elicitation::ElicitationResponse, Error> {
     let response = serde_json::from_value(value).map_err(|err| {
@@ -297,7 +303,8 @@ pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
 }
 
 #[derive(Clone)]
-pub(crate) struct RpcDispatchState<S> {
+#[doc(hidden)]
+pub struct RpcDispatchState<S> {
     pub agent: Arc<S>,
     pub session_owners: SessionOwnerMap,
     pub pending_elicitations: PendingElicitationMap,
@@ -305,7 +312,8 @@ pub(crate) struct RpcDispatchState<S> {
     pub tx: mpsc::Sender<String>,
 }
 
-pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
+#[doc(hidden)]
+pub async fn dispatch_rpc_message_with_context<S: SendAgent>(
     state: RpcDispatchState<S>,
     request: RpcMessage,
     context: RpcDispatchContext,
@@ -389,7 +397,7 @@ pub struct RpcDispatchContext {
     pub session_load: Option<Arc<std::sync::Mutex<AcpSessionLoadPreferences>>>,
     /// The connection's delivery position. `session/prompt` waits on it so the
     /// response follows the session updates the prompt produced.
-    pub(crate) delivery: Option<Arc<crate::acp::delivery::ConnectionDelivery>>,
+    pub delivery: Option<Arc<crate::acp::delivery::ConnectionDelivery>>,
 }
 
 impl RpcDispatchContext {
@@ -775,7 +783,8 @@ pub fn delegate_models_changed_notification(
     )
 }
 
-pub(crate) async fn current_session_observations(
+#[doc(hidden)]
+pub async fn current_session_observations(
     agent: &AgentHandle,
     session_ids: &[String],
     sources: &[Arc<EventFanout>],
@@ -2017,7 +2026,8 @@ impl AcpLiveEventTranslator {
     }
 
     /// Seed options that have not already been observed on the live stream.
-    pub(crate) fn seed_config_options(
+    #[doc(hidden)]
+    pub fn seed_config_options(
         &mut self,
         session_id: &str,
         options: &[crate::acp::protocol::SessionConfigOption],
@@ -2048,10 +2058,8 @@ impl AcpLiveEventTranslator {
         self.delegation_updates.project_envelope(event)
     }
 
-    pub(crate) fn restore_delegation_observations(
-        &mut self,
-        updates: &[DelegationUpdateNotification],
-    ) {
+    #[doc(hidden)]
+    pub fn restore_delegation_observations(&mut self, updates: &[DelegationUpdateNotification]) {
         for update in updates {
             self.delegation_updates.restore_observation(update.clone());
         }

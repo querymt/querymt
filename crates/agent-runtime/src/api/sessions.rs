@@ -176,7 +176,8 @@ pub struct AcpSessionListPage {
 
 /// Rows per global (non-workspace) ACP list page. Large catalogs need fewer round trips;
 /// workspace-scoped pages stay small because they load incrementally.
-pub(crate) const ACP_GLOBAL_PAGE_SIZE: usize = 250;
+#[doc(hidden)]
+pub const ACP_GLOBAL_PAGE_SIZE: usize = 250;
 
 /// Which listing a `session/list` request reads. `All` is the legacy chained listing
 /// (local pages, then remote pages behind `remote:` cursors); `Local` and `Remote`
@@ -212,7 +213,7 @@ fn acp_session_source_from_meta(
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum AcpSessionListError {
+pub enum AcpSessionListError {
     #[error("invalid session list cursor")]
     InvalidCursor,
     #[error(transparent)]
@@ -425,7 +426,8 @@ where
 }
 
 impl AgentSessions {
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         agent: Arc<LocalAgentHandle>,
         view_store: Arc<dyn ViewStore>,
         session_store: Arc<dyn SessionStore>,
@@ -818,7 +820,8 @@ impl AgentSessions {
             .map_err(anyhow::Error::from)
     }
 
-    pub(crate) async fn list_for_acp_with_runtime(
+    #[doc(hidden)]
+    pub async fn list_for_acp_with_runtime(
         agent: &LocalAgentHandle,
         view_store: Arc<dyn ViewStore>,
         request: AcpListSessionsRequest,
@@ -1155,7 +1158,8 @@ impl AgentSessions {
         })
     }
 
-    pub(crate) async fn list_for_acp_from_view_store(
+    #[doc(hidden)]
+    pub async fn list_for_acp_from_view_store(
         view_store: Arc<dyn ViewStore>,
         request: AcpListSessionsRequest,
     ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {

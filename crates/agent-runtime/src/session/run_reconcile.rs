@@ -118,8 +118,10 @@ async fn reconcile_with_root(
     Some(closed)
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[allow(dead_code, unused_imports)]
+pub mod tests {
     use super::*;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
@@ -184,7 +186,8 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) async fn seed(storage: &SqliteStorage, session: &str, kind: AgentEventKind) {
+    #[doc(hidden)]
+    pub async fn seed(storage: &SqliteStorage, session: &str, kind: AgentEventKind) {
         use crate::session::projection::EventJournal;
         storage
             .append_durable(&NewDurableEvent {
@@ -200,7 +203,8 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    pub(crate) fn started(run_id: &str) -> AgentEventKind {
+    #[doc(hidden)]
+    pub fn started(run_id: &str) -> AgentEventKind {
         AgentEventKind::RunStarted {
             run_id: run_id.into(),
             origin: "interactive".into(),

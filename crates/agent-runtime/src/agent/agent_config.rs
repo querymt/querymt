@@ -31,7 +31,8 @@ use crate::session::store::SessionExecutionConfig;
 use crate::tools::ToolRegistry;
 
 #[derive(Clone)]
-pub(crate) struct SessionBridgeRoute {
+#[doc(hidden)]
+pub struct SessionBridgeRoute {
     pub bridge: ClientBridgeSender,
 }
 
@@ -68,7 +69,7 @@ pub struct AgentConfig {
     pub agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     pub delegate_model_overrides: crate::delegation::DelegateModelOverrideStore,
     pub workspace_manager_actor: ActorRef<WorkspaceIndexManagerActor>,
-    pub(crate) session_bridges: Arc<StdMutex<HashMap<String, SessionBridgeRoute>>>,
+    pub session_bridges: Arc<StdMutex<HashMap<String, SessionBridgeRoute>>>,
 
     // ── Defaults (used when spawning new sessions) ───────────────
     /// Shared live reference to the default agent mode.
@@ -147,7 +148,8 @@ impl AgentConfig {
     ///
     /// Used by `AgentBuilder::build()` to swap in the final middleware chain
     /// without manually cloning every field.
-    pub(crate) fn with_middleware(mut self, drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
+    #[doc(hidden)]
+    pub fn with_middleware(mut self, drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
         for driver in &drivers {
             driver.bind_agent(&self.tool_registry, &self.event_sink);
         }

@@ -149,7 +149,8 @@ impl LocalAgentHandle {
     ///   peer (whose commands are not visible here), has none.
     /// - Built-ins come from [`Builtin`](crate::slash_commands::builtin::Builtin)
     ///   filtered by what the host can run. `/compact` is always present.
-    pub(crate) async fn slash_command_catalog(
+    #[doc(hidden)]
+    pub async fn slash_command_catalog(
         &self,
         session_id: &str,
     ) -> crate::acp::protocol::SessionNotification {
@@ -347,7 +348,8 @@ impl LocalAgentHandle {
             .await
     }
 
-    pub(crate) async fn session_profile_config_options(
+    #[doc(hidden)]
+    pub async fn session_profile_config_options(
         &self,
         session_id: Option<&str>,
         mode: AgentMode,
@@ -635,12 +637,14 @@ impl LocalAgentHandle {
         self.scheduler_handle.lock().clone()
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_shutdown(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn is_shutdown(&self) -> bool {
         self.shutdown_done.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn clear_scheduler_handle(&self) {
+    #[doc(hidden)]
+    pub fn clear_scheduler_handle(&self) {
         *self.scheduler_handle.lock() = None;
     }
 

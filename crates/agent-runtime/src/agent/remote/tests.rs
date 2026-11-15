@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), allow(unused_imports, dead_code))]
 //! Tests for remote session support: SessionActorRef, SessionRegistry,
 //! RemoteNodeManager, EventRelayActor, and EventForwarder.
 //!
@@ -34,7 +35,8 @@ use tokio::sync::Mutex;
 ///
 /// Returns `(Arc<AgentConfig>, TempDir)` — the `TempDir` must be kept alive for
 /// the duration of the test.
-pub(crate) async fn test_agent_config() -> (Arc<AgentConfig>, TempDir) {
+#[doc(hidden)]
+pub async fn test_agent_config() -> (Arc<AgentConfig>, TempDir) {
     let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
     let factory = Arc::new(TestProviderFactory::new(SharedLlmProvider {
         inner: provider,

@@ -65,7 +65,8 @@ impl Config {
     }
 
     /// Protocol (`.agents/`) settings of the configuration.
-    pub(crate) fn dotagents(&self) -> &crate::dotagents::DotagentsSettings {
+    #[doc(hidden)]
+    pub fn dotagents(&self) -> &crate::dotagents::DotagentsSettings {
         match self {
             Self::Single(config) => &config.dotagents,
             Self::Multi(config) => &config.dotagents,
@@ -73,7 +74,8 @@ impl Config {
     }
 
     /// Working directory the configuration selects, if any.
-    pub(crate) fn cwd(&self) -> Option<&Path> {
+    #[doc(hidden)]
+    pub fn cwd(&self) -> Option<&Path> {
         match self {
             Self::Single(config) => config.agent.cwd.as_deref(),
             Self::Multi(config) => config.quorum.cwd.as_deref(),

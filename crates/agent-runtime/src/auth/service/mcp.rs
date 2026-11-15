@@ -30,8 +30,9 @@ pub(super) struct McpFlow {
 
 /// An OAuth MCP server declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OAuthServer {
-    pub(crate) name: String,
+#[doc(hidden)]
+pub struct OAuthServer {
+    pub name: String,
     url: String,
     auth: McpAuth,
 }
@@ -65,7 +66,8 @@ impl OAuthServer {
         client_id.as_deref()
     }
 
-    pub(crate) fn scopes(&self) -> &[String] {
+    #[doc(hidden)]
+    pub fn scopes(&self) -> &[String] {
         let McpAuth::OAuth { scopes, .. } = &self.auth;
         scopes
     }
@@ -86,13 +88,14 @@ impl OAuthServer {
 }
 
 /// Every declaration of one server name, merged.
-pub(crate) struct DeclaredServer {
+#[doc(hidden)]
+pub struct DeclaredServer {
     /// The first declaration seen.
-    pub(crate) server: OAuthServer,
+    pub server: OAuthServer,
     /// Where it is declared (agent configuration, profiles, `.agents/`).
-    pub(crate) sources: Vec<String>,
+    pub sources: Vec<String>,
     /// Some declaration differs from `server`.
-    pub(crate) conflicting: bool,
+    pub conflicting: bool,
 }
 
 /// Label of servers declared by the agent configuration itself.
@@ -160,7 +163,8 @@ impl OAuthService {
 
     /// OAuth servers by name, in first-seen order. Identical declarations
     /// from several sources are merged; differing ones are flagged.
-    pub(crate) async fn oauth_servers(&self) -> Vec<DeclaredServer> {
+    #[doc(hidden)]
+    pub async fn oauth_servers(&self) -> Vec<DeclaredServer> {
         let mut servers: Vec<DeclaredServer> = Vec::new();
         for (source, config) in self.mcp_declarations().await {
             let Some(server) = OAuthServer::from_config(&config) else {
@@ -189,7 +193,8 @@ impl OAuthService {
     /// [`AuthFlowError::UnknownMcpServer`] when no source declares it with
     /// OAuth, [`AuthFlowError::ConflictingMcpServer`] when sources disagree:
     /// credentials are stored per name, so one login cannot serve both.
-    pub(crate) async fn mcp_server(&self, name: &str) -> Result<OAuthServer, AuthFlowError> {
+    #[doc(hidden)]
+    pub async fn mcp_server(&self, name: &str) -> Result<OAuthServer, AuthFlowError> {
         let declared = self
             .oauth_servers()
             .await
@@ -218,7 +223,8 @@ impl OAuthService {
     /// One entry per OAuth MCP server (or the one named by `filter`):
     /// connected when usable credentials are stored for the configured URL,
     /// otherwise a login is required.
-    pub(crate) async fn mcp_auth_status(&self, filter: Option<&str>) -> Vec<AuthProviderStatus> {
+    #[doc(hidden)]
+    pub async fn mcp_auth_status(&self, filter: Option<&str>) -> Vec<AuthProviderStatus> {
         let mut out = Vec::new();
         for DeclaredServer { server, .. } in self.oauth_servers().await {
             let provider = mcp_auth::provider_id(&server.name);
@@ -592,10 +598,12 @@ impl OAuthService {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[allow(dead_code, unused_imports)]
+pub mod tests {
     use super::*;
-    pub(crate) use crate::mcp_auth::test_support::MemoryBackend;
+    pub use crate::mcp_auth::test_support::MemoryBackend;
     use axum::{
         Json, Router,
         extract::State,
@@ -603,11 +611,11 @@ pub(crate) mod tests {
     };
 
     #[derive(Default)]
-    pub(crate) struct AuthServer {
-        pub(crate) base: String,
+    pub struct AuthServer {
+        pub base: String,
         registrations: parking_lot::Mutex<Vec<serde_json::Value>>,
         /// `scope` of token responses; omitted when `None`.
-        pub(crate) token_scope: parking_lot::Mutex<Option<String>>,
+        pub token_scope: parking_lot::Mutex<Option<String>>,
         /// Refuse every OAuth request with 403.
         refuse: std::sync::atomic::AtomicBool,
     }
@@ -629,7 +637,7 @@ pub(crate) mod tests {
     }
 
     /// Minimal authorization server: metadata, dynamic registration, tokens.
-    pub(crate) async fn serve_auth_server() -> Arc<AuthServer> {
+    pub async fn serve_auth_server() -> Arc<AuthServer> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(AuthServer {
@@ -760,7 +768,7 @@ pub(crate) mod tests {
 
     /// Query string of a redirect as the authorization server sends it: with
     /// the RFC 9207 `iss` of the server.
-    pub(crate) fn redirect_query(auth: &AuthServer, authorization_url: &str) -> String {
+    pub fn redirect_query(auth: &AuthServer, authorization_url: &str) -> String {
         let iss: String = url::form_urlencoded::byte_serialize(auth.base.as_bytes()).collect();
         format!("code=abc&state={}&iss={iss}", state_of(authorization_url))
     }
@@ -787,10 +795,7 @@ pub(crate) mod tests {
         panic!("credentials were never stored");
     }
 
-    pub(crate) fn status_of(
-        statuses: &[AuthProviderStatus],
-        provider: &str,
-    ) -> Option<OAuthStatus> {
+    pub fn status_of(statuses: &[AuthProviderStatus], provider: &str) -> Option<OAuthStatus> {
         statuses
             .iter()
             .find(|s| s.provider == provider)

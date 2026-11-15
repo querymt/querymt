@@ -207,7 +207,7 @@ impl SessionTemplateContext {
 /// # Example
 ///
 /// ```no_run
-/// use querymt_agent::template::SessionTemplateContext;
+/// use querymt_agent_runtime::template::SessionTemplateContext;
 ///
 /// let ctx = SessionTemplateContext::builder()
 ///     .cwd("/home/user/project")

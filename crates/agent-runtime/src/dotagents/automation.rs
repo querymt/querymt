@@ -19,6 +19,7 @@ pub use crate::core_staging::dotagents_automation::{
     AUTOMATION_SESSION_KIND, DotagentsAutomationIdentity, DotagentsAutomationRepository,
 };
 use crate::session::error::SessionResult;
+#[cfg(any(test, feature = "test-support"))]
 pub use querymt_agent_sqlite::repo_dotagents_automation::SqliteDotagentsAutomationRepository;
 
 /// Bind the persisted automation session to a profile so scheduler execution

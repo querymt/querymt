@@ -1,5 +1,5 @@
 use crate::api::ProfileRuntimeHandle;
-use crate::{acp::AcpServer, session::StorageBackend};
+use crate::session::StorageBackend;
 use axum::Router;
 use axum::routing::get;
 #[cfg(feature = "dashboard")]
@@ -90,7 +90,7 @@ impl AgentServer {
         let acp_router = match mode {
             #[cfg(feature = "dashboard")]
             ServerMode::Dashboard => crate::acp::websocket::same_origin_router(self.agent.clone()),
-            ServerMode::Api => AcpServer::new(self.agent.clone()).router(),
+            ServerMode::Api => crate::acp::websocket::router(self.agent.clone()),
         };
         let export_storage = self.storage.clone();
         let app = acp_router.route(

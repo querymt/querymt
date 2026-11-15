@@ -151,10 +151,10 @@ pub async fn test_ledger() -> crate::accounting::DispatchLedger {
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::SnapshotPolicy;
+use crate::delegation::AgentInfo;
 use crate::delegation::DefaultAgentRegistry;
 use crate::middleware::{AgentStats, ConversationContext, ToolCall, ToolFunction};
 use crate::model::{AgentMessage, MessagePart};
-use crate::prelude::AgentInfo;
 use crate::session::backend::StorageBackend;
 use crate::session::domain::ForkOrigin;
 use crate::session::sqlite_storage::SqliteStorage;

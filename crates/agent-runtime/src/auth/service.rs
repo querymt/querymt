@@ -89,7 +89,8 @@ pub struct OAuthService {
 }
 
 #[cfg(feature = "oauth")]
-pub(crate) mod mcp;
+#[doc(hidden)]
+pub mod mcp;
 
 impl OAuthService {
     /// Construct a new `OAuthService` from the shared dependencies.
@@ -118,17 +119,16 @@ impl OAuthService {
     /// slot filled later is picked up).
     #[cfg(feature = "oauth")]
     #[must_use]
-    pub(crate) fn with_profile_slot(
-        mut self,
-        profiles: crate::agent::handle::ProfileRuntimeSlot,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn with_profile_slot(mut self, profiles: crate::agent::handle::ProfileRuntimeSlot) -> Self {
         self.profiles = profiles;
         self
     }
 
     /// Use a different credential backend for MCP logins (tests).
-    #[cfg(all(test, feature = "oauth"))]
-    pub(crate) fn with_mcp_secret_backend(
+    #[cfg(all(any(test, feature = "test-support"), feature = "oauth"))]
+    #[doc(hidden)]
+    pub fn with_mcp_secret_backend(
         mut self,
         backend: Arc<dyn crate::mcp_auth::SecretBackend>,
     ) -> Self {

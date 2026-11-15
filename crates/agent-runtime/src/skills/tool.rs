@@ -77,8 +77,9 @@ fn read_local_file(skill_dir: &std::path::Path, id: &str, path: &str) -> Result<
 }
 
 /// Sorted skill IDs advertised in the `skill` tool's description.
-#[cfg(test)]
-pub(crate) fn listed_skill_ids(definition: &querymt::chat::Tool) -> Vec<String> {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn listed_skill_ids(definition: &querymt::chat::Tool) -> Vec<String> {
     let mut ids: Vec<String> = definition
         .function
         .description

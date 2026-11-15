@@ -44,9 +44,11 @@ pub use adapters::{
     RedactedValue, apply_selected_model_preset, convert_server,
     convert_server_with_workspace_stdio_approval, select_model_overlay, validate_preset_provider,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use automation::SqliteDotagentsAutomationRepository;
 pub use automation::{
     AUTOMATION_SESSION_KIND, DotagentsAutomationIdentity, DotagentsAutomationRepository,
-    SqliteDotagentsAutomationRepository, bind_automation_session_profile,
+    bind_automation_session_profile,
 };
 pub use confine::{ConfineResult, ConfinementPolicy, read_confined_text};
 pub use coordinator::{
@@ -65,7 +67,8 @@ pub use frontmatter::{
 };
 pub use layer::{DotagentsLayer, DotagentsSource, DotagentsSourceRef};
 pub use loader::{DotagentsLoadError, DotagentsLoader, assemble_layer};
-pub(crate) use loader::{compose_prompt, resolve_for_builder};
+#[doc(hidden)]
+pub use loader::{compose_prompt, resolve_for_builder};
 pub use manifest::{
     DotagentsAgent, DotagentsAgentConfig, DotagentsAgentConnection, DotagentsAgentConnectionType,
     DotagentsAgentRole, DotagentsManifest, DotagentsMcpServer, DotagentsMcpTransport,
@@ -154,9 +157,9 @@ pub use tasks::{
     DotagentsTaskReconcileAction, DotagentsTaskReconcileOutcome, DotagentsTaskRecord,
     DotagentsTaskRetireAction, DotagentsTaskRetireOutcome, DotagentsTaskRetireReason,
     DotagentsTaskStateRepository, DotagentsTaskTrustOutcome, DotagentsTaskTrustPolicy,
-    SqliteDotagentsTaskStateRepository, classify_activation_unavailable,
-    decide_task_reconciliation, evaluate_task_trust, plan_startup_fire, plan_task_activation,
-    plan_task_retirement, summarize_prompt, task_execution_fingerprint,
+    classify_activation_unavailable, decide_task_reconciliation, evaluate_task_trust,
+    plan_startup_fire, plan_task_activation, plan_task_retirement, summarize_prompt,
+    task_execution_fingerprint,
 };
 
 #[cfg(test)]

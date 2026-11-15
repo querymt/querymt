@@ -24,7 +24,8 @@ pub(crate) mod remote_connect;
 pub(crate) mod remote_mesh;
 pub(crate) mod remote_nodes;
 pub(crate) mod remote_sessions;
-pub(crate) mod runtime_observation;
+#[doc(hidden)]
+pub mod runtime_observation;
 pub(crate) mod scheduler;
 pub(crate) mod send_agent_config;
 pub(crate) mod send_agent_impl;
@@ -177,7 +178,8 @@ pub trait AgentHandle: Send + Sync {
 /// mutable state. Not an actor — just a convenient bundle.
 #[cfg(feature = "remote")]
 #[derive(Clone, Debug)]
-pub(crate) enum CachedNodeEntry {
+#[doc(hidden)]
+pub enum CachedNodeEntry {
     Ready {
         info: crate::agent::remote::NodeInfo,
         expires_at: std::time::Instant,
@@ -189,8 +191,9 @@ pub(crate) enum CachedNodeEntry {
 
 #[cfg(feature = "remote")]
 #[derive(Debug)]
-pub(crate) struct RemoteNodeMetadataCache {
-    pub(crate) by_label: parking_lot::RwLock<std::collections::HashMap<String, CachedNodeEntry>>,
+#[doc(hidden)]
+pub struct RemoteNodeMetadataCache {
+    pub by_label: parking_lot::RwLock<std::collections::HashMap<String, CachedNodeEntry>>,
     invalidation_task_started: AtomicBool,
 }
 
@@ -242,7 +245,7 @@ pub struct LocalAgentHandle {
     published_mesh_scopes: StdMutex<std::collections::HashSet<crate::agent::remote::MeshScopeId>>,
 
     #[cfg(feature = "remote")]
-    pub(crate) remote_node_cache: Arc<RemoteNodeMetadataCache>,
+    pub remote_node_cache: Arc<RemoteNodeMetadataCache>,
 
     /// Per-session single-flight gates for the remote connection coordinator
     /// (`remote_connect`). Kept independent of the registry mutex so recovery
@@ -264,14 +267,15 @@ pub struct LocalAgentHandle {
 
     /// Handle to the scheduler actor, set after `start_scheduler()` succeeds.
     /// `None` if scheduling is not enabled or lease was not acquired.
-    pub(crate) scheduler_handle: SchedulerHandleSlot,
+    pub scheduler_handle: SchedulerHandleSlot,
 
     /// Guard to ensure `shutdown()` only runs its body once.
     shutdown_done: AtomicBool,
 }
 
-pub(crate) type ProfileRuntime = Arc<dyn ProfileRuntimeHost>;
-pub(crate) type ProfileRuntimeSlot = Arc<ArcSwap<Option<ProfileRuntime>>>;
+#[doc(hidden)]
+pub type ProfileRuntime = Arc<dyn ProfileRuntimeHost>;
+pub type ProfileRuntimeSlot = Arc<ArcSwap<Option<ProfileRuntime>>>;
 pub(crate) type SchedulerHandleSlot = Arc<ParkingMutex<Option<crate::scheduler::SchedulerHandle>>>;
 
 // ── Remote node lookup type aliases ─────────────────────────────────────────

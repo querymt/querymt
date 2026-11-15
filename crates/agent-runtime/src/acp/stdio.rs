@@ -143,7 +143,8 @@ async fn actorless_replay_sources(
     Ok(Some((events, stored_user_prompt_blocks(history))))
 }
 
-pub(crate) async fn replay_loaded_session(
+#[doc(hidden)]
+pub async fn replay_loaded_session(
     agent: &crate::agent::LocalAgentHandle,
     session_id: &str,
     capabilities: &crate::acp::shared::AcpSessionUpdateCapabilities,
@@ -994,7 +995,8 @@ fn spawn_event_bridge_forwarder(
 ///
 /// # Example
 ///
-/// ```rust,no_run
+/// ```rust,ignore
+/// // `Agent` is defined in the `querymt-agent` facade crate.
 /// use querymt_agent::api::Agent;
 /// use querymt_agent::acp::serve_stdio;
 ///

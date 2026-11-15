@@ -30,7 +30,8 @@ pub(crate) fn is_mcp_server_visible(config: &ToolConfig, server: &str) -> bool {
 /// MCP tools (`server.tool`, `server.*`) or an attached server by its bare
 /// name; otherwise `BuiltInOnly`. Shared by standalone agents, quorum
 /// planner/delegates and `.agents` delegation targets.
-pub(crate) fn infer_restricted_tool_policy(
+#[doc(hidden)]
+pub fn infer_restricted_tool_policy(
     tools: &[ToolSpec],
     mcp_servers: &[McpServerConfig],
 ) -> ToolPolicy {

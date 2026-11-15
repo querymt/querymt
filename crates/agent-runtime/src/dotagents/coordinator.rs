@@ -190,7 +190,8 @@ impl DotagentsActivationReport {
     }
 
     /// Restore deterministic ordering after a host appends passive diagnostics.
-    pub(crate) fn sort_diagnostics(&mut self) {
+    #[doc(hidden)]
+    pub fn sort_diagnostics(&mut self) {
         self.diagnostics.sort_by(diagnostic_order);
     }
 }

@@ -80,6 +80,8 @@ fn every_dispatch_site_is_recorded_or_classified() {
     let roots = [
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-services/src"),
+        // The top crate (`runner.rs`) is scanned too.
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent/src"),
     ];
 
     let mut found: BTreeMap<String, usize> = BTreeMap::new();

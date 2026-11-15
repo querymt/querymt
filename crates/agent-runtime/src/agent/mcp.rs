@@ -164,8 +164,9 @@ impl McpConnectContext {
     }
 
     /// Use a different credential backend (tests).
-    #[cfg(test)]
-    pub(crate) fn with_secret_backend(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_secret_backend(
         mut self,
         backend: std::sync::Arc<dyn crate::mcp_auth::SecretBackend>,
     ) -> Self {

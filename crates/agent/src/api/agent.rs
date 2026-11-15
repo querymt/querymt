@@ -1,11 +1,9 @@
 //! Single agent implementation
 
-use super::callbacks::EventCallbacksState;
 #[cfg(feature = "remote")]
 use super::mesh::{AgentMesh, Mesh, MeshSpec};
 use super::profiles::{AgentProfiles, ProfileRuntimeHandle};
 use super::quorum::QuorumBuilder;
-use super::session::AgentSession;
 use super::sessions::{AgentSessions, ListSessionsOptions, SessionListPage};
 use super::utils::{default_registry, latest_assistant_message, to_absolute_path};
 use super::worktrees::{AgentWorktrees, SessionOptions};
@@ -34,6 +32,8 @@ use crate::session::store::SessionStore;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use querymt::LLMParams;
+use querymt_agent_runtime::api::AgentSession;
+use querymt_agent_runtime::api::callbacks::EventCallbacksState;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

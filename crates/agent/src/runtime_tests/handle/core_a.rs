@@ -333,13 +333,13 @@ async fn stopped_actor_is_evicted_without_another_load() {
 
 #[test]
 fn test_should_return_without_force_stop_only_for_idle() {
-    assert!(LocalAgentHandle::should_return_without_force_stop(
+    assert!(should_return_without_force_stop(
         crate::agent::messages::SessionRuntimeStatus::Idle
     ));
-    assert!(!LocalAgentHandle::should_return_without_force_stop(
+    assert!(!should_return_without_force_stop(
         crate::agent::messages::SessionRuntimeStatus::Running
     ));
-    assert!(!LocalAgentHandle::should_return_without_force_stop(
+    assert!(!should_return_without_force_stop(
         crate::agent::messages::SessionRuntimeStatus::CancelRequested
     ));
 }

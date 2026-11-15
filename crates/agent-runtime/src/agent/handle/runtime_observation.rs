@@ -39,32 +39,34 @@ async fn observe_lease_free(root: RunLeaseRoot, session_id: &str) -> std::io::Re
     })
     .await
     .map_err(std::io::Error::other)??;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pause_probe_result(root.path(), session_id).await;
     Ok(free)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
-pub(crate) struct ProbePause {
+#[doc(hidden)]
+pub struct ProbePause {
     pub entered: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 type ProbePauses = HashMap<(std::path::PathBuf, String), Arc<ProbePause>>;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static PROBE_PAUSES: std::sync::LazyLock<parking_lot::Mutex<ProbePauses>> =
     std::sync::LazyLock::new(Default::default);
-#[cfg(test)]
-pub(crate) fn pause_next_probe(root: &std::path::Path, session_id: &str) -> Arc<ProbePause> {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn pause_next_probe(root: &std::path::Path, session_id: &str) -> Arc<ProbePause> {
     let pause = Arc::new(ProbePause::default());
     PROBE_PAUSES
         .lock()
         .insert((root.to_path_buf(), session_id.to_string()), pause.clone());
     pause
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 async fn pause_probe_result(root: &std::path::Path, session_id: &str) {
     let pause = PROBE_PAUSES
         .lock()
@@ -114,7 +116,8 @@ async fn probe_workers_serialize_canonical_roots_before_trying_the_lease() {
 }
 
 impl LocalAgentHandle {
-    pub(crate) async fn observe_session_runtimes(
+    #[doc(hidden)]
+    pub async fn observe_session_runtimes(
         &self,
         session_ids: &[String],
     ) -> HashMap<String, SessionRuntimeStatus> {

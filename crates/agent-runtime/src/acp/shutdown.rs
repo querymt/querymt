@@ -14,7 +14,7 @@ use tokio::signal;
 /// # Example
 ///
 /// ```no_run
-/// use querymt_agent::acp::shutdown;
+/// use querymt_agent_runtime::acp::shutdown;
 ///
 /// # async fn example() {
 /// tokio::select! {
@@ -61,7 +61,7 @@ pub async fn signal() {
 /// # Example
 ///
 /// ```no_run
-/// use querymt_agent::acp::shutdown;
+/// use querymt_agent_runtime::acp::shutdown;
 /// use axum::Router;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {

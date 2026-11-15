@@ -221,7 +221,8 @@ impl LocalAgentHandle {
         ext_json_response(&result)
     }
 
-    pub(crate) async fn handle_ext_session_runtime_state(
+    #[doc(hidden)]
+    pub async fn handle_ext_session_runtime_state(
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {

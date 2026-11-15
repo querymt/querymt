@@ -11,8 +11,9 @@
 //! allows only one global `ActorSwarm` per process, but one mesh is sufficient
 //! because actors registered under distinct DHT names simulate separate nodes.
 
-#[cfg(all(test, feature = "remote"))]
-pub(crate) mod fixtures {
+#[cfg(all(any(test, feature = "test-support"), feature = "remote"))]
+#[doc(hidden)]
+pub mod fixtures {
     use crate::agent::agent_config::AgentConfig;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::remote::NodeId;

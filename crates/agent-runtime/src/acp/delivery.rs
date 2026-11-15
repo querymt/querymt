@@ -51,7 +51,8 @@ pub(crate) fn with_event_tip(mut response: PromptResponse, tip: i64) -> PromptRe
 
 /// Remove and return the event tip of a prompt reply. A missing (or malformed)
 /// tip means "no watermark": the response is not held back.
-pub(crate) fn take_event_tip(response: &mut PromptResponse) -> Option<i64> {
+#[doc(hidden)]
+pub fn take_event_tip(response: &mut PromptResponse) -> Option<i64> {
     let meta = response.meta.as_mut()?;
     let namespace = meta
         .get_mut(crate::acp::shared::QUERYMT_META_NAMESPACE)?
@@ -120,14 +121,16 @@ fn release(state: &SessionState, reason: ReleaseReason) {
 }
 
 /// An event cleared for handling, with the guard that records its delivery.
-pub(crate) struct Admitted {
-    pub(crate) event: EventEnvelope,
-    pub(crate) guard: Option<DeliveredGuard>,
+#[doc(hidden)]
+pub struct Admitted {
+    pub event: EventEnvelope,
+    pub guard: Option<DeliveredGuard>,
 }
 
 /// Advances the delivered position of its session when dropped, and releases
 /// waiters when the handled event announces lost delivery.
-pub(crate) struct DeliveredGuard {
+#[doc(hidden)]
+pub struct DeliveredGuard {
     state: SessionState,
     seq: i64,
     release: Option<ReleaseReason>,
@@ -153,7 +156,8 @@ impl Drop for DeliveredGuard {
 }
 
 /// Delivery positions of one client connection.
-pub(crate) struct ConnectionDelivery {
+#[doc(hidden)]
+pub struct ConnectionDelivery {
     journal: Option<Arc<dyn EventJournal>>,
     sessions: Mutex<HashMap<String, SessionState>>,
     closed: CancellationToken,
@@ -163,10 +167,8 @@ impl ConnectionDelivery {
     /// `journal` is used to recover missed durable events; without one, lag
     /// and gaps are logged and skipped. `closed` is the connection's
     /// cancellation token and releases every waiter.
-    pub(crate) fn new(
-        journal: Option<Arc<dyn EventJournal>>,
-        closed: CancellationToken,
-    ) -> Arc<Self> {
+    #[doc(hidden)]
+    pub fn new(journal: Option<Arc<dyn EventJournal>>, closed: CancellationToken) -> Arc<Self> {
         Arc::new(Self {
             journal,
             sessions: Mutex::new(HashMap::new()),
@@ -197,7 +199,8 @@ impl ConnectionDelivery {
     /// after a gap, the recovered durable events followed by the event (unless
     /// the journal already supplied it); nothing for a lagged copy of an
     /// event that was already recovered.
-    pub(crate) async fn admit(&self, event: EventEnvelope) -> Vec<Admitted> {
+    #[doc(hidden)]
+    pub async fn admit(&self, event: EventEnvelope) -> Vec<Admitted> {
         let seq = event.session_seq();
         if seq <= 0 {
             // Unsequenced events are not tracked, except that the loss of a
@@ -281,7 +284,8 @@ impl ConnectionDelivery {
     /// Recover every durable event a lagged connection missed, for every
     /// session it has seen events of. Call [`Self::finish_lag_recovery`] after
     /// the returned events were handled.
-    pub(crate) async fn recover_after_lag(&self) -> Vec<Admitted> {
+    #[doc(hidden)]
+    pub async fn recover_after_lag(&self) -> Vec<Admitted> {
         let tracked: Vec<(String, SessionState, i64)> = {
             let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
             sessions
@@ -323,7 +327,8 @@ impl ConnectionDelivery {
     /// Record that lag handling completed: waiters whose watermark is still
     /// ahead of the delivered position are released, because the remainder
     /// may be ephemeral events that cannot be recovered.
-    pub(crate) fn finish_lag_recovery(&self) {
+    #[doc(hidden)]
+    pub fn finish_lag_recovery(&self) {
         let sessions: Vec<SessionState> = {
             let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
             sessions.values().cloned().collect()

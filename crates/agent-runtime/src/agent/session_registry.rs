@@ -226,13 +226,14 @@ struct RemoteRelayRegistration {
 /// Read-only metadata for the currently installed remote attachment.
 #[cfg(feature = "remote")]
 #[derive(Clone)]
-pub(crate) struct RemoteAttachmentSnapshot {
-    pub(crate) session_ref: SessionActorRef,
-    pub(crate) attachment_id: u64,
-    pub(crate) remote_actor_id: u64,
-    pub(crate) node_id: Option<String>,
-    pub(crate) peer_label: String,
-    pub(crate) matched_scope: Option<MeshScopeId>,
+#[doc(hidden)]
+pub struct RemoteAttachmentSnapshot {
+    pub session_ref: SessionActorRef,
+    pub attachment_id: u64,
+    pub remote_actor_id: u64,
+    pub node_id: Option<String>,
+    pub peer_label: String,
+    pub matched_scope: Option<MeshScopeId>,
 }
 
 /// Fully prepared control + relay attachment which has not yet been published
@@ -605,7 +606,8 @@ impl SessionRegistry {
 
     /// Snapshot the complete routing identity of the current attachment.
     #[cfg(feature = "remote")]
-    pub(crate) fn remote_attachment(&self, session_id: &str) -> Option<RemoteAttachmentSnapshot> {
+    #[doc(hidden)]
+    pub fn remote_attachment(&self, session_id: &str) -> Option<RemoteAttachmentSnapshot> {
         let session_ref = self.sessions.get(session_id)?.clone();
         let registration = self.relay_actor_ids.get(session_id)?;
         let SessionActorRef::Remote {

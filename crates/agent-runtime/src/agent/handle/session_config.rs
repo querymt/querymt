@@ -1,7 +1,8 @@
 use super::*;
 
 impl LocalAgentHandle {
-    pub(crate) async fn session_reasoning_effort(
+    #[doc(hidden)]
+    pub async fn session_reasoning_effort(
         &self,
         session_ref: &crate::agent::remote::SessionActorRef,
         session_id: &str,

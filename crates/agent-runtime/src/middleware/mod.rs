@@ -18,7 +18,8 @@ mod presets;
 mod specialized;
 mod tasks;
 
-pub(crate) use assembly::build_from_entries;
+#[doc(hidden)]
+pub use assembly::build_from_entries;
 
 // Re-export new architecture types
 pub use driver::{

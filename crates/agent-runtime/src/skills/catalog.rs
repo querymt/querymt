@@ -57,7 +57,8 @@ pub struct SkillCatalog {
 
 impl SkillCatalog {
     /// Discover the configured skills and build the catalog for an agent.
-    pub(crate) fn from_config(config: &SkillsConfig, project_root: &Path) -> Arc<Self> {
+    #[doc(hidden)]
+    pub fn from_config(config: &SkillsConfig, project_root: &Path) -> Arc<Self> {
         let mut search_paths = discovery::default_search_paths(project_root);
         for custom_path in &config.paths {
             search_paths.push(SkillSource::Configured(custom_path.clone()));
