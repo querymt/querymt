@@ -15,6 +15,7 @@ use std::time::Duration;
 use super::md;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
+use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::input::{Enter, IndentInline, OutdentInline, Textarea};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarMode};
 use gpui_kit::component::tooltip::Tooltip;
@@ -174,6 +175,13 @@ impl RenderCtx {
                 self.expanded.contains(&item.key).hash(&mut h);
                 for e in entries {
                     self.expanded.contains(e.id()).hash(&mut h);
+                    if let WorkEntry::Tool(call) = e
+                        && is_skill(call)
+                    {
+                        self.expanded
+                            .contains(&skill_content_key(&call.id))
+                            .hash(&mut h);
+                    }
                 }
                 (self.running && ix >= self.last_turn_start).hash(&mut h);
             }
@@ -489,6 +497,11 @@ fn tool_preview(call: &ToolCall, cwd: &str) -> String {
 
 fn tool_preview_raw(call: &ToolCall) -> String {
     let name = concrete_tool_name(call);
+    if is_skill(call)
+        && let Some(skill) = SkillContent::parse(&call.output)
+    {
+        return skill.name.to_string();
+    }
     let Some(args) = call.input.as_ref().filter(|v| v.is_object()) else {
         return call
             .locations
@@ -617,6 +630,79 @@ fn is_shell(call: &ToolCall) -> bool {
 
 fn is_read(call: &ToolCall) -> bool {
     READ_FILE_TOOLS.contains(&concrete_tool_name(call).as_str())
+}
+
+fn is_skill(call: &ToolCall) -> bool {
+    concrete_tool_name(call) == "skill" || normalized_tool_name(call) == "skill"
+}
+
+/// The skill tool returns an XML-like envelope, not escaped XML: markdown
+/// inside `<content>` can contain arbitrary tags. Read metadata in order and
+/// split the closing content tag from the end so examples stay untouched.
+/// History may clip a result inside the body, leaving its metadata intact.
+struct SkillContent<'a> {
+    name: &'a str,
+    description: &'a str,
+    base_path: &'a str,
+    content: &'a str,
+    sample_files: Option<&'a str>,
+    incomplete: bool,
+}
+
+impl<'a> SkillContent<'a> {
+    fn parse(output: &'a str) -> Option<Self> {
+        let output = output.trim();
+        let closed = output.strip_suffix("</skill_content>");
+        let inner = closed.unwrap_or(output);
+        let (name, rest) = inner
+            .strip_prefix("<skill_content name=\"")?
+            .split_once("\">")?;
+        if name.trim().is_empty() {
+            return None;
+        }
+        let (description, rest) = rest
+            .trim_start()
+            .strip_prefix("<description>")?
+            .split_once("</description>")?;
+        let (base_path, rest) = rest
+            .trim_start()
+            .strip_prefix("<base_path>")?
+            .split_once("</base_path>")?;
+        let body = rest.trim_start().strip_prefix("<content>")?;
+        let (content, sample_files) = if closed.is_some() {
+            let (content, rest) = body.rsplit_once("</content>")?;
+            let files = if rest.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    rest.trim()
+                        .strip_prefix("<sample_files>")?
+                        .strip_suffix("</sample_files>")?
+                        .trim_matches(['\r', '\n']),
+                )
+            };
+            (content, files)
+        } else {
+            // Do not treat a closing tag in a markdown example as the wrapper's
+            // end. Without the complete envelope, keep the available body intact.
+            (body, None)
+        };
+        Some(Self {
+            name: name.trim(),
+            description: description.trim(),
+            base_path: base_path
+                .trim()
+                .strip_prefix("file://")
+                .unwrap_or(base_path.trim()),
+            content: content.trim_matches(['\r', '\n']),
+            sample_files: sample_files.filter(|s| !s.is_empty()),
+            incomplete: closed.is_none(),
+        })
+    }
+}
+
+fn skill_content_key(id: &str) -> String {
+    format!("skill-instructions-{id}")
 }
 
 /// URL fetches (`browse`, `web_fetch`, or the ACP `fetch` kind).
@@ -979,10 +1065,14 @@ fn render_diff_file(
         ))
 }
 
-/// Diffs, file reads and shell output open as one card attached to the tool
-/// row (desktop `session-tool-block-attached`); other tools use the indented well.
+/// Structured results open as a card attached to the tool row; unknown or
+/// failed skill results keep the generic parameters/error view.
 fn attaches_to_header(call: &ToolCall) -> bool {
-    !call.diffs.is_empty() || is_shell(call) || is_read(call) || is_fetch(call)
+    !call.diffs.is_empty()
+        || is_shell(call)
+        || is_read(call)
+        || is_fetch(call)
+        || (is_skill(call) && !call.failed() && SkillContent::parse(&call.output).is_some())
 }
 
 /// Frame of a borderless output block inside an attached tool card.
@@ -1177,9 +1267,122 @@ fn flat_note(text: &'static str, p: &Palette) -> Div {
         .child(text)
 }
 
-/// Body of an attached tool card: diff, terminal or read output, flush with the header.
+/// Skill metadata stays visible when the tool card is open; the long markdown
+/// instructions use a second disclosure, like the compaction summary.
+fn render_skill_content(call: &ToolCall, skill: &SkillContent<'_>, rc: &RenderCtx) -> Div {
+    let p = &rc.p;
+    let key = skill_content_key(&call.id);
+    let open = rc.expanded.contains(&key);
+    let weak = rc.weak.clone();
+    let copy_label = if skill.incomplete {
+        "Copy available skill instructions"
+    } else {
+        "Copy skill instructions"
+    };
+    v_flex()
+        .min_w_0()
+        .gap_3()
+        .p_3()
+        .when(!skill.description.is_empty(), |el| {
+            el.child(
+                div()
+                    .text_sm()
+                    .text_color(p.muted)
+                    .child(skill.description.to_string()),
+            )
+        })
+        .when(!skill.base_path.is_empty(), |el| {
+            el.child(
+                v_flex()
+                    .gap_1()
+                    .text_xs()
+                    .child(div().text_color(p.dim).child("Location"))
+                    .child(
+                        div()
+                            .font_family(kit::MONO)
+                            .text_color(p.muted)
+                            .child(skill.base_path.to_string()),
+                    ),
+            )
+        })
+        .when_some(skill.sample_files, |el, files| {
+            el.child(
+                v_flex()
+                    .gap_1()
+                    .text_xs()
+                    .child(div().text_color(p.dim).child("Sample files"))
+                    .child(
+                        div()
+                            .font_family(kit::MONO)
+                            .text_color(p.muted)
+                            .child(files.to_string()),
+                    ),
+            )
+        })
+        .when(skill.incomplete, |el| {
+            el.child(div().text_xs().text_color(p.dim).child(
+                "This skill result is incomplete. Only the available instructions are shown.",
+            ))
+        })
+        .map(|el| {
+            if skill.content.trim().is_empty() {
+                return el.child(div().text_xs().text_color(p.dim).child("No instructions."));
+            }
+            el.child(
+                h_flex()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        kit::button(kit::keyed("skill-toggle", call.id.clone()))
+                            .ghost()
+                            .xsmall()
+                            .label(if open {
+                                "Hide instructions"
+                            } else {
+                                "Show instructions"
+                            })
+                            .icon(if open {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .on_click(move |_, _, cx| toggle_expanded(&weak, key.clone(), cx)),
+                    )
+                    .child(
+                        Clipboard::new(kit::keyed("skill-copy", call.id.clone()))
+                            .value(skill.content.to_string())
+                            .accessibility_label(copy_label)
+                            .tooltip(copy_label)
+                            .xsmall(),
+                    ),
+            )
+            .when(open, |el| {
+                el.child(
+                    div()
+                        .min_w_0()
+                        .p_4()
+                        .rounded_lg()
+                        .bg(p.card)
+                        .text_sm()
+                        .child(md::markdown(
+                            format!("skill-md-{}", call.id),
+                            skill.content.to_string(),
+                            p,
+                        )),
+                )
+            })
+        })
+}
+
+/// Body of an attached tool card, flush with the header.
 fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
     let p = &rc.p;
+    if is_skill(call)
+        && !call.failed()
+        && let Some(skill) = SkillContent::parse(&call.output)
+    {
+        return render_skill_content(call, &skill, rc);
+    }
     let output = call.pretty_output();
     let body = v_flex().w_full();
     if !call.diffs.is_empty() {
@@ -4417,6 +4620,105 @@ mod tests {
         assert_eq!(tool_label(&call("mcp_Shell", "other")), "Shell");
         assert_eq!(humanize_tool_name("run my_tool.name"), "My tool name");
         assert_eq!(humanize_tool_name(""), "Tool call");
+    }
+
+    const SKILL_OUTPUT: &str = "<skill_content name=\"rust-skills\">\n\
+        <description>Rust guidelines & examples</description>\n\
+        <base_path>file:///skills/rust-skills</base_path>\n\
+        <content>\n# Rust\n\n```xml\n<content>example</content>\n```\n\n    indented\n</content>\n\
+        <sample_files>\n  - references (dir)\n  - SKILL.md (file)\n</sample_files>\n\
+        </skill_content>";
+
+    #[test]
+    fn skill_result_separates_metadata_from_markdown() {
+        let skill = super::SkillContent::parse(SKILL_OUTPUT).expect("valid skill output");
+        assert!(!skill.incomplete);
+        assert_eq!(skill.name, "rust-skills");
+        assert_eq!(skill.description, "Rust guidelines & examples");
+        assert_eq!(skill.base_path, "/skills/rust-skills");
+        assert_eq!(
+            skill.content,
+            "# Rust\n\n```xml\n<content>example</content>\n```\n\n    indented"
+        );
+        assert_eq!(
+            skill.sample_files,
+            Some("  - references (dir)\n  - SKILL.md (file)")
+        );
+        // Sample files are optional; neither they nor the outer tags enter the markdown.
+        let no_files = SKILL_OUTPUT.replace(
+            "<sample_files>\n  - references (dir)\n  - SKILL.md (file)\n</sample_files>\n",
+            "",
+        );
+        let parsed = super::SkillContent::parse(&no_files).expect("skill without files");
+        assert_eq!(parsed.sample_files, None);
+        assert_eq!(parsed.content, skill.content);
+    }
+
+    #[test]
+    fn history_clipped_skill_body_still_uses_the_skill_card() {
+        // The Rust skill exceeds history's 32 KiB result limit. Reproduce the
+        // same byte-prefix clipping (including UTF-8 and markup in examples).
+        let header = "<skill_content name=\"rust-skills\">\n\
+            <description>Rust guidelines</description>\n\
+            <base_path>file:///skills/rust-skills</base_path>\n<content>\n";
+        let body = "# Rust\n\n```xml\n<content>example</content>\n```\n".to_string()
+            + &"- Ownership and borrowing: 日本語\n".repeat(1400);
+        let output = format!("{header}{body}\n</content>\n</skill_content>");
+        let mut end = 32 * 1024;
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        let clipped = &output[..end];
+        let skill = super::SkillContent::parse(clipped).expect("metadata survives clipping");
+        assert!(skill.incomplete);
+        assert_eq!(skill.name, "rust-skills");
+        assert_eq!(skill.description, "Rust guidelines");
+        assert_eq!(skill.base_path, "/skills/rust-skills");
+        assert_eq!(
+            skill.content,
+            clipped[header.len()..].trim_end_matches(['\r', '\n'])
+        );
+        assert!(skill.content.contains("<content>example</content>"));
+        assert!(skill.sample_files.is_none());
+        let mut tool = call("skill", "other");
+        tool.output = clipped.into();
+        assert!(super::attaches_to_header(&tool));
+        assert_eq!(super::tool_preview_raw(&tool), "rust-skills");
+        tool.status = "failed".into();
+        assert!(!super::attaches_to_header(&tool));
+    }
+
+    #[test]
+    fn skill_metadata_must_be_intact_before_rendering_a_partial_body() {
+        for tag in ["<description>", "<base_path>", "<content>"] {
+            let end = SKILL_OUTPUT.find(tag).expect("fixture tag") + tag.len() - 1;
+            assert!(super::SkillContent::parse(&SKILL_OUTPUT[..end]).is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_and_failed_skill_results_keep_the_raw_view() {
+        for output in [
+            "",
+            "Permission denied",
+            "<skill_content name=\"rust-skills\">",
+            "<skill_content name=\"x\"><content>missing metadata</content></skill_content>",
+        ] {
+            assert!(super::SkillContent::parse(output).is_none());
+        }
+        let mut skill_call = call("skill", "other");
+        skill_call.output = SKILL_OUTPUT.into();
+        assert_eq!(super::tool_preview_raw(&skill_call), "rust-skills");
+        assert!(super::attaches_to_header(&skill_call));
+        skill_call.status = "failed".into();
+        assert!(!super::attaches_to_header(&skill_call));
+        skill_call.status = "completed".into();
+        skill_call.output = "legacy unwrapped skill instructions".into();
+        assert!(!super::attaches_to_header(&skill_call));
+        // A non-skill tool returning similar markup must retain its own renderer.
+        let mut other = call("custom_tool", "other");
+        other.output = SKILL_OUTPUT.into();
+        assert!(!super::attaches_to_header(&other));
     }
 
     #[test]
