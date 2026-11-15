@@ -150,6 +150,10 @@ pub struct QmtApp {
     /// Last painted trigger bounds and window height, to place the menu.
     profile_trigger: Bounds<Pixels>,
     profile_viewport_h: Pixels,
+    /// Where the open profile menu was placed (it overhangs the Options panel).
+    profile_menu_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
+    /// Popovers just closed by an outside mouse down, so their triggers toggle.
+    dismissed: kit::Dismissed,
     _subs: Vec<Subscription>,
 }
 
@@ -331,6 +335,8 @@ impl QmtApp {
             profile_scroll: ScrollHandle::new(),
             profile_trigger: Bounds::default(),
             profile_viewport_h: px(0.),
+            profile_menu_bounds: Default::default(),
+            dismissed: kit::Dismissed::default(),
             _subs: subs,
         }
     }

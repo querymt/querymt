@@ -46,6 +46,71 @@ impl ButtonExt for Button {
 pub const SEGMENT_H: f32 = 32.;
 
 /// Track of a segmented picker; fill it with [`segment`] buttons.
+/// Remembers the mouse-down that dismissed a popover from outside. A popover
+/// closes on mouse down, but its trigger toggles on the click that follows,
+/// so without this a second click on the trigger would close and reopen it.
+/// One mouse down can close several nested popovers, so all are kept.
+#[derive(Default)]
+pub struct Dismissed {
+    at: Option<Point<Pixels>>,
+    popovers: Vec<String>,
+}
+
+impl Dismissed {
+    /// Call from the popover's `on_mouse_down_out`.
+    pub fn record(&mut self, popover: impl Into<String>, ev: &MouseDownEvent) {
+        if self.at != Some(ev.position) {
+            self.at = Some(ev.position);
+            self.popovers.clear();
+        }
+        self.popovers.push(popover.into());
+    }
+
+    /// Whether `click` on `popover`'s trigger is the click that just closed
+    /// it (and so must not reopen it).
+    pub fn closed_by(&mut self, popover: &str, click: &ClickEvent) -> bool {
+        let at = self.at.take();
+        let popovers = std::mem::take(&mut self.popovers);
+        matches!(click, ClickEvent::Mouse(m) if at == Some(m.down.position))
+            && popovers.iter().any(|p| p == popover)
+    }
+}
+
+#[cfg(test)]
+mod dismissed_tests {
+    use super::Dismissed;
+    use gpui_kit::{ClickEvent, MouseClickEvent, MouseDownEvent, point, px};
+
+    fn down(x: f32) -> MouseDownEvent {
+        MouseDownEvent {
+            position: point(px(x), px(0.)),
+            ..Default::default()
+        }
+    }
+
+    fn click(x: f32) -> ClickEvent {
+        ClickEvent::Mouse(MouseClickEvent {
+            down: down(x),
+            up: Default::default(),
+        })
+    }
+
+    #[test]
+    fn only_the_closing_click_is_swallowed() {
+        let mut d = Dismissed::default();
+        d.record("menu", &down(5.));
+        d.record("panel", &down(5.));
+        assert!(d.closed_by("panel", &click(5.)));
+        // Consumed: the next click on the trigger toggles again.
+        assert!(!d.closed_by("panel", &click(5.)));
+        // A click elsewhere, or on another popover's trigger, is not swallowed.
+        d.record("menu", &down(5.));
+        assert!(!d.closed_by("menu", &click(9.)));
+        d.record("menu", &down(5.));
+        assert!(!d.closed_by("other", &click(5.)));
+    }
+}
+
 /// Desktop `.action-btn` (`compact`: `.action-btn-compact`): bordered card
 /// fill, stronger border + hover fill when enabled, dimmed when not. Also the
 /// trigger of the app's pill selects.
