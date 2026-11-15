@@ -21,24 +21,24 @@ pub mod auth;
 // feature.  Dashboard and ACP builds use this for plain API-key storage.
 pub use querymt_utils::secret_store::SecretStore;
 
-pub mod accounting;
+pub use querymt_agent_services::accounting;
 pub mod acp;
 pub mod agent;
 pub mod delegation;
 pub mod dotagents;
 pub mod elicitation;
-pub mod event_fanout;
-pub mod event_sink;
 pub use querymt_agent_core::events;
-pub mod export;
 pub use querymt_agent_core::hash;
+pub use querymt_agent_services::event_fanout;
+pub use querymt_agent_services::event_sink;
+pub use querymt_agent_services::export;
 pub mod hooks;
 pub use querymt_agent_index as index;
 pub mod knowledge;
 pub mod middleware;
 pub use querymt_agent_core::model;
-pub mod model_heuristics;
-pub mod model_info;
+pub use querymt_agent_services::model_heuristics;
+pub use querymt_agent_services::model_info;
 pub mod model_inventory;
 pub mod model_registry;
 #[cfg(feature = "plugin-loaders")]
@@ -50,15 +50,33 @@ pub mod send_agent;
 #[cfg(feature = "api")]
 pub mod server;
 pub mod session;
-pub mod session_event_stream;
+pub use querymt_agent_services::session_event_stream;
 pub mod skills;
 pub mod slash_commands;
-pub mod snapshot;
-pub mod tasks;
-pub mod tools;
-pub mod verification;
-pub mod workspace_query;
-pub mod worktree;
+pub use querymt_agent_services::snapshot;
+pub use querymt_agent_services::tasks;
+/// Tools: the services-layer tools plus the agent-aware built-ins.
+pub mod tools {
+    pub use querymt_agent_services::tools::*;
+
+    /// Built-in tools: the services-layer set with the runtime's additions.
+    pub mod builtins {
+        pub use crate::agent::builtin_tools::{
+            DelegateTool, RouteDelegationToPeerTool, UseRemoteProviderTool, all_builtin_tools,
+        };
+        pub use querymt_agent_services::tools::builtins::*;
+    }
+}
+pub use querymt_agent_services::verification;
+pub use querymt_agent_services::workspace_query;
+/// Managed worktrees: the services layer plus the SQLite registry.
+pub mod worktree {
+    #[cfg(test)]
+    pub use querymt_agent_services::worktree::test_support;
+    pub use querymt_agent_services::worktree::*;
+    pub use querymt_agent_sqlite::repo_workspace;
+    pub use repo_workspace::SqliteWorkspaceRepository;
+}
 
 #[cfg(test)]
 pub mod test_utils;

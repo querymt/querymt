@@ -1728,7 +1728,7 @@ pub mod tests {
             cached_llm_provider: Arc::new(tokio::sync::OnceCell::new()),
         };
 
-        let ledger = crate::accounting::test_ledger().await;
+        let ledger = crate::test_utils::test_ledger().await;
         let error = handle.chat(&[], &ledger).await.unwrap_err();
 
         assert!(matches!(error, SessionError::InvalidOperation(_)));

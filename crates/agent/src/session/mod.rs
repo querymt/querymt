@@ -6,16 +6,15 @@ pub use querymt_agent_core::session::{
 pub mod provider;
 pub mod provider_config;
 pub use provider::{SessionHandle, SessionProvider};
-pub mod run_lease;
+pub use querymt_agent_services::session::run_lease;
 pub mod run_reconcile;
+pub use querymt_agent_services::session::task_service;
 pub use querymt_agent_sqlite::session::{schema, sqlite_storage};
 pub use sqlite_storage::SqliteStorage;
-pub mod task_service;
 pub use task_service::TaskService;
 
 // Compaction system (3-layer)
 pub mod compaction;
-pub mod pruning;
 pub use compaction::{
     CompactionResult, RetryConfig as CompactionRetryConfig, SessionCompaction,
     filter_to_effective_history, get_last_compaction, has_compaction,
@@ -24,6 +23,7 @@ pub use pruning::{
     PrunableToolResult, PruneAnalysis, PruneConfig, SimpleTokenEstimator, TokenEstimator,
     compute_prune_candidates,
 };
+pub use querymt_agent_services::session::pruning;
 
 // Storage backend abstraction
 pub mod backend;
@@ -53,10 +53,8 @@ pub use domain_schedule::{
 pub use repository::ScheduleRepository;
 
 // Projection stores
-pub mod history_window;
+pub use querymt_agent_services::session::{history_window, remote_sync, turns};
 pub mod load_snapshot;
-pub mod remote_sync;
-pub mod turns;
 
 pub use load_snapshot::{
     SessionLoadSnapshot, StreamCursor, cursor_from_events, load_session_snapshot,
@@ -68,5 +66,5 @@ pub use projection::{
 };
 
 // Phase 3: Runtime integration
-pub mod runtime;
+pub use querymt_agent_services::session::runtime;
 pub use runtime::{RuntimeContext, SessionForkHelper};

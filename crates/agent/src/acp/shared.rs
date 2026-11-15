@@ -7517,7 +7517,9 @@ mod session_update_tests {
         purpose: crate::accounting::AttemptPurpose,
         complete: bool,
     ) -> Vec<EventEnvelope> {
-        use crate::accounting::tests::{sample_pricing, sample_settlement, sample_start};
+        use crate::core_staging::accounting::samples::{
+            sample_pricing, sample_settlement, sample_start,
+        };
         let mut start = sample_start();
         start.attempt.attempt_id = id.into();
         start.attempt.session_id = "s-1".into();
@@ -8638,7 +8640,7 @@ mod session_update_tests {
         let AgentEventKind::LlmAttemptSettled { settlement } = &mut durable.kind else {
             unreachable!()
         };
-        let mut manual = crate::accounting::tests::sample_pricing();
+        let mut manual = crate::core_staging::accounting::samples::sample_pricing();
         manual.cache_write = None;
         settlement.budget_valuation = Some(querymt::providers::value_usage(
             Some(&manual),
@@ -9388,7 +9390,7 @@ mod session_update_tests {
                 12,
                 AgentEventKind::LlmAttemptStarted {
                     start: {
-                        let mut start = crate::accounting::tests::sample_start();
+                        let mut start = crate::core_staging::accounting::samples::sample_start();
                         start.attempt.session_id = "s-1".into();
                         start
                     },
@@ -9398,7 +9400,8 @@ mod session_update_tests {
                 13,
                 AgentEventKind::LlmAttemptSettled {
                     settlement: {
-                        let mut settlement = crate::accounting::tests::sample_settlement();
+                        let mut settlement =
+                            crate::core_staging::accounting::samples::sample_settlement();
                         settlement.attempt.session_id = "s-1".into();
                         settlement
                     },

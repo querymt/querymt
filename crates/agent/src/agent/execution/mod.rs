@@ -1076,13 +1076,13 @@ mod tests {
         use std::time::Duration;
 
         fn totals(settle: Option<IncompleteReason>) -> ScopeTotals {
-            let start = crate::accounting::tests::sample_start();
+            let start = crate::core_staging::accounting::samples::sample_start();
             let mut reducer = AccountingReducer::new(start.attempt.session_id.clone());
             reducer
                 .apply(&AgentEventKind::LlmAttemptStarted { start })
                 .unwrap();
             if let Some(reason) = settle {
-                let mut settlement = crate::accounting::tests::sample_settlement();
+                let mut settlement = crate::core_staging::accounting::samples::sample_settlement();
                 settlement.valuation.complete_total_usd = None;
                 settlement.valuation.incomplete = vec![reason];
                 reducer

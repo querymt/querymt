@@ -4412,9 +4412,10 @@ mod prepared_call_tests {
 
     #[tokio::test]
     async fn baseline_failure_shapes_replay_through_preparation_validation_and_execution() {
-        let fixture: Value =
-            serde_json::from_str(include_str!("../../tools/testdata/baseline_failures.json"))
-                .unwrap();
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../agent-services/src/tools/testdata/baseline_failures.json"
+        ))
+        .unwrap();
         let classes = fixture["classes"].as_array().unwrap();
         let covered: u64 = classes
             .iter()

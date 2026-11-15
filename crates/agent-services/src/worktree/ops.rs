@@ -708,7 +708,8 @@ impl WorktreeOps {
     /// window in which an just-unloaded actor is still dropping its shared
     /// lease. Anything still holding it after the grace period (a running
     /// turn, shared delegates, another process) is `owner_active`.
-    pub(crate) async fn acquire_exclusive_activity(
+    #[doc(hidden)]
+    pub async fn acquire_exclusive_activity(
         &self,
         record: &WorkspaceRecord,
     ) -> Result<crate::worktree::gate::CheckoutActivityLease, WorktreeOpError> {

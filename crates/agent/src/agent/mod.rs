@@ -18,6 +18,8 @@ pub mod agent_config;
 pub mod agent_config_builder;
 pub mod builtin_tools;
 pub mod core;
+#[cfg(test)]
+mod dispatch_coverage_tests;
 pub(crate) mod event_chunk;
 pub mod execution;
 pub mod execution_context;

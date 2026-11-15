@@ -6,11 +6,11 @@
 //! Runtime totals, cycle scopes, ACP replay metadata and the ATIF export must
 //! all agree with the recorded attempts.
 
-use crate::accounting::tests::{sample_settlement, sample_start};
 use crate::accounting::{
     AccountingSnapshot, AttemptOutcome, AttemptPurpose, AttemptRecorder, CycleAccounting,
     SessionAccounting,
 };
+use crate::core_staging::accounting::samples::{sample_settlement, sample_start};
 use crate::event_fanout::EventFanout;
 use crate::events::AgentEvent;
 use crate::session::backend::StorageBackend;
@@ -319,8 +319,8 @@ async fn mixed_scenario_agrees_across_runtime_restart_acp_and_export() {
 // ── SessionRuntime ownership of the accounting projection ──
 
 mod runtime_projection {
-    use crate::accounting::tests::{sample_settlement, sample_start};
     use crate::accounting::{AttemptRecorder, SessionAccounting};
+    use crate::core_staging::accounting::samples::{sample_settlement, sample_start};
     use crate::event_fanout::EventFanout;
     use crate::events::AgentEventKind;
     use crate::session::backend::StorageBackend;

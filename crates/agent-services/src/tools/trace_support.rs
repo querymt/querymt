@@ -1,7 +1,7 @@
 //! Capture-based trace test helpers (services layer, test-only).
 
 /// Isolated, capture-based trace tests; never installs global telemetry or uses OTLP.
-pub(crate) mod genai_trace {
+pub mod genai_trace {
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::error::OTelSdkResult;
     use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
@@ -19,9 +19,7 @@ pub(crate) mod genai_trace {
         }
     }
 
-    pub(crate) async fn capture<T>(
-        future: impl std::future::Future<Output = T>,
-    ) -> (T, Vec<SpanData>) {
+    pub async fn capture<T>(future: impl std::future::Future<Output = T>) -> (T, Vec<SpanData>) {
         capture_inner(
             future,
             false,
@@ -31,7 +29,7 @@ pub(crate) mod genai_trace {
     }
 
     /// Match normal INFO export while leaving existing diagnostic DEBUG logging unchanged.
-    pub(crate) async fn capture_info<T>(
+    pub async fn capture_info<T>(
         future: impl std::future::Future<Output = T>,
     ) -> (T, Vec<SpanData>) {
         capture_inner(future, false, tracing_subscriber::filter::LevelFilter::INFO).await
@@ -63,13 +61,13 @@ pub(crate) mod genai_trace {
     }
 
     /// Capture spawned actors as well; call only from a current-thread Tokio test.
-    pub(crate) async fn capture_local_tasks<T>(
+    pub async fn capture_local_tasks<T>(
         future: impl std::future::Future<Output = T>,
     ) -> (T, Vec<SpanData>) {
         capture_inner(future, true, tracing_subscriber::filter::LevelFilter::TRACE).await
     }
 
-    pub(crate) fn attr<'a>(span: &'a SpanData, key: &str) -> Option<&'a opentelemetry::Value> {
+    pub fn attr<'a>(span: &'a SpanData, key: &str) -> Option<&'a opentelemetry::Value> {
         // SDK 0.32 retains updates in order; attribute map semantics are last-value-wins.
         span.attributes
             .iter()
@@ -78,7 +76,7 @@ pub(crate) mod genai_trace {
             .map(|attr| &attr.value)
     }
 
-    pub(crate) fn assert_private(spans: &[SpanData]) {
+    pub fn assert_private(spans: &[SpanData]) {
         let capture = format!("{spans:?}");
         for secret in [
             "SECRET_PROMPT",

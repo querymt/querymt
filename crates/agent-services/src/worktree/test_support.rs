@@ -5,7 +5,7 @@
 //! used for fixture setup (the CLI adapter tests exercise the adapter
 //! itself).
 
-#![cfg(test)]
+#![cfg(any(test, feature = "test-support"))]
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -15,7 +15,7 @@ use crate::worktree::WorkspaceRepository;
 
 /// Initialize a non-bare repository with a commit identity in its config
 /// (mirroring the snapshot backend's config handling).
-pub(crate) fn init_repo() -> tempfile::TempDir {
+pub fn init_repo() -> tempfile::TempDir {
     let tmp = tempfile::TempDir::new().unwrap();
     gix::init(tmp.path()).unwrap();
     let config_path = tmp.path().join(".git/config");
@@ -27,7 +27,7 @@ pub(crate) fn init_repo() -> tempfile::TempDir {
 
 /// Recursively write nested trees for `(relative_path, blob)` entries and
 /// return the root tree id.
-pub(crate) fn write_tree_recursive(
+pub fn write_tree_recursive(
     repo: &gix::Repository,
     entries: Vec<(String, gix::ObjectId)>,
 ) -> gix::ObjectId {
@@ -74,7 +74,7 @@ pub(crate) fn write_tree_recursive(
 
 /// Write `files` as blobs/trees and commit them on the current HEAD,
 /// returning the new commit id.
-pub(crate) fn commit_files(root: &Path, message: &str, files: &[(&str, &str)]) -> gix::ObjectId {
+pub fn commit_files(root: &Path, message: &str, files: &[(&str, &str)]) -> gix::ObjectId {
     let repo = gix::open(root).unwrap();
     let entries: Vec<(String, gix::ObjectId)> = files
         .iter()
@@ -98,7 +98,7 @@ pub(crate) fn commit_files(root: &Path, message: &str, files: &[(&str, &str)]) -
 
 /// Write `files` into the working tree at `root` (gix fixtures create
 /// objects in the ODB only; the checkout must be materialized too).
-pub(crate) fn materialize(root: &Path, files: &[(&str, &str)]) {
+pub fn materialize(root: &Path, files: &[(&str, &str)]) {
     for (path, content) in files {
         let target = root.join(path);
         if let Some(parent) = target.parent() {
@@ -111,7 +111,7 @@ pub(crate) fn materialize(root: &Path, files: &[(&str, &str)]) {
 /// Standard content history: commit 1 has `file.txt`; commit 2 adds
 /// `sub/file.txt`. Both checkouts are materialized on disk. Returns the
 /// temp dir and both commit ids.
-pub(crate) fn init_repo_with_subdir() -> (tempfile::TempDir, gix::ObjectId, gix::ObjectId) {
+pub fn init_repo_with_subdir() -> (tempfile::TempDir, gix::ObjectId, gix::ObjectId) {
     let tmp = init_repo();
     let first = commit_files(tmp.path(), "first", &[("file.txt", "one")]);
     materialize(tmp.path(), &[("file.txt", "one")]);
@@ -126,7 +126,7 @@ pub(crate) fn init_repo_with_subdir() -> (tempfile::TempDir, gix::ObjectId, gix:
 
 /// Registry persistence boundaries that provisioning depends on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum RegistryFaultPoint {
+pub enum RegistryFaultPoint {
     /// Persisting the initial provisioning intent.
     InsertWorkspace,
     /// Binding the captured baseline identity.
@@ -138,13 +138,13 @@ pub(crate) enum RegistryFaultPoint {
 /// Wraps a [`WorkspaceRepository`], injecting failures at named persistence
 /// boundaries so tests can interrupt provisioning exactly between durable
 /// writes without fabricating SQLite errors or parsing Git commands.
-pub(crate) struct FaultInjectingWorkspaceRepository {
+pub struct FaultInjectingWorkspaceRepository {
     inner: std::sync::Arc<dyn WorkspaceRepository>,
     failures: std::sync::Mutex<std::collections::HashMap<RegistryFaultPoint, (usize, String)>>,
 }
 
 impl FaultInjectingWorkspaceRepository {
-    pub(crate) fn new(inner: std::sync::Arc<dyn WorkspaceRepository>) -> Self {
+    pub fn new(inner: std::sync::Arc<dyn WorkspaceRepository>) -> Self {
         Self {
             inner,
             failures: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -152,7 +152,7 @@ impl FaultInjectingWorkspaceRepository {
     }
 
     /// Fail the next `times` calls at `point` with `message`.
-    pub(crate) fn fail_next(&self, point: RegistryFaultPoint, times: usize, message: &str) {
+    pub fn fail_next(&self, point: RegistryFaultPoint, times: usize, message: &str) {
         self.failures
             .lock()
             .unwrap()
@@ -324,7 +324,7 @@ impl WorkspaceRepository for FaultInjectingWorkspaceRepository {
 const CHILD_ENV: &str = "QMT_TEST_CHILD";
 
 /// True inside a process started by [`run_in_child`].
-pub(crate) fn in_child() -> bool {
+pub fn in_child() -> bool {
     std::env::var_os(CHILD_ENV).is_some()
 }
 
@@ -333,7 +333,7 @@ pub(crate) fn in_child() -> bool {
 /// applied. gix reads the process environment while opening a repository,
 /// so checks that depend on it must not mutate the shared test process.
 /// The child half returns early unless [`in_child`] is true.
-pub(crate) fn run_in_child(test_path: &str, env: &[(&str, &std::ffi::OsStr)]) {
+pub fn run_in_child(test_path: &str, env: &[(&str, &std::ffi::OsStr)]) {
     let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
     cmd.args(["--exact", test_path, "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, "1");
@@ -357,7 +357,7 @@ pub(crate) fn run_in_child(test_path: &str, env: &[(&str, &std::ffi::OsStr)]) {
 /// `git commit` would have it. Fixtures that build commits through object
 /// APIs never write one, and a missing index reads as "every tracked file is
 /// staged for deletion".
-pub(crate) fn write_index_from_head(root: &Path) {
+pub fn write_index_from_head(root: &Path) {
     let repo = gix::open(root).unwrap();
     let tree = repo.head_commit().unwrap().tree_id().unwrap();
     let mut index = repo.index_from_tree(&tree).unwrap();
@@ -366,11 +366,11 @@ pub(crate) fn write_index_from_head(root: &Path) {
 
 /// Run the Git CLI in `root` (fixture setup only, never production code) and
 /// return trimmed stdout. Inherited repository redirection is cleared.
-pub(crate) fn git(root: &Path, args: &[&str]) -> String {
+pub fn git(root: &Path, args: &[&str]) -> String {
     git_with_stdin(root, args, "")
 }
 
-pub(crate) fn git_with_stdin(root: &Path, args: &[&str], stdin: &str) -> String {
+pub fn git_with_stdin(root: &Path, args: &[&str], stdin: &str) -> String {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let mut child = Command::new("git")

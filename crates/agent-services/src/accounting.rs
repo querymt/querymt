@@ -134,41 +134,6 @@ pub use crate::core_staging::accounting::{
     non_secret_route,
 };
 
-/// A ledger over a fresh in-memory journal for tests of components that
-/// require explicit recording but do not assert on it.
-#[cfg(test)]
-pub(crate) async fn test_ledger() -> DispatchLedger {
-    use crate::session::backend::StorageBackend;
-    let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
-        .await
-        .unwrap();
-    let journal = storage.event_journal();
-    let accounting = SessionAccounting::hydrate("session", journal.clone())
-        .await
-        .unwrap();
-    let stream = crate::session_event_stream::SessionEventStream::new(
-        "session",
-        journal,
-        std::sync::Arc::new(crate::event_fanout::EventFanout::new()),
-    );
-    let recorder =
-        std::sync::Arc::new(AttemptRecorder::with_projection(stream, accounting.clone()));
-    let cycle = CycleAccounting::with_id(accounting, "cycle-1");
-    DispatchLedger {
-        operation: std::sync::Arc::new(AttemptOperation::new(
-            recorder,
-            &cycle,
-            AttemptPurpose::MainResponse,
-            "p",
-            "m",
-        )),
-        basis: BillingBasis {
-            billing: querymt::providers::BillingClass::Unknown,
-            pricing: None,
-        },
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

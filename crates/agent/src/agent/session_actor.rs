@@ -4890,7 +4890,7 @@ mod tests {
     #[tokio::test]
     async fn local_copy_replaced_after_the_owners_undo_keeps_retained_charges_once() {
         use crate::accounting::SessionAccounting;
-        use crate::accounting::tests::{sample_settlement, sample_start};
+        use crate::core_staging::accounting::samples::{sample_settlement, sample_start};
         use crate::events::AgentEventKind;
 
         let rig = SyncRig::new(0).await;

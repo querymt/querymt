@@ -97,7 +97,7 @@ pub(crate) mod genai_metrics {
     }
 }
 
-pub(crate) use crate::tools::trace_support::genai_trace;
+pub(crate) use querymt_agent_services::tools::trace_support::genai_trace;
 
 /// Deterministic incompressible bytes (xorshift), so test files do not deflate.
 pub fn noise(len: usize, seed: u64) -> Vec<u8> {
@@ -110,6 +110,42 @@ pub fn noise(len: usize, seed: u64) -> Vec<u8> {
             (x >> 24) as u8
         })
         .collect()
+}
+
+/// A ledger over a fresh in-memory journal for tests of components that
+/// require explicit recording but do not assert on it.
+pub async fn test_ledger() -> crate::accounting::DispatchLedger {
+    use crate::session::backend::StorageBackend;
+    let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+        .await
+        .unwrap();
+    let journal = storage.event_journal();
+    let accounting = crate::accounting::SessionAccounting::hydrate("session", journal.clone())
+        .await
+        .unwrap();
+    let stream = crate::session_event_stream::SessionEventStream::new(
+        "session",
+        journal,
+        std::sync::Arc::new(crate::event_fanout::EventFanout::new()),
+    );
+    let recorder = std::sync::Arc::new(crate::accounting::AttemptRecorder::with_projection(
+        stream,
+        accounting.clone(),
+    ));
+    let cycle = crate::accounting::CycleAccounting::with_id(accounting, "cycle-1");
+    crate::accounting::DispatchLedger {
+        operation: std::sync::Arc::new(crate::accounting::AttemptOperation::new(
+            recorder,
+            &cycle,
+            crate::accounting::AttemptPurpose::MainResponse,
+            "p",
+            "m",
+        )),
+        basis: crate::accounting::BillingBasis {
+            billing: querymt::providers::BillingClass::Unknown,
+            pricing: None,
+        },
+    }
 }
 
 use crate::agent::LocalAgentHandle as AgentHandle;

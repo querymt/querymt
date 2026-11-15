@@ -46,6 +46,7 @@ pub mod service;
 pub mod session_options;
 pub mod storage_root;
 #[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 pub mod test_support;
 
 pub use crate::core_staging::worktree::repository::WorkspaceRepository;

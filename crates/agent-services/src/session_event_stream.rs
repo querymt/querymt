@@ -149,8 +149,9 @@ impl SessionEventStream {
     /// journal already holds, and start its writer task.
     ///
     /// Must be called inside a Tokio runtime.
-    #[cfg(test)]
-    pub(crate) fn new(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn new(
         session_id: &str,
         journal: Arc<dyn EventJournal>,
         fanout: Arc<EventFanout>,
@@ -240,8 +241,9 @@ impl SessionEventStream {
     }
 
     /// Highest `session_seq` already published to the fanout (`0` when none).
-    #[cfg(test)]
-    pub(crate) fn published_tip(&self) -> i64 {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn published_tip(&self) -> i64 {
         self.shared.state.lock().next_publish - 1
     }
 

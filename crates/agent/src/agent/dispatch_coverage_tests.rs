@@ -76,20 +76,26 @@ fn dispatch_calls(source: &str) -> usize {
 
 #[test]
 fn every_dispatch_site_is_recorded_or_classified() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    rust_files(&root, &mut files);
+    // The services crate must not dispatch provider requests either.
+    let roots = [
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-services/src"),
+    ];
 
     let mut found: BTreeMap<String, usize> = BTreeMap::new();
-    for file in files {
-        let rel = file
-            .strip_prefix(&root)
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
-        let n = dispatch_calls(&std::fs::read_to_string(&file).unwrap());
-        if n > 0 {
-            found.insert(rel, n);
+    for root in &roots {
+        let mut files = Vec::new();
+        rust_files(root, &mut files);
+        for file in files {
+            let rel = file
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let n = dispatch_calls(&std::fs::read_to_string(&file).unwrap());
+            if n > 0 {
+                found.insert(rel, n);
+            }
         }
     }
 

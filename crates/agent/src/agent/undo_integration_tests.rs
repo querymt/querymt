@@ -770,8 +770,8 @@ async fn test_undo_cleanup_bumps_history_epoch_and_appends_do_not() -> Result<()
 /// numbers are not reused or shifted.
 #[tokio::test]
 async fn test_cleanup_revert_keeps_accounting_for_undone_turn() -> Result<()> {
-    use crate::accounting::tests::{sample_settlement, sample_start};
     use crate::accounting::{AttemptRecorder, SessionAccounting};
+    use crate::core_staging::accounting::samples::{sample_settlement, sample_start};
     use crate::event_fanout::EventFanout;
     use crate::session_event_stream::SessionEventStream;
 

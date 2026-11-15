@@ -42,6 +42,7 @@ querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "
 querymt-agent-core = { path = "../agent-core" }
 querymt-agent-index = { path = "../agent-index" }
 querymt-agent-knowledge = { path = "../agent-knowledge" }
+querymt-agent-services = { path = "../agent-services" }
 querymt-agent-sqlite = { path = "../agent-sqlite" }
 agent-client-protocol.workspace = true
 kameo = "0.22"
@@ -148,6 +149,7 @@ ureq = { version = "3", optional = true, default-features = false, features = ["
 rusqlite = { workspace = true, features = ["uuid", "time"] }
 querymt-agent-core = { path = "../agent-core", features = ["test-support"] }
 querymt-agent-sqlite = { path = "../agent-sqlite", features = ["test-support"] }
+querymt-agent-services = { path = "../agent-services", features = ["test-support"] }
 rmcp = { version = "3.9", features = ["server", "transport-streamable-http-server"] }
 qmt-openai = { path = "../providers/openai", default-features = false, features = ["api"] }
 mockall.workspace = true

@@ -79,7 +79,8 @@ impl CheckoutMutationGate {
 /// Shared leases permit explicit shared delegates; archival/removal requires
 /// an exclusive lease, including against actors in other processes.
 #[derive(Debug)]
-pub(crate) struct CheckoutActivityLease {
+#[doc(hidden)]
+pub struct CheckoutActivityLease {
     _file: std::fs::File,
     exclusive: bool,
 }
@@ -92,15 +93,11 @@ impl Drop for CheckoutActivityLease {
 
 impl CheckoutActivityLease {
     /// Whether this lease excludes every other activity on the checkout.
-    pub(crate) fn is_exclusive(&self) -> bool {
+    pub fn is_exclusive(&self) -> bool {
         self.exclusive
     }
 
-    pub(crate) fn acquire(
-        storage: &Path,
-        checkout: &Path,
-        exclusive: bool,
-    ) -> WorktreeResult<Self> {
+    pub fn acquire(storage: &Path, checkout: &Path, exclusive: bool) -> WorktreeResult<Self> {
         let checkout = std::fs::canonicalize(checkout).unwrap_or_else(|_| {
             match (checkout.parent(), checkout.file_name()) {
                 (Some(parent), Some(name)) => std::fs::canonicalize(parent)
