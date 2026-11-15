@@ -207,7 +207,32 @@ mod tests {
     }
 
     #[test]
-    fn corruption_and_total_unavailability_are_errors() {
+    fn probe_failures_fall_through_and_total_unavailability_is_error() {
+        // Probes never read persisted credentials, so even an InvalidData probe
+        // failure (e.g. systemd key/TPM mismatch) must fall through to the next
+        // backend instead of aborting selection.
+        let mut attempted = Vec::new();
+        let (chosen, ()) = select(None, |backend| -> io::Result<()> {
+            attempted.push(backend);
+            if backend == Backend::Keyutils {
+                Ok(())
+            } else {
+                Err(if backend == Backend::Systemd {
+                    io::ErrorKind::InvalidData
+                } else {
+                    io::ErrorKind::NotFound
+                }
+                .into())
+            }
+        })
+        .unwrap();
+        assert_eq!(chosen, Backend::Keyutils);
+        assert_eq!(
+            attempted,
+            [Backend::SecretService, Backend::Systemd, Backend::Keyutils]
+        );
+
+        // When every backend fails, the combined error names each of them.
         let mut attempted = Vec::new();
         let error = select(None, |backend| -> io::Result<()> {
             attempted.push(backend);
@@ -219,8 +244,16 @@ mod tests {
             .into())
         })
         .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(attempted, [Backend::SecretService, Backend::Systemd]);
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            attempted,
+            [Backend::SecretService, Backend::Systemd, Backend::Keyutils]
+        );
+        let message = error.to_string();
+        assert!(message.starts_with("No usable credential store"));
+        for name in ["SecretService:", "Systemd:", "Keyutils:"] {
+            assert!(message.contains(name), "{message}");
+        }
         assert!(
             select(None, |_| -> io::Result<()> {
                 Err(io::ErrorKind::PermissionDenied.into())
