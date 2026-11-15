@@ -8,12 +8,12 @@ use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
-use crate::index::outline_index::common::get_language_for_extension;
-use crate::index::outline_index::{IndexOptions, OutlineError, format_outline, index_file};
 use crate::tools::{
     CapabilityRequirement, FileAccess, Tool as ToolTrait, ToolContext, ToolError, effective_root,
     resolve_arg_path,
 };
+use querymt_agent_index::outline_index::common::get_language_for_extension;
+use querymt_agent_index::outline_index::{IndexOptions, OutlineError, format_outline, index_file};
 
 use super::helpers::{resolve_root, resolve_target};
 

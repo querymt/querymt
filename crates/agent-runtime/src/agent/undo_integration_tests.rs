@@ -7,13 +7,13 @@
 //! - Proper reverted files list
 
 use crate::agent::undo::UndoError;
-use crate::events::{AgentEventKind, EventOrigin};
-use crate::model::MessagePart;
 use crate::session::backend::StorageBackend;
 use crate::session::domain::ForkOrigin;
 use crate::session::projection::{EventJournal, NewDurableEvent};
 use crate::test_utils::UndoTestFixture;
 use anyhow::Result;
+use querymt_agent_core::events::{AgentEventKind, EventOrigin};
+use querymt_agent_core::model::MessagePart;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -31,10 +31,12 @@ async fn test_undo_rejects_foreign_snapshot_before_any_restore() -> Result<()> {
     let foreign = TempDir::new()?;
     // Inject a direct foreign entry after a valid patch. Preflight must
     // reject the whole selection, not restore the valid patch first.
-    let mut message =
-        crate::model::AgentMessage::new(session.clone(), querymt::chat::ChatRole::Assistant);
+    let mut message = querymt_agent_core::model::AgentMessage::new(
+        session.clone(),
+        querymt::chat::ChatRole::Assistant,
+    );
     message.parts.push(MessagePart::TurnSnapshotStart {
-        turn_id: crate::model::TurnId::new(),
+        turn_id: querymt_agent_core::model::TurnId::new(),
         snapshot_id: pre,
         workspace_root: Some(foreign.path().to_path_buf()),
         inherited: false,
@@ -770,10 +772,10 @@ async fn test_undo_cleanup_bumps_history_epoch_and_appends_do_not() -> Result<()
 /// numbers are not reused or shifted.
 #[tokio::test]
 async fn test_cleanup_revert_keeps_accounting_for_undone_turn() -> Result<()> {
-    use crate::accounting::{AttemptRecorder, SessionAccounting};
-    use crate::core_staging::accounting::samples::{sample_settlement, sample_start};
-    use crate::event_fanout::EventFanout;
-    use crate::session_event_stream::SessionEventStream;
+    use querymt_agent_core::accounting::samples::{sample_settlement, sample_start};
+    use querymt_agent_services::accounting::{AttemptRecorder, SessionAccounting};
+    use querymt_agent_services::event_fanout::EventFanout;
+    use querymt_agent_services::session_event_stream::SessionEventStream;
 
     let fixture = UndoTestFixture::new().await?;
     let session_id = fixture.create_session().await?;
@@ -937,7 +939,7 @@ async fn test_cleanup_revert_removes_undone_messages_from_history() -> Result<()
         .iter()
         .filter_map(|m| {
             m.parts.iter().find_map(|p| {
-                if let crate::model::MessagePart::Text { content } = p {
+                if let querymt_agent_core::model::MessagePart::Text { content } = p {
                     Some(content.as_str())
                 } else {
                     None
@@ -1683,8 +1685,8 @@ async fn failed_delete_fails_the_restore() -> Result<()> {
     Ok(())
 }
 
-fn gc_keep(n: usize) -> crate::snapshot::GcConfig {
-    crate::snapshot::GcConfig {
+fn gc_keep(n: usize) -> querymt_agent_services::snapshot::GcConfig {
+    querymt_agent_services::snapshot::GcConfig {
         max_snapshots: std::num::NonZeroUsize::new(n),
         max_age_days: None,
     }
@@ -1692,7 +1694,7 @@ fn gc_keep(n: usize) -> crate::snapshot::GcConfig {
 
 /// `count` extra changed snapshots, so earlier ones can be pruned.
 async fn churn(fixture: &UndoTestFixture, count: usize) -> Result<()> {
-    use crate::snapshot::SnapshotBackend;
+    use querymt_agent_services::snapshot::SnapshotBackend;
     for i in 0..count {
         fixture.write_file("churn.txt", &format!("churn {i}"))?;
         fixture.backend.track(fixture.worktree.path()).await?;
@@ -1715,7 +1717,7 @@ fn workspace_bytes(fixture: &UndoTestFixture) -> Result<Vec<(String, Vec<u8>)>> 
 
 #[tokio::test]
 async fn undo_without_limits_reaches_the_first_turn() -> Result<()> {
-    use crate::snapshot::SnapshotBackend;
+    use querymt_agent_services::snapshot::SnapshotBackend;
     let fixture = UndoTestFixture::new().await?;
     fixture.write_file("f.txt", "v0")?;
     let session = fixture.create_session().await?;
@@ -1732,7 +1734,7 @@ async fn undo_without_limits_reaches_the_first_turn() -> Result<()> {
             .backend
             .gc(
                 fixture.worktree.path(),
-                &crate::snapshot::GcConfig::default(),
+                &querymt_agent_services::snapshot::GcConfig::default(),
             )
             .await?;
     }
@@ -1748,7 +1750,7 @@ async fn undo_without_limits_reaches_the_first_turn() -> Result<()> {
 
 #[tokio::test]
 async fn undo_to_a_pruned_snapshot_changes_no_files() -> Result<()> {
-    use crate::snapshot::SnapshotBackend;
+    use querymt_agent_services::snapshot::SnapshotBackend;
     let fixture = UndoTestFixture::new().await?;
     fixture.write_file("test.txt", "original")?;
     let session = fixture.create_session().await?;
@@ -1784,7 +1786,7 @@ async fn undo_to_a_pruned_snapshot_changes_no_files() -> Result<()> {
 
 #[tokio::test]
 async fn redo_to_a_pruned_snapshot_keeps_its_frame() -> Result<()> {
-    use crate::snapshot::SnapshotBackend;
+    use querymt_agent_services::snapshot::SnapshotBackend;
     let fixture = UndoTestFixture::new().await?;
     fixture.write_file("test.txt", "original")?;
     let session = fixture.create_session().await?;
@@ -1914,9 +1916,9 @@ async fn undo_of_a_prompt_that_deleted_a_file_restores_it() -> Result<()> {
 
 mod turn_records {
     use super::*;
-    use crate::model::{AgentMessage, TurnId};
-    use crate::snapshot::{SnapshotBackend as _, SnapshotId};
     use querymt::chat::ChatRole;
+    use querymt_agent_core::model::{AgentMessage, TurnId};
+    use querymt_agent_services::snapshot::{SnapshotBackend as _, SnapshotId};
 
     async fn record(fixture: &UndoTestFixture, session: &str, part: MessagePart) -> Result<()> {
         let mut message = AgentMessage::new(session.to_string(), ChatRole::Assistant);

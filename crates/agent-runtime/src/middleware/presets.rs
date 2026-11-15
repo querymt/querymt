@@ -2,7 +2,7 @@ use crate::middleware::{
     ContextConfig, ContextMiddleware, LimitsConfig, LimitsMiddleware, MiddlewareDriver,
     OutputLimitRecoveryMiddleware,
 };
-use crate::model_info::ModelInfoSource;
+use querymt_agent_services::model_info::ModelInfoSource;
 use std::sync::Arc;
 
 pub struct MiddlewarePresets;

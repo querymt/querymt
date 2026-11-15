@@ -19,16 +19,16 @@ use crate::agent::core::{
 use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{DelegationWaitPolicy, McpServerConfig, RuntimeExecutionPolicy, ToolRef};
 use crate::delegation::AgentRegistry;
-use crate::event_sink::EventSink;
-use crate::events::{AgentEventKind, DurableEvent};
 use crate::hooks::Hooks;
-use crate::index::WorkspaceIndexManagerActor;
 use crate::middleware::{CompositeDriver, MiddlewareDriver};
 use crate::session::backend::StorageBackend;
 use crate::session::compaction::SessionCompaction;
 use crate::session::provider::SessionProvider;
 use crate::session::store::SessionExecutionConfig;
 use crate::tools::ToolRegistry;
+use querymt_agent_core::events::{AgentEventKind, DurableEvent};
+use querymt_agent_index::WorkspaceIndexManagerActor;
+use querymt_agent_services::event_sink::EventSink;
 
 #[derive(Clone)]
 #[doc(hidden)]
@@ -106,8 +106,8 @@ pub struct AgentConfig {
     /// Grouped execution policy: tool output, pruning, compaction, rate limit.
     pub execution_policy: RuntimeExecutionPolicy,
     pub compaction: SessionCompaction,
-    pub snapshot_backend: Option<Arc<dyn crate::snapshot::SnapshotBackend>>,
-    pub snapshot_gc_config: crate::snapshot::GcConfig,
+    pub snapshot_backend: Option<Arc<dyn querymt_agent_services::snapshot::SnapshotBackend>>,
+    pub snapshot_gc_config: querymt_agent_services::snapshot::GcConfig,
     pub delegation_context_config: DelegationContextConfig,
     pub pending_elicitations: crate::elicitation::PendingElicitationMap,
 
@@ -194,7 +194,7 @@ impl AgentConfig {
     }
 
     /// Returns the session limits from configured middleware.
-    pub fn get_session_limits(&self) -> Option<crate::events::SessionLimits> {
+    pub fn get_session_limits(&self) -> Option<querymt_agent_core::events::SessionLimits> {
         self.create_driver().get_limits()
     }
 
@@ -269,7 +269,7 @@ impl AgentConfig {
     /// Subscribes to agent events via the fanout (live stream).
     pub fn subscribe_events(
         &self,
-    ) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
+    ) -> tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope> {
         self.event_sink.fanout().subscribe()
     }
 

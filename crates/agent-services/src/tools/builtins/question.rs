@@ -181,8 +181,8 @@ impl Tool for QuestionTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::elicitation::{ElicitationAction, ElicitationResponse};
     use crate::tools::AgentToolContext;
+    use querymt_agent_core::elicitation::{ElicitationAction, ElicitationResponse};
     use tokio::sync::mpsc;
 
     /// Run the tool against a context that answers every elicitation, returning

@@ -16,11 +16,11 @@ use super::*;
 use crate::acp::delivery::with_event_tip;
 use crate::acp::protocol::{ContentBlock, StopReason};
 use crate::agent::session_materializer::ReadOnlyReason;
-use crate::events::AgentEventKind;
 use crate::worktree::{
     HandoffHost, HandoffOptions, IsolatedSessionSpawner, OwnerHost, WorkspaceTarget,
     WorktreeCreateRequest, WorktreeError, WorktreeOpError, WorktreeOps, WorktreeRecoverResponse,
 };
+use querymt_agent_core::events::AgentEventKind;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -466,7 +466,7 @@ impl HandoffHost for LocalAgentHandle {
         let event = config
             .emit_event_persisted(
                 previous,
-                crate::events::AgentEventKind::WorktreeOwnershipTransferred {
+                querymt_agent_core::events::AgentEventKind::WorktreeOwnershipTransferred {
                     workspace_id: workspace_id.to_string(),
                     successor_session_id: successor.to_string(),
                     summary_seeded,
@@ -558,21 +558,24 @@ impl LocalAgentHandle {
             .session_accounting(previous)
             .await
             .map_err(|err| failed(format!("accounting unavailable: {err}")))?;
-        let cycle = crate::accounting::CycleAccounting::begin_maintenance(accounting);
-        let recorder = Arc::new(crate::accounting::AttemptRecorder::with_projection(
-            self.config.event_sink.session_stream(previous),
-            cycle.session_accounting().clone(),
-        ));
+        let cycle =
+            querymt_agent_services::accounting::CycleAccounting::begin_maintenance(accounting);
+        let recorder = Arc::new(
+            querymt_agent_services::accounting::AttemptRecorder::with_projection(
+                self.config.event_sink.session_stream(previous),
+                cycle.session_accounting().clone(),
+            ),
+        );
         let provider_name = handle
             .llm_config()
             .map(|config| config.provider.clone())
             .unwrap_or_default();
-        let ledger = crate::accounting::DispatchLedger {
+        let ledger = querymt_agent_services::accounting::DispatchLedger {
             operation: Arc::new(
-                crate::accounting::AttemptOperation::new(
+                querymt_agent_services::accounting::AttemptOperation::new(
                     recorder,
                     &cycle,
-                    crate::accounting::AttemptPurpose::Compaction,
+                    querymt_agent_services::accounting::AttemptPurpose::Compaction,
                     provider_name,
                     model.clone(),
                 )
@@ -740,7 +743,7 @@ impl LocalAgentHandle {
         {
             Ok(events) => events.into_iter().any(|event| {
                 matches!(
-                    crate::events::AgentEvent::from(event).kind,
+                    querymt_agent_core::events::AgentEvent::from(event).kind,
                     AgentEventKind::WorktreeOwnershipTransferred {
                         successor_session_id: ref s, ..
                     } if s == successor

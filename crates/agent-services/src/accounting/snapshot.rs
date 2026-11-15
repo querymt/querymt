@@ -11,7 +11,7 @@
 //! value. A message without the payload does not update accounting.
 
 use super::{AccountingReason, AccountingReducer, ScopeTotals};
-use crate::events::AgentEventKind;
+use querymt_agent_core::events::AgentEventKind;
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
@@ -209,8 +209,10 @@ impl AccountingSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounting::tests::{sample_pricing, sample_settlement, sample_start};
     use querymt::providers::{UsageValuation, value_usage};
+    use querymt_agent_core::accounting::samples::{
+        sample_pricing, sample_settlement, sample_start,
+    };
 
     #[test]
     fn untransferred_history_withdraws_complete_total_once() {

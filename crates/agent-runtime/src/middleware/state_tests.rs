@@ -1,10 +1,10 @@
-use crate::events::StopType;
 use crate::middleware::{
     AgentStats, ConversationContext, ExecutionState, LlmResponse, PreparedModelRequest, ToolResult,
     WaitCondition, WaitReason,
 };
 use crate::test_utils::{mock_tool_call, test_context};
 use querymt::chat::{ChatMessage, ChatRole, FinishReason, ToolResultPart};
+use querymt_agent_core::events::StopType;
 use std::sync::Arc;
 
 #[test]
@@ -206,9 +206,9 @@ fn test_tool_result_with_snapshot() {
 
     assert!(result.snapshot_part.is_none());
 
-    let updated = result.with_snapshot(crate::model::MessagePart::Snapshot {
-        root_hash: crate::hash::RapidHash::new(b"hash"),
-        changed_paths: crate::index::merkle::DiffPaths::default(),
+    let updated = result.with_snapshot(querymt_agent_core::model::MessagePart::Snapshot {
+        root_hash: querymt_agent_core::hash::RapidHash::new(b"hash"),
+        changed_paths: querymt_agent_index::merkle::DiffPaths::default(),
     });
 
     assert!(updated.snapshot_part.is_some());
@@ -244,7 +244,7 @@ fn test_agent_stats_default() {
 
 #[test]
 fn recorded_costs_view_reports_components_without_repricing() {
-    use crate::accounting::{ComponentSums, ScopeTotals};
+    use querymt_agent_services::accounting::{ComponentSums, ScopeTotals};
     // Token counters at one rate must not influence the monetary view.
     let mut stats = AgentStats {
         total_input_tokens: 1_000_000,

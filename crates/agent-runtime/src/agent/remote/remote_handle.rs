@@ -7,8 +7,8 @@
 use crate::agent::handle::AgentHandle;
 use crate::agent::remote::SessionActorRef;
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
-use crate::event_fanout::EventFanout;
-use crate::events::{AgentEventKind, EphemeralEvent, EventEnvelope, EventOrigin};
+use querymt_agent_core::events::{AgentEventKind, EphemeralEvent, EventEnvelope, EventOrigin};
+use querymt_agent_services::event_fanout::EventFanout;
 use querymt_remote::{
     CancelProviderStreamRequest, GetProviderStreamStatus, ProviderHostActor,
     ask_remote_with_timeout,

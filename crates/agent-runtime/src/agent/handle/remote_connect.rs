@@ -1933,7 +1933,7 @@ mod tests {
             journal
                 .append_durable(&NewDurableEvent {
                     session_id: session_id.into(),
-                    origin: crate::events::EventOrigin::Local,
+                    origin: querymt_agent_core::events::EventOrigin::Local,
                     source_node: None,
                     source_node_id: None,
                     source_seq: None,
@@ -2008,7 +2008,7 @@ mod tests {
 
         // Non-snapshot clients get the same replay as the owner's stream.
         let owner_stream = session_ref.get_event_stream().await.unwrap();
-        let strip = |events: &[crate::events::AgentEvent]| {
+        let strip = |events: &[querymt_agent_core::events::AgentEvent]| {
             events
                 .iter()
                 .map(|e| (e.seq, serde_json::to_value(&e.kind).unwrap()))

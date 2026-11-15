@@ -114,7 +114,7 @@ mod tests {
 
     #[tokio::test]
     async fn genai_injection_round_trips_tracestate_and_is_noop_without_telemetry() {
-        use crate::test_utils::helpers::genai_trace::capture;
+        use querymt_agent_services::tools::trace_support::genai_trace::capture;
         use tracing::Instrument;
         use tracing_opentelemetry::OpenTelemetrySpanExt;
         assert!(inject_current_acp_trace_context().is_none());

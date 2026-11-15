@@ -1,4 +1,3 @@
-use crate::events::StopType;
 use crate::middleware::{
     AgentStats, CompositeDriver, ConversationContext, ExecutionState, LlmResponse, MiddlewareDriver,
 };
@@ -7,6 +6,7 @@ use crate::test_utils::{
     test_context,
 };
 use querymt::chat::FinishReason;
+use querymt_agent_core::events::StopType;
 use std::sync::Arc;
 
 #[tokio::test]

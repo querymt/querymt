@@ -3,13 +3,13 @@
 //! This module implements the pruning layer of the 3-layer compaction system,
 //! which marks old tool outputs as compacted (soft delete) to keep context size manageable.
 
-use crate::model::{AgentMessage, MessagePart};
 use crate::session::store::LLMConfig;
 use base64::Engine as _;
 use querymt::chat::{
     ChatInputPart, ChatMessage, ChatMessagePart, ChatOutputItem, ChatRole, MediaKind, MediaPart,
     MediaSource, ToolResultPart,
 };
+use querymt_agent_core::model::{AgentMessage, MessagePart};
 use tracing::instrument;
 
 // Payload-independent reserves, not exact model-specific vision token counts.
@@ -679,7 +679,7 @@ pub fn extract_call_ids(candidates: &[PrunableToolResult]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::AgentMessage;
+    use querymt_agent_core::model::AgentMessage;
 
     fn make_user_message(id: &str, session_id: &str) -> AgentMessage {
         AgentMessage {

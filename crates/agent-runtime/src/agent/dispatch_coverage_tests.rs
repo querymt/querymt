@@ -119,7 +119,7 @@ fn recorded_sites_require_a_ledger_by_signature() {
     let compaction = include_str!("../session/compaction.rs");
     assert!(compaction.contains("ledger: &DispatchLedger"));
     let provider = include_str!("../session/provider.rs");
-    assert!(provider.contains("ledger: &crate::accounting::DispatchLedger"));
+    assert!(provider.contains("ledger: &querymt_agent_services::accounting::DispatchLedger"));
     let summarizer = include_str!("../delegation/summarizer.rs");
     assert!(summarizer.contains("operation: &AttemptOperation"));
 }

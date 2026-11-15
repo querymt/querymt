@@ -22,9 +22,9 @@ use crate::agent::messages::{
     EventStreamChunk, GetEventStreamChunk, MAX_EVENT_STREAM_CHUNK_BYTES,
     MAX_EVENT_STREAM_CHUNK_EVENTS,
 };
-use crate::event_sink::EventSink;
-use crate::events::{AgentEventKind, EventOrigin};
 use crate::session::remote_sync::{Claim, EpochCheck, RemoteSyncState, SyncGuard};
+use querymt_agent_core::events::{AgentEventKind, EventOrigin};
+use querymt_agent_services::event_sink::EventSink;
 
 use super::actor_ref::SessionActorRef;
 

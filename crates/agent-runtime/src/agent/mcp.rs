@@ -288,13 +288,13 @@ pub(crate) fn auth_required_text(server: &str) -> String {
 
 /// Map an MCP tool-call failure on an OAuth server that needs a login to the
 /// user-facing error text, and tell the session's clients via the transient
-/// [`McpServerAuthRequired`](crate::events::AgentEventKind::McpServerAuthRequired)
+/// [`McpServerAuthRequired`](querymt_agent_core::events::AgentEventKind::McpServerAuthRequired)
 /// event. Returns `None` for every other failure.
 pub(crate) fn report_auth_required(
     err: &anyhow::Error,
     server: &str,
     is_oauth_server: bool,
-    event_sink: &crate::event_sink::EventSink,
+    event_sink: &querymt_agent_services::event_sink::EventSink,
     session_id: &str,
 ) -> Option<String> {
     if !is_oauth_server || !is_auth_required_error(err) {
@@ -302,7 +302,7 @@ pub(crate) fn report_auth_required(
     }
     event_sink.emit_ephemeral(
         session_id,
-        crate::events::AgentEventKind::McpServerAuthRequired {
+        querymt_agent_core::events::AgentEventKind::McpServerAuthRequired {
             server_name: server.to_string(),
             provider_id: crate::mcp_auth::provider_id(server),
             error: None,

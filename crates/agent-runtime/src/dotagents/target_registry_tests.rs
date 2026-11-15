@@ -74,17 +74,19 @@ impl AgentHandleTrait for StubHandle {
         Err(crate::acp::protocol::Error::internal_error())
     }
 
-    fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
+    fn subscribe_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope> {
         let (tx, rx) = tokio::sync::broadcast::channel(1);
         drop(tx);
         rx
     }
 
-    fn event_fanout(&self) -> &Arc<crate::event_fanout::EventFanout> {
+    fn event_fanout(&self) -> &Arc<querymt_agent_services::event_fanout::EventFanout> {
         unimplemented!("not needed for registry tests")
     }
 
-    fn emit_event(&self, _session_id: &str, _kind: crate::events::AgentEventKind) {}
+    fn emit_event(&self, _session_id: &str, _kind: querymt_agent_core::events::AgentEventKind) {}
 
     fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
         Arc::new(DefaultAgentRegistry::new())

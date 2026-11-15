@@ -349,8 +349,8 @@ impl From<crate::slash_commands::builtin::BuiltinError> for AcpError {
     }
 }
 
-impl From<crate::model::PromptContentError> for AgentError {
-    fn from(error: crate::model::PromptContentError) -> Self {
+impl From<querymt_agent_core::model::PromptContentError> for AgentError {
+    fn from(error: querymt_agent_core::model::PromptContentError) -> Self {
         Self::InvalidPromptContent {
             message: error.to_string(),
         }

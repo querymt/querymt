@@ -1,4 +1,3 @@
-use crate::model::AgentMessage;
 use crate::session::domain::{
     Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
     DelegationStatus, ForkOrigin, ForkPointType, IntentSnapshot, ProgressEntry, ProgressKind, Task,
@@ -6,6 +5,7 @@ use crate::session::domain::{
 };
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::store::SessionStore;
+use querymt_agent_core::model::AgentMessage;
 use serde_json::Value;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -300,7 +300,7 @@ impl RuntimeContext {
     ) -> SessionResult<Delegation> {
         let session_internal_id = self.resolve_session_internal_id().await?;
 
-        let objective_hash = crate::hash::RapidHash::new(objective.as_bytes());
+        let objective_hash = querymt_agent_core::hash::RapidHash::new(objective.as_bytes());
         let retry_count = self
             .store
             .list_delegations(&self.session_id)
@@ -431,7 +431,7 @@ impl SessionForkHelper {
         let parent_messages = store.get_history(parent_id).await?;
         let mut truncated_messages: Vec<AgentMessage> =
             parent_messages.into_iter().take(index + 1).collect();
-        crate::model::repair_unmatched_tool_calls(&mut truncated_messages);
+        querymt_agent_core::model::repair_unmatched_tool_calls(&mut truncated_messages);
 
         for message in truncated_messages {
             let mut child_message = message;
@@ -465,7 +465,7 @@ impl SessionForkHelper {
             .into_iter()
             .filter(|message| message.created_at <= cutoff_time.unix_timestamp())
             .collect::<Vec<_>>();
-        crate::model::repair_unmatched_tool_calls(&mut truncated_messages);
+        querymt_agent_core::model::repair_unmatched_tool_calls(&mut truncated_messages);
         for mut child_message in truncated_messages {
             child_message.id = uuid::Uuid::now_v7().to_string();
             child_message.session_id = child_id.to_string();

@@ -139,7 +139,10 @@ mod remote_agent_stub_tests {
         let handle = make_handle("peer-c4", mesh);
 
         let mut rx = handle.subscribe_events();
-        handle.emit_event("test-session", crate::events::AgentEventKind::Cancelled);
+        handle.emit_event(
+            "test-session",
+            querymt_agent_core::events::AgentEventKind::Cancelled,
+        );
 
         let received = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
             .await

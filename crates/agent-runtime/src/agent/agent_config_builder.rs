@@ -16,10 +16,7 @@ use crate::config::{
     RateLimitConfig, RuntimeExecutionPolicy, ToolOutputConfig, ToolSpec,
 };
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
-use crate::event_fanout::EventFanout;
-use crate::event_sink::EventSink;
 use crate::hooks::Hooks;
-use crate::index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
 use crate::middleware::{
     AgentModeMiddleware, ContextConfig, ContextMiddleware, DelegationConfig, DelegationMiddleware,
     LimitsConfig, LimitsMiddleware, MiddlewareDriver,
@@ -32,6 +29,9 @@ use crate::tools::ToolRegistry;
 use arc_swap::ArcSwap;
 use querymt::LLMParams;
 use querymt::plugin::host::PluginRegistry;
+use querymt_agent_index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
+use querymt_agent_services::event_fanout::EventFanout;
+use querymt_agent_services::event_sink::EventSink;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
@@ -66,8 +66,8 @@ pub struct AgentConfigBuilder {
     delegation_cancel_grace_secs: u64,
     execution_policy: RuntimeExecutionPolicy,
     compaction: SessionCompaction,
-    snapshot_backend: Option<Arc<dyn crate::snapshot::SnapshotBackend>>,
-    snapshot_gc_config: crate::snapshot::GcConfig,
+    snapshot_backend: Option<Arc<dyn querymt_agent_services::snapshot::SnapshotBackend>>,
+    snapshot_gc_config: querymt_agent_services::snapshot::GcConfig,
     pending_elicitations: crate::elicitation::PendingElicitationMap,
     mcp_servers: Vec<McpServerConfig>,
     session_mcp_attachment_source: Arc<dyn SessionMcpAttachmentSource>,
@@ -129,7 +129,7 @@ impl AgentConfigBuilder {
             execution_policy: RuntimeExecutionPolicy::default(),
             compaction: SessionCompaction::new(),
             snapshot_backend: None,
-            snapshot_gc_config: crate::snapshot::GcConfig::default(),
+            snapshot_gc_config: querymt_agent_services::snapshot::GcConfig::default(),
             pending_elicitations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: Arc::new(NoopSessionMcpAttachmentSource),
@@ -185,7 +185,7 @@ impl AgentConfigBuilder {
             execution_policy: RuntimeExecutionPolicy::default(),
             compaction: SessionCompaction::new(),
             snapshot_backend: None,
-            snapshot_gc_config: crate::snapshot::GcConfig::default(),
+            snapshot_gc_config: querymt_agent_services::snapshot::GcConfig::default(),
             pending_elicitations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: Arc::new(NoopSessionMcpAttachmentSource),
@@ -449,14 +449,17 @@ impl AgentConfigBuilder {
     /// Sets the snapshot backend for undo/redo support.
     pub fn with_snapshot_backend(
         mut self,
-        backend: Arc<dyn crate::snapshot::SnapshotBackend>,
+        backend: Arc<dyn querymt_agent_services::snapshot::SnapshotBackend>,
     ) -> Self {
         self.snapshot_backend = Some(backend);
         self
     }
 
     /// Sets the snapshot GC configuration.
-    pub fn with_snapshot_gc_config(mut self, config: crate::snapshot::GcConfig) -> Self {
+    pub fn with_snapshot_gc_config(
+        mut self,
+        config: querymt_agent_services::snapshot::GcConfig,
+    ) -> Self {
         self.snapshot_gc_config = config;
         self
     }
@@ -738,9 +741,11 @@ impl AgentConfigBuilder {
         self = self.with_execution_policy(RuntimeExecutionPolicy::from(exec));
         match exec.snapshot.backend.as_str() {
             "git" => {
-                use crate::snapshot::git::GitSnapshotBackend;
+                use querymt_agent_services::snapshot::git::GitSnapshotBackend;
                 self.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()))
-                    .with_snapshot_gc_config(crate::snapshot::GcConfig::from(&exec.snapshot))
+                    .with_snapshot_gc_config(querymt_agent_services::snapshot::GcConfig::from(
+                        &exec.snapshot,
+                    ))
             }
             "none" | "" => self,
             other => {
@@ -1071,7 +1076,7 @@ mod tests {
     #[tokio::test]
     async fn configured_retention_reaches_the_snapshot_store() {
         use crate::config::ExecutionPolicy;
-        use crate::snapshot::GcConfig;
+        use querymt_agent_services::snapshot::GcConfig;
         use std::num::{NonZeroU64, NonZeroUsize};
 
         let mut exec = ExecutionPolicy::default();

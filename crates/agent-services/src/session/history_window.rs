@@ -10,13 +10,13 @@ use crate::accounting::{AccountingReducer, ScopeTotals};
 use crate::control::delegation_notifications::{
     DelegationUpdateNotification, DelegationUpdateProjector,
 };
-use crate::core_staging::protocol::ContentBlock;
-use crate::core_staging::stream_cursor::{StreamCursor, observe_cursor};
-use crate::events::{AgentEvent, AgentEventKind};
 use crate::session::domain::ForkOrigin;
 use crate::session::error::SessionResult;
 use crate::session::projection::{EventJournal, HistoryPageDirection};
 use crate::session::turns::turn_start_indices;
+use querymt_agent_core::events::{AgentEvent, AgentEventKind};
+use querymt_agent_core::protocol::ContentBlock;
+use querymt_agent_core::stream_cursor::{StreamCursor, observe_cursor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use typeshare::typeshare;
@@ -76,7 +76,7 @@ pub fn load_window_from_meta(
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<LoadWindow> {
     let window = meta?
-        .get(crate::core_staging::meta::QUERYMT_META_NAMESPACE)?
+        .get(querymt_agent_core::meta::QUERYMT_META_NAMESPACE)?
         .get("loadWindow")?
         .as_object()?;
     let field = |key: &str, default: usize| -> usize {
@@ -896,9 +896,9 @@ pub async fn find_tool_content(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{EventOrigin, ExecutionMetrics};
     use crate::session::projection::NewDurableEvent;
-    use crate::session::sqlite_storage::SqliteStorage;
+    use querymt_agent_core::events::{EventOrigin, ExecutionMetrics};
+    use querymt_agent_sqlite::session::sqlite_storage::SqliteStorage;
 
     const SID: &str = "s1";
 

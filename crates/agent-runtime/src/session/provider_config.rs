@@ -1,4 +1,3 @@
-use crate::model_heuristics::{ModelDefaults, OutputCaps};
 use crate::session::error::SessionError;
 use querymt::LLMParams;
 use querymt::error::LLMError;
@@ -7,6 +6,7 @@ use querymt::provider_config::{
     ConfigOverrideMode, ProviderConfigBuilder,
     ResolvedProviderConfig as SharedResolvedProviderConfig,
 };
+use querymt_agent_services::model_heuristics::{ModelDefaults, OutputCaps};
 use serde_json::Value;
 
 pub(crate) enum ProviderConfigMode<'a> {
@@ -116,7 +116,7 @@ pub(crate) async fn resolve_provider_config(
 
             // Only parse the models.dev cache when it can change the caps.
             let model_info = ModelDefaults::wants_model_info(provider_name, builder.value())
-                .then(|| crate::model_info::get_model_info(provider_name, model))
+                .then(|| querymt_agent_services::model_info::get_model_info(provider_name, model))
                 .flatten();
             let defaults = ModelDefaults::for_model(provider_name, model, model_info.as_ref());
             // Resolve caps before applying defaults so an explicit `max_tokens`
@@ -446,8 +446,10 @@ mod tests {
 
     #[tokio::test]
     async fn genai_settings_follow_binding_session_defaults_and_schema_pruning() {
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
         use opentelemetry::Value;
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
+        };
         let registry = registry_with_provider("providers = []");
         let factory = adapted_factory(
             Some("UNUSED_TEST_KEY"),
@@ -515,7 +517,9 @@ mod tests {
 
     #[tokio::test]
     async fn genai_reasoning_effort_is_omitted_after_schema_pruning() {
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
+        };
         let registry = registry_with_provider("providers = []");
         let factory = adapted_factory(None, r#"{"properties":{"model":{},"api_key":{}}}"#);
         let mut binding = binding(&registry, factory);

@@ -54,11 +54,11 @@ pub(crate) use wait::cleanup_timed_out_delegations;
 use crate::acp::protocol::StopReason;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::utils::u32_from_usize;
-use crate::events::{AgentEventKind, ExecutionMetrics, StopType};
 use crate::hooks::StopRequest;
 use crate::middleware::ExecutionState;
 use log::{debug, info, trace, warn};
 use querymt::chat::ChatRole;
+use querymt_agent_core::events::{AgentEventKind, ExecutionMetrics, StopType};
 use std::sync::Arc;
 use tracing::{Instrument, info_span, instrument};
 
@@ -99,7 +99,7 @@ fn mark_automatic_compaction(
 fn warn_incomplete_budget(
     config: &AgentConfig,
     exec_ctx: &ExecutionContext,
-    totals: &crate::accounting::ScopeTotals,
+    totals: &querymt_agent_services::accounting::ScopeTotals,
 ) {
     let Some(cap) = config.budget_cap_usd() else {
         return;
@@ -112,7 +112,7 @@ fn warn_incomplete_budget(
         &exec_ctx.session_id,
         AgentEventKind::HookNotice {
             event_name: "price_limit".to_string(),
-            message: crate::accounting::budget_warning_message(
+            message: querymt_agent_services::accounting::budget_warning_message(
                 &reasons,
                 totals.budget_known_subtotal_usd,
                 cap,
@@ -235,11 +235,11 @@ pub(crate) async fn apply_pending_steering(
         let display = crate::agent::utils::render_prompt_for_display(&blocks);
         let message_id = uuid::Uuid::new_v4().to_string();
         let client_prompt_id = input.client_input_id.clone();
-        let message = crate::model::AgentMessage {
+        let message = querymt_agent_core::model::AgentMessage {
             id: message_id.clone(),
             session_id: exec_ctx.session_id.clone(),
             role: querymt::chat::ChatRole::User,
-            parts: vec![crate::model::MessagePart::Steering {
+            parts: vec![querymt_agent_core::model::MessagePart::Steering {
                 run_id: exec_ctx.turn_id().to_string(),
                 client_input_id: client_prompt_id.clone(),
                 blocks: blocks.clone(),
@@ -1068,21 +1068,21 @@ mod tests {
 
     mod budget_warning_tests {
         use super::super::warn_incomplete_budget;
-        use crate::accounting::{AccountingReducer, ScopeTotals};
-        use crate::events::{AgentEventKind, EventEnvelope};
         use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
         use querymt::providers::{IncompleteReason, PricingCategory};
+        use querymt_agent_core::events::{AgentEventKind, EventEnvelope};
+        use querymt_agent_services::accounting::{AccountingReducer, ScopeTotals};
         use std::sync::Arc;
         use std::time::Duration;
 
         fn totals(settle: Option<IncompleteReason>) -> ScopeTotals {
-            let start = crate::core_staging::accounting::samples::sample_start();
+            let start = querymt_agent_core::accounting::samples::sample_start();
             let mut reducer = AccountingReducer::new(start.attempt.session_id.clone());
             reducer
                 .apply(&AgentEventKind::LlmAttemptStarted { start })
                 .unwrap();
             if let Some(reason) = settle {
-                let mut settlement = crate::core_staging::accounting::samples::sample_settlement();
+                let mut settlement = querymt_agent_core::accounting::samples::sample_settlement();
                 settlement.valuation.complete_total_usd = None;
                 settlement.valuation.incomplete = vec![reason];
                 reducer
@@ -1230,7 +1230,7 @@ mod tests {
             crate::agent::core::McpToolState::empty(),
         );
         let steering = Arc::new(crate::agent::turn_control::SteeringInbox::new(
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
         ));
         let blocks = vec![
             crate::acp::protocol::ContentBlock::Text(crate::acp::protocol::TextContent::new(
@@ -1254,7 +1254,7 @@ mod tests {
             .expect("queue steering");
         let mut exec_ctx = crate::agent::execution_context::ExecutionContext::new(
             session_id.clone(),
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             runtime,
             runtime_context,
             session_handle,
@@ -1302,7 +1302,7 @@ mod tests {
         let message_id = history[0].id.clone();
         assert!(matches!(
             &history[0].parts[0],
-            crate::model::MessagePart::Steering {
+            querymt_agent_core::model::MessagePart::Steering {
                 run_id,
                 client_input_id: Some(client_input_id),
                 blocks: stored_blocks,
@@ -1312,13 +1312,16 @@ mod tests {
         ));
 
         let mut observed = Vec::new();
-        while !observed.iter().any(|event: &crate::events::EventEnvelope| {
-            matches!(
-                event.kind(),
-                crate::events::AgentEventKind::SteeringApplied { input_id, .. }
-                    if input_id == "input-1"
-            )
-        }) {
+        while !observed
+            .iter()
+            .any(|event: &querymt_agent_core::events::EventEnvelope| {
+                matches!(
+                    event.kind(),
+                    querymt_agent_core::events::AgentEventKind::SteeringApplied { input_id, .. }
+                        if input_id == "input-1"
+                )
+            })
+        {
             let event = tokio::time::timeout(std::time::Duration::from_secs(2), live_events.recv())
                 .await
                 .expect("steering events should arrive")
@@ -1328,7 +1331,7 @@ mod tests {
         for (index, block) in blocks.iter().enumerate() {
             assert!(matches!(
                 observed[index].kind(),
-                crate::events::AgentEventKind::UserPromptBlock {
+                querymt_agent_core::events::AgentEventKind::UserPromptBlock {
                     message_id: event_message_id,
                     client_prompt_id: Some(client_prompt_id),
                     block: event_block,
@@ -1337,14 +1340,14 @@ mod tests {
         }
         assert!(matches!(
             observed[blocks.len()].kind(),
-            crate::events::AgentEventKind::PromptReceived {
+            querymt_agent_core::events::AgentEventKind::PromptReceived {
                 message_id: Some(event_message_id),
                 ..
             } if event_message_id == &message_id
         ));
         assert!(observed[blocks.len() + 1..].iter().any(|event| matches!(
             event.kind(),
-            crate::events::AgentEventKind::SteeringApplied { input_id, .. }
+            querymt_agent_core::events::AgentEventKind::SteeringApplied { input_id, .. }
                 if input_id == "input-1"
         )));
 
@@ -1358,7 +1361,7 @@ mod tests {
             .iter()
             .position(|event| matches!(
                 &event.kind,
-                crate::events::AgentEventKind::PromptReceived { message_id: Some(prompt_id), .. }
+                querymt_agent_core::events::AgentEventKind::PromptReceived { message_id: Some(prompt_id), .. }
                     if prompt_id == &message_id
             ))
             .expect("durable prompt event");
@@ -1367,7 +1370,7 @@ mod tests {
             .position(|event| {
                 matches!(
                     &event.kind,
-                    crate::events::AgentEventKind::SteeringApplied { input_id, .. }
+                    querymt_agent_core::events::AgentEventKind::SteeringApplied { input_id, .. }
                         if input_id == "input-1"
                 )
             })
@@ -1375,18 +1378,18 @@ mod tests {
         assert!(prompt_position < applied_position);
         assert!(durable.iter().any(|event| matches!(
             event.kind,
-            crate::events::AgentEventKind::UserMessageStored { .. }
+            querymt_agent_core::events::AgentEventKind::UserMessageStored { .. }
         )));
     }
 
     #[tokio::test]
     async fn tool_results_stay_ahead_of_steering_in_live_and_reloaded_history() {
-        use crate::model::{AgentMessage, MessagePart};
         use querymt::chat::{ChatMessage, ChatRole, ToolResultPart};
+        use querymt_agent_core::model::{AgentMessage, MessagePart};
 
         let fixture = crate::test_utils::TestAgent::new().await;
         let steering = Arc::new(crate::agent::turn_control::SteeringInbox::new(
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
         ));
         steering
             .push(

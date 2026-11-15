@@ -23,7 +23,6 @@
 
 #![cfg(test)]
 
-use crate::session::schema;
 use crate::worktree::domain::{
     BaselineMode, ExecutionMode, ManagedBranch, ProvisioningPhase, WorkspaceId, WorkspaceLifecycle,
     WorkspaceOwnership, WorkspaceRecord, baseline_ref_for,
@@ -36,6 +35,7 @@ use crate::worktree::session_options::SessionCreationOptions;
 use crate::worktree::test_support::{commit_files, init_repo_with_subdir, materialize};
 use parking_lot::Mutex;
 use querymt_agent_sqlite::repo_workspace::SqliteWorkspaceRepository;
+use querymt_agent_sqlite::session::schema;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

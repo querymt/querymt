@@ -4,11 +4,11 @@
 
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::utils::u32_from_usize;
-use crate::events::AgentEventKind;
 use futures_util::{Stream, StreamExt};
 use log::{info, warn};
 use querymt::chat::StreamChunk;
 use querymt::error::LLMError;
+use querymt_agent_core::events::AgentEventKind;
 use std::future::Future;
 use std::pin::Pin;
 use tokio_util::sync::CancellationToken;
@@ -423,7 +423,6 @@ mod tests {
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
     use crate::config::RuntimeExecutionPolicy;
-    use crate::events::AgentEventKind;
     use crate::test_utils::{
         MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
         mock_plugin_registry, mock_session,
@@ -431,6 +430,7 @@ mod tests {
     use querymt::LLMParams;
     use querymt::chat::{ChatOutput, FinishReason, StreamChunk};
     use querymt::error::{LLMError, ProviderErrorKind, ProviderFailure};
+    use querymt_agent_core::events::AgentEventKind;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{Mutex, broadcast};
@@ -485,15 +485,17 @@ mod tests {
     }
 
     async fn recv_event(
-        rx: &mut broadcast::Receiver<crate::events::EventEnvelope>,
-    ) -> crate::events::EventEnvelope {
+        rx: &mut broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+    ) -> querymt_agent_core::events::EventEnvelope {
         tokio::time::timeout(tokio::time::Duration::from_secs(1), rx.recv())
             .await
             .expect("timed out waiting for retry event")
             .expect("retry event channel closed")
     }
 
-    async fn assert_no_event(rx: &mut broadcast::Receiver<crate::events::EventEnvelope>) {
+    async fn assert_no_event(
+        rx: &mut broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+    ) {
         assert!(
             tokio::time::timeout(tokio::time::Duration::from_millis(50), rx.recv())
                 .await

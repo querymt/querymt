@@ -97,8 +97,6 @@ pub(crate) mod genai_metrics {
     }
 }
 
-pub(crate) use querymt_agent_services::tools::trace_support::genai_trace;
-
 /// Deterministic incompressible bytes (xorshift), so test files do not deflate.
 pub fn noise(len: usize, seed: u64) -> Vec<u8> {
     let mut x = seed | 1;
@@ -114,34 +112,37 @@ pub fn noise(len: usize, seed: u64) -> Vec<u8> {
 
 /// A ledger over a fresh in-memory journal for tests of components that
 /// require explicit recording but do not assert on it.
-pub async fn test_ledger() -> crate::accounting::DispatchLedger {
+pub async fn test_ledger() -> querymt_agent_services::accounting::DispatchLedger {
     use crate::session::backend::StorageBackend;
     let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
         .await
         .unwrap();
     let journal = storage.event_journal();
-    let accounting = crate::accounting::SessionAccounting::hydrate("session", journal.clone())
-        .await
-        .unwrap();
-    let stream = crate::session_event_stream::SessionEventStream::new(
+    let accounting =
+        querymt_agent_services::accounting::SessionAccounting::hydrate("session", journal.clone())
+            .await
+            .unwrap();
+    let stream = querymt_agent_services::session_event_stream::SessionEventStream::new(
         "session",
         journal,
-        std::sync::Arc::new(crate::event_fanout::EventFanout::new()),
+        std::sync::Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
     );
-    let recorder = std::sync::Arc::new(crate::accounting::AttemptRecorder::with_projection(
-        stream,
-        accounting.clone(),
-    ));
-    let cycle = crate::accounting::CycleAccounting::with_id(accounting, "cycle-1");
-    crate::accounting::DispatchLedger {
-        operation: std::sync::Arc::new(crate::accounting::AttemptOperation::new(
+    let recorder = std::sync::Arc::new(
+        querymt_agent_services::accounting::AttemptRecorder::with_projection(
+            stream,
+            accounting.clone(),
+        ),
+    );
+    let cycle = querymt_agent_services::accounting::CycleAccounting::with_id(accounting, "cycle-1");
+    querymt_agent_services::accounting::DispatchLedger {
+        operation: std::sync::Arc::new(querymt_agent_services::accounting::AttemptOperation::new(
             recorder,
             &cycle,
-            crate::accounting::AttemptPurpose::MainResponse,
+            querymt_agent_services::accounting::AttemptPurpose::MainResponse,
             "p",
             "m",
         )),
-        basis: crate::accounting::BillingBasis {
+        basis: querymt_agent_services::accounting::BillingBasis {
             billing: querymt::providers::BillingClass::Unknown,
             pricing: None,
         },
@@ -154,18 +155,18 @@ use crate::agent::core::SnapshotPolicy;
 use crate::delegation::AgentInfo;
 use crate::delegation::DefaultAgentRegistry;
 use crate::middleware::{AgentStats, ConversationContext, ToolCall, ToolFunction};
-use crate::model::{AgentMessage, MessagePart};
 use crate::session::backend::StorageBackend;
 use crate::session::domain::ForkOrigin;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::session::store::{LLMConfig, Session};
-use crate::snapshot::backend::SnapshotBackend;
-use crate::snapshot::git::GitSnapshotBackend;
 use crate::test_utils::mocks::{TestPluginLoader, TestProviderFactory};
 use anyhow::Result;
 use querymt::LLMParams;
 use querymt::chat::{ChatMessage, ChatRole};
 use querymt::plugin::host::PluginRegistry;
+use querymt_agent_core::model::{AgentMessage, MessagePart};
+use querymt_agent_services::snapshot::backend::SnapshotBackend;
+use querymt_agent_services::snapshot::git::GitSnapshotBackend;
 pub use querymt_agent_sqlite::test_support::sqlite_conn_with_schema;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -567,7 +568,10 @@ impl UndoTestFixture {
     pub async fn take_pre_snapshot(
         &self,
         session_id: &str,
-    ) -> Result<(crate::model::TurnId, crate::snapshot::SnapshotId)> {
+    ) -> Result<(
+        querymt_agent_core::model::TurnId,
+        querymt_agent_services::snapshot::SnapshotId,
+    )> {
         self.take_pre_snapshot_with_cwd(session_id, self.worktree.path())
             .await
     }
@@ -577,9 +581,12 @@ impl UndoTestFixture {
         &self,
         session_id: &str,
         cwd: &std::path::Path,
-    ) -> Result<(crate::model::TurnId, crate::snapshot::SnapshotId)> {
+    ) -> Result<(
+        querymt_agent_core::model::TurnId,
+        querymt_agent_services::snapshot::SnapshotId,
+    )> {
         let snapshot_id = self.backend.track(cwd).await?;
-        let turn_id = crate::model::TurnId::new();
+        let turn_id = querymt_agent_core::model::TurnId::new();
 
         let msg = AgentMessage {
             id: Uuid::new_v4().to_string(),
@@ -608,8 +615,8 @@ impl UndoTestFixture {
     pub async fn take_post_snapshot(
         &self,
         session_id: &str,
-        turn_id: &crate::model::TurnId,
-        pre_snapshot: &crate::snapshot::SnapshotId,
+        turn_id: &querymt_agent_core::model::TurnId,
+        pre_snapshot: &querymt_agent_services::snapshot::SnapshotId,
     ) -> Result<Vec<String>> {
         self.take_post_snapshot_with_cwd(session_id, turn_id, pre_snapshot, self.worktree.path())
             .await
@@ -619,8 +626,8 @@ impl UndoTestFixture {
     pub async fn take_post_snapshot_with_cwd(
         &self,
         session_id: &str,
-        turn_id: &crate::model::TurnId,
-        pre_snapshot: &crate::snapshot::SnapshotId,
+        turn_id: &querymt_agent_core::model::TurnId,
+        pre_snapshot: &querymt_agent_services::snapshot::SnapshotId,
         cwd: &std::path::Path,
     ) -> Result<Vec<String>> {
         let post_snapshot = self.backend.track(cwd).await?;
@@ -710,7 +717,7 @@ impl UndoTestFixture {
         session_id: &str,
         text: &str,
     ) -> Result<crate::acp::protocol::PromptResponse> {
-        use crate::events::AgentEventKind;
+        use querymt_agent_core::events::AgentEventKind;
         use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
         // Subscribe before prompting so neither event can be missed.

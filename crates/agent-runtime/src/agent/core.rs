@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
-pub use crate::core_staging::agent_mode::AgentMode;
+pub use querymt_agent_core::agent_mode::AgentMode;
 
 /// Configuration for when and how delegation context is injected into conversations.
 #[derive(Debug, Clone)]
@@ -46,7 +46,7 @@ pub struct McpToolSnapshot {
     /// Hash of the currently available tool set used for change detection.
     /// `None` signals that the next turn should unconditionally re-emit a
     /// `ToolsAvailable` event.
-    pub tools_hash: Option<crate::hash::RapidHash>,
+    pub tools_hash: Option<querymt_agent_core::hash::RapidHash>,
     /// Skills published by this session's eligible MCP servers (MCP Skills
     /// extension). Updated together with the tools so one snapshot is always
     /// consistent.
@@ -219,16 +219,18 @@ impl McpToolState {
 /// The snapshot taken at the start of a turn, paired with the turn it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnSnapshot {
-    pub turn_id: crate::model::TurnId,
-    pub snapshot_id: crate::snapshot::SnapshotId,
+    pub turn_id: querymt_agent_core::model::TurnId,
+    pub snapshot_id: querymt_agent_services::snapshot::SnapshotId,
 }
 
 /// Type alias for the in-flight pre-turn snapshot task handle.
 type PreTurnSnapshotTask = ParkingMutex<
     Option<
         tokio::task::JoinHandle<(
-            crate::model::TurnId,
-            crate::snapshot::SnapshotResult<crate::snapshot::SnapshotId>,
+            querymt_agent_core::model::TurnId,
+            querymt_agent_services::snapshot::SnapshotResult<
+                querymt_agent_services::snapshot::SnapshotId,
+            >,
         )>,
     >,
 >;
@@ -252,18 +254,22 @@ pub struct SessionRuntime {
     pub skill_grants: Arc<ParkingMutex<HashSet<String>>>,
     pub tool_validator_cache: ParkingMutex<HashMap<String, Arc<jsonschema::Validator>>>,
     /// Workspace handle for duplicate code detection (built asynchronously on session start)
-    pub workspace_handle: Arc<OnceCell<crate::index::WorkspaceHandle>>,
+    pub workspace_handle: Arc<OnceCell<querymt_agent_index::WorkspaceHandle>>,
     /// Turn snapshot taken at the start of the turn for undo/redo.
     pub turn_snapshot: ParkingMutex<Option<TurnSnapshot>>,
     /// In-flight pre-turn snapshot task, resolved before first assistant response or post-turn use.
     pub pre_turn_snapshot_task: PreTurnSnapshotTask,
     /// Accumulated changed file paths across the entire turn (for end-of-turn dedup check)
-    pub turn_diffs: ParkingMutex<crate::index::DiffPaths>,
+    pub turn_diffs: ParkingMutex<querymt_agent_index::DiffPaths>,
     /// Workspace tree after the last diff snapshot, keyed by root. Seeds the
     /// next pre-call scan so unchanged files (same size and mtime) are not
     /// re-hashed.
-    pub last_snapshot_tree:
-        ParkingMutex<Option<(std::path::PathBuf, Arc<crate::index::merkle::MerkleTree>)>>,
+    pub last_snapshot_tree: ParkingMutex<
+        Option<(
+            std::path::PathBuf,
+            Arc<querymt_agent_index::merkle::MerkleTree>,
+        )>,
+    >,
     /// Execution permit ensuring only one prompt runs at a time for this session.
     /// Uses a semaphore with capacity 1 to guarantee FIFO ordering of concurrent prompts.
     /// This prevents race conditions where user messages are inserted between
@@ -288,7 +294,7 @@ pub struct SessionRuntime {
     pub(crate) workspace_activity: OnceCell<crate::worktree::gate::CheckoutActivityLease>,
     /// Rebuildable accounting projection, hydrated from the journal on first
     /// use and released with the runtime.
-    accounting: OnceCell<Arc<crate::accounting::SessionAccounting>>,
+    accounting: OnceCell<Arc<querymt_agent_services::accounting::SessionAccounting>>,
 }
 
 impl SessionRuntime {
@@ -312,8 +318,11 @@ impl SessionRuntime {
     pub async fn accounting(
         &self,
         session_id: &str,
-        sink: &crate::event_sink::EventSink,
-    ) -> Result<Arc<crate::accounting::SessionAccounting>, crate::accounting::AccountingError> {
+        sink: &querymt_agent_services::event_sink::EventSink,
+    ) -> Result<
+        Arc<querymt_agent_services::accounting::SessionAccounting>,
+        querymt_agent_services::accounting::AccountingError,
+    > {
         self.accounting
             .get_or_try_init(|| sink.session_accounting(session_id))
             .await

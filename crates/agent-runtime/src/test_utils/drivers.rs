@@ -1,8 +1,8 @@
 //! Common test driver implementations for middleware testing
 
-use crate::events::StopType;
 use crate::middleware::{ExecutionState, MiddlewareDriver, Result};
 use async_trait::async_trait;
+use querymt_agent_core::events::StopType;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 

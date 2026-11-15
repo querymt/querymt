@@ -656,7 +656,6 @@ impl WorkspaceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::schema;
     use crate::worktree::FaultInjectingRepoOps;
     use crate::worktree::GitRunner as _;
     use crate::worktree::GixRepoOps;
@@ -670,6 +669,7 @@ mod tests {
     use crate::worktree::identity::resolve_repository;
     use crate::worktree::test_support::{commit_files, init_repo, materialize};
     use querymt_agent_sqlite::repo_workspace::SqliteWorkspaceRepository;
+    use querymt_agent_sqlite::session::schema;
     use std::fs;
     use tempfile::TempDir;
 

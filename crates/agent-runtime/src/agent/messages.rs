@@ -16,11 +16,11 @@ use crate::agent::session_control::{
     SessionControlState, SessionControlTransition, SessionModelSelection,
 };
 pub use crate::agent::turn_control::{InputDelivery, SubmitInput, SubmitInputResult};
-pub use crate::core_staging::runtime_status::{
-    RuntimeAvailability, RuntimeObservation, SessionRuntimePhase, SessionRuntimeStatus,
-};
 use querymt::LLMParams;
 use querymt::chat::ReasoningEffort;
+pub use querymt_agent_core::runtime_status::{
+    RuntimeAvailability, RuntimeObservation, SessionRuntimePhase, SessionRuntimeStatus,
+};
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
@@ -74,20 +74,20 @@ pub(crate) enum RunCompletionDisposition {
     Cancelled,
     /// The run ended on a middleware stop (e.g. the model's output limit).
     Stopped {
-        stop_type: crate::events::StopType,
+        stop_type: querymt_agent_core::events::StopType,
         reason: String,
     },
 }
 
 pub(crate) struct PromptFinished {
     pub generation: u64,
-    pub run_id: crate::model::TurnId,
+    pub run_id: querymt_agent_core::model::TurnId,
     pub disposition: RunCompletionDisposition,
 }
 
 pub(crate) struct RunPhaseChanged {
     pub generation: u64,
-    pub run_id: crate::model::TurnId,
+    pub run_id: querymt_agent_core::model::TurnId,
     pub phase: Option<crate::agent::turn_control::RunPhase>,
 }
 
@@ -328,7 +328,7 @@ pub struct GetEventStreamSince {
 pub struct EventStreamPage {
     /// Events ordered by source sequence. `AgentEvent.seq` is the host
     /// journal sequence and doubles as the backfill cursor.
-    pub events: Vec<crate::events::AgentEvent>,
+    pub events: Vec<querymt_agent_core::events::AgentEvent>,
     /// The host's current stream tip. Once a page reaches this value the
     /// backfill is complete. Overlap between pages and the live relay is
     /// allowed and deduplicated requester-side via source identity.
@@ -375,7 +375,7 @@ pub struct GetEventStreamChunk {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventStreamChunk {
     /// Events in ascending source-sequence order (`AgentEvent.seq`).
-    pub events: Vec<crate::events::AgentEvent>,
+    pub events: Vec<querymt_agent_core::events::AgentEvent>,
     /// The owner's current stream tip.
     pub latest_source_seq: i64,
     /// Owner-side counter bumped whenever journal events are deleted (undo).
@@ -773,15 +773,15 @@ mod tests {
         assert_eq!(rt.limit, 100);
     }
 
-    fn chunk_test_event(seq: i64) -> crate::events::AgentEvent {
-        crate::events::AgentEvent {
+    fn chunk_test_event(seq: i64) -> querymt_agent_core::events::AgentEvent {
+        querymt_agent_core::events::AgentEvent {
             seq,
             session_seq: seq,
             timestamp: 1,
             session_id: "sess-1".into(),
-            origin: crate::events::EventOrigin::Local,
+            origin: querymt_agent_core::events::EventOrigin::Local,
             source_node: None,
-            kind: crate::events::AgentEventKind::PromptReceived {
+            kind: querymt_agent_core::events::AgentEventKind::PromptReceived {
                 content: "hi".into(),
                 message_id: None,
             },

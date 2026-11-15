@@ -133,7 +133,7 @@ impl LocalAgentHandle {
         &self,
         session_id: &str,
         session_ref: &crate::agent::remote::SessionActorRef,
-    ) -> Result<Option<Vec<crate::events::AgentEvent>>, crate::error::AgentError> {
+    ) -> Result<Option<Vec<querymt_agent_core::events::AgentEvent>>, crate::error::AgentError> {
         if !session_ref.is_remote() {
             return Ok(None);
         }
@@ -186,7 +186,7 @@ impl LocalAgentHandle {
             history
                 .into_iter()
                 .map(|(position, durable)| {
-                    let mut event = crate::events::AgentEvent::from(durable);
+                    let mut event = querymt_agent_core::events::AgentEvent::from(durable);
                     event.seq = position;
                     event
                 })
@@ -203,7 +203,7 @@ impl LocalAgentHandle {
     pub(crate) async fn remote_prompt_records_for(
         &self,
         session_id: &str,
-        events: &[crate::events::AgentEvent],
+        events: &[querymt_agent_core::events::AgentEvent],
         deadline: tokio::time::Instant,
     ) -> Vec<crate::session::load_snapshot::UserPromptRecord> {
         let ids = crate::session::load_snapshot::prompt_message_ids(events);

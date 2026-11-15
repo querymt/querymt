@@ -172,11 +172,13 @@ impl ToolTrait for KnowledgeIngestTool {
             .map_err(|e| ToolError::ProviderError(format!("Failed to ingest: {}", e)))?;
 
         // Emit KnowledgeIngested event so the scheduler can react
-        context.emit_event(crate::events::AgentEventKind::KnowledgeIngested {
-            scope: scope.clone(),
-            entry_public_id: entry.public_id.clone(),
-            source: entry.source.clone(),
-        });
+        context.emit_event(
+            querymt_agent_core::events::AgentEventKind::KnowledgeIngested {
+                scope: scope.clone(),
+                entry_public_id: entry.public_id.clone(),
+                source: entry.source.clone(),
+            },
+        );
 
         Ok(vec![ToolResultPart::text(format!(
             "Ingested knowledge entry {} (scope: {}, importance: {:.2})",
@@ -253,7 +255,7 @@ mod tests {
         use crate::event_fanout::EventFanout;
         use crate::event_sink::EventSink;
         use crate::session::backend::StorageBackend;
-        use crate::session::sqlite_storage::SqliteStorage;
+        use querymt_agent_sqlite::session::sqlite_storage::SqliteStorage;
 
         let temp_dir = TempDir::new().unwrap();
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
@@ -286,10 +288,10 @@ mod tests {
         // Check that a KnowledgeIngested event was emitted
         let mut found = false;
         while let Ok(envelope) = rx.try_recv() {
-            if let crate::events::EventEnvelope::Durable(ev) = envelope
+            if let querymt_agent_core::events::EventEnvelope::Durable(ev) = envelope
                 && matches!(
                     ev.kind,
-                    crate::events::AgentEventKind::KnowledgeIngested { .. }
+                    querymt_agent_core::events::AgentEventKind::KnowledgeIngested { .. }
                 )
             {
                 found = true;

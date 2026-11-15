@@ -10,12 +10,6 @@ pub use querymt_agent_core::session::{
     store,
 };
 
-// The SQLite implementation is a dev-dependency only (design D1).
-#[cfg(test)]
-pub(crate) use querymt_agent_sqlite::session::{schema, sqlite_storage};
-#[cfg(test)]
-pub(crate) use sqlite_storage::SqliteStorage;
-
 pub mod history_window;
 pub mod pruning;
 pub mod remote_sync;

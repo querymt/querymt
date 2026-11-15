@@ -3,12 +3,7 @@
 //! This module implements the AI compaction layer of the 3-layer compaction system,
 //! which generates summaries when context threshold is reached.
 
-use crate::accounting::{AccountingError, DispatchLedger, DispatchMode};
 use crate::agent::utils::{genai, render_prompt_for_llm};
-pub use crate::core_staging::history::{
-    filter_to_effective_history, merge_consecutive_tool_result_messages,
-};
-use crate::model::{AgentMessage, MessagePart};
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use anyhow::Result;
 use futures_util::{FutureExt, StreamExt};
@@ -17,6 +12,11 @@ use querymt::chat::{
     ChatStreamAccumulatorError, ChatStreamFinish, FinishReason,
 };
 use querymt::error::LLMError;
+pub use querymt_agent_core::history::{
+    filter_to_effective_history, merge_consecutive_tool_result_messages,
+};
+use querymt_agent_core::model::{AgentMessage, MessagePart};
+use querymt_agent_services::accounting::{AccountingError, DispatchLedger, DispatchMode};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -739,37 +739,47 @@ mod tests {
     async fn ledger_with(
         billing: querymt::providers::BillingClass,
         pricing: Option<querymt::providers::ModelPricing>,
-    ) -> (DispatchLedger, Arc<crate::accounting::SessionAccounting>) {
+    ) -> (
+        DispatchLedger,
+        Arc<querymt_agent_services::accounting::SessionAccounting>,
+    ) {
         use crate::session::backend::StorageBackend;
         let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
             .await
             .unwrap();
         let journal = storage.event_journal();
-        let accounting =
-            crate::accounting::SessionAccounting::hydrate("compaction-session", journal.clone())
-                .await
-                .unwrap();
-        let stream = crate::session_event_stream::SessionEventStream::new(
+        let accounting = querymt_agent_services::accounting::SessionAccounting::hydrate(
+            "compaction-session",
+            journal.clone(),
+        )
+        .await
+        .unwrap();
+        let stream = querymt_agent_services::session_event_stream::SessionEventStream::new(
             "compaction-session",
             journal,
-            Arc::new(crate::event_fanout::EventFanout::new()),
+            Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
         );
-        let recorder = Arc::new(crate::accounting::AttemptRecorder::with_projection(
-            stream,
+        let recorder = Arc::new(
+            querymt_agent_services::accounting::AttemptRecorder::with_projection(
+                stream,
+                accounting.clone(),
+            ),
+        );
+        let cycle = querymt_agent_services::accounting::CycleAccounting::with_id(
             accounting.clone(),
-        ));
-        let cycle = crate::accounting::CycleAccounting::with_id(accounting.clone(), "cycle-1");
-        let operation = crate::accounting::AttemptOperation::new(
+            "cycle-1",
+        );
+        let operation = querymt_agent_services::accounting::AttemptOperation::new(
             recorder,
             &cycle,
-            crate::accounting::AttemptPurpose::Compaction,
+            querymt_agent_services::accounting::AttemptPurpose::Compaction,
             "p",
             "model",
         );
         (
             DispatchLedger {
                 operation: Arc::new(operation),
-                basis: crate::accounting::BillingBasis { billing, pricing },
+                basis: querymt_agent_services::accounting::BillingBasis { billing, pricing },
             },
             accounting,
         )
@@ -777,12 +787,14 @@ mod tests {
 
     #[tokio::test]
     async fn genai_compaction_stream_retry_records_one_canonical_output_without_content() {
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
         use opentelemetry::{
             Array, Value,
             trace::{SpanKind, Status},
         };
         use querymt::chat::ChatOutputProvenance;
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
+        };
         use tracing::Instrument;
 
         for session_id in [None, Some("compaction-session"), Some("")] {
@@ -904,8 +916,10 @@ mod tests {
 
     #[tokio::test]
     async fn genai_compaction_drains_buffered_usage_without_waiting_or_revalidating() {
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
         use opentelemetry::Value;
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
+        };
 
         for structured in [false, true] {
             for pending_tail in [false, true] {
@@ -985,8 +999,10 @@ mod tests {
 
     #[tokio::test]
     async fn genai_compaction_first_chunk_is_logical_across_retry_helper_spans() {
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
         use opentelemetry::Value;
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
+        };
         for metadata_first in [false, true] {
             let error = || LLMError::AuthError("SECRET_ERROR".into());
             let initial = if metadata_first {
@@ -1057,8 +1073,10 @@ mod tests {
 
     #[tokio::test]
     async fn genai_compaction_failed_stream_records_sanitized_terminal_error() {
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
         use opentelemetry::{Value, trace::Status};
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
+        };
         let provider = ScriptedProvider::new(
             true,
             vec![Attempt::Stream(vec![Err(LLMError::AuthError(
@@ -2434,8 +2452,8 @@ mod tests {
 
     mod accounting_tests {
         use super::*;
-        use crate::accounting::{AccountingReason, UsageDisposition};
         use querymt::providers::{BillingClass, ModelPricing};
+        use querymt_agent_services::accounting::{AccountingReason, UsageDisposition};
 
         fn pricing() -> ModelPricing {
             ModelPricing {
@@ -2489,7 +2507,7 @@ mod tests {
             retries: usize,
         ) -> (
             Result<CompactionResult>,
-            Arc<crate::accounting::SessionAccounting>,
+            Arc<querymt_agent_services::accounting::SessionAccounting>,
         ) {
             let (ledger, accounting) = ledger_with(BillingClass::Metered, Some(pricing())).await;
             let history = [MessageFixture::user_message(
@@ -2533,8 +2551,9 @@ mod tests {
             // Cache read/write and reasoning are priced, once per attempt.
             assert!((t.known_subtotal_usd - 2.0 * cost()).abs() < 1e-12);
             assert!((t.complete_total_usd().unwrap() - 2.0 * cost()).abs() < 1e-12);
-            let compaction =
-                accounting.read(|r| r.purpose(crate::accounting::AttemptPurpose::Compaction));
+            let compaction = accounting.read(|r| {
+                r.purpose(querymt_agent_services::accounting::AttemptPurpose::Compaction)
+            });
             assert_eq!(compaction.priced_attempts, 2);
         }
 
@@ -2659,10 +2678,10 @@ mod tests {
             let provider = ScriptedProvider::new(false, vec![Attempt::output(response("ok"))]);
             let (ledger, _) = ledger_with(BillingClass::Metered, Some(pricing())).await;
             // An attempt owned by another session is rejected by the recorder.
-            let foreign = crate::accounting::DispatchLedger {
-                operation: Arc::new(crate::accounting::AttemptOperation::new(
-                    Arc::new(crate::accounting::AttemptRecorder::new(
-                        crate::session_event_stream::SessionEventStream::new(
+            let foreign = querymt_agent_services::accounting::DispatchLedger {
+                operation: Arc::new(querymt_agent_services::accounting::AttemptOperation::new(
+                    Arc::new(querymt_agent_services::accounting::AttemptRecorder::new(
+                        querymt_agent_services::session_event_stream::SessionEventStream::new(
                             "someone-else",
                             {
                                 use crate::session::backend::StorageBackend;
@@ -2673,24 +2692,27 @@ mod tests {
                                 .unwrap()
                                 .event_journal()
                             },
-                            Arc::new(crate::event_fanout::EventFanout::new()),
+                            Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
                         ),
                     )),
-                    &crate::accounting::CycleAccounting::with_id(
-                        crate::accounting::SessionAccounting::hydrate("compaction-session", {
-                            use crate::session::backend::StorageBackend;
-                            crate::session::sqlite_storage::SqliteStorage::connect(
-                                ":memory:".into(),
-                            )
-                            .await
-                            .unwrap()
-                            .event_journal()
-                        })
+                    &querymt_agent_services::accounting::CycleAccounting::with_id(
+                        querymt_agent_services::accounting::SessionAccounting::hydrate(
+                            "compaction-session",
+                            {
+                                use crate::session::backend::StorageBackend;
+                                crate::session::sqlite_storage::SqliteStorage::connect(
+                                    ":memory:".into(),
+                                )
+                                .await
+                                .unwrap()
+                                .event_journal()
+                            },
+                        )
                         .await
                         .unwrap(),
                         "c",
                     ),
-                    crate::accounting::AttemptPurpose::Compaction,
+                    querymt_agent_services::accounting::AttemptPurpose::Compaction,
                     "p",
                     "model",
                 )),

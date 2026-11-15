@@ -4,7 +4,7 @@
 //! Parallel to `undo.rs`, this module defines the error type and response
 //! structs used by `GetFileIndex` and `ReadRemoteFile` session messages.
 
-use crate::index::FileIndexEntry;
+use querymt_agent_index::FileIndexEntry;
 use serde::{Deserialize, Serialize};
 
 /// Errors from remote file index/read operations.

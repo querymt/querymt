@@ -6,12 +6,12 @@
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::utils::{genai, u32_from_usize};
-use crate::events::{AgentEventKind, StopType};
 use crate::hooks::{PostCompactionRequest, PreCompactionRequest};
 use crate::middleware::ExecutionState;
-use crate::model::MessagePart;
 use crate::session::compaction::SessionCompaction;
 use log::{debug, info, warn};
+use querymt_agent_core::events::{AgentEventKind, StopType};
+use querymt_agent_core::model::MessagePart;
 use std::sync::Arc;
 
 /// Emits the terminal event for a started compaction before propagating an
@@ -51,25 +51,27 @@ async fn compaction_ledger(
     config: &AgentConfig,
     exec_ctx: &ExecutionContext,
     model: &str,
-) -> Result<crate::accounting::DispatchLedger, anyhow::Error> {
+) -> Result<querymt_agent_services::accounting::DispatchLedger, anyhow::Error> {
     let cycle = exec_ctx
         .cycle_accounting(&config.event_sink)
         .await
         .map_err(|error| anyhow::anyhow!("accounting unavailable: {error}"))?;
-    let recorder = Arc::new(crate::accounting::AttemptRecorder::with_projection(
-        config.event_sink.session_stream(&exec_ctx.session_id),
-        cycle.session_accounting().clone(),
-    ));
+    let recorder = Arc::new(
+        querymt_agent_services::accounting::AttemptRecorder::with_projection(
+            config.event_sink.session_stream(&exec_ctx.session_id),
+            cycle.session_accounting().clone(),
+        ),
+    );
     let provider = exec_ctx
         .llm_config()
         .map(|c| c.provider.clone())
         .unwrap_or_default();
-    Ok(crate::accounting::DispatchLedger {
+    Ok(querymt_agent_services::accounting::DispatchLedger {
         operation: Arc::new(
-            crate::accounting::AttemptOperation::new(
+            querymt_agent_services::accounting::AttemptOperation::new(
                 recorder,
                 cycle,
-                crate::accounting::AttemptPurpose::Compaction,
+                querymt_agent_services::accounting::AttemptPurpose::Compaction,
                 provider,
                 model,
             )
@@ -148,7 +150,7 @@ pub(crate) enum CompactionOutcome {
     /// A summary boundary was stored. Carries the new effective history and
     /// its estimated token count.
     Completed {
-        messages: Vec<crate::model::AgentMessage>,
+        messages: Vec<querymt_agent_core::model::AgentMessage>,
         context_tokens: usize,
     },
     /// A pre-compaction hook blocked the compaction.
@@ -525,8 +527,10 @@ pub(crate) async fn compact_history(
         crate::agent::repository_delivery::post_compaction_contexts(config, exec_ctx, &messages)
             .await;
     if !restored.is_empty() {
-        let mut message =
-            crate::model::AgentMessage::new(session_id.clone(), querymt::chat::ChatRole::User);
+        let mut message = querymt_agent_core::model::AgentMessage::new(
+            session_id.clone(),
+            querymt::chat::ChatRole::User,
+        );
         message.parts = restored
             .into_iter()
             .map(|context| MessagePart::HookContext {
@@ -594,12 +598,10 @@ mod tests {
     use super::*;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::{McpToolState, SessionRuntime, ToolConfig};
-    use crate::events::{DurableEvent, EventEnvelope};
     use crate::hooks::{
         HookCommandConfig, HookHandlerConfig, Hooks, HooksConfig, MatcherGroupConfig,
     };
     use crate::middleware::{AgentStats, ConversationContext};
-    use crate::model::AgentMessage;
     use crate::session::RuntimeContext;
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::session::store::SessionExecutionConfig;
@@ -607,6 +609,8 @@ mod tests {
     use crate::test_utils::mocks::{MockLlmProvider, SharedLlmProvider, TestProviderFactory};
     use querymt::LLMParams;
     use querymt::chat::{ChatMessage, ChatOutput, ChatRole, FinishReason};
+    use querymt_agent_core::events::{DurableEvent, EventEnvelope};
+    use querymt_agent_core::model::AgentMessage;
 
     fn hook_group(output: serde_json::Value) -> Vec<MatcherGroupConfig> {
         vec![MatcherGroupConfig {
@@ -683,7 +687,7 @@ mod tests {
         let runtime = SessionRuntime::new(None, Default::default(), McpToolState::empty());
         let exec_ctx = ExecutionContext::new(
             session_id.clone(),
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             runtime,
             runtime_context,
             session_handle,
@@ -987,7 +991,9 @@ mod tests {
 
     mod accounting_tests {
         use super::*;
-        use crate::accounting::{AccountingReason, AttemptPurpose, CycleAccounting};
+        use querymt_agent_services::accounting::{
+            AccountingReason, AttemptPurpose, CycleAccounting,
+        };
 
         fn usage() -> querymt::Usage {
             querymt::Usage {
@@ -1012,7 +1018,9 @@ mod tests {
             out
         }
 
-        async fn totals(exec: &ExecutionContext) -> crate::accounting::ScopeTotals {
+        async fn totals(
+            exec: &ExecutionContext,
+        ) -> querymt_agent_services::accounting::ScopeTotals {
             exec.cycle_accounting
                 .get()
                 .expect("compaction opens the cycle's accounting")

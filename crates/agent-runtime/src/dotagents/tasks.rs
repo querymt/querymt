@@ -4,11 +4,11 @@ use super::{
     DotagentsDiagnostic, DotagentsDiagnosticCode, DotagentsSource, DotagentsStrictness,
     DotagentsTask, DotagentsTaskKind, normalize_id,
 };
-pub use crate::core_staging::dotagents_tasks::{
+use async_trait::async_trait;
+pub use querymt_agent_core::dotagents_tasks::{
     DotagentsAutomationBinding, DotagentsTaskApproval, DotagentsTaskApprovalDecision,
     DotagentsTaskIdentity, DotagentsTaskOwnership, DotagentsTaskStateRepository,
 };
-use async_trait::async_trait;
 #[cfg(any(test, feature = "test-support"))]
 #[allow(unused_imports)]
 pub use querymt_agent_sqlite::repo_dotagents_tasks::SqliteDotagentsTaskStateRepository;

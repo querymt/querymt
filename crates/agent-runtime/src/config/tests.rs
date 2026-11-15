@@ -69,7 +69,7 @@ async fn plain_file_and_inline_sections_receive_runtime_cache_defaults() {
         .await
         .unwrap();
     let mut config = serde_json::json!({"system": resolved, "api_mode": "responses"});
-    crate::model_heuristics::ModelDefaults::for_model("openai", "gpt-5.6", None)
+    querymt_agent_services::model_heuristics::ModelDefaults::for_model("openai", "gpt-5.6", None)
         .apply_to(&mut config, "session");
     assert_eq!(config["system"][0]["text"], "stable instructions");
     assert_eq!(

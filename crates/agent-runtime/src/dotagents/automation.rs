@@ -15,10 +15,10 @@
 //! Sessions created here are tagged with [`AUTOMATION_SESSION_KIND`] so hosts can
 //! distinguish protocol-owned automation from user sessions.
 
-pub use crate::core_staging::dotagents_automation::{
+use crate::session::error::SessionResult;
+pub use querymt_agent_core::dotagents_automation::{
     AUTOMATION_SESSION_KIND, DotagentsAutomationIdentity, DotagentsAutomationRepository,
 };
-use crate::session::error::SessionResult;
 #[cfg(any(test, feature = "test-support"))]
 pub use querymt_agent_sqlite::repo_dotagents_automation::SqliteDotagentsAutomationRepository;
 

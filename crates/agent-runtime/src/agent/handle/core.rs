@@ -127,7 +127,9 @@ impl LocalAgentHandle {
     }
 
     /// Subscribes to agent events via the fanout (live stream).
-    pub fn subscribe_events(&self) -> broadcast::Receiver<crate::events::EventEnvelope> {
+    pub fn subscribe_events(
+        &self,
+    ) -> broadcast::Receiver<querymt_agent_core::events::EventEnvelope> {
         self.config.event_sink.fanout().subscribe()
     }
 
@@ -589,7 +591,7 @@ impl LocalAgentHandle {
     ///
     /// This is a detached fire-and-forget API.
     /// FIXME: Prefer an awaited emit path for critical flows.
-    pub fn emit_event(&self, session_id: &str, kind: crate::events::AgentEventKind) {
+    pub fn emit_event(&self, session_id: &str, kind: querymt_agent_core::events::AgentEventKind) {
         self.config.emit_event(session_id, kind);
     }
 

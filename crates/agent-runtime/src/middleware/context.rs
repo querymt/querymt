@@ -4,10 +4,10 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 
 use super::{ExecutionState, MiddlewareDriver, Result};
-use crate::events::StopType;
 use crate::middleware::ConversationContext;
 use crate::middleware::factory::MiddlewareFactory;
-use crate::model_info::{ModelInfoSource, get_model_info};
+use querymt_agent_core::events::StopType;
+use querymt_agent_services::model_info::{ModelInfoSource, get_model_info};
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]

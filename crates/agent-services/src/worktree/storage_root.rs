@@ -1,5 +1,5 @@
-use crate::core_staging::config::workspace::WorkspaceSettings;
 use anyhow::{Context, Result, anyhow};
+use querymt_agent_core::config::workspace::WorkspaceSettings;
 use std::path::{Path, PathBuf};
 
 /// The effective, absolute storage root of managed worktrees: the configured

@@ -20,7 +20,6 @@ use super::{
     AttemptRef, AttemptSettlement, AttemptStart, BillingBasis, CycleAccounting, DispatchMode,
     PricingApplicability, ScopeTotals, UsageDisposition,
 };
-use crate::events::AgentEventKind;
 use parking_lot::Mutex;
 use querymt::Usage;
 use querymt::chat::{ChatOutput, ChatOutputProvenance};
@@ -28,6 +27,7 @@ use querymt::error::{LLMError, ProviderErrorKind};
 use querymt::providers::{
     BillingClass, IncompleteReason, ModelPricing, UsageValuation, value_usage,
 };
+use querymt_agent_core::events::AgentEventKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -630,10 +630,10 @@ mod tests {
     use crate::accounting::SessionAccounting;
     use crate::event_fanout::EventFanout;
     use crate::session::backend::StorageBackend;
-    use crate::session::sqlite_storage::SqliteStorage;
     use crate::session_event_stream::SessionEventStream;
     use querymt::error::ProviderFailure;
     use querymt::providers::ModelPricing;
+    use querymt_agent_sqlite::session::sqlite_storage::SqliteStorage;
 
     fn pricing() -> ModelPricing {
         ModelPricing {

@@ -4,10 +4,10 @@
 //! in a standardized JSON format. See: https://github.com/laude-institute/harbor
 
 use crate::accounting::{AccountingSnapshot, AttemptOutcome, AttemptPurpose};
-use crate::events::{AgentEvent, AgentEventKind};
 use crate::export::turns::{self, Turn};
 use crate::session::projection::AuditView;
 use querymt::chat::ReasoningEffort;
+use querymt_agent_core::events::{AgentEvent, AgentEventKind};
 use serde::{Deserialize, Serialize};
 
 /// ATIF Trajectory root object
@@ -622,7 +622,7 @@ impl ATIF {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{AgentEventKind, EventOrigin};
+    use querymt_agent_core::events::{AgentEventKind, EventOrigin};
 
     #[test]
     fn typed_state_fields_serialize_unchanged() {
@@ -732,7 +732,7 @@ mod tests {
                     cost_usd: None,
                     cumulative_cost_usd: None,
                     context_tokens: 100,
-                    metrics: crate::events::ExecutionMetrics { steps: 1, turns: 1 },
+                    metrics: querymt_agent_core::events::ExecutionMetrics { steps: 1, turns: 1 },
                     accounting: None,
                 },
             },
@@ -932,7 +932,7 @@ mod tests {
                     cost_usd: Some(0.01),
                     cumulative_cost_usd: Some(0.01),
                     context_tokens: 150,
-                    metrics: crate::events::ExecutionMetrics { steps: 1, turns: 1 },
+                    metrics: querymt_agent_core::events::ExecutionMetrics { steps: 1, turns: 1 },
                     accounting: None,
                 },
             },
@@ -967,7 +967,9 @@ mod tests {
 
     /// start + settlement for one attempt of `sess-1`.
     fn attempt(seq: i64, id: &str, purpose: AttemptPurpose, complete: bool) -> Vec<AgentEvent> {
-        use crate::accounting::tests::{sample_pricing, sample_settlement, sample_start};
+        use querymt_agent_core::accounting::samples::{
+            sample_pricing, sample_settlement, sample_start,
+        };
         let mut start = sample_start();
         start.attempt.attempt_id = id.into();
         start.attempt.operation_id = format!("op-{id}");
@@ -1004,7 +1006,7 @@ mod tests {
                     cost_usd: complete.then_some(cost),
                     cumulative_cost_usd: None,
                     context_tokens: 110,
-                    metrics: crate::events::ExecutionMetrics { steps: 1, turns: 1 },
+                    metrics: querymt_agent_core::events::ExecutionMetrics { steps: 1, turns: 1 },
                     accounting: Some(crate::accounting::RequestAccounting {
                         operation_id: format!("op-{attempt_id}"),
                         attempt_ids: vec![attempt_id.into()],
@@ -1072,7 +1074,7 @@ mod tests {
 
     #[test]
     fn failed_and_unresolved_attempts_stay_represented() {
-        use crate::accounting::tests::sample_start;
+        use querymt_agent_core::accounting::samples::sample_start;
         let mut events = attempt(1, "a1", AttemptPurpose::MainResponse, true);
         // Started but never settled (interrupted before final accounting).
         let mut start = sample_start();

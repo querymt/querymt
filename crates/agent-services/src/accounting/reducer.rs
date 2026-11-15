@@ -24,9 +24,9 @@
 use super::{
     AccountingReason, AttemptPurpose, AttemptRef, AttemptSettlement, AttemptStart, UsageDisposition,
 };
-use crate::events::AgentEventKind;
-use crate::hash::RapidHash;
 use querymt::providers::{BillingClass, ComponentCharges, IncompleteReason};
+use querymt_agent_core::events::AgentEventKind;
+use querymt_agent_core::hash::RapidHash;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -643,10 +643,12 @@ impl AccountingReducer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounting::tests::{sample_pricing, sample_settlement, sample_start};
     use crate::accounting::{AttemptOutcome, PricingApplicability};
     use querymt::Usage;
     use querymt::providers::{UsageValuation, value_usage};
+    use querymt_agent_core::accounting::samples::{
+        sample_pricing, sample_settlement, sample_start,
+    };
 
     fn approx(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-12, "{a} != {b}");

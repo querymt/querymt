@@ -98,7 +98,9 @@ impl ToolTrait for CreateTaskTool {
             )
             .await
             .map_err(|error| ToolError::SessionError(error.to_string()))?;
-        context.emit_event(crate::events::AgentEventKind::TaskCreated { task: task.clone() });
+        context.emit_event(querymt_agent_core::events::AgentEventKind::TaskCreated {
+            task: task.clone(),
+        });
         Ok(vec![ToolResultPart::text(
             serde_json::to_string_pretty(&task)
                 .map_err(|error| ToolError::SessionError(error.to_string()))?,
@@ -117,9 +119,11 @@ mod tests {
     async fn test_create_task_validation() {
         let temp_dir = TempDir::new().unwrap();
         let storage = Arc::new(
-            crate::session::SqliteStorage::connect(":memory:".into())
-                .await
-                .unwrap(),
+            querymt_agent_sqlite::session::sqlite_storage::SqliteStorage::connect(
+                ":memory:".into(),
+            )
+            .await
+            .unwrap(),
         );
         use crate::session::store::SessionStore;
         storage

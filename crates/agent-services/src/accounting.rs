@@ -128,7 +128,7 @@ pub use snapshot::{
     AccountingCycleSnapshot, AccountingScopeSnapshot, AccountingSnapshot,
 };
 
-pub use crate::core_staging::accounting::{
+pub use querymt_agent_core::accounting::{
     AccountingReason, AttemptOutcome, AttemptPurpose, AttemptRef, AttemptSettlement, AttemptStart,
     BillingBasis, DispatchMode, PricingApplicability, RequestAccounting, UsageDisposition,
     non_secret_route,
@@ -139,9 +139,7 @@ pub(crate) mod tests {
     use super::*;
     use querymt::providers::{BillingClass, value_usage};
 
-    pub(crate) use crate::core_staging::accounting::samples::{
-        sample_pricing, sample_ref, sample_settlement, sample_start,
-    };
+    use querymt_agent_core::accounting::samples::{sample_settlement, sample_start};
 
     #[test]
     fn start_round_trips() {
@@ -239,7 +237,7 @@ pub(crate) mod tests {
 
     #[test]
     fn events_are_durable_and_round_trip_through_the_journal_shape() {
-        use crate::events::{
+        use querymt_agent_core::events::{
             AgentEventKind, Durability, DurableEvent, EventOrigin, classify_durability,
         };
 
@@ -271,7 +269,7 @@ pub(crate) mod tests {
 
     #[test]
     fn event_wire_tags_are_snake_case() {
-        use crate::events::AgentEventKind;
+        use querymt_agent_core::events::AgentEventKind;
         let started = serde_json::to_value(AgentEventKind::LlmAttemptStarted {
             start: sample_start(),
         })
@@ -288,7 +286,7 @@ pub(crate) mod tests {
 
     #[test]
     fn documented_start_example() {
-        use crate::events::AgentEventKind;
+        use querymt_agent_core::events::AgentEventKind;
         let documented = serde_json::json!({
             "type": "llm_attempt_started",
             "data": { "start": {
@@ -312,7 +310,7 @@ pub(crate) mod tests {
 
     #[test]
     fn documented_request_end_example() {
-        use crate::events::{AgentEventKind, ExecutionMetrics};
+        use querymt_agent_core::events::{AgentEventKind, ExecutionMetrics};
         // Mirrors the JSON in docs/docs/agent/api_reference.md.
         let documented = serde_json::json!({
             "type": "llm_request_end",
@@ -356,7 +354,7 @@ pub(crate) mod tests {
 
     #[test]
     fn request_end_without_accounting_still_parses_and_omits_the_field() {
-        use crate::events::AgentEventKind;
+        use querymt_agent_core::events::AgentEventKind;
         let legacy = serde_json::json!({
             "type": "llm_request_end",
             "data": {

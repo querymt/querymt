@@ -9,20 +9,20 @@ use crate::agent::execution_context::ExecutionContext;
 use crate::agent::snapshots::{SnapshotState, snapshot_metadata};
 use crate::agent::utils::genai;
 use crate::config::{ApprovalNeed, ToolRef};
-use crate::events::AgentEventKind;
 use crate::hooks::{
     PermissionRequestDecision, PostToolUseRequest, PreDelegationRequest, PreToolUseRequest,
     UpdatedDelegation,
 };
 use crate::middleware::ToolCall as MiddlewareToolCall;
 use crate::middleware::{ExecutionState, ToolResult, WaitCondition};
-use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::TaskStatus;
 use crate::tools::Tool;
 use crate::tools::args::{Repair, normalize_arguments};
 use log::debug;
 use querymt::chat::ChatRole;
 use querymt::mcp::adapter::McpToolAdapter;
+use querymt_agent_core::events::AgentEventKind;
+use querymt_agent_core::model::{AgentMessage, MessagePart};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -575,7 +575,7 @@ async fn execute_prepared_inner(
                 tool_call_id = %call.id,
             )
             .in_scope(|| {
-                let post_tree = crate::index::merkle::MerkleTree::scan_with_previous(
+                let post_tree = querymt_agent_index::merkle::MerkleTree::scan_with_previous(
                     root.as_path(),
                     Some(&pre_tree),
                 );
@@ -1047,7 +1047,7 @@ fn begin_snapshot(
                             .as_ref()
                             .filter(|(cached_root, _)| *cached_root == root)
                             .map(|(_, tree)| Arc::clone(tree));
-                        let pre_tree = crate::index::merkle::MerkleTree::scan_with_previous(
+                        let pre_tree = querymt_agent_index::merkle::MerkleTree::scan_with_previous(
                             root.as_path(),
                             previous.as_deref(),
                         );
@@ -1212,7 +1212,7 @@ fn selection_labels(response: &crate::elicitation::ElicitationResponse) -> Optio
 /// tool and journals how the question ended.
 #[derive(Clone)]
 struct ElicitationRelay {
-    event_sink: Arc<crate::event_sink::EventSink>,
+    event_sink: Arc<querymt_agent_services::event_sink::EventSink>,
     session_id: String,
     run_id: String,
     tool_call_id: String,
@@ -1223,7 +1223,7 @@ struct ElicitationRelay {
 impl ElicitationRelay {
     async fn relay_request(self, request: crate::tools::ElicitationRequest) {
         use crate::elicitation::{ElicitationAction, ElicitationResponse};
-        use crate::events::{AgentEventKind, ElicitationOutcome};
+        use querymt_agent_core::events::{AgentEventKind, ElicitationOutcome};
 
         let crate::tools::ElicitationRequest {
             elicitation_id,
@@ -2104,7 +2104,7 @@ pub(super) async fn store_all_tool_results(
     );
 
     // Aggregate changed file paths from tool results for dedup check
-    let mut combined = crate::index::DiffPaths::default();
+    let mut combined = querymt_agent_index::DiffPaths::default();
     for result in ordered_results.iter() {
         if let Some(ref snapshot) = result.snapshot_part
             && let Some(paths) = snapshot.changed_paths()
@@ -2206,11 +2206,13 @@ mod genai_trace_tests {
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::hooks::{Hooks, HooksConfig};
     use crate::session::backend::StorageBackend;
-    use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
     use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent, mock_tool_call};
     use opentelemetry::{
         Value,
         trace::{SpanKind, Status},
+    };
+    use querymt_agent_services::tools::trace_support::genai_trace::{
+        assert_private, attr, capture,
     };
 
     fn hooks(event: &str, output: serde_json::Value) -> Hooks {
@@ -2231,8 +2233,8 @@ mod genai_trace_tests {
             registry::SkillRegistry,
             types::SkillSource,
         };
-        use crate::test_utils::helpers::genai_trace::capture_info;
         use crate::tools::{Tool, ToolContext, ToolError, ToolRegistry};
+        use querymt_agent_services::tools::trace_support::genai_trace::capture_info;
 
         struct UnrelatedSkill;
         #[async_trait::async_trait]
@@ -2390,10 +2392,10 @@ mod genai_trace_tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn genai_shell_refines_only_spawned_builtin_on_existing_span() {
-        use crate::test_utils::helpers::genai_trace::capture_info;
         use crate::tools::{
             Tool, ToolContext, ToolError, ToolRegistry, builtins::shell::ShellTool,
         };
+        use querymt_agent_services::tools::trace_support::genai_trace::capture_info;
         use std::os::unix::fs::PermissionsExt;
 
         struct CustomShell;
@@ -4124,8 +4126,8 @@ mod prepared_call_tests {
     // ---- repair telemetry (task 4.5) ----
 
     use crate::test_utils::helpers::genai_metrics;
-    use crate::test_utils::helpers::genai_trace::{attr, capture};
     use opentelemetry::Value as OtelValue;
+    use querymt_agent_services::tools::trace_support::genai_trace::{attr, capture};
 
     fn repaired(rule: &'static str) -> u64 {
         genai_metrics::sum(
@@ -4521,9 +4523,9 @@ mod prepared_call_tests {
 mod mcp_tool_tests {
     use super::*;
     use crate::acp::protocol::{SessionUpdate, ToolCallStatus};
-    use crate::events::EventEnvelope;
     use crate::test_utils::mcp_harness::{HarnessOptions, McpHarness};
     use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent, mock_tool_call};
+    use querymt_agent_core::events::EventEnvelope;
     use serde_json::json;
     use std::time::Duration;
     use tokio::sync::broadcast;
@@ -4786,7 +4788,7 @@ mod mcp_tool_tests {
     ) -> Vec<(
         &'static str,
         String,
-        Option<crate::events::ElicitationOutcome>,
+        Option<querymt_agent_core::events::ElicitationOutcome>,
         Option<Vec<String>>,
     )> {
         for _ in 0..100 {
@@ -4832,7 +4834,7 @@ mod mcp_tool_tests {
     /// Covers session-interactions / Skill approval answer is recorded.
     #[tokio::test]
     async fn skill_approval_answer_is_recorded() {
-        use crate::events::ElicitationOutcome;
+        use querymt_agent_core::events::ElicitationOutcome;
 
         let f = skill_fixture().await;
         let exec = f
@@ -4864,7 +4866,7 @@ mod mcp_tool_tests {
     #[tokio::test]
     async fn declined_question_is_recorded() {
         use crate::elicitation::{ElicitationAction, ElicitationResponse};
-        use crate::events::ElicitationOutcome;
+        use querymt_agent_core::events::ElicitationOutcome;
 
         let f = skill_fixture().await;
         let exec = f.agent.execution_context().await;
@@ -4907,7 +4909,7 @@ mod mcp_tool_tests {
     /// question as cancelled.
     #[tokio::test]
     async fn cancelled_run_records_the_pending_question_as_cancelled() {
-        use crate::events::ElicitationOutcome;
+        use querymt_agent_core::events::ElicitationOutcome;
 
         let f = skill_fixture().await;
         let exec = f

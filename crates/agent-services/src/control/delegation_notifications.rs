@@ -1,8 +1,8 @@
-pub use crate::core_staging::delegation_update::{
+use crate::session::domain::ForkOrigin;
+pub use querymt_agent_core::delegation_update::{
     DelegationActivity, DelegationStage, DelegationUpdateNotification, DelegationUpdateState,
 };
-use crate::events::{AgentEvent, AgentEventKind, EventEnvelope};
-use crate::session::domain::ForkOrigin;
+use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventEnvelope};
 use std::collections::HashMap;
 
 const TERMINAL_SUMMARY_MAX_CHARS: usize = 512;
@@ -554,8 +554,8 @@ fn bounded_summary(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{AgentEvent, EventOrigin};
     use crate::session::domain::{Delegation, DelegationStatus, ForkPointType};
+    use querymt_agent_core::events::{AgentEvent, EventOrigin};
     use time::OffsetDateTime;
 
     fn delegation() -> Delegation {
@@ -567,7 +567,7 @@ mod tests {
             task_id: None,
             target_agent_id: "coder".into(),
             objective: "Implement it".into(),
-            objective_hash: crate::hash::RapidHash::default(),
+            objective_hash: querymt_agent_core::hash::RapidHash::default(),
             context: None,
             constraints: None,
             expected_output: None,
@@ -667,7 +667,7 @@ mod tests {
             },
         ));
         let stage = |seq, value| {
-            EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            EventEnvelope::Ephemeral(querymt_agent_core::events::EphemeralEvent {
                 session_id: "parent-1".into(),
                 session_seq: seq,
                 timestamp: 2,

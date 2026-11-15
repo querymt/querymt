@@ -12,13 +12,13 @@ mod event_relay_mesh_tests {
     use crate::agent::remote::event_relay::{EventRelayActor, RelayedEvent};
     use crate::agent::remote::test_helpers::fixtures::{AgentConfigFixture, get_test_mesh};
     use crate::agent::session_actor::SessionActor;
-    use crate::event_fanout::EventFanout;
-    use crate::event_sink::EventSink;
-    use crate::events::{AgentEvent, AgentEventKind, EventEnvelope, EventOrigin};
-    use crate::index::{FileIndexConfig, FunctionIndexConfig, WorkspaceIndexActor};
     use crate::session::backend::StorageBackend;
     use crate::session::sqlite_storage::SqliteStorage;
     use kameo::actor::Spawn;
+    use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventEnvelope, EventOrigin};
+    use querymt_agent_index::{FileIndexConfig, FunctionIndexConfig, WorkspaceIndexActor};
+    use querymt_agent_services::event_fanout::EventFanout;
+    use querymt_agent_services::event_sink::EventSink;
     use std::collections::HashMap;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -96,16 +96,18 @@ mod event_relay_mesh_tests {
         );
 
         // Publish a durable event to the source fanout
-        source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
-            session_seq: 0,
-            event_id: "e-f1".into(),
-            stream_seq: 1,
-            session_id: "s-f1".into(),
-            timestamp: 1000,
-            origin: EventOrigin::Local,
-            source_node: None,
-            kind: AgentEventKind::SessionCreated,
-        }));
+        source_fanout.publish(EventEnvelope::Durable(
+            querymt_agent_core::events::DurableEvent {
+                session_seq: 0,
+                event_id: "e-f1".into(),
+                stream_seq: 1,
+                session_id: "s-f1".into(),
+                timestamp: 1000,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::SessionCreated,
+            },
+        ));
 
         let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
             .await
@@ -143,16 +145,18 @@ mod event_relay_mesh_tests {
 
         relay_ref.kill();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
-            session_seq: 0,
-            event_id: "e-f1-dead".into(),
-            stream_seq: 1,
-            session_id: "s-f1-dead".into(),
-            timestamp: 1000,
-            origin: EventOrigin::Local,
-            source_node: None,
-            kind: AgentEventKind::SessionCreated,
-        }));
+        source_fanout.publish(EventEnvelope::Durable(
+            querymt_agent_core::events::DurableEvent {
+                session_seq: 0,
+                event_id: "e-f1-dead".into(),
+                stream_seq: 1,
+                session_id: "s-f1-dead".into(),
+                timestamp: 1000,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::SessionCreated,
+            },
+        ));
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while !handle.is_finished() {
@@ -191,16 +195,18 @@ mod event_relay_mesh_tests {
         );
 
         for i in 1i64..=5 {
-            source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
-                session_seq: 0,
-                event_id: format!("e-f2-{}", i),
-                stream_seq: i,
-                session_id: "s-f2".into(),
-                timestamp: i * 100,
-                origin: EventOrigin::Local,
-                source_node: None,
-                kind: AgentEventKind::SessionCreated,
-            }));
+            source_fanout.publish(EventEnvelope::Durable(
+                querymt_agent_core::events::DurableEvent {
+                    session_seq: 0,
+                    event_id: format!("e-f2-{}", i),
+                    stream_seq: i,
+                    session_id: "s-f2".into(),
+                    timestamp: i * 100,
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::SessionCreated,
+                },
+            ));
         }
 
         // All 5 durable events (SessionCreated) should arrive on fanout.
@@ -280,7 +286,7 @@ mod event_relay_mesh_tests {
 
         for i in 0..COUNT {
             let envelope = if i % 5 == 4 {
-                EventEnvelope::Durable(crate::events::DurableEvent {
+                EventEnvelope::Durable(querymt_agent_core::events::DurableEvent {
                     session_seq: 0,
                     event_id: format!("e-{i}"),
                     stream_seq: i as i64 + 1,
@@ -296,7 +302,7 @@ mod event_relay_mesh_tests {
                     },
                 })
             } else {
-                EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+                EventEnvelope::Ephemeral(querymt_agent_core::events::EphemeralEvent {
                     session_seq: 0,
                     session_id: "s-f2-1000".into(),
                     timestamp: 0,
@@ -419,7 +425,7 @@ mod event_relay_mesh_tests {
             attempt += 1;
 
             f.config.event_sink.fanout().publish(EventEnvelope::Durable(
-                crate::events::DurableEvent {
+                querymt_agent_core::events::DurableEvent {
                     session_seq: 0,
                     event_id: format!("e-f4-{attempt}"),
                     stream_seq: attempt as i64,
@@ -604,28 +610,32 @@ mod event_relay_mesh_tests {
         );
 
         // Publish event for a DIFFERENT session — must be dropped by forwarder
-        source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
-            session_seq: 0,
-            event_id: "e-other".into(),
-            stream_seq: 1,
-            session_id: "other-session".into(),
-            timestamp: 100,
-            origin: EventOrigin::Local,
-            source_node: None,
-            kind: AgentEventKind::SessionCreated,
-        }));
+        source_fanout.publish(EventEnvelope::Durable(
+            querymt_agent_core::events::DurableEvent {
+                session_seq: 0,
+                event_id: "e-other".into(),
+                stream_seq: 1,
+                session_id: "other-session".into(),
+                timestamp: 100,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::SessionCreated,
+            },
+        ));
 
         // Publish event for the TARGET session — must be forwarded
-        source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
-            session_seq: 0,
-            event_id: "e-target".into(),
-            stream_seq: 2,
-            session_id: "target-session".into(),
-            timestamp: 200,
-            origin: EventOrigin::Local,
-            source_node: None,
-            kind: AgentEventKind::SessionCreated,
-        }));
+        source_fanout.publish(EventEnvelope::Durable(
+            querymt_agent_core::events::DurableEvent {
+                session_seq: 0,
+                event_id: "e-target".into(),
+                stream_seq: 2,
+                session_id: "target-session".into(),
+                timestamp: 200,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::SessionCreated,
+            },
+        ));
 
         // We should receive exactly the target-session event
         let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
@@ -708,16 +718,18 @@ mod event_relay_mesh_tests {
         );
 
         // Publish event for session-a only
-        source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
-            session_seq: 0,
-            event_id: "e-a".into(),
-            stream_seq: 1,
-            session_id: "session-a".into(),
-            timestamp: 100,
-            origin: EventOrigin::Local,
-            source_node: None,
-            kind: AgentEventKind::SessionCreated,
-        }));
+        source_fanout.publish(EventEnvelope::Durable(
+            querymt_agent_core::events::DurableEvent {
+                session_seq: 0,
+                event_id: "e-a".into(),
+                stream_seq: 1,
+                session_id: "session-a".into(),
+                timestamp: 100,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::SessionCreated,
+            },
+        ));
 
         // Relay A should receive it
         let got_a = tokio::time::timeout(std::time::Duration::from_millis(500), rx_a.recv())
@@ -958,7 +970,7 @@ mod event_relay_mesh_tests {
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             f.config.event_sink.fanout().publish(EventEnvelope::Durable(
-                crate::events::DurableEvent {
+                querymt_agent_core::events::DurableEvent {
                     session_seq: 0,
                     event_id: "e-f7-pre".into(),
                     stream_seq: 1,
@@ -1022,10 +1034,8 @@ mod event_relay_mesh_tests {
         // as a failure so delayed delivery of an earlier probe event does not
         // make the test flaky under suite load.
         let post_detach_event_id = "e-f7-post";
-        f.config
-            .event_sink
-            .fanout()
-            .publish(EventEnvelope::Durable(crate::events::DurableEvent {
+        f.config.event_sink.fanout().publish(EventEnvelope::Durable(
+            querymt_agent_core::events::DurableEvent {
                 session_seq: 0,
                 event_id: post_detach_event_id.into(),
                 stream_seq: 99,
@@ -1034,7 +1044,8 @@ mod event_relay_mesh_tests {
                 origin: EventOrigin::Local,
                 source_node: None,
                 kind: AgentEventKind::SessionCreated,
-            }));
+            },
+        ));
 
         // We should see the local publish but NO Remote-origin relay copy of
         // the post-detach event.

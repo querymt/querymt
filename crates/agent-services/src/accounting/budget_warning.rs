@@ -95,17 +95,17 @@ mod tests {
     fn totals_with(reason: IncompleteReason) -> ScopeTotals {
         // Build real totals through the reducer: a settled metered attempt
         // whose reported valuation is incomplete for `reason`.
-        let mut start = crate::accounting::tests::sample_start();
+        let mut start = querymt_agent_core::accounting::samples::sample_start();
         start.attempt.purpose = AttemptPurpose::MainResponse;
-        let mut settlement = crate::accounting::tests::sample_settlement();
+        let mut settlement = querymt_agent_core::accounting::samples::sample_settlement();
         settlement.valuation.complete_total_usd = None;
         settlement.valuation.incomplete = vec![reason];
         let mut reducer = AccountingReducer::new(start.attempt.session_id.clone());
         reducer
-            .apply(&crate::events::AgentEventKind::LlmAttemptStarted { start })
+            .apply(&querymt_agent_core::events::AgentEventKind::LlmAttemptStarted { start })
             .unwrap();
         reducer
-            .apply(&crate::events::AgentEventKind::LlmAttemptSettled { settlement })
+            .apply(&querymt_agent_core::events::AgentEventKind::LlmAttemptSettled { settlement })
             .unwrap();
         reducer.session().clone()
     }

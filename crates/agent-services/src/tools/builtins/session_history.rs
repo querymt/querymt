@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
-use crate::core_staging::prompt_text::{render_prompt_for_display, truncate_to_bytes};
-use crate::model::{AgentMessage, MessagePart};
 use crate::tools::{Tool as ToolTrait, ToolContext, ToolError};
+use querymt_agent_core::model::{AgentMessage, MessagePart};
+use querymt_agent_core::prompt_text::{render_prompt_for_display, truncate_to_bytes};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 100;
@@ -349,10 +349,10 @@ fn read_tool_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::sqlite_storage::SqliteStorage;
     use crate::session::store::SessionStore;
     use crate::tools::AgentToolContext;
     use querymt::chat::ChatRole;
+    use querymt_agent_sqlite::session::sqlite_storage::SqliteStorage;
     use std::sync::Arc;
 
     fn tool_result_message(

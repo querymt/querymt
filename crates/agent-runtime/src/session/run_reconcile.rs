@@ -6,8 +6,8 @@
 //! which serializes concurrent reconcilers and a racing run start.
 
 use crate::agent::agent_config::AgentConfig;
-use crate::events::{AgentEventKind, RunOutcome};
 use crate::session::run_lease::RunLeaseRoot;
+use querymt_agent_core::events::{AgentEventKind, RunOutcome};
 
 /// Upper bound on orphaned runs closed in one call (a journal can hold several
 /// unmatched `run_started` events, e.g. after repeated crashes).
@@ -193,7 +193,7 @@ pub mod tests {
             .append_durable(&NewDurableEvent {
                 session_seq: None,
                 session_id: session.to_string(),
-                origin: crate::events::EventOrigin::Local,
+                origin: querymt_agent_core::events::EventOrigin::Local,
                 source_node: None,
                 source_node_id: None,
                 source_seq: None,
@@ -309,7 +309,7 @@ pub mod tests {
             .append_durable_from_source(&NewDurableEvent {
                 session_seq: None,
                 session_id: SID.to_string(),
-                origin: crate::events::EventOrigin::Remote,
+                origin: querymt_agent_core::events::EventOrigin::Remote,
                 source_node: Some("peer".to_string()),
                 source_node_id: Some("node-a".to_string()),
                 source_seq: Some(1),
@@ -468,8 +468,9 @@ pub mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
 
-        let last_kind =
-            |events: &[crate::events::AgentEvent]| events.last().map(|e| e.kind.clone());
+        let last_kind = |events: &[querymt_agent_core::events::AgentEvent]| {
+            events.last().map(|e| e.kind.clone())
+        };
 
         // While the owner is alive its run stays open.
         let live = load_session_snapshot(&agent, f.storage.view_store().unwrap(), &session)

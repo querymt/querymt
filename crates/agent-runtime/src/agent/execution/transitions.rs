@@ -12,16 +12,11 @@ use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::session_actor::ensure_pre_turn_snapshot_ready;
 use crate::agent::utils::{genai, u32_from_usize};
-use crate::events::{
-    AgentEventKind, ExecutionMetrics, ReasoningPartStored, StopType, reasoning_content_part_id,
-    reasoning_summary_part_id,
-};
 use crate::middleware::{
     CompositeDriver, ExecutionState, LlmResponse, PreparedBatch, PreparedCallVerdict,
     PreparedModelRequest, PreparedToolCall, ToolCall as MiddlewareToolCall, ToolFunction,
     ToolResult, apply_usage_to_stats, calculate_context_tokens,
 };
-use crate::model::{AgentMessage, MessagePart};
 use anyhow::Context as _;
 use futures_util::Stream;
 use futures_util::StreamExt;
@@ -35,6 +30,11 @@ use querymt::chat::{
 };
 use querymt::error::LLMError;
 use querymt::error::{ProviderErrorKind, ProviderFailure};
+use querymt_agent_core::events::{
+    AgentEventKind, ExecutionMetrics, ReasoningPartStored, StopType, reasoning_content_part_id,
+    reasoning_summary_part_id,
+};
+use querymt_agent_core::model::{AgentMessage, MessagePart};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -128,7 +128,7 @@ pub(super) async fn transition_before_llm_call(
         );
         let tools_json =
             serde_json::to_vec(&tools).context("Failed to serialize tools for hash computation")?;
-        let new_hash = crate::hash::RapidHash::new(&tools_json);
+        let new_hash = querymt_agent_core::hash::RapidHash::new(&tools_json);
         collect_span.record("tool_count", tools.len() as u64);
         collect_span.record("tools_bytes", tools_json.len() as u64);
         (tools, tools_json, new_hash)
@@ -147,7 +147,7 @@ pub(super) async fn transition_before_llm_call(
     if changed {
         config.emit_event(
             &exec_ctx.session_id,
-            crate::events::AgentEventKind::ToolsAvailable {
+            querymt_agent_core::events::AgentEventKind::ToolsAvailable {
                 tools: tools.clone(),
                 tools_hash: new_hash,
             },
@@ -163,10 +163,11 @@ pub(super) async fn transition_before_llm_call(
     } else {
         "user_prompt"
     };
-    let context_window = crate::model_info::get_model_info(&context.provider, &context.model)
-        .and_then(|info| info.limits.context)
-        .unwrap_or(u32::MAX as u64)
-        .min(u32::MAX as u64) as u32;
+    let context_window =
+        querymt_agent_services::model_info::get_model_info(&context.provider, &context.model)
+            .and_then(|info| info.limits.context)
+            .unwrap_or(u32::MAX as u64)
+            .min(u32::MAX as u64) as u32;
     let hook_span = info_span!(
         "agent.hooks.context",
         trigger,
@@ -200,7 +201,7 @@ pub(super) async fn transition_before_llm_call(
     messages = hook_result.messages.unwrap_or_default();
     // Providers reject a tool call without its result. Reaching this point
     // with one is a bug upstream; answer it so the run survives, and make it loud.
-    let unanswered = crate::model::answer_unanswered_tool_calls(&mut messages);
+    let unanswered = querymt_agent_core::model::answer_unanswered_tool_calls(&mut messages);
     if !unanswered.is_empty() {
         log::error!(
             "Session {}: request had unanswered tool call(s) {:?}; answered them as cancelled",
@@ -298,7 +299,7 @@ fn contextualize_llm_error(
 /// Map a failed LLM setup/call into either `Cancelled` or a contextualized error.
 ///
 /// Cancel must never bubble as `Err`; it is an execution state, not a provider failure.
-fn accounting_failure(error: crate::accounting::AccountingError) -> anyhow::Error {
+fn accounting_failure(error: querymt_agent_services::accounting::AccountingError) -> anyhow::Error {
     anyhow::anyhow!("accounting failure: {error}")
 }
 
@@ -308,23 +309,25 @@ fn accounting_failure(error: crate::accounting::AccountingError) -> anyhow::Erro
 async fn main_attempt_operation(
     config: &AgentConfig,
     exec_ctx: &ExecutionContext,
-) -> Result<crate::accounting::AttemptOperation, anyhow::Error> {
+) -> Result<querymt_agent_services::accounting::AttemptOperation, anyhow::Error> {
     let cycle = exec_ctx
         .cycle_accounting(&config.event_sink)
         .await
         .map_err(|error| anyhow::anyhow!("accounting unavailable: {error}"))?;
-    let recorder = Arc::new(crate::accounting::AttemptRecorder::with_projection(
-        config.event_sink.session_stream(&exec_ctx.session_id),
-        cycle.session_accounting().clone(),
-    ));
+    let recorder = Arc::new(
+        querymt_agent_services::accounting::AttemptRecorder::with_projection(
+            config.event_sink.session_stream(&exec_ctx.session_id),
+            cycle.session_accounting().clone(),
+        ),
+    );
     let (provider, model) = exec_ctx
         .llm_config()
         .map(|c| (c.provider.clone(), c.model.clone()))
         .unwrap_or_default();
-    Ok(crate::accounting::AttemptOperation::new(
+    Ok(querymt_agent_services::accounting::AttemptOperation::new(
         recorder,
         cycle,
-        crate::accounting::AttemptPurpose::MainResponse,
+        querymt_agent_services::accounting::AttemptPurpose::MainResponse,
         provider,
         model,
     )
@@ -335,7 +338,7 @@ async fn main_attempt_operation(
 /// A paid dispatch the cycle budget gate refused ends the cycle as a
 /// price-limit stop, not an execution failure. Nothing was sent.
 fn budget_stop(
-    operation: &crate::accounting::AttemptOperation,
+    operation: &querymt_agent_services::accounting::AttemptOperation,
     context: &Arc<crate::middleware::ConversationContext>,
 ) -> Option<ExecutionState> {
     operation
@@ -828,7 +831,7 @@ pub(super) async fn transition_call_llm(
                     let options =
                         crate::session::provider::supported_overrides(provider.as_ref(), options);
                     let call = ChatCall::new(messages_with_cache).options(options);
-                    crate::accounting::run_attempt(
+                    querymt_agent_services::accounting::run_attempt(
                         operation,
                         session_handle.billing_basis(),
                         &cancel,
@@ -1010,7 +1013,7 @@ pub(super) async fn transition_call_llm(
                 // means nothing was dispatched.
                 let mut attempt = match operation
                     .begin(
-                        crate::accounting::DispatchMode::Streaming,
+                        querymt_agent_services::accounting::DispatchMode::Streaming,
                         session_handle.billing_basis(),
                     )
                     .await
@@ -1211,7 +1214,7 @@ pub(super) async fn transition_call_llm(
                                     drain_trailing_usage(&mut stream, &exec_ctx.cancellation_token)
                                         .await;
                                 if exec_ctx.cancellation_token.is_cancelled() {
-                                    let partial = crate::accounting::merge_usage(
+                                    let partial = querymt_agent_services::accounting::merge_usage(
                                         accumulator.output().usage,
                                         drained_usage.take(),
                                     );
@@ -1308,7 +1311,7 @@ pub(super) async fn transition_call_llm(
                                     drain_trailing_usage(&mut stream, &exec_ctx.cancellation_token)
                                         .await;
                                 if exec_ctx.cancellation_token.is_cancelled() {
-                                    let partial = crate::accounting::merge_usage(
+                                    let partial = querymt_agent_services::accounting::merge_usage(
                                         accumulator.output().usage,
                                         drained_usage.take(),
                                     );
@@ -1494,7 +1497,7 @@ pub(super) async fn transition_call_llm(
                         let call = ChatCall::new(messages_with_cache)
                             .tools(tools)
                             .options(options);
-                        crate::accounting::run_attempt(
+                        querymt_agent_services::accounting::run_attempt(
                             operation,
                             session_handle.billing_basis(),
                             &cancel,
@@ -2487,8 +2490,8 @@ mod tests {
         use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent, mock_tool_call};
         use std::time::Duration;
 
-        fn turn() -> crate::model::TurnId {
-            crate::model::TurnId::from(uuid::Uuid::from_u128(0x1111))
+        fn turn() -> querymt_agent_core::model::TurnId {
+            querymt_agent_core::model::TurnId::from(uuid::Uuid::from_u128(0x1111))
         }
 
         async fn pending_snapshot_exec(agent: &TestAgent) -> ExecutionContext {
@@ -2619,9 +2622,9 @@ mod tests {
 
     mod mcp_cancel_tests {
         use super::*;
-        use crate::events::{AgentEventKind, EventEnvelope};
         use crate::test_utils::mcp_harness::{HarnessOptions, McpHarness, TaskScript};
         use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent, mock_tool_call};
+        use querymt_agent_core::events::{AgentEventKind, EventEnvelope};
         use serde_json::json;
         use std::time::Duration;
         use tokio_util::sync::CancellationToken;
@@ -2746,13 +2749,15 @@ mod tests {
 
     mod genai_trace_tests {
         use super::*;
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
         use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
         use opentelemetry::{
             Array, Value,
             trace::{SpanKind, Status},
         };
         use querymt::chat::ChatOutputProvenance;
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
+        };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         fn request() -> Arc<PreparedModelRequest> {
@@ -2770,7 +2775,7 @@ mod tests {
             use crate::hooks::{Hooks, HooksConfig};
             use crate::session::backend::StorageBackend;
             use crate::session::compaction::SessionCompaction;
-            use crate::test_utils::helpers::genai_trace::capture_info;
+            use querymt_agent_services::tools::trace_support::genai_trace::capture_info;
 
             for mode in [
                 "retained",
@@ -3138,7 +3143,7 @@ mod tests {
             chunks: Vec<StreamChunk>,
         ) -> (
             ExecutionState,
-            Vec<crate::events::AgentEventKind>,
+            Vec<querymt_agent_core::events::AgentEventKind>,
             Arc<TimedFactory>,
         ) {
             let attempts = vec![Ok(chunks.into_iter().map(|chunk| (0, Ok(chunk))).collect())];
@@ -3212,9 +3217,10 @@ mod tests {
             .await;
 
             assert!(
-                !events
-                    .iter()
-                    .any(|kind| matches!(kind, crate::events::AgentEventKind::LlmRetryWait { .. })),
+                !events.iter().any(|kind| matches!(
+                    kind,
+                    querymt_agent_core::events::AgentEventKind::LlmRetryWait { .. }
+                )),
                 "a length cut-off must not be retried as a transient stream failure"
             );
             assert!(
@@ -3373,10 +3379,13 @@ mod tests {
                 .expect("fixture chunks")
         }
 
-        fn has_retry_wait(events: &[crate::events::AgentEventKind]) -> bool {
-            events
-                .iter()
-                .any(|kind| matches!(kind, crate::events::AgentEventKind::LlmRetryWait { .. }))
+        fn has_retry_wait(events: &[querymt_agent_core::events::AgentEventKind]) -> bool {
+            events.iter().any(|kind| {
+                matches!(
+                    kind,
+                    querymt_agent_core::events::AgentEventKind::LlmRetryWait { .. }
+                )
+            })
         }
 
         /// Session 01a18903: an opaque server-tool block alongside local calls
@@ -3451,9 +3460,10 @@ mod tests {
             let text: String = events
                 .iter()
                 .filter_map(|kind| match kind {
-                    crate::events::AgentEventKind::AssistantContentDelta { content, .. } => {
-                        Some(content.as_str())
-                    }
+                    querymt_agent_core::events::AgentEventKind::AssistantContentDelta {
+                        content,
+                        ..
+                    } => Some(content.as_str()),
                     _ => None,
                 })
                 .collect();
@@ -3462,7 +3472,7 @@ mod tests {
             let thinking: Vec<(&str, Option<&str>)> = events
                 .iter()
                 .filter_map(|kind| match kind {
-                    crate::events::AgentEventKind::AssistantThinkingDelta {
+                    querymt_agent_core::events::AgentEventKind::AssistantThinkingDelta {
                         content,
                         part_id,
                         ..
@@ -3512,7 +3522,7 @@ mod tests {
         /// A model profile for a streaming provider honouring `support`.
         fn profile_with(
             support: querymt::chat::GenerationOptionSupport,
-            caps: Option<crate::model_heuristics::OutputCaps>,
+            caps: Option<querymt_agent_services::model_heuristics::OutputCaps>,
         ) -> Arc<crate::middleware::ModelProfile> {
             Arc::new(crate::middleware::ModelProfile {
                 caps,
@@ -3588,8 +3598,10 @@ mod tests {
                     .expect("before llm call");
                 let deadline = std::time::Duration::from_secs(2);
                 while let Ok(Ok(event)) = tokio::time::timeout(deadline, events.recv()).await {
-                    if let crate::events::AgentEventKind::ToolsAvailable { tools, .. } =
-                        event.kind()
+                    if let querymt_agent_core::events::AgentEventKind::ToolsAvailable {
+                        tools,
+                        ..
+                    } = event.kind()
                     {
                         return tools.clone();
                     }
@@ -3625,10 +3637,13 @@ mod tests {
             context.request_overrides = querymt::chat::GenerationOptions::NONE
                 .with_max_tokens(u32::MAX)
                 .with_reasoning_effort(querymt::chat::ReasoningEffort::Low);
-            let window = crate::model_info::get_model_info(&context.provider, &context.model)
-                .and_then(|info| info.limits.context)
-                .unwrap_or(u64::from(u32::MAX))
-                .min(u64::from(u32::MAX)) as u32;
+            let window = querymt_agent_services::model_info::get_model_info(
+                &context.provider,
+                &context.model,
+            )
+            .and_then(|info| info.limits.context)
+            .unwrap_or(u64::from(u32::MAX))
+            .min(u64::from(u32::MAX)) as u32;
             let state = transition_before_llm_call(&fixture.config, &Arc::new(context), &exec)
                 .await
                 .unwrap();
@@ -3751,7 +3766,7 @@ mod tests {
             // The binding's explicit max_tokens is its own ceiling.
             assert_eq!(
                 profile.caps,
-                Some(crate::model_heuristics::OutputCaps {
+                Some(querymt_agent_services::model_heuristics::OutputCaps {
                     initial: 123,
                     ceiling: 123,
                 })
@@ -3873,7 +3888,7 @@ mod tests {
                 &exec.session_id,
                 profile_with(
                     querymt::chat::GenerationOptionSupport::ALL,
-                    Some(crate::model_heuristics::OutputCaps {
+                    Some(querymt_agent_services::model_heuristics::OutputCaps {
                         initial: 32_000,
                         ceiling: 128_000,
                     }),
@@ -3982,7 +3997,7 @@ mod tests {
                 &exec.session_id,
                 profile_with(
                     querymt::chat::GenerationOptionSupport::ALL,
-                    Some(crate::model_heuristics::OutputCaps {
+                    Some(querymt_agent_services::model_heuristics::OutputCaps {
                         initial: 32_000,
                         ceiling: 128_000,
                     }),
@@ -4139,7 +4154,7 @@ mod tests {
             };
             let mut probe = request.messages.to_vec();
             assert!(
-                crate::model::answer_unanswered_tool_calls(&mut probe).is_empty(),
+                querymt_agent_core::model::answer_unanswered_tool_calls(&mut probe).is_empty(),
                 "request must answer every call"
             );
             let mut request = (*request).clone();
@@ -4203,7 +4218,7 @@ mod tests {
                 &exec.session_id,
                 profile_with(
                     querymt::chat::GenerationOptionSupport::ALL,
-                    Some(crate::model_heuristics::OutputCaps {
+                    Some(querymt_agent_services::model_heuristics::OutputCaps {
                         initial: 32_000,
                         ceiling: 128_000,
                     }),
@@ -4332,7 +4347,7 @@ mod tests {
             {
                 stored |= matches!(
                     envelope.kind(),
-                    crate::events::AgentEventKind::AssistantMessageStored { .. }
+                    querymt_agent_core::events::AgentEventKind::AssistantMessageStored { .. }
                 );
             }
             (state, stored)
@@ -5856,7 +5871,9 @@ mod tests {
         }
 
         async fn request_end_costs(
-            events: &mut tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+            events: &mut tokio::sync::broadcast::Receiver<
+                querymt_agent_core::events::EventEnvelope,
+            >,
         ) -> (Option<f64>, Option<f64>) {
             loop {
                 let envelope = tokio::time::timeout(Duration::from_secs(1), events.recv())
@@ -6003,11 +6020,13 @@ mod tests {
         use super::cost_accounting_tests::{CACHE_ENV_LOCK, InjectedPricing};
         use super::genai_trace_tests::{TimedChunks, timed_fixture};
         use super::*;
-        use crate::accounting::{AccountingReason, AttemptOutcome, UsageDisposition};
         use crate::session::backend::StorageBackend;
         use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
         use querymt::Usage;
         use querymt::providers::ModelPricing;
+        use querymt_agent_services::accounting::{
+            AccountingReason, AttemptOutcome, UsageDisposition,
+        };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         fn pricing() -> ModelPricing {
@@ -6099,7 +6118,9 @@ mod tests {
                 .collect()
         }
 
-        fn settlements(ledger: &[AgentEventKind]) -> Vec<&crate::accounting::AttemptSettlement> {
+        fn settlements(
+            ledger: &[AgentEventKind],
+        ) -> Vec<&querymt_agent_services::accounting::AttemptSettlement> {
             ledger
                 .iter()
                 .filter_map(|k| match k {
@@ -6116,7 +6137,9 @@ mod tests {
                 .count()
         }
 
-        async fn session_totals(exec: &ExecutionContext) -> crate::accounting::ScopeTotals {
+        async fn session_totals(
+            exec: &ExecutionContext,
+        ) -> querymt_agent_services::accounting::ScopeTotals {
             exec.cycle_accounting
                 .get()
                 .expect("cycle accounting is created on first dispatch")
@@ -6355,7 +6378,7 @@ mod tests {
             );
 
             // Replay from the journal alone reproduces the same totals.
-            let replayed = crate::accounting::SessionAccounting::hydrate(
+            let replayed = querymt_agent_services::accounting::SessionAccounting::hydrate(
                 &exec.session_id,
                 fixture.storage.event_journal(),
             )
@@ -6425,7 +6448,7 @@ mod tests {
 
             // The charge is unaffected, live and from the journal alone.
             assert_eq!(session_totals(&exec).await, recorded);
-            let replayed = crate::accounting::SessionAccounting::hydrate(
+            let replayed = querymt_agent_services::accounting::SessionAccounting::hydrate(
                 &exec.session_id,
                 fixture.storage.event_journal(),
             )
@@ -6463,14 +6486,17 @@ mod tests {
             assert!(error.to_string().contains("accounting"), "{error:#}");
         }
 
-        type Events = tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>;
+        type Events = tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>;
 
         /// The next `LlmRequestEnd` as (cost, accounting), or `None` if none
         /// arrives within the window.
         async fn next_request_end(
             events: &mut Events,
             wait: Duration,
-        ) -> Option<(Option<f64>, Option<crate::accounting::RequestAccounting>)> {
+        ) -> Option<(
+            Option<f64>,
+            Option<querymt_agent_services::accounting::RequestAccounting>,
+        )> {
             let deadline = tokio::time::Instant::now() + wait;
             loop {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

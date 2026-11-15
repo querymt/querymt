@@ -10,11 +10,11 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::index::symbol_index::{SymbolDigest, SymbolIndex, SymbolKind, parse_kind_filter};
 use crate::tools::{
     AliasScope, ArgAlias, CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError,
     WrapRule, effective_root, resolve_arg_path,
 };
+use querymt_agent_index::symbol_index::{SymbolDigest, SymbolIndex, SymbolKind, parse_kind_filter};
 
 use super::helpers::{resolve_root, resolve_target};
 

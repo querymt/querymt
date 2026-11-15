@@ -1,7 +1,7 @@
 //! Snapshot management utilities
 
-use crate::index::merkle::{DiffPaths, MerkleTree};
-use crate::model::MessagePart;
+use querymt_agent_core::model::MessagePart;
+use querymt_agent_index::merkle::{DiffPaths, MerkleTree};
 use std::path::Path;
 
 /// State of a filesystem snapshot
@@ -46,7 +46,7 @@ pub fn snapshot_metadata(root: &Path) -> (MessagePart, Option<String>) {
     }
 
     let meta_string = format!("files={files},bytes={bytes},mtime={latest_mtime}");
-    let root_hash = crate::hash::RapidHash::new(meta_string.as_bytes());
+    let root_hash = querymt_agent_core::hash::RapidHash::new(meta_string.as_bytes());
 
     let summary = format!("Files: {files}, Bytes: {bytes}, Latest mtime: {latest_mtime}");
     // Metadata snapshot doesn't track actual file changes, just aggregate info

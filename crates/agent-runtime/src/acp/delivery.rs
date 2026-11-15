@@ -18,8 +18,8 @@
 //! lost, so a response is never withheld indefinitely.
 
 use crate::acp::protocol::{Meta, PromptResponse};
-use crate::events::{AgentEventKind, EventEnvelope};
 use crate::session::projection::EventJournal;
+use querymt_agent_core::events::{AgentEventKind, EventEnvelope};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -351,7 +351,7 @@ impl ConnectionDelivery {
         session_id: &str,
         after: i64,
         up_to: Option<i64>,
-    ) -> Result<Vec<crate::events::DurableEvent>, ()> {
+    ) -> Result<Vec<querymt_agent_core::events::DurableEvent>, ()> {
         let Some(journal) = &self.journal else {
             log::warn!(
                 "session {session_id}: events after session_seq {after} were missed and no journal is available to recover them"
@@ -428,10 +428,10 @@ impl ConnectionDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{AgentEventKind, EphemeralEvent, EventOrigin};
     use crate::session::backend::StorageBackend;
     use crate::session::projection::NewDurableEvent;
     use crate::session::sqlite_storage::SqliteStorage;
+    use querymt_agent_core::events::{AgentEventKind, EphemeralEvent, EventOrigin};
 
     async fn journal() -> Arc<dyn EventJournal> {
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
@@ -673,7 +673,8 @@ mod tests {
             async fn append_durable(
                 &self,
                 _: &NewDurableEvent,
-            ) -> crate::session::error::SessionResult<crate::events::DurableEvent> {
+            ) -> crate::session::error::SessionResult<querymt_agent_core::events::DurableEvent>
+            {
                 unimplemented!()
             }
             async fn load_session_stream(
@@ -681,7 +682,7 @@ mod tests {
                 _: &str,
                 _: Option<i64>,
                 _: Option<usize>,
-            ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>>
+            ) -> crate::session::error::SessionResult<Vec<querymt_agent_core::events::DurableEvent>>
             {
                 Err(crate::session::error::SessionError::Other("boom".into()))
             }
@@ -689,7 +690,7 @@ mod tests {
                 &self,
                 _: Option<i64>,
                 _: Option<usize>,
-            ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>>
+            ) -> crate::session::error::SessionResult<Vec<querymt_agent_core::events::DurableEvent>>
             {
                 unimplemented!()
             }
@@ -703,8 +704,9 @@ mod tests {
             async fn append_durable_from_source(
                 &self,
                 _: &NewDurableEvent,
-            ) -> crate::session::error::SessionResult<Option<crate::events::DurableEvent>>
-            {
+            ) -> crate::session::error::SessionResult<
+                Option<querymt_agent_core::events::DurableEvent>,
+            > {
                 unimplemented!()
             }
             async fn latest_source_seq(
@@ -734,7 +736,7 @@ mod tests {
                 &self,
                 _: &str,
                 _: &str,
-            ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>>
+            ) -> crate::session::error::SessionResult<Vec<querymt_agent_core::events::DurableEvent>>
             {
                 unimplemented!()
             }

@@ -3,12 +3,12 @@ use crate::agent::core::ToolPolicy;
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
 use crate::delegation::{AgentInfo, DefaultAgentRegistry, DelegationOrchestrator};
-use crate::events::{AgentEventKind, StopType};
 use crate::middleware::{
     AgentStats, ConversationContext, DelegationGuardMiddleware, ExecutionState, LlmResponse,
     MiddlewareDriver,
 };
-use crate::model::{AgentMessage, MessagePart};
+use querymt_agent_core::events::{AgentEventKind, StopType};
+use querymt_agent_core::model::{AgentMessage, MessagePart};
 
 use crate::session::backend::StorageBackend;
 use crate::session::domain::{Delegation, DelegationStatus};
@@ -37,8 +37,10 @@ async fn genai_delegation_concurrent_parent_prompts_reach_child_agents_without_p
 {
     use crate::acp::protocol::{ContentBlock, LoadSessionRequest, PromptRequest, TextContent};
     use crate::agent::handle::AgentHandle as _;
-    use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture_local_tasks};
     use opentelemetry::Value;
+    use querymt_agent_services::tools::trace_support::genai_trace::{
+        assert_private, attr, capture_local_tasks,
+    };
 
     let ((parents, children), spans) = capture_local_tasks(async {
         async fn run(trace: &str, unsuccessful_summary: bool) -> (String, String) {
@@ -380,9 +382,11 @@ async fn genai_delegation_concurrent_parent_prompts_reach_child_agents_without_p
 
 #[tokio::test(flavor = "current_thread")]
 async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consumer_context() {
-    use crate::events::{DurableEvent, EventEnvelope, EventOrigin};
-    use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture_local_tasks};
     use opentelemetry::{Value, trace::SpanId};
+    use querymt_agent_core::events::{DurableEvent, EventEnvelope, EventOrigin};
+    use querymt_agent_services::tools::trace_support::genai_trace::{
+        assert_private, attr, capture_local_tasks,
+    };
     use tracing::{Instrument, Span};
 
     for route in ["absent", "remote", "replay"] {
@@ -421,7 +425,7 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
                     task_id: None,
                     target_agent_id: "agent".into(),
                     objective: "SECRET_ARGUMENT".into(),
-                    objective_hash: crate::hash::RapidHash::new(b"SECRET_ARGUMENT"),
+                    objective_hash: querymt_agent_core::hash::RapidHash::new(b"SECRET_ARGUMENT"),
                     context: Some("SECRET_PROMPT".into()),
                     constraints: None,
                     expected_output: None,
@@ -792,7 +796,7 @@ impl TestHarness {
 
         let exec_ctx = ExecutionContext::new(
             session_id,
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             session_runtime,
             runtime_context,
             context,
@@ -1479,7 +1483,7 @@ async fn timeout_cleanup_cancels_requested_delegation_before_it_can_start() {
         task_id: None,
         target_agent_id: "agent".to_string(),
         objective: "not started yet".to_string(),
-        objective_hash: crate::hash::RapidHash::new(b"not started yet"),
+        objective_hash: querymt_agent_core::hash::RapidHash::new(b"not started yet"),
         context: None,
         constraints: None,
         expected_output: None,
@@ -1534,7 +1538,7 @@ async fn timeout_cleanup_does_not_overwrite_terminal_delegation() {
         task_id: None,
         target_agent_id: "agent".to_string(),
         objective: "already complete".to_string(),
-        objective_hash: crate::hash::RapidHash::new(b"already complete"),
+        objective_hash: querymt_agent_core::hash::RapidHash::new(b"already complete"),
         context: None,
         constraints: None,
         expected_output: None,
@@ -2016,7 +2020,7 @@ async fn test_delegation_completion_message_format_and_replay_safety() {
             task_id: None,
             target_agent_id: "agent".to_string(),
             objective: "Retry task".to_string(),
-            objective_hash: crate::hash::RapidHash::new(b"Retry task"),
+            objective_hash: querymt_agent_core::hash::RapidHash::new(b"Retry task"),
             context: None,
             constraints: None,
             expected_output: None,
@@ -2313,17 +2317,17 @@ async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct(
             task_id: None,
             target_agent_id: "agent".into(),
             objective: "bounded verification cleanup".into(),
-            objective_hash: crate::hash::RapidHash::new(b"bounded verification cleanup"),
+            objective_hash: querymt_agent_core::hash::RapidHash::new(b"bounded verification cleanup"),
             context: None,
             constraints: None,
             expected_output: None,
-            verification_spec: Some(crate::verification::VerificationSpec {
+            verification_spec: Some(querymt_agent_services::verification::VerificationSpec {
                 description: "wait for test release".into(),
                 strategy: Default::default(),
-                steps: vec![crate::verification::VerificationStep::ToolCall {
+                steps: vec![querymt_agent_services::verification::VerificationStep::ToolCall {
                     tool_name: "shell".into(),
                     arguments: serde_json::json!({"command": "sh", "args": ["-c", ": > \"$2\"; i=0; while test ! -f \"$1\" && test $i -lt 500; do i=$((i+1)); sleep 0.01; done; test -f \"$1\"", "qmt-verification", release_file, entered_file], "workdir": harness._temp_dir.path()}),
-                    expectation: crate::verification::Expectation::Success,
+                    expectation: querymt_agent_services::verification::Expectation::Success,
                     error_message: None,
                 }],
             }),
@@ -2507,7 +2511,7 @@ async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct(
                 serde_json::to_value(activity[0].session_seq).unwrap()
             );
             assert!(!snapshot["audit"]["events"].as_array().unwrap().is_empty());
-            let events: Vec<crate::events::AgentEvent> =
+            let events: Vec<querymt_agent_core::events::AgentEvent> =
                 serde_json::from_value(snapshot["audit"]["events"].clone()).unwrap();
             assert_eq!(
                 snapshot["cursor"],
@@ -2515,10 +2519,12 @@ async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct(
             );
             assert_eq!(
                 snapshot["accounting"],
-                serde_json::to_value(crate::accounting::AccountingSnapshot::from_events(
-                    &parent_id,
-                    events.iter().map(|event| &event.kind),
-                ))
+                serde_json::to_value(
+                    querymt_agent_services::accounting::AccountingSnapshot::from_events(
+                        &parent_id,
+                        events.iter().map(|event| &event.kind),
+                    )
+                )
                 .unwrap(),
                 "idle/verifying owner snapshot must include accounting at its audit cursor"
             );
@@ -2617,18 +2623,20 @@ async fn verification_failure_resolves_terminal_delegate_child() {
             task_id: None,
             target_agent_id: "agent".to_string(),
             objective: "run and fail verification".to_string(),
-            objective_hash: crate::hash::RapidHash::new(b"run and fail verification"),
+            objective_hash: querymt_agent_core::hash::RapidHash::new(b"run and fail verification"),
             context: None,
             constraints: None,
             expected_output: None,
-            verification_spec: Some(crate::verification::VerificationSpec {
+            verification_spec: Some(querymt_agent_services::verification::VerificationSpec {
                 description: "require a missing file".to_string(),
-                steps: vec![crate::verification::VerificationStep::FileAssertion {
-                    path: harness._temp_dir.path().join("missing-verification-file"),
-                    exists: true,
-                    contains: None,
-                    matches_regex: None,
-                }],
+                steps: vec![
+                    querymt_agent_services::verification::VerificationStep::FileAssertion {
+                        path: harness._temp_dir.path().join("missing-verification-file"),
+                        exists: true,
+                        contains: None,
+                        matches_regex: None,
+                    },
+                ],
                 strategy: Default::default(),
             }),
             status: DelegationStatus::Requested,
@@ -2799,7 +2807,7 @@ async fn test_delegation_guard_blocks_duplicate() {
         task_id: None,
         target_agent_id: "agent".to_string(),
         objective: "task".to_string(),
-        objective_hash: crate::hash::RapidHash::new(b"task"),
+        objective_hash: querymt_agent_core::hash::RapidHash::new(b"task"),
         context: None,
         constraints: None,
         expected_output: None,
@@ -2877,7 +2885,7 @@ async fn test_delegation_guard_blocks_max_retries() {
         task_id: None,
         target_agent_id: "agent".to_string(),
         objective: "task".to_string(),
-        objective_hash: crate::hash::RapidHash::new(b"task"),
+        objective_hash: querymt_agent_core::hash::RapidHash::new(b"task"),
         context: None,
         constraints: None,
         expected_output: None,

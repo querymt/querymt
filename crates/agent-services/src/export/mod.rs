@@ -45,10 +45,10 @@ pub use turns::{SessionMeta, Turn, materialize_turns};
 #[cfg(test)]
 mod session_atif_tests {
     use super::*;
-    use crate::events::{AgentEventKind, EventOrigin, ExecutionMetrics};
     use crate::session::projection::{EventJournal, NewDurableEvent, ViewStore};
-    use crate::session::sqlite_storage::SqliteStorage;
     use crate::session::store::SessionStore;
+    use querymt_agent_core::events::{AgentEventKind, EventOrigin, ExecutionMetrics};
+    use querymt_agent_sqlite::session::sqlite_storage::SqliteStorage;
 
     fn ev(session_id: &str, kind: AgentEventKind) -> NewDurableEvent {
         NewDurableEvent {

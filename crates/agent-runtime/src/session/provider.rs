@@ -1,12 +1,6 @@
-use crate::accounting::{
-    BillingBasis, is_non_billable_oauth_provider, pricing_for, resolve_billing_basis,
-};
 #[cfg(feature = "remote")]
 use crate::agent::remote::NodeId;
 use crate::middleware::ModelProfile;
-use crate::model::{AgentMessage, MessagePart, OutputTarget};
-use crate::model_heuristics::OutputCaps;
-use crate::model_info::get_model_info;
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::provider_config::{ProviderConfigMode, resolve_provider_config};
 use crate::session::store::{LLMConfig, Session, SessionExecutionConfig, SessionStore};
@@ -19,6 +13,12 @@ use querymt::{
     chat::{ChatCall, ChatMessage, ChatOutput, ChatRole, GenerationOptions},
     error::LLMError,
 };
+use querymt_agent_core::model::{AgentMessage, MessagePart, OutputTarget};
+use querymt_agent_services::accounting::{
+    BillingBasis, is_non_billable_oauth_provider, pricing_for, resolve_billing_basis,
+};
+use querymt_agent_services::model_heuristics::OutputCaps;
+use querymt_agent_services::model_info::get_model_info;
 use std::sync::Arc;
 #[cfg(feature = "remote")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -968,7 +968,7 @@ impl SessionHandle {
             .history_store
             .get_effective_history(&self.session.public_id)
             .await?;
-        let repaired = crate::model::repair_unmatched_tool_calls(&mut messages);
+        let repaired = querymt_agent_core::model::repair_unmatched_tool_calls(&mut messages);
         if repaired > 0 {
             log::warn!(
                 "Repaired {} unmatched tool call(s) while loading session {} history",
@@ -1050,12 +1050,12 @@ impl SessionHandle {
     pub async fn submit_request(
         &self,
         call: &ChatCall<'_>,
-        ledger: &crate::accounting::DispatchLedger,
+        ledger: &querymt_agent_services::accounting::DispatchLedger,
     ) -> Result<ChatOutput, LLMError> {
         let provider = self.provider().await?;
         let options = supported_overrides(provider.as_ref(), call.options);
         let call = call.options(options);
-        crate::accounting::run_attempt(
+        querymt_agent_services::accounting::run_attempt(
             &ledger.operation,
             ledger.basis.clone(),
             &tokio_util::sync::CancellationToken::new(),
@@ -1068,7 +1068,7 @@ impl SessionHandle {
     pub async fn chat(
         &self,
         messages: &[ChatMessage],
-        ledger: &crate::accounting::DispatchLedger,
+        ledger: &querymt_agent_services::accounting::DispatchLedger,
     ) -> SessionResult<ChatOutput> {
         // 1. Store incoming messages (User or Tool Result)
         for msg in messages {
@@ -1694,8 +1694,8 @@ pub mod tests {
     #[tokio::test]
     async fn chat_skips_provider_when_history_conversion_fails() {
         use crate::acp::protocol::{ContentBlock, ImageContent};
-        use crate::model::MessagePart;
         use crate::test_utils::{MockSessionStore, mock_llm_config, mock_session};
+        use querymt_agent_core::model::MessagePart;
 
         let invalid_message = AgentMessage {
             id: "invalid".to_string(),

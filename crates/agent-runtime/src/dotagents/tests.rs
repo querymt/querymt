@@ -1309,7 +1309,7 @@ fn dotagents_sections_count_as_system_sections() {
     assert_eq!(params.system.len(), 3);
 
     let mut config = serde_json::to_value(&params).unwrap();
-    crate::model_heuristics::ModelDefaults::for_model(
+    querymt_agent_services::model_heuristics::ModelDefaults::for_model(
         "anthropic",
         "claude-3-7-sonnet-20250219",
         None,

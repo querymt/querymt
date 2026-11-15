@@ -1,4 +1,3 @@
-use crate::events::StopType;
 use crate::middleware::PreparedModelRequest;
 use crate::middleware::{
     AgentStats, CompositeDriver, ConversationContext, ExecutionState, LimitsConfig,
@@ -9,6 +8,7 @@ use crate::test_utils::{
     CancelDriver, CompleteDriver, CountingDriver, ErrorDriver, PassThroughDriver, StopDriver,
     test_context, test_context_with_user_messages,
 };
+use querymt_agent_core::events::StopType;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;

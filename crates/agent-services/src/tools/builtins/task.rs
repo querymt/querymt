@@ -201,7 +201,9 @@ impl ToolTrait for UpdateTaskTool {
                     .map_err(|error| ToolError::Other(error.into()))?
             ))]);
         }
-        context.emit_event(crate::events::AgentEventKind::TaskUpdated { task: task.clone() });
+        context.emit_event(querymt_agent_core::events::AgentEventKind::TaskUpdated {
+            task: task.clone(),
+        });
         task_content(&task, task.status == TaskStatus::Active)
     }
 }
@@ -282,7 +284,9 @@ impl ToolTrait for CompleteTaskTool {
             .complete(task_id, expected_revision, evidence)
             .await
             .map_err(|error| ToolError::SessionError(error.to_string()))?;
-        context.emit_event(crate::events::AgentEventKind::TaskStatusChanged { task: task.clone() });
+        context.emit_event(
+            querymt_agent_core::events::AgentEventKind::TaskStatusChanged { task: task.clone() },
+        );
         task_content(&task, false)
     }
 }

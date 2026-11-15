@@ -1,10 +1,10 @@
-use crate::events::StopType;
 use crate::middleware::{ExecutionState, MiddlewareDriver, Result};
 use crate::session::domain::DelegationStatus;
 use crate::session::store::SessionStore;
 use async_trait::async_trait;
 use log::{debug, trace};
 use querymt::chat::ChatRole;
+use querymt_agent_core::events::StopType;
 use std::sync::Arc;
 use time::OffsetDateTime;
 
@@ -56,7 +56,7 @@ impl DelegationGuardMiddleware {
     async fn check_delegation_allowed(
         &self,
         session_id: &str,
-        objective_hash: &crate::hash::RapidHash,
+        objective_hash: &querymt_agent_core::hash::RapidHash,
         target_agent_id: &str,
     ) -> Option<String> {
         // Get all delegations for this session
@@ -172,8 +172,9 @@ impl MiddlewareDriver for DelegationGuardMiddleware {
 
                                 if !target_agent_id.is_empty() && !objective.is_empty() {
                                     // Compute objective hash
-                                    let objective_hash =
-                                        crate::hash::RapidHash::new(objective.as_bytes());
+                                    let objective_hash = querymt_agent_core::hash::RapidHash::new(
+                                        objective.as_bytes(),
+                                    );
 
                                     // Check if this delegation should be blocked
                                     if let Some(warning) = self
@@ -228,9 +229,9 @@ impl MiddlewareDriver for DelegationGuardMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::RapidHash;
     use crate::session::domain::{Delegation, DelegationStatus};
     use crate::test_utils::mocks::MockSessionStore;
+    use querymt_agent_core::hash::RapidHash;
     use time::OffsetDateTime;
 
     fn make_guard(store: Arc<dyn SessionStore>) -> DelegationGuardMiddleware {

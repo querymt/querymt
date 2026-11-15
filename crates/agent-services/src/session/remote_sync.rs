@@ -431,7 +431,7 @@ impl RemoteSyncRegistry {
 mod tests {
     use super::*;
     use crate::session::backend::StorageBackend;
-    use crate::session::sqlite_storage::SqliteStorage;
+    use querymt_agent_sqlite::session::sqlite_storage::SqliteStorage;
 
     async fn state() -> (Arc<RemoteSyncState>, Arc<dyn EventJournal>) {
         let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();

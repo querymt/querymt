@@ -5,10 +5,6 @@
 //! Depends on `querymt-agent-core`, `-index` and `-knowledge` (design D1); the
 //! SQLite implementation is a dev-dependency used by tests.
 
-pub(crate) use querymt_agent_core as core_staging;
-pub(crate) use querymt_agent_core::{elicitation, events, hash, model};
-pub(crate) use querymt_agent_index as index;
-
 /// Contract types from core plus the repository-knowledge crate, at their old
 /// paths.
 pub(crate) mod knowledge {

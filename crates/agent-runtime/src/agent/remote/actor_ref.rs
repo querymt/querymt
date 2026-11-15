@@ -15,11 +15,11 @@ use crate::agent::session_control::{
 };
 use crate::agent::undo::{RedoResult, UndoError, UndoResult};
 use crate::error::AgentError;
-use crate::events::SessionLimits;
-use crate::model::AgentMessage;
 use crate::session::store::LLMConfig;
 use kameo::actor::ActorRef;
 use querymt::chat::ReasoningEffort;
+use querymt_agent_core::events::SessionLimits;
+use querymt_agent_core::model::AgentMessage;
 use querymt_remote::{
     classify_infallible_remote_send_error, classify_remote_send_error_with_timeout_message,
 };
@@ -108,7 +108,7 @@ mod interaction_error_tests {
 #[cfg(any(feature = "remote", test))]
 async fn collect_event_stream_pages<F, Fut>(
     mut fetch: F,
-) -> Result<Vec<crate::events::AgentEvent>, AgentError>
+) -> Result<Vec<querymt_agent_core::events::AgentEvent>, AgentError>
 where
     F: FnMut(i64) -> Fut,
     Fut: std::future::Future<Output = Result<messages::EventStreamPage, AgentError>>,
@@ -876,7 +876,9 @@ impl SessionActorRef {
         skip(self),
         fields(is_remote = self.is_remote(), peer_label = %self.node_label())
     )]
-    pub async fn get_event_stream(&self) -> Result<Vec<crate::events::AgentEvent>, AcpError> {
+    pub async fn get_event_stream(
+        &self,
+    ) -> Result<Vec<querymt_agent_core::events::AgentEvent>, AcpError> {
         match self {
             Self::Local(actor_ref) => actor_ref
                 .ask(messages::GetEventStream)
@@ -1473,14 +1475,14 @@ mod history_paging_tests {
         messages::EventStreamPage {
             events: seqs
                 .into_iter()
-                .map(|seq| crate::events::AgentEvent {
+                .map(|seq| querymt_agent_core::events::AgentEvent {
                     session_seq: 0,
                     seq,
                     timestamp: 0,
                     session_id: "s1".into(),
-                    origin: crate::events::EventOrigin::Local,
+                    origin: querymt_agent_core::events::EventOrigin::Local,
                     source_node: None,
-                    kind: crate::events::AgentEventKind::Cancelled,
+                    kind: querymt_agent_core::events::AgentEventKind::Cancelled,
                 })
                 .collect(),
             latest_source_seq: tip,

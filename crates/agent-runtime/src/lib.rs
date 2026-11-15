@@ -7,16 +7,6 @@
 //! crates (design D1); the SQLite implementation is a dev-dependency used by
 //! tests and by the `test-support` feature.
 
-// Temporary internal aliases for the layers below (removed in task 9.1).
-pub(crate) use querymt_agent_core as core_staging;
-pub(crate) use querymt_agent_core::{events, hash, model};
-pub(crate) use querymt_agent_index as index;
-#[allow(unused_imports)]
-pub(crate) use querymt_agent_services::{
-    accounting, event_fanout, event_sink, export, model_heuristics, model_info,
-    session_event_stream, snapshot, tasks, verification, workspace_query,
-};
-
 pub mod acp;
 pub mod agent;
 pub mod api;

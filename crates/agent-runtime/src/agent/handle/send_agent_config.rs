@@ -19,7 +19,7 @@ impl LocalAgentHandle {
             .map_err(|error| Error::from(crate::error::AgentError::from(error)))?;
         self.emit_event(
             session_id,
-            crate::events::AgentEventKind::SessionMetadataUpdated {
+            querymt_agent_core::events::AgentEventKind::SessionMetadataUpdated {
                 title: Some(title),
                 updated_at: Some(updated_at.clone()),
             },

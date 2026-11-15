@@ -99,7 +99,7 @@ pub trait ToolContext: Send + Sync {
     /// Knowledge tools use this to emit `KnowledgeIngested` / `KnowledgeConsolidated`
     /// events so the scheduler can react to them. The default implementation is a
     /// no-op — only `AgentToolContext` (which carries an `EventSink`) actually emits.
-    fn emit_event(&self, _kind: crate::events::AgentEventKind) {}
+    fn emit_event(&self, _kind: querymt_agent_core::events::AgentEventKind) {}
 
     /// ID of the tool call this context was built for, when known. Used to
     /// keep concurrent approval prompts distinct.
@@ -457,8 +457,8 @@ pub trait Tool: Send + Sync {
     /// (`always_ask` makes a `Session` default ask on every call). A
     /// `pre_tool_use` hook that allows the call still skips the prompt.
     /// Default: none.
-    fn default_approval(&self) -> crate::core_staging::config::approval::ApprovalNeed {
-        crate::core_staging::config::approval::ApprovalNeed::None
+    fn default_approval(&self) -> querymt_agent_core::config::approval::ApprovalNeed {
+        querymt_agent_core::config::approval::ApprovalNeed::None
     }
 
     /// Capabilities this tool requires. Default: empty.

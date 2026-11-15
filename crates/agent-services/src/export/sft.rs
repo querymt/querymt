@@ -11,10 +11,10 @@
 //! example as a single JSONL line. Memory usage is proportional to one session
 //! at a time, not the total dataset.
 
-use crate::events::AgentEvent;
 use crate::export::turns::{Turn, materialize_turns};
 use crate::session::backend::StorageBackend;
 use crate::session::store::SessionStore;
+use querymt_agent_core::events::AgentEvent;
 use serde::Serialize;
 use std::io::{self, Write};
 
@@ -540,9 +540,12 @@ fn passes_filter(
 
     // Error filter
     if filter.exclude_errored {
-        let has_error = events
-            .iter()
-            .any(|e| matches!(e.kind, crate::events::AgentEventKind::Error { .. }));
+        let has_error = events.iter().any(|e| {
+            matches!(
+                e.kind,
+                querymt_agent_core::events::AgentEventKind::Error { .. }
+            )
+        });
         if has_error {
             return false;
         }

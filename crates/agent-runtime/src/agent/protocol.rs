@@ -36,7 +36,7 @@ pub(crate) async fn build_mcp_state(
     servers: &[McpServer],
     connect_ctx: &McpConnectContext,
     pending_elicitations: crate::elicitation::PendingElicitationMap,
-    event_sink: Arc<crate::event_sink::EventSink>,
+    event_sink: Arc<querymt_agent_services::event_sink::EventSink>,
     session_id: String,
     client_impl: &Implementation,
     tool_state: Arc<McpToolState>,
@@ -88,7 +88,7 @@ pub(crate) async fn build_mcp_state(
                 };
                 event_sink.emit_ephemeral(
                     &session_id,
-                    crate::events::AgentEventKind::McpServerAuthRequired {
+                    querymt_agent_core::events::AgentEventKind::McpServerAuthRequired {
                         server_name: skipped.server_name.clone(),
                         provider_id: skipped.provider_id.clone(),
                         error: skipped.error.clone(),
@@ -286,7 +286,7 @@ async fn start_mcp_server(
     server: &McpServer,
     connect_ctx: &McpConnectContext,
     pending_elicitations: crate::elicitation::PendingElicitationMap,
-    event_sink: Arc<crate::event_sink::EventSink>,
+    event_sink: Arc<querymt_agent_services::event_sink::EventSink>,
     session_id: String,
     client_impl: &Implementation,
     tool_state: Arc<McpToolState>,
@@ -665,9 +665,9 @@ pub(crate) mod tests {
         let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
             .await
             .unwrap();
-        let sink = Arc::new(crate::event_sink::EventSink::new(
+        let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
             storage.event_journal(),
-            Arc::new(crate::event_fanout::EventFanout::new()),
+            Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
         ));
         for path in ["", "@"] {
             let server = McpServerConfig::http("bad-sock", "http://localhost/mcp")
@@ -698,9 +698,9 @@ pub(crate) mod tests {
         let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
             .await
             .unwrap();
-        let sink = Arc::new(crate::event_sink::EventSink::new(
+        let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
             storage.event_journal(),
-            Arc::new(crate::event_fanout::EventFanout::new()),
+            Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
         ));
         let server = McpServerConfig::http("other", "https://other.test/mcp")
             .with_auth(McpAuth::OAuth {
@@ -868,9 +868,9 @@ pub(crate) mod tests {
             let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                 .await
                 .unwrap();
-            let sink = Arc::new(crate::event_sink::EventSink::new(
+            let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
                 storage.event_journal(),
-                Arc::new(crate::event_fanout::EventFanout::new()),
+                Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
             ));
             let ctx = McpConnectContext::from_config(std::slice::from_ref(server))
                 .with_secret_backend(backend.clone());
@@ -900,9 +900,9 @@ pub(crate) mod tests {
             let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                 .await
                 .unwrap();
-            let sink = Arc::new(crate::event_sink::EventSink::new(
+            let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
                 storage.event_journal(),
-                Arc::new(crate::event_fanout::EventFanout::new()),
+                Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
             ));
             let ctx = McpConnectContext::from_config(std::slice::from_ref(server))
                 .with_secret_backend(backend.clone());
@@ -980,9 +980,9 @@ pub(crate) mod tests {
             let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                 .await
                 .unwrap();
-            let sink = Arc::new(crate::event_sink::EventSink::new(
+            let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
                 storage.event_journal(),
-                Arc::new(crate::event_fanout::EventFanout::new()),
+                Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
             ));
             let mut events = sink.fanout().subscribe();
             let ctx = McpConnectContext::from_config(std::slice::from_ref(&secured))
@@ -1011,7 +1011,7 @@ pub(crate) mod tests {
             assert_eq!(event.session_id(), "s1");
             assert!(matches!(
                 event.kind(),
-                crate::events::AgentEventKind::McpServerAuthRequired { server_name, provider_id, .. }
+                querymt_agent_core::events::AgentEventKind::McpServerAuthRequired { server_name, provider_id, .. }
                     if server_name == "secured" && provider_id == "mcp:secured"
             ));
             assert!(event.is_ephemeral(), "transient");
@@ -1041,9 +1041,9 @@ pub(crate) mod tests {
             let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                 .await
                 .unwrap();
-            let sink = Arc::new(crate::event_sink::EventSink::new(
+            let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
                 storage.event_journal(),
-                Arc::new(crate::event_fanout::EventFanout::new()),
+                Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
             ));
             let _clients = build_mcp_state(
                 &[plain.to_acp()],
@@ -1071,9 +1071,9 @@ pub(crate) mod tests {
             let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                 .await
                 .unwrap();
-            let sink = Arc::new(crate::event_sink::EventSink::new(
+            let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
                 storage.event_journal(),
-                Arc::new(crate::event_fanout::EventFanout::new()),
+                Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
             ));
             let mut events = sink.fanout().subscribe();
             let ctx = McpConnectContext::from_config(std::slice::from_ref(&secured))
@@ -1106,7 +1106,10 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(matches!(
                 event.kind(),
-                crate::events::AgentEventKind::McpServerAuthRequired { error: Some(_), .. }
+                querymt_agent_core::events::AgentEventKind::McpServerAuthRequired {
+                    error: Some(_),
+                    ..
+                }
             ));
         }
 
@@ -1162,9 +1165,9 @@ pub(crate) mod tests {
             let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                 .await
                 .unwrap();
-            let sink = Arc::new(crate::event_sink::EventSink::new(
+            let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
                 storage.event_journal(),
-                Arc::new(crate::event_fanout::EventFanout::new()),
+                Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
             ));
             let mut events = sink.fanout().subscribe();
 
@@ -1187,7 +1190,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(matches!(
                 event.kind(),
-                crate::events::AgentEventKind::McpServerAuthRequired { server_name, provider_id, .. }
+                querymt_agent_core::events::AgentEventKind::McpServerAuthRequired { server_name, provider_id, .. }
                     if server_name == "secured" && provider_id == "mcp:secured"
             ));
 
@@ -1210,9 +1213,9 @@ pub(crate) mod tests {
             let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                 .await
                 .unwrap();
-            let sink = crate::event_sink::EventSink::new(
+            let sink = querymt_agent_services::event_sink::EventSink::new(
                 storage.event_journal(),
-                Arc::new(crate::event_fanout::EventFanout::new()),
+                Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
             );
             assert!(
                 crate::agent::mcp::report_auth_required(&err, "secured", true, &sink, "s1")
@@ -1287,9 +1290,9 @@ pub(crate) mod tests {
         let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
             .await
             .unwrap();
-        let sink = Arc::new(crate::event_sink::EventSink::new(
+        let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
             storage.event_journal(),
-            Arc::new(crate::event_fanout::EventFanout::new()),
+            Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
         ));
         let server = McpServerConfig::http("secured", "https://secured.test/mcp").with_auth(
             McpAuth::OAuth {
@@ -1418,9 +1421,9 @@ pub(crate) mod tests {
         let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
             .await
             .unwrap();
-        let sink = Arc::new(crate::event_sink::EventSink::new(
+        let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
             storage.event_journal(),
-            Arc::new(crate::event_fanout::EventFanout::new()),
+            Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
         ));
         let config = McpServerConfig::http("sock", "http://mcp.internal/mcp")
             .with_socket_path(&socket)

@@ -17,7 +17,7 @@
 //! - Exclusivity also holds within one process: `flock` (Unix) and
 //!   `LockFileEx` (Windows) conflict between separate opens of the same file.
 
-pub use crate::core_staging::run_lease_path::run_lease_root_for_db;
+pub use querymt_agent_core::run_lease_path::run_lease_root_for_db;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};

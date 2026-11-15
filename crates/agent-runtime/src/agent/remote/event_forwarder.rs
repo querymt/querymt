@@ -6,7 +6,7 @@
 //! the local `EventRelayActor` via kameo remote messaging.
 
 #[cfg(feature = "remote")]
-use crate::events::{AgentEvent, EventEnvelope};
+use querymt_agent_core::events::{AgentEvent, EventEnvelope};
 #[cfg(feature = "remote")]
 use std::sync::Arc;
 
@@ -67,7 +67,7 @@ impl EventForwarder {
     ///
     /// Returns an owned handle which cancels the forwarder when dropped.
     pub fn start(
-        fanout: Arc<crate::event_fanout::EventFanout>,
+        fanout: Arc<querymt_agent_services::event_fanout::EventFanout>,
         relay_ref: RemoteActorRef<EventRelayActor>,
         source_label: String,
         filter_session_id: String,
@@ -169,7 +169,7 @@ impl EventForwarder {
     /// This stub should never be constructed without the remote feature
     #[allow(dead_code)]
     pub fn start(
-        _fanout: std::sync::Arc<crate::event_fanout::EventFanout>,
+        _fanout: std::sync::Arc<querymt_agent_services::event_fanout::EventFanout>,
         _relay_ref: (),
         _source_label: String,
         _filter_session_id: String,

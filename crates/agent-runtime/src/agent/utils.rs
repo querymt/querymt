@@ -1,12 +1,12 @@
 //! Utility functions for the agent
 
 use crate::acp::protocol::{ContentBlock, EmbeddedResourceResource, ToolCallLocation, ToolKind};
-pub use crate::core_staging::prompt_text::{
-    format_prompt_user_text_only, render_prompt_for_display, truncate_to_bytes,
-};
-use crate::model::{AgentMessage, MessagePart};
 use log::warn;
 use querymt::chat::ChatRole;
+use querymt_agent_core::model::{AgentMessage, MessagePart};
+pub use querymt_agent_core::prompt_text::{
+    format_prompt_user_text_only, render_prompt_for_display, truncate_to_bytes,
+};
 
 /// Latency histograms for the model call and the work that precedes it.
 ///
@@ -142,7 +142,7 @@ pub(crate) mod genai {
     use tracing::Span;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-    use crate::model::{AgentMessage, MessagePart};
+    use querymt_agent_core::model::{AgentMessage, MessagePart};
 
     pub(crate) fn agent_id(span: &Span, id: Option<&str>) {
         if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
@@ -845,8 +845,10 @@ mod tests {
 
     #[tokio::test]
     async fn stream_timing_records_ordered_ttfb_chunk_and_token_once() {
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
         use opentelemetry::Value;
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
+        };
         use std::time::Duration;
 
         let (_, spans) = capture(async {
@@ -907,7 +909,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_timing_without_chunks_records_no_aggregates() {
-        use crate::test_utils::helpers::genai_trace::{attr, capture};
+        use querymt_agent_services::tools::trace_support::genai_trace::{attr, capture};
         let (_, spans) = capture(async {
             let span = tracing::info_span!("chat");
             let mut timing = super::genai::StreamTiming::default();
@@ -968,8 +970,10 @@ mod tests {
 
     #[tokio::test]
     async fn genai_generation_settings_are_typed_bounded_and_provider_specific() {
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
         use opentelemetry::Value;
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
+        };
         for (provider, effort, expected) in [
             ("openai", None, None),
             ("openai", Some("low"), Some("low")),
@@ -1066,7 +1070,9 @@ mod tests {
 
     #[tokio::test]
     async fn genai_effort_omits_unverified_config_and_google_budgets() {
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
+        };
         use serde_json::json;
         for (provider, model) in [("xai", "grok-4.3"), ("google", "gemini-3-pro")] {
             let mut configs = vec![
@@ -1099,9 +1105,11 @@ mod tests {
 
     #[tokio::test]
     async fn genai_reasoning_usage_alias_and_cache_inclusive_totals_are_typed_and_widened() {
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
         use opentelemetry::Value;
         use querymt::chat::{ChatOutput, FinishReason};
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
+        };
         for reasoning in [None, Some(0), Some(u32::MAX)] {
             let mut output = ChatOutput::from_projections(
                 Some("SECRET_ARGUMENT".into()),
@@ -1151,8 +1159,8 @@ mod tests {
 
     #[tokio::test]
     async fn genai_tool_scope_is_future_local_and_does_not_survive_drop() {
-        use crate::test_utils::helpers::genai_trace::{attr, capture};
         use opentelemetry::Value;
+        use querymt_agent_services::tools::trace_support::genai_trace::{attr, capture};
         let (_, spans) = capture(async {
             let first = tracing::info_span!("first", otel.name = tracing::field::Empty);
             let second = tracing::info_span!("second", otel.name = tracing::field::Empty);
@@ -1224,9 +1232,11 @@ mod tests {
 
     #[tokio::test]
     async fn genai_missing_finish_reason_is_unknown_only_for_completed_output() {
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
         use opentelemetry::{Array, Value, trace::Status};
         use querymt::chat::{ChatOutput, ChatOutputStatus, FinishReason};
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
+        };
         use tracing::Instrument;
 
         for (status, finish, reason, failed) in [

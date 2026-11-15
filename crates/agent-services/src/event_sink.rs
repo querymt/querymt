@@ -10,14 +10,14 @@
 //! - Domain code MUST NOT call EventJournal directly.
 
 use crate::event_fanout::EventFanout;
-use crate::events::{
-    AgentEventKind, Durability, DurableEvent, EphemeralEvent, EventEnvelope, EventOrigin,
-    classify_durability,
-};
 use crate::session::error::SessionResult;
 use crate::session::projection::{EventJournal, NewDurableEvent};
 use crate::session_event_stream::SessionEventStream;
 use parking_lot::Mutex;
+use querymt_agent_core::events::{
+    AgentEventKind, Durability, DurableEvent, EphemeralEvent, EventEnvelope, EventOrigin,
+    classify_durability,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -373,7 +373,7 @@ impl EventSink {
 mod tests {
     use super::*;
     use crate::session::backend::StorageBackend;
-    use crate::session::sqlite_storage::SqliteStorage;
+    use querymt_agent_sqlite::session::sqlite_storage::SqliteStorage;
 
     async fn make_sink() -> EventSink {
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
@@ -936,11 +936,11 @@ mod tests {
         let sink = make_sink().await;
         let mut rx = sink.fanout().subscribe();
         let blocks = [
-            crate::core_staging::protocol::ContentBlock::Text(
-                crate::core_staging::protocol::TextContent::new("before"),
+            querymt_agent_core::protocol::ContentBlock::Text(
+                querymt_agent_core::protocol::TextContent::new("before"),
             ),
-            crate::core_staging::protocol::ContentBlock::Image(
-                crate::core_staging::protocol::ImageContent::new("AQID", "image/png"),
+            querymt_agent_core::protocol::ContentBlock::Image(
+                querymt_agent_core::protocol::ImageContent::new("AQID", "image/png"),
             ),
         ];
 
@@ -1066,7 +1066,7 @@ mod tests {
 
     #[tokio::test]
     async fn ephemeral_emitted_before_base_resolves_is_numbered_after_the_journal() {
-        use crate::events::EventEnvelope;
+        use querymt_agent_core::events::EventEnvelope;
         use tokio::sync::broadcast::error::TryRecvError;
 
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());

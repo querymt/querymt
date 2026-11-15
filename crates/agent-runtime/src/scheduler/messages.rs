@@ -12,8 +12,8 @@
 //!   `ResumeSchedule`, `TriggerNow`, `ListSchedules`) are `pub` — sent by
 //!   `SchedulerHandle` on behalf of the API layer.
 
-use crate::events::EventEnvelope;
 use crate::session::domain_schedule::Schedule;
+use querymt_agent_core::events::EventEnvelope;
 
 // ── Internal messages (sent by background loops) ─────────────────────────
 

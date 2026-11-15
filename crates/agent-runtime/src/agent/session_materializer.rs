@@ -34,9 +34,9 @@ use crate::agent::session_mcp::{
 use crate::agent::session_registry::{
     SessionMaterialization, SessionMaterializationOptions, SessionRegistry,
 };
-use crate::events::AgentEventKind;
 use crate::worktree::{WorkspaceBinding, WorkspaceService};
 use kameo::actor::{ActorRef, Spawn};
+use querymt_agent_core::events::AgentEventKind;
 #[cfg(feature = "remote")]
 use querymt_remote::MeshRuntimeHandle;
 use std::collections::HashMap;
@@ -1582,7 +1582,7 @@ impl SessionMaterializer {
                 self.config
                     .emit_event_persisted(
                         &prepared.session_id,
-                        crate::events::AgentEventKind::HookNotice {
+                        querymt_agent_core::events::AgentEventKind::HookNotice {
                             event_name: notice.event_name,
                             message: notice.message,
                             is_error: notice.is_error,
@@ -1608,13 +1608,15 @@ impl SessionMaterializer {
             .get_session_llm_config(&prepared.session_id)
             .await
         {
-            let context_limit =
-                crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
-                    .and_then(|m| m.context_limit());
+            let context_limit = querymt_agent_services::model_info::get_model_info(
+                &llm_config.provider,
+                &llm_config.model,
+            )
+            .and_then(|m| m.context_limit());
             self.config
                 .emit_event_persisted(
                     &prepared.session_id,
-                    crate::events::AgentEventKind::ProviderChanged {
+                    querymt_agent_core::events::AgentEventKind::ProviderChanged {
                         provider: llm_config.provider.clone(),
                         model: llm_config.model.clone(),
                         config_id: llm_config.id,
@@ -1644,9 +1646,12 @@ impl SessionMaterializer {
                     registry.spawn_prewarm(cwd_path.clone());
                 }
                 tokio::spawn(async move {
-                    let root = crate::index::resolve_workspace_root(&cwd_owned);
-                    match crate::index::get_or_create_workspace_with_timeout(&manager_actor, root)
-                        .await
+                    let root = querymt_agent_index::resolve_workspace_root(&cwd_owned);
+                    match querymt_agent_index::get_or_create_workspace_with_timeout(
+                        &manager_actor,
+                        root,
+                    )
+                    .await
                     {
                         Ok(handle) => {
                             if let Some(registry) = repository_knowledge {
@@ -1674,14 +1679,14 @@ impl SessionMaterializer {
             .iter()
             .map(|server| {
                 crate::config::McpServerConfig::from_acp(server)
-                    .map(crate::events::McpServerInfo::from)
+                    .map(querymt_agent_core::events::McpServerInfo::from)
             })
             .collect::<anyhow::Result<Vec<_>>>()
             .map_err(|e| Error::invalid_params().data(e.to_string()))?;
         self.config
             .emit_event_persisted(
                 &prepared.session_id,
-                crate::events::AgentEventKind::SessionConfigured {
+                querymt_agent_core::events::AgentEventKind::SessionConfigured {
                     cwd: prepared.cwd.clone(),
                     mcp_servers,
                     limits: self.config.get_session_limits(),
@@ -2053,7 +2058,6 @@ mod fork_meta_tests {
     use super::*;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
-    use crate::model::AgentMessage;
     use crate::session::backend::StorageBackend;
     use crate::session::domain::ForkOrigin;
     use crate::session::provider::SessionProvider;
@@ -2064,6 +2068,7 @@ mod fork_meta_tests {
     };
     use querymt::LLMParams;
     use querymt::chat::ChatRole;
+    use querymt_agent_core::model::AgentMessage;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -2601,7 +2606,7 @@ mod worktree_binding_tests {
         crate::session::run_reconcile::tests::seed(
             &fx.storage,
             &session_id,
-            crate::events::AgentEventKind::RunStarted {
+            querymt_agent_core::events::AgentEventKind::RunStarted {
                 run_id: "orphan".into(),
                 origin: "interactive".into(),
             },
@@ -2622,7 +2627,7 @@ mod worktree_binding_tests {
             .unwrap()
             .into_iter()
             .filter(|e| {
-                matches!(&e.kind, crate::events::AgentEventKind::RunCompleted { run_id, outcome, .. }
+                matches!(&e.kind, querymt_agent_core::events::AgentEventKind::RunCompleted { run_id, outcome, .. }
                     if run_id == "orphan" && outcome == "interrupted")
             })
             .count();
@@ -2654,9 +2659,10 @@ mod worktree_binding_tests {
             .map(|e| e.kind)
             .collect::<Vec<_>>();
         assert!(
-            kinds
-                .iter()
-                .any(|k| matches!(k, crate::events::AgentEventKind::SessionConfigured { .. })),
+            kinds.iter().any(|k| matches!(
+                k,
+                querymt_agent_core::events::AgentEventKind::SessionConfigured { .. }
+            )),
             "SessionConfigured must be persisted before finalize_session returns: {kinds:?}"
         );
     }
@@ -3152,9 +3158,11 @@ mod worktree_binding_tests {
         assert!(err.to_string().contains("already owned"), "error: {err}");
     }
 
-    fn user_message(session_id: &str, id: &str) -> crate::model::AgentMessage {
-        let mut message =
-            crate::model::AgentMessage::new(session_id.to_string(), querymt::chat::ChatRole::User);
+    fn user_message(session_id: &str, id: &str) -> querymt_agent_core::model::AgentMessage {
+        let mut message = querymt_agent_core::model::AgentMessage::new(
+            session_id.to_string(),
+            querymt::chat::ChatRole::User,
+        );
         message.id = id.to_string();
         message
     }
@@ -4505,15 +4513,18 @@ mod worktree_binding_tests {
     /// history exactly as the runtime would, scoped to an explicit workspace.
     async fn record_pre_snapshot(
         storage: &SqliteStorage,
-        backend: &crate::snapshot::GitSnapshotBackend,
+        backend: &querymt_agent_services::snapshot::GitSnapshotBackend,
         session_id: &str,
         cwd: &std::path::Path,
-    ) -> (crate::model::TurnId, crate::snapshot::SnapshotId) {
-        use crate::model::MessagePart;
-        use crate::snapshot::SnapshotBackend as _;
+    ) -> (
+        querymt_agent_core::model::TurnId,
+        querymt_agent_services::snapshot::SnapshotId,
+    ) {
+        use querymt_agent_core::model::MessagePart;
+        use querymt_agent_services::snapshot::SnapshotBackend as _;
         let snapshot_id = backend.track(cwd).await.expect("track pre snapshot");
-        let turn_id = crate::model::TurnId::new();
-        let msg = crate::model::AgentMessage {
+        let turn_id = querymt_agent_core::model::TurnId::new();
+        let msg = querymt_agent_core::model::AgentMessage {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
             role: querymt::chat::ChatRole::Assistant,
@@ -4540,14 +4551,14 @@ mod worktree_binding_tests {
     /// paths, scoped to an explicit workspace.
     async fn record_post_snapshot(
         storage: &SqliteStorage,
-        backend: &crate::snapshot::GitSnapshotBackend,
+        backend: &querymt_agent_services::snapshot::GitSnapshotBackend,
         session_id: &str,
-        turn_id: &crate::model::TurnId,
-        pre_snapshot: &crate::snapshot::SnapshotId,
+        turn_id: &querymt_agent_core::model::TurnId,
+        pre_snapshot: &querymt_agent_services::snapshot::SnapshotId,
         cwd: &std::path::Path,
     ) -> Vec<String> {
-        use crate::model::MessagePart;
-        use crate::snapshot::SnapshotBackend as _;
+        use querymt_agent_core::model::MessagePart;
+        use querymt_agent_services::snapshot::SnapshotBackend as _;
         let post_snapshot = backend.track(cwd).await.expect("track post snapshot");
         let changed = backend
             .diff(cwd, pre_snapshot, &post_snapshot)
@@ -4557,7 +4568,7 @@ mod worktree_binding_tests {
             .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect();
-        let msg = crate::model::AgentMessage {
+        let msg = querymt_agent_core::model::AgentMessage {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
             role: querymt::chat::ChatRole::Assistant,
@@ -4592,7 +4603,7 @@ mod worktree_binding_tests {
     async fn parent_undo_excludes_isolated_fork_and_fork_undo_redo_works_after_restart() {
         let fx = worktree_fixture(true).await;
         let snapshot_base = tempfile::TempDir::new().unwrap();
-        let backend = crate::snapshot::GitSnapshotBackend::new()
+        let backend = querymt_agent_services::snapshot::GitSnapshotBackend::new()
             .with_snapshot_base(snapshot_base.path().to_path_buf());
 
         // Parent: a plain local session in the real repository.
@@ -4720,7 +4731,7 @@ mod worktree_binding_tests {
         // backend over the same snapshot base. Fork-local undo rewinds the
         // fork's OWN workspace to its baseline contents; redo reapplies it.
         let restarted = SessionMaterializer::new(fx.materializer.config.clone());
-        let restarted_backend = crate::snapshot::GitSnapshotBackend::new()
+        let restarted_backend = querymt_agent_services::snapshot::GitSnapshotBackend::new()
             .with_snapshot_base(snapshot_base.path().to_path_buf());
         // The fork's copied messages carry new public ids; target the
         // copied user message (first entry of the fork's history).
@@ -4919,8 +4930,8 @@ mod worktree_binding_tests {
         // A linked worktree's `.git` file marks the checkout itself as the
         // workspace root, so each session's index resolves to its own root
         // even though both checkouts share one repository identity.
-        let root_a = crate::index::resolve_workspace_root(&cwd_a);
-        let root_b = crate::index::resolve_workspace_root(&cwd_b);
+        let root_a = querymt_agent_index::resolve_workspace_root(&cwd_a);
+        let root_b = querymt_agent_index::resolve_workspace_root(&cwd_b);
         assert_ne!(
             root_a, root_b,
             "per-workspace indexes must not share a workspace root"
@@ -4928,15 +4939,17 @@ mod worktree_binding_tests {
 
         // The index manager keys actors by root: distinct roots get
         // distinct workspace indexes (never shared by common repository).
-        let manager = crate::index::WorkspaceIndexManagerActor::new(
-            crate::index::WorkspaceIndexManagerConfig::default(),
+        let manager = querymt_agent_index::WorkspaceIndexManagerActor::new(
+            querymt_agent_index::WorkspaceIndexManagerConfig::default(),
         );
-        let handle_a = crate::index::get_or_create_workspace_with_timeout(&manager, root_a.clone())
-            .await
-            .expect("index a");
-        let handle_b = crate::index::get_or_create_workspace_with_timeout(&manager, root_b.clone())
-            .await
-            .expect("index b");
+        let handle_a =
+            querymt_agent_index::get_or_create_workspace_with_timeout(&manager, root_a.clone())
+                .await
+                .expect("index a");
+        let handle_b =
+            querymt_agent_index::get_or_create_workspace_with_timeout(&manager, root_b.clone())
+                .await
+                .expect("index b");
         // The initial index snapshot carries its workspace root.
         let index_a = handle_a.file_index().expect("index a initialized");
         let index_b = handle_b.file_index().expect("index b initialized");

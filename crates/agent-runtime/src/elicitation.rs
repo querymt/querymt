@@ -6,7 +6,7 @@
 //!
 //! All elicitation requests flow through the same event system and pending map.
 
-pub use crate::core_staging::elicitation::{ElicitationAction, ElicitationResponse};
+pub use querymt_agent_core::elicitation::{ElicitationAction, ElicitationResponse};
 use rmcp::RoleClient;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
@@ -81,7 +81,7 @@ pub enum InteractionKind {
     },
 }
 
-pub use crate::core_staging::elicitation::PERMISSION_OPTION_KEY;
+pub use querymt_agent_core::elicitation::PERMISSION_OPTION_KEY;
 
 pub struct PendingElicitationRegistration {
     pub session_id: String,
@@ -1232,7 +1232,7 @@ async fn take_from_pending_map(
 ///   [`McpToolState`][crate::agent::core::McpToolState].
 pub struct McpClientHandler {
     pending: PendingElicitationMap,
-    event_sink: Arc<crate::event_sink::EventSink>,
+    event_sink: Arc<querymt_agent_services::event_sink::EventSink>,
     server_name: String,
     session_id: String,
     client_impl: Implementation,
@@ -1248,7 +1248,7 @@ pub struct McpClientHandler {
 impl McpClientHandler {
     pub fn new(
         pending: PendingElicitationMap,
-        event_sink: Arc<crate::event_sink::EventSink>,
+        event_sink: Arc<querymt_agent_services::event_sink::EventSink>,
         server_name: String,
         session_id: String,
         client_impl: Implementation,
@@ -1339,7 +1339,7 @@ impl McpClientHandler {
             .event_sink
             .emit_durable(
                 &self.session_id,
-                crate::events::AgentEventKind::ElicitationRequested {
+                querymt_agent_core::events::AgentEventKind::ElicitationRequested {
                     elicitation_id: elicitation_id.clone(),
                     session_id: self.session_id.clone(),
                     message,
@@ -1357,16 +1357,17 @@ impl McpClientHandler {
 
         // Journal how the question ended. The submitted form content is
         // never recorded, so no selection is attached.
-        let outcome = response
-            .as_ref()
-            .map_or(crate::events::ElicitationOutcome::Cancelled, |response| {
-                crate::events::ElicitationOutcome::from_action(&response.action)
-            });
+        let outcome = response.as_ref().map_or(
+            querymt_agent_core::events::ElicitationOutcome::Cancelled,
+            |response| {
+                querymt_agent_core::events::ElicitationOutcome::from_action(&response.action)
+            },
+        );
         if let Err(err) = self
             .event_sink
             .emit_durable(
                 &self.session_id,
-                crate::events::AgentEventKind::ElicitationResolved {
+                querymt_agent_core::events::AgentEventKind::ElicitationResolved {
                     elicitation_id,
                     session_id: self.session_id.clone(),
                     outcome,
@@ -1519,15 +1520,15 @@ mod tests {
     /// Covers session-interactions / Server elicitation content is not recorded.
     #[tokio::test]
     async fn server_elicitation_content_is_not_recorded() {
-        use crate::events::{AgentEventKind, ElicitationOutcome};
         use crate::session::backend::StorageBackend;
+        use querymt_agent_core::events::{AgentEventKind, ElicitationOutcome};
 
         let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
             .await
             .unwrap();
-        let event_sink = Arc::new(crate::event_sink::EventSink::new(
+        let event_sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
             storage.event_journal(),
-            Arc::new(crate::event_fanout::EventFanout::new()),
+            Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
         ));
         let pending = PendingElicitationMap::default();
         let handler = McpClientHandler::new(

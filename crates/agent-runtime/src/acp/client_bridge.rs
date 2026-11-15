@@ -102,8 +102,10 @@ pub enum ClientBridgeMessage {
     /// The client (VS Code extension) handles it by calling VS Code language APIs
     /// and returns the result.
     WorkspaceQuery {
-        query: crate::workspace_query::WorkspaceQueryRequest,
-        response_tx: oneshot::Sender<Result<crate::workspace_query::WorkspaceQueryResponse, Error>>,
+        query: querymt_agent_services::workspace_query::WorkspaceQueryRequest,
+        response_tx: oneshot::Sender<
+            Result<querymt_agent_services::workspace_query::WorkspaceQueryResponse, Error>,
+        >,
     },
 }
 
@@ -172,11 +174,11 @@ pub struct ClientBridgeSender {
 }
 
 #[async_trait::async_trait]
-impl crate::workspace_query::WorkspaceQueryBridge for ClientBridgeSender {
+impl querymt_agent_services::workspace_query::WorkspaceQueryBridge for ClientBridgeSender {
     async fn workspace_query(
         &self,
-        query: crate::workspace_query::WorkspaceQueryRequest,
-    ) -> Result<crate::workspace_query::WorkspaceQueryResponse, Error> {
+        query: querymt_agent_services::workspace_query::WorkspaceQueryRequest,
+    ) -> Result<querymt_agent_services::workspace_query::WorkspaceQueryResponse, Error> {
         ClientBridgeSender::workspace_query(self, query).await
     }
 }
@@ -297,8 +299,8 @@ impl ClientBridgeSender {
     /// - The client does not support workspace queries
     pub async fn workspace_query(
         &self,
-        query: crate::workspace_query::WorkspaceQueryRequest,
-    ) -> Result<crate::workspace_query::WorkspaceQueryResponse, Error> {
+        query: querymt_agent_services::workspace_query::WorkspaceQueryRequest,
+    ) -> Result<querymt_agent_services::workspace_query::WorkspaceQueryResponse, Error> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
             .send(ClientBridgeMessage::WorkspaceQuery { query, response_tx })

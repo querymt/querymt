@@ -21,13 +21,13 @@
 //! the same order.
 
 use crate::event_fanout::EventFanout;
-use crate::events::{
-    AgentEventKind, Durability, DurableEvent, EphemeralEvent, EventEnvelope, EventOrigin,
-    classify_durability,
-};
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::projection::{EventJournal, NewDurableEvent};
 use parking_lot::Mutex;
+use querymt_agent_core::events::{
+    AgentEventKind, Durability, DurableEvent, EphemeralEvent, EventEnvelope, EventOrigin,
+    classify_durability,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -459,7 +459,7 @@ async fn run_writer(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<WriterM
 mod tests {
     use super::*;
     use crate::session::backend::StorageBackend;
-    use crate::session::sqlite_storage::SqliteStorage;
+    use querymt_agent_sqlite::session::sqlite_storage::SqliteStorage;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     async fn make_stream(session_id: &str) -> (Arc<SessionEventStream>, Arc<EventFanout>) {

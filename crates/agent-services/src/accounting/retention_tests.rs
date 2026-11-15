@@ -4,14 +4,14 @@
 //! behind pruning and rewind, so it is exercised directly and through the
 //! real rewind cleanup entry point.
 
-use crate::accounting::tests::{sample_settlement, sample_start};
 use crate::accounting::{AttemptRecorder, SessionAccounting};
 use crate::event_fanout::EventFanout;
-use crate::events::{AgentEventKind, EventOrigin, ExecutionMetrics};
 use crate::session::backend::StorageBackend;
 use crate::session::projection::{EventJournal, NewDurableEvent};
-use crate::session::sqlite_storage::SqliteStorage;
 use crate::session_event_stream::SessionEventStream;
+use querymt_agent_core::accounting::samples::{sample_settlement, sample_start};
+use querymt_agent_core::events::{AgentEventKind, EventOrigin, ExecutionMetrics};
+use querymt_agent_sqlite::session::sqlite_storage::SqliteStorage;
 use std::sync::Arc;
 
 fn cost() -> f64 {
@@ -225,10 +225,10 @@ async fn explicit_full_session_deletion_is_still_allowed() {
 /// its own identities, and the source keeps its spend.
 mod fork {
     use super::*;
-    use crate::model::{AgentMessage, MessagePart};
     use crate::session::domain::ForkOrigin;
     use crate::session::store::SessionStore;
     use querymt::chat::ChatRole;
+    use querymt_agent_core::model::{AgentMessage, MessagePart};
 
     struct Forked {
         storage: Arc<SqliteStorage>,
@@ -514,12 +514,16 @@ mod coverage {
             .await
             .unwrap()
             .public_id;
-        let mut message =
-            crate::model::AgentMessage::new(source.clone(), querymt::chat::ChatRole::Assistant);
+        let mut message = querymt_agent_core::model::AgentMessage::new(
+            source.clone(),
+            querymt::chat::ChatRole::Assistant,
+        );
         message.id = "assistant-1".into();
-        message.parts.push(crate::model::MessagePart::Text {
-            content: "old".into(),
-        });
+        message
+            .parts
+            .push(querymt_agent_core::model::MessagePart::Text {
+                content: "old".into(),
+            });
         storage.add_message(&source, message).await.unwrap();
         let journal = storage.event_journal();
         append(

@@ -6,18 +6,18 @@
 //! Runtime totals, cycle scopes, ACP replay metadata and the ATIF export must
 //! all agree with the recorded attempts.
 
-use crate::accounting::{
+use crate::session::backend::StorageBackend;
+use crate::session::sqlite_storage::SqliteStorage;
+use querymt::providers::{ModelPricing, value_usage};
+use querymt::{CacheWriteTiers, Usage};
+use querymt_agent_core::accounting::samples::{sample_settlement, sample_start};
+use querymt_agent_core::events::AgentEvent;
+use querymt_agent_services::accounting::{
     AccountingSnapshot, AttemptOutcome, AttemptPurpose, AttemptRecorder, CycleAccounting,
     SessionAccounting,
 };
-use crate::core_staging::accounting::samples::{sample_settlement, sample_start};
-use crate::event_fanout::EventFanout;
-use crate::events::AgentEvent;
-use crate::session::backend::StorageBackend;
-use crate::session::sqlite_storage::SqliteStorage;
-use crate::session_event_stream::SessionEventStream;
-use querymt::providers::{ModelPricing, value_usage};
-use querymt::{CacheWriteTiers, Usage};
+use querymt_agent_services::event_fanout::EventFanout;
+use querymt_agent_services::session_event_stream::SessionEventStream;
 use std::sync::Arc;
 
 const SESSION: &str = "sess-1";
@@ -291,9 +291,9 @@ async fn mixed_scenario_agrees_across_runtime_restart_acp_and_export() {
     )));
 
     // The export's total and attempt list match the recorded attempts.
-    let mut builder = crate::export::ATIFBuilder::new(
+    let mut builder = querymt_agent_services::export::ATIFBuilder::new(
         SESSION.to_string(),
-        &crate::export::AtifExportOptions::default(),
+        &querymt_agent_services::export::AtifExportOptions::default(),
     );
     builder.process_events(&journal_events);
     let atif = builder.build().to_json_value().unwrap();
@@ -319,23 +319,26 @@ async fn mixed_scenario_agrees_across_runtime_restart_acp_and_export() {
 // ── SessionRuntime ownership of the accounting projection ──
 
 mod runtime_projection {
-    use crate::accounting::{AttemptRecorder, SessionAccounting};
-    use crate::core_staging::accounting::samples::{sample_settlement, sample_start};
-    use crate::event_fanout::EventFanout;
-    use crate::events::AgentEventKind;
     use crate::session::backend::StorageBackend;
     use crate::session::sqlite_storage::SqliteStorage;
-    use crate::session_event_stream::SessionEventStream;
+    use querymt_agent_core::accounting::samples::{sample_settlement, sample_start};
+    use querymt_agent_core::events::AgentEventKind;
+    use querymt_agent_services::accounting::{AttemptRecorder, SessionAccounting};
+    use querymt_agent_services::event_fanout::EventFanout;
+    use querymt_agent_services::session_event_stream::SessionEventStream;
     use std::sync::Arc;
 
-    fn start_for(id: &str, cycle: &str) -> crate::accounting::AttemptStart {
+    fn start_for(id: &str, cycle: &str) -> querymt_agent_services::accounting::AttemptStart {
         let mut s = sample_start();
         s.attempt.attempt_id = id.into();
         s.attempt.cycle_id = cycle.into();
         s
     }
 
-    fn settlement_for(id: &str, cycle: &str) -> crate::accounting::AttemptSettlement {
+    fn settlement_for(
+        id: &str,
+        cycle: &str,
+    ) -> querymt_agent_services::accounting::AttemptSettlement {
         let mut s = sample_settlement();
         s.attempt.attempt_id = id.into();
         s.attempt.cycle_id = cycle.into();
@@ -381,7 +384,7 @@ mod runtime_projection {
         record_history(&storage, None).await;
 
         let runtime = SessionRuntime::new(None, HashMap::new(), McpToolState::empty());
-        let sink = crate::event_sink::EventSink::new(
+        let sink = querymt_agent_services::event_sink::EventSink::new(
             storage.event_journal(),
             Arc::new(EventFanout::new()),
         );

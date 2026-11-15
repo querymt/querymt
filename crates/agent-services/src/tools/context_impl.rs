@@ -8,10 +8,10 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::elicitation::{ElicitationAction, ElicitationResponse};
 use crate::event_sink::EventSink;
 use crate::knowledge::{KnowledgeStore, ScopePolicy};
 use crate::tools::context::{QuestionOption, ToolContext, ToolError};
+use querymt_agent_core::elicitation::{ElicitationAction, ElicitationResponse};
 
 /// A request to elicit information from the user, sent from tool context to the agent
 pub struct ElicitationRequest {
@@ -256,7 +256,7 @@ impl ToolContext for AgentToolContext {
         self.scope_policy.clone()
     }
 
-    fn emit_event(&self, kind: crate::events::AgentEventKind) {
+    fn emit_event(&self, kind: querymt_agent_core::events::AgentEventKind) {
         if let Some(ref sink) = self.event_sink {
             sink.session_stream(&self.session_id).emit(kind);
         }
@@ -451,7 +451,7 @@ mod tests {
             option["_meta"]["querymt"]["description"],
             "Deploy to the customer-facing environment"
         );
-        serde_json::from_value::<crate::core_staging::protocol::ElicitationSchema>(schema)
+        serde_json::from_value::<querymt_agent_core::protocol::ElicitationSchema>(schema)
             .expect("question schema should be valid ACP elicitation schema");
     }
 
@@ -475,7 +475,7 @@ mod tests {
             selection["items"]["anyOf"][1]["_meta"]["querymt"]["description"],
             "Customer traffic"
         );
-        serde_json::from_value::<crate::core_staging::protocol::ElicitationSchema>(schema)
+        serde_json::from_value::<querymt_agent_core::protocol::ElicitationSchema>(schema)
             .expect("multi-select schema should be valid ACP elicitation schema");
     }
 }

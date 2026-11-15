@@ -76,7 +76,7 @@ pub(crate) fn io_err<'a>(
 /// Convenience `Result` alias for snapshot operations.
 pub type SnapshotResult<T> = Result<T, SnapshotError>;
 
-pub use crate::core_staging::snapshot_id::SnapshotId;
+pub use querymt_agent_core::snapshot_id::SnapshotId;
 
 /// Configuration for garbage collection of old snapshots.
 ///
@@ -98,8 +98,8 @@ impl GcConfig {
     }
 }
 
-impl From<&crate::core_staging::config::execution::SnapshotBackendConfig> for GcConfig {
-    fn from(config: &crate::core_staging::config::execution::SnapshotBackendConfig) -> Self {
+impl From<&querymt_agent_core::config::execution::SnapshotBackendConfig> for GcConfig {
+    fn from(config: &querymt_agent_core::config::execution::SnapshotBackendConfig) -> Self {
         Self {
             max_snapshots: config.max_snapshots,
             max_age_days: config.max_age_days,

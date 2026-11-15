@@ -4,12 +4,12 @@ use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig};
 use crate::agent::objective::RunObjective;
 use crate::knowledge::KnowledgeStore;
-use crate::model::AgentMessage;
 use crate::session::error::SessionResult;
 use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::{LLMConfig, SessionExecutionConfig};
 use crate::tools::AgentToolContext;
+use querymt_agent_core::model::AgentMessage;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -89,13 +89,13 @@ pub(crate) struct ExecutionContext {
         std::sync::Mutex<Option<crate::knowledge::repository::budget::DeliveryBudget>>,
 
     /// Optional event sink, propagated into tool contexts so tools can emit agent events.
-    pub event_sink: Option<Arc<crate::event_sink::EventSink>>,
+    pub event_sink: Option<Arc<querymt_agent_services::event_sink::EventSink>>,
 
     /// Optional workspace query bridge for VS Code language intelligence.
     pub workspace_query_bridge: Option<ClientBridgeSender>,
     /// The run this execution belongs to. Set at construction and never
     /// changes: hook payloads, run events and snapshot records all carry it.
-    turn_id: crate::model::TurnId,
+    turn_id: querymt_agent_core::model::TurnId,
     /// Agent mode captured at turn start for this execution.
     pub turn_mode: AgentMode,
     /// Inbox bound to this run for boundary-safe steering.
@@ -110,10 +110,11 @@ pub(crate) struct ExecutionContext {
     /// Immutable accounting handle for this execution cycle, created at the
     /// cycle boundary. Cycle spend starts at zero; session spend is retained
     /// by the session-owned projection it points at.
-    pub cycle_accounting: tokio::sync::OnceCell<crate::accounting::CycleAccounting>,
+    pub cycle_accounting:
+        tokio::sync::OnceCell<querymt_agent_services::accounting::CycleAccounting>,
     /// Budget-uncertainty reasons already reported for this cycle, so
     /// repeated step-start snapshots never repeat a warning.
-    pub budget_warnings: crate::accounting::BudgetWarnings,
+    pub budget_warnings: querymt_agent_services::accounting::BudgetWarnings,
     /// Retains a supplementary terminal read across bounded BeforeModel reconciliation.
     pub suspended_recovery: tokio::sync::Mutex<Option<crate::agent::execution::DelegationRecovery>>,
     /// Turn-scoped tool lookup (session tools over the agent registry),
@@ -125,7 +126,7 @@ impl ExecutionContext {
     /// Create a new execution context for the run `turn_id`.
     pub fn new(
         session_id: String,
-        turn_id: crate::model::TurnId,
+        turn_id: querymt_agent_core::model::TurnId,
         runtime: Arc<SessionRuntime>,
         state: RuntimeContext,
         session_handle: SessionHandle,
@@ -206,7 +207,10 @@ impl ExecutionContext {
     }
 
     /// Set the event sink for this context.
-    pub fn with_event_sink(mut self, sink: Arc<crate::event_sink::EventSink>) -> Self {
+    pub fn with_event_sink(
+        mut self,
+        sink: Arc<querymt_agent_services::event_sink::EventSink>,
+    ) -> Self {
         self.event_sink = Some(sink);
         self
     }
@@ -246,7 +250,10 @@ impl ExecutionContext {
         self
     }
 
-    pub fn with_cycle_accounting(self, cycle: crate::accounting::CycleAccounting) -> Self {
+    pub fn with_cycle_accounting(
+        self,
+        cycle: querymt_agent_services::accounting::CycleAccounting,
+    ) -> Self {
         let _ = self.cycle_accounting.set(cycle);
         self
     }
@@ -255,12 +262,17 @@ impl ExecutionContext {
     /// session-owned projection. A cycle has exactly one identity.
     pub(crate) async fn cycle_accounting(
         &self,
-        sink: &crate::event_sink::EventSink,
-    ) -> Result<&crate::accounting::CycleAccounting, crate::accounting::AccountingError> {
+        sink: &querymt_agent_services::event_sink::EventSink,
+    ) -> Result<
+        &querymt_agent_services::accounting::CycleAccounting,
+        querymt_agent_services::accounting::AccountingError,
+    > {
         self.cycle_accounting
             .get_or_try_init(|| async {
                 let accounting = self.runtime.accounting(&self.session_id, sink).await?;
-                Ok(crate::accounting::CycleAccounting::begin(accounting))
+                Ok(querymt_agent_services::accounting::CycleAccounting::begin(
+                    accounting,
+                ))
             })
             .await
     }
@@ -298,7 +310,7 @@ impl ExecutionContext {
 
     /// The id of the run this execution belongs to. Work that happens inside
     /// a run (native `/compact`, maintenance compaction) uses the run's id.
-    pub fn turn_id(&self) -> crate::model::TurnId {
+    pub fn turn_id(&self) -> querymt_agent_core::model::TurnId {
         self.turn_id
     }
 
@@ -399,7 +411,7 @@ mod tests {
         let session_id = handle.session().public_id.clone();
         let ctx = ExecutionContext::new(
             session_id.clone(),
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -413,7 +425,7 @@ mod tests {
         let (runtime, runtime_ctx, handle) = make_context_parts().await;
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -428,7 +440,7 @@ mod tests {
         let (runtime, runtime_ctx, handle) = make_context_with_cwd(cwd.clone()).await;
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -443,7 +455,7 @@ mod tests {
         let token = CancellationToken::new();
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -462,7 +474,7 @@ mod tests {
         let (runtime, runtime_ctx, handle) = make_context_parts().await;
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -477,7 +489,7 @@ mod tests {
         let (runtime, runtime_ctx, handle) = make_context_parts().await;
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -500,7 +512,7 @@ mod tests {
         let (runtime, runtime_ctx, handle) = make_context_parts().await;
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -530,7 +542,7 @@ mod tests {
         runtime.mutation_gate.set(gate.clone()).unwrap();
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -551,7 +563,7 @@ mod tests {
         let (runtime, runtime_ctx, handle) = make_context_parts().await;
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,
@@ -582,7 +594,7 @@ mod tests {
         let (runtime, runtime_ctx, handle) = make_context_parts().await;
         let ctx = ExecutionContext::new(
             handle.session().public_id.clone(),
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             runtime,
             runtime_ctx,
             handle,

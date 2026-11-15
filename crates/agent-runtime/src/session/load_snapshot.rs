@@ -1,13 +1,13 @@
 use crate::acp::protocol::ContentBlock;
 use crate::agent::LocalAgentHandle;
-pub use crate::core_staging::stream_cursor::{StreamCursor, observe_cursor};
-use crate::events::AgentEvent;
-use crate::model::MessagePart;
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::history_window::{
     HistoryInfo, LoadWindow, SessionHistorySummary, TruncatedEntry, read_window, summarize_history,
 };
 use crate::session::projection::{AuditView, ViewStore};
+use querymt_agent_core::events::AgentEvent;
+use querymt_agent_core::model::MessagePart;
+pub use querymt_agent_core::stream_cursor::{StreamCursor, observe_cursor};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -38,10 +38,10 @@ pub struct SessionLoadSnapshot {
     /// audit events by the shared accounting reducer. Present even when
     /// historical replay is skipped or the context limit is unknown.
     #[typeshare(serialized_as = "AccountingSnapshot")]
-    pub accounting: crate::accounting::AccountingSnapshot,
+    pub accounting: querymt_agent_services::accounting::AccountingSnapshot,
     #[serde(rename = "delegationUpdates")]
     pub delegation_updates:
-        Vec<crate::core_staging::delegation_update::DelegationUpdateNotification>,
+        Vec<querymt_agent_core::delegation_update::DelegationUpdateNotification>,
     #[serde(
         default,
         rename = "userPrompts",
@@ -86,7 +86,7 @@ pub(crate) fn filter_prompt_records(
 pub(crate) fn prompt_message_ids(events: &[AgentEvent]) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for event in events {
-        if let crate::events::AgentEventKind::PromptReceived {
+        if let querymt_agent_core::events::AgentEventKind::PromptReceived {
             message_id: Some(id),
             ..
         } = &event.kind
@@ -116,7 +116,7 @@ pub(crate) fn merge_prompt_records(into: &mut Vec<UserPromptRecord>, more: Vec<U
 }
 
 pub(crate) fn user_prompt_records(
-    messages: &[crate::model::AgentMessage],
+    messages: &[querymt_agent_core::model::AgentMessage],
 ) -> Vec<UserPromptRecord> {
     messages
         .iter()
@@ -186,7 +186,7 @@ pub async fn load_session_snapshot_windowed(
             event.seq = position;
         }
     }
-    let accounting = crate::accounting::AccountingSnapshot::from_events(
+    let accounting = querymt_agent_services::accounting::AccountingSnapshot::from_events(
         session_id,
         audit.events.iter().map(|event| &event.kind),
     );
@@ -404,7 +404,6 @@ mod tests {
     use super::{SessionLoadSnapshot, load_session_snapshot, user_prompt_records};
     use crate::acp::protocol::{ContentBlock, ImageContent, TextContent};
     use crate::agent::agent_config_builder::AgentConfigBuilder;
-    use crate::model::{AgentMessage, MessagePart};
     use crate::session::backend::StorageBackend;
     use crate::session::error::{SessionError, SessionResult};
     use crate::session::projection::{
@@ -415,6 +414,7 @@ mod tests {
     use crate::session::provider::SessionProvider;
     use crate::session::store::{RemoteSessionBookmark, SessionStore};
     use crate::test_utils::{MockSessionStore, empty_plugin_registry};
+    use querymt_agent_core::model::{AgentMessage, MessagePart};
 
     #[test]
     fn user_prompt_projection_preserves_message_identity_order_and_blocks() {
@@ -566,8 +566,8 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_reconciles_orphaned_run_unless_lease_is_held() {
-        use crate::events::AgentEventKind;
         use crate::session::run_reconcile::tests::{fixture, seed, started};
+        use querymt_agent_core::events::AgentEventKind;
 
         let f = fixture().await;
         let agent = crate::agent::LocalAgentHandle::from_config(f.config.clone());
@@ -628,7 +628,7 @@ mod tests {
             },
             "cursor": {"local_seq": 0, "remote_seq_by_source": {}},
             "accounting": serde_json::to_value(
-                crate::accounting::AccountingSnapshot::default()
+                querymt_agent_services::accounting::AccountingSnapshot::default()
             ).unwrap(),
             "delegationUpdates": []
         });
@@ -800,8 +800,8 @@ mod tests {
     /// is its history position (the owner's `source_seq`).
     #[tokio::test]
     async fn remote_snapshot_is_owner_ordered_covered_only_with_history_positions() {
-        use crate::events::{AgentEventKind, EventOrigin};
         use crate::session::projection::NewDurableEvent;
+        use querymt_agent_core::events::{AgentEventKind, EventOrigin};
 
         let storage = Arc::new(
             crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())

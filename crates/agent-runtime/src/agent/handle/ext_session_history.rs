@@ -7,13 +7,13 @@
 
 use super::utils::ext_json_response;
 use super::*;
-use crate::events::AgentEvent;
 use crate::session::history_window::{
     HistoryInfo, LoadWindow, ToolContentPart, TruncatedEntry, find_tool_content,
     parse_history_token, read_window,
 };
 use crate::session::projection::EventJournal;
 use crate::session::store::RemoteSessionBookmark;
+use querymt_agent_core::events::AgentEvent;
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 

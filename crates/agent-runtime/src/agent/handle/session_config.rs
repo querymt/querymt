@@ -98,7 +98,7 @@ impl LocalAgentHandle {
     }
 
     /// Returns the session limits from configured middleware
-    pub fn get_session_limits(&self) -> Option<crate::events::SessionLimits> {
+    pub fn get_session_limits(&self) -> Option<querymt_agent_core::events::SessionLimits> {
         self.config.get_session_limits()
     }
 

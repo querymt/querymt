@@ -12,8 +12,6 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/test-agent.yml'
-      - 'scripts/check-agent-layering.py'
-      - 'scripts/agent-layering-allowance.json'
   pull_request:
     paths:
       - 'crates/agent*/**'
@@ -24,8 +22,6 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/test-agent.yml'
-      - 'scripts/check-agent-layering.py'
-      - 'scripts/agent-layering-allowance.json'
 
 permissions:
   contents: read
@@ -58,10 +54,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
-
-      # Cheap and dependency-free, so it runs before the toolchain and clippy.
-      - name: Check agent layering
-        run: python3 scripts/check-agent-layering.py
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

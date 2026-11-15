@@ -544,9 +544,9 @@ impl McpHarness {
         let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
             .await
             .expect("in-memory storage");
-        let event_sink = Arc::new(crate::event_sink::EventSink::new(
+        let event_sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
             storage.event_journal(),
-            Arc::new(crate::event_fanout::EventFanout::new()),
+            Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
         ));
         let shared = Arc::new(Shared {
             skills: Mutex::new(options.skills.clone().map(|skills| SkillsScript {

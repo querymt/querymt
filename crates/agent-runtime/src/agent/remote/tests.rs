@@ -13,7 +13,6 @@ use crate::agent::core::{AgentMode, SessionRuntime};
 use crate::agent::remote::SessionActorRef;
 use crate::agent::session_actor::SessionActor;
 use crate::agent::session_registry::SessionRegistry;
-use crate::events::{AgentEvent, AgentEventKind, EventOrigin};
 use crate::session::backend::StorageBackend;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::test_utils::{
@@ -22,6 +21,7 @@ use crate::test_utils::{
 use kameo::actor::Spawn;
 use querymt::LLMParams;
 use querymt::chat::ReasoningEffort;
+use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventOrigin};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -717,8 +717,8 @@ async fn test_registry_overwrite() {
 mod event_relay_extended {
     use super::*;
     use crate::agent::remote::event_relay::{EventRelayActor, RelayedEvent};
-    use crate::event_fanout::EventFanout;
-    use crate::event_sink::EventSink;
+    use querymt_agent_services::event_fanout::EventFanout;
+    use querymt_agent_services::event_sink::EventSink;
 
     /// Create an EventSink backed by an in-memory journal.
     async fn make_sink() -> Arc<EventSink> {
@@ -872,7 +872,7 @@ mod event_relay_extended {
                 .expect("recv should succeed");
 
             assert_eq!(received.session_id(), expected_event.session_id);
-            if let crate::events::EventEnvelope::Durable(de) = &received {
+            if let querymt_agent_core::events::EventEnvelope::Durable(de) = &received {
                 assert!(de.stream_seq >= 1, "journal-assigned seq must be >= 1");
                 received_seqs.push(de.stream_seq);
             } else {
@@ -1044,7 +1044,7 @@ mod event_forwarder_stub {
     #[test]
     #[should_panic(expected = "requires the 'remote' feature")]
     fn test_stub_panics_on_start() {
-        let fanout = std::sync::Arc::new(crate::event_fanout::EventFanout::new());
+        let fanout = std::sync::Arc::new(querymt_agent_services::event_fanout::EventFanout::new());
         let _ = EventForwarder::start(fanout, (), "test".to_string(), "sess".to_string());
     }
 }
@@ -1064,11 +1064,11 @@ mod node_manager_tests {
         ResumeRemoteSession, SessionHandoff, StopRemoteSessionRuntime,
     };
     use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
-    use crate::model::{AgentMessage, MessagePart};
     use crate::session::domain::IntentSnapshot;
     use kameo::actor::{ActorRef, Spawn};
     use kameo::error::{RemoteSendError, SendError};
     use querymt::chat::ChatRole;
+    use querymt_agent_core::model::{AgentMessage, MessagePart};
     use std::time::Duration;
     use tokio::sync::Mutex;
     use uuid::Uuid;
@@ -1820,7 +1820,7 @@ mod node_manager_tests {
         config
             .emit_event_persisted(
                 &resp.session_id,
-                crate::events::AgentEventKind::SessionCreated,
+                querymt_agent_core::events::AgentEventKind::SessionCreated,
             )
             .await
             .expect("persist SessionCreated event");
@@ -1828,7 +1828,10 @@ mod node_manager_tests {
         // Force the wrapper's full-history read to cross a remote page boundary.
         for _ in 0..crate::agent::messages::MAX_EVENT_STREAM_PAGE_SIZE + 1 {
             config
-                .emit_event_persisted(&resp.session_id, crate::events::AgentEventKind::Cancelled)
+                .emit_event_persisted(
+                    &resp.session_id,
+                    querymt_agent_core::events::AgentEventKind::Cancelled,
+                )
                 .await
                 .expect("persist paging event");
         }
@@ -1866,7 +1869,7 @@ mod node_manager_tests {
             other => panic!("expected DirectRemote handoff, got {other:?}"),
         };
 
-        let events: Vec<crate::events::AgentEvent> = tokio::time::timeout(
+        let events: Vec<querymt_agent_core::events::AgentEvent> = tokio::time::timeout(
             control_timeout,
             querymt_remote::ask_remote_with_timeout(&session_ref, &GetEventStream, control_timeout),
         )

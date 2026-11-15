@@ -21,9 +21,6 @@ mod schema;
 mod single;
 mod tools;
 
-pub use crate::core_staging::config::execution::*;
-pub use crate::core_staging::config::mcp::*;
-pub use crate::core_staging::config::workspace::WorkspaceSettings;
 pub use crate::knowledge::repository::settings::{
     REPOSITORY_KNOWLEDGE_MAX_DELIVERY_BYTES, REPOSITORY_KNOWLEDGE_MAX_DELIVERY_CARDS,
     REPOSITORY_KNOWLEDGE_MAX_DELIVERY_TOKENS, REPOSITORY_KNOWLEDGE_MAX_RESPONSE_BYTES,
@@ -38,6 +35,9 @@ pub use mesh::*;
 pub use permissions::*;
 pub use prompt::SystemPart;
 pub(crate) use prompt::{deserialize_system_parts, resolve_system_parts};
+pub use querymt_agent_core::config::execution::*;
+pub use querymt_agent_core::config::mcp::*;
+pub use querymt_agent_core::config::workspace::WorkspaceSettings;
 pub use quorum::*;
 pub use schema::{schema_for_system_parts, schema_for_value};
 pub use single::*;

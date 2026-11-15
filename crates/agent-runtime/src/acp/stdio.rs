@@ -36,9 +36,9 @@ use crate::acp::shared::{
     convert_elicitation_response, create_elicitation_request, input_state_from_event,
 };
 use crate::acp::shutdown;
-use crate::event_fanout::EventFanout;
 use crate::send_agent::SendAgent;
 use agent_client_protocol::{self as acp, ByteStreams, ConnectionTo};
+use querymt_agent_services::event_fanout::EventFanout;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -55,14 +55,14 @@ pub struct AcpSessionLoadOutcome {
 }
 
 fn stored_user_prompt_blocks(
-    history: Vec<crate::model::AgentMessage>,
+    history: Vec<querymt_agent_core::model::AgentMessage>,
 ) -> HashMap<String, Vec<crate::acp::protocol::ContentBlock>> {
     history
         .into_iter()
         .filter_map(|message| {
             let blocks = message.parts.into_iter().find_map(|part| match part {
-                crate::model::MessagePart::Prompt { blocks }
-                | crate::model::MessagePart::Steering { blocks, .. } => Some(blocks),
+                querymt_agent_core::model::MessagePart::Prompt { blocks }
+                | querymt_agent_core::model::MessagePart::Steering { blocks, .. } => Some(blocks),
                 _ => None,
             })?;
             Some((message.id, blocks))
@@ -96,7 +96,7 @@ async fn actorless_replay_sources(
     session_id: &str,
 ) -> Result<
     Option<(
-        Vec<crate::events::AgentEvent>,
+        Vec<querymt_agent_core::events::AgentEvent>,
         HashMap<String, Vec<crate::acp::protocol::ContentBlock>>,
     )>,
     acp::Error,
@@ -131,7 +131,7 @@ async fn actorless_replay_sources(
         .await
         .map_err(|err| internal("events", &err))?
         .into_iter()
-        .map(crate::events::AgentEvent::from)
+        .map(querymt_agent_core::events::AgentEvent::from)
         .collect();
     let history = config
         .provider
@@ -600,9 +600,9 @@ async fn forward_stdio_event(
     bridge: &ClientBridgeSender,
     forwarded_elicitations: &Arc<Mutex<HashSet<(String, String)>>>,
     translator: &Arc<Mutex<AcpLiveEventTranslator>>,
-    event: &crate::events::EventEnvelope,
+    event: &querymt_agent_core::events::EventEnvelope,
 ) -> StdioFlow {
-    if let crate::events::AgentEventKind::ElicitationRequested {
+    if let querymt_agent_core::events::AgentEventKind::ElicitationRequested {
         elicitation_id,
         session_id,
         message,
@@ -685,7 +685,7 @@ async fn forward_stdio_event(
         return StdioFlow::Skipped;
     }
 
-    if let crate::events::AgentEventKind::PermissionRequested {
+    if let querymt_agent_core::events::AgentEventKind::PermissionRequested {
         permission_id,
         request: Some(request),
         ..
@@ -722,7 +722,9 @@ async fn forward_stdio_event(
         };
         (delegation_update, session_updates)
     };
-    let result = if let crate::events::AgentEventKind::RuntimeChanged { runtime } = event.kind() {
+    let result = if let querymt_agent_core::events::AgentEventKind::RuntimeChanged { runtime } =
+        event.kind()
+    {
         match serde_json::value::RawValue::from_string(
             serde_json::json!({
                 "version": 1, "session_id": event.session_id(), "runtime": runtime
@@ -739,7 +741,9 @@ async fn forward_stdio_event(
             }
             Err(error) => Err(acp::Error::into_internal_error(error)),
         }
-    } else if let crate::events::AgentEventKind::DelegateModelsChanged { revision } = event.kind() {
+    } else if let querymt_agent_core::events::AgentEventKind::DelegateModelsChanged { revision } =
+        event.kind()
+    {
         let notification =
             crate::acp::shared::delegate_models_changed_notification(event.session_id(), *revision);
         let params = serde_json::value::RawValue::from_string(notification["params"].to_string())
@@ -756,7 +760,7 @@ async fn forward_stdio_event(
             }
             Err(error) => Err(error),
         }
-    } else if let crate::events::AgentEventKind::McpServerAuthRequired {
+    } else if let querymt_agent_core::events::AgentEventKind::McpServerAuthRequired {
         server_name,
         provider_id,
         error,
@@ -1423,20 +1427,20 @@ mod stdio_tests {
     use tokio::time::{Duration, timeout};
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-    fn assert_structured_user_message_replay(prompt_part: crate::model::MessagePart) {
-        let event = crate::events::AgentEvent {
+    fn assert_structured_user_message_replay(prompt_part: querymt_agent_core::model::MessagePart) {
+        let event = querymt_agent_core::events::AgentEvent {
             session_seq: 0,
             seq: 1,
             timestamp: 1,
             session_id: "s-1".to_string(),
-            origin: crate::events::EventOrigin::Local,
+            origin: querymt_agent_core::events::EventOrigin::Local,
             source_node: None,
-            kind: crate::events::AgentEventKind::PromptReceived {
+            kind: querymt_agent_core::events::AgentEventKind::PromptReceived {
                 content: "flattened summary".to_string(),
                 message_id: Some("stored-message-id".to_string()),
             },
         };
-        let message = crate::model::AgentMessage {
+        let message = querymt_agent_core::model::AgentMessage {
             id: "stored-message-id".to_string(),
             session_id: "s-1".to_string(),
             role: querymt::chat::ChatRole::User,
@@ -1488,14 +1492,14 @@ mod stdio_tests {
 
     #[test]
     fn session_load_replay_preserves_structured_prompt_order_and_message_id() {
-        assert_structured_user_message_replay(crate::model::MessagePart::Prompt {
+        assert_structured_user_message_replay(querymt_agent_core::model::MessagePart::Prompt {
             blocks: structured_blocks(),
         });
     }
 
     #[test]
     fn session_load_replay_preserves_structured_steering_order_and_message_id() {
-        assert_structured_user_message_replay(crate::model::MessagePart::Steering {
+        assert_structured_user_message_replay(querymt_agent_core::model::MessagePart::Steering {
             run_id: "run-1".to_string(),
             client_input_id: Some("input-1".to_string()),
             blocks: structured_blocks(),
@@ -1520,24 +1524,22 @@ mod stdio_tests {
             shutdown_tx,
         );
         tokio::task::yield_now().await;
-        fixture
-            .config
-            .event_sink
-            .fanout()
-            .publish(crate::events::EventEnvelope::Durable(
-                crate::events::DurableEvent {
+        fixture.config.event_sink.fanout().publish(
+            querymt_agent_core::events::EventEnvelope::Durable(
+                querymt_agent_core::events::DurableEvent {
                     session_seq: 0,
                     event_id: "assignment-event".into(),
                     stream_seq: 1,
                     session_id: "parent".into(),
                     timestamp: 0,
-                    origin: crate::events::EventOrigin::Local,
+                    origin: querymt_agent_core::events::EventOrigin::Local,
                     source_node: None,
-                    kind: crate::events::AgentEventKind::DelegateModelsChanged {
+                    kind: querymt_agent_core::events::AgentEventKind::DelegateModelsChanged {
                         revision: Some(7),
                     },
                 },
-            ));
+            ),
+        );
         let message = timeout(Duration::from_secs(2), bridge_rx.recv())
             .await
             .unwrap()
@@ -1575,27 +1577,25 @@ mod stdio_tests {
             shutdown_tx,
         );
         tokio::task::yield_now().await;
-        fixture
-            .config
-            .event_sink
-            .fanout()
-            .publish(crate::events::EventEnvelope::Durable(
-                crate::events::DurableEvent {
+        fixture.config.event_sink.fanout().publish(
+            querymt_agent_core::events::EventEnvelope::Durable(
+                querymt_agent_core::events::DurableEvent {
                     session_seq: 0,
                     event_id: "input-event".into(),
                     stream_seq: 1,
                     session_id: "parent".into(),
                     timestamp: 0,
-                    origin: crate::events::EventOrigin::Local,
+                    origin: querymt_agent_core::events::EventOrigin::Local,
                     source_node: None,
-                    kind: crate::events::AgentEventKind::SteeringApplied {
+                    kind: querymt_agent_core::events::AgentEventKind::SteeringApplied {
                         run_id: "run-1".into(),
                         input_id: "input-1".into(),
                         boundary: "after_tools".into(),
                         latency_ms: 12,
                     },
                 },
-            ));
+            ),
+        );
         let message = timeout(Duration::from_secs(2), bridge_rx.recv())
             .await
             .expect("notification should arrive")
@@ -1615,7 +1615,7 @@ mod stdio_tests {
         assert_eq!(params["boundary"], "after_tools");
         fixture.config.event_sink.emit_ephemeral(
             "parent",
-            crate::events::AgentEventKind::RuntimeChanged {
+            querymt_agent_core::events::AgentEventKind::RuntimeChanged {
                 runtime: crate::agent::messages::SessionRuntimeStatus::Waiting,
             },
         );
@@ -1661,7 +1661,7 @@ mod stdio_tests {
             task_id: None,
             target_agent_id: "coder".into(),
             objective: "Implement it".into(),
-            objective_hash: crate::hash::RapidHash::default(),
+            objective_hash: querymt_agent_core::hash::RapidHash::default(),
             context: None,
             constraints: None,
             expected_output: None,
@@ -1672,27 +1672,25 @@ mod stdio_tests {
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             completed_at: None,
         };
-        fixture
-            .config
-            .event_sink
-            .fanout()
-            .publish(crate::events::EventEnvelope::Durable(
-                crate::events::DurableEvent {
+        fixture.config.event_sink.fanout().publish(
+            querymt_agent_core::events::EventEnvelope::Durable(
+                querymt_agent_core::events::DurableEvent {
                     session_seq: 0,
                     event_id: "event-1".into(),
                     stream_seq: 1,
                     session_id: "parent-1".into(),
                     timestamp: 10,
-                    origin: crate::events::EventOrigin::Local,
+                    origin: querymt_agent_core::events::EventOrigin::Local,
                     source_node: None,
-                    kind: crate::events::AgentEventKind::DelegationRequested {
+                    kind: querymt_agent_core::events::AgentEventKind::DelegationRequested {
                         delegation,
                         tool_call_id: Some("call-1".into()),
                         batch_id: None,
                         cycle_id: None,
                     },
                 },
-            ));
+            ),
+        );
 
         let message = timeout(Duration::from_secs(2), bridge_rx.recv())
             .await
@@ -1824,12 +1822,13 @@ mod stdio_tests {
         tokio::task::yield_now().await;
 
         let stream = fixture.config.event_sink.session_stream(session_id);
-        let stored = |content: String| crate::events::AgentEventKind::AssistantMessageStored {
-            content,
-            thinking: None,
-            reasoning_parts: Vec::new(),
-            message_id: None,
-        };
+        let stored =
+            |content: String| querymt_agent_core::events::AgentEventKind::AssistantMessageStored {
+                content,
+                thinking: None,
+                reasoning_parts: Vec::new(),
+                message_id: None,
+            };
         for n in 1..=TOTAL {
             stream.emit(stored(format!("m{n}")));
         }
@@ -1911,18 +1910,15 @@ mod stdio_tests {
             shutdown_tx,
         );
         tokio::task::yield_now().await;
-        fixture
-            .config
-            .event_sink
-            .fanout()
-            .publish(crate::events::EventEnvelope::Ephemeral(
-                crate::events::EphemeralEvent {
+        fixture.config.event_sink.fanout().publish(
+            querymt_agent_core::events::EventEnvelope::Ephemeral(
+                querymt_agent_core::events::EphemeralEvent {
                     session_seq: 0,
                     session_id: session_id.to_string(),
                     timestamp: 0,
-                    origin: crate::events::EventOrigin::Local,
+                    origin: querymt_agent_core::events::EventOrigin::Local,
                     source_node: None,
-                    kind: crate::events::AgentEventKind::ElicitationRequested {
+                    kind: querymt_agent_core::events::AgentEventKind::ElicitationRequested {
                         elicitation_id: elicitation_id.to_string(),
                         session_id: session_id.to_string(),
                         message: "Choose".to_string(),
@@ -1930,7 +1926,8 @@ mod stdio_tests {
                         source: "builtin:question".to_string(),
                     },
                 },
-            ));
+            ),
+        );
 
         let message = timeout(Duration::from_secs(2), bridge_rx.recv())
             .await

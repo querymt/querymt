@@ -4,7 +4,7 @@
 //! structured, consumer-friendly representation of the conversation.
 //! Both the ATIF exporter and the SFT exporter build on this.
 
-use crate::events::{AgentEvent, AgentEventKind, ReasoningPartStored};
+use querymt_agent_core::events::{AgentEvent, AgentEventKind, ReasoningPartStored};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -297,7 +297,7 @@ fn extract_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{EventOrigin, ExecutionMetrics, ReasoningPartStored};
+    use querymt_agent_core::events::{EventOrigin, ExecutionMetrics, ReasoningPartStored};
 
     fn make_event(seq: i64, ts: i64, kind: AgentEventKind) -> AgentEvent {
         AgentEvent {

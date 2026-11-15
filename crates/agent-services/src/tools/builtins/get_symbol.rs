@@ -8,11 +8,11 @@ use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde_json::{Value, json};
 use std::path::Path;
 
-use crate::index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind, parse_kind_filter};
 use crate::tools::{
     CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, collect_read_paths,
     effective_root, resolve_arg_path,
 };
+use querymt_agent_index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind, parse_kind_filter};
 
 use super::helpers::{resolve_root, resolve_target};
 

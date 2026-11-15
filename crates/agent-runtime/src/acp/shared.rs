@@ -18,10 +18,10 @@ use crate::acp::protocol::{
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::control::delegation_notifications::DelegationUpdateNotification;
 use crate::control::remote::{AttachRemoteSessionRequest, RemoteSessionAttachInfo};
-use crate::event_fanout::EventFanout;
-use crate::events::{AgentEvent, AgentEventKind, EventEnvelope, ReasoningPartStored};
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
+use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventEnvelope, ReasoningPartStored};
+use querymt_agent_services::event_fanout::EventFanout;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -1058,8 +1058,8 @@ where
 }
 
 /// Notice title naming why a run stopped.
-fn stop_notice_title(stop_type: crate::events::StopType) -> &'static str {
-    use crate::events::StopType;
+fn stop_notice_title(stop_type: querymt_agent_core::events::StopType) -> &'static str {
+    use querymt_agent_core::events::StopType;
     match stop_type {
         StopType::ModelTokenLimit => "Output token limit reached",
         StopType::StepLimit => "Step limit reached",
@@ -1075,12 +1075,12 @@ fn stop_notice_title(stop_type: crate::events::StopType) -> &'static str {
 /// Notice title for one output-limit recovery step, e.g.
 /// "Output limit hit; retrying at 128000 tokens (1)".
 fn output_limit_recovery_title(
-    action: crate::events::OutputLimitRecoveryAction,
+    action: querymt_agent_core::events::OutputLimitRecoveryAction,
     attempt: u32,
     from: Option<u32>,
     to: Option<u32>,
 ) -> String {
-    use crate::events::OutputLimitRecoveryAction;
+    use querymt_agent_core::events::OutputLimitRecoveryAction;
     match (action, to) {
         (OutputLimitRecoveryAction::Escalate, Some(to)) => {
             format!("Output limit hit; retrying at {to} tokens")
@@ -1387,7 +1387,7 @@ struct MaterializedReplayState {
 /// Deterministic plan identity for QueryMT's todo list within a session.
 pub const QUERYMT_TODO_PLAN_ID: &str = "querymt-todos";
 
-pub use crate::core_staging::meta::QUERYMT_META_NAMESPACE;
+pub use querymt_agent_core::meta::QUERYMT_META_NAMESPACE;
 
 /// `_meta.querymt.sessionLoadSnapshot` key. A client that advertises a
 /// supported version promises it can hydrate session history directly from the
@@ -1498,7 +1498,7 @@ struct SessionUsageProjection {
     context_limit: Option<u64>,
     /// Shared reducer over attempt records; created on first accounting
     /// evidence so a session with none publishes no accounting payload.
-    accounting: Option<crate::accounting::AccountingReducer>,
+    accounting: Option<querymt_agent_services::accounting::AccountingReducer>,
     /// Last main-context occupancy and the journal sequence that reported it.
     context_used: Option<u64>,
     used_seq: Option<i64>,
@@ -1561,11 +1561,11 @@ impl SessionUsageProjection {
     /// Apply an accounting record. Returns whether it changed accounting
     /// state (an identical redelivery does not).
     fn apply_accounting(&mut self, session_id: &str, seq: i64, kind: &AgentEventKind) -> bool {
-        let reducer = self
-            .accounting
-            .get_or_insert_with(|| crate::accounting::AccountingReducer::new(session_id));
+        let reducer = self.accounting.get_or_insert_with(|| {
+            querymt_agent_services::accounting::AccountingReducer::new(session_id)
+        });
         match reducer.apply_at(seq, kind) {
-            Ok(crate::accounting::Applied::New) => true,
+            Ok(querymt_agent_services::accounting::Applied::New) => true,
             Ok(_) => false,
             Err(conflict) => {
                 tracing::warn!(
@@ -1597,9 +1597,12 @@ impl SessionUsageProjection {
             .flatten()
     }
 
-    fn accounting_snapshot(&self) -> Option<crate::accounting::AccountingSnapshot> {
+    fn accounting_snapshot(
+        &self,
+    ) -> Option<querymt_agent_services::accounting::AccountingSnapshot> {
         self.accounting.as_ref().map(|reducer| {
-            let mut snapshot = crate::accounting::AccountingSnapshot::from_reducer(reducer);
+            let mut snapshot =
+                querymt_agent_services::accounting::AccountingSnapshot::from_reducer(reducer);
             if self.untransferred_history {
                 snapshot.mark_untransferred_history();
             }
@@ -2018,8 +2021,11 @@ impl AcpLiveEventTranslator {
         }
         if let Some(reducer) = usage.accounting.as_mut() {
             reducer.replace_session_totals(summary.usage.accounting.clone());
-        } else if summary.usage.accounting != crate::accounting::ScopeTotals::default() {
-            let mut reducer = crate::accounting::AccountingReducer::new(session_id);
+        } else if summary.usage.accounting
+            != querymt_agent_services::accounting::ScopeTotals::default()
+        {
+            let mut reducer =
+                querymt_agent_services::accounting::AccountingReducer::new(session_id);
             reducer.replace_session_totals(summary.usage.accounting.clone());
             usage.accounting = Some(reducer);
         }
@@ -3746,10 +3752,10 @@ mod tests {
     }
 
     use crate::elicitation::ElicitationAction;
-    use crate::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
     use crate::session::backend::StorageBackend;
     use crate::session::projection::NewDurableEvent;
     use crate::test_utils::DelegateTestFixture;
+    use querymt_agent_core::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4046,7 +4052,7 @@ mod tests {
 
     #[test]
     fn tool_call_progress_maps_to_in_progress_update_and_is_not_replayed() {
-        let event = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+        let event = EventEnvelope::Ephemeral(querymt_agent_core::events::EphemeralEvent {
             session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
@@ -4084,7 +4090,7 @@ mod tests {
             kind: AgentEventKind::ElicitationResolved {
                 elicitation_id: "e-1".into(),
                 session_id: "s-1".into(),
-                outcome: crate::events::ElicitationOutcome::Accepted,
+                outcome: querymt_agent_core::events::ElicitationOutcome::Accepted,
                 selection: Some(vec!["Allow".into()]),
             },
         });
@@ -4136,18 +4142,20 @@ mod tests {
             .enumerate()
             .map(|(index, block)| {
                 translator
-                    .translate_update(&EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
-                        session_seq: 0,
-                        session_id: "s-1".to_string(),
-                        timestamp: index as i64,
-                        origin: EventOrigin::Local,
-                        source_node: None,
-                        kind: AgentEventKind::UserPromptBlock {
-                            message_id: "u-1".to_string(),
-                            client_prompt_id: Some("client-1".to_string()),
-                            block,
+                    .translate_update(&EventEnvelope::Ephemeral(
+                        querymt_agent_core::events::EphemeralEvent {
+                            session_seq: 0,
+                            session_id: "s-1".to_string(),
+                            timestamp: index as i64,
+                            origin: EventOrigin::Local,
+                            source_node: None,
+                            kind: AgentEventKind::UserPromptBlock {
+                                message_id: "u-1".to_string(),
+                                client_prompt_id: Some("client-1".to_string()),
+                                block,
+                            },
                         },
-                    }))
+                    ))
                     .expect("prompt block should translate")
             })
             .collect::<Vec<_>>();
@@ -4302,7 +4310,7 @@ mod tests {
                 message_id: Some("a-1".to_string()),
             },
         });
-        let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+        let delta = EventEnvelope::Ephemeral(querymt_agent_core::events::EphemeralEvent {
             session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
@@ -4337,7 +4345,7 @@ mod tests {
 
     #[test]
     fn live_translator_suppresses_stored_message_after_streaming_delta() {
-        let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+        let delta = EventEnvelope::Ephemeral(querymt_agent_core::events::EphemeralEvent {
             session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
@@ -4407,7 +4415,7 @@ mod tests {
 
     #[test]
     fn replay_translation_skips_streaming_deltas() {
-        let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+        let delta = EventEnvelope::Ephemeral(querymt_agent_core::events::EphemeralEvent {
             session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
@@ -4440,7 +4448,7 @@ mod tests {
 
     #[test]
     fn live_translator_forwards_thinking_delta_as_agent_thought_chunk() {
-        let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+        let delta = EventEnvelope::Ephemeral(querymt_agent_core::events::EphemeralEvent {
             session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
@@ -4527,7 +4535,7 @@ mod tests {
 
     #[test]
     fn live_translator_skips_empty_thinking_delta() {
-        let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+        let delta = EventEnvelope::Ephemeral(querymt_agent_core::events::EphemeralEvent {
             session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
@@ -6037,11 +6045,11 @@ mod tests {
             .history_store()
             .add_message(
                 &source_id,
-                crate::model::AgentMessage {
+                querymt_agent_core::model::AgentMessage {
                     id: "m1".into(),
                     session_id: source_id.clone(),
                     role: querymt::chat::ChatRole::User,
-                    parts: vec![crate::model::MessagePart::Prompt {
+                    parts: vec![querymt_agent_core::model::MessagePart::Prompt {
                         blocks: vec![crate::acp::protocol::ContentBlock::Text(
                             crate::acp::protocol::TextContent::new("hello"),
                         )],
@@ -7408,7 +7416,7 @@ mod tests {
 mod session_update_tests {
     use super::*;
     use crate::agent::core::AgentMode;
-    use crate::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
+    use querymt_agent_core::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
     use std::collections::HashMap;
 
     // ── Helpers ────────────────────────────────────────────────────────────
@@ -7488,8 +7496,8 @@ mod session_update_tests {
         envelope(seq, accounted_end_kind(context_tokens))
     }
 
-    fn accounted_end_accounting() -> Option<crate::accounting::RequestAccounting> {
-        Some(crate::accounting::RequestAccounting {
+    fn accounted_end_accounting() -> Option<querymt_agent_services::accounting::RequestAccounting> {
+        Some(querymt_agent_services::accounting::RequestAccounting {
             operation_id: "op-1".into(),
             attempt_ids: vec![],
             known_subtotal_usd: 0.0,
@@ -7522,10 +7530,10 @@ mod session_update_tests {
         seq: i64,
         id: &str,
         cycle: &str,
-        purpose: crate::accounting::AttemptPurpose,
+        purpose: querymt_agent_services::accounting::AttemptPurpose,
         complete: bool,
     ) -> Vec<EventEnvelope> {
-        use crate::core_staging::accounting::samples::{
+        use querymt_agent_core::accounting::samples::{
             sample_pricing, sample_settlement, sample_start,
         };
         let mut start = sample_start();
@@ -8312,9 +8320,9 @@ mod session_update_tests {
 
     #[tokio::test]
     async fn load_snapshot_carries_authoritative_accounting_without_context_or_replay() {
-        use crate::accounting::AttemptPurpose::{Compaction, MainResponse};
         use crate::session::backend::StorageBackend;
         use crate::session::projection::NewDurableEvent;
+        use querymt_agent_services::accounting::AttemptPurpose::{Compaction, MainResponse};
         let fixture = crate::test_utils::TestAgent::new().await;
         let session_id = fixture.create_session().await;
         let journal = fixture.storage.event_journal();
@@ -8387,7 +8395,7 @@ mod session_update_tests {
 
     #[test]
     fn older_snapshot_cannot_resurrect_a_cleared_complete_total() {
-        use crate::accounting::AttemptPurpose::MainResponse;
+        use querymt_agent_services::accounting::AttemptPurpose::MainResponse;
         // Live delivery already cleared the total (partial attempt seq 3-4).
         let mut translator = AcpLiveEventTranslator::new();
         settle_all(
@@ -8488,7 +8496,7 @@ mod session_update_tests {
     #[test]
     fn usage_uses_latest_limit_and_includes_cost_and_cached_tokens() {
         let mut translator = AcpLiveEventTranslator::new();
-        use crate::accounting::AttemptPurpose::MainResponse;
+        use querymt_agent_services::accounting::AttemptPurpose::MainResponse;
         translator.translate_updates(&provider_changed(1, Some(100_000)));
         for event in attempt_events(2, "a1", "c1", MainResponse, true) {
             translator.translate_updates(&event);
@@ -8549,7 +8557,7 @@ mod session_update_tests {
 
     #[test]
     fn attempt_start_alone_publishes_nothing() {
-        use crate::accounting::AttemptPurpose::MainResponse;
+        use querymt_agent_services::accounting::AttemptPurpose::MainResponse;
         let mut translator = AcpLiveEventTranslator::new();
         let start = attempt_events(1, "a1", "c1", MainResponse, true).remove(0);
         assert!(translator.translate_updates(&start).is_empty());
@@ -8557,7 +8565,7 @@ mod session_update_tests {
 
     #[test]
     fn unknown_context_delivers_accounting_through_metadata_only_session_info() {
-        use crate::accounting::AttemptPurpose::MainResponse;
+        use querymt_agent_services::accounting::AttemptPurpose::MainResponse;
         // No notice/compaction capability and no known context limit.
         let mut translator = AcpLiveEventTranslator::new();
         assert!(!translator.capabilities().notices);
@@ -8583,7 +8591,7 @@ mod session_update_tests {
 
     #[test]
     fn auxiliary_settlement_reuses_valid_main_context_and_keeps_usage_v1() {
-        use crate::accounting::AttemptPurpose::{Compaction, MainResponse};
+        use querymt_agent_services::accounting::AttemptPurpose::{Compaction, MainResponse};
         let mut translator = AcpLiveEventTranslator::new();
         translator.translate_updates(&provider_changed(1, Some(100_000)));
         settle_all(
@@ -8613,7 +8621,7 @@ mod session_update_tests {
 
     #[test]
     fn model_switch_invalidates_prior_context_measurement() {
-        use crate::accounting::AttemptPurpose::MainResponse;
+        use querymt_agent_services::accounting::AttemptPurpose::MainResponse;
         let mut translator = AcpLiveEventTranslator::new();
         translator.translate_updates(&provider_changed(1, Some(100_000)));
         translator.translate_updates(&accounted_end(2, 5_000));
@@ -8631,7 +8639,7 @@ mod session_update_tests {
 
     #[test]
     fn partial_budget_warning_follows_notice_capability_but_accounting_always_arrives() {
-        use crate::accounting::AttemptPurpose::MainResponse;
+        use querymt_agent_services::accounting::AttemptPurpose::MainResponse;
         let notice = envelope(
             9,
             AgentEventKind::HookNotice {
@@ -8648,7 +8656,7 @@ mod session_update_tests {
         let AgentEventKind::LlmAttemptSettled { settlement } = &mut durable.kind else {
             unreachable!()
         };
-        let mut manual = crate::core_staging::accounting::samples::sample_pricing();
+        let mut manual = querymt_agent_core::accounting::samples::sample_pricing();
         manual.cache_write = None;
         settlement.budget_valuation = Some(querymt::providers::value_usage(
             Some(&manual),
@@ -8682,7 +8690,7 @@ mod session_update_tests {
 
     #[test]
     fn duplicate_settlement_delivery_publishes_once() {
-        use crate::accounting::AttemptPurpose::MainResponse;
+        use querymt_agent_services::accounting::AttemptPurpose::MainResponse;
         let mut translator = AcpLiveEventTranslator::new();
         let events = attempt_events(1, "a1", "c1", MainResponse, true);
         let first = settle_all(&mut translator, events.clone());
@@ -8693,7 +8701,7 @@ mod session_update_tests {
 
     #[test]
     fn replay_accounting_matches_live_for_the_same_records() {
-        use crate::accounting::AttemptPurpose::{Compaction, MainResponse};
+        use querymt_agent_services::accounting::AttemptPurpose::{Compaction, MainResponse};
         let mut envelopes = vec![provider_changed(1, Some(100_000))];
         envelopes.extend(attempt_events(2, "a1", "c1", MainResponse, true));
         envelopes.push(accounted_end(4, 7_000));
@@ -8733,7 +8741,7 @@ mod session_update_tests {
 
     #[test]
     fn replay_without_context_still_carries_accounting() {
-        use crate::accounting::AttemptPurpose::MainResponse;
+        use querymt_agent_services::accounting::AttemptPurpose::MainResponse;
         let events: Vec<AgentEvent> = attempt_events(1, "a1", "c1", MainResponse, true)
             .iter()
             .map(|e| agent_event(e.seq(), e.kind().clone()))
@@ -8756,7 +8764,7 @@ mod session_update_tests {
 
     #[test]
     fn seeding_from_load_snapshot_restores_reducer_accounting() {
-        use crate::accounting::AttemptPurpose::MainResponse;
+        use querymt_agent_services::accounting::AttemptPurpose::MainResponse;
         let events: Vec<AgentEvent> = attempt_events(1, "a1", "c1", MainResponse, true)
             .iter()
             .map(|e| agent_event(e.seq(), e.kind().clone()))
@@ -8783,7 +8791,7 @@ mod session_update_tests {
 
     #[test]
     fn untransferred_history_limit_survives_live_accounting_updates() {
-        use crate::accounting::AttemptPurpose::MainResponse;
+        use querymt_agent_services::accounting::AttemptPurpose::MainResponse;
         let events: Vec<AgentEvent> = attempt_events(1, "a1", "c1", MainResponse, true)
             .iter()
             .map(|e| agent_event(e.seq(), e.kind().clone()))
@@ -8808,10 +8816,9 @@ mod session_update_tests {
         assert!(!snapshot.session.complete);
         assert!(snapshot.session.complete_total_usd.is_none());
         assert!(
-            snapshot
-                .session
-                .reasons
-                .contains(&crate::accounting::AccountingReason::UntransferredHistory)
+            snapshot.session.reasons.contains(
+                &querymt_agent_services::accounting::AccountingReason::UntransferredHistory
+            )
         );
 
         // A later load that reports full history lifts the limit.
@@ -8822,7 +8829,7 @@ mod session_update_tests {
 
     #[test]
     fn excluded_only_session_has_no_standard_cost() {
-        use crate::accounting::AttemptPurpose::MainResponse;
+        use querymt_agent_services::accounting::AttemptPurpose::MainResponse;
         let mut translator = AcpLiveEventTranslator::new();
         translator.translate_updates(&provider_changed(1, Some(100_000)));
         let mut events = attempt_events(2, "a1", "c1", MainResponse, true);
@@ -8897,7 +8904,7 @@ mod session_update_tests {
             2,
             "a1",
             "c1",
-            crate::accounting::AttemptPurpose::MainResponse,
+            querymt_agent_services::accounting::AttemptPurpose::MainResponse,
             true,
         ) {
             translator.translate_updates(&event);
@@ -9050,9 +9057,9 @@ mod session_update_tests {
 
     fn stop_event() -> AgentEventKind {
         AgentEventKind::MiddlewareStopped {
-            stop_type: crate::events::StopType::ModelTokenLimit,
+            stop_type: querymt_agent_core::events::StopType::ModelTokenLimit,
             reason: "model hit its output limit".to_string(),
-            metrics: crate::events::ExecutionMetrics { steps: 1, turns: 1 },
+            metrics: querymt_agent_core::events::ExecutionMetrics { steps: 1, turns: 1 },
         }
     }
 
@@ -9060,7 +9067,7 @@ mod session_update_tests {
         AgentEventKind::OutputLimitRecovery {
             turn: 1,
             attempt: 1,
-            action: crate::events::OutputLimitRecoveryAction::Escalate,
+            action: querymt_agent_core::events::OutputLimitRecoveryAction::Escalate,
             from_max_tokens: Some(32_000),
             to_max_tokens: Some(128_000),
             thinking_only: false,
@@ -9129,9 +9136,10 @@ mod session_update_tests {
     #[test]
     fn output_limit_stop_reports_max_tokens_without_querymt_meta() {
         // Capable and non-capable clients get the same protocol-level reason.
-        let response = crate::acp::protocol::PromptResponse::new(
-            crate::acp::protocol::StopReason::from(crate::events::StopType::ModelTokenLimit),
-        );
+        let response =
+            crate::acp::protocol::PromptResponse::new(crate::acp::protocol::StopReason::from(
+                querymt_agent_core::events::StopType::ModelTokenLimit,
+            ));
         assert_eq!(
             response.stop_reason,
             crate::acp::protocol::StopReason::MaxTokens
@@ -9398,7 +9406,7 @@ mod session_update_tests {
                 12,
                 AgentEventKind::LlmAttemptStarted {
                     start: {
-                        let mut start = crate::core_staging::accounting::samples::sample_start();
+                        let mut start = querymt_agent_core::accounting::samples::sample_start();
                         start.attempt.session_id = "s-1".into();
                         start
                     },
@@ -9409,7 +9417,7 @@ mod session_update_tests {
                 AgentEventKind::LlmAttemptSettled {
                     settlement: {
                         let mut settlement =
-                            crate::core_staging::accounting::samples::sample_settlement();
+                            querymt_agent_core::accounting::samples::sample_settlement();
                         settlement.attempt.session_id = "s-1".into();
                         settlement
                     },

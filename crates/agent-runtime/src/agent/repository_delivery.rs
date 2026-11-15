@@ -134,7 +134,7 @@ fn append_policy_once(system: &mut Vec<querymt::params::SystemPrompt>) -> bool {
 /// compactions so far. Nothing here depends on a diagnostics cache, so losing
 /// one never causes reinjection. A history failure leaves the state as it was.
 pub(crate) async fn restore_state(config: &AgentConfig, exec_ctx: &ExecutionContext) {
-    use crate::model::MessagePart;
+    use querymt_agent_core::model::MessagePart;
     let Some(registry) = config.repository_knowledge() else {
         return;
     };
@@ -425,9 +425,9 @@ const RECENT_PATHS: usize = 3;
 pub(crate) async fn post_compaction_contexts(
     config: &AgentConfig,
     exec_ctx: &ExecutionContext,
-    before: &[crate::model::AgentMessage],
+    before: &[querymt_agent_core::model::AgentMessage],
 ) -> Vec<HookContextContribution> {
-    use crate::model::MessagePart;
+    use querymt_agent_core::model::MessagePart;
     let Some(registry) = config.repository_knowledge() else {
         return Vec::new();
     };

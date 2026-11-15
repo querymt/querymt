@@ -1,21 +1,21 @@
 use crate::acp::protocol::{ContentBlock, PromptRequest, StopReason, TextContent};
-use crate::event_fanout::EventFanout;
-use crate::event_sink::EventSink;
-use crate::events::{AgentEventKind, EventEnvelope};
 use crate::hooks::{
     DelegationFailureRequest, DelegationStartRequest, HookNotice, Hooks, PostDelegationRequest,
 };
-use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::{
     Delegation, DelegationClaim, DelegationStatus, ForkOrigin, ForkPointType,
 };
 use crate::session::error::SessionResult;
 use crate::session::store::SessionStore;
 use crate::tools::ToolRegistry;
-use crate::verification::VerificationSpec;
-use crate::verification::service::{VerificationContext, VerificationService};
 use log::{debug, error, warn};
 use querymt::chat::{ChatRole, ReasoningEffort};
+use querymt_agent_core::events::{AgentEventKind, EventEnvelope};
+use querymt_agent_core::model::{AgentMessage, MessagePart};
+use querymt_agent_services::event_fanout::EventFanout;
+use querymt_agent_services::event_sink::EventSink;
+use querymt_agent_services::verification::VerificationSpec;
+use querymt_agent_services::verification::service::{VerificationContext, VerificationService};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -1004,16 +1004,25 @@ async fn summary_operation(
     summarizer: &super::summarizer::DelegationSummarizer,
     parent_session_id: &str,
     cycle_id: Option<&str>,
-) -> Result<crate::accounting::AttemptOperation, crate::accounting::AccountingError> {
+) -> Result<
+    querymt_agent_services::accounting::AttemptOperation,
+    querymt_agent_services::accounting::AccountingError,
+> {
     let accounting = ctx.event_sink.session_accounting(parent_session_id).await?;
     let cycle = match cycle_id {
-        Some(id) => crate::accounting::CycleAccounting::with_id(accounting.clone(), id),
-        None => crate::accounting::CycleAccounting::begin_maintenance(accounting.clone()),
+        Some(id) => {
+            querymt_agent_services::accounting::CycleAccounting::with_id(accounting.clone(), id)
+        }
+        None => querymt_agent_services::accounting::CycleAccounting::begin_maintenance(
+            accounting.clone(),
+        ),
     };
-    let recorder = Arc::new(crate::accounting::AttemptRecorder::with_projection(
-        ctx.event_sink.session_stream(parent_session_id),
-        accounting,
-    ));
+    let recorder = Arc::new(
+        querymt_agent_services::accounting::AttemptRecorder::with_projection(
+            ctx.event_sink.session_stream(parent_session_id),
+            accounting,
+        ),
+    );
     Ok(summarizer
         .attempt_operation(recorder, &cycle)
         .with_budget_pricing(ctx.budget_pricing.clone())
@@ -1333,7 +1342,7 @@ async fn execute_delegation(
         .run_delegation_start(DelegationStartRequest {
             session_id: parent_session_id.clone(),
             parent_cwd: source_parent_cwd.clone(),
-            turn_id: crate::model::TurnId::new().to_string(),
+            turn_id: querymt_agent_core::model::TurnId::new().to_string(),
             cwd: effective_cwd.clone(),
             model: String::new(),
             permission_mode: "default".to_string(),
@@ -2065,7 +2074,7 @@ async fn execute_delegation(
                 .run_post_delegation(PostDelegationRequest {
                     session_id: parent_session_id.clone(),
                     parent_cwd: source_parent_cwd.clone(),
-                    turn_id: crate::model::TurnId::new().to_string(),
+                    turn_id: querymt_agent_core::model::TurnId::new().to_string(),
                     // Execution hook: identifies the delegate's actual
                     // execution root, not the orchestrator default.
                     cwd: effective_cwd.clone(),
@@ -2387,7 +2396,7 @@ async fn fail_delegation(ctx: DelegationFailureContext<'_>, error_message: &str)
         match hooks
             .run_delegation_failure(DelegationFailureRequest {
                 session_id: ctx.parent_session_id.to_string(),
-                turn_id: crate::model::TurnId::new().to_string(),
+                turn_id: querymt_agent_core::model::TurnId::new().to_string(),
                 // The delegate's execution root once allocated; `None` keeps
                 // explicit parent context for pre-allocation failures.
                 cwd: ctx.execution_cwd.clone(),
@@ -2779,14 +2788,14 @@ mod tests {
     };
     use crate::agent::handle::AgentHandle;
     use crate::agent::remote::SessionActorRef;
-    use crate::event_fanout::EventFanout;
-    use crate::event_sink::EventSink;
-    use crate::events::EventEnvelope;
     use crate::hooks::Hooks;
     use crate::session::backend::StorageBackend;
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::test_utils::MockSessionStore;
     use async_trait::async_trait;
+    use querymt_agent_core::events::EventEnvelope;
+    use querymt_agent_services::event_fanout::EventFanout;
+    use querymt_agent_services::event_sink::EventSink;
 
     #[tokio::test]
     async fn workflow_producer_orders_stages_and_keeps_cleanup_visible_with_idle_parent() {
@@ -2835,7 +2844,7 @@ mod tests {
             task_id: None,
             target_agent_id: "coder".into(),
             objective: "test workflow observation".into(),
-            objective_hash: crate::hash::RapidHash::default(),
+            objective_hash: querymt_agent_core::hash::RapidHash::default(),
             context: None,
             constraints: None,
             expected_output: None,
@@ -3214,7 +3223,9 @@ mod tests {
                 task_id: None,
                 target_agent_id: "coder".to_string(),
                 objective: "test shutdown registration".to_string(),
-                objective_hash: crate::hash::RapidHash::new(b"test shutdown registration"),
+                objective_hash: querymt_agent_core::hash::RapidHash::new(
+                    b"test shutdown registration",
+                ),
                 context: None,
                 constraints: None,
                 expected_output: None,
@@ -3256,7 +3267,7 @@ mod tests {
             .append_durable(&crate::session::projection::NewDurableEvent {
                 session_seq: None,
                 session_id: session.public_id.clone(),
-                origin: crate::events::EventOrigin::Local,
+                origin: querymt_agent_core::events::EventOrigin::Local,
                 source_node: None,
                 source_node_id: None,
                 source_seq: None,
@@ -3370,7 +3381,7 @@ mod tests {
             task_id: None,
             target_agent_id: "coder".to_string(),
             objective: "test".to_string(),
-            objective_hash: crate::hash::RapidHash::new(b"test"),
+            objective_hash: querymt_agent_core::hash::RapidHash::new(b"test"),
             context: None,
             constraints: None,
             expected_output: None,
@@ -3597,7 +3608,7 @@ mod tests {
             task_id: None,
             target_agent_id: "coder".to_string(),
             objective: "test".to_string(),
-            objective_hash: crate::hash::RapidHash::new(b"test"),
+            objective_hash: querymt_agent_core::hash::RapidHash::new(b"test"),
             context: None,
             constraints: None,
             expected_output: None,
@@ -3609,12 +3620,12 @@ mod tests {
             completed_at: None,
         };
 
-        let envelope = EventEnvelope::from(crate::events::AgentEvent {
+        let envelope = EventEnvelope::from(querymt_agent_core::events::AgentEvent {
             seq: 0,
             session_seq: 0,
             timestamp: 0,
             session_id: "session-1".to_string(),
-            origin: crate::events::EventOrigin::Local,
+            origin: querymt_agent_core::events::EventOrigin::Local,
             source_node: None,
             kind: AgentEventKind::DelegationRequested {
                 delegation,

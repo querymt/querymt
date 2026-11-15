@@ -141,7 +141,7 @@ impl GitSnapshotBackend {
         let canonical = worktree
             .canonicalize()
             .unwrap_or_else(|_| worktree.to_path_buf());
-        let hash = crate::hash::RapidHash::new(canonical.to_string_lossy().as_bytes());
+        let hash = querymt_agent_core::hash::RapidHash::new(canonical.to_string_lossy().as_bytes());
 
         if let Some(base) = &self.snapshot_base {
             return Ok(base.join(format!("{:016x}", hash.as_u64())));

@@ -148,11 +148,13 @@ impl ToolTrait for KnowledgeConsolidateTool {
             .map_err(|e| ToolError::ProviderError(format!("Consolidation failed: {}", e)))?;
 
         // Emit KnowledgeConsolidated event so the scheduler can react
-        context.emit_event(crate::events::AgentEventKind::KnowledgeConsolidated {
-            scope: scope.clone(),
-            consolidation_public_id: result.public_id.clone(),
-            source_count,
-        });
+        context.emit_event(
+            querymt_agent_core::events::AgentEventKind::KnowledgeConsolidated {
+                scope: scope.clone(),
+                consolidation_public_id: result.public_id.clone(),
+                source_count,
+            },
+        );
 
         Ok(vec![ToolResultPart::text(format!(
             "Created consolidation {} from {} entries (scope: {})",
@@ -289,7 +291,7 @@ mod tests {
         use crate::event_fanout::EventFanout;
         use crate::event_sink::EventSink;
         use crate::session::backend::StorageBackend;
-        use crate::session::sqlite_storage::SqliteStorage;
+        use querymt_agent_sqlite::session::sqlite_storage::SqliteStorage;
 
         let temp_dir = TempDir::new().unwrap();
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
@@ -338,10 +340,10 @@ mod tests {
 
         let mut found = false;
         while let Ok(envelope) = rx.try_recv() {
-            if let crate::events::EventEnvelope::Durable(ev) = envelope
+            if let querymt_agent_core::events::EventEnvelope::Durable(ev) = envelope
                 && matches!(
                     ev.kind,
-                    crate::events::AgentEventKind::KnowledgeConsolidated { .. }
+                    querymt_agent_core::events::AgentEventKind::KnowledgeConsolidated { .. }
                 )
             {
                 found = true;

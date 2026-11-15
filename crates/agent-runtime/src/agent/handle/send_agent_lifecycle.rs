@@ -268,7 +268,7 @@ impl LocalAgentHandle {
         for notice in result.notices {
             self.config.emit_event(
                 session_id,
-                crate::events::AgentEventKind::HookNotice {
+                querymt_agent_core::events::AgentEventKind::HookNotice {
                     event_name: notice.event_name,
                     message: notice.message,
                     is_error: notice.is_error,

@@ -4,10 +4,10 @@
 //! the git-based snapshot backend. When undoing, it reverts all filesystem changes
 //! made after a specific message. Redo restores the pre-undo state.
 
-use crate::events::AgentEventKind;
-use crate::model::{MessagePart, TurnId};
-use crate::snapshot::SnapshotId;
 use log::{debug, warn};
+use querymt_agent_core::events::AgentEventKind;
+use querymt_agent_core::model::{MessagePart, TurnId};
+use querymt_agent_services::snapshot::SnapshotId;
 use std::path::PathBuf;
 use time::OffsetDateTime;
 use tracing::instrument;
@@ -79,8 +79,8 @@ impl UndoError {
     }
 }
 
-impl From<crate::snapshot::SnapshotError> for UndoError {
-    fn from(e: crate::snapshot::SnapshotError) -> Self {
+impl From<querymt_agent_services::snapshot::SnapshotError> for UndoError {
+    fn from(e: querymt_agent_services::snapshot::SnapshotError) -> Self {
         UndoError::Snapshot(e.to_string())
     }
 }
@@ -117,7 +117,7 @@ pub struct RedoResult {
     )
 )]
 pub(crate) async fn undo_impl(
-    backend: &dyn crate::snapshot::SnapshotBackend,
+    backend: &dyn querymt_agent_services::snapshot::SnapshotBackend,
     provider: &crate::session::provider::SessionProvider,
     session_id: &str,
     message_id: &str,
@@ -372,7 +372,7 @@ pub(crate) async fn undo_impl(
     fields(restored_files = tracing::field::Empty)
 )]
 pub(crate) async fn redo_impl(
-    backend: &dyn crate::snapshot::SnapshotBackend,
+    backend: &dyn querymt_agent_services::snapshot::SnapshotBackend,
     provider: &crate::session::provider::SessionProvider,
     session_id: &str,
     worktree: &std::path::Path,
@@ -497,7 +497,7 @@ struct HistoryRecord<'a> {
 ///
 /// The base is the patch's own `base_snapshot_id`, else the start's snapshot.
 fn resolve_turn_patches(
-    history: &[crate::model::AgentMessage],
+    history: &[querymt_agent_core::model::AgentMessage],
     from: usize,
     starts_from: usize,
     target: Option<usize>,
@@ -655,7 +655,7 @@ async fn inherited_foreign_workspace_message_count(
     provider: &crate::session::provider::SessionProvider,
     session_id: &str,
     worktree: &std::path::Path,
-    history: &[crate::model::AgentMessage],
+    history: &[querymt_agent_core::model::AgentMessage],
 ) -> usize {
     if let Some(last_foreign) = history.iter().rposition(|msg| {
         msg.parts.iter().any(|part| {
@@ -737,8 +737,8 @@ async fn inherited_foreign_workspace_message_count(
 /// verbatim; only the public id changes, so the history entries themselves
 /// are identical.
 fn is_copied_fork_message(
-    copied: &crate::model::AgentMessage,
-    parent: &crate::model::AgentMessage,
+    copied: &querymt_agent_core::model::AgentMessage,
+    parent: &querymt_agent_core::model::AgentMessage,
 ) -> bool {
     copied.created_at == parent.created_at
         && serde_json::to_string(&copied.parts).is_ok_and(|copied_parts| {

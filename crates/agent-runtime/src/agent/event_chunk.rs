@@ -11,9 +11,9 @@ use crate::agent::messages::{
     MAX_EVENT_STREAM_CHUNK_EVENTS,
 };
 use crate::error::AgentError;
-use crate::events::AgentEvent;
 use crate::session::projection::EventJournal;
 use crate::session::turns::first_turn_start;
+use querymt_agent_core::events::AgentEvent;
 
 /// Journal read size while filling a chunk.
 const READ_PAGE: usize = 500;
@@ -306,9 +306,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{AgentEventKind, EventOrigin};
     use crate::session::projection::NewDurableEvent;
     use crate::session::sqlite_storage::SqliteStorage;
+    use querymt_agent_core::events::{AgentEventKind, EventOrigin};
     use querymt_remote::{DeliveryCertainty, RemoteTransportFailure, RemoteTransportFailureKind};
     use std::sync::atomic::{AtomicUsize, Ordering};
 

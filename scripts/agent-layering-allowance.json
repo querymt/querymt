@@ -1,6 +1,0 @@
-{
-  "_comment": "Distinct upward production items per layer pair, from scripts/check-agent-layering.py. Lower these as cuts land; never raise.",
-  "pairs": {},
-  "core_staging_sqlite_mentions": 0,
-  "core_forbidden_mentions": 0
-}

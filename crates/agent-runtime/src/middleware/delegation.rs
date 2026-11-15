@@ -1,10 +1,10 @@
-use crate::events::StopType;
 use crate::middleware::{ExecutionState, MiddlewareDriver, Result};
 use crate::session::domain::DelegationStatus;
 use crate::session::store::SessionStore;
 use async_trait::async_trait;
 use log::{debug, trace};
 use querymt::chat::ChatRole;
+use querymt_agent_core::events::StopType;
 use std::sync::Arc;
 use time::OffsetDateTime;
 
@@ -134,7 +134,7 @@ impl DelegationMiddleware {
     async fn check_delegation_allowed(
         &self,
         session_id: &str,
-        objective_hash: &crate::hash::RapidHash,
+        objective_hash: &querymt_agent_core::hash::RapidHash,
         target_agent_id: &str,
     ) -> Option<String> {
         let delegations = match self.store.list_delegations(session_id).await {
@@ -266,7 +266,7 @@ impl MiddlewareDriver for DelegationMiddleware {
 
                             if !target_agent_id.is_empty() && !objective.is_empty() {
                                 let objective_hash =
-                                    crate::hash::RapidHash::new(objective.as_bytes());
+                                    querymt_agent_core::hash::RapidHash::new(objective.as_bytes());
 
                                 if let Some(warning) = self
                                     .check_delegation_allowed(

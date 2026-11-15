@@ -5,7 +5,7 @@
 
 pub mod service;
 
-pub use crate::core_staging::verification::{
+pub use querymt_agent_core::verification::{
     Expectation, VerificationSpec, VerificationStep, VerificationStrategy,
 };
 use serde_json::Value;

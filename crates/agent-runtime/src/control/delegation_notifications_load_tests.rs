@@ -4,8 +4,8 @@
 //! while `delegation_notifications.rs` itself belongs to the services layer.
 
 use crate::control::delegation_notifications::*;
-use crate::events::{AgentEvent, AgentEventKind, EventEnvelope, EventOrigin};
 use crate::session::domain::{Delegation, DelegationStatus, ForkOrigin, ForkPointType};
+use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventEnvelope, EventOrigin};
 use time::OffsetDateTime;
 
 fn delegation() -> Delegation {
@@ -17,7 +17,7 @@ fn delegation() -> Delegation {
         task_id: None,
         target_agent_id: "coder".into(),
         objective: "Implement it".into(),
-        objective_hash: crate::hash::RapidHash::default(),
+        objective_hash: querymt_agent_core::hash::RapidHash::default(),
         context: None,
         constraints: None,
         expected_output: None,

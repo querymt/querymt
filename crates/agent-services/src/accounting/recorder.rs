@@ -20,9 +20,9 @@
 //! exact billing after an unobservable crash.
 
 use super::{AccountingConflict, AttemptRef, AttemptSettlement, AttemptStart, SessionAccounting};
-use crate::events::{AgentEventKind, DurableEvent};
 use crate::session::error::SessionError;
 use crate::session_event_stream::SessionEventStream;
+use querymt_agent_core::events::{AgentEventKind, DurableEvent};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -168,13 +168,13 @@ impl AttemptRecorder {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::accounting::tests::{sample_ref, sample_settlement, sample_start};
     use crate::event_fanout::EventFanout;
-    use crate::events::DurableEvent;
     use crate::session::backend::StorageBackend;
     use crate::session::error::SessionResult;
     use crate::session::projection::{EventJournal, NewDurableEvent};
-    use crate::session::sqlite_storage::SqliteStorage;
+    use querymt_agent_core::accounting::samples::{sample_ref, sample_settlement, sample_start};
+    use querymt_agent_core::events::DurableEvent;
+    use querymt_agent_sqlite::session::sqlite_storage::SqliteStorage;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Journal that delegates to a real store but can be told to fail appends.

@@ -1,8 +1,8 @@
 use querymt::chat::{ChatMessage, ChatOutput, ChatRole, FinishReason, GenerationOptions};
 use std::sync::Arc;
 
-use crate::events::StopType;
-use crate::model::MessagePart;
+use querymt_agent_core::events::StopType;
+use querymt_agent_core::model::MessagePart;
 
 /// Statistics about agent execution
 #[derive(Debug, Clone, Default)]
@@ -43,7 +43,10 @@ impl AgentStats {
     /// a valuation: nothing here prices token counters, so a model switch or
     /// catalog refresh cannot change an earlier charge. Unknown components
     /// contribute nothing; completeness lives in [`ScopeTotals`].
-    pub fn apply_recorded_costs(&mut self, totals: &crate::accounting::ScopeTotals) {
+    pub fn apply_recorded_costs(
+        &mut self,
+        totals: &querymt_agent_services::accounting::ScopeTotals,
+    ) {
         let c = &totals.components;
         self.total_cost_usd = totals.known_subtotal_usd;
         self.budget_cost_usd = totals.budget_known_subtotal_usd;
@@ -136,7 +139,7 @@ pub struct PreparedModelRequest {
 #[derive(Debug, Clone, Default)]
 pub struct ModelProfile {
     /// Initial output cap and escalation ceiling; `None` when unknown.
-    pub caps: Option<crate::model_heuristics::OutputCaps>,
+    pub caps: Option<querymt_agent_services::model_heuristics::OutputCaps>,
     /// What the session's provider supports per request.
     pub capabilities: querymt::chat::ChatCapabilities,
     /// Reasoning effort the provider is configured with, when known.
@@ -739,8 +742,8 @@ mod tests {
 
         assert!(result.snapshot_part.is_none());
 
-        let test_hash = crate::hash::RapidHash::new(b"test");
-        let changed_paths = crate::index::merkle::DiffPaths {
+        let test_hash = querymt_agent_core::hash::RapidHash::new(b"test");
+        let changed_paths = querymt_agent_index::merkle::DiffPaths {
             added: vec![],
             modified: vec![std::path::PathBuf::from("test.txt")],
             removed: vec![],

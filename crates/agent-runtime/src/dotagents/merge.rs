@@ -226,7 +226,7 @@ pub mod source_of {
     }
 }
 
-pub use crate::core_staging::dotagents_tasks::normalize_id;
+pub use querymt_agent_core::dotagents_tasks::normalize_id;
 
 #[cfg(test)]
 mod tests {

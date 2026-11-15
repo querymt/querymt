@@ -10,5 +10,5 @@ pub use querymt_agent_knowledge as repository;
 #[cfg(any(test, feature = "test-support"))]
 pub use querymt_agent_sqlite::knowledge::sqlite;
 
-pub use crate::core_staging::knowledge::text_processing;
-pub use crate::core_staging::knowledge::*;
+pub use querymt_agent_core::knowledge::text_processing;
+pub use querymt_agent_core::knowledge::*;

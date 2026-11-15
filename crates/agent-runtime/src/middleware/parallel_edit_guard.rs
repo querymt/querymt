@@ -44,8 +44,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::event_sink::EventSink;
-use crate::events::AgentEventKind;
+use querymt_agent_core::events::AgentEventKind;
+use querymt_agent_services::event_sink::EventSink;
 
 /// How the guard reacts to a flagged batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

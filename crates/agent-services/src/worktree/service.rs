@@ -140,7 +140,7 @@ impl WorkspaceService {
     /// storage root must be creatable and a directory, and it must be on the
     /// local filesystem.
     pub fn from_settings(
-        settings: &crate::core_staging::config::workspace::WorkspaceSettings,
+        settings: &querymt_agent_core::config::workspace::WorkspaceSettings,
         storage: &dyn crate::session::backend::StorageBackend,
     ) -> WorktreeResult<Option<Arc<Self>>> {
         if !settings.enabled {
@@ -671,7 +671,7 @@ impl WorkspaceService {
         );
         let lock_path = self.storage_root.join("batch-locks").join(format!(
             "{}.lock",
-            crate::hash::RapidHash::new(batch_key.as_bytes()).to_hex()
+            querymt_agent_core::hash::RapidHash::new(batch_key.as_bytes()).to_hex()
         ));
         crate::worktree::lock::with_lock_file(&lock_path, async {
             let existing = match delegation_batch_id.as_deref() {
@@ -869,7 +869,6 @@ impl WorkspaceService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::schema;
     use crate::worktree::AcceptRequest;
     use crate::worktree::GitRunner as _;
     use crate::worktree::GixRepoOps;
@@ -878,6 +877,7 @@ mod tests {
     use crate::worktree::test_support::{commit_files, init_repo, materialize};
     use parking_lot::Mutex as StdMutex;
     use querymt_agent_sqlite::repo_workspace::SqliteWorkspaceRepository;
+    use querymt_agent_sqlite::session::schema;
     use rusqlite::Connection;
     use std::fs;
     use std::path::PathBuf;
@@ -901,9 +901,10 @@ mod tests {
         );
         let data = TempDir::new().unwrap();
         let db = data.path().join("sessions.db");
-        let storage = crate::session::sqlite_storage::SqliteStorage::connect(db.clone())
-            .await
-            .unwrap();
+        let storage =
+            querymt_agent_sqlite::session::sqlite_storage::SqliteStorage::connect(db.clone())
+                .await
+                .unwrap();
         let svc = WorkspaceService::new(
             Arc::new(GixRepoOps::new()),
             storage.workspace_repository().unwrap(),
@@ -1027,7 +1028,7 @@ mod tests {
         drop(svc);
         drop(store);
         drop(storage);
-        let reopened = crate::session::sqlite_storage::SqliteStorage::connect(db)
+        let reopened = querymt_agent_sqlite::session::sqlite_storage::SqliteStorage::connect(db)
             .await
             .unwrap();
         let resumed = WorkspaceService::new(
@@ -1086,7 +1087,7 @@ mod tests {
         let root = PathBuf::from(std::env::var_os("QMT_ACCEPT_ROOT").unwrap());
         let repo = PathBuf::from(std::env::var_os("QMT_ACCEPT_REPO").unwrap());
         let marker = PathBuf::from(std::env::var_os("QMT_ACCEPT_MARKER").unwrap());
-        let storage = crate::session::sqlite_storage::SqliteStorage::connect(db)
+        let storage = querymt_agent_sqlite::session::sqlite_storage::SqliteStorage::connect(db)
             .await
             .unwrap();
         let owner = storage
@@ -1154,9 +1155,10 @@ mod tests {
         materialize(repo.path(), &[("file.txt", "parent dirty")]);
         let data = TempDir::new().unwrap();
         let db = data.path().join("sessions.db");
-        let storage = crate::session::sqlite_storage::SqliteStorage::connect(db.clone())
-            .await
-            .unwrap();
+        let storage =
+            querymt_agent_sqlite::session::sqlite_storage::SqliteStorage::connect(db.clone())
+                .await
+                .unwrap();
         let mut processes = Vec::new();
         for n in 0..3 {
             let marker = data.path().join(format!("child-{n}"));
@@ -1262,9 +1264,10 @@ mod tests {
         // replay it without a Git executable.
         let data = TempDir::new().unwrap();
         let db = data.path().join("sessions.db");
-        let storage = crate::session::sqlite_storage::SqliteStorage::connect(db.clone())
-            .await
-            .unwrap();
+        let storage =
+            querymt_agent_sqlite::session::sqlite_storage::SqliteStorage::connect(db.clone())
+                .await
+                .unwrap();
         let registry = storage.workspace_repository().unwrap();
         let storage_root = data.path().join("worktrees");
         let resolved = resolve_repository(repo.path()).unwrap();
@@ -3202,8 +3205,8 @@ mod tests {
 #[cfg(test)]
 mod settings_tests {
     use super::*;
-    use crate::core_staging::config::workspace::WorkspaceSettings;
-    use crate::session::sqlite_storage::SqliteStorage;
+    use querymt_agent_core::config::workspace::WorkspaceSettings;
+    use querymt_agent_sqlite::session::sqlite_storage::SqliteStorage;
 
     async fn storage() -> (tempfile::TempDir, Arc<SqliteStorage>) {
         let dir = tempfile::TempDir::new().unwrap();

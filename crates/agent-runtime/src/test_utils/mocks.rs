@@ -1,6 +1,5 @@
 //! Mock implementations for testing
 
-pub use crate::core_staging::test_support::MockSessionStore;
 use async_trait::async_trait;
 use mockall::mock;
 use querymt::chat::{ChatCall, ChatCapabilities, ChatMessage, ChatOutput, FinishReason, Tool};
@@ -9,6 +8,7 @@ use querymt::error::LLMError;
 use querymt::plugin::host::{PluginLoader, PluginType, ProviderConfig, ProviderPlugin};
 use querymt::plugin::{Fut, LLMProviderFactory};
 use querymt::{LLMProvider, Usage};
+pub use querymt_agent_core::test_support::MockSessionStore;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 

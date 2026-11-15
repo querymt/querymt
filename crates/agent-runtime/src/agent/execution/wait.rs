@@ -6,11 +6,11 @@
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
 use crate::delegation::{format_delegation_completion_message, format_delegation_failure_message};
-use crate::events::{AgentEventKind, StopType};
 use crate::middleware::{ExecutionState, WaitCondition, WaitReason};
-use crate::model::{AgentMessage, MessagePart};
 use log::{debug, warn};
 use querymt::chat::ChatRole;
+use querymt_agent_core::events::{AgentEventKind, StopType};
+use querymt_agent_core::model::{AgentMessage, MessagePart};
 use std::collections::HashSet;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -93,7 +93,7 @@ pub(super) async fn transition_waiting_for_event(
     wait: &WaitCondition,
     context: &Arc<crate::middleware::ConversationContext>,
     exec_ctx: &ExecutionContext,
-    event_rx: &mut tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+    event_rx: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
 ) -> Result<ExecutionState, anyhow::Error> {
     debug!(
         "WaitingForEvent: session={}, reason={:?}",
@@ -324,7 +324,7 @@ pub(super) async fn reconcile_suspended_delegations(
     config: &AgentConfig,
     context: &Arc<crate::middleware::ConversationContext>,
     exec_ctx: &ExecutionContext,
-    event_rx: &mut tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+    event_rx: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
 ) -> Result<Arc<crate::middleware::ConversationContext>, anyhow::Error> {
     let mut context = context.clone();
     if exec_ctx.suspended_delegations.lock().await.is_empty() {
@@ -458,7 +458,10 @@ async fn durable_wait_outcomes(
     Ok(events
         .into_iter()
         .filter_map(|event| {
-            let outcome = match_wait_event(&wait, &crate::events::EventEnvelope::Durable(event))?;
+            let outcome = match_wait_event(
+                &wait,
+                &querymt_agent_core::events::EventEnvelope::Durable(event),
+            )?;
             seen.insert(outcome_id(&outcome).to_string())
                 .then_some(outcome)
         })
@@ -467,7 +470,7 @@ async fn durable_wait_outcomes(
 
 fn match_wait_event(
     wait: &WaitCondition,
-    event: &crate::events::EventEnvelope,
+    event: &querymt_agent_core::events::EventEnvelope,
 ) -> Option<WaitEventOutcome> {
     match wait.reason {
         WaitReason::Delegation => match event.kind() {
@@ -697,7 +700,7 @@ mod tests {
         );
         let exec = ExecutionContext::new(
             session.public_id.clone(),
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             runtime,
             state,
             handle,
@@ -863,7 +866,8 @@ mod tests {
             &self,
             session: &str,
             ids: &[String],
-        ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>> {
+        ) -> crate::session::error::SessionResult<Vec<querymt_agent_core::events::DurableEvent>>
+        {
             use std::sync::atomic::Ordering;
             let read = self.reads.fetch_add(1, Ordering::SeqCst);
             let snapshot = if self.snapshot_before_wait.load(Ordering::SeqCst) {
@@ -902,7 +906,8 @@ mod tests {
         async fn append_durable(
             &self,
             event: &crate::session::projection::NewDurableEvent,
-        ) -> crate::session::error::SessionResult<crate::events::DurableEvent> {
+        ) -> crate::session::error::SessionResult<querymt_agent_core::events::DurableEvent>
+        {
             self.inner.append_durable(event).await
         }
         async fn load_session_stream(
@@ -910,14 +915,16 @@ mod tests {
             session: &str,
             after: Option<i64>,
             limit: Option<usize>,
-        ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>> {
+        ) -> crate::session::error::SessionResult<Vec<querymt_agent_core::events::DurableEvent>>
+        {
             self.inner.load_session_stream(session, after, limit).await
         }
         async fn load_global_stream(
             &self,
             after: Option<i64>,
             limit: Option<usize>,
-        ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>> {
+        ) -> crate::session::error::SessionResult<Vec<querymt_agent_core::events::DurableEvent>>
+        {
             self.inner.load_global_stream(after, limit).await
         }
         async fn delete_session_events_from(
@@ -930,7 +937,8 @@ mod tests {
         async fn append_durable_from_source(
             &self,
             event: &crate::session::projection::NewDurableEvent,
-        ) -> crate::session::error::SessionResult<Option<crate::events::DurableEvent>> {
+        ) -> crate::session::error::SessionResult<Option<querymt_agent_core::events::DurableEvent>>
+        {
             self.inner.append_durable_from_source(event).await
         }
         async fn latest_source_seq(
@@ -962,7 +970,8 @@ mod tests {
             &self,
             session: &str,
             node: &str,
-        ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>> {
+        ) -> crate::session::error::SessionResult<Vec<querymt_agent_core::events::DurableEvent>>
+        {
             self.inner.load_remote_session_stream(session, node).await
         }
         async fn max_stream_seq(&self, session: &str) -> crate::session::error::SessionResult<i64> {
@@ -980,9 +989,9 @@ mod tests {
                 config.event_sink.journal().clone(),
                 0,
             ));
-            config.event_sink = Arc::new(crate::event_sink::EventSink::new(
+            config.event_sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
                 gate.clone(),
-                Arc::new(crate::event_fanout::EventFanout::new()),
+                Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
             ));
             let mut rx = config.subscribe_events();
             let wait = WaitCondition {
@@ -1020,9 +1029,9 @@ mod tests {
             config.event_sink.journal().clone(),
             block_after,
         ));
-        config.event_sink = Arc::new(crate::event_sink::EventSink::new(
+        config.event_sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
             gate.clone(),
-            Arc::new(crate::event_fanout::EventFanout::new()),
+            Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
         ));
         gate
     }
@@ -1568,7 +1577,7 @@ mod tests {
             let gate = gated_sink(&mut config, usize::MAX);
             gate.failures.store(usize::MAX, Ordering::SeqCst);
             let inbox = Arc::new(crate::agent::turn_control::SteeringInbox::new(
-                crate::model::TurnId::new(),
+                querymt_agent_core::model::TurnId::new(),
             ));
             let exec = exec.with_steering(inbox.clone());
             let mut rx = config.subscribe_events();

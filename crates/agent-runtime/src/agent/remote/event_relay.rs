@@ -6,11 +6,13 @@
 //! local `EventBus`, making remote session events visible to the local dashboard
 //! and other local observers.
 
-use crate::event_sink::EventSink;
-use crate::events::{AgentEvent, AgentEventKind, Durability, EventOrigin, classify_durability};
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
+use querymt_agent_core::events::{
+    AgentEvent, AgentEventKind, Durability, EventOrigin, classify_durability,
+};
+use querymt_agent_services::event_sink::EventSink;
 use serde::{Deserialize, Serialize};
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -372,11 +374,11 @@ impl Message<RelayedEvent> for EventRelayActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_fanout::EventFanout;
-    use crate::event_sink::EventSink;
-    use crate::events::{AgentEventKind, EventEnvelope, EventOrigin};
     use crate::session::backend::StorageBackend;
     use crate::session::sqlite_storage::SqliteStorage;
+    use querymt_agent_core::events::{AgentEventKind, EventEnvelope, EventOrigin};
+    use querymt_agent_services::event_fanout::EventFanout;
+    use querymt_agent_services::event_sink::EventSink;
     use tokio::sync::mpsc;
 
     async fn make_relay_with_sink(
@@ -415,7 +417,7 @@ mod tests {
             session_id: "test-session".to_string(),
             origin: EventOrigin::Remote,
             source_node: Some("remote-a".to_string()),
-            kind: crate::events::AgentEventKind::SessionCreated,
+            kind: querymt_agent_core::events::AgentEventKind::SessionCreated,
         };
 
         relay_ref
@@ -437,7 +439,7 @@ mod tests {
             assert_eq!(de.source_node.as_deref(), Some("remote-a"));
             assert!(matches!(
                 de.kind,
-                crate::events::AgentEventKind::SessionCreated
+                querymt_agent_core::events::AgentEventKind::SessionCreated
             ));
         } else {
             panic!("expected durable event envelope");
@@ -565,7 +567,7 @@ mod tests {
             session_id: "remote-sess".to_string(),
             origin: EventOrigin::Remote,
             source_node: Some("gpu-box".to_string()),
-            kind: crate::events::AgentEventKind::SessionCreated,
+            kind: querymt_agent_core::events::AgentEventKind::SessionCreated,
         };
 
         relay_ref
@@ -608,7 +610,7 @@ mod tests {
             session_id: "s-eph".to_string(),
             origin: EventOrigin::Local,
             source_node: None,
-            kind: crate::events::AgentEventKind::AssistantContentDelta {
+            kind: querymt_agent_core::events::AgentEventKind::AssistantContentDelta {
                 content: "token".into(),
                 message_id: "m1".into(),
             },
@@ -660,7 +662,7 @@ mod tests {
             session_id: "s-default".to_string(),
             origin: EventOrigin::Local,
             source_node: None, // no source_node set
-            kind: crate::events::AgentEventKind::SessionCreated,
+            kind: querymt_agent_core::events::AgentEventKind::SessionCreated,
         };
 
         relay_ref
@@ -703,7 +705,7 @@ mod tests {
             session_id: "s-preserve".to_string(),
             origin: EventOrigin::Remote,
             source_node: Some("original-peer".to_string()),
-            kind: crate::events::AgentEventKind::SessionCreated,
+            kind: querymt_agent_core::events::AgentEventKind::SessionCreated,
         };
 
         relay_ref

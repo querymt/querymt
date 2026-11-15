@@ -3,7 +3,7 @@
 //! `EventFanout` delivers events to live subscribers. It does NOT write to
 //! storage. This is the "transport boundary" from the refactor plan.
 
-use crate::events::{AgentEventKind, EventEnvelope};
+use querymt_agent_core::events::{AgentEventKind, EventEnvelope};
 use tokio::sync::broadcast;
 
 const FANOUT_BUFFER: usize = 1024;
@@ -115,7 +115,9 @@ impl Default for EventFanout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{AgentEventKind, DurableEvent, EphemeralEvent, EventEnvelope, EventOrigin};
+    use querymt_agent_core::events::{
+        AgentEventKind, DurableEvent, EphemeralEvent, EventEnvelope, EventOrigin,
+    };
 
     #[tokio::test]
     async fn new_creates_working_fanout() {

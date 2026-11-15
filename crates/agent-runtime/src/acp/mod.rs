@@ -8,7 +8,7 @@ pub mod client_bridge;
 pub mod cwd;
 #[doc(hidden)]
 pub mod delivery;
-pub use crate::core_staging::protocol;
+pub use querymt_agent_core::protocol;
 pub mod shared;
 #[doc(hidden)]
 pub mod stdio;
@@ -28,7 +28,7 @@ use crate::acp::shared::{
     AcpLiveEventTranslator, PendingElicitationMap, RpcMessage, SessionOwnerMap,
     collect_event_sources, dispatch_rpc_message, is_event_owned,
 };
-use crate::event_fanout::EventFanout;
+use querymt_agent_services::event_fanout::EventFanout;
 
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

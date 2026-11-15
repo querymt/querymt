@@ -198,7 +198,7 @@ pub fn session_creation_options_from_meta(
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Option<SessionCreationOptions>, String> {
     let Some(value) = meta
-        .and_then(|meta| meta.get(crate::core_staging::meta::QUERYMT_META_NAMESPACE))
+        .and_then(|meta| meta.get(querymt_agent_core::meta::QUERYMT_META_NAMESPACE))
         .and_then(|querymt| querymt.get(SESSION_WORKSPACE_META_KEY))
     else {
         return Ok(None);
@@ -288,7 +288,7 @@ pub fn fork_creation_options_from_meta(
 /// explicit boolean `includeLocalChanges` (including `false`, which asks for a
 /// commit baseline and must not be overridden by any default).
 fn baseline_pinned(meta: Option<&serde_json::Map<String, serde_json::Value>>) -> bool {
-    meta.and_then(|meta| meta.get(crate::core_staging::meta::QUERYMT_META_NAMESPACE))
+    meta.and_then(|meta| meta.get(querymt_agent_core::meta::QUERYMT_META_NAMESPACE))
         .and_then(|querymt| querymt.get(SESSION_WORKSPACE_META_KEY))
         .is_some_and(|workspace| {
             workspace.get("baseline").is_some_and(|v| !v.is_null())
@@ -394,7 +394,7 @@ mod tests {
     fn meta_with_workspace(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         let mut meta = serde_json::Map::new();
         meta.insert(
-            crate::core_staging::meta::QUERYMT_META_NAMESPACE.to_string(),
+            querymt_agent_core::meta::QUERYMT_META_NAMESPACE.to_string(),
             serde_json::json!({ SESSION_WORKSPACE_META_KEY: value }),
         );
         meta
@@ -410,7 +410,7 @@ mod tests {
         );
         let mut without_workspace = serde_json::Map::new();
         without_workspace.insert(
-            crate::core_staging::meta::QUERYMT_META_NAMESPACE.to_string(),
+            querymt_agent_core::meta::QUERYMT_META_NAMESPACE.to_string(),
             serde_json::json!({ "otherKey": 1 }),
         );
         assert_eq!(

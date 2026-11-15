@@ -33,7 +33,7 @@ pub use state::{
 };
 
 // Re-export model info types for convenience
-pub use crate::model_info::{CapabilityError, ModelInfoSource};
+pub use querymt_agent_services::model_info::{CapabilityError, ModelInfoSource};
 
 // Re-export middleware implementations (will be converted to new system)
 pub use context::{ContextConfig, ContextMiddleware};

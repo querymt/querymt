@@ -279,7 +279,7 @@ pub(crate) struct RemoteAttachmentInstallConflict {
 #[cfg(feature = "remote")]
 #[derive(Clone)]
 pub(crate) struct RemoteAttachmentPrepareContext {
-    pub(crate) event_sink: Arc<crate::event_sink::EventSink>,
+    pub(crate) event_sink: Arc<querymt_agent_services::event_sink::EventSink>,
     pub(crate) disconnect_tx: Option<mpsc::UnboundedSender<RemoteSessionDisconnect>>,
 }
 
@@ -831,8 +831,10 @@ impl SessionRegistry {
                 )
                 .await?;
 
-            self.config
-                .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
+            self.config.emit_event(
+                &session_id,
+                querymt_agent_core::events::AgentEventKind::SessionCreated,
+            );
         }
 
         let session_ref = self

@@ -19,10 +19,12 @@ use crate::agent::turn_control::{
 use crate::agent::undo::{RedoResult, UndoError, UndoResult};
 use crate::agent::utils::{format_prompt_user_text_only, genai, render_prompt_for_display};
 use crate::error::AgentError;
-use crate::events::{AgentEventKind, RunOutcome, SessionLimits};
 use crate::hooks::HookNotice;
-use crate::model::{AgentMessage, MessagePart, prompt_contains_images, validate_prompt_blocks};
 use crate::session::run_lease::{RunLease, RunLeaseRoot};
+use querymt_agent_core::events::{AgentEventKind, RunOutcome, SessionLimits};
+use querymt_agent_core::model::{
+    AgentMessage, MessagePart, prompt_contains_images, validate_prompt_blocks,
+};
 
 /// How long a run start waits for a momentarily held run lease (a reconciler
 /// or session delete) before treating the session as running elsewhere.
@@ -518,7 +520,7 @@ impl SessionActor {
     fn prompt_execution(
         &self,
         req: crate::acp::protocol::PromptRequest,
-        turn_id: crate::model::TurnId,
+        turn_id: querymt_agent_core::model::TurnId,
         steering: Arc<crate::agent::turn_control::SteeringInbox>,
         phase_reporter: tokio::sync::mpsc::UnboundedSender<Option<RunPhase>>,
     ) -> DetachedPromptExecution {
@@ -610,7 +612,7 @@ impl SessionActor {
         self.turn_state.generation = self.turn_state.generation.saturating_add(1);
         self.turn_state.token = CancellationToken::new();
         let generation = self.turn_state.generation;
-        let turn_id = crate::model::TurnId::new();
+        let turn_id = querymt_agent_core::model::TurnId::new();
         let run_id = turn_id;
         let active_run = ActiveRun::new(run_id, generation, self.turn_state.token.clone());
         let steering = active_run.steering.clone();
@@ -1077,9 +1079,11 @@ impl SessionActor {
         }
         if model_changed {
             let binding = &current.effective_model;
-            let context_limit =
-                crate::model_info::get_model_info(&binding.provider, &binding.model)
-                    .and_then(|model| model.context_limit());
+            let context_limit = querymt_agent_services::model_info::get_model_info(
+                &binding.provider,
+                &binding.model,
+            )
+            .and_then(|model| model.context_limit());
             self.config.emit_event(
                 &self.session_id,
                 AgentEventKind::ProviderChanged {
@@ -1764,7 +1768,7 @@ impl Message<crate::agent::messages::GetUserPrompts> for SessionActor {
 
 /// Return the full durable event stream for this session from the local journal.
 impl Message<crate::agent::messages::GetEventStream> for SessionActor {
-    type Reply = Result<Vec<crate::events::AgentEvent>, AgentError>;
+    type Reply = Result<Vec<querymt_agent_core::events::AgentEvent>, AgentError>;
 
     async fn handle(
         &mut self,
@@ -1779,7 +1783,7 @@ impl Message<crate::agent::messages::GetEventStream> for SessionActor {
             .map(|events| {
                 events
                     .into_iter()
-                    .map(crate::events::AgentEvent::from)
+                    .map(querymt_agent_core::events::AgentEvent::from)
                     .collect()
             })
             .map_err(|e| AgentError::Internal(e.to_string()))
@@ -1824,7 +1828,7 @@ impl Message<crate::agent::messages::GetEventStreamSince> for SessionActor {
         Ok(crate::agent::messages::EventStreamPage {
             events: events
                 .into_iter()
-                .map(crate::events::AgentEvent::from)
+                .map(querymt_agent_core::events::AgentEvent::from)
                 .collect(),
             latest_source_seq,
         })
@@ -1929,7 +1933,7 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
                     .config
                     .emit_event_persisted(
                         &self.session_id,
-                        crate::events::AgentEventKind::WorkspaceIndexReady {
+                        querymt_agent_core::events::AgentEventKind::WorkspaceIndexReady {
                             workspace_root: index.root.display().to_string(),
                         },
                     )
@@ -2122,7 +2126,7 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
             .canonicalize()
             .map_err(|e| FileProxyError::PathResolution(e.to_string()))?;
 
-        let root = crate::index::resolve_workspace_root(cwd);
+        let root = querymt_agent_index::resolve_workspace_root(cwd);
         if !resolved.starts_with(&root) {
             return Err(FileProxyError::PathOutsideWorkspace(
                 resolved.display().to_string(),
@@ -2213,7 +2217,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                     .expected_run_id
                     .ok_or_else(|| AgentError::from(TurnControlError::ExpectedRunIdRequired))?;
                 // A non-UUID expected id never matches the active run.
-                let expected = crate::model::TurnId::from_stored(&expected);
+                let expected = querymt_agent_core::model::TurnId::from_stored(&expected);
                 if expected != run.run_id {
                     return Err(AgentError::from(TurnControlError::RunMismatch {
                         expected,
@@ -2478,7 +2482,7 @@ impl Message<ScheduledPrompt> for SessionActor {
         self.prompt_running = true;
         self.turn_state.generation = self.turn_state.generation.saturating_add(1);
         let prompt_generation = self.turn_state.generation;
-        let turn_id = crate::model::TurnId::new();
+        let turn_id = querymt_agent_core::model::TurnId::new();
         let run_id = turn_id;
         self.turn_state.token = CancellationToken::new();
         let scheduled_run =
@@ -2620,7 +2624,7 @@ struct DetachedPromptExecution {
     execution_origin: crate::agent::execution_context::ExecutionOrigin,
     /// The run's single turn id; the `String` run id used by events, hooks and
     /// steering is derived from it.
-    turn_id: crate::model::TurnId,
+    turn_id: querymt_agent_core::model::TurnId,
     steering: Arc<crate::agent::turn_control::SteeringInbox>,
     phase_reporter: tokio::sync::mpsc::UnboundedSender<Option<RunPhase>>,
 }
@@ -2685,7 +2689,8 @@ fn validate_model_image_support(
         return Ok(());
     };
     if !model_supports_images(
-        crate::model_info::get_model_info(&llm_config.provider, &llm_config.model).as_ref(),
+        querymt_agent_services::model_info::get_model_info(&llm_config.provider, &llm_config.model)
+            .as_ref(),
     ) {
         return Err(AgentError::InvalidPromptContent {
             message: format!(
@@ -2743,7 +2748,7 @@ async fn validate_execution_task(
 /// the ACP stop reason.
 struct PromptRun {
     response: PromptResponse,
-    stop: Option<(crate::events::StopType, String)>,
+    stop: Option<(querymt_agent_core::events::StopType, String)>,
 }
 
 impl PromptRun {
@@ -2953,7 +2958,8 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         .accounting(&session_id, &config.event_sink)
         .await
         .map_err(|e| AgentError::Internal(format!("failed to load accounting: {e}")))?;
-    let cycle_accounting = crate::accounting::CycleAccounting::begin(session_accounting);
+    let cycle_accounting =
+        querymt_agent_services::accounting::CycleAccounting::begin(session_accounting);
 
     // Create execution context — attach the cancellation token so it propagates
     // into individual tool calls for cooperative cancellation.
@@ -3020,9 +3026,9 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
             Ok(crate::agent::execution::CompactionOutcome::PriceLimit { message }) => {
                 Ok(PromptRun {
                     response: PromptResponse::new(StopReason::from(
-                        crate::events::StopType::PriceLimit,
+                        querymt_agent_core::events::StopType::PriceLimit,
                     )),
-                    stop: Some((crate::events::StopType::PriceLimit, message)),
+                    stop: Some((querymt_agent_core::events::StopType::PriceLimit, message)),
                 })
             }
             Ok(crate::agent::execution::CompactionOutcome::NothingToCompact) => {
@@ -3545,7 +3551,6 @@ mod tests {
     }
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
-    use crate::events::DurableEvent;
     use crate::session::backend::StorageBackend;
     use crate::session::domain::IntentSnapshot;
     use crate::session::error::{SessionError, SessionResult};
@@ -3556,13 +3561,16 @@ mod tests {
         MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
         mock_plugin_registry, mock_session,
     };
+    use querymt_agent_core::events::DurableEvent;
 
     #[tokio::test]
     async fn genai_detached_agent_uses_each_request_parent_and_closes_on_early_exits() {
-        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
         use opentelemetry::{
             Value,
             trace::{SpanId, SpanKind, Status, TraceId},
+        };
+        use querymt_agent_services::tools::trace_support::genai_trace::{
+            assert_private, attr, capture,
         };
 
         let fixture = crate::test_utils::TestAgent::new().await;
@@ -3612,7 +3620,7 @@ mod tests {
                     serde_json::Value::from(format!("00-{trace}-1234567890abcdef-01")),
                 )]));
             }
-            let trace_turn_id = crate::model::TurnId::new();
+            let trace_turn_id = querymt_agent_core::model::TurnId::new();
             let exec = actor.prompt_execution(
                 req,
                 trace_turn_id,
@@ -3893,7 +3901,7 @@ mod tests {
 
             ExecutionContext::new(
                 session_id.to_string(),
-                crate::model::TurnId::new(),
+                querymt_agent_core::model::TurnId::new(),
                 runtime,
                 runtime_context,
                 session_handle,
@@ -4095,7 +4103,7 @@ mod tests {
             .append_durable(&crate::session::projection::NewDurableEvent {
                 session_seq: None,
                 session_id: f._session_id.clone(),
-                origin: crate::events::EventOrigin::Local,
+                origin: querymt_agent_core::events::EventOrigin::Local,
                 source_node: None,
                 source_node_id: None,
                 source_seq: None,
@@ -4321,7 +4329,7 @@ mod tests {
         f.actor_ref
             .tell(PromptFinished {
                 generation: 1,
-                run_id: crate::model::TurnId::from_stored(&run_id),
+                run_id: querymt_agent_core::model::TurnId::from_stored(&run_id),
                 disposition: RunCompletionDisposition::Completed,
             })
             .await
@@ -4365,7 +4373,7 @@ mod tests {
         f.actor_ref
             .tell(PromptFinished {
                 generation: 1,
-                run_id: crate::model::TurnId::from_stored(&first),
+                run_id: querymt_agent_core::model::TurnId::from_stored(&first),
                 disposition: RunCompletionDisposition::Completed,
             })
             .await
@@ -4394,7 +4402,7 @@ mod tests {
         f.actor_ref
             .tell(PromptFinished {
                 generation: 1,
-                run_id: crate::model::TurnId::from_stored(&first),
+                run_id: querymt_agent_core::model::TurnId::from_stored(&first),
                 disposition: RunCompletionDisposition::Completed,
             })
             .await
@@ -4435,7 +4443,7 @@ mod tests {
         f.actor_ref
             .tell(PromptFinished {
                 generation: 2,
-                run_id: crate::model::TurnId::from_stored(&second),
+                run_id: querymt_agent_core::model::TurnId::from_stored(&second),
                 disposition: RunCompletionDisposition::Completed,
             })
             .await
@@ -4647,7 +4655,7 @@ mod tests {
                 .config
                 .emit_event_persisted(
                     "test-session",
-                    crate::events::AgentEventKind::SessionCreated,
+                    querymt_agent_core::events::AgentEventKind::SessionCreated,
                 )
                 .await
                 .unwrap();
@@ -4687,8 +4695,8 @@ mod tests {
     struct SyncRig {
         owner: ActorFixture,
         journal: Arc<dyn EventJournal>,
-        sink: Arc<crate::event_sink::EventSink>,
-        rx: tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+        sink: Arc<querymt_agent_services::event_sink::EventSink>,
+        rx: tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
     }
 
     #[cfg(feature = "remote")]
@@ -4700,9 +4708,12 @@ mod tests {
                 .await
                 .unwrap();
             let journal = storage.event_journal();
-            let fanout = Arc::new(crate::event_fanout::EventFanout::new());
+            let fanout = Arc::new(querymt_agent_services::event_fanout::EventFanout::new());
             let rx = fanout.subscribe();
-            let sink = Arc::new(crate::event_sink::EventSink::new(journal.clone(), fanout));
+            let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
+                journal.clone(),
+                fanout,
+            ));
             Self {
                 owner,
                 journal,
@@ -4750,12 +4761,12 @@ mod tests {
                 journal
                     .append_durable(&NewDurableEvent {
                         session_id: "test-session".into(),
-                        origin: crate::events::EventOrigin::Local,
+                        origin: querymt_agent_core::events::EventOrigin::Local,
                         source_node: None,
                         source_node_id: None,
                         source_seq: None,
                         session_seq: None,
-                        kind: crate::events::AgentEventKind::SessionCreated,
+                        kind: querymt_agent_core::events::AgentEventKind::SessionCreated,
                     })
                     .await
                     .unwrap();
@@ -4804,9 +4815,9 @@ mod tests {
 
         // Interrupted before the fill: a restarted node (new sink, same
         // journal) resumes from the persisted coverage.
-        let restarted = Arc::new(crate::event_sink::EventSink::new(
+        let restarted = Arc::new(querymt_agent_services::event_sink::EventSink::new(
             rig.journal.clone(),
-            Arc::new(crate::event_fanout::EventFanout::new()),
+            Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
         ));
         let resumed = crate::agent::remote::event_backfill::RemoteSync::new(
             restarted,
@@ -4889,9 +4900,9 @@ mod tests {
     #[cfg(feature = "remote")]
     #[tokio::test]
     async fn local_copy_replaced_after_the_owners_undo_keeps_retained_charges_once() {
-        use crate::accounting::SessionAccounting;
-        use crate::core_staging::accounting::samples::{sample_settlement, sample_start};
-        use crate::events::AgentEventKind;
+        use querymt_agent_core::accounting::samples::{sample_settlement, sample_start};
+        use querymt_agent_core::events::AgentEventKind;
+        use querymt_agent_services::accounting::SessionAccounting;
 
         let rig = SyncRig::new(0).await;
         let owner_journal = rig.owner.config.event_sink.journal();
@@ -4901,7 +4912,7 @@ mod tests {
                 journal
                     .append_durable(&NewDurableEvent {
                         session_id: "test-session".into(),
-                        origin: crate::events::EventOrigin::Local,
+                        origin: querymt_agent_core::events::EventOrigin::Local,
                         source_node: None,
                         source_node_id: None,
                         source_seq: None,
@@ -4979,9 +4990,9 @@ mod tests {
         assert_eq!(sync.state().transfers().1, before + 30);
 
         rig.owner.append_owner_events(30).await;
-        let restarted = Arc::new(crate::event_sink::EventSink::new(
+        let restarted = Arc::new(querymt_agent_services::event_sink::EventSink::new(
             rig.journal.clone(),
-            Arc::new(crate::event_fanout::EventFanout::new()),
+            Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
         ));
         let fresh = crate::agent::remote::event_backfill::RemoteSync::new(
             restarted,
@@ -5009,7 +5020,7 @@ mod tests {
                 .config
                 .emit_event_persisted(
                     "test-session",
-                    crate::events::AgentEventKind::SessionCreated,
+                    querymt_agent_core::events::AgentEventKind::SessionCreated,
                 )
                 .await
                 .unwrap();
@@ -5018,17 +5029,20 @@ mod tests {
             .await
             .unwrap();
         let journal = storage.event_journal();
-        let fanout = Arc::new(crate::event_fanout::EventFanout::new());
+        let fanout = Arc::new(querymt_agent_services::event_fanout::EventFanout::new());
         let mut rx = fanout.subscribe();
-        let sink = Arc::new(crate::event_sink::EventSink::new(journal.clone(), fanout));
+        let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
+            journal.clone(),
+            fanout,
+        ));
         let session_ref = crate::agent::remote::SessionActorRef::from(fixture.actor_ref.clone());
 
         // Cursorless legacy rows remain stored, but the complete host snapshot
         // supersedes them in the remote read model without guessed identities.
         sink.emit_durable_with_origin(
             "test-session",
-            crate::events::AgentEventKind::SessionCreated,
-            crate::events::EventOrigin::Remote,
+            querymt_agent_core::events::AgentEventKind::SessionCreated,
+            querymt_agent_core::events::EventOrigin::Remote,
             Some("peer-a".into()),
         )
         .await
@@ -5042,7 +5056,7 @@ mod tests {
         // Deterministically simulate a new live event arriving before backfill.
         sink.emit_durable_from_source(
             "test-session",
-            crate::events::AgentEventKind::SessionCreated,
+            querymt_agent_core::events::AgentEventKind::SessionCreated,
             Some("peer-a".into()),
             "node-a".into(),
             3,
@@ -5103,7 +5117,7 @@ mod tests {
         // delivered (2 newly persisted events; the live overlap was a no-op).
         assert!(matches!(
             rx.recv().await.unwrap().kind(),
-            crate::events::AgentEventKind::RemoteSessionSyncCompleted {
+            querymt_agent_core::events::AgentEventKind::RemoteSessionSyncCompleted {
                 backfilled: 2,
                 boundary: true,
                 ..
@@ -5115,7 +5129,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             rx.recv().await.unwrap().kind(),
-            crate::events::AgentEventKind::RemoteSessionSyncCompleted {
+            querymt_agent_core::events::AgentEventKind::RemoteSessionSyncCompleted {
                 backfilled: 0,
                 boundary: false,
                 ..
@@ -5139,12 +5153,12 @@ mod tests {
             host.config
                 .emit_event_persisted(
                     "test-session",
-                    crate::events::AgentEventKind::SessionCreated,
+                    querymt_agent_core::events::AgentEventKind::SessionCreated,
                 )
                 .await
                 .unwrap();
         }
-        let host_events: Vec<crate::events::AgentEvent> = host
+        let host_events: Vec<querymt_agent_core::events::AgentEvent> = host
             .config
             .event_sink
             .journal()
@@ -5159,9 +5173,12 @@ mod tests {
             .await
             .unwrap();
         let journal = storage.event_journal();
-        let fanout = Arc::new(crate::event_fanout::EventFanout::new());
+        let fanout = Arc::new(querymt_agent_services::event_fanout::EventFanout::new());
         let mut rx = fanout.subscribe();
-        let sink = Arc::new(crate::event_sink::EventSink::new(journal.clone(), fanout));
+        let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
+            journal.clone(),
+            fanout,
+        ));
         let relay = EventRelayActor::new(
             sink,
             "test-session".to_string(),
@@ -5221,12 +5238,12 @@ mod tests {
             host.config
                 .emit_event_persisted(
                     "test-session",
-                    crate::events::AgentEventKind::SessionCreated,
+                    querymt_agent_core::events::AgentEventKind::SessionCreated,
                 )
                 .await
                 .unwrap();
         }
-        let host_events: Vec<crate::events::AgentEvent> = host
+        let host_events: Vec<querymt_agent_core::events::AgentEvent> = host
             .config
             .event_sink
             .journal()
@@ -5248,9 +5265,12 @@ mod tests {
             .await
             .unwrap();
         let journal = storage.event_journal();
-        let fanout = Arc::new(crate::event_fanout::EventFanout::new());
+        let fanout = Arc::new(querymt_agent_services::event_fanout::EventFanout::new());
         let mut rx = fanout.subscribe();
-        let sink = Arc::new(crate::event_sink::EventSink::new(journal.clone(), fanout));
+        let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
+            journal.clone(),
+            fanout,
+        ));
         let relay = EventRelayActor::new(
             sink,
             "test-session".to_string(),
@@ -5549,7 +5569,10 @@ mod tests {
         // Look for Cancelled event
         let mut found_cancel = false;
         while let Ok(envelope) = rx.try_recv() {
-            if matches!(envelope.kind(), crate::events::AgentEventKind::Cancelled) {
+            if matches!(
+                envelope.kind(),
+                querymt_agent_core::events::AgentEventKind::Cancelled
+            ) {
                 found_cancel = true;
             }
         }
@@ -5566,7 +5589,7 @@ mod tests {
             exec.runtime.clone(),
         );
         actor.turn_state.generation = 1;
-        let held_run_id = crate::model::TurnId::new();
+        let held_run_id = querymt_agent_core::model::TurnId::new();
         let mut run = ActiveRun::new(held_run_id, 1, actor.turn_state.token.clone());
         run.phase = RunPhase::Model;
         exec = exec.with_steering(run.steering.clone());
@@ -5677,7 +5700,7 @@ mod tests {
         f.actor_ref
             .tell(PromptFinished {
                 generation: 0,
-                run_id: crate::model::TurnId::new(),
+                run_id: querymt_agent_core::model::TurnId::new(),
                 disposition: RunCompletionDisposition::Completed,
             })
             .await
@@ -5718,7 +5741,9 @@ mod tests {
 
         let mut found = false;
         while let Ok(envelope) = rx.try_recv() {
-            if let crate::events::AgentEventKind::SessionModeChanged { mode } = envelope.kind() {
+            if let querymt_agent_core::events::AgentEventKind::SessionModeChanged { mode } =
+                envelope.kind()
+            {
                 assert_eq!(*mode, AgentMode::Plan);
                 found = true;
             }
@@ -5741,8 +5766,9 @@ mod tests {
 
         let mut snapshots = 0;
         while let Ok(envelope) = rx.try_recv() {
-            if let crate::events::AgentEventKind::SessionConfigChanged { mode, .. } =
-                envelope.kind()
+            if let querymt_agent_core::events::AgentEventKind::SessionConfigChanged {
+                mode, ..
+            } = envelope.kind()
             {
                 assert_eq!(*mode, AgentMode::Plan);
                 snapshots += 1;
@@ -5777,8 +5803,8 @@ mod tests {
             assert!(
                 !matches!(
                     envelope.kind(),
-                    crate::events::AgentEventKind::SessionConfigChanged { .. }
-                        | crate::events::AgentEventKind::SessionModeChanged { .. }
+                    querymt_agent_core::events::AgentEventKind::SessionConfigChanged { .. }
+                        | querymt_agent_core::events::AgentEventKind::SessionModeChanged { .. }
                 ),
                 "no-op transitions must not emit configuration updates"
             );
@@ -6237,7 +6263,7 @@ mod tests {
         f.actor_ref
             .tell(PromptFinished {
                 generation: 0,
-                run_id: crate::model::TurnId::new(),
+                run_id: querymt_agent_core::model::TurnId::new(),
                 disposition: RunCompletionDisposition::Completed,
             })
             .await
@@ -6253,12 +6279,15 @@ mod tests {
     fn run_disposition_reports_stops_without_touching_the_response() {
         let stopped: Result<PromptRun, AgentError> = Ok(PromptRun {
             response: PromptResponse::new(StopReason::MaxTokens),
-            stop: Some((crate::events::StopType::ModelTokenLimit, "cut off".into())),
+            stop: Some((
+                querymt_agent_core::events::StopType::ModelTokenLimit,
+                "cut off".into(),
+            )),
         });
         assert_eq!(
             run_disposition(false, &stopped),
             RunCompletionDisposition::Stopped {
-                stop_type: crate::events::StopType::ModelTokenLimit,
+                stop_type: querymt_agent_core::events::StopType::ModelTokenLimit,
                 reason: "cut off".into(),
             }
         );
@@ -6293,7 +6322,7 @@ mod tests {
                 crate::agent::core::McpToolState::empty(),
             ),
         );
-        let stop_run_id = crate::model::TurnId::new();
+        let stop_run_id = querymt_agent_core::model::TurnId::new();
         actor.active_run = Some(ActiveRun::new(stop_run_id, 1, CancellationToken::new()));
         let actor_ref = SessionActor::spawn(actor);
         let mut events = fixture.config.subscribe_events();
@@ -6303,7 +6332,7 @@ mod tests {
                 generation: 1,
                 run_id: stop_run_id,
                 disposition: RunCompletionDisposition::Stopped {
-                    stop_type: crate::events::StopType::ModelTokenLimit,
+                    stop_type: querymt_agent_core::events::StopType::ModelTokenLimit,
                     reason: "output limit".to_string(),
                 },
             })
@@ -6327,7 +6356,10 @@ mod tests {
         .await
         .expect("run_completed emitted");
         assert_eq!(completed.0, "stopped");
-        assert_eq!(completed.1, Some(crate::events::StopType::ModelTokenLimit));
+        assert_eq!(
+            completed.1,
+            Some(querymt_agent_core::events::StopType::ModelTokenLimit)
+        );
         assert_eq!(completed.2.as_deref(), Some("output limit"));
     }
 
@@ -6345,7 +6377,7 @@ mod tests {
             ),
         );
         actor.active_run = Some(ActiveRun::new(
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             1,
             CancellationToken::new(),
         ));
@@ -6477,7 +6509,7 @@ mod tests {
             ),
         );
         actor.active_run = Some(ActiveRun::new(
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             1,
             CancellationToken::new(),
         ));
@@ -6995,7 +7027,7 @@ mod tests {
     }
 
     fn drain_provider_changes(
-        rx: &mut tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+        rx: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
     ) -> usize {
         let mut changes = 0;
         while let Ok(envelope) = rx.try_recv() {

@@ -8,7 +8,7 @@
 //! events: a turn starts at a `UserPromptBlock` / `PromptReceived` that does
 //! not directly follow another prompt event.
 
-use crate::events::AgentEventKind;
+use querymt_agent_core::events::AgentEventKind;
 
 /// Indices (into the iterated sequence) at which a turn starts.
 ///

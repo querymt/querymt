@@ -1,5 +1,5 @@
 //! Shared helper utilities for builtin tools
-use crate::core_staging::config::execution::OverflowStorage;
+use querymt_agent_core::config::execution::OverflowStorage;
 use std::path::{Path, PathBuf};
 
 use crate::tools::{ToolContext, ToolError};

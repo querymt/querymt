@@ -23,7 +23,7 @@
 pub mod allocate;
 pub mod apply;
 pub mod capture;
-pub use crate::core_staging::worktree::domain;
+pub use querymt_agent_core::worktree::domain;
 pub mod error;
 pub mod finalize;
 pub mod gate;
@@ -49,7 +49,6 @@ pub mod storage_root;
 #[doc(hidden)]
 pub mod test_support;
 
-pub use crate::core_staging::worktree::repository::WorkspaceRepository;
 pub use allocate::{BaselineSource, RecoveredWorkspace, WorkspaceAllocator, checkout_path_for};
 pub use capture::{
     CaptureRetryPolicy, CapturedState, capture_working_state, capture_working_state_validated,
@@ -86,6 +85,7 @@ pub use ops::{
     WorktreeStatusResponse, WorktreeSummary,
 };
 pub use protect::IndexLock;
+pub use querymt_agent_core::worktree::repository::WorkspaceRepository;
 pub use repo_ops::{
     CapturedWorkingState, CheckoutStatus, FailurePoint, FaultInjectingRepoOps, GixRepoOps,
     RegisteredWorktree, RepositoryOps, validate_ref_name,

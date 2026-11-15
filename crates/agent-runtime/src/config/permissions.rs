@@ -1,5 +1,5 @@
 use super::*;
-pub use crate::core_staging::config::approval::ApprovalNeed;
+pub use querymt_agent_core::config::approval::ApprovalNeed;
 use std::num::NonZeroU64;
 use std::time::Duration;
 

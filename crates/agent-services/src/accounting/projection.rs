@@ -22,9 +22,9 @@
 //! delivery between writers cannot lose a record that was observed.
 
 use super::{AccountingConflict, AccountingError, AccountingReducer, Applied};
-use crate::events::DurableEvent;
 use crate::session::projection::EventJournal;
 use parking_lot::Mutex;
+use querymt_agent_core::events::DurableEvent;
 use std::sync::Arc;
 
 /// Journal events loaded per hydration/catch-up page.
@@ -149,13 +149,13 @@ impl SessionAccounting {
 mod tests {
     use super::*;
     use crate::accounting::AttemptRecorder;
-    use crate::accounting::tests::{sample_settlement, sample_start};
     use crate::event_fanout::EventFanout;
-    use crate::events::AgentEventKind;
     use crate::session::backend::StorageBackend;
     use crate::session::projection::NewDurableEvent;
-    use crate::session::sqlite_storage::SqliteStorage;
     use crate::session_event_stream::SessionEventStream;
+    use querymt_agent_core::accounting::samples::{sample_settlement, sample_start};
+    use querymt_agent_core::events::AgentEventKind;
+    use querymt_agent_sqlite::session::sqlite_storage::SqliteStorage;
 
     fn start_for(id: &str, cycle: &str) -> crate::accounting::AttemptStart {
         let mut s = sample_start();
@@ -339,7 +339,7 @@ mod tests {
             journal
                 .append_durable(&NewDurableEvent {
                     session_id: "sess-1".into(),
-                    origin: crate::events::EventOrigin::Local,
+                    origin: querymt_agent_core::events::EventOrigin::Local,
                     source_node: None,
                     source_node_id: None,
                     source_seq: None,

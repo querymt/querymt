@@ -30,17 +30,17 @@
 //! min_lines = 5
 //! ```
 
-pub use crate::core_staging::dedup::{DuplicateWarning, FunctionLocation, SimilarMatch};
-use crate::event_sink::EventSink;
-use crate::events::AgentEventKind;
-use crate::index::workspace_actor::{FindSimilarToCode, RemoveFile, UpdateFile};
-use crate::index::{DiffPaths, IndexedFunctionEntry, SimilarFunctionMatch, WorkspaceHandle};
 use crate::middleware::factory::MiddlewareFactory;
 use crate::middleware::{
     ConversationContext, ExecutionState, MiddlewareDriver, Result, ToolResult,
 };
 use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
+pub use querymt_agent_core::dedup::{DuplicateWarning, FunctionLocation, SimilarMatch};
+use querymt_agent_core::events::AgentEventKind;
+use querymt_agent_index::workspace_actor::{FindSimilarToCode, RemoveFile, UpdateFile};
+use querymt_agent_index::{DiffPaths, IndexedFunctionEntry, SimilarFunctionMatch, WorkspaceHandle};
+use querymt_agent_services::event_sink::EventSink;
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -832,7 +832,7 @@ impl MiddlewareFactory for DedupCheckFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::MessagePart;
+    use querymt_agent_core::model::MessagePart;
     use std::path::PathBuf;
 
     #[test]
@@ -1045,7 +1045,7 @@ mod tests {
             tool_arguments: None,
             hook_contexts: Vec::new(),
             snapshot_part: Some(MessagePart::Snapshot {
-                root_hash: crate::hash::RapidHash::new(b"test"),
+                root_hash: querymt_agent_core::hash::RapidHash::new(b"test"),
                 changed_paths: DiffPaths {
                     added: vec![PathBuf::from("new.ts")],
                     modified: vec![],

@@ -1008,9 +1008,9 @@ pub mod tests {
         let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
             .await
             .unwrap();
-        let sink = Arc::new(crate::event_sink::EventSink::new(
+        let sink = Arc::new(querymt_agent_services::event_sink::EventSink::new(
             storage.event_journal(),
-            Arc::new(crate::event_fanout::EventFanout::new()),
+            Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
         ));
         let ctx = crate::agent::mcp::McpConnectContext::from_config(&svc.config.mcp_servers)
             .with_secret_backend(backend.clone());
@@ -1074,7 +1074,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn refused_registration_reports_the_step_and_marks_the_span() {
-        use crate::test_utils::genai_trace::{attr, capture_info};
+        use querymt_agent_services::tools::trace_support::genai_trace::{attr, capture_info};
         let auth = serve_auth_server().await;
         auth.refuse.store(true, std::sync::atomic::Ordering::SeqCst);
         let backend = Arc::new(MemoryBackend::default());
@@ -1121,7 +1121,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn unknown_server_is_a_user_error_with_a_readable_message() {
-        use crate::test_utils::genai_trace::{attr, capture_info};
+        use querymt_agent_services::tools::trace_support::genai_trace::{attr, capture_info};
         let auth = serve_auth_server().await;
         let backend = Arc::new(MemoryBackend::default());
         let (svc, _) = service(&auth, &backend, free_port()).await;

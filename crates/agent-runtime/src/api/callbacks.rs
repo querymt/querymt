@@ -1,7 +1,7 @@
 //! Event callback system for the simple API
 
-use crate::events::{AgentEventKind, EventEnvelope};
 use parking_lot::Mutex;
+use querymt_agent_core::events::{AgentEventKind, EventEnvelope};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::task::JoinHandle;

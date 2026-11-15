@@ -134,11 +134,11 @@ impl ToolTrait for AcceptDelegationResultTool {
         }
     }
 
-    fn default_approval(&self) -> crate::core_staging::config::approval::ApprovalNeed {
+    fn default_approval(&self) -> querymt_agent_core::config::approval::ApprovalNeed {
         // Integration rewrites tracked files and advances the branch, so it
         // asks once per session ("Allow for this session" is offered).
         // `permissions.always_ask` makes it ask on every call instead.
-        crate::core_staging::config::approval::ApprovalNeed::Session
+        querymt_agent_core::config::approval::ApprovalNeed::Session
     }
 
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {

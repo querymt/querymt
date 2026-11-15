@@ -1,12 +1,12 @@
 use crate::agent::utils::u32_from_usize;
-use crate::events::StopType;
 use crate::middleware::factory::MiddlewareFactory;
 use crate::middleware::{ConversationContext, ExecutionState, MiddlewareDriver, Result};
-use crate::model_info::{InvalidManualPricing, ModelInfoSource};
 use async_trait::async_trait;
 use log::{debug, trace};
 use parking_lot::Mutex;
 use querymt::providers::ModelPricing;
+use querymt_agent_core::events::StopType;
+use querymt_agent_services::model_info::{InvalidManualPricing, ModelInfoSource};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -229,8 +229,8 @@ impl MiddlewareDriver for LimitsMiddleware {
         "LimitsMiddleware"
     }
 
-    fn get_limits(&self) -> Option<crate::events::SessionLimits> {
-        Some(crate::events::SessionLimits {
+    fn get_limits(&self) -> Option<querymt_agent_core::events::SessionLimits> {
+        Some(querymt_agent_core::events::SessionLimits {
             max_steps: self
                 .config
                 .max_steps
@@ -309,8 +309,8 @@ impl MiddlewareDriver for MaxStepsMiddleware {
         "MaxStepsMiddleware"
     }
 
-    fn get_limits(&self) -> Option<crate::events::SessionLimits> {
-        Some(crate::events::SessionLimits {
+    fn get_limits(&self) -> Option<querymt_agent_core::events::SessionLimits> {
+        Some(querymt_agent_core::events::SessionLimits {
             max_steps: Some(u32_from_usize(
                 self.max_steps,
                 "MaxStepsMiddleware.max_steps",
@@ -390,8 +390,8 @@ impl MiddlewareDriver for TurnLimitMiddleware {
         "TurnLimitMiddleware"
     }
 
-    fn get_limits(&self) -> Option<crate::events::SessionLimits> {
-        Some(crate::events::SessionLimits {
+    fn get_limits(&self) -> Option<querymt_agent_core::events::SessionLimits> {
+        Some(querymt_agent_core::events::SessionLimits {
             max_steps: None,
             max_turns: Some(u32_from_usize(
                 self.max_turns,
@@ -491,8 +491,8 @@ impl MiddlewareDriver for PriceLimitMiddleware {
         "PriceLimitMiddleware"
     }
 
-    fn get_limits(&self) -> Option<crate::events::SessionLimits> {
-        Some(crate::events::SessionLimits {
+    fn get_limits(&self) -> Option<querymt_agent_core::events::SessionLimits> {
+        Some(querymt_agent_core::events::SessionLimits {
             max_steps: None,
             max_turns: None,
             max_cost_usd: Some(self.max_cost),

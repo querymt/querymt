@@ -25,19 +25,19 @@
 
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::SessionRuntime;
-use crate::event_sink::EventSink;
-use crate::events::{AgentEventKind, OutputLimitRecoveryAction, StopType};
 use crate::middleware::factory::MiddlewareFactory;
 use crate::middleware::{
     ContextPriority, ConversationContext, ExecutionState, LlmResponse, MiddlewareDriver,
     ModelProfile, Result, apply_usage_to_stats,
 };
-use crate::model_info::get_model_info;
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use log::debug;
 use parking_lot::Mutex;
 use querymt::chat::{FinishReason, GenerationOptions, ReasoningEffort};
+use querymt_agent_core::events::{AgentEventKind, OutputLimitRecoveryAction, StopType};
+use querymt_agent_services::event_sink::EventSink;
+use querymt_agent_services::model_info::get_model_info;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -559,7 +559,7 @@ mod tests {
     /// A profile whose provider honours every option, starting at `max_tokens`.
     fn profile_for(max_tokens: u32, ceiling: u32) -> Arc<ModelProfile> {
         Arc::new(ModelProfile {
-            caps: Some(crate::model_heuristics::OutputCaps {
+            caps: Some(querymt_agent_services::model_heuristics::OutputCaps {
                 initial: max_tokens.min(ceiling),
                 ceiling,
             }),
@@ -1009,7 +1009,7 @@ mod tests {
 
     /// Next `OutputLimitRecovery` event on `rx`, with its durability.
     async fn next_recovery(
-        rx: &mut tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+        rx: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
     ) -> (AgentEventKind, bool) {
         let deadline = std::time::Duration::from_secs(5);
         loop {
@@ -1025,7 +1025,7 @@ mod tests {
 
     async fn bound_middleware() -> (
         OutputLimitRecoveryMiddleware,
-        tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+        tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
         crate::test_utils::TestAgent,
     ) {
         let agent = crate::test_utils::TestAgent::new().await;

@@ -852,7 +852,6 @@ fn validate_rev_expression(expr: &str) -> WorktreeResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::schema;
     use crate::worktree::GitRunner as _;
     use crate::worktree::GixRepoOps;
     use crate::worktree::git::CliGit;
@@ -862,6 +861,7 @@ mod tests {
     };
     use parking_lot::Mutex;
     use querymt_agent_sqlite::repo_workspace::SqliteWorkspaceRepository;
+    use querymt_agent_sqlite::session::schema;
     use rusqlite::Connection;
     use std::time::SystemTime;
     use tempfile::TempDir;

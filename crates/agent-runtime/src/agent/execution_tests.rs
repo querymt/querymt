@@ -21,7 +21,6 @@ use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::ToolPolicy;
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
-use crate::events::AgentEventKind;
 use crate::session::backend::StorageBackend;
 use crate::session::domain::{Task, TaskKind, TaskStatus};
 use crate::session::provider::SessionHandle;
@@ -33,6 +32,7 @@ use crate::test_utils::{
     mock_session,
 };
 use crate::tools::{Tool as AgentTool, ToolContext, ToolError, ToolExecutionClass, ToolRegistry};
+use querymt_agent_core::events::AgentEventKind;
 
 // Mock implementations moved to crate::test_utils::mocks
 
@@ -41,21 +41,21 @@ struct TestHarness {
     session_id: String,
     exec_ctx: ExecutionContext,
     provider: Arc<Mutex<MockLlmProvider>>,
-    stored_messages: Arc<StdMutex<Vec<crate::model::AgentMessage>>>,
+    stored_messages: Arc<StdMutex<Vec<querymt_agent_core::model::AgentMessage>>>,
     history_writes: Arc<AtomicUsize>,
     _temp_dir: TempDir,
 }
 
 impl TestHarness {
     async fn new(
-        history: Vec<crate::model::AgentMessage>,
+        history: Vec<querymt_agent_core::model::AgentMessage>,
         delegation_sender: Option<oneshot::Sender<String>>,
     ) -> Self {
         Self::new_with_tools(history, delegation_sender, Vec::new()).await
     }
 
     async fn new_with_tools(
-        history: Vec<crate::model::AgentMessage>,
+        history: Vec<querymt_agent_core::model::AgentMessage>,
         delegation_sender: Option<oneshot::Sender<String>>,
         tools: Vec<Tool>,
     ) -> Self {
@@ -209,7 +209,7 @@ impl TestHarness {
 
         let exec_ctx = ExecutionContext::new(
             session_id.clone(),
-            crate::model::TurnId::new(),
+            querymt_agent_core::model::TurnId::new(),
             session_runtime,
             runtime_context,
             context,
@@ -597,7 +597,7 @@ impl crate::middleware::MiddlewareDriver for StopThenRecover {
             {
                 Ok(crate::middleware::ExecutionState::Stopped {
                     message: "cut off".into(),
-                    stop_type: crate::events::StopType::ModelTokenLimit,
+                    stop_type: querymt_agent_core::events::StopType::ModelTokenLimit,
                     context: Some(context),
                 })
             }
@@ -629,7 +629,7 @@ impl crate::middleware::MiddlewareDriver for StopThenRecover {
 
 /// Count `MiddlewareStopped` events currently buffered on `events`.
 async fn drain_middleware_stopped(
-    events: &mut tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+    events: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
 ) -> usize {
     let mut stopped = 0;
     while let Ok(Ok(envelope)) =
@@ -971,7 +971,7 @@ async fn completion_guard_does_not_continue_for_non_active_task() {
 async fn invalid_steering_conversion_does_not_persist_history() {
     let mut harness = TestHarness::new(vec![], None).await;
     let inbox = Arc::new(crate::agent::turn_control::SteeringInbox::new(
-        crate::model::TurnId::new(),
+        querymt_agent_core::model::TurnId::new(),
     ));
     inbox
         .push(
@@ -1291,7 +1291,9 @@ async fn mixed_scheduler_cancellation_stores_one_result_per_call() {
         .iter()
         .flat_map(|message| message.parts.iter())
         .filter_map(|part| match part {
-            crate::model::MessagePart::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            querymt_agent_core::model::MessagePart::ToolResult { call_id, .. } => {
+                Some(call_id.as_str())
+            }
             _ => None,
         })
         .collect();
@@ -1335,7 +1337,7 @@ fn stored_tool_results(harness: &TestHarness) -> Vec<(String, bool)> {
         .iter()
         .flat_map(|message| message.parts.iter())
         .filter_map(|part| match part {
-            crate::model::MessagePart::ToolResult {
+            querymt_agent_core::model::MessagePart::ToolResult {
                 call_id, is_error, ..
             } => Some((call_id.clone(), *is_error)),
             _ => None,
@@ -2395,7 +2397,7 @@ async fn raw_arguments_stay_in_history_while_execution_uses_effective_arguments(
         .iter()
         .flat_map(|message| message.parts.iter())
         .filter_map(|part| match part {
-            crate::model::MessagePart::ToolResult {
+            querymt_agent_core::model::MessagePart::ToolResult {
                 tool_arguments: Some(arguments),
                 ..
             } => Some(arguments.clone()),
@@ -2440,7 +2442,7 @@ mod repository_delivery {
     use crate::knowledge::repository::adapters::{
         INDEX_CONTEXT_HANDLER_ID, ORIENTATION_HANDLER_ID,
     };
-    use crate::model::MessagePart;
+    use querymt_agent_core::model::MessagePart;
 
     struct Kb {
         repo: TempDir,
@@ -2841,8 +2843,8 @@ mod repository_delivery {
         );
     }
 
-    fn history_with(parts: Vec<MessagePart>, id: &str) -> crate::model::AgentMessage {
-        crate::model::AgentMessage {
+    fn history_with(parts: Vec<MessagePart>, id: &str) -> querymt_agent_core::model::AgentMessage {
+        querymt_agent_core::model::AgentMessage {
             id: id.to_string(),
             session_id: "sess-test".to_string(),
             role: querymt::chat::ChatRole::User,
@@ -2867,7 +2869,7 @@ mod repository_delivery {
 
     async fn orient_with_history(
         kb: &Kb,
-        history: Vec<crate::model::AgentMessage>,
+        history: Vec<querymt_agent_core::model::AgentMessage>,
     ) -> Vec<crate::hooks::HookContextContribution> {
         let mut harness = TestHarness::new(history, None).await;
         harness.with_repository_delivery(kb, &settings(false, true), Vec::new());

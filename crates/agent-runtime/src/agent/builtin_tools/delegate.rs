@@ -162,13 +162,13 @@ mod tests {
     use std::sync::Arc;
 
     struct StubAgentHandle {
-        event_fanout: Arc<crate::event_fanout::EventFanout>,
+        event_fanout: Arc<querymt_agent_services::event_fanout::EventFanout>,
     }
 
     impl StubAgentHandle {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                event_fanout: Arc::new(crate::event_fanout::EventFanout::new()),
+                event_fanout: Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
             })
         }
     }
@@ -219,15 +219,16 @@ mod tests {
 
         fn subscribe_events(
             &self,
-        ) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
+        ) -> tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope> {
             self.event_fanout.subscribe()
         }
 
-        fn event_fanout(&self) -> &Arc<crate::event_fanout::EventFanout> {
+        fn event_fanout(&self) -> &Arc<querymt_agent_services::event_fanout::EventFanout> {
             &self.event_fanout
         }
 
-        fn emit_event(&self, _session_id: &str, _kind: crate::events::AgentEventKind) {}
+        fn emit_event(&self, _session_id: &str, _kind: querymt_agent_core::events::AgentEventKind) {
+        }
 
         fn agent_registry(&self) -> Arc<dyn crate::delegation::AgentRegistry + Send + Sync> {
             Arc::new(DefaultAgentRegistry::new())

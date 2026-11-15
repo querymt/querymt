@@ -1,9 +1,9 @@
 use crate::agent::core::SessionRuntime;
-use crate::events::SessionLimits;
 use crate::middleware::{ExecutionState, Result, ToolCall, ToolResult};
 use crate::tools::FileAccess;
 use async_trait::async_trait;
 use log::{debug, trace};
+use querymt_agent_core::events::SessionLimits;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -129,7 +129,7 @@ pub trait MiddlewareDriver: Send + Sync {
     fn bind_agent(
         &self,
         _registry: &Arc<crate::tools::ToolRegistry>,
-        _events: &Arc<crate::event_sink::EventSink>,
+        _events: &Arc<querymt_agent_services::event_sink::EventSink>,
     ) {
     }
 
@@ -566,8 +566,8 @@ impl MiddlewarePhase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::StopType;
     use crate::middleware::{AgentStats, ConversationContext};
+    use querymt_agent_core::events::StopType;
     use std::sync::Arc;
 
     struct TestDriver {

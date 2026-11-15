@@ -67,12 +67,12 @@ impl CycleAccounting {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounting::tests::{sample_settlement, sample_start};
     use crate::accounting::{AttemptRecorder, AttemptSettlement, AttemptStart};
     use crate::event_fanout::EventFanout;
     use crate::session::backend::StorageBackend;
-    use crate::session::sqlite_storage::SqliteStorage;
     use crate::session_event_stream::SessionEventStream;
+    use querymt_agent_core::accounting::samples::{sample_settlement, sample_start};
+    use querymt_agent_sqlite::session::sqlite_storage::SqliteStorage;
 
     fn cost() -> f64 {
         (100.0 * 3.0 + 15.0 * 15.0 + 50.0 * 0.3 + 20.0 * 3.75) / 1e6

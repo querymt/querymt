@@ -3,8 +3,8 @@
 //! These tests focus on testing the undo logic with minimal setup.
 //! They use real GitSnapshotBackend but mock the store interactions.
 
-use crate::snapshot::backend::SnapshotBackend;
-use crate::snapshot::git::GitSnapshotBackend;
+use querymt_agent_services::snapshot::backend::SnapshotBackend;
+use querymt_agent_services::snapshot::git::GitSnapshotBackend;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;

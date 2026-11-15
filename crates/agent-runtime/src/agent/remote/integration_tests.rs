@@ -14,7 +14,7 @@ mod node_manager_extended_tests {
         CreateRemoteSession, GetNodeInfo, ListRemoteSessions, StopRemoteSessionRuntime,
     };
     use crate::agent::remote::test_helpers::fixtures::NodeManagerFixture;
-    use crate::events::AgentEventKind;
+    use querymt_agent_core::events::AgentEventKind;
 
     // ── D.3 — HOSTNAME env override ───────────────────────────────────────────
 
@@ -227,8 +227,8 @@ mod remote_session_lifecycle_integration_tests {
     };
     use crate::agent::remote::test_helpers::fixtures::{TwoNodeFixture, get_test_mesh};
     use crate::agent::session_actor::SessionActor;
-    use crate::model::{AgentMessage, MessagePart};
     use querymt::chat::ChatRole;
+    use querymt_agent_core::model::{AgentMessage, MessagePart};
     use std::future::Future;
     use std::time::Duration;
     use uuid::Uuid;
@@ -962,10 +962,10 @@ mod remote_session_lifecycle_integration_tests {
         let mesh = get_test_mesh().await;
 
         use crate::agent::remote::event_relay::EventRelayActor;
-        use crate::event_fanout::EventFanout;
-        use crate::event_sink::EventSink;
         use crate::session::backend::StorageBackend;
         use kameo::actor::Spawn;
+        use querymt_agent_services::event_fanout::EventFanout;
+        use querymt_agent_services::event_sink::EventSink;
         use std::sync::Arc;
 
         let beta_ref = mesh
