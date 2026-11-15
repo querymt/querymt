@@ -1,0 +1,1982 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QuorumConfig",
+  "description": "Multi-agent quorum configuration (planner + delegates).\n\nA quorum consists of a planner agent that decomposes tasks and one or more\ndelegate agents that execute them. The planner uses the `delegate` built-in\ntool to assign work.\n\n```toml\n[quorum]\ncwd = \".\"\ndelegation = true\n\n[planner]\nprovider = \"anthropic\"\nmodel = \"claude-sonnet-4-5-20250929\"\ntools = [\"delegate\", \"read_tool\", \"shell\"]\n\n[[delegates]]\nid = \"coder\"\nprovider = \"anthropic\"\nmodel = \"claude-sonnet-4-5-20250929\"\ntools = [\"edit\", \"write_file\", \"shell\", \"read_tool\", \"glob\"]\n```",
+  "type": "object",
+  "properties": {
+    "quorum": {
+      "description": "Top-level quorum orchestration settings.",
+      "$ref": "#/$defs/QuorumSettings"
+    },
+    "mcp": {
+      "description": "MCP servers available to all agents in the quorum.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/McpServerConfig"
+      },
+      "default": []
+    },
+    "planner": {
+      "description": "The planner agent that decomposes tasks and delegates to workers.\nShould have the `\"delegate\"` tool enabled.",
+      "$ref": "#/$defs/PlannerConfig"
+    },
+    "delegates": {
+      "description": "Delegate (worker) agents that execute tasks assigned by the planner.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DelegateConfig"
+      }
+    },
+    "mesh": {
+      "description": "Optional kameo libp2p mesh for cross-machine delegation.",
+      "$ref": "#/$defs/MeshTomlConfig",
+      "default": {
+        "enabled": false,
+        "listen": "/ip4/0.0.0.0/tcp/0",
+        "discovery": "mdns",
+        "transport": "lan",
+        "iroh_gso": true,
+        "iroh_dns": null,
+        "auto_fallback": false,
+        "peers": [],
+        "request_timeout_secs": 300,
+        "stream_reconnect_grace_secs": 120,
+        "identity_file": null,
+        "invite": null,
+        "node_name": null,
+        "lan": null,
+        "iroh": []
+      }
+    },
+    "remote_agents": {
+      "description": "Remote agents on other mesh nodes available for delegation.\nRequires `[mesh] enabled = true`.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RemoteAgentConfig"
+      },
+      "default": []
+    },
+    "dotagents": {
+      "description": "Optional `.agents` Protocol loading settings (disabled by default).",
+      "$ref": "#/$defs/DotagentsSettings",
+      "default": {
+        "enabled": false,
+        "workspace": null,
+        "global_root": null,
+        "workspace_root": null,
+        "global_enabled": true,
+        "workspace_enabled": true,
+        "selected_model_preset": null,
+        "trusted_roots": [],
+        "strictness": "compatibility",
+        "workspace_task_trust": "prompt"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "quorum",
+    "planner"
+  ],
+  "$defs": {
+    "QuorumSettings": {
+      "description": "Top-level settings for a multi-agent quorum (planner + delegates).",
+      "type": "object",
+      "properties": {
+        "cwd": {
+          "description": "Working directory for the quorum. Relative paths are resolved against this.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "delegation": {
+          "description": "Enable task delegation from the planner to delegate agents. Default: `true`.",
+          "type": "boolean",
+          "default": true
+        },
+        "verification": {
+          "description": "Enable verification pass after delegation completes. Default: `false`.",
+          "type": "boolean",
+          "default": false
+        },
+        "snapshot_policy": {
+          "description": "Snapshot policy for capturing file state during delegation.\n- `\"diff\"`: Capture file diffs between snapshots.\n- `\"metadata\"`: Capture file metadata only.\n- absent / `null`: No snapshots.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "enum": [
+            "diff",
+            "metadata"
+          ]
+        },
+        "delegation_summary": {
+          "description": "Optional LLM call that summarises the planner conversation before\nhanding off to a delegate, providing richer context.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DelegationSummaryConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "delegation_wait_policy": {
+          "description": "How to handle multiple concurrent delegations completing.\n- `\"any\"` (default): proceed when the first delegate finishes.\n- `\"all\"`: wait for all delegates to finish.",
+          "$ref": "#/$defs/DelegationWaitPolicy"
+        },
+        "delegation_wait_timeout_secs": {
+          "description": "Timeout in seconds to wait for delegations to complete. Default: `120`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 120
+        },
+        "delegation_cancel_grace_secs": {
+          "description": "Grace period in seconds to allow in-flight delegates to finish after\nthe wait policy threshold is met. Default: `5`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 5
+        },
+        "max_parallel_delegations": {
+          "description": "Maximum number of delegates that can run in parallel. Default: `5`.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 5
+        },
+        "workspace": {
+          "description": "Managed Git worktree workspaces (`[quorum.workspace]`). One service is\nshared by the planner and every delegate. Disabled by default.",
+          "$ref": "#/$defs/WorkspaceSettings",
+          "default": {
+            "enabled": false,
+            "storage_root": null,
+            "baseline": "commit"
+          }
+        },
+        "repository_knowledge": {
+          "description": "Portable repository knowledge (`[quorum.repository_knowledge]`). One\nservice is shared across the quorum. Disabled by default.",
+          "$ref": "#/$defs/RepositoryKnowledgeSettings",
+          "default": {
+            "enabled": false,
+            "root": null,
+            "allowed_roots": [],
+            "max_files": 2000,
+            "max_file_bytes": 524288,
+            "max_total_bytes": 33554432,
+            "max_response_bytes": 16384,
+            "default_result_limit": 10,
+            "force_hash": false,
+            "allow_ignored": false,
+            "delivery": {
+              "orientation": false,
+              "index_context": false,
+              "max_cards": 2,
+              "max_tokens": 600,
+              "max_bytes": 4096
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "DelegationSummaryConfig": {
+      "description": "Configuration for delegation summary LLM call\nThis generates an Implementation Brief from the parent planning conversation\nbefore delegation to provide context to the coder agent",
+      "type": "object",
+      "properties": {
+        "provider": {
+          "description": "LLM provider for the summary call (can be different from main agent)",
+          "type": "string"
+        },
+        "model": {
+          "description": "Model for the summary call (should be cheap/fast, e.g., claude-haiku)",
+          "type": "string"
+        },
+        "api_key": {
+          "description": "API key override (optional, falls back to env)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "description": "Enable/disable (default: true when config section present)",
+          "type": "boolean",
+          "default": true
+        },
+        "max_tokens": {
+          "description": "Maximum tokens for the summary (prevents runaway context consumption)",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 2000
+        },
+        "timeout_secs": {
+          "description": "Timeout in seconds for the summarizer LLM call (default: 30)",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 30
+        },
+        "min_history_tokens": {
+          "description": "Minimum estimated tokens in parent history before triggering LLM summarization.\nBelow this, raw formatted history is injected directly (no LLM call).\nDefault: 2000 (~8000 chars / ~10-15 messages)",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 2000
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "model"
+      ]
+    },
+    "DelegationWaitPolicy": {
+      "type": "string",
+      "enum": [
+        "all",
+        "any"
+      ]
+    },
+    "WorkspaceSettings": {
+      "description": "Managed Git worktree workspace settings (`[agent.workspace]` /\n`[quorum.workspace]`).\n\nSettings only *enable the capability* and tune how a requested worktree is\nbuilt. Isolation itself stays an explicit per-request decision: an option-less\nsession is local whether or not the service is enabled.\n\n```toml\n[agent.workspace]\nenabled = true\n# storage_root = \"~/.qmt/worktrees\"   # relative paths resolve against the config file\n# baseline = \"commit\"                 # \"commit\" | \"current_working_tree\"\n```",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Build a workspace service. Default `false`: no service, behavior unchanged.",
+          "type": "boolean",
+          "default": false
+        },
+        "storage_root": {
+          "description": "Durable storage root for managed checkouts. Defaults to\n`<qmt config dir>/worktrees` (`~/.qmt/worktrees`). A leading `~/` is\nexpanded; relative paths resolve against the config file.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "baseline": {
+          "description": "Default baseline for explicitly requested top-level isolation that does\nnot choose one itself. It never decides *whether* to isolate. Delegates\nalways start from the parent's working contents.",
+          "$ref": "#/$defs/BaselineMode",
+          "default": "commit"
+        }
+      },
+      "additionalProperties": false
+    },
+    "BaselineMode": {
+      "description": "What the baseline of a new isolated workspace is captured from.",
+      "oneOf": [
+        {
+          "description": "Capture a committed ref only. Uncommitted local edits in the source\nare excluded and disclosed.",
+          "type": "string",
+          "const": "commit"
+        },
+        {
+          "description": "Capture the source's current working contents (tracked working files,\ntracked deletions, and non-ignored untracked files) into an immutable\nprivate baseline without touching the source index, HEAD, or files.",
+          "type": "string",
+          "const": "current_working_tree"
+        }
+      ]
+    },
+    "RepositoryKnowledgeSettings": {
+      "description": "Portable repository knowledge settings (`[agent.repository_knowledge]` /\n`[quorum.repository_knowledge]`).\n\nThe feature is **disabled by default**. Only host configuration can enable\nit; a repository file (`.qmt/knowledge.toml`) selects *what* to index but can\nnever enable the feature, grant tools, or widen filesystem access.\n\n```toml\n[agent.repository_knowledge]\nenabled = true\n# root = \".\"                  # explicit knowledge root (required for non-Git workspaces)\n# max_files = 2000\n# max_file_bytes = 524288\n# max_total_bytes = 33554432\n# max_response_bytes = 16384  # capped at 64 KiB\n# force_hash = false          # hash every selected file on every refresh\n\n[agent.repository_knowledge.delivery]\n# Both automatic delivery stages are independently opt-in.\n# orientation = false\n# index_context = false\n```",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Build a repository knowledge service. Default `false`: no repository\nreads, writes, tools, or prompt changes.",
+          "type": "boolean",
+          "default": false
+        },
+        "root": {
+          "description": "Explicit knowledge root. When absent, the Git worktree root containing\nthe session working directory is used. Relative paths resolve against\nthe config file. Non-Git workspaces require this to be set.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "allowed_roots": {
+          "description": "Host allowlist of roots repository knowledge may read from. When empty\nno extra restriction applies; when non-empty, a resolved root outside\nevery listed directory is denied. Relative paths resolve against the\nconfig file.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "max_files": {
+          "description": "Maximum number of selected files indexed per refresh.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 2000
+        },
+        "max_file_bytes": {
+          "description": "Maximum size in bytes of any single selected file.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 524288
+        },
+        "max_total_bytes": {
+          "description": "Maximum total bytes indexed across all selected files.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 33554432
+        },
+        "max_response_bytes": {
+          "description": "Default serialized response budget in bytes for repository tools.\nCapped at 64 KiB.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 16384
+        },
+        "default_result_limit": {
+          "description": "Default result limit for `repo_knowledge_query`. Capped at 50.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 10
+        },
+        "force_hash": {
+          "description": "Hash every selected file during reconciliation, bypassing the\nmetadata fast path (debugging aid).",
+          "type": "boolean",
+          "default": false
+        },
+        "allow_ignored": {
+          "description": "Include Git-ignored files matched by the manifest. Default `false`.",
+          "type": "boolean",
+          "default": false
+        },
+        "delivery": {
+          "description": "Automatic delivery controls. Each stage is independently opt-in.",
+          "$ref": "#/$defs/RepositoryKnowledgeDeliverySettings",
+          "default": {
+            "orientation": false,
+            "index_context": false,
+            "max_cards": 2,
+            "max_tokens": 600,
+            "max_bytes": 4096
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RepositoryKnowledgeDeliverySettings": {
+      "description": "Automatic delivery controls. Both stages default off and are independent of\neach other and of tool availability.",
+      "type": "object",
+      "properties": {
+        "orientation": {
+          "description": "Prompt-triggered orientation cards before the first model request.",
+          "type": "boolean",
+          "default": false
+        },
+        "index_context": {
+          "description": "Knowledge-for-path context after successful built-in `index` calls.",
+          "type": "boolean",
+          "default": false
+        },
+        "max_cards": {
+          "description": "Maximum cards delivered per turn (default 2, capped at 4).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 2
+        },
+        "max_tokens": {
+          "description": "Maximum estimated tokens delivered per turn (default 600, capped at 2000).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 600
+        },
+        "max_bytes": {
+          "description": "Serialized hard ceiling per turn in bytes (default 4 KiB, capped at 16 KiB).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 4096
+        }
+      },
+      "additionalProperties": false
+    },
+    "McpServerConfig": {
+      "description": "MCP (Model Context Protocol) server configuration.\n\nThe `transport` field is the discriminator — it must be `\"stdio\"` or `\"http\"`.\nNote: the field is named `transport`, NOT `type`.\n\n**stdio** — spawns a local process:\n```toml\n[[mcp]]\nname = \"filesystem\"\ntransport = \"stdio\"\ncommand = \"npx\"\nargs = [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/tmp\"]\n```\n\n**http** — connects to a remote MCP endpoint:\n```toml\n[[mcp]]\nname = \"context7\"\ntransport = \"http\"\nurl = \"https://mcp.context7.com/mcp\"\nheaders = { AUTHORIZATION = \"Bearer ${CONTEXT7_API_KEY}\" }\n```\n\n**http + OAuth** — the login flow runs through the `_querymt/auth/*`\nextension using the provider id `mcp:<name>`:\n```toml\n[[mcp]]\nname = \"linear\"\ntransport = \"http\"\nurl = \"https://mcp.linear.app/mcp\"\nauth = { type = \"oauth\", scopes = [\"read\"] }\n```\n\n**http over a Unix socket** (Unix only; `url` is used for addressing):\n```toml\n[[mcp]]\nname = \"local\"\ntransport = \"http\"\nurl = \"http://localhost/mcp\"\nsocket_path = \"/run/mcp.sock\"\n```\n\nBoth transports accept `tasks = true` (declare the MCP tasks extension;\ndefault `false`) and `cache = false` (disable response caching of tool\nlistings; default `true`).\n\nTo enable MCP tools, add them to `agent.tools`:\n- `\"filesystem.*\"` — all tools from the `filesystem` server\n- `\"filesystem.read_file\"` — a specific tool from the server\n\nBuild values in Rust with [`McpServerConfig::stdio`] / [`McpServerConfig::http`]\nand the `with_*` setters; the variants are `#[non_exhaustive]`.",
+      "oneOf": [
+        {
+          "description": "Local process-based MCP server launched via stdio.",
+          "type": "object",
+          "properties": {
+            "transport": {
+              "type": "string",
+              "const": "stdio"
+            },
+            "name": {
+              "description": "Unique name for this server. Referenced in `agent.tools` as `\"name.*\"`.",
+              "type": "string"
+            },
+            "command": {
+              "description": "Executable to run (e.g. `\"npx\"`, `\"uvx\"`, `\"/path/to/binary\"`).",
+              "type": "string"
+            },
+            "args": {
+              "description": "Arguments passed to the command.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            },
+            "env": {
+              "description": "Environment variables to set for the server process.\nSupports `${VAR}` interpolation.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {}
+            },
+            "tasks": {
+              "description": "Declare the MCP tasks extension to this server (default `false`).",
+              "type": "boolean"
+            },
+            "cache": {
+              "description": "Honour server cache hints for tool listings (default `true`).",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "transport",
+            "name",
+            "command"
+          ]
+        },
+        {
+          "description": "Remote HTTP-based MCP server.",
+          "type": "object",
+          "properties": {
+            "transport": {
+              "type": "string",
+              "const": "http"
+            },
+            "name": {
+              "description": "Unique name for this server. Referenced in `agent.tools` as `\"name.*\"`.",
+              "type": "string"
+            },
+            "url": {
+              "description": "Full URL of the MCP HTTP endpoint.",
+              "type": "string"
+            },
+            "headers": {
+              "description": "HTTP headers to include in every request (e.g. auth tokens).\nSupports `${VAR}` interpolation in values.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {}
+            },
+            "auth": {
+              "description": "OAuth authorization. Cannot be combined with `socket_path` or an\n`Authorization` header.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/McpAuth"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "socket_path": {
+              "description": "Connect over this Unix domain socket instead of TCP (Unix only).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tasks": {
+              "description": "Declare the MCP tasks extension to this server (default `false`).",
+              "type": "boolean"
+            },
+            "cache": {
+              "description": "Honour server cache hints for tool listings (default `true`).",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "transport",
+            "name",
+            "url"
+          ]
+        }
+      ],
+      "examples": [
+        {
+          "name": "filesystem",
+          "transport": "stdio",
+          "command": "npx",
+          "args": [
+            "-y",
+            "@modelcontextprotocol/server-filesystem",
+            "/tmp"
+          ]
+        },
+        {
+          "name": "github",
+          "transport": "stdio",
+          "command": "npx",
+          "args": [
+            "-y",
+            "@modelcontextprotocol/server-github"
+          ],
+          "env": {
+            "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+          }
+        },
+        {
+          "name": "context7",
+          "transport": "http",
+          "url": "https://mcp.context7.com/mcp"
+        },
+        {
+          "name": "linear",
+          "transport": "http",
+          "url": "https://mcp.linear.app/mcp",
+          "auth": {
+            "type": "oauth",
+            "scopes": [
+              "read"
+            ]
+          }
+        },
+        {
+          "name": "local",
+          "transport": "http",
+          "url": "http://localhost/mcp",
+          "socket_path": "/run/mcp.sock",
+          "tasks": true,
+          "cache": false
+        }
+      ]
+    },
+    "McpAuth": {
+      "description": "Authorization scheme for an HTTP MCP server.",
+      "oneOf": [
+        {
+          "description": "OAuth 2.1 with discovery, PKCE and (unless `client_id` is set) dynamic\nclient registration.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "oauth"
+            },
+            "client_id": {
+              "description": "Pre-registered client id. When absent, dynamic registration is used.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "scopes": {
+              "description": "Scopes to request.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "redirect_port": {
+              "description": "Loopback redirect port. Defaults to a fixed port.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "strict_scopes": {
+              "description": "Refuse grants wider than `scopes` (default `false`).\n\nAuthorization servers may grant more than was requested. With\n`strict_scopes = true` a login whose token carries any scope beyond\n`scopes` (plus `offline_access`) is discarded, and stored\ncredentials with such a grant are not used to connect. Checked\nagainst the token response `scope` and, for JWT access tokens, the\n`scope` / `scp` claim. Requires a nonempty `scopes`.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
+    "PlannerConfig": {
+      "description": "Planner agent configuration.\n\nThe planner decomposes tasks and delegates subtasks to worker agents.\nIt should have the `\"delegate\"` built-in tool enabled.",
+      "type": "object",
+      "properties": {
+        "provider": {
+          "description": "LLM provider name (e.g. `\"anthropic\"`, `\"openai\"`).",
+          "type": "string"
+        },
+        "model": {
+          "description": "Model identifier for the planner (typically a capable reasoning model).",
+          "type": "string"
+        },
+        "api_key": {
+          "description": "API key override. Supports `${VAR}` interpolation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tools": {
+          "description": "Tools available to the planner. The `\"delegate\"` tool is required for\ntask delegation. Typical set: `[\"delegate\", \"read_tool\", \"shell\", \"glob\"]`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolSpec"
+          },
+          "default": [],
+          "examples": [
+            [
+              "delegate",
+              "read_tool",
+              "shell",
+              "glob"
+            ],
+            [
+              "delegate",
+              "read_tool",
+              "shell",
+              "glob",
+              "search_text",
+              "question"
+            ]
+          ]
+        },
+        "mode": {
+          "description": "Initial mode of new planner sessions: `build` (default), `plan` or `review`.",
+          "$ref": "#/$defs/AgentMode",
+          "default": "build"
+        },
+        "system": {
+          "description": "System prompt for the planner. Accepts a string or mixed array of\ninline strings and `{ file = \"path\" }` references.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "text": {
+                        "type": "string"
+                      },
+                      "cache": {
+                        "$ref": "#/$defs/CacheHint"
+                      }
+                    },
+                    "required": [
+                      "text"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "file": {
+                        "type": "string"
+                      },
+                      "cache": {
+                        "$ref": "#/$defs/CacheHint"
+                      }
+                    },
+                    "required": [
+                      "file"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "parameters": {
+          "description": "Extra parameters forwarded to the LLM provider API.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "default": null
+        },
+        "middleware": {
+          "description": "Middleware stack for the planner (limits, context management, etc.).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MiddlewareEntry"
+          }
+        },
+        "execution": {
+          "description": "Execution policy (tool output, pruning, compaction, snapshot, rate limit).",
+          "$ref": "#/$defs/ExecutionPolicy",
+          "default": {
+            "tool_output": {
+              "max_lines": 2000,
+              "max_bytes": 51200,
+              "overflow_storage": "temp_dir"
+            },
+            "pruning": {
+              "enabled": true,
+              "protect_tokens": 40000,
+              "minimum_tokens": 20000,
+              "protected_tools": [
+                "skill"
+              ]
+            },
+            "compaction": {
+              "auto": true,
+              "provider": null,
+              "model": null,
+              "retry": {
+                "max_retries": 3,
+                "initial_backoff_ms": 1000,
+                "backoff_multiplier": 2.0
+              }
+            },
+            "snapshot": {
+              "backend": "none",
+              "max_snapshots": null,
+              "max_age_days": null
+            },
+            "rate_limit": {
+              "max_retries": 3,
+              "default_wait_secs": 60,
+              "backoff_multiplier": 2.0,
+              "max_stream_retries": 2
+            },
+            "task_completion_guard": false,
+            "max_stop_recoveries": 5,
+            "max_stop_hook_continuations": 1
+          }
+        },
+        "skills": {
+          "description": "Skills system configuration.",
+          "$ref": "#/$defs/SkillsConfig",
+          "default": {
+            "enabled": true,
+            "include_external": true,
+            "paths": [],
+            "urls": [],
+            "permissions": {},
+            "mcp": true
+          }
+        },
+        "permissions": {
+          "description": "Tool approval for the planner.",
+          "$ref": "#/$defs/PermissionsConfig"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "model"
+      ]
+    },
+    "ToolSpec": {
+      "description": "Tool selector: `name` (built-in or provider tool), `server.tool` (one MCP tool) or `server.*` (every tool of an MCP server).",
+      "type": "string",
+      "minLength": 1,
+      "examples": [
+        "shell",
+        "github.create_issue",
+        "ibkr.*"
+      ]
+    },
+    "AgentMode": {
+      "description": "Runtime operating mode for the agent.\nModes control what the agent is allowed to do and what system reminders are injected.",
+      "oneOf": [
+        {
+          "description": "Full read/write mode - all tools available, no restrictions",
+          "type": "string",
+          "const": "build"
+        },
+        {
+          "description": "Planning mode - read-only, agent observes and plans without making changes",
+          "type": "string",
+          "const": "plan"
+        },
+        {
+          "description": "Review mode - read-only, agent reviews code and provides feedback",
+          "type": "string",
+          "const": "review"
+        }
+      ]
+    },
+    "CacheHint": {
+      "description": "Cache hint for providers that support prompt caching.\nWhen set on a message, the provider may use it to mark cache breakpoints,\nallowing the conversation prefix up to this point to be cached and reused.",
+      "oneOf": [
+        {
+          "description": "Ephemeral cache breakpoint. Providers that support caching (e.g., Anthropic)\nwill cache the conversation prefix up to and including this message.\nThe optional TTL requests a supported lifetime in seconds; providers\nvalidate/translate it, sometimes at request scope. None uses their default.\nThis is not a deletion deadline or a guarantee of cache availability.\nUnsupported endpoints may ignore hints without changing message content.",
+          "type": "object",
+          "properties": {
+            "ephemeral": {
+              "type": "object",
+              "properties": {
+                "ttl_seconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": [
+            "ephemeral"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "MiddlewareEntry": {
+      "description": "A middleware entry in the agent's processing stack.\n\nThe `type` field selects which middleware to use; all other fields are\nforwarded to that middleware as configuration.\n\nAvailable middleware types:\n- `\"limits\"` — hard cap on steps and turns (`max_steps`, `max_turns`)\n- `\"context\"` — token-window management (`warn_at_percent`, `compact_at_percent`, `fallback_max_tokens`)\n- `\"dedup_check\"` — detects repeated/similar code output (`threshold`, `min_lines`)\n- `\"agent_mode\"` — build/plan/review mode switching (`default`, `reminder`, `review_reminder`)\n- `\"plan_mode\"` — legacy read-only mode (prefer `agent_mode`)\n\n```toml\n[[middleware]]\ntype = \"limits\"\nmax_steps = 200\nmax_turns = 50\n\n[[middleware]]\ntype = \"context\"\nwarn_at_percent = 80\ncompact_at_percent = 90\n```",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The middleware type name. Built-in types: `\"limits\"`, `\"context\"`,\n`\"dedup_check\"`, `\"agent_mode\"`, `\"plan_mode\"`, `\"parallel_edit_guard\"`,\n`\"output_limit_recovery\"`.\nCustom middleware types can be registered at runtime.",
+          "type": "string",
+          "enum": [
+            "limits",
+            "context",
+            "dedup_check",
+            "agent_mode",
+            "plan_mode",
+            "parallel_edit_guard",
+            "output_limit_recovery"
+          ]
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": true,
+      "examples": [
+        {
+          "type": "limits",
+          "max_steps": 200,
+          "max_turns": 50
+        },
+        {
+          "type": "context",
+          "warn_at_percent": 80,
+          "compact_at_percent": 90,
+          "fallback_max_tokens": 128000
+        },
+        {
+          "type": "dedup_check",
+          "threshold": 0.85,
+          "min_lines": 10
+        },
+        {
+          "type": "agent_mode",
+          "default": "build"
+        }
+      ]
+    },
+    "ExecutionPolicy": {
+      "description": "Execution-policy configuration (3-layer context management system).\n\n- **Layer 1** `tool_output`: Truncates individual tool outputs exceeding\n  size limits. Saves overflowed content to temp storage.\n- **Layer 2** `pruning`: Removes old tool output entries from the context\n  window after every turn to reclaim token budget.\n- **Layer 3** `compaction`: AI-powered summarisation triggered when the\n  context window fills. Condenses history to free space.\n\nAlso controls `snapshot` (undo/redo via git), `rate_limit` (429 retry), and\nwhether an unfinished finite task forces an additional model request.\n\n```toml\n[agent.execution.tool_output]\nmax_lines = 2000\nmax_bytes = 51200\n\n[agent.execution.pruning]\nprotect_tokens = 40000\n\n[agent.execution.compaction]\nauto = true\n\n[agent.execution.snapshot]\nbackend = \"git\"\n```",
+      "type": "object",
+      "properties": {
+        "tool_output": {
+          "description": "Tool output truncation settings (Layer 1)",
+          "$ref": "#/$defs/ToolOutputConfig",
+          "default": {
+            "max_lines": 2000,
+            "max_bytes": 51200,
+            "overflow_storage": "temp_dir"
+          }
+        },
+        "pruning": {
+          "description": "Pruning settings — runs after every turn (Layer 2)",
+          "$ref": "#/$defs/PruningConfig",
+          "default": {
+            "enabled": true,
+            "protect_tokens": 40000,
+            "minimum_tokens": 20000,
+            "protected_tools": [
+              "skill"
+            ]
+          }
+        },
+        "compaction": {
+          "description": "AI compaction settings — runs on context overflow (Layer 3)",
+          "$ref": "#/$defs/CompactionConfig",
+          "default": {
+            "auto": true,
+            "provider": null,
+            "model": null,
+            "retry": {
+              "max_retries": 3,
+              "initial_backoff_ms": 1000,
+              "backoff_multiplier": 2.0
+            }
+          }
+        },
+        "snapshot": {
+          "description": "Snapshot backend for undo/redo support",
+          "$ref": "#/$defs/SnapshotBackendConfig",
+          "default": {
+            "backend": "none",
+            "max_snapshots": null,
+            "max_age_days": null
+          }
+        },
+        "rate_limit": {
+          "description": "Rate limit retry configuration",
+          "$ref": "#/$defs/RateLimitConfig",
+          "default": {
+            "max_retries": 3,
+            "default_wait_secs": 60,
+            "backoff_multiplier": 2.0,
+            "max_stream_retries": 2
+          }
+        },
+        "task_completion_guard": {
+          "description": "Force one additional model request when a finite task remains active.",
+          "type": "boolean",
+          "default": false
+        },
+        "max_stop_recoveries": {
+          "description": "Maximum times middleware may turn a stop into a continuation within one\nturn before the stop is published (default: 5).",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255,
+          "default": 5
+        },
+        "max_stop_hook_continuations": {
+          "description": "Maximum times a Stop hook may turn the end of a turn into another agent\nstep within one turn (default: 1). `0` makes Stop hooks advisory only.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ToolOutputConfig": {
+      "description": "Configuration for tool output truncation (Layer 1)",
+      "type": "object",
+      "properties": {
+        "max_lines": {
+          "description": "Maximum lines before truncation",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 2000
+        },
+        "max_bytes": {
+          "description": "Maximum bytes before truncation",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 51200
+        },
+        "overflow_storage": {
+          "description": "Where to save full output when truncated",
+          "$ref": "#/$defs/OverflowStorage",
+          "default": "temp_dir"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OverflowStorage": {
+      "description": "Where to store overflow output when tool output is truncated",
+      "oneOf": [
+        {
+          "description": "Discard overflow (don't save)",
+          "type": "string",
+          "const": "discard"
+        },
+        {
+          "description": "Save to temp directory (/tmp/qmt-tool-outputs/{session_id}/)",
+          "type": "string",
+          "const": "temp_dir"
+        },
+        {
+          "description": "Save to persistent data directory",
+          "type": "string",
+          "const": "data_dir"
+        }
+      ]
+    },
+    "PruningConfig": {
+      "description": "Configuration for pruning (Layer 2) - runs after every turn",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Enable/disable pruning",
+          "type": "boolean",
+          "default": true
+        },
+        "protect_tokens": {
+          "description": "Tokens of recent tool outputs to protect from pruning",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 40000
+        },
+        "minimum_tokens": {
+          "description": "Minimum tokens to clear before pruning (avoids small pruning operations)",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 20000
+        },
+        "protected_tools": {
+          "description": "Tools that should never be pruned",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "skill"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CompactionConfig": {
+      "description": "Configuration for AI compaction (Layer 3) - runs on context overflow",
+      "type": "object",
+      "properties": {
+        "auto": {
+          "description": "Enable/disable AI compaction (setting true auto-enables ContextMiddleware)",
+          "type": "boolean",
+          "default": true
+        },
+        "provider": {
+          "description": "Optional: different provider for compaction (cheaper model)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "Optional: different model for compaction (cheaper model)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry": {
+          "description": "Retry configuration for compaction LLM calls",
+          "$ref": "#/$defs/RetryConfig",
+          "default": {
+            "max_retries": 3,
+            "initial_backoff_ms": 1000,
+            "backoff_multiplier": 2.0
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RetryConfig": {
+      "description": "Retry configuration for compaction LLM calls",
+      "type": "object",
+      "properties": {
+        "max_retries": {
+          "description": "Maximum retry attempts",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 3
+        },
+        "initial_backoff_ms": {
+          "description": "Initial backoff delay in milliseconds",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 1000
+        },
+        "backoff_multiplier": {
+          "description": "Exponential backoff multiplier",
+          "type": "number",
+          "format": "double",
+          "default": 2.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "SnapshotBackendConfig": {
+      "description": "Configuration for snapshot backend (undo/redo support).\n\nSnapshots capture the state of modified files before each agent action,\nenabling undo/redo. Requires the `[agent.execution.snapshot]` section.\n\n```toml\n[agent.execution.snapshot]\nbackend = \"git\"\n# Optional retention. Leave both unset to never delete snapshots.\n# max_snapshots = 100\n# max_age_days = 30\n```",
+      "type": "object",
+      "properties": {
+        "backend": {
+          "description": "Snapshot storage backend.\n- `\"git\"`: Commits snapshots into the current git repository.\n- `\"none\"`: Snapshots disabled (default).",
+          "type": "string",
+          "default": "none",
+          "enum": [
+            "git",
+            "none"
+          ]
+        },
+        "max_snapshots": {
+          "description": "Maximum number of snapshots to retain; oldest are pruned first. Unset\n(the default) means no limit. Must be at least 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1,
+          "default": null
+        },
+        "max_age_days": {
+          "description": "Maximum age of snapshots in days; older ones are pruned. Unset (the\ndefault) means no limit. Must be at least 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1,
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "RateLimitConfig": {
+      "description": "Configuration for rate limit retry behavior",
+      "type": "object",
+      "properties": {
+        "max_retries": {
+          "description": "Total request-attempt budget, including the initial request (default: 3)",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 3
+        },
+        "default_wait_secs": {
+          "description": "Default wait time in seconds if no retry-after header (default: 60)",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 60
+        },
+        "backoff_multiplier": {
+          "description": "Backoff multiplier when no retry-after header (default: 2.0)\nWait time increases exponentially: default_wait_secs * multiplier^(attempt-1)\nMust be finite and `> 0`.",
+          "type": "number",
+          "format": "double",
+          "default": 2.0
+        },
+        "max_stream_retries": {
+          "description": "Maximum stream recreations within the shared request-attempt budget (default: 2).\nEach recreation restarts the provider request and also consumes `max_retries`.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 2
+        },
+        "jitter_ratio": {
+          "description": "Proportional jitter for calculated delays (`0.0..=1.0`). Provider retry\nhints are not jittered.\n\nRuntime-only for now: not written into `session_execution_configs` so older\nqmtcode builds (strict `deny_unknown_fields`) can still open sessions.\nTODO(session-compat): drop `skip_serializing` and persist once older readers\nare retired, or gate behind a session config migration.",
+          "type": "number",
+          "format": "double",
+          "writeOnly": true
+        },
+        "max_wait_secs": {
+          "description": "Upper bound for every retry delay (`>= 1`).\n\nProvider `Retry-After` / message hints are clamped by this field before\nsleeping or emitting retry-wait events.\n\nRuntime-only for now — same session-compat rationale as `jitter_ratio`.\nTODO(session-compat): persist with `jitter_ratio` when ready.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "writeOnly": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "SkillsConfig": {
+      "description": "Configuration for skills system",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Enable skills system (default: true)",
+          "type": "boolean",
+          "default": true
+        },
+        "include_external": {
+          "description": "Check external paths (Claude Code, agents conventions)",
+          "type": "boolean",
+          "default": true
+        },
+        "paths": {
+          "description": "Custom search paths (added to defaults)",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "urls": {
+          "description": "Remote skill URLs (Phase 2 - not yet implemented)",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "permissions": {
+          "description": "Skill permissions",
+          "$ref": "#/$defs/SkillPermissions",
+          "default": {}
+        },
+        "mcp": {
+          "description": "Offer skills published by connected MCP servers (default: true)",
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "SkillPermissions": {
+      "description": "Skill-level permissions in agent config",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/PermissionLevel"
+      }
+    },
+    "PermissionLevel": {
+      "oneOf": [
+        {
+          "description": "Automatically allow (default)",
+          "type": "string",
+          "const": "allow"
+        },
+        {
+          "description": "Block entirely",
+          "type": "string",
+          "const": "deny"
+        },
+        {
+          "description": "Prompt user for confirmation",
+          "type": "string",
+          "const": "ask"
+        }
+      ]
+    },
+    "PermissionsConfig": {
+      "description": "`[agent.permissions]`, `[planner.permissions]` and `[delegates.permissions]`.\n\n```toml\n[agent.permissions]\nask         = [\"shell\"]             # prompt; \"Allow for this session\" offered\nalways_ask  = [\"ibkr.place_order\"]  # prompt on every call\ntimeout_sec = 120                   # reject unanswered prompts; unset = wait\n```",
+      "type": "object",
+      "properties": {
+        "ask": {
+          "description": "Tools that need the user's approval. The prompt offers \"Allow once\",\n\"Allow for this session\" and \"Reject\".",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolSpec"
+          },
+          "default": []
+        },
+        "always_ask": {
+          "description": "Tools that prompt on every call and never offer the session option.\nWins over `ask`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolSpec"
+          },
+          "default": []
+        },
+        "timeout_sec": {
+          "description": "Seconds after which an unanswered approval prompt (from a list or a\nhook) is rejected. Prompts wait indefinitely when unset.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1,
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "DelegateConfig": {
+      "description": "Delegate (worker) agent configuration.\n\nDelegates execute tasks assigned by the planner. Each delegate has its own\ntool set, system prompt, and optionally its own MCP servers.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "Unique identifier for this delegate, used by the planner to target it.",
+          "type": "string"
+        },
+        "provider": {
+          "description": "LLM provider name (e.g. `\"anthropic\"`, `\"openai\"`, `\"llama_cpp\"`).",
+          "type": "string"
+        },
+        "model": {
+          "description": "Model identifier for this delegate.",
+          "type": "string"
+        },
+        "api_key": {
+          "description": "API key override. Supports `${VAR}` interpolation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "description": "Human-readable description shown to the planner when choosing a delegate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capabilities": {
+          "description": "Capability tags used by the planner to select suitable delegates\n(e.g. `[\"coding\", \"filesystem\", \"gpu\"]`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "tools": {
+          "description": "Tools available to this delegate. Typical coder set:\n`[\"edit\", \"write_file\", \"shell\", \"read_tool\", \"glob\", \"search_text\"]`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolSpec"
+          },
+          "default": [],
+          "examples": [
+            [
+              "edit",
+              "write_file",
+              "shell",
+              "read_tool",
+              "glob",
+              "search_text"
+            ],
+            [
+              "edit",
+              "write_file",
+              "read_tool",
+              "glob"
+            ]
+          ]
+        },
+        "mode": {
+          "description": "Initial mode of new delegate sessions: `build` (default), `plan` or `review`.",
+          "$ref": "#/$defs/AgentMode",
+          "default": "build"
+        },
+        "system": {
+          "description": "System prompt for this delegate. Accepts a string or mixed array of\ninline strings and `{ file = \"path\" }` references.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "text": {
+                        "type": "string"
+                      },
+                      "cache": {
+                        "$ref": "#/$defs/CacheHint"
+                      }
+                    },
+                    "required": [
+                      "text"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "file": {
+                        "type": "string"
+                      },
+                      "cache": {
+                        "$ref": "#/$defs/CacheHint"
+                      }
+                    },
+                    "required": [
+                      "file"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "parameters": {
+          "description": "Extra parameters forwarded to the LLM provider API.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "default": null
+        },
+        "mcp": {
+          "description": "MCP servers specific to this delegate (in addition to quorum-level MCP).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/McpServerConfig"
+          },
+          "default": []
+        },
+        "middleware": {
+          "description": "Middleware stack for this delegate (limits, context management, etc.).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MiddlewareEntry"
+          }
+        },
+        "execution": {
+          "description": "Execution policy (tool output, pruning, compaction, snapshot, rate limit).",
+          "$ref": "#/$defs/ExecutionPolicy",
+          "default": {
+            "tool_output": {
+              "max_lines": 2000,
+              "max_bytes": 51200,
+              "overflow_storage": "temp_dir"
+            },
+            "pruning": {
+              "enabled": true,
+              "protect_tokens": 40000,
+              "minimum_tokens": 20000,
+              "protected_tools": [
+                "skill"
+              ]
+            },
+            "compaction": {
+              "auto": true,
+              "provider": null,
+              "model": null,
+              "retry": {
+                "max_retries": 3,
+                "initial_backoff_ms": 1000,
+                "backoff_multiplier": 2.0
+              }
+            },
+            "snapshot": {
+              "backend": "none",
+              "max_snapshots": null,
+              "max_age_days": null
+            },
+            "rate_limit": {
+              "max_retries": 3,
+              "default_wait_secs": 60,
+              "backoff_multiplier": 2.0,
+              "max_stream_retries": 2
+            },
+            "task_completion_guard": false,
+            "max_stop_recoveries": 5,
+            "max_stop_hook_continuations": 1
+          }
+        },
+        "skills": {
+          "description": "Skills system configuration.",
+          "$ref": "#/$defs/SkillsConfig",
+          "default": {
+            "enabled": true,
+            "include_external": true,
+            "paths": [],
+            "urls": [],
+            "permissions": {},
+            "mcp": true
+          }
+        },
+        "permissions": {
+          "description": "Tool approval for this delegate.",
+          "$ref": "#/$defs/PermissionsConfig"
+        },
+        "peer": {
+          "description": "Optional mesh peer name (references a `[[mesh.peers]]` entry).\n\nWhen set, LLM calls for this delegate are routed to the remote peer via\nthe mesh while tool execution continues locally on the planner node.\nThis is the \"remote model, local session\" pattern.\n\nRequires `[mesh] enabled = true`. Validated at startup.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "isolation": {
+          "description": "Workspace isolation for tasks delegated to this delegate.\n\nPrecedence: an explicit non-`inherit` value on the `delegate` tool call,\nthen this value, then the parent's execution mode. `isolated` requires\n`[quorum.workspace] enabled = true`.",
+          "$ref": "#/$defs/DelegationIsolation",
+          "default": "inherit"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "provider",
+        "model"
+      ]
+    },
+    "DelegationIsolation": {
+      "description": "Delegation isolation requested for a delegate relative to its parent.",
+      "oneOf": [
+        {
+          "description": "Resolve from the parent's execution mode: isolated parents isolate\ndelegates by default; local parents keep legacy shared execution.",
+          "type": "string",
+          "const": "inherit"
+        },
+        {
+          "description": "Explicitly share the parent's checkout (disclosed as shared).",
+          "type": "string",
+          "const": "shared"
+        },
+        {
+          "description": "Explicitly request a private checkout for this delegate.",
+          "type": "string",
+          "const": "isolated"
+        }
+      ]
+    },
+    "MeshTomlConfig": {
+      "description": "Configuration for the kameo libp2p mesh.\n\nIn TOML:\n```toml\n[mesh]\nenabled = true\nlisten = \"/ip4/0.0.0.0/tcp/0\"\ndiscovery = \"mdns\"\n\n[[mesh.peers]]\nname = \"dev-gpu\"\naddr = \"/ip4/192.168.1.100/tcp/9000\"\n```",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether to start the mesh swarm at startup.  Default: `false`.",
+          "type": "boolean",
+          "default": false
+        },
+        "listen": {
+          "description": "Multiaddr to listen on.  Default: `\"/ip4/0.0.0.0/tcp/0\"` (OS-assigned random port).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": "/ip4/0.0.0.0/tcp/0"
+        },
+        "discovery": {
+          "description": "Peer discovery strategy.  Default: `\"mdns\"`.",
+          "$ref": "#/$defs/MeshDiscoveryConfig",
+          "default": "mdns"
+        },
+        "transport": {
+          "description": "Transport layer.  Default: `\"lan\"`.\n\nSet to `\"iroh\"` for internet-capable mesh with NAT traversal and relay.\nRequires the `remote` feature.",
+          "$ref": "#/$defs/MeshTransportConfig",
+          "default": "lan"
+        },
+        "iroh_gso": {
+          "description": "Enable Generic Segmentation Offload (GSO) on the shared iroh actor endpoint.\nDefault: true. Set to false as a UDP offload compatibility workaround.\nApplies to all Iroh scopes; does not affect LAN or separate payload endpoints.",
+          "type": "boolean",
+          "default": true
+        },
+        "iroh_dns": {
+          "description": "DNS policy for the shared iroh endpoint; absent preserves upstream defaults.\nDisabling public DNS fallback does not disable N0's public pkarr services.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IrohDnsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "auto_fallback": {
+          "description": "Whether `provider_node_id = None` may fall back to mesh provider discovery.\n\nDefault: `false` (local-only unless an explicit `provider_node_id` is set).",
+          "type": "boolean",
+          "default": false
+        },
+        "peers": {
+          "description": "Explicit peers to connect to at startup.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MeshPeerConfig"
+          },
+          "default": []
+        },
+        "request_timeout_secs": {
+          "description": "Timeout in seconds for non-streaming mesh request-response calls\n(e.g. compaction, no-tools LLM calls).  Default: 300 (5 minutes).\nIncrease for very slow models or large context windows.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 300
+        },
+        "stream_reconnect_grace_secs": {
+          "description": "Grace period (seconds) to wait for mesh reconnection before failing an\nin-flight remote streaming request.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 120
+        },
+        "identity_file": {
+          "description": "Path to the persistent ed25519 identity file.\n\nWhen absent, defaults to `~/.qmt/mesh_identity.key`.  The node's\n`PeerId` is derived from this keypair and stays stable across restarts.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "invite": {
+          "description": "Invite token to join an existing mesh.\n\nWhen set, the node bootstraps in \"join\" mode: it dials the inviter\nfrom the token using the iroh transport.  Overrides `transport` to\n`\"iroh\"` automatically.\n\nSupports `${VAR}` interpolation, e.g. `\"${QMT_MESH_INVITE}\"`.\n\nExample:\n```toml\n[mesh]\nenabled = true\ninvite = \"${QMT_MESH_INVITE}\"\n```",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "node_name": {
+          "description": "Human-readable name advertised to mesh peers.\n\nWhen set, overrides the OS hostname in `GetNodeInfo` responses.\nUseful on mobile where the OS hostname is often meaningless (\"unknown\").",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "lan": {
+          "description": "LAN transport sub-configuration (new multi-transport syntax).\n\nWhen present and `enabled = true`, the LAN transport is activated\nalongside any Iroh scopes.  Takes precedence over the legacy\n`transport` and `discovery` fields for LAN configuration.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LanMeshTomlConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "iroh": {
+          "description": "Iroh mesh scopes (new multi-transport syntax).\n\nEach entry represents a logical Iroh mesh scope.  When present and\nat least one entry has `enabled = true`, the Iroh transport is\nactivated alongside LAN (if also enabled).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IrohMeshTomlConfig"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "MeshDiscoveryConfig": {
+      "description": "Discovery strategy for the libp2p swarm.\n\nIn TOML: `discovery = \"mdns\"` | `\"kademlia\"` | `\"none\"`.",
+      "oneOf": [
+        {
+          "description": "Zero-config local-network discovery (mDNS multicast).",
+          "type": "string",
+          "const": "mdns"
+        },
+        {
+          "description": "Distributed discovery using the Kademlia DHT (for cross-subnet).",
+          "type": "string",
+          "const": "kademlia"
+        },
+        {
+          "description": "No automatic discovery — peers are added only via `[[mesh.peers]]`.",
+          "type": "string",
+          "const": "none"
+        }
+      ]
+    },
+    "MeshTransportConfig": {
+      "description": "Transport layer for the libp2p swarm.\n\nIn TOML: `transport = \"lan\"` | `\"iroh\"`.",
+      "oneOf": [
+        {
+          "description": "Traditional TCP + QUIC + Noise + Yamux (LAN-optimised, default).",
+          "type": "string",
+          "const": "lan"
+        },
+        {
+          "description": "iroh-backed QUIC transport with relay and NAT traversal (internet-capable).\nRequires the `remote` feature.",
+          "type": "string",
+          "const": "iroh"
+        }
+      ]
+    },
+    "IrohDnsConfig": {
+      "type": "object",
+      "properties": {
+        "system_defaults": {
+          "type": "boolean",
+          "default": true
+        },
+        "fallback": {
+          "$ref": "#/$defs/IrohDnsFallback",
+          "default": "deferred"
+        },
+        "nameservers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IrohDnsNameserver"
+          },
+          "default": []
+        },
+        "fallback_nameservers": {
+          "description": "An empty list preserves upstream's public fallback resolvers.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IrohDnsNameserver"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "IrohDnsFallback": {
+      "type": "string",
+      "enum": [
+        "deferred",
+        "eager",
+        "if_system_empty",
+        "never"
+      ]
+    },
+    "IrohDnsNameserver": {
+      "type": "object",
+      "properties": {
+        "addr": {
+          "type": "string"
+        },
+        "protocol": {
+          "$ref": "#/$defs/IrohDnsProtocol",
+          "default": "udp"
+        },
+        "tls_server_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "addr"
+      ]
+    },
+    "IrohDnsProtocol": {
+      "type": "string",
+      "enum": [
+        "udp",
+        "tcp",
+        "tls",
+        "https"
+      ]
+    },
+    "MeshPeerConfig": {
+      "description": "A single peer that this node should connect to in the mesh.\n\nIn TOML:\n```toml\n[[mesh.peers]]\nname = \"dev-gpu\"\naddr = \"/ip4/192.168.1.100/tcp/9000\"\n```",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Human-readable label (referenced by `[[remote_agents]]`).",
+          "type": "string"
+        },
+        "addr": {
+          "description": "libp2p multiaddr of the peer, e.g. `\"/ip4/192.168.1.100/tcp/9000\"`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "addr"
+      ]
+    },
+    "LanMeshTomlConfig": {
+      "description": "LAN mesh sub-configuration for multi-transport setups.\n\nIn TOML:\n```toml\n[mesh.lan]\nenabled = true\ndiscovery = \"mdns\"\nlisten = \"/ip4/0.0.0.0/tcp/0\"\n```",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether the LAN transport is enabled.",
+          "type": "boolean",
+          "default": false
+        },
+        "listen": {
+          "description": "Multiaddr to listen on for LAN connections.\n\nFalls back to `[mesh] listen` when absent.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "discovery": {
+          "description": "Discovery strategy for LAN peers.",
+          "$ref": "#/$defs/MeshDiscoveryConfig",
+          "default": "mdns"
+        }
+      },
+      "additionalProperties": false
+    },
+    "IrohMeshTomlConfig": {
+      "description": "Iroh mesh scope sub-configuration for multi-transport setups.\n\nIn TOML (array of tables):\n```toml\n[[mesh.iroh]]\nenabled = true\ninvite = \"...\"\nname = \"personal\"\n```",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether this Iroh scope is enabled.",
+          "type": "boolean",
+          "default": false
+        },
+        "invite": {
+          "description": "Invite token string to join an existing Iroh mesh.\n\nWhen set, the `mesh_id` is derived from the invite grant.\nSupports `${VAR}` interpolation.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "name": {
+          "description": "Human-readable name for this Iroh scope.\n\nUsed as the `mesh_id` when `invite` is absent, or as a display\nlabel alongside the invite-derived mesh_id.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "RemoteAgentConfig": {
+      "description": "A remote agent running on another mesh node, used for task delegation.\n\nRemote agents require `[mesh] enabled = true` and a matching peer in\n`[[mesh.peers]]`. This is for multi-machine agent delegation — it is\nNOT for MCP tool servers (use `[[mcp]]` for those).\n\n```toml\n[mesh]\nenabled = true\n\n[[mesh.peers]]\nname = \"dev-gpu\"\naddr = \"/ip4/192.168.1.100/tcp/9000\"\n\n[[remote_agents]]\nid = \"gpu-coder\"\nname = \"GPU Coder\"\ndescription = \"Coder running on GPU server with fast model\"\npeer = \"dev-gpu\"\ncapabilities = [\"gpu\", \"fast-model\"]\n```",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "Unique agent identifier used when targeting this agent for delegation.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Human-readable display name shown in delegation context.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Short description of the agent's purpose or specialisation,\nshown to the planner when choosing which agent to delegate to.",
+          "type": "string",
+          "default": ""
+        },
+        "peer": {
+          "description": "Name of the peer in `[[mesh.peers]]` that hosts this agent.\nMust match the `name` field of a `[[mesh.peers]]` entry.",
+          "type": "string"
+        },
+        "capabilities": {
+          "description": "Capability tags used by the planner to select suitable agents\n(e.g. `[\"gpu\", \"shell\", \"filesystem\"]`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "peer"
+      ]
+    },
+    "DotagentsSettings": {
+      "description": "Opt-in protocol configuration.\n\nThe default is disabled, preserving all existing TOML-only and programmatic\nbehavior. Roots and workspace are only consulted when `enabled = true`.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Enable `.agents` discovery and loading.",
+          "type": "boolean",
+          "default": false
+        },
+        "workspace": {
+          "description": "Workspace used to derive `<workspace>/.agents`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "global_root": {
+          "description": "Explicit global protocol root override.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "workspace_root": {
+          "description": "Explicit workspace protocol root override.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "global_enabled": {
+          "description": "Whether the global layer is enabled.",
+          "type": "boolean",
+          "default": true
+        },
+        "workspace_enabled": {
+          "description": "Whether the workspace layer is enabled.",
+          "type": "boolean",
+          "default": true
+        },
+        "selected_model_preset": {
+          "description": "Selected `models.json` preset.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "trusted_roots": {
+          "description": "Additional roots trusted by confined resolution.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "strictness": {
+          "description": "Error handling policy.",
+          "$ref": "#/$defs/DotagentsStrictness",
+          "default": "compatibility"
+        },
+        "workspace_task_trust": {
+          "description": "Trust policy for repository-controlled workspace repeat tasks.",
+          "$ref": "#/$defs/DotagentsTaskTrustPolicy",
+          "default": "prompt"
+        }
+      },
+      "additionalProperties": false
+    },
+    "DotagentsStrictness": {
+      "description": "How strictly the loader treats error diagnostics during resolution.\n\nThis controls whether an error diagnostic is fatal for the resolved\nconfiguration as a whole, or whether unaffected valid entries remain\navailable. Runtime activation (see the runtime adapters) additionally uses\nthis to decide whether construction fails or continues with warnings.",
+      "oneOf": [
+        {
+          "description": "Activate valid entries, return structured warnings, and fail only when\nthe selected root configuration cannot be applied safely.",
+          "type": "string",
+          "const": "compatibility"
+        },
+        {
+          "description": "Fail resolution when any error diagnostic is present.",
+          "type": "string",
+          "const": "strict"
+        }
+      ]
+    },
+    "DotagentsTaskTrustPolicy": {
+      "description": "Host policy for workspace protocol tasks.",
+      "oneOf": [
+        {
+          "description": "Ask the host and remain pending when no approval mechanism exists.",
+          "type": "string",
+          "const": "prompt"
+        },
+        {
+          "description": "Never activate workspace protocol tasks.",
+          "type": "string",
+          "const": "deny"
+        },
+        {
+          "description": "Activate without approval. This is intentionally and explicitly unsafe.",
+          "type": "string",
+          "const": "allow"
+        }
+      ]
+    }
+  }
+}

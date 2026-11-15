@@ -21,15 +21,21 @@ Conventions used below. They are reference text, not tracked tasks.
 
 ## 1. Baseline
 
-- [ ] 1.1 Create the dashboard fixture outside `target/` (`index.html` and `querymt-ui.json` as in `test-agent.yml`), export `QMT_UI_DIST`, and confirm `cargo nextest --version`, `cargo check -p querymt-agent-runtime --features "$RF"` and `cargo check -p querymt-agent --features "$F"` succeed.
-- [ ] 1.2 Add characterization test `quorum_profiles_keep_their_runtime_shape` in top `api/agent_tests.rs`. For each `[quorum]` profile in `agent/examples/confs` (`coder_agent`, `coder_delegate`, `learning_pair`, `multi_agent`), build it through `Agent::from_quorum_config` and assert:
+- [x] 1.1 Create the dashboard fixture outside `target/` (`index.html` and `querymt-ui.json` as in `test-agent.yml`), export `QMT_UI_DIST`, and confirm `cargo nextest --version`, `cargo check -p querymt-agent-runtime --features "$RF"` and `cargo check -p querymt-agent --features "$F"` succeed.
+  - Done: fixture in `/tmp/qmt-dashboard-ui`, `QMT_UI_DIST=/tmp/qmt-dashboard-ui`; `cargo nextest` 0.9.136; runtime check (`$RF`) and top check (`$F`) pass on macOS (zbus/systemd paths unverified).
+- [x] 1.2 Add characterization test `quorum_profiles_keep_their_runtime_shape` in top `api/agent_tests.rs`. For each `[quorum]` profile in `agent/examples/confs` (`coder_agent`, `coder_delegate`, `learning_pair`, `multi_agent`), build it through `Agent::from_quorum_config` and assert:
   - root tool names and member IDs;
   - middleware names per agent;
   - snapshot policy and backend per agent;
   - delegation settings.
 
   Verify: Run-T `quorum_profiles_keep_their_runtime_shape`; it passes on the unchanged code.
-- [ ] 1.3 Record the starting point under `openspec/changes/unify-agent-runtime/baseline/` (create the directory). Verify: the four files are committed.
+  - Done: Run-T passes (1 passed); Run-R `config::tests` 119 passed; `cargo fmt -p querymt-agent-runtime -p querymt-agent -- --check` clean.
+  - Test sets `GITHUB_TOKEN` itself because `multi_agent.toml` interpolates it (safe: nextest runs one test per process).
+  - Added read-only `DelegationOrchestrator::config()` (runtime `delegation/core.rs`) so the test can assert delegation settings.
+  - Pre-existing example defects found on HEAD and fixed (user-approved) so the profiles load at all: `coder_agent.toml` had `[delegates.parameters]` commented out (duplicate `model` key, invalid TOML) and referenced the missing `../prompts/anthropic_opencode.txt` (now `../prompts/coder.md`); `multi_agent.toml` prompt paths were `prompts/*.md` and are now `../prompts/*.md`. The `config/tests.rs` comment saying `coder_agent.toml` is invalid TOML is now stale; its textual check still passes.
+- [x] 1.3 Record the starting point under `openspec/changes/unify-agent-runtime/baseline/` (create the directory). Verify: the four files are committed.
+  - Done: five files recorded (the task text says four but lists five): `nextest-list.txt` (3946 tests: runtime `$RF`, top `$F`, services), `line-counts.txt` (agent 35580, agent-core 18248, agent-index 15142, agent-knowledge 26987, agent-runtime 177764, agent-services 65877, agent-sqlite 22313), `types.ts` (2367 lines), `schema-single.json`, `schema-quorum.json`. The list includes the 1.2 test. Schemas were dumped by a temporary test that was removed afterwards.
   - `nextest-list.txt`: the sorted `cargo nextest list --message-format oneline` over `querymt-agent-runtime` (`$RF`), `querymt-agent` (`$F`) and `querymt-agent-services`.
   - `line-counts.txt`: `wc -l` over `crates/agent*/src` per package.
   - `types.ts`: typeshare output of `scripts/generate-types.sh`.

@@ -111,10 +111,10 @@ description = "Specialized in implementation and code writing"
 capabilities = ["rust", "python"]
 tools = ["question", "edit", "todowrite", "todoread", "glob", "search_text", "ls", "index", "shell", "read_tool", "write_file"]
 system = [
-  { file = "../prompts/anthropic_opencode.txt" }
+  { file = "../prompts/coder.md" }
 ]
 
-#[delegates.parameters]
+[delegates.parameters]
 model = "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf"
 n_ctx = 120000
 max_tokens = 8192

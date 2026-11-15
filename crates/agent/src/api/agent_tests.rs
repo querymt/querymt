@@ -3377,3 +3377,207 @@ async fn target_sees_only_its_server_skills_and_parent_sees_both() -> Result<()>
     agent.shutdown().await;
     Ok(())
 }
+
+// ── Characterization of the `[quorum]` example profiles ─────────────────────
+
+/// Runtime shape of one built agent handle, for comparison across refactors.
+#[derive(Debug, PartialEq, Eq)]
+struct AgentShape {
+    tools: Vec<String>,
+    middleware: Vec<String>,
+    snapshot_policy: String,
+    has_snapshot_backend: bool,
+}
+
+fn agent_shape(handle: &crate::agent::LocalAgentHandle) -> AgentShape {
+    let mut tools = handle.tool_registry().names();
+    tools.sort();
+    AgentShape {
+        tools,
+        middleware: handle
+            .config
+            .middleware_drivers
+            .iter()
+            .map(|d| d.name().to_string())
+            .collect(),
+        snapshot_policy: handle.config.snapshot_policy.to_string(),
+        has_snapshot_backend: handle.config.snapshot_backend.is_some(),
+    }
+}
+
+fn planner_mw<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+    let mut m = vec!["DelegationMiddleware", "ContextMiddleware"];
+    m.extend_from_slice(extra);
+    m.extend(["OutputLimitRecoveryMiddleware", "ParallelEditGuard"]);
+    m
+}
+
+fn with_tail<'a>(head: &[&'a str]) -> Vec<&'a str> {
+    let mut m = head.to_vec();
+    m.extend(["OutputLimitRecoveryMiddleware", "ParallelEditGuard"]);
+    m
+}
+
+const QUORUM_BASELINE_TOOLS: &[&str] = &[
+    "accept_delegation_result",
+    "browse",
+    "complete_task",
+    "create_task",
+    "delegate",
+    "delete_file",
+    "edit",
+    "find_symbol_references",
+    "get_function",
+    "get_symbol",
+    "glob",
+    "index",
+    "knowledge_consolidate",
+    "knowledge_ingest",
+    "knowledge_list_unconsolidated",
+    "knowledge_query",
+    "knowledge_stats",
+    "language_query",
+    "ls",
+    "mdq",
+    "multiedit",
+    "question",
+    "read_task",
+    "read_tool",
+    "replace_symbol",
+    "search_text",
+    "session_history",
+    "shell",
+    "todoread",
+    "todowrite",
+    "update_task",
+    "web_fetch",
+    "write_file",
+];
+
+#[tokio::test]
+async fn quorum_profiles_keep_their_runtime_shape() -> Result<()> {
+    // `multi_agent.toml` interpolates `${GITHUB_TOKEN}`. nextest runs each test
+    // in its own process, so setting it here cannot race another test.
+    unsafe { std::env::set_var("GITHUB_TOKEN", "test-token") };
+    let confs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/confs");
+
+    let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let shape = |middleware: &[&str], policy: &str, backend: bool| AgentShape {
+        tools: owned(QUORUM_BASELINE_TOOLS),
+        middleware: owned(middleware),
+        snapshot_policy: policy.to_string(),
+        has_snapshot_backend: backend,
+    };
+    // (profile, planner, delegates, "policy timeout grace max_parallel verification")
+    let coder_mw = with_tail(&[
+        "LimitsMiddleware",
+        "ContextMiddleware",
+        "DedupCheckMiddleware",
+    ]);
+    let expected: Vec<(&str, AgentShape, Vec<(&str, AgentShape)>, &str)> = vec![
+        (
+            "coder_agent",
+            shape(&planner_mw(&["AgentModeMiddleware"]), "diff", true),
+            vec![("coder", shape(&coder_mw, "diff", true))],
+            "All 120 5 5 false",
+        ),
+        (
+            "coder_delegate",
+            shape(&planner_mw(&["AgentModeMiddleware"]), "diff", true),
+            vec![
+                ("coder", shape(&coder_mw, "diff", true)),
+                (
+                    "explorer",
+                    shape(
+                        &with_tail(&["ContextMiddleware", "LimitsMiddleware"]),
+                        "diff",
+                        true,
+                    ),
+                ),
+            ],
+            "All 2400 5 5 true",
+        ),
+        (
+            "learning_pair",
+            shape(&planner_mw(&["AgentModeMiddleware"]), "diff", true),
+            vec![("coder", shape(&coder_mw, "diff", true))],
+            "All 300 5 1 false",
+        ),
+        (
+            "multi_agent",
+            shape(&planner_mw(&[]), "none", false),
+            vec![
+                (
+                    "coder",
+                    shape(&with_tail(&["ContextMiddleware"]), "none", false),
+                ),
+                (
+                    "researcher",
+                    shape(&with_tail(&["ContextMiddleware"]), "none", false),
+                ),
+            ],
+            "Any 120 5 5 true",
+        ),
+    ];
+
+    for (name, planner_shape, delegates, settings) in expected {
+        let config = crate::config::load_config(confs.join(format!("{name}.toml"))).await?;
+        let crate::config::Config::Multi(config) = config else {
+            panic!("{name}: expected a quorum config");
+        };
+        let (registry, _dir) = empty_plugin_registry()?;
+        let agent = Agent::from_quorum_config_with_infra(
+            *config,
+            AgentInfra {
+                plugin_registry: Arc::new(registry),
+                storage: Some(Arc::new(
+                    crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                        .await?,
+                )),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            },
+        )
+        .await?;
+        let quorum = agent.quorum().expect("quorum");
+        let local = |h: &Arc<dyn crate::agent::handle::AgentHandle>| {
+            agent_shape(
+                h.as_any()
+                    .downcast_ref::<crate::agent::LocalAgentHandle>()
+                    .expect("local handle"),
+            )
+        };
+
+        assert_eq!(local(&quorum.planner()), planner_shape, "{name}: planner");
+        let ids: Vec<&str> = quorum
+            .delegates()
+            .iter()
+            .map(|d| d.info.id.as_str())
+            .collect();
+        let expected_ids: Vec<&str> = delegates.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, expected_ids, "{name}: member ids");
+        for (id, expected_shape) in &delegates {
+            let handle = quorum.delegate(id).expect("delegate");
+            assert_eq!(&local(&handle), expected_shape, "{name}: delegate {id}");
+        }
+        let c = quorum
+            .orchestrator()
+            .expect("orchestrator")
+            .config()
+            .clone();
+        assert_eq!(
+            format!(
+                "{:?} {} {} {} {}",
+                c.wait_policy,
+                c.wait_timeout_secs,
+                c.cancel_grace_secs,
+                c.max_parallel_delegations,
+                c.run_verification
+            ),
+            settings,
+            "{name}: delegation settings"
+        );
+        agent.shutdown().await;
+    }
+    Ok(())
+}

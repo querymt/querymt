@@ -287,6 +287,11 @@ impl DelegationOrchestrator {
         self
     }
 
+    /// The settings this service runs with.
+    pub fn config(&self) -> &DelegationOrchestratorConfig {
+        &self.config
+    }
+
     pub fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
     }
