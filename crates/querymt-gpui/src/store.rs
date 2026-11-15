@@ -662,6 +662,20 @@ pub struct Prefs {
     /// Mouse-wheel inertia (`off`, `light`, `strong`).
     #[serde(default)]
     pub scroll_inertia: String,
+    /// How image attachments are sent in prompts.
+    #[serde(default)]
+    pub image_send_mode: ImageSendMode,
+}
+
+/// ACP encoding of image attachments in a prompt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageSendMode {
+    /// Native ACP `image` content blocks.
+    #[default]
+    Image,
+    /// Embedded `resource` blocks, for agents without image prompt support.
+    Resource,
 }
 
 impl Prefs {
@@ -1112,6 +1126,34 @@ impl AgentsStore {
     pub fn update_prefs(&mut self, f: impl FnOnce(&mut Prefs), cx: &mut Context<Self>) {
         f(&mut self.prefs);
         self.save();
+        cx.notify();
+    }
+
+    /// Forget everything this app stores (agent configurations and
+    /// preferences) and start over like a fresh install. Sessions on the
+    /// agents, provider sign-ins and project files are not touched.
+    pub fn reset_app_data(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self.runtime.keys().cloned().collect();
+        for id in &ids {
+            self.disconnect(id, cx);
+        }
+        self.runtime.clear();
+        self.requests.clear();
+        self.session = None;
+        self.launch = LaunchState::default();
+        self._launch_task = None;
+        self.prefs = Prefs::default();
+        self.configs = seed_configs();
+        self.save();
+        let auto: Vec<String> = self
+            .configs
+            .iter()
+            .filter(|c| c.auto_start)
+            .map(|c| c.id.clone())
+            .collect();
+        for id in auto {
+            self.connect(&id, cx);
+        }
         cx.notify();
     }
 
@@ -1642,6 +1684,7 @@ impl AgentsStore {
             return;
         };
         let model = self.launch_model(agent_id).cloned();
+        let image_mode = self.prefs.image_send_mode;
         let mode = self.prefs.mode().to_string();
         let reasoning = self.prefs.reasoning().to_string();
         self.launch = LaunchState {
@@ -1734,7 +1777,7 @@ impl AgentsStore {
                 // The prompt resolves when the turn ends; keep it running in the background.
                 let turn = rpc.request(
                     "session/prompt",
-                    json!({ "sessionId": session_id, "prompt": prompt_content(&prompt, &attachments) }),
+                    json!({ "sessionId": session_id, "prompt": prompt_content(&prompt, &attachments, image_mode) }),
                 );
                 let (this2, agent_id2, session_id2) = (this.clone(), agent_id.clone(), session_id.clone());
                 cx.spawn(async move |cx| {
@@ -1977,7 +2020,7 @@ impl AgentsStore {
             return;
         };
         let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
-        let content = prompt_content(&text, &attachments);
+        let content = prompt_content(&text, &attachments, self.prefs.image_send_mode);
         if view.running() && control {
             // Like desktop: slash commands can't steer, they always queue.
             let wanted: &'static str = if text.trim_start().starts_with('/') || delivery == "queue"
@@ -2889,8 +2932,13 @@ fn percent_encode(s: &str) -> String {
         .collect()
 }
 
-/// ACP prompt blocks: text plus attachments (images inline, other files as embedded resources).
-fn prompt_content(prompt: &str, attachments: &[Attachment]) -> Vec<Value> {
+/// ACP prompt blocks: text plus attachments. Images are native `image` blocks
+/// unless `image_mode` asks for resources; other files are always embedded resources.
+fn prompt_content(
+    prompt: &str,
+    attachments: &[Attachment],
+    image_mode: ImageSendMode,
+) -> Vec<Value> {
     let mut content = Vec::new();
     if !prompt.is_empty() {
         content.push(json!({ "type": "text", "text": prompt }));
@@ -2898,7 +2946,7 @@ fn prompt_content(prompt: &str, attachments: &[Attachment]) -> Vec<Value> {
     for a in attachments {
         let meta =
             json!({ "querymt": { "attachment_id": a.id, "filename": a.name, "size": a.size } });
-        if a.is_image() {
+        if a.is_image() && image_mode == ImageSendMode::Image {
             content.push(
                 json!({ "type": "image", "data": a.data, "mimeType": a.mime, "_meta": meta }),
             );
@@ -3090,4 +3138,51 @@ async fn load_extras(
         }),
         cx,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attachment(name: &str, mime: &str) -> Attachment {
+        Attachment {
+            id: format!("id-{name}"),
+            name: name.into(),
+            mime: mime.into(),
+            size: 3,
+            data: "AAA".into(),
+            image: None,
+        }
+    }
+
+    #[test]
+    fn image_send_mode_controls_how_images_are_encoded() {
+        let files = [
+            attachment("a.png", "image/png"),
+            attachment("b.txt", "text/plain"),
+        ];
+        let kinds = |mode| -> Vec<String> {
+            prompt_content("hi", &files, mode)
+                .iter()
+                .map(|b| b["type"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        assert_eq!(kinds(ImageSendMode::Image), ["text", "image", "resource"]);
+        assert_eq!(
+            kinds(ImageSendMode::Resource),
+            ["text", "resource", "resource"]
+        );
+    }
+
+    #[test]
+    fn prefs_without_image_mode_default_to_native_images() {
+        let prefs: Prefs = serde_json::from_str(r#"{"dark":null,"primary_agent":null}"#).unwrap();
+        assert_eq!(prefs.image_send_mode, ImageSendMode::Image);
+        let json = serde_json::to_string(&Prefs {
+            image_send_mode: ImageSendMode::Resource,
+            ..prefs
+        })
+        .unwrap();
+        assert!(json.contains(r#""image_send_mode":"resource""#));
+    }
 }

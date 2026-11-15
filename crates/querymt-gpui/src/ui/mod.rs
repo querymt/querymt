@@ -88,6 +88,10 @@ pub struct QmtApp {
     method_menu: Option<String>,
     maintenance_open: bool,
     failed_plugins_open: bool,
+    /// General settings: Advanced / Danger zone disclosures and the reset confirmation.
+    general_advanced_open: bool,
+    general_danger_open: bool,
+    confirm_reset: bool,
     key_input: Entity<InputState>,
     oauth_code: Entity<InputState>,
     session_prompt: Entity<TextareaState>,
@@ -258,6 +262,9 @@ impl QmtApp {
             method_menu: None,
             maintenance_open: false,
             failed_plugins_open: false,
+            general_advanced_open: false,
+            general_danger_open: false,
+            confirm_reset: false,
             key_input,
             oauth_code,
             session_prompt,
@@ -353,7 +360,8 @@ impl QmtApp {
         {
             return true;
         }
-        if self.confirm_delete.take().is_some()
+        if std::mem::take(&mut self.confirm_reset)
+            || self.confirm_delete.take().is_some()
             || self.dialog.take().is_some()
             || self.details.take().is_some()
         {

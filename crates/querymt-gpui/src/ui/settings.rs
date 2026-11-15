@@ -4,13 +4,13 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Selectable as _, Sizable as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::mesh::panel;
 use super::{QmtApp, kit};
-use crate::store::ProviderAuth;
+use crate::store::{ImageSendMode, ProviderAuth};
 use crate::theme::{ACCENTS, Palette, accent_color, palette};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -27,7 +27,7 @@ const TABS: [(SettingsTab, IconName, &str, &str); 5] = [
         SettingsTab::General,
         IconName::SlidersHorizontal,
         "General",
-        "Sidebar and session behavior",
+        "Sidebar, prompts and app data",
     ),
     (
         SettingsTab::Appearance,
@@ -84,6 +84,122 @@ fn setting_row(
                 .child(div().text_xs().text_color(p.muted).child(desc)),
         )
         .child(control)
+}
+
+/// Rounded card that groups [`simple_row`]s (desktop `.settings-simple-row` list).
+fn settings_card(p: &Palette) -> Div {
+    v_flex()
+        .min_w_0()
+        .rounded(px(12.))
+        .overflow_hidden()
+        .bg(p.card)
+}
+
+/// One row of a [`settings_card`]: title and help on the left, control on the right.
+fn simple_row(
+    title: &'static str,
+    desc: impl Into<SharedString>,
+    control: impl IntoElement,
+    first: bool,
+    p: &Palette,
+) -> Div {
+    let (subtle_border, _) = subtle(p);
+    h_flex()
+        .min_h(px(59.))
+        .justify_between()
+        .gap_4()
+        .px(px(14.4))
+        .py(px(11.5))
+        .when(!first, |el| el.border_t_1().border_color(subtle_border))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_size(px(13.4))
+                        .font_semibold()
+                        .text_color(p.text)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .mt(px(3.2))
+                        .text_size(px(12.))
+                        .text_color(p.muted)
+                        .child(desc.into()),
+                ),
+        )
+        .child(control)
+}
+
+/// Collapsible section below a settings card (desktop `.settings-advanced`):
+/// a quiet trigger row with title, help and chevron, then `content` when open.
+fn disclosure(
+    id: &'static str,
+    title: &'static str,
+    desc: &'static str,
+    open: bool,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    content: Option<Div>,
+    p: &Palette,
+) -> Div {
+    let (subtle_border, subtle_surface) = subtle(p);
+    let (hover_bg, hover_fg) = (subtle_surface, p.text);
+    v_flex()
+        .border_t_1()
+        .border_color(subtle_border)
+        .pt(px(5.6))
+        .child(
+            h_flex()
+                .id(id)
+                .w_full()
+                .justify_between()
+                .gap_4()
+                .px(px(10.4))
+                .py(px(9.6))
+                .rounded(px(8.))
+                .cursor_pointer()
+                .text_color(p.muted)
+                .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
+                .child(
+                    v_flex()
+                        .child(div().text_size(px(12.5)).font_semibold().child(title))
+                        .child(
+                            div()
+                                .mt(px(2.4))
+                                .text_size(px(10.9))
+                                .text_color(p.dim)
+                                .child(desc),
+                        ),
+                )
+                .child(kit::icon(
+                    if open {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    },
+                    16.,
+                    p.muted,
+                ))
+                .on_click(on_toggle),
+        )
+        .children(content.map(|c| c.mt(px(5.6))))
+}
+
+/// [`action_btn`] in the destructive tone (Clear API key, Reset app data).
+fn danger_btn(id: impl Into<ElementId>, enabled: bool, p: &Palette) -> Stateful<Div> {
+    let danger = p.danger;
+    action_btn(id, enabled, true, p)
+        .border_color(danger.opacity(0.35))
+        .bg(danger.opacity(0.1))
+        .text_color(danger)
+        .when(enabled, |el| {
+            el.hover(move |s| {
+                s.border_color(danger.opacity(0.65))
+                    .bg(danger.opacity(0.16))
+            })
+        })
 }
 
 fn keycap(k: &str, p: &Palette) -> Div {
@@ -226,16 +342,9 @@ impl QmtApp {
 
     fn settings_general(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let prefs = self.store.read(cx).prefs.clone();
-        let store = self.store.read(cx);
-        let agents: Vec<(String, String)> = store
-            .connected_ids()
-            .into_iter()
-            .filter_map(|id| store.config(&id).map(|c| (id, c.name.clone())))
-            .collect();
-        let primary = store.primary_agent();
 
-        panel(p)
-            .child(setting_row(
+        let sidebar = settings_card(p)
+            .child(simple_row(
                 "Show pinned sessions in sidebar",
                 "Keep pinned sessions above Open sessions.",
                 Switch::new("sw-pinned")
@@ -246,10 +355,10 @@ impl QmtApp {
                             s.update_prefs(|p| p.show_pinned_sidebar = v, cx)
                         });
                     })),
+                true,
                 p,
             ))
-            .child(kit::divider(p))
-            .child(setting_row(
+            .child(simple_row(
                 "Collapse sidebar",
                 "Show only icons in the left panel. Toggle anytime with Ctrl+B.",
                 Switch::new("sw-collapse")
@@ -259,35 +368,86 @@ impl QmtApp {
                         this.store
                             .update(cx, |s, cx| s.update_prefs(|p| p.sidebar_collapsed = v, cx));
                     })),
+                false,
+                p,
+            ));
+
+        // ---- Advanced: prompt encoding
+        let advanced_open = self.general_advanced_open;
+        let advanced = advanced_open.then(|| {
+            let modes = [
+                (ImageSendMode::Image, "Native image"),
+                (ImageSendMode::Resource, "Embedded resource"),
+            ];
+            let encoding = kit::segment_bar(p).children(modes.into_iter().map(|(mode, label)| {
+                let id = match mode {
+                    ImageSendMode::Image => "image-mode-image",
+                    ImageSendMode::Resource => "image-mode-resource",
+                };
+                kit::segment(id, prefs.image_send_mode == mode, p)
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .update(cx, |s, cx| s.update_prefs(|p| p.image_send_mode = mode, cx))
+                    }))
+            }));
+            settings_card(p).child(simple_row(
+                "Image attachment encoding",
+                "Send images as native ACP image blocks or embedded resources.",
+                encoding,
+                true,
                 p,
             ))
-            .child(kit::divider(p))
-            .child(setting_row(
-                "Default agent",
-                "New sessions start on this agent.",
-                h_flex()
-                    .gap_1()
-                    .when(agents.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .text_xs()
-                                .text_color(p.dim)
-                                .child("No agent connected"),
-                        )
-                    })
-                    .children(agents.into_iter().map(|(id, name)| {
-                        let selected = primary.as_deref() == Some(id.as_str());
-                        kit::button(kit::keyed("def-agent", id.clone()))
-                            .xsmall()
-                            .ghost()
-                            .label(name)
-                            .selected(selected)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.store.update(cx, |s, cx| s.set_primary_agent(&id, cx))
-                            }))
+        });
+        let advanced = disclosure(
+            "general-advanced",
+            "Advanced",
+            "How prompts are sent to agents.",
+            advanced_open,
+            cx.listener(|this, _, _, cx| {
+                this.general_advanced_open = !this.general_advanced_open;
+                cx.notify();
+            }),
+            advanced,
+            p,
+        );
+
+        // ---- Danger zone: reset app data
+        let danger_open = self.general_danger_open;
+        let danger = danger_open.then(|| {
+            settings_card(p).child(simple_row(
+                "Reset app data",
+                "Removes configured agents and preferences stored by this app, then starts \
+                 over like a fresh install. Agent sessions, provider sign-ins and project \
+                 files are not touched.",
+                danger_btn("reset-app-data", true, p)
+                    .child("Reset app data")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.confirm_reset = true;
+                        cx.notify();
                     })),
+                true,
                 p,
             ))
+        });
+        let danger = disclosure(
+            "general-danger",
+            "Danger zone",
+            "Irreversible actions for app data.",
+            danger_open,
+            cx.listener(|this, _, _, cx| {
+                this.general_danger_open = !this.general_danger_open;
+                cx.notify();
+            }),
+            danger,
+            p,
+        );
+
+        v_flex()
+            .gap(px(12.8))
+            .child(sidebar)
+            .child(advanced)
+            .child(danger)
     }
 
     fn settings_appearance(
@@ -836,14 +996,9 @@ impl QmtApp {
                 }
                 if show_clear {
                     let (a, prov) = (agent.clone(), pr.provider.clone());
-                    let danger = p.danger;
                     actions.push(
-                        action_btn(kit::keyed("prov-clearkey", pkey.clone()), !pending, true, p)
-                            .border_color(danger.opacity(0.35))
-                            .bg(danger.opacity(0.1))
-                            .text_color(danger)
-                            .hover(move |s| s.border_color(danger.opacity(0.65)).bg(danger.opacity(0.16)))
-                            .child(kit::icon(IconName::Trash, 14., danger))
+                        danger_btn(kit::keyed("prov-clearkey", pkey.clone()), !pending, p)
+                            .child(kit::icon(IconName::Trash, 14., p.danger))
                             .child("Clear API key")
                             .when(!pending, |el| el.on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.clear_api_key(&a, &prov, cx)))))
                             .into_any_element(),
@@ -1021,79 +1176,8 @@ impl QmtApp {
 
         // ---- Advanced maintenance (desktop `ProviderMaintenance`)
         let maint_open = self.maintenance_open;
-        let (hover_bg, hover_fg) = (subtle_surface, p.text);
-        let trigger = h_flex()
-            .id("maint-trigger")
-            .w_full()
-            .justify_between()
-            .gap_4()
-            .px(px(10.4))
-            .py(px(9.6))
-            .rounded(px(8.))
-            .cursor_pointer()
-            .text_color(p.muted)
-            .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
-            .child(
-                v_flex()
-                    .child(
-                        div()
-                            .text_size(px(12.5))
-                            .font_semibold()
-                            .child("Advanced maintenance"),
-                    )
-                    .child(
-                        div()
-                            .mt(px(2.4))
-                            .text_size(px(10.9))
-                            .text_color(p.dim)
-                            .child("Refresh model availability and update provider plugins."),
-                    ),
-            )
-            .child(kit::icon(
-                if maint_open {
-                    IconName::ChevronUp
-                } else {
-                    IconName::ChevronDown
-                },
-                16.,
-                p.muted,
-            ))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.maintenance_open = !this.maintenance_open;
-                cx.notify();
-            }));
         let content =
             maint_open.then(|| {
-                let simple_row =
-                    |title: &'static str, desc: String, button: Stateful<Div>, first: bool| {
-                        h_flex()
-                            .min_h(px(59.))
-                            .justify_between()
-                            .gap_4()
-                            .px(px(14.4))
-                            .py(px(11.5))
-                            .when(!first, |el| el.border_t_1().border_color(subtle_border))
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(
-                                        div()
-                                            .text_size(px(13.4))
-                                            .font_semibold()
-                                            .text_color(p.text)
-                                            .child(title),
-                                    )
-                                    .child(
-                                        div()
-                                            .mt(px(3.2))
-                                            .text_size(px(12.))
-                                            .text_color(p.muted)
-                                            .child(desc),
-                                    ),
-                            )
-                            .child(button)
-                    };
                 let (a, a2) = (agent.clone(), agent.clone());
                 let refresh = action_btn("maint-refresh", !refreshing_models, false, p)
                     .child(if refreshing_models {
@@ -1194,17 +1278,14 @@ impl QmtApp {
                                 ))
                             })
                     });
-                v_flex()
-                    .mt(px(5.6))
-                    .rounded(px(12.))
-                    .overflow_hidden()
-                    .bg(p.card)
-                    .child(simple_row("Models", models_desc, refresh, true))
+                settings_card(p)
+                    .child(simple_row("Models", models_desc, refresh, true, p))
                     .child(simple_row(
                         "Plugins",
-                        "Update installed provider integrations.".into(),
+                        "Update installed provider integrations.",
                         update,
                         false,
+                        p,
                     ))
                     .when_some(maintenance.clone(), |el, (msg, is_err)| {
                         let color = if is_err { p.danger } else { p.success };
@@ -1223,12 +1304,18 @@ impl QmtApp {
                     })
                     .children(failed_box)
             });
-        let maintenance_el = v_flex()
-            .border_t_1()
-            .border_color(subtle_border)
-            .pt(px(5.6))
-            .child(trigger)
-            .children(content);
+        let maintenance_el = disclosure(
+            "maint-trigger",
+            "Advanced maintenance",
+            "Refresh model availability and update provider plugins.",
+            maint_open,
+            cx.listener(|this, _, _, cx| {
+                this.maintenance_open = !this.maintenance_open;
+                cx.notify();
+            }),
+            content,
+            p,
+        );
 
         v_flex()
             .gap(px(12.8))
