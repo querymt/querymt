@@ -32,14 +32,12 @@ remote = ["querymt-agent-runtime/remote", "kameo/remote", "dep:libp2p", "querymt
 remote-metrics = ["remote", "querymt-remote/iroh-metrics"]
 
 [dependencies]
-typeshare.workspace = true
 querymt = { path = "../querymt", default-features = false, features = ["runtime"] }
 querymt-remote = { path = "../querymt-remote" }
 querymt-provider-common = { path = "../provider-common" }
 querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "secret-store"] }
 querymt-agent-core = { path = "../agent-core" }
 querymt-agent-index = { path = "../agent-index" }
-querymt-agent-knowledge = { path = "../agent-knowledge" }
 querymt-agent-services = { path = "../agent-services" }
 querymt-agent-sqlite = { path = "../agent-sqlite" }
 querymt-agent-runtime = { path = "../agent-runtime" }
@@ -93,10 +91,6 @@ dirs.workspace = true
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tempfile = "3.0"
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-rustix = { version = "1", features = ["fs"] }
-
 [lib]
 name = "querymt_agent"
 path = "src/lib.rs"
@@ -115,18 +109,11 @@ rusqlite = { workspace = true, features = ["uuid", "time"] }
 querymt-agent-core = { path = "../agent-core", features = ["test-support"] }
 querymt-agent-sqlite = { path = "../agent-sqlite", features = ["test-support"] }
 querymt-agent-services = { path = "../agent-services", features = ["test-support"] }
-rmcp = { version = "3.9", features = ["server", "transport-streamable-http-server"] }
-qmt-openai = { path = "../providers/openai", default-features = false, features = ["api"] }
-mockall.workspace = true
 tar = { version = "0.4", default-features = false }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 env_logger = "0.11"
 clap = { version = "4.5", features = ["derive", "env"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-log = "0.2"
-opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "testing"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
-jsonschema = "0.60"
 tower = { version = "0.5", features = ["util"] }
 
 [[test]]
