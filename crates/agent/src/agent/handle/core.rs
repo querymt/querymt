@@ -540,7 +540,7 @@ impl LocalAgentHandle {
         if let Some(profiles) = self.profiles() {
             for runtime in profiles.materialized_runtimes().await {
                 removed |= Self::remove_session_bridge_routes_from_handle(
-                    &runtime.agent().handle(),
+                    &runtime.handle(),
                     session_id,
                     connection_id,
                 );
@@ -703,7 +703,7 @@ impl LocalAgentHandle {
                     "profileId": profile_id,
                 }))
             })?;
-            let profile_handle = runtime.agent().handle();
+            let profile_handle = runtime.handle();
             let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
             if let Some(bridge) = bridge {
                 profile_handle.set_bridge(bridge).await;
@@ -714,7 +714,7 @@ impl LocalAgentHandle {
                 .await?;
             let session_id = prepared.session_id.clone();
             if let Err(error) = profiles
-                .bind_session_to_runtime(session_id.clone(), &runtime)
+                .bind_session_to_runtime(&session_id, &runtime)
                 .await
             {
                 prepared.actor_ref.kill();
@@ -989,7 +989,7 @@ impl LocalAgentHandle {
                 return delegate_handle.load_session(req).await;
             }
 
-            let profile_handle = runtime.agent().handle();
+            let profile_handle = runtime.handle();
             let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
             if let Some(bridge) = bridge {
                 profile_handle.set_bridge(bridge).await;

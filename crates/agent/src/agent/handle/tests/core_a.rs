@@ -1250,10 +1250,10 @@ async fn test_set_profile_config_option_rejects_different_bound_profile() {
 
 async fn register_profile_bound_delegate_session(
     f: &HandleFixture,
-    runtime: &Arc<crate::profiles::ProfileRuntime>,
+    runtime: &Arc<crate::profile_host::ProfileRuntimeView>,
     session_id: &str,
 ) -> (Arc<dyn AgentHandle>, SessionActorRef) {
-    let delegate_handle = runtime.agent().delegate("coder").expect("coder delegate");
+    let delegate_handle = runtime.delegate("coder").expect("coder delegate");
     let local_handle = delegate_handle
         .as_any()
         .downcast_ref::<LocalAgentHandle>()
@@ -1335,7 +1335,6 @@ async fn test_clear_session_bridge_finds_profile_route_after_binding_is_forgotte
         "materialized profile runtime should retain enough routing state to clear the bridge"
     );
     let delegate_handle = runtime
-        .agent()
         .delegate("coder")
         .expect("coder delegate")
         .as_any()

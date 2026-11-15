@@ -333,7 +333,7 @@ impl LocalAgentHandle {
                     "sessionId": session_id,
                 }))
             })?;
-        Ok(Some(runtime.agent().handle()))
+        Ok(Some(runtime.handle()))
     }
 
     async fn load_ext_undo_stack(&self, session_id: &str) -> Vec<UndoStackFrameResponse> {

@@ -205,7 +205,6 @@ async fn persisted_delegate_parent(f: &HandleFixture) -> String {
         .await
         .unwrap();
     let session = runtime
-        .agent()
         .handle()
         .config
         .provider
@@ -230,12 +229,11 @@ async fn delegate_profile_fixture_shares_storage_without_leaking_across_fixtures
     let alpha = profiles.runtime_for_profile("alpha").await.unwrap();
     let quorum = profiles.runtime_for_profile("quorum").await.unwrap();
     assert!(Arc::ptr_eq(
-        &alpha.agent().storage_backend(),
-        &quorum.agent().storage_backend()
+        &alpha.handle().config.storage,
+        &quorum.handle().config.storage
     ));
     assert!(
         alpha
-            .agent()
             .handle()
             .config
             .provider
@@ -254,7 +252,6 @@ async fn delegate_profile_fixture_shares_storage_without_leaking_across_fixtures
         .unwrap();
     assert!(
         other
-            .agent()
             .handle()
             .config
             .provider
@@ -301,7 +298,7 @@ async fn delegate_assignments_custom_storage_uses_legacy_memory_without_false_no
         .runtime_for_profile("quorum")
         .await
         .unwrap();
-    let handle = runtime.agent().handle();
+    let handle = runtime.handle();
     let mut events = handle.subscribe_events();
 
     let before = ext_method_json(
@@ -549,7 +546,7 @@ async fn delegate_assignment_user_fork_inherits_revision_zero_copy() {
         .runtime_for_profile("quorum")
         .await
         .unwrap();
-    let store = runtime.agent().handle().config.provider.history_store();
+    let store = runtime.handle().config.provider.history_store();
     ext_method_json(
         &f.handle,
         "querymt/session/setDelegateModel",
@@ -627,7 +624,7 @@ async fn delegate_assignment_readback_survives_reconnect_and_preserves_unavailab
         .runtime_for_profile("quorum")
         .await
         .unwrap();
-    let handle = runtime.agent().handle();
+    let handle = runtime.handle();
     let model = crate::delegation::DelegateModelOverride {
         model_id: "provider/removed-model".into(),
         node_id: Some("offline-node".into()),
@@ -708,7 +705,6 @@ async fn delegate_assignment_child_cannot_edit_parent_routing() {
         .await
         .unwrap();
     let child = runtime
-        .agent()
         .handle()
         .config
         .provider
@@ -758,7 +754,7 @@ async fn delegate_assignment_changes_notify_and_failed_writes_do_not() {
         .runtime_for_profile("quorum")
         .await
         .unwrap();
-    let mut events = runtime.agent().handle().subscribe_events();
+    let mut events = runtime.handle().subscribe_events();
     ext_method_json(
         &f.handle,
         "querymt/session/setDelegateModel",
@@ -787,7 +783,7 @@ async fn delegate_assignment_changes_notify_and_failed_writes_do_not() {
     assert_eq!(notification["params"]["version"], 1);
     assert_eq!(notification["params"]["session_id"], session_id);
     assert_eq!(notification["params"]["revision"], 1);
-    let handle = runtime.agent().handle();
+    let handle = runtime.handle();
     let durable = handle
         .config
         .event_sink
@@ -919,7 +915,6 @@ async fn test_querymt_session_set_delegate_model_sets_and_clears_override() {
         .unwrap();
     assert!(
         runtime
-            .agent()
             .handle()
             .registry
             .lock()
@@ -978,7 +973,7 @@ async fn test_delegate_model_override_cleanup_clears_bound_runtime() {
         .runtime_for_profile("quorum")
         .await
         .unwrap();
-    let store = &runtime.agent().handle().config.delegate_model_overrides;
+    let store = &runtime.handle().config.delegate_model_overrides;
     store
         .set(
             "parent-1",

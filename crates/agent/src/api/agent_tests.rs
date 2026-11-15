@@ -273,7 +273,7 @@ async fn with_profiles_reuses_root_agent_for_active_profile() -> Result<()> {
         .active_runtime()
         .await?;
 
-    assert!(Arc::ptr_eq(&root_handle, &runtime.agent().handle()));
+    assert!(Arc::ptr_eq(&root_handle, &runtime.handle()));
     Ok(())
 }
 

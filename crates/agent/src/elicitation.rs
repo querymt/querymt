@@ -249,7 +249,7 @@ pub async fn take_pending_elicitation_sender_for_session_with_profiles(
     {
         match profiles.runtime_for_profile(&binding.profile_id).await {
             Ok(runtime) => {
-                let profile_agent = runtime.agent().handle();
+                let profile_agent = runtime.handle();
                 if let Some(sender) =
                     take_pending_elicitation_sender(profile_agent.as_ref(), elicitation_id).await
                 {
@@ -447,11 +447,7 @@ async fn all_registries(agent: &crate::agent::LocalAgentHandle) -> Vec<SharedReg
     let mut seen = HashSet::new();
     if let Some(profiles) = agent.profiles().as_ref() {
         for runtime in profiles.materialized_runtimes().await {
-            push_agent_registries(
-                runtime.agent().handle().as_ref(),
-                &mut registries,
-                &mut seen,
-            );
+            push_agent_registries(runtime.handle().as_ref(), &mut registries, &mut seen);
         }
     }
     push_agent_registries(agent, &mut registries, &mut seen);
@@ -501,7 +497,7 @@ async fn all_pending_maps(agent: &crate::agent::LocalAgentHandle) -> Vec<Pending
     let mut seen = HashSet::new();
     if let Some(profiles) = agent.profiles().as_ref() {
         for runtime in profiles.materialized_runtimes().await {
-            push_agent_pending_maps(runtime.agent().handle().as_ref(), &mut maps, &mut seen);
+            push_agent_pending_maps(runtime.handle().as_ref(), &mut maps, &mut seen);
         }
     }
     push_agent_pending_maps(agent, &mut maps, &mut seen);

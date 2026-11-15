@@ -1,17 +1,17 @@
-use crate::profiles::{ProfileCatalog, ProfileRuntime, ProfileRuntimeManager};
+use crate::profiles::{ProfileCatalog, ProfileRuntime, ProfileRuntimeHost, ProfileRuntimeManager};
 use notify::RecommendedWatcher;
 use std::sync::Arc;
 
 use super::AgentInfra;
 
-pub type ProfileRuntimeHandle = Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>;
+pub type ProfileRuntimeHandle = Arc<dyn ProfileRuntimeHost>;
 
 /// Public wrapper for attaching a profile catalog to an agent runtime.
 ///
 /// Owns the filesystem watcher so live profile reloads stay active for as long
 /// as the agent keeps this attachment alive.
 pub struct AgentProfiles {
-    manager: ProfileRuntimeHandle,
+    manager: Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>,
     #[allow(dead_code)]
     watcher: Option<RecommendedWatcher>,
 }
@@ -36,7 +36,7 @@ impl AgentProfiles {
         if let Some(workspace) = workspace {
             manager = manager.with_dotagents_workspace(workspace);
         }
-        let manager: ProfileRuntimeHandle = Arc::new(manager);
+        let manager = Arc::new(manager);
         let watcher = manager.start_profile_watcher();
         Self { manager, watcher }
     }
@@ -53,6 +53,12 @@ impl AgentProfiles {
     }
 
     pub fn manager(&self) -> ProfileRuntimeHandle {
+        self.manager.clone()
+    }
+
+    /// The concrete manager, for top-crate callers that need the full
+    /// `ProfileRuntime` (which owns an `Agent`).
+    pub fn concrete_manager(&self) -> Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>> {
         self.manager.clone()
     }
 

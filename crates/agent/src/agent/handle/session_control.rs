@@ -55,7 +55,7 @@ impl LocalAgentHandle {
     ) -> Result<
         Option<(
             Arc<dyn crate::agent::handle::AgentHandle>,
-            crate::profiles::SessionProfileBinding,
+            crate::profile_host::SessionProfileBinding,
         )>,
         Error,
     > {

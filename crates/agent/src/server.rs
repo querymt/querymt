@@ -490,7 +490,7 @@ system = "inline"
             .await
             .expect("runtime materializes");
         assert!(
-            runtime.agent().handle().mesh().is_some(),
+            runtime.handle().mesh().is_some(),
             "profile manager should synchronously store root mesh for future runtimes"
         );
         profiles.shutdown().await;

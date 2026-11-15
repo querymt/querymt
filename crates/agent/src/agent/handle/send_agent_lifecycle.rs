@@ -360,7 +360,6 @@ impl LocalAgentHandle {
             && let Ok(runtime) = profiles.runtime_for_profile(&binding.profile_id).await
         {
             runtime
-                .agent()
                 .handle()
                 .config
                 .delegate_model_overrides

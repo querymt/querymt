@@ -105,7 +105,7 @@ impl LocalAgentHandle {
                 }))
             })?;
 
-        let mut delegates = runtime.agent().handle().agent_registry().list_agents();
+        let mut delegates = runtime.handle().agent_registry().list_agents();
         delegates.sort_by(|left, right| left.id.cmp(&right.id));
         let mut agents = vec![serde_json::json!({
             "id": "primary",
@@ -119,7 +119,7 @@ impl LocalAgentHandle {
                 "name": agent.name,
                 "description": agent.description,
                 "capabilities": agent.capabilities,
-                "configured_default_model_id": Self::configured_delegate_model_id(&runtime.agent().handle(), &agent.id),
+                "configured_default_model_id": Self::configured_delegate_model_id(&runtime.handle(), &agent.id),
             })
         }));
 
@@ -167,7 +167,7 @@ impl LocalAgentHandle {
                     &error,
                 ))
             })?;
-        let handle = runtime.agent().handle();
+        let handle = runtime.handle();
         let store = handle.config.provider.history_store();
         let session = store
             .get_session(session_id)
@@ -339,7 +339,7 @@ impl LocalAgentHandle {
                     "sessionId": session_id,
                 }))
             })?;
-        let profile_handle = runtime.agent().handle();
+        let profile_handle = runtime.handle();
         let store = profile_handle.config.provider.history_store();
         let session = store
             .get_session(session_id)

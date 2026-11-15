@@ -1048,7 +1048,7 @@ mod remote_impl {
             };
             let config = owner_runtime
                 .as_ref()
-                .map(|runtime| runtime.agent().handle().config.clone())
+                .map(|runtime| runtime.handle().config.clone())
                 .unwrap_or_else(|| self.config.clone());
             let session_context = config
                 .provider

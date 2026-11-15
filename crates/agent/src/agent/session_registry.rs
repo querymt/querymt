@@ -17,7 +17,7 @@ use crate::agent::remote::event_relay::RemoteSessionDisconnect;
 use crate::agent::remote::scope::{MeshScopeId, scoped_event_relay, scoped_session};
 use crate::agent::session_actor::SessionActor;
 use crate::error::AgentError;
-use crate::profiles::ProfileMetadata;
+use crate::profile_host::ProfileMetadata;
 use kameo::actor::{ActorRef, Spawn};
 #[cfg(feature = "remote")]
 use querymt_remote::MeshRuntimeHandle;

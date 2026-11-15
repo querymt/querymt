@@ -318,7 +318,7 @@ async fn register_bound_test_session(f: &HandleFixture, session_id: &str, profil
         .runtime_for_profile(profile_id)
         .await
         .expect("bound profile runtime should load");
-    let profile_handle = runtime.agent().handle();
+    let profile_handle = runtime.handle();
     let actor = SessionActor::new(
         profile_handle.config.clone(),
         session_id.to_string(),

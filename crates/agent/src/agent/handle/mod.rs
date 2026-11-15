@@ -59,6 +59,8 @@ use crate::event_fanout::EventFanout;
 use crate::events::{AgentEventKind, EventEnvelope};
 use crate::index::WorkspaceIndexManagerActor;
 use crate::middleware::CompositeDriver;
+use crate::profile_host::ProfileRuntimeHost;
+#[cfg(test)]
 use crate::profiles::{ProfileCatalog, ProfileRuntimeManager};
 use crate::send_agent::SendAgent;
 use crate::session::store::LLMConfig;
@@ -273,8 +275,7 @@ pub struct LocalAgentHandle {
     shutdown_done: AtomicBool,
 }
 
-type SharedProfileCatalog = Arc<dyn ProfileCatalog>;
-pub(crate) type ProfileRuntime = Arc<ProfileRuntimeManager<SharedProfileCatalog>>;
+pub(crate) type ProfileRuntime = Arc<dyn ProfileRuntimeHost>;
 pub(crate) type ProfileRuntimeSlot = Arc<ArcSwap<Option<ProfileRuntime>>>;
 pub(crate) type SchedulerHandleSlot = Arc<ParkingMutex<Option<crate::scheduler::SchedulerHandle>>>;
 

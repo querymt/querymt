@@ -191,7 +191,7 @@ async fn remote_profile_creation_rejects_failed_binding_without_a_session_or_mem
         "failed persistence must not install an in-memory binding"
     );
     assert!(
-        runtime.agent().handle().registry_lock().await.is_empty(),
+        runtime.handle().registry_lock().await.is_empty(),
         "no session actor materialized"
     );
     let local_error = owner
@@ -214,7 +214,6 @@ async fn remote_profile_creation_rejects_failed_binding_without_a_session_or_mem
             .runtime_for_profile("alpha")
             .await
             .unwrap()
-            .agent()
             .handle()
             .registry_lock()
             .await
@@ -260,7 +259,7 @@ async fn remote_delegate_child_reuses_session_listing_attach_and_bookmarked_load
         .unwrap();
     let profiles = owner.handle.profiles().unwrap();
     let runtime = profiles.runtime_for_profile("cdr").await.unwrap();
-    let delegate = runtime.agent().delegate("coder").unwrap();
+    let delegate = runtime.delegate("coder").unwrap();
     let (child_id, child_ref) = delegate
         .create_delegation_session(None, parent.session_id.to_string())
         .await
