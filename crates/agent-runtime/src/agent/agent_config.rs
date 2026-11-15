@@ -1,0 +1,680 @@
+//! Shared agent configuration and infrastructure.
+//!
+//! `AgentConfig` is constructed once at build time and wrapped in `Arc`.
+//! It holds all shared/immutable state that session actors need. It is NOT
+//! an actor — it has no lifecycle or message processing needs.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
+
+use arc_swap::ArcSwap;
+use kameo::actor::ActorRef;
+use querymt::chat::ReasoningEffort;
+
+use crate::acp::client_bridge::ClientBridgeSender;
+use crate::acp::protocol::AuthMethod;
+use crate::agent::core::{
+    AgentMode, DelegationContextConfig, SnapshotPolicy, ToolConfig, ToolPolicy,
+};
+use crate::agent::session_mcp::SessionMcpAttachmentSource;
+use crate::config::{DelegationWaitPolicy, McpServerConfig, RuntimeExecutionPolicy, ToolRef};
+use crate::delegation::AgentRegistry;
+use crate::hooks::Hooks;
+use crate::middleware::{CompositeDriver, MiddlewareDriver};
+use crate::session::backend::StorageBackend;
+use crate::session::compaction::SessionCompaction;
+use crate::session::provider::SessionProvider;
+use crate::session::store::SessionExecutionConfig;
+use crate::tools::ToolRegistry;
+use querymt_agent_core::events::{AgentEventKind, DurableEvent};
+use querymt_agent_index::WorkspaceIndexManagerActor;
+use querymt_agent_services::event_sink::EventSink;
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct SessionBridgeRoute {
+    pub bridge: ClientBridgeSender,
+}
+
+impl AgentConfig {
+    /// Workspace-query capability for a locally hosted session.
+    ///
+    /// Returns the transport connection currently attached to the session on
+    /// this node, if any. Sessions hosted on remote nodes never have an entry
+    /// in the local route table, so they report no capability.
+    pub(crate) fn workspace_query_bridge_for_session(
+        &self,
+        session_id: &str,
+    ) -> Option<ClientBridgeSender> {
+        self.session_bridges
+            .lock()
+            .ok()
+            .and_then(|bridges| bridges.get(session_id).map(|route| route.bridge.clone()))
+    }
+}
+
+/// Shared agent configuration and infrastructure.
+///
+/// Constructed once at build time. Wrapped in `Arc` and passed to each
+/// `SessionActor` at spawn. Not an actor — no lifecycle, no message processing.
+///
+/// For rare agent-wide config changes (e.g., updating tool policy across all sessions),
+/// the server layer broadcasts messages to all active session actors.
+#[derive(Clone)]
+pub struct AgentConfig {
+    // ── Infrastructure (Arc, thread-safe) ────────────────────────
+    pub provider: Arc<SessionProvider>,
+    pub storage: Arc<dyn StorageBackend>,
+    pub event_sink: Arc<EventSink>,
+    pub agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
+    pub delegate_model_overrides: crate::delegation::DelegateModelOverrideStore,
+    pub workspace_manager_actor: ActorRef<WorkspaceIndexManagerActor>,
+    pub session_bridges: Arc<StdMutex<HashMap<String, SessionBridgeRoute>>>,
+
+    // ── Defaults (used when spawning new sessions) ───────────────
+    /// Shared live reference to the default agent mode.
+    /// Session actors read this at spawn time to get the current mode.
+    pub default_mode: Arc<StdMutex<AgentMode>>,
+    /// Shared live reference to the default reasoning effort.
+    /// Lock-free reads via `ArcSwap`. `None` = use model heuristic defaults.
+    pub default_reasoning_effort: Arc<ArcSwap<Option<ReasoningEffort>>>,
+    pub tool_config: ToolConfig,
+    /// Immutable after build; shared (not copied) with tool-aware middleware.
+    pub tool_registry: Arc<ToolRegistry>,
+    /// Agent-level skill state. When set, every turn binds a session-owned
+    /// `skill` tool from it (see `ToolSet`); the tool is deliberately absent
+    /// from `tool_registry`.
+    pub skill_catalog: Option<Arc<crate::skills::SkillCatalog>>,
+    pub middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,
+    pub auth_methods: Vec<AuthMethod>,
+
+    // ── MCP servers (from TOML config, applied to every session) ────────
+    /// MCP servers defined in the TOML `[[mcp]]` section.
+    /// These are merged into every `NewSessionRequest` automatically.
+    pub mcp_servers: Vec<McpServerConfig>,
+
+    // ── Execution config ─────────────────────────────────────────
+    pub max_steps: Option<usize>,
+    pub snapshot_policy: SnapshotPolicy,
+    /// Tool approval policy (`ask` / `always_ask` lists and prompt timeout).
+    pub permissions: crate::config::Permissions,
+    pub max_prompt_bytes: Option<usize>,
+    pub execution_timeout_secs: u64,
+    pub delegation_wait_policy: DelegationWaitPolicy,
+    pub delegation_wait_timeout_secs: u64,
+    pub delegation_cancel_grace_secs: u64,
+    /// Grouped execution policy: tool output, pruning, compaction, rate limit.
+    pub execution_policy: RuntimeExecutionPolicy,
+    pub compaction: SessionCompaction,
+    pub snapshot_backend: Option<Arc<dyn querymt_agent_services::snapshot::SnapshotBackend>>,
+    pub snapshot_gc_config: querymt_agent_services::snapshot::GcConfig,
+    pub delegation_context_config: DelegationContextConfig,
+    pub pending_elicitations: crate::elicitation::PendingElicitationMap,
+
+    // ── Session MCP attachments ───────────────────────────────────
+    /// Source of MCP capabilities that should be attached to every session
+    /// materialized on this agent node (e.g., mobile in-process MCP peers).
+    /// Defaults to a no-op if not configured.
+    pub session_mcp_attachment_source: Arc<dyn SessionMcpAttachmentSource>,
+
+    // ── Scheduling & Knowledge (optional) ─────────────────────────
+    /// Schedule repository for the scheduler actor.
+    pub schedule_repository: Option<Arc<dyn crate::session::repository::ScheduleRepository>>,
+    /// Knowledge store for the knowledge tools.
+    pub knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
+    /// Per-session todo lists for the `todowrite` / `todoread` tools.
+    pub todo_store: Arc<crate::tools::builtins::todo::TodoStore>,
+    /// Slash command registry for prompt expansion and ACP advertising.
+    pub slash_command_registry: crate::slash_commands::SlashCommandRegistry,
+    /// The slash command discovery configuration, retained so workspace-bound
+    /// sessions can re-resolve prompt sources from their bound checkout.
+    pub slash_commands_config: Option<crate::config::SlashCommandsConfig>,
+    /// Hook command registry for lifecycle policy checks.
+    pub hooks: Hooks,
+    /// Managed Git worktree workspace service for isolated session creation.
+    ///
+    /// `None` keeps every session local (existing behavior). When set, new
+    /// sessions may request isolated worktree execution and existing sessions
+    /// resolve their persisted workspace binding before startup.
+    pub workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    /// Lazy per-checkout repository knowledge. `None` unless the host enabled
+    /// the feature; no root is resolved until a session uses it.
+    pub repository_knowledge:
+        Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
+}
+
+impl AgentConfig {
+    /// Create a copy with `middleware_drivers` replaced.
+    ///
+    /// Used by `AgentBuilder::build()` to swap in the final middleware chain
+    /// without manually cloning every field.
+    #[doc(hidden)]
+    pub fn with_middleware(mut self, drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
+        for driver in &drivers {
+            driver.bind_agent(&self.tool_registry, &self.event_sink);
+        }
+        self.middleware_drivers = drivers;
+        self
+    }
+
+    /// Creates a `CompositeDriver` from the configured middleware drivers.
+    pub fn create_driver(&self) -> CompositeDriver {
+        use crate::middleware::{LimitsConfig, LimitsMiddleware};
+
+        let mut drivers: Vec<Arc<dyn MiddlewareDriver>> = Vec::new();
+
+        // Add LimitsMiddleware if configured
+        if let Some(max_steps) = self.max_steps {
+            drivers.push(Arc::new(LimitsMiddleware::new(
+                LimitsConfig::default().max_steps(max_steps),
+            )));
+        }
+
+        // Add all user-configured middleware drivers
+        for driver in &self.middleware_drivers {
+            drivers.push(driver.clone());
+        }
+
+        CompositeDriver::new(drivers)
+    }
+
+    /// Manual budget pricing configured on the middleware chain, if any.
+    /// Snapshotted onto each paid attempt and valued separately from
+    /// reported API spend.
+    pub fn budget_pricing(&self) -> Option<querymt::providers::ModelPricing> {
+        self.create_driver().budget_pricing()
+    }
+
+    /// Per-cycle price cap (USD) from the configured middleware, if any.
+    /// Enforced before every paid attempt, best effort.
+    pub fn budget_cap_usd(&self) -> Option<f64> {
+        self.create_driver()
+            .get_limits()
+            .and_then(|limits| limits.max_cost_usd)
+    }
+
+    /// Returns the session limits from configured middleware.
+    pub fn get_session_limits(&self) -> Option<querymt_agent_core::events::SessionLimits> {
+        self.create_driver().get_limits()
+    }
+
+    /// Builds delegation metadata for ACP `AgentCapabilities._meta` field.
+    pub fn build_delegation_meta(&self) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let agents = self.agent_registry.list_agents();
+        if agents.is_empty() {
+            return None;
+        }
+
+        let delegation_value = serde_json::json!({
+            "version": "1",
+            "available": true,
+            "agents": agents.iter().map(|agent| {
+                serde_json::json!({
+                    "id": agent.id,
+                    "name": agent.name,
+                    "description": agent.description,
+                    "capabilities": agent.capabilities,
+                })
+            }).collect::<Vec<_>>()
+        });
+
+        let mut meta = serde_json::Map::new();
+        meta.insert("mt.query.agent.delegation".to_string(), delegation_value);
+        Some(meta)
+    }
+
+    /// Emits an event through the session's ordered stream (auto-classifies as
+    /// durable/ephemeral).
+    ///
+    /// The event is numbered (`session_seq`) synchronously, before this call
+    /// returns. Durable events are then persisted in order by the session's
+    /// writer and published after they are persisted; ephemeral events publish
+    /// immediately unless an earlier durable event is still unpublished.
+    pub fn emit_event(&self, session_id: &str, kind: AgentEventKind) {
+        self.event_sink.session_stream(session_id).emit(kind);
+    }
+
+    /// Best-effort removal of a deleted session's run lease file. The file is
+    /// removed only after the lease is acquired, so a live run keeps it.
+    pub fn remove_run_lease_file(&self, session_id: &str) {
+        if let Some(root) = self.storage.run_lease_root() {
+            crate::session::run_lease::RunLeaseRoot::new(root).remove_if_free(session_id);
+        }
+    }
+
+    /// Publishes an ephemeral event and returns its `session_seq`, so a prompt
+    /// response can be held until the event has been delivered.
+    pub async fn emit_ephemeral_event(&self, session_id: &str, kind: AgentEventKind) -> i64 {
+        self.event_sink
+            .session_stream(session_id)
+            .emit_ephemeral_seq(kind)
+            .await
+    }
+
+    /// Persists and publishes a durable event, returning the `DurableEvent`.
+    ///
+    /// Use this path when caller-side ordering matters (awaited). The event is
+    /// ordered with every other event of the session.
+    pub async fn emit_event_persisted(
+        &self,
+        session_id: &str,
+        kind: AgentEventKind,
+    ) -> crate::session::error::SessionResult<DurableEvent> {
+        self.event_sink
+            .session_stream(session_id)
+            .emit_persisted(kind)
+            .await
+    }
+
+    /// Subscribes to agent events via the fanout (live stream).
+    pub fn subscribe_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope> {
+        self.event_sink.fanout().subscribe()
+    }
+
+    /// Access the agent registry.
+    pub fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
+        self.agent_registry.clone()
+    }
+
+    /// Shared handle to the tool registry (cheap `Arc` clone).
+    pub fn tool_registry_arc(&self) -> Arc<ToolRegistry> {
+        self.tool_registry.clone()
+    }
+
+    /// Access the workspace manager actor ref.
+    pub fn workspace_manager_actor(&self) -> ActorRef<WorkspaceIndexManagerActor> {
+        self.workspace_manager_actor.clone()
+    }
+
+    /// Access the pending elicitations map.
+    pub fn pending_elicitations(&self) -> crate::elicitation::PendingElicitationMap {
+        self.pending_elicitations.clone()
+    }
+
+    /// Access the knowledge store, if configured.
+    pub fn knowledge_store(&self) -> Option<Arc<dyn crate::knowledge::KnowledgeStore>> {
+        self.knowledge_store.clone()
+    }
+
+    /// Repository knowledge registry, when the host enabled the feature.
+    pub fn repository_knowledge(
+        &self,
+    ) -> Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>> {
+        self.repository_knowledge.clone()
+    }
+
+    /// Managed worktree workspace service, when configured.
+    ///
+    /// `None` means every session executes locally (existing behavior).
+    pub fn workspace_service(&self) -> Option<Arc<crate::worktree::WorkspaceService>> {
+        self.workspace_service.clone()
+    }
+
+    /// Prepares a snapshot configuration if enabled.
+    pub fn prepare_snapshot(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Option<(std::path::PathBuf, SnapshotPolicy)> {
+        if self.snapshot_policy == SnapshotPolicy::None {
+            return None;
+        }
+        let root = cwd?.to_path_buf();
+        Some((root, self.snapshot_policy))
+    }
+
+    /// Checks if a tool is allowed by current configuration.
+    pub fn is_tool_allowed(&self, tool: crate::config::ToolRef<'_>) -> bool {
+        self.tool_config.allows(tool)
+    }
+
+    /// Gets a snapshot of the current tool configuration.
+    pub fn tool_config_snapshot(&self) -> ToolConfig {
+        self.tool_config.clone()
+    }
+
+    /// Access the session provider.
+    pub fn provider(&self) -> &Arc<SessionProvider> {
+        &self.provider
+    }
+
+    /// Gracefully shutdown.
+    pub async fn shutdown(&self) {
+        // No-op: EventBus observer infrastructure has been removed.
+        // EventFanout broadcast subscribers are dropped automatically.
+    }
+
+    /// Get LLM config by ID.
+    pub async fn get_llm_config(
+        &self,
+        config_id: i64,
+    ) -> Result<Option<crate::session::store::LLMConfig>, agent_client_protocol::Error> {
+        self.provider
+            .history_store()
+            .get_llm_config(config_id)
+            .await
+            .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))
+    }
+
+    /// Get a session by ID from the store.
+    pub async fn get_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<crate::session::store::Session>, agent_client_protocol::Error> {
+        self.provider
+            .history_store()
+            .get_session(session_id)
+            .await
+            .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))
+    }
+
+    /// Collects available tools based on current configuration.
+    ///
+    /// `tool_config_override` is the per-session tool configuration captured at the
+    /// start of a turn (from `SessionActor.tool_config`). When `Some`, it takes
+    /// precedence over the global `AgentConfig.tool_config`, allowing runtime
+    /// mutations via `SetAllowedTools` / `SetDeniedTools` / `SetToolPolicy` to
+    /// take effect. When `None`, falls back to the global config.
+    pub fn collect_tools(
+        &self,
+        provider: Arc<dyn querymt::LLMProvider>,
+        runtime: Option<&crate::agent::core::SessionRuntime>,
+        tool_config_override: Option<&crate::agent::core::ToolConfig>,
+        tool_set: &crate::tools::ToolSet,
+    ) -> Vec<querymt::chat::Tool> {
+        let mut tools = Vec::new();
+        let config = tool_config_override.unwrap_or(&self.tool_config);
+
+        match config.policy {
+            ToolPolicy::BuiltInOnly => {
+                tools.extend(tool_set.definitions());
+            }
+            ToolPolicy::ProviderOnly => {
+                if let Some(provider_tools) = provider.tools() {
+                    tools.extend(provider_tools.iter().cloned::<querymt::chat::Tool>());
+                }
+            }
+            ToolPolicy::BuiltInAndProvider => {
+                tools.extend(tool_set.definitions());
+                if let Some(provider_tools) = provider.tools() {
+                    tools.extend(provider_tools.iter().cloned::<querymt::chat::Tool>());
+                }
+            }
+        }
+
+        // Collect MCP tools (always when a runtime is present, regardless of
+        // policy, because the policy was already chosen with MCP in mind in
+        // builder_from_config).
+        //
+        // Load a single consistent snapshot — tools and defs are guaranteed to
+        // be from the same generation (no multi-lock tearing).
+        let mcp_snapshot =
+            if let (Some(runtime), ToolPolicy::ProviderOnly | ToolPolicy::BuiltInAndProvider) =
+                (runtime, config.policy)
+            {
+                Some(runtime.mcp_tool_state.load())
+            } else {
+                None
+            };
+
+        let mcp_tool_defs: Vec<querymt::chat::Tool> = mcp_snapshot
+            .as_ref()
+            .map(|s| s.tool_defs.clone())
+            .unwrap_or_default();
+
+        // Built-in / provider tools are matched by bare name.
+        let mut filtered: Vec<querymt::chat::Tool> = tools
+            .into_iter()
+            .filter(|tool| config.allows(ToolRef::builtin(&tool.function.name)))
+            .collect();
+
+        // MCP tools are matched with their serving server.
+        if let Some(ref snap) = mcp_snapshot {
+            for tool_def in mcp_tool_defs {
+                let name = &tool_def.function.name;
+                let tool = match snap.tools.get(name) {
+                    Some(adapter) => ToolRef::mcp(adapter.server_name(), name),
+                    None => ToolRef::builtin(name),
+                };
+                if config.allows(tool) {
+                    filtered.push(tool_def);
+                }
+            }
+        }
+
+        filtered
+    }
+
+    pub fn execution_config_snapshot(&self) -> SessionExecutionConfig {
+        SessionExecutionConfig {
+            max_steps: self.max_steps,
+            max_prompt_bytes: self.max_prompt_bytes,
+            execution_timeout_secs: self.execution_timeout_secs,
+            snapshot_policy: self.snapshot_policy.to_string(),
+            tool_output_config: self.execution_policy.tool_output.clone(),
+            pruning_config: self.execution_policy.pruning.clone(),
+            compaction_config: self.execution_policy.compaction.clone(),
+            rate_limit_config: self.execution_policy.rate_limit.clone(),
+        }
+    }
+
+    pub async fn invalidate_provider_cache(&self) {
+        self.provider.clear_provider_cache().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::agent_config_builder::AgentConfigBuilder;
+    use crate::agent::core::ToolPolicy;
+    use crate::session::sqlite_storage::SqliteStorage;
+    use crate::test_utils::helpers::empty_plugin_registry;
+    use querymt::LLMParams;
+    use std::sync::Arc;
+
+    async fn make_config() -> (Arc<AgentConfig>, tempfile::TempDir) {
+        let (registry, temp_dir) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let llm = LLMParams::new().provider("mock").model("mock-model");
+        let config =
+            Arc::new(AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm).build());
+        (config, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn is_tool_allowed_defaults_all_allowed() {
+        let (config, _td) = make_config().await;
+        assert!(config.is_tool_allowed(ToolRef::builtin("shell")));
+        assert!(config.is_tool_allowed(ToolRef::builtin("read_tool")));
+        assert!(config.is_tool_allowed(ToolRef::builtin("unknown_tool")));
+    }
+
+    #[tokio::test]
+    async fn is_tool_allowed_with_denylist() {
+        let (registry, _temp_dir) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let llm = LLMParams::new().provider("mock").model("mock");
+        let config = Arc::new(
+            AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm)
+                .with_denied_tools(["shell".parse().unwrap()])
+                .build(),
+        );
+        assert!(!config.is_tool_allowed(ToolRef::builtin("shell")));
+        assert!(config.is_tool_allowed(ToolRef::builtin("read_tool")));
+    }
+
+    #[tokio::test]
+    async fn is_tool_allowed_with_allowlist() {
+        let (registry, _temp_dir) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let llm = LLMParams::new().provider("mock").model("mock");
+        let config = Arc::new(
+            AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm)
+                .with_allowed_tools(["read_tool".parse().unwrap(), "shell".parse().unwrap()])
+                .build(),
+        );
+        assert!(config.is_tool_allowed(ToolRef::builtin("read_tool")));
+        assert!(config.is_tool_allowed(ToolRef::builtin("shell")));
+        assert!(!config.is_tool_allowed(ToolRef::builtin("delete_file")));
+    }
+
+    #[tokio::test]
+    async fn tool_config_snapshot_returns_current_config() {
+        let (config, _td) = make_config().await;
+        let snapshot = config.tool_config_snapshot();
+        // Default ToolPolicy is BuiltInAndProvider (see #[default] in core.rs)
+        assert_eq!(snapshot.policy, ToolPolicy::BuiltInAndProvider);
+    }
+
+    #[tokio::test]
+    async fn event_sink_returns_shared_instance() {
+        let (config, _td) = make_config().await;
+        // Verify event_sink is accessible and returns consistent fanout
+        let _rx = config.subscribe_events();
+    }
+
+    #[tokio::test]
+    async fn subscribe_events_returns_receiver() {
+        let (config, _td) = make_config().await;
+        let _rx = config.subscribe_events();
+    }
+
+    #[tokio::test]
+    async fn agent_registry_returns_instance() {
+        let (config, _td) = make_config().await;
+        let registry = config.agent_registry();
+        let agents = registry.list_agents();
+        // Default empty registry
+        assert!(agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_delegation_meta_empty_registry_returns_none() {
+        let (config, _td) = make_config().await;
+        let meta = config.build_delegation_meta();
+        assert!(meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn execution_config_snapshot_has_defaults() {
+        let (config, _td) = make_config().await;
+        let snapshot = config.execution_config_snapshot();
+        assert_eq!(snapshot.execution_timeout_secs, 300);
+        assert!(snapshot.max_steps.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_driver_with_no_steps() {
+        let (config, _td) = make_config().await;
+        let _driver = config.create_driver();
+    }
+
+    #[tokio::test]
+    async fn create_driver_with_max_steps() {
+        let (registry, _temp_dir) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let llm = LLMParams::new().provider("mock").model("mock");
+        let config = Arc::new(
+            AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm)
+                .with_max_steps(100)
+                .build(),
+        );
+        let _driver = config.create_driver();
+        let limits = config.get_session_limits();
+        assert!(limits.is_some());
+    }
+
+    #[tokio::test]
+    async fn prepare_snapshot_no_cwd_returns_none() {
+        let (config, _td) = make_config().await;
+        let result = config.prepare_snapshot(None);
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn prepare_snapshot_policy_none_returns_none_even_with_cwd() {
+        let (config, _td) = make_config().await;
+        let result = config.prepare_snapshot(Some(std::path::Path::new("/tmp")));
+        // Default policy is None
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_manager_actor_returns_ref() {
+        let (config, _td) = make_config().await;
+        let _actor = config.workspace_manager_actor();
+    }
+
+    /// Probe for "Replay matches live order": a tool-call start and end
+    /// emitted back to back must be journaled start-before-end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn back_to_back_tool_events_keep_production_order_in_journal() {
+        const PAIRS: usize = 50;
+        let (config, _td) = make_config().await;
+
+        for i in 0..PAIRS {
+            let tool_call_id = format!("tc-{i}");
+            config.emit_event(
+                "s-probe",
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: "shell".into(),
+                    arguments: "{}".into(),
+                },
+            );
+            config.emit_event(
+                "s-probe",
+                AgentEventKind::ToolCallEnd {
+                    tool_call_id,
+                    tool_name: "shell".into(),
+                    is_error: false,
+                    result: "ok".into(),
+                },
+            );
+        }
+
+        let journal = config.event_sink.journal().clone();
+        let events = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let events = journal
+                    .load_session_stream("s-probe", None, None)
+                    .await
+                    .expect("load journal");
+                if events.len() >= PAIRS * 2 {
+                    break events;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("all durable events persisted");
+
+        let ids: Vec<String> = events
+            .iter()
+            .map(|event| match &event.kind {
+                AgentEventKind::ToolCallStart { tool_call_id, .. } => {
+                    format!("start:{tool_call_id}")
+                }
+                AgentEventKind::ToolCallEnd { tool_call_id, .. } => format!("end:{tool_call_id}"),
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        let expected: Vec<String> = (0..PAIRS)
+            .flat_map(|i| [format!("start:tc-{i}"), format!("end:tc-{i}")])
+            .collect();
+        assert_eq!(
+            ids, expected,
+            "journal replay order must equal production order"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_elicitations_returns_map() {
+        let (config, _td) = make_config().await;
+        let map = config.pending_elicitations();
+        let locked = map.try_lock().unwrap();
+        assert!(locked.is_empty());
+    }
+}

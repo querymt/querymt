@@ -1,0 +1,801 @@
+//! Domain model entities for the agent refactor.
+//! These entities represent intent, tasks, decisions, and progress as first-class concepts.
+
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
+use time::OffsetDateTime;
+use typeshare::typeshare;
+
+/// Task kind determines lifecycle and completion semantics
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    /// One-time task with clear completion
+    Finite,
+    /// Repeated or periodic task
+    Recurring,
+    /// Open-ended, continuously evolving task
+    Evolving,
+}
+
+/// Task status tracks current state
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Active,
+    Paused,
+    Done,
+    Cancelled,
+}
+
+/// A unit of work within a session
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Task {
+    #[serde(skip)]
+    pub id: i64,
+    pub public_id: String,
+    #[serde(skip)]
+    pub session_id: i64,
+    pub kind: TaskKind,
+    pub status: TaskStatus,
+    pub expected_deliverable: Option<String>,
+    pub acceptance_criteria: Option<String>,
+    #[typeshare(serialized_as = "number")]
+    pub revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creation_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_evidence: Option<String>,
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[typeshare(serialized_as = "Option<string>")]
+    pub completed_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
+    pub updated_at: OffsetDateTime,
+}
+
+/// Snapshot of current user intent at a point in time (internal only)
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentSnapshot {
+    #[serde(skip)]
+    pub id: i64,
+    #[serde(skip)]
+    pub session_id: i64,
+    #[serde(skip)]
+    pub task_id: Option<i64>,
+    /// Stable descriptive summary used for continuity and search, not execution authority.
+    pub summary: String,
+    /// Durable descriptive constraints known to the session.
+    pub constraints: Option<String>,
+    /// Latest accepted user directive useful for recovery.
+    pub next_step_hint: Option<String>,
+    #[typeshare(serialized_as = "number")]
+    pub revision: u64,
+    pub source: String,
+    pub source_ref: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Decision status
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionStatus {
+    Accepted,
+    Rejected,
+}
+
+/// Records a decision made during task execution (internal only)
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Decision {
+    #[serde(skip)]
+    pub id: i64,
+    #[serde(skip)]
+    pub session_id: i64,
+    #[serde(skip)]
+    pub task_id: Option<i64>,
+    pub description: String,
+    pub rationale: Option<String>,
+    pub status: DecisionStatus,
+    #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Alternative status
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlternativeStatus {
+    Active,
+    Discarded,
+}
+
+/// Alternative approach considered (internal only)
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Alternative {
+    #[serde(skip)]
+    pub id: i64,
+    #[serde(skip)]
+    pub session_id: i64,
+    #[serde(skip)]
+    pub task_id: Option<i64>,
+    pub description: String,
+    pub status: AlternativeStatus,
+    #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Progress entry kind
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressKind {
+    ToolCall,
+    Artifact,
+    Note,
+    Checkpoint,
+}
+
+/// Records a step of progress during task execution (internal only)
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressEntry {
+    #[serde(skip)]
+    pub id: i64,
+    #[serde(skip)]
+    pub session_id: i64,
+    #[serde(skip)]
+    pub task_id: Option<i64>,
+    pub kind: ProgressKind,
+    pub content: String,
+    /// JSON metadata for extensibility
+    pub metadata: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Artifact produced during task execution (internal only)
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Artifact {
+    #[serde(skip)]
+    pub id: i64,
+    #[serde(skip)]
+    pub session_id: i64,
+    #[serde(skip)]
+    pub task_id: Option<i64>,
+    pub kind: String,
+    pub uri: Option<String>,
+    pub path: Option<String>,
+    pub summary: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Delegation status
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationStatus {
+    Requested,
+    Running,
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationClaim {
+    Claimed,
+    AlreadyClaimed,
+    NotFound,
+    InvalidState(DelegationStatus),
+}
+
+/// Agent-to-agent delegation record
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Delegation {
+    #[serde(skip)]
+    pub id: i64,
+    pub public_id: String,
+    #[serde(skip)]
+    pub session_id: i64,
+    #[serde(skip)]
+    pub task_id: Option<i64>,
+    pub target_agent_id: String,
+    pub objective: String,
+    /// Rapidhash of objective for deduplication tracking
+    #[typeshare(serialized_as = "number")]
+    pub objective_hash: crate::hash::RapidHash,
+    pub context: Option<String>,
+    pub constraints: Option<String>,
+    pub expected_output: Option<String>,
+    /// Optional structured verification specification (preferred over parsing expected_output)
+    #[serde(default)]
+    #[typeshare(serialized_as = "any")]
+    pub verification_spec: Option<crate::verification::VerificationSpec>,
+    /// AI-generated summary of parent planning conversation for coder context
+    pub planning_summary: Option<String>,
+    /// Execution isolation for this delegate. Requested policy from the
+    /// delegate tool/request, persisted as the resolved policy (`shared` or
+    /// `isolated`) once the parent's execution mode is known. Legacy rows
+    /// without the column deserialize as `inherit`.
+    #[serde(default)]
+    #[typeshare(serialized_as = "string")]
+    pub isolation: crate::worktree::domain::DelegationIsolation,
+    pub status: DelegationStatus,
+    /// Number of retry attempts for this objective
+    pub retry_count: u32,
+    #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    #[typeshare(serialized_as = "Option<string>")]
+    pub completed_at: Option<OffsetDateTime>,
+}
+
+/// Fork point type
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkPointType {
+    MessageIndex,
+    ProgressEntry,
+}
+
+/// Fork origin (why the fork happened)
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkOrigin {
+    User,
+    Delegation,
+    /// A sibling started from a source session with no history copied
+    /// (`/worktree create` children and handoff successors).
+    Worktree,
+}
+
+impl ForkOrigin {
+    /// Origins listed as visible forks/children (delegates are hidden). The
+    /// SQL twin is `VISIBLE_FORK_ORIGINS` in the view store.
+    pub fn is_visible_fork(origin: &str) -> bool {
+        matches!(origin, "user" | "worktree")
+    }
+}
+
+impl std::fmt::Display for ForkOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ForkOrigin::User => write!(f, "user"),
+            ForkOrigin::Delegation => write!(f, "delegation"),
+            ForkOrigin::Worktree => write!(f, "worktree"),
+        }
+    }
+}
+
+impl std::str::FromStr for ForkOrigin {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "user" => Ok(ForkOrigin::User),
+            "delegation" => Ok(ForkOrigin::Delegation),
+            "worktree" => Ok(ForkOrigin::Worktree),
+            _ => Err(format!("Unknown fork origin: {}", s)),
+        }
+    }
+}
+
+impl std::fmt::Display for ForkPointType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ForkPointType::MessageIndex => write!(f, "message_index"),
+            ForkPointType::ProgressEntry => write!(f, "progress_entry"),
+        }
+    }
+}
+
+impl std::str::FromStr for ForkPointType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "message_index" => Ok(ForkPointType::MessageIndex),
+            "progress_entry" => Ok(ForkPointType::ProgressEntry),
+            _ => Err(format!("Unknown fork point type: {}", s)),
+        }
+    }
+}
+
+/// State saved during an undo operation, enabling redo
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevertState {
+    pub public_id: String,
+    pub session_id: String,
+    /// The message ID we reverted to
+    pub message_id: String,
+    /// Snapshot taken before the undo (for redo)
+    pub snapshot_id: crate::snapshot_id::SnapshotId,
+    /// Backend type used (e.g., "git")
+    pub backend_id: String,
+    /// Workspace provenance: the checkout the snapshot was captured
+    /// against. `None` for frames recorded before provenance existed —
+    /// those keep legacy behavior (treated as same-workspace). Frames
+    /// recorded against a different workspace than the current execution
+    /// cwd are rejected before any restore, so a cross-workspace redo can
+    /// never partially restore files.
+    #[serde(default)]
+    pub workspace_root: Option<std::path::PathBuf>,
+    /// `true` when the undo that produced this frame failed part-way. The
+    /// frame is a recovery point only: redo can restore it, but it is not a
+    /// committed undo, so a new prompt must neither delete history for it nor
+    /// discard it.
+    #[serde(default)]
+    pub restore_failed: bool,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Information about a forked session
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkInfo {
+    #[serde(skip)]
+    pub parent_session_id: Option<i64>,
+    pub fork_origin: Option<ForkOrigin>,
+    pub fork_point_type: Option<ForkPointType>,
+    pub fork_point_ref: Option<String>,
+    pub fork_instructions: Option<String>,
+}
+
+// String conversions used by the SQLite layer and the wire formats.
+impl fmt::Display for DecisionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DecisionStatus::Accepted => write!(f, "accepted"),
+            DecisionStatus::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
+impl FromStr for DecisionStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "accepted" => Ok(DecisionStatus::Accepted),
+            "rejected" => Ok(DecisionStatus::Rejected),
+            _ => Err(format!("Unknown decision status: {}", s)),
+        }
+    }
+}
+
+impl fmt::Display for AlternativeStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AlternativeStatus::Active => write!(f, "active"),
+            AlternativeStatus::Discarded => write!(f, "discarded"),
+        }
+    }
+}
+
+impl FromStr for AlternativeStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(AlternativeStatus::Active),
+            "discarded" => Ok(AlternativeStatus::Discarded),
+            _ => Err(format!("Unknown alternative status: {}", s)),
+        }
+    }
+}
+
+impl fmt::Display for DelegationStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DelegationStatus::Requested => write!(f, "requested"),
+            DelegationStatus::Running => write!(f, "running"),
+            DelegationStatus::Complete => write!(f, "complete"),
+            DelegationStatus::Failed => write!(f, "failed"),
+            DelegationStatus::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
+impl FromStr for DelegationStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "requested" => Ok(DelegationStatus::Requested),
+            "running" => Ok(DelegationStatus::Running),
+            "complete" => Ok(DelegationStatus::Complete),
+            "failed" => Ok(DelegationStatus::Failed),
+            "cancelled" => Ok(DelegationStatus::Cancelled),
+            _ => Err(format!("Unknown delegation status: {}", s)),
+        }
+    }
+}
+
+impl fmt::Display for ProgressKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProgressKind::ToolCall => write!(f, "tool_call"),
+            ProgressKind::Artifact => write!(f, "artifact"),
+            ProgressKind::Note => write!(f, "note"),
+            ProgressKind::Checkpoint => write!(f, "checkpoint"),
+        }
+    }
+}
+
+impl FromStr for ProgressKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "tool_call" => Ok(ProgressKind::ToolCall),
+            "artifact" => Ok(ProgressKind::Artifact),
+            "note" => Ok(ProgressKind::Note),
+            "checkpoint" => Ok(ProgressKind::Checkpoint),
+            _ => Err(format!("Unknown progress kind: {}", s)),
+        }
+    }
+}
+
+impl fmt::Display for TaskKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TaskKind::Finite => write!(f, "finite"),
+            TaskKind::Recurring => write!(f, "recurring"),
+            TaskKind::Evolving => write!(f, "evolving"),
+        }
+    }
+}
+
+impl FromStr for TaskKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "finite" => Ok(TaskKind::Finite),
+            "recurring" => Ok(TaskKind::Recurring),
+            "evolving" => Ok(TaskKind::Evolving),
+            _ => Err(format!("Unknown task kind: {}", s)),
+        }
+    }
+}
+
+impl fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TaskStatus::Active => write!(f, "active"),
+            TaskStatus::Paused => write!(f, "paused"),
+            TaskStatus::Done => write!(f, "done"),
+            TaskStatus::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
+impl FromStr for TaskStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(TaskStatus::Active),
+            "paused" => Ok(TaskStatus::Paused),
+            "done" => Ok(TaskStatus::Done),
+            "cancelled" => Ok(TaskStatus::Cancelled),
+            _ => Err(format!("Unknown task status: {}", s)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::OffsetDateTime;
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::now_utc()
+    }
+
+    // ── TaskKind ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_task_kind_variants() {
+        let kinds = [TaskKind::Finite, TaskKind::Recurring, TaskKind::Evolving];
+        for kind in &kinds {
+            let json = serde_json::to_string(kind).unwrap();
+            let roundtrip: TaskKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, &roundtrip);
+        }
+    }
+
+    #[test]
+    fn test_task_kind_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TaskKind::Finite).unwrap(),
+            r#""finite""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskKind::Recurring).unwrap(),
+            r#""recurring""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskKind::Evolving).unwrap(),
+            r#""evolving""#
+        );
+    }
+
+    // ── TaskStatus ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_task_status_variants_equality() {
+        assert_eq!(TaskStatus::Active, TaskStatus::Active);
+        assert_ne!(TaskStatus::Active, TaskStatus::Done);
+        assert_ne!(TaskStatus::Paused, TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_task_status_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Active).unwrap(),
+            r#""active""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Paused).unwrap(),
+            r#""paused""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Done).unwrap(),
+            r#""done""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Cancelled).unwrap(),
+            r#""cancelled""#
+        );
+    }
+
+    #[test]
+    fn test_task_status_roundtrip() {
+        for status in [
+            TaskStatus::Active,
+            TaskStatus::Paused,
+            TaskStatus::Done,
+            TaskStatus::Cancelled,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let rt: TaskStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(status, rt);
+        }
+    }
+
+    // ── Task ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_task_construction_and_fields() {
+        let t = Task {
+            id: 1,
+            public_id: "task-abc".to_string(),
+            session_id: 2,
+            kind: TaskKind::Finite,
+            status: TaskStatus::Active,
+            expected_deliverable: Some("deliver X".to_string()),
+            acceptance_criteria: Some("X is correct".to_string()),
+            revision: 1,
+            creation_key: None,
+            completion_evidence: None,
+            completed_at: None,
+            created_at: now(),
+            updated_at: now(),
+        };
+        assert_eq!(t.public_id, "task-abc");
+        assert_eq!(t.kind, TaskKind::Finite);
+        assert_eq!(t.status, TaskStatus::Active);
+        assert!(t.expected_deliverable.is_some());
+        assert!(t.acceptance_criteria.is_some());
+    }
+
+    #[test]
+    fn test_task_status_transitions() {
+        let mut t = Task {
+            id: 1,
+            public_id: "x".to_string(),
+            session_id: 1,
+            kind: TaskKind::Evolving,
+            status: TaskStatus::Active,
+            expected_deliverable: None,
+            acceptance_criteria: None,
+            revision: 1,
+            creation_key: None,
+            completion_evidence: None,
+            completed_at: None,
+            created_at: now(),
+            updated_at: now(),
+        };
+        assert_eq!(t.status, TaskStatus::Active);
+        t.status = TaskStatus::Paused;
+        assert_eq!(t.status, TaskStatus::Paused);
+        t.status = TaskStatus::Done;
+        assert_eq!(t.status, TaskStatus::Done);
+    }
+
+    // ── DecisionStatus ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_decision_status_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&DecisionStatus::Accepted).unwrap(),
+            r#""accepted""#
+        );
+        assert_eq!(
+            serde_json::to_string(&DecisionStatus::Rejected).unwrap(),
+            r#""rejected""#
+        );
+    }
+
+    #[test]
+    fn test_decision_status_roundtrip() {
+        for s in [DecisionStatus::Accepted, DecisionStatus::Rejected] {
+            let json = serde_json::to_string(&s).unwrap();
+            let rt: DecisionStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(s, rt);
+        }
+    }
+
+    // ── AlternativeStatus ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_alternative_status_roundtrip() {
+        for s in [AlternativeStatus::Active, AlternativeStatus::Discarded] {
+            let json = serde_json::to_string(&s).unwrap();
+            let rt: AlternativeStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(s, rt);
+        }
+    }
+
+    // ── DelegationStatus ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_delegation_status_all_variants_roundtrip() {
+        let statuses = [
+            DelegationStatus::Requested,
+            DelegationStatus::Running,
+            DelegationStatus::Complete,
+            DelegationStatus::Failed,
+            DelegationStatus::Cancelled,
+        ];
+        for s in &statuses {
+            let json = serde_json::to_string(s).unwrap();
+            let rt: DelegationStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(s, &rt);
+        }
+    }
+
+    // ── ForkOrigin ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fork_origin_display_and_parse() {
+        assert_eq!(ForkOrigin::User.to_string(), "user");
+        assert_eq!(ForkOrigin::Delegation.to_string(), "delegation");
+        assert_eq!(ForkOrigin::Worktree.to_string(), "worktree");
+        assert_eq!(
+            "worktree".parse::<ForkOrigin>().unwrap(),
+            ForkOrigin::Worktree
+        );
+
+        let user: ForkOrigin = "user".parse().unwrap();
+        assert_eq!(user, ForkOrigin::User);
+
+        let delegation: ForkOrigin = "delegation".parse().unwrap();
+        assert_eq!(delegation, ForkOrigin::Delegation);
+    }
+
+    #[test]
+    fn test_fork_origin_parse_unknown_errors() {
+        let result: Result<ForkOrigin, _> = "unknown".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fork_origin_serialization() {
+        assert_eq!(
+            serde_json::to_string(&ForkOrigin::User).unwrap(),
+            r#""user""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ForkOrigin::Delegation).unwrap(),
+            r#""delegation""#
+        );
+    }
+
+    // ── ForkPointType ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fork_point_type_display_and_parse() {
+        assert_eq!(ForkPointType::MessageIndex.to_string(), "message_index");
+        assert_eq!(ForkPointType::ProgressEntry.to_string(), "progress_entry");
+
+        let mi: ForkPointType = "message_index".parse().unwrap();
+        assert_eq!(mi, ForkPointType::MessageIndex);
+
+        let pe: ForkPointType = "progress_entry".parse().unwrap();
+        assert_eq!(pe, ForkPointType::ProgressEntry);
+    }
+
+    #[test]
+    fn test_fork_point_type_parse_unknown_errors() {
+        let result: Result<ForkPointType, _> = "bogus".parse();
+        assert!(result.is_err());
+    }
+
+    // ── ForkInfo construction ───────────────────────────────────────────────
+
+    #[test]
+    fn test_fork_info_construction() {
+        let info = ForkInfo {
+            parent_session_id: Some(42),
+            fork_origin: Some(ForkOrigin::User),
+            fork_point_type: Some(ForkPointType::MessageIndex),
+            fork_point_ref: Some("msg-001".to_string()),
+            fork_instructions: Some("do X differently".to_string()),
+        };
+        assert_eq!(info.parent_session_id, Some(42));
+        assert_eq!(info.fork_origin, Some(ForkOrigin::User));
+        assert_eq!(info.fork_point_type, Some(ForkPointType::MessageIndex));
+        assert_eq!(info.fork_point_ref.as_deref(), Some("msg-001"));
+    }
+
+    #[test]
+    fn test_fork_info_serialization_skips_parent_id() {
+        let info = ForkInfo {
+            parent_session_id: Some(99),
+            fork_origin: Some(ForkOrigin::Delegation),
+            fork_point_type: None,
+            fork_point_ref: None,
+            fork_instructions: None,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        // parent_session_id is #[serde(skip)] so it should NOT appear in JSON
+        assert!(!json.contains("parent_session_id"));
+        assert!(json.contains("delegation"));
+    }
+
+    // ── ProgressKind ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_progress_kind_all_variants_roundtrip() {
+        let kinds = [
+            ProgressKind::ToolCall,
+            ProgressKind::Artifact,
+            ProgressKind::Note,
+            ProgressKind::Checkpoint,
+        ];
+        for k in &kinds {
+            let json = serde_json::to_string(k).unwrap();
+            let rt: ProgressKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(k, &rt);
+        }
+    }
+}

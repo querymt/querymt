@@ -8,12 +8,12 @@ description = "Agent and Session management for querymt"
 [features]
 default = ["plugin-loaders"]
 # Enables the ACP WebSocket and SFT export API server without dashboard assets.
-api = []
+api = ["querymt-agent-runtime/api"]
 # QueryMT core runtime is always enabled; this remains as a compatibility alias
 # for embedders that want the agent without dynamic plugin loading.
 plugin-host-only = ["agent-mcp", "agent-tracing"]
 # Desktop/plugin-loading support. Mobile embedders should use plugin-host-only.
-plugin-loaders = ["plugin-host-only", "querymt/dynamic-plugins"]
+plugin-loaders = ["plugin-host-only", "querymt/dynamic-plugins", "querymt-agent-runtime/plugin-loaders"]
 agent-mcp = ["querymt/mcp"]
 agent-tracing = ["querymt/tracing"]
 # Embeds the pinned querymt-desktop Svelte dashboard served over same-origin ACP.
@@ -21,60 +21,47 @@ agent-tracing = ["querymt/tracing"]
 # QMT_UI_DIST and QMT_UI_REVISION optionally override the default source build.
 dashboard = ["api", "plugin-loaders", "dep:flate2", "dep:tar", "dep:ureq"]
 # Enables OAuth token support for authentication (reads tokens from system keyring)
-oauth = ["querymt-utils/oauth", "rmcp/auth"]
+oauth = ["querymt-utils/oauth", "querymt-agent-runtime/oauth"]
 
 zbus-secret-service = ["querymt-utils/zbus-secret-service"]
 systemd-credentials = ["querymt-utils/systemd-credentials"]
 
 # Enables kameo remote actor support for cross-machine session management.
-# Adds libp2p-based P2P networking, mDNS peer discovery, and Kademlia DHT
-# for distributed actor registry. SessionActorRef gains a Remote variant.
-remote = ["kameo/remote", "dep:libp2p", "querymt-remote/kameo-mesh", "querymt-remote/qr"]
+remote = ["querymt-agent-runtime/remote", "kameo/remote", "dep:libp2p", "querymt-remote/kameo-mesh", "querymt-remote/qr"]
 # Collect relay and address-lookup counters in mesh diagnostics.
 remote-metrics = ["remote", "querymt-remote/iroh-metrics"]
 
 [dependencies]
-typeshare.workspace = true
 querymt = { path = "../querymt", default-features = false, features = ["runtime"] }
 querymt-remote = { path = "../querymt-remote" }
 querymt-provider-common = { path = "../provider-common" }
 querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "secret-store"] }
-agent-client-protocol = { version = "2.0", features = ["unstable"] }
+querymt-agent-core = { path = "../agent-core" }
+querymt-agent-index = { path = "../agent-index" }
+querymt-agent-services = { path = "../agent-services" }
+querymt-agent-sqlite = { path = "../agent-sqlite" }
+querymt-agent-runtime = { path = "../agent-runtime" }
+agent-client-protocol.workspace = true
 kameo = "0.22"
-rmp-serde = "1.3"
-kameo_actors = "0.8.1"
 libp2p = { version = "0.56", optional = true, default-features = false }
 async-trait.workspace = true
-anyhow = "1.0"
-thiserror = "2.0"
+http.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
 log.workspace = true
 tracing = { version = "0.1", features = ["attributes", "release_max_level_debug"] }
 serde.workspace = true
 serde_json.workspace = true
-serde_path_to_error = "0.1"
-schemars.workspace = true
-jsonschema = "0.60"
 tokio = { version = "1.0", features = ["full"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "gzip", "brotli", "deflate"] }
-rusqlite = { version = "0.41", features = ["bundled", "uuid", "time"] }
-time = { version = "0.3", features = ["serde", "formatting", "macros", "local-offset"] }
-uuid = { version = "1.18", features = ["v4", "v5", "v7"] }
+time.workspace = true
+uuid.workspace = true
 url.workspace = true
-rapidhash = "4.2"
-rand = "0.10"
 ignore = "0.4.25"
 notify = "8"
-glob = "0.3"
 arc-swap = "1.7"
-grep-searcher = "0.1"
-grep-regex = "0.1"
-strsim = "0.11"
 once_cell = "1.21"
 parking_lot = "0.13"
-moka = { version = "0.12", features = ["future", "sync"] }
 
-imara-diff = "0.2"
-rmcp = { version = "3.8", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-async-rw", "elicitation", "reqwest"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 # NOTE: Enabled `debug-embed` for testing debug builds on mobile.
 rust-embed = { version = "8.6", features = ["axum", "include-exclude", "debug-embed", "interpolate-folder-path", "deterministic-timestamps"] }
@@ -82,89 +69,28 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 mime_guess = "2.0"
 futures-util = "0.3"
 toml.workspace = true
-minijinja = { version = "3", default-features = false, features = ["serde"] }
-iana-time-zone = "0.1"
-regex.workspace = true
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
 base64.workspace = true
 hex = "0.4"
 sha2 = "0.11"
-infer = "0.22"
-rayon = "1.11"
 
 # Unix process-group cleanup on cancellation (shell tool)
-imagesize = "0.15"
 
 # NLP: multilingual stopwords, stemming, language detection
-stop-words = "0.10"
-rust-stemmers = "1.2"
-whatlang = "0.18"
-indexmap = { version = "2", features = ["serde"] }
-gray_matter = "0.3"
-fast_html2md = { package = "fast_html2md", version = "0.0.63", features = ["scraper"] }
 
 # Markdown Query cli tool for agent `mdq` tool
-mdq = "0.10.0"
 
 # Snapshot backend support
-gix = { version = "0.90", default-features = false, features = ["basic", "worktree-mutation", "attributes", "sha1", "status", "merge"] }
-gix-error = "0.5"
 dirs.workspace = true
 # Windows-safe canonicalize (avoids \\?\ UNC prefixes) for tool path identity
-dunce = "1"
 
 # OAuth support (optional, feature-gated) - now provided by querymt-utils
 
 # OpenTelemetry trace context extraction from ACP _meta
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
-opentelemetry-semantic-conventions = { version = "0.32", features = ["semconv_experimental"] }
-tracing-opentelemetry = "0.33"
-
-# Code similarity detection (local fork with tree-sitter 0.26)
-similarity-core = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
-similarity-rs = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
-similarity-py = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
-
-# Tree-sitter grammars for the `index` tool (outline extraction).
-# These crates are already compiled transitively via similarity-*; listing them
-# here lets outline_index use the raw tree-sitter API directly.
-tree-sitter = "0.26"
-tree-sitter-rust = "0.24"
-tree-sitter-python = "0.25"
-tree-sitter-typescript = "0.23"
-tree-sitter-go = "0.25"
-tree-sitter-java = "0.23"
-tree-sitter-c = "0.24"
-tree-sitter-cpp = "0.23"
-tree-sitter-c-sharp = "0.23"
-tree-sitter-ruby = "0.23"
-tree-sitter-elixir = "0.3"
-tree-sitter-nix = "0.3"
-tree-sitter-lua = "0.5"
-tree-sitter-svelte-ng = "1.0"
-tree-sitter-bash = "0.25"
-tree-sitter-php = "0.25"
-# crates.io tree-sitter-kotlin 0.3.x pins tree-sitter 0.20, whose C runtime
-# (linked globally via build-script flags) breaks the tree-sitter 0.26 runtime
-# already in the graph. Master binds via tree-sitter-language only.
-tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", rev = "d6af96d2e23ef0a8ff5ab512864378cf08fba311" }
-tree-sitter-swift = "0.7"
-tree-sitter-json = "0.24"
-tree-sitter-yaml = "0.7"
-tree-sitter-toml-ng = "0.7"
-tree-sitter-md = "0.5"
-
-# Rust AST parsing for rich structural fingerprinting during function indexing
-syn = { version = "2", features = ["full", "visit"] }
 
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tempfile = "3.0"
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-rustix = { version = "1", features = ["fs"] }
-rmcp = { version = "3.8", features = ["transport-streamable-http-client-unix-socket"] }
+querymt-workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [lib]
 name = "querymt_agent"
@@ -179,19 +105,16 @@ tar = { version = "0.4", optional = true, default-features = false }
 ureq = { version = "3", optional = true, default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
-rmcp = { version = "3.8", features = ["server"] }
-qmt-openai = { path = "../providers/openai", default-features = false, features = ["api"] }
-mockall = "0.15"
+querymt-agent-runtime = { path = "../agent-runtime", features = ["test-support"] }
+rusqlite = { workspace = true, features = ["uuid", "time"] }
+querymt-agent-core = { path = "../agent-core", features = ["test-support"] }
+querymt-agent-sqlite = { path = "../agent-sqlite", features = ["test-support"] }
+querymt-agent-services = { path = "../agent-services", features = ["test-support"] }
 tar = { version = "0.4", default-features = false }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 env_logger = "0.11"
 clap = { version = "4.5", features = ["derive", "env"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-log = "0.2"
-opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "testing"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
-http.workspace = true
-jsonschema = "0.60"
 tower = { version = "0.5", features = ["util"] }
 
 [[test]]

@@ -1,127 +1,340 @@
 name: Test Agent
 
+# The agent stack is split into layered packages (see AGENTS.md). A `detect` job
+# maps the changed paths to the packages they reach, including reverse and
+# dev-dependencies (scripts/ci-agent-affected.sh), and everything downstream runs
+# only for those. querymt-mobile-ffi is deliberately not built here yet (deferred:
+# under heavy development); add a `cargo check -p querymt-mobile-ffi` job when it
+# stabilises. There is no workflow-level `paths:` filter on purpose: a
+# workflow skipped by `paths:` never reports, which blocks required checks.
 on:
   push:
     branches: [main, master]
-    paths:
-      - 'crates/agent/**'
-      - 'crates/querymt-utils/**'
-      - 'crates/cli/**'
-      - 'crates/service-client/**'
-      - 'crates/querymt/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/test-agent.yml'
   pull_request:
-    paths:
-      - 'crates/agent/**'
-      - 'crates/querymt-utils/**'
-      - 'crates/cli/**'
-      - 'crates/service-client/**'
-      - 'crates/querymt/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/test-agent.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
-  features: 'dashboard,oauth,zbus-secret-service,systemd-credentials,remote'
+  # Keep in sync with .cargo/config.toml and scripts/ci-agent-affected.sh.
+  AGENT_FEATURES: 'dashboard,oauth,zbus-secret-service,systemd-credentials,remote'
 
 jobs:
-  # Job 1: Check formatting (fast, fails first)
-  format:
-    name: Check formatting
+  detect:
+    name: Detect affected packages
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # dorny/paths-filter lists the files of a pull request through the API
+      pull-requests: read
+    outputs:
+      any: ${{ steps.affected.outputs.any }}
+      core: ${{ steps.affected.outputs.core }}
+      index: ${{ steps.affected.outputs.index }}
+      knowledge: ${{ steps.affected.outputs.knowledge }}
+      sqlite: ${{ steps.affected.outputs.sqlite }}
+      services: ${{ steps.affected.outputs.services }}
+      runtime: ${{ steps.affected.outputs.runtime }}
+      agent: ${{ steps.affected.outputs.agent }}
+      test_args: ${{ steps.affected.outputs.test_args }}
+      features: ${{ steps.affected.outputs.features }}
+      codecov_specs: ${{ steps.affected.outputs.codecov_specs }}
+      clippy: ${{ steps.affected.outputs.clippy }}
+      standalone: ${{ steps.affected.outputs.standalone }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      
-      - name: Check formatting
-        run: cargo fmt --all -- --check
 
-  # Job 2: Run Clippy (parallel with format)
+      - name: Detect path changes
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            shared:
+              - 'crates/querymt/**'
+              - 'crates/providers/openai/**'
+              - 'crates/workspace-hack/**'
+              - '.config/**'
+              - '.cargo/**'
+              - 'rust-toolchain.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/test-agent.yml'
+              - '.github/actions/rust-setup/**'
+              - 'scripts/ci-agent-affected.sh'
+              - 'scripts/split-codecov.py'
+            core:
+              - 'crates/agent-core/**'
+            index:
+              - 'crates/agent-index/**'
+            knowledge:
+              - 'crates/agent-knowledge/**'
+            sqlite:
+              - 'crates/agent-sqlite/**'
+            services:
+              - 'crates/agent-services/**'
+              - 'crates/querymt-utils/**'
+            runtime:
+              - 'crates/agent-runtime/**'
+              - 'crates/querymt-remote/**'
+              - 'crates/provider-common/**'
+            agent:
+              - 'crates/agent/**'
+            agent_read:
+              # runtime tests read these by relative path
+              - 'crates/agent/src/**'
+              - 'crates/agent/examples/**'
+            corpus:
+              - '.qmt/**'
+              - 'crates/*/knowledge/**'
+              - 'openspec/specs/**'
+            docs:
+              # doc-sync tests in services/runtime read these by relative path
+              - 'docs/docs/agent/**'
+              - 'scripts/testdata/**'
+
+      - name: Select affected packages
+        id: affected
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          F_SHARED: ${{ steps.filter.outputs.shared }}
+          F_CORE: ${{ steps.filter.outputs.core }}
+          F_INDEX: ${{ steps.filter.outputs.index }}
+          F_KNOWLEDGE: ${{ steps.filter.outputs.knowledge }}
+          F_SQLITE: ${{ steps.filter.outputs.sqlite }}
+          F_SERVICES: ${{ steps.filter.outputs.services }}
+          F_RUNTIME: ${{ steps.filter.outputs.runtime }}
+          F_AGENT: ${{ steps.filter.outputs.agent }}
+          F_AGENT_READ: ${{ steps.filter.outputs.agent_read }}
+          F_CORPUS: ${{ steps.filter.outputs.corpus }}
+          F_DOCS: ${{ steps.filter.outputs.docs }}
+        run: bash scripts/ci-agent-affected.sh | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Lints run in parallel, one job per layer group. The lower layers are shared
+  # compile output through sccache, so each job only pays for its own crates.
   clippy:
-    name: Clippy lints
+    name: Clippy (${{ matrix.name }})
     runs-on: ubuntu-latest
+    needs: detect
+    if: ${{ needs.detect.outputs.clippy != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.clippy) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
         with:
           components: clippy
+          cache-key: agent-clippy
+          dashboard-fixture: 'true'
 
-      - name: Cache Cargo dependencies
-        uses: swatinem/rust-cache@v2
-        with:
-          key: agent-clippy
-
-      - name: Prepare embedded dashboard fixture
-        run: |
-          mkdir -p "$RUNNER_TEMP/dashboard-ui"
-          printf '<!doctype html><title>QueryMT</title>\n' > "$RUNNER_TEMP/dashboard-ui/index.html"
-          printf '{"revision":"ci","target":"embedded","acpWebSocketPath":"/acp/ws"}\n' > "$RUNNER_TEMP/dashboard-ui/querymt-ui.json"
-          echo "QMT_UI_DIST=$RUNNER_TEMP/dashboard-ui" >> "$GITHUB_ENV"
-      
       - name: Run Clippy
-        run: cargo clippy --package querymt-agent --all-targets --features "${features}" -- -D warnings
+        run: cargo clippy ${{ matrix.flags }} --all-targets -- -D warnings
 
-  # Job 3: Run tests with coverage
+  # Each package must build on its own with only the features it declares. The
+  # workspace-hack crate unifies third-party features across the stack and would
+  # hide a missing feature, so it is disabled here (only in this job's checkout).
+  standalone:
+    name: Standalone (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    needs: detect
+    if: ${{ needs.detect.outputs.standalone != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.standalone) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          cache-key: agent-standalone
+          dashboard-fixture: 'true'
+
+      - name: Install cargo-hakari
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hakari
+
+      - name: Disable workspace-hack
+        run: cargo hakari disable
+
+      # Core must not depend on rmcp, querymt-utils or rusqlite (design D7 of
+      # split-agent-crate). The workspace-hack lists them, so it is pruned.
+      - name: Check querymt-agent-core dependency exclusions
+        if: ${{ matrix.name == 'core' }}
+        run: |
+          tree="$(cargo tree --package querymt-agent-core --edges normal --prune querymt-workspace-hack)"
+          for forbidden in rmcp querymt-utils rusqlite; do
+            if [[ "$tree" == *"── ${forbidden} v"* ]]; then
+              echo "querymt-agent-core must not depend on ${forbidden}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Check standalone builds
+        env:
+          CHECKS: ${{ matrix.checks }}
+        run: |
+          IFS='|' read -ra checks <<<"$CHECKS"
+          for args in "${checks[@]}"; do
+            echo "::group::cargo check $args"
+            # shellcheck disable=SC2086
+            cargo check $args
+            echo "::endgroup::"
+          done
+
+  # One instrumented build serves every step of this job (tests, examples,
+  # doctests, corpus check): `show-env` points them all at the same target
+  # directory, so nothing is compiled twice.
   test:
     name: Tests
     runs-on: ubuntu-latest
-    needs: [format, clippy]
-    
+    needs: detect
+    if: ${{ needs.detect.outputs.any == 'true' }}
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo dependencies
-        uses: swatinem/rust-cache@v2
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
         with:
-          key: agent-test
+          components: llvm-tools-preview
+          cache-key: agent-test
+          dashboard-fixture: 'true'
 
-      - name: Prepare embedded dashboard fixture
-        run: |
-          mkdir -p "$RUNNER_TEMP/dashboard-ui"
-          printf '<!doctype html><title>QueryMT</title>\n' > "$RUNNER_TEMP/dashboard-ui/index.html"
-          printf '{"revision":"ci","target":"embedded","acpWebSocketPath":"/acp/ws"}\n' > "$RUNNER_TEMP/dashboard-ui/querymt-ui.json"
-          echo "QMT_UI_DIST=$RUNNER_TEMP/dashboard-ui" >> "$GITHUB_ENV"
-      
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
-      
-      - name: Create coverage directory
-        run: mkdir -p ./coverage
 
-      - name: Run tests with coverage
+      - name: Instrument the build
         run: |
-          cargo llvm-cov nextest \
-            --package querymt-agent \
+          cargo llvm-cov show-env --export-prefix > "$RUNNER_TEMP/llvm-cov-env.sh"
+          source "$RUNNER_TEMP/llvm-cov-env.sh"
+          cargo llvm-cov clean --workspace
+          mkdir -p ./coverage
+
+      - name: Run tests
+        run: |
+          source "$RUNNER_TEMP/llvm-cov-env.sh"
+          cargo nextest run --profile ci \
+            ${{ needs.detect.outputs.test_args }} \
             --lib --tests \
-            --features "${features}" \
-            --codecov --output-path ./coverage/codecov.json
-      
-      - name: Upload coverage to Codecov
+            ${{ needs.detect.outputs.features }}
+
+      # nextest does not run doctests.
+      - name: Run doctests
+        run: |
+          source "$RUNNER_TEMP/llvm-cov-env.sh"
+          cargo test --doc \
+            ${{ needs.detect.outputs.test_args }} \
+            ${{ needs.detect.outputs.features }}
+
+      # `--lib --tests` skips tests compiled into examples. The repository
+      # knowledge maintenance CLI's exit-code and headless contracts live there.
+      - name: Run example tests
+        if: ${{ needs.detect.outputs.agent == 'true' }}
+        run: |
+          source "$RUNNER_TEMP/llvm-cov-env.sh"
+          cargo nextest run --profile ci \
+            --package querymt-agent \
+            --example repository_knowledge \
+            --features "${AGENT_FEATURES}"
+
+      # This repository's own knowledge corpus must stay consistent: a moved
+      # note or an include pattern that matches nothing fails here.
+      - name: Check repository knowledge corpus
+        if: ${{ needs.detect.outputs.agent == 'true' }}
+        run: |
+          source "$RUNNER_TEMP/llvm-cov-env.sh"
+          cargo run --package querymt-agent \
+            --example repository_knowledge \
+            --features "${AGENT_FEATURES}" \
+            -- --root . check
+
+      - name: Create coverage reports
+        run: |
+          source "$RUNNER_TEMP/llvm-cov-env.sh"
+          cargo llvm-cov report --codecov --output-path ./coverage/codecov.json
+          # shellcheck disable=SC2086
+          python3 scripts/split-codecov.py ./coverage/codecov.json ./coverage \
+            ${{ needs.detect.outputs.codecov_specs }}
+
+      # One upload per package, each with its own flag (see codecov.yml). Flags
+      # of packages that were not tested carry forward from the last upload.
+      - name: Upload coverage (core)
+        if: ${{ needs.detect.outputs.core == 'true' }}
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/codecov.json
-          flags: agent
-          verbose: true
+          files: ./coverage/codecov-querymt-agent-core.json
+          flags: agent-core
           fail_ci_if_error: false
 
+      - name: Upload coverage (index)
+        if: ${{ needs.detect.outputs.index == 'true' }}
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/codecov-querymt-agent-index.json
+          flags: agent-index
+          fail_ci_if_error: false
+
+      - name: Upload coverage (knowledge)
+        if: ${{ needs.detect.outputs.knowledge == 'true' }}
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/codecov-querymt-agent-knowledge.json
+          flags: agent-knowledge
+          fail_ci_if_error: false
+
+      - name: Upload coverage (sqlite)
+        if: ${{ needs.detect.outputs.sqlite == 'true' }}
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/codecov-querymt-agent-sqlite.json
+          flags: agent-sqlite
+          fail_ci_if_error: false
+
+      - name: Upload coverage (services)
+        if: ${{ needs.detect.outputs.services == 'true' }}
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/codecov-querymt-agent-services.json
+          flags: agent-services
+          fail_ci_if_error: false
+
+      - name: Upload coverage (runtime)
+        if: ${{ needs.detect.outputs.runtime == 'true' }}
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/codecov-querymt-agent-runtime.json
+          flags: agent-runtime
+          fail_ci_if_error: false
+
+      - name: Upload coverage (agent)
+        if: ${{ needs.detect.outputs.agent == 'true' }}
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/codecov-querymt-agent.json
+          flags: agent
+          fail_ci_if_error: false

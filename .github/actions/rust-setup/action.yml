@@ -1,0 +1,73 @@
+name: Rust CI Setup
+description: >
+  Shared setup for the agent test workflows: Rust toolchain, sccache (compiled
+  crates, workspace crates included) and rust-cache (third-party dependencies),
+  plus the optional minimal embedded-dashboard fixture.
+  NOTE: The caller must checkout the repo before invoking this action.
+
+inputs:
+  components:
+    description: Extra rustup components (comma-separated), e.g. clippy or rustfmt
+    required: false
+    default: ""
+  cache-key:
+    description: >
+      rust-cache shared key. Jobs that build the same artifacts (same command
+      family, same RUSTFLAGS) should share one key.
+    required: true
+  sccache:
+    description: Cache compiler output with sccache ("true" or "false")
+    required: false
+    default: "true"
+  dashboard-fixture:
+    description: Export QMT_UI_DIST with a minimal embedded dashboard ("true" or "false")
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+
+    # sccache keys every rustc invocation by content, so unchanged workspace
+    # crates (core, index, ...) are cache hits even though rust-cache drops them.
+    # Failure to set it up must not fail the job: the build just runs uncached.
+    - name: Install sccache
+      id: sccache
+      if: ${{ inputs.sccache == 'true' }}
+      continue-on-error: true
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Enable sccache
+      if: ${{ steps.sccache.outcome == 'success' }}
+      shell: bash
+      run: |
+        {
+          echo "SCCACHE_GHA_ENABLED=true"
+          echo "RUSTC_WRAPPER=sccache"
+        } >> "$GITHUB_ENV"
+
+    # sccache refuses incremental builds, and CI never benefits from them.
+    - name: Disable incremental compilation
+      shell: bash
+      run: echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+
+    # Only the default branch writes the cache: PR caches are branch-scoped and
+    # would just crowd out the shared one in the repository's cache quota.
+    - name: Cache Cargo dependencies
+      uses: swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.cache-key }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - name: Prepare embedded dashboard fixture
+      if: ${{ inputs.dashboard-fixture == 'true' }}
+      shell: bash
+      run: |
+        mkdir -p "$RUNNER_TEMP/dashboard-ui"
+        printf '<!doctype html><title>QueryMT</title>\n' > "$RUNNER_TEMP/dashboard-ui/index.html"
+        printf '{"revision":"ci","target":"embedded","acpWebSocketPath":"/acp/ws"}\n' > "$RUNNER_TEMP/dashboard-ui/querymt-ui.json"
+        echo "QMT_UI_DIST=$RUNNER_TEMP/dashboard-ui" >> "$GITHUB_ENV"

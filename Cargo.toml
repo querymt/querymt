@@ -2,6 +2,12 @@
 resolver = "2"
 members = [
     "crates/agent",
+    "crates/agent-core",
+    "crates/agent-index",
+    "crates/agent-knowledge",
+    "crates/agent-runtime",
+    "crates/agent-services",
+    "crates/agent-sqlite",
     "crates/querymt",
     "crates/querymt-remote",
     "crates/cli",
@@ -13,6 +19,30 @@ members = [
     "crates/querymt-mobile-ffi",
     "crates/py/querymt-py",
     "crates/py/querymt-agent-py",
+    "crates/workspace-hack",
+]
+# What plain `cargo build/run/test/check` selects from the repository root.
+# Deliberately excludes the WASM provider plugins (`crates/providers/*`, built
+# for wasm32 by their own workflows): they default to the `extism` feature and
+# are cdylibs, so compiling them for the host fails at link time with undefined
+# `extism` host symbols (`alloc`, `error_set`, `qmt_http_request`, ...). Also
+# excluded are the packages that need external tooling (Python extension
+# modules, the mobile FFI) and the heavy native providers (llama-cpp, izwi,
+# mrs). Use `--workspace` or `-p <package>` to select those explicitly.
+default-members = [
+    "crates/agent",
+    "crates/agent-core",
+    "crates/agent-index",
+    "crates/agent-knowledge",
+    "crates/agent-runtime",
+    "crates/agent-services",
+    "crates/agent-sqlite",
+    "crates/querymt",
+    "crates/querymt-remote",
+    "crates/cli",
+    "crates/provider-common",
+    "crates/querymt-utils",
+    "crates/service-client",
 ]
 
 [workspace.package]
@@ -41,6 +71,15 @@ typeshare = "1.0"
 dirs = "7"
 hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"] }
 toml = "1"
+thiserror = "2.0"
+anyhow = "1.0"
+time = { version = "0.3", features = ["serde", "formatting", "macros", "local-offset"] }
+uuid = { version = "1.18", features = ["v4", "v5", "v7"] }
+agent-client-protocol = { version = "2.0", features = ["unstable"] }
+rust-stemmers = "1.2"
+mockall = "0.15"
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 [profile.dev]
 debug = "line-tables-only"
+split-debuginfo = "unpacked"

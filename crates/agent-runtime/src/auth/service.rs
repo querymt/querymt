@@ -1,0 +1,1722 @@
+//! Shared OAuth / auth service layer.
+//!
+//! This module contains transport-agnostic business logic for OAuth flows,
+//! provider status queries, and credential management used by ACP extension
+//! handlers.
+
+use crate::agent::agent_config::AgentConfig;
+use crate::model_inventory::ModelInventory;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use typeshare::typeshare;
+
+// ── Shared types ──────────────────────────────────────────────────────────────
+
+/// A pending OAuth flow awaiting completion.
+#[derive(Debug, Clone)]
+pub struct PendingOAuthFlow {
+    /// Identifies the connection that started this flow.
+    pub owner: String,
+    pub provider: String,
+    pub state: String,
+    pub verifier: String,
+    pub created_at: Instant,
+}
+
+/// An active local HTTP callback listener for redirect-based OAuth flows.
+pub struct ActiveOAuthCallbackListener {
+    pub flow_id: String,
+    pub owner: String,
+    pub provider: String,
+    pub stop_tx: tokio::sync::oneshot::Sender<()>,
+    pub task: JoinHandle<()>,
+}
+
+/// Thread-safe map of flow_id -> PendingOAuthFlow.
+pub type OAuthFlowMap = Arc<Mutex<HashMap<String, PendingOAuthFlow>>>;
+
+/// Thread-safe slot for the single active callback listener.
+pub type CallbackListenerSlot = Arc<Mutex<Option<ActiveOAuthCallbackListener>>>;
+
+/// A valid loopback redirect: authorization code, the checked `state`, and the
+/// RFC 9207 `iss` parameter when the authorization server sent one.
+#[cfg(feature = "oauth")]
+struct LoopbackCallback {
+    code: String,
+    state: String,
+    issuer: Option<String>,
+}
+
+/// Result sent from the HTTP callback handler back to the listener task.
+#[cfg(feature = "oauth")]
+type CallbackResult = Result<LoopbackCallback, String>;
+#[cfg(feature = "oauth")]
+type CallbackResultSender = Arc<Mutex<Option<tokio::sync::oneshot::Sender<CallbackResult>>>>;
+
+/// Identifies a specific OAuth flow (used internally by listener lifecycle).
+#[cfg(feature = "oauth")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FlowIdentity {
+    flow_id: String,
+    owner: String,
+    provider: String,
+}
+
+/// Shared auth service dependencies. Cheaply cloneable (all fields are `Arc`-backed).
+///
+/// Groups the shared dependencies (`AgentConfig`, `ModelInventory`,
+/// `OAuthFlowMap`, `CallbackListenerSlot`) that every auth operation needs,
+/// providing a single entry point for OAuth flows and API-token mutations.
+#[derive(Clone)]
+pub struct OAuthService {
+    config: Arc<AgentConfig>,
+    model_inventory: ModelInventory,
+    flows: OAuthFlowMap,
+    listener_slot: CallbackListenerSlot,
+    /// Pending `mcp:<server>` logins, keyed like provider flows.
+    #[cfg(feature = "oauth")]
+    mcp_flows: mcp::McpFlowMap,
+    /// Where MCP OAuth credentials are stored (the system keyring).
+    #[cfg(feature = "oauth")]
+    mcp_backend: Arc<dyn crate::mcp_auth::SecretBackend>,
+    /// Profiles whose MCP servers can be logged into besides `config`'s.
+    #[cfg(feature = "oauth")]
+    profiles: crate::agent::handle::ProfileRuntimeSlot,
+}
+
+#[cfg(feature = "oauth")]
+#[doc(hidden)]
+pub mod mcp;
+
+impl OAuthService {
+    /// Construct a new `OAuthService` from the shared dependencies.
+    pub fn new(
+        config: Arc<AgentConfig>,
+        model_inventory: ModelInventory,
+        flows: OAuthFlowMap,
+        listener_slot: CallbackListenerSlot,
+    ) -> Self {
+        Self {
+            config,
+            model_inventory,
+            flows,
+            listener_slot,
+            #[cfg(feature = "oauth")]
+            mcp_flows: Default::default(),
+            #[cfg(feature = "oauth")]
+            mcp_backend: Arc::new(crate::mcp_auth::KeyringBackend),
+            #[cfg(feature = "oauth")]
+            profiles: Default::default(),
+        }
+    }
+
+    /// Also offer `mcp:<server>` logins for the MCP servers of the profiles
+    /// in `profiles` (read whenever a login or status is requested, so a
+    /// slot filled later is picked up).
+    #[cfg(feature = "oauth")]
+    #[must_use]
+    #[doc(hidden)]
+    pub fn with_profile_slot(mut self, profiles: crate::agent::handle::ProfileRuntimeSlot) -> Self {
+        self.profiles = profiles;
+        self
+    }
+
+    /// Use a different credential backend for MCP logins (tests).
+    #[cfg(all(any(test, feature = "test-support"), feature = "oauth"))]
+    #[doc(hidden)]
+    pub fn with_mcp_secret_backend(
+        mut self,
+        backend: Arc<dyn crate::mcp_auth::SecretBackend>,
+    ) -> Self {
+        self.mcp_backend = backend;
+        self
+    }
+}
+
+/// OAuth authentication status for a provider.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthStatus {
+    NotAuthenticated,
+    Expired,
+    Connected,
+}
+
+/// Auth status entry for a single provider.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthProviderStatus {
+    pub provider: String,
+    pub display_name: String,
+    /// `None` if the provider has no OAuth support.
+    pub oauth_status: Option<OAuthStatus>,
+    pub has_stored_api_key: bool,
+    pub has_env_api_key: bool,
+    pub env_var_name: Option<String>,
+    pub supports_oauth: bool,
+    pub preferred_method: Option<String>,
+}
+
+/// Result of `start_flow`.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartFlowResult {
+    pub flow_id: String,
+    pub provider: String,
+    pub authorization_url: String,
+    pub flow_kind: String,
+}
+
+/// Result of `complete_flow`.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteFlowResult {
+    pub provider: String,
+    pub success: bool,
+    pub message: String,
+}
+
+/// Result of `logout`.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogoutResult {
+    pub provider: String,
+    pub success: bool,
+    pub message: String,
+}
+
+/// Result of API-token / auth-method mutations (`set_api_token`, `clear_api_token`,
+/// `set_auth_method`).
+///
+/// Same wire shape as [`LogoutResult`] / [`CompleteFlowResult`] so ACP clients and
+/// the dashboard can treat auth mutations uniformly.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthMutationResult {
+    pub provider: String,
+    pub success: bool,
+    pub message: String,
+}
+
+/// Why an auth operation could not be carried out.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AuthFlowError {
+    #[error("provider name is required")]
+    EmptyProvider,
+    #[error("unknown OAuth MCP server: {0}")]
+    UnknownMcpServer(String),
+    /// The same server name is declared with different OAuth settings by
+    /// several sources (agent config, profiles, `.agents/`). Its credentials
+    /// are stored per name, so it cannot be logged into until they agree.
+    #[error("MCP server {server} is defined differently in {}", .sources.join(", "))]
+    ConflictingMcpServer {
+        server: String,
+        sources: Vec<String>,
+    },
+    #[cfg(feature = "oauth")]
+    #[error("failed to start OAuth flow for MCP server {server} ({step})")]
+    McpAuthorization {
+        server: String,
+        /// What was being done: `http client`, `metadata discovery` or
+        /// `client registration`.
+        step: &'static str,
+        #[source]
+        // Boxed: `AuthError` is large and would bloat every `Result<_, AuthFlowError>`.
+        source: Box<rmcp::transport::AuthError>,
+    },
+    /// A provider (non-MCP) login failure.
+    #[error("{0}")]
+    Provider(String),
+}
+
+impl AuthFlowError {
+    /// Low-cardinality failure class for the `error.type` span attribute and
+    /// metric label.
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            Self::EmptyProvider => "empty_provider",
+            Self::UnknownMcpServer(_) => "unknown_server",
+            Self::ConflictingMcpServer { .. } => "conflicting_server",
+            #[cfg(feature = "oauth")]
+            Self::McpAuthorization { source, .. } => crate::mcp_auth::auth_error_type(source),
+            Self::Provider(_) => "provider",
+        }
+    }
+
+    /// A mistake in the request or configuration rather than a failure of the
+    /// agent or the authorization server.
+    pub fn is_user_error(&self) -> bool {
+        matches!(
+            self,
+            Self::EmptyProvider | Self::UnknownMcpServer(_) | Self::ConflictingMcpServer { .. }
+        )
+    }
+
+    /// Log the failure of `operation` once, with its whole cause chain:
+    /// `warn` for user mistakes, `error` otherwise (so it shows on the default
+    /// console and in exported logs). Never logs tokens or codes.
+    pub fn log(&self, operation: &'static str, provider: &str) {
+        let error = self.message_chain();
+        let error_type = self.error_type();
+        if self.is_user_error() {
+            tracing::warn!(operation, provider, error_type, %error, "auth request refused");
+        } else {
+            tracing::error!(operation, provider, error_type, %error, "auth request failed");
+        }
+    }
+
+    /// The message with its whole source chain.
+    pub fn message_chain(&self) -> String {
+        let mut message = self.to_string();
+        let mut source = std::error::Error::source(self);
+        while let Some(error) = source {
+            message.push_str(": ");
+            message.push_str(&error.to_string());
+            source = error.source();
+        }
+        message
+    }
+}
+
+impl From<AuthFlowError> for agent_client_protocol::Error {
+    fn from(error: AuthFlowError) -> Self {
+        // The message itself carries the reason: clients show `message`, and
+        // `Error::internal_error()` alone would read just "Internal error".
+        let message = error.message_chain();
+        let code = match error {
+            AuthFlowError::EmptyProvider
+            | AuthFlowError::UnknownMcpServer(_)
+            | AuthFlowError::ConflictingMcpServer { .. } => {
+                agent_client_protocol::ErrorCode::InvalidParams
+            }
+            _ => agent_client_protocol::ErrorCode::InternalError,
+        };
+        // `error` is kept for clients that read the previous shape.
+        Self::new(i32::from(code), message.clone())
+            .data(serde_json::json!({ "message": message, "error": message }))
+    }
+}
+
+/// A parsed `provider` argument of the auth methods.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AuthTarget<'a> {
+    /// `mcp:<server>`; server names are case-sensitive.
+    Mcp(&'a str),
+    /// A model provider, trimmed and lowercased.
+    Provider(String),
+}
+
+impl<'a> AuthTarget<'a> {
+    pub(crate) fn parse(raw: &'a str) -> Result<Self, AuthFlowError> {
+        let raw = raw.trim();
+        if let Some(server) = crate::mcp_auth::server_of_provider(raw) {
+            return Ok(Self::Mcp(server));
+        }
+        if raw.is_empty() {
+            return Err(AuthFlowError::EmptyProvider);
+        }
+        Ok(Self::Provider(raw.to_lowercase()))
+    }
+}
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "oauth")]
+const OAUTH_FLOW_TTL_SECS: u64 = 15 * 60;
+
+#[cfg(feature = "oauth")]
+const OAUTH_CALLBACK_TIMEOUT_SECS: u64 = 5 * 60;
+
+#[cfg(feature = "oauth")]
+const OAUTH_CALLBACK_HOST: &str = "127.0.0.1";
+
+// ── OAuthService methods ──────────────────────────────────────────────────────
+
+impl OAuthService {
+    // ── auth_status ───────────────────────────────────────────────────────
+
+    /// Query authentication status for all configured providers (or a single one).
+    ///
+    /// This is the shared implementation for the ACP `_querymt/auth/status`
+    /// extension method.
+    pub async fn auth_status(
+        &self,
+        provider_filter: Option<&str>,
+    ) -> Result<Vec<AuthProviderStatus>, String> {
+        // `mcp:<server>` entries come from the agent's MCP configuration and
+        // the MCP credential store, never from the provider registry.
+        #[cfg(feature = "oauth")]
+        if matches!(
+            provider_filter.map(AuthTarget::parse),
+            Some(Ok(AuthTarget::Mcp(_)))
+        ) {
+            return Ok(self.mcp_auth_status(provider_filter).await);
+        }
+        let registry = self.config.provider.plugin_registry();
+        let provider_names = auth_provider_names(&registry);
+        let mut provider_configs = Vec::new();
+        for provider_name in provider_names {
+            if provider_filter.is_some_and(|filter| provider_name != filter) {
+                continue;
+            }
+
+            let factory = registry.get(&provider_name).await;
+            let env_var_name = factory
+                .as_ref()
+                .and_then(|factory| factory.as_http())
+                .and_then(|factory| factory.api_key_name());
+            provider_configs.push((provider_name, env_var_name));
+        }
+
+        let providers = tokio::task::spawn_blocking(move || {
+            let store = crate::auth::SecretStore::new()
+                .map_err(|error| format!("Failed to open secret store: {error}"))?;
+            let mut providers = Vec::new();
+            for (provider_name, env_var_name) in provider_configs {
+                #[cfg(feature = "oauth")]
+                let (supports_oauth, oauth_status, display_name_from_oauth) = {
+                    match crate::auth::get_oauth_provider(&provider_name, None) {
+                        Ok(oauth_provider) => {
+                            let status = match store.get_oauth_tokens(&provider_name) {
+                                Some(tokens) if tokens.is_expired() => Some(OAuthStatus::Expired),
+                                Some(_) => Some(OAuthStatus::Connected),
+                                None => Some(OAuthStatus::NotAuthenticated),
+                            };
+                            (
+                                true,
+                                status,
+                                Some(oauth_provider.display_name().to_string()),
+                            )
+                        }
+                        Err(_) => (false, None, None),
+                    }
+                };
+                #[cfg(not(feature = "oauth"))]
+                let (supports_oauth, oauth_status, display_name_from_oauth): (
+                    bool,
+                    Option<OAuthStatus>,
+                    Option<String>,
+                ) = (false, None, None);
+
+                let has_stored_api_key = match env_var_name.as_deref() {
+                Some(name) => store
+                    .try_get(name)
+                    .map_err(|error| {
+                        format!(
+                            "Failed to read stored API key for provider '{provider_name}': {error}"
+                        )
+                    })?
+                    .is_some(),
+                None => false,
+            };
+                let has_env_api_key = env_var_name
+                    .as_ref()
+                    .is_some_and(|name| std::env::var(name).is_ok());
+                let preferred_method = store
+                    .try_get(&format!("auth_method_{provider_name}"))
+                    .map_err(|error| {
+                        format!(
+                            "Failed to read auth preference for provider '{provider_name}': {error}"
+                        )
+                    })?;
+
+                let display_name = display_name_from_oauth.unwrap_or_else(|| {
+                    let mut chars = provider_name.chars();
+                    match chars.next() {
+                        None => provider_name.clone(),
+                        Some(character) => character.to_uppercase().to_string() + chars.as_str(),
+                    }
+                });
+                providers.push(AuthProviderStatus {
+                    provider: provider_name,
+                    display_name,
+                    oauth_status,
+                    has_stored_api_key,
+                    has_env_api_key,
+                    env_var_name,
+                    supports_oauth,
+                    preferred_method,
+                });
+            }
+            Ok::<_, String>(providers)
+        })
+        .await
+        .map_err(|error| format!("Secret store task failed: {error}"))??;
+        #[cfg(feature = "oauth")]
+        let providers = {
+            let mut providers = providers;
+            if provider_filter.is_none() {
+                providers.extend(self.mcp_auth_status(None).await);
+            }
+            providers
+        };
+        Ok(providers)
+    }
+
+    // ── start_flow ────────────────────────────────────────────────────────
+
+    /// Start an OAuth login flow for a provider.
+    ///
+    /// On success the flow is stored in `flows` and a [`StartFlowResult`] is
+    /// returned containing the authorization URL the user must visit.
+    ///
+    /// If the provider uses the redirect-code flow, a local HTTP callback
+    /// listener is automatically spawned (via [`Self::spawn_callback_listener`]).
+    /// On receiving the callback it will call [`Self::complete_flow`] server-side,
+    /// persist credentials, and invalidate caches so ACP clients can discover
+    /// completion via [`Self::auth_status`].
+    ///
+    /// # Errors
+    /// An empty or unknown provider, an MCP server that is not an OAuth server
+    /// or is declared inconsistently, or a failure to begin authorization.
+    pub async fn start_flow(
+        &self,
+        owner: &str,
+        provider: &str,
+    ) -> Result<StartFlowResult, AuthFlowError> {
+        #[cfg(feature = "oauth")]
+        {
+            let provider_name = match AuthTarget::parse(provider)? {
+                AuthTarget::Mcp(server) => return self.start_mcp_flow(owner, server).await,
+                AuthTarget::Provider(name) => name,
+            };
+
+            validate_provider_configured(&self.config, &provider_name)
+                .map_err(AuthFlowError::Provider)?;
+
+            let mode = oauth_mode_for_provider(&provider_name);
+            let oauth_provider = crate::auth::get_oauth_provider(&provider_name, mode)
+                .map_err(|e| AuthFlowError::Provider(e.to_string()))?;
+
+            let flow = oauth_provider.start_flow().await.map_err(|e| {
+                AuthFlowError::Provider(format!(
+                    "Failed to start OAuth flow for {}: {}",
+                    provider_name, e
+                ))
+            })?;
+
+            let flow_id = uuid::Uuid::now_v7().to_string();
+            {
+                let mut map = self.flows.lock().await;
+                map.insert(
+                    flow_id.clone(),
+                    PendingOAuthFlow {
+                        owner: owner.to_string(),
+                        provider: provider_name.clone(),
+                        state: flow.state.clone(),
+                        verifier: flow.verifier.clone(),
+                        created_at: Instant::now(),
+                    },
+                );
+            }
+
+            let flow_kind = oauth_provider.flow_kind();
+            let flow_kind_str = match flow_kind {
+                crate::auth::OAuthFlowKind::RedirectCode => "redirect_code",
+                crate::auth::OAuthFlowKind::DevicePoll => "device_poll",
+            };
+
+            // Auto-spawn a loopback callback listener for redirect flows that
+            // declare one. Providers with a hosted callback (e.g. Anthropic)
+            // report no callback port and complete via `complete_flow` instead;
+            // spawning a listener for them would needlessly replace any pending
+            // loopback flow (e.g. a Codex login waiting on the same port).
+            if let Some(callback_port) =
+                callback_listener_port(flow_kind, oauth_provider.callback_port())
+            {
+                self.spawn_callback_listener(
+                    FlowIdentity {
+                        flow_id: flow_id.clone(),
+                        owner: owner.to_string(),
+                        provider: provider_name.clone(),
+                    },
+                    callback_port,
+                )
+                .await;
+            }
+
+            Ok(StartFlowResult {
+                flow_id,
+                provider: provider_name,
+                authorization_url: flow.authorization_url,
+                flow_kind: flow_kind_str.to_string(),
+            })
+        }
+
+        #[cfg(not(feature = "oauth"))]
+        {
+            let _ = (owner, provider);
+            Err(AuthFlowError::Provider(
+                "OAuth support is not enabled in this build".to_string(),
+            ))
+        }
+    }
+
+    // ── complete_flow ────────────────────────────────────────────────────
+
+    /// Complete an OAuth login flow by exchanging the authorization code for tokens.
+    ///
+    /// This is called by the callback listener or by ACP clients through
+    /// `_querymt/auth/complete`.
+    pub async fn complete_flow(
+        &self,
+        owner: &str,
+        flow_id: &str,
+        response: &str,
+    ) -> CompleteFlowResult {
+        #[cfg(feature = "oauth")]
+        {
+            // A flow another owner started is treated as nonexistent.
+            if let Some(result) = self.complete_mcp_flow(owner, flow_id, response).await {
+                return result;
+            }
+            let flow = {
+                let map = self.flows.lock().await;
+                map.get(flow_id).cloned()
+            };
+
+            let Some(flow) = flow else {
+                return CompleteFlowResult {
+                    provider: String::new(),
+                    success: false,
+                    message: format!("Unknown OAuth flow: {}", flow_id),
+                };
+            };
+
+            if flow.owner != owner {
+                return CompleteFlowResult {
+                    provider: flow.provider,
+                    success: false,
+                    message: "OAuth flow belongs to a different connection".to_string(),
+                };
+            }
+
+            if flow.created_at.elapsed().as_secs() > OAUTH_FLOW_TTL_SECS {
+                {
+                    let mut map = self.flows.lock().await;
+                    map.remove(flow_id);
+                }
+                stop_listener_for_flow(&self.listener_slot, &self.flows, flow_id, false).await;
+                return CompleteFlowResult {
+                    provider: flow.provider,
+                    success: false,
+                    message: "OAuth flow expired, please start again".to_string(),
+                };
+            }
+
+            let mode = oauth_mode_for_provider(&flow.provider);
+            let oauth_provider = match crate::auth::get_oauth_provider(&flow.provider, mode) {
+                Ok(p) => p,
+                Err(err) => {
+                    return CompleteFlowResult {
+                        provider: flow.provider,
+                        success: false,
+                        message: err.to_string(),
+                    };
+                }
+            };
+
+            let code_input = response.trim();
+            let code = match oauth_provider.flow_kind() {
+                crate::auth::OAuthFlowKind::RedirectCode => {
+                    if code_input.is_empty() {
+                        return CompleteFlowResult {
+                            provider: flow.provider,
+                            success: false,
+                            message: "Authorization response is required".to_string(),
+                        };
+                    }
+                    code_input.to_string()
+                }
+                crate::auth::OAuthFlowKind::DevicePoll => code_input.to_string(),
+            };
+
+            let result = async {
+                let tokens = oauth_provider
+                    .exchange_code(&code, &flow.state, &flow.verifier)
+                    .await
+                    .map_err(|e| format!("Token exchange failed: {}", e))?;
+                persist_oauth_credentials(oauth_provider.as_ref(), &tokens, None).await?;
+                Ok::<(), String>(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => {
+                    let removed = {
+                        let mut map = self.flows.lock().await;
+                        map.remove(flow_id).is_some()
+                    };
+                    if !removed {
+                        return CompleteFlowResult {
+                            provider: flow.provider,
+                            success: false,
+                            message: "Flow already completed".to_string(),
+                        };
+                    }
+
+                    stop_listener_for_flow(&self.listener_slot, &self.flows, flow_id, false).await;
+                    self.config.invalidate_provider_cache().await;
+                    self.model_inventory.invalidate_all().await;
+
+                    CompleteFlowResult {
+                        provider: flow.provider.clone(),
+                        success: true,
+                        message: format!(
+                            "Successfully authenticated with {}",
+                            oauth_provider.display_name()
+                        ),
+                    }
+                }
+                Err(err) => CompleteFlowResult {
+                    provider: flow.provider,
+                    success: false,
+                    message: err,
+                },
+            }
+        }
+
+        #[cfg(not(feature = "oauth"))]
+        {
+            let _ = (owner, flow_id, response);
+            CompleteFlowResult {
+                provider: String::new(),
+                success: false,
+                message: "OAuth support is not enabled in this build".to_string(),
+            }
+        }
+    }
+
+    // ── logout ──────────────────────────────────────────────────────────
+
+    /// Disconnect / logout OAuth credentials for a provider.
+    pub async fn logout(&self, owner: &str, provider: &str) -> LogoutResult {
+        #[cfg(feature = "oauth")]
+        {
+            let provider_name = match AuthTarget::parse(provider) {
+                Ok(AuthTarget::Mcp(server)) => return self.logout_mcp(owner, server).await,
+                Ok(AuthTarget::Provider(name)) => name,
+                Err(error) => {
+                    return LogoutResult {
+                        provider: String::new(),
+                        success: false,
+                        message: error.to_string(),
+                    };
+                }
+            };
+
+            if let Err(e) = validate_provider_configured(&self.config, &provider_name) {
+                return LogoutResult {
+                    provider: provider_name,
+                    success: false,
+                    message: e,
+                };
+            }
+
+            let mode = oauth_mode_for_provider(&provider_name);
+            let oauth_provider = match crate::auth::get_oauth_provider(&provider_name, mode) {
+                Ok(p) => p,
+                Err(err) => {
+                    return LogoutResult {
+                        provider: provider_name,
+                        success: false,
+                        message: err.to_string(),
+                    };
+                }
+            };
+
+            let store = match crate::auth::SecretStore::new_async().await {
+                Ok(s) => s,
+                Err(err) => {
+                    return LogoutResult {
+                        provider: provider_name,
+                        success: false,
+                        message: format!("Failed to access secure storage: {}", err),
+                    };
+                }
+            };
+
+            // Serialize with any in-flight token refresh so it cannot repopulate
+            // the cache or keyring after the credentials are removed.
+            let token_guard = crate::auth::lock_provider_tokens(&provider_name).await;
+
+            let name = provider_name.clone();
+            let api_key_name = oauth_provider.api_key_name().map(str::to_owned);
+            let delete_result = store
+                .run(move |store| {
+                    let _guard = token_guard;
+                    let result = (|| {
+                        store.delete_oauth_tokens(&name)?;
+                        if let Some(key) = api_key_name {
+                            store.delete(&key)?;
+                        }
+                        Ok(())
+                    })();
+                    // Also invalidate after partial deletion or caller cancellation.
+                    crate::auth::invalidate_cached_tokens(&name);
+                    result
+                })
+                .await
+                .map_err(|error| format!("Failed to remove credentials: {error}"));
+
+            match delete_result {
+                Ok(()) => {
+                    // Clean up pending flows for this owner+provider.
+                    {
+                        let mut map = self.flows.lock().await;
+                        map.retain(|_, f| !(f.owner == owner && f.provider == provider_name));
+                    }
+                    stop_listener_for_owner_provider(&self.listener_slot, owner, &provider_name)
+                        .await;
+                    self.config.invalidate_provider_cache().await;
+                    self.model_inventory.invalidate_all().await;
+
+                    LogoutResult {
+                        provider: provider_name,
+                        success: true,
+                        message: format!("Disconnected from {}", oauth_provider.display_name()),
+                    }
+                }
+                Err(err) => LogoutResult {
+                    provider: provider_name,
+                    success: false,
+                    message: err,
+                },
+            }
+        }
+
+        #[cfg(not(feature = "oauth"))]
+        {
+            let _ = (owner, provider);
+            LogoutResult {
+                provider: provider.to_string(),
+                success: false,
+                message: "OAuth support is not enabled in this build".to_string(),
+            }
+        }
+    }
+
+    // ── API token / auth method mutations ────────────────────────────────
+
+    /// Store an API token for a provider in the secret store.
+    ///
+    /// Shared by the dashboard `SetApiToken` handler and the ACP
+    /// `querymt/auth/setApiToken` extension method.
+    pub async fn set_api_token(&self, provider: &str, api_key: &str) -> AuthMutationResult {
+        let provider_name = provider.trim().to_string();
+        if provider_name.is_empty() {
+            return AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: "Provider name is required".to_string(),
+            };
+        }
+
+        let api_key = api_key.trim();
+        if api_key.is_empty() {
+            return AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: "API key cannot be empty".to_string(),
+            };
+        }
+
+        if let Err(e) = validate_provider_configured(&self.config, &provider_name) {
+            return AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: e,
+            };
+        }
+
+        let Some(name) = resolve_api_key_name(&self.config, &provider_name).await else {
+            return AuthMutationResult {
+                provider: provider_name.clone(),
+                success: false,
+                message: format!(
+                    "Provider '{}' does not have a known API key name",
+                    provider_name
+                ),
+            };
+        };
+
+        let store = match crate::auth::SecretStore::new_async().await {
+            Ok(s) => s,
+            Err(err) => {
+                return AuthMutationResult {
+                    provider: provider_name,
+                    success: false,
+                    message: format!("Failed to open secret store: {}", err),
+                };
+            }
+        };
+
+        let stored_name = name.clone();
+        let api_key = api_key.to_owned();
+        match store
+            .run(move |store| store.set(stored_name, api_key))
+            .await
+        {
+            Ok(()) => {
+                self.invalidate_auth_caches().await;
+                AuthMutationResult {
+                    provider: provider_name.clone(),
+                    success: true,
+                    message: format!("API key stored for {} ({})", provider_name, name),
+                }
+            }
+            Err(err) => AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: format!("Failed to store API key: {}", err),
+            },
+        }
+    }
+
+    /// Clear a stored API token for a provider.
+    ///
+    /// Shared by the dashboard `ClearApiToken` handler and the ACP
+    /// `querymt/auth/clearApiToken` extension method. Delete is idempotent.
+    pub async fn clear_api_token(&self, provider: &str) -> AuthMutationResult {
+        let provider_name = provider.trim().to_string();
+        if provider_name.is_empty() {
+            return AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: "Provider name is required".to_string(),
+            };
+        }
+
+        if let Err(e) = validate_provider_configured(&self.config, &provider_name) {
+            return AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: e,
+            };
+        }
+
+        let Some(name) = resolve_api_key_name(&self.config, &provider_name).await else {
+            return AuthMutationResult {
+                provider: provider_name.clone(),
+                success: false,
+                message: format!(
+                    "Provider '{}' does not have a known API key name",
+                    provider_name
+                ),
+            };
+        };
+
+        let store = match crate::auth::SecretStore::new_async().await {
+            Ok(s) => s,
+            Err(err) => {
+                return AuthMutationResult {
+                    provider: provider_name,
+                    success: false,
+                    message: format!("Failed to open secret store: {}", err),
+                };
+            }
+        };
+
+        let stored_name = name.clone();
+        match store.run(move |store| store.delete(&stored_name)).await {
+            Ok(()) => {
+                self.invalidate_auth_caches().await;
+                AuthMutationResult {
+                    provider: provider_name.clone(),
+                    success: true,
+                    message: format!("API key cleared for {} ({})", provider_name, name),
+                }
+            }
+            Err(err) => AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: format!("Failed to clear API key: {}", err),
+            },
+        }
+    }
+
+    /// Persist the preferred auth method for a provider.
+    ///
+    /// Shared by the dashboard `SetAuthMethod` handler and the ACP
+    /// `querymt/auth/setMethod` extension method. Accepts `oauth`, `api_key`,
+    /// and `env_var` (case-sensitive snake_case).
+    pub async fn set_auth_method(&self, provider: &str, method: &str) -> AuthMutationResult {
+        let provider_name = provider.trim().to_string();
+        if provider_name.is_empty() {
+            return AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: "Provider name is required".to_string(),
+            };
+        }
+
+        if let Err(e) = validate_provider_configured(&self.config, &provider_name) {
+            return AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: e,
+            };
+        }
+
+        let parsed = match method.trim().parse::<crate::auth::AuthMethod>() {
+            Ok(m) => m,
+            Err(err) => {
+                return AuthMutationResult {
+                    provider: provider_name,
+                    success: false,
+                    message: err,
+                };
+            }
+        };
+
+        let key = format!("auth_method_{}", provider_name);
+        let store = match crate::auth::SecretStore::new_async().await {
+            Ok(s) => s,
+            Err(err) => {
+                return AuthMutationResult {
+                    provider: provider_name,
+                    success: false,
+                    message: format!("Failed to open secret store: {}", err),
+                };
+            }
+        };
+
+        let value = parsed.to_string();
+        match store.run(move |store| store.set(key, value)).await {
+            Ok(()) => {
+                // Preferred method changes credential resolution order, so both
+                // the instantiated-provider cache and model inventory must refresh.
+                self.invalidate_auth_caches().await;
+                AuthMutationResult {
+                    provider: provider_name.clone(),
+                    success: true,
+                    message: format!("Auth method set to '{}' for {}", parsed, provider_name),
+                }
+            }
+            Err(err) => AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: format!("Failed to set auth method: {}", err),
+            },
+        }
+    }
+
+    /// Drop cached providers and model inventory after credential changes.
+    async fn invalidate_auth_caches(&self) {
+        self.config.invalidate_provider_cache().await;
+        self.model_inventory.invalidate_all().await;
+    }
+
+    // ── Callback listener lifecycle ───────────────────────────────────────
+
+    #[cfg(feature = "oauth")]
+    async fn spawn_callback_listener(&self, identity: FlowIdentity, callback_port: u16) {
+        let previous = {
+            let active = self.listener_slot.lock().await;
+            active
+                .as_ref()
+                .map(|l| (l.flow_id.clone(), l.provider.clone(), l.owner.clone()))
+        };
+
+        if let Some((old_flow_id, old_provider, old_owner)) = previous {
+            log::debug!(
+                "Restarting OAuth callback listener: replacing flow '{}' (provider='{}', owner='{}') with flow '{}' (provider='{}', owner='{}')",
+                old_flow_id,
+                old_provider,
+                old_owner,
+                identity.flow_id,
+                identity.provider,
+                identity.owner
+            );
+        } else {
+            log::debug!(
+                "Starting OAuth callback listener for flow '{}' (provider='{}', owner='{}')",
+                identity.flow_id,
+                identity.provider,
+                identity.owner
+            );
+        }
+
+        // Stop any existing listener first.
+        stop_listener(&self.listener_slot, &self.flows, true).await;
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let svc = self.clone();
+
+        let flow_id = identity.flow_id.clone();
+        let owner = identity.owner.clone();
+        let provider = identity.provider.clone();
+
+        let task = tokio::spawn(async move {
+            run_callback_listener_task(svc, identity, stop_rx, callback_port).await;
+        });
+
+        let mut active = self.listener_slot.lock().await;
+        *active = Some(ActiveOAuthCallbackListener {
+            flow_id,
+            owner,
+            provider,
+            stop_tx,
+            task,
+        });
+    }
+} // end impl OAuthService
+
+// ── Credential persistence ────────────────────────────────────────────────────
+
+#[cfg(feature = "oauth")]
+pub(crate) async fn persist_oauth_credentials(
+    oauth_provider: &dyn crate::auth::OAuthProvider,
+    tokens: &crate::auth::TokenSet,
+    api_key_override: Option<&str>,
+) -> Result<(), String> {
+    let store = crate::auth::SecretStore::new_async()
+        .await
+        .map_err(|e| format!("Failed to access secure storage: {}", e))?;
+
+    // Do the network call before taking the lock so it is never held across it.
+    let api_key_to_store = if let Some(api_key) = api_key_override {
+        Some(api_key.to_string())
+    } else {
+        oauth_provider
+            .create_api_key(&tokens.access_token)
+            .await
+            .ok()
+            .flatten()
+    };
+
+    // Serialize with token refresh and logout for *all* credential writes
+    // (tokens and API key), so neither can overwrite or resurrect part of a
+    // fresh login. Only synchronous keyring calls happen under the guard.
+    let token_guard = crate::auth::lock_provider_tokens(oauth_provider.name()).await;
+    let provider_name = oauth_provider.name().to_owned();
+    let key_name = oauth_provider.api_key_name().map(str::to_owned);
+    let tokens = tokens.clone();
+    store
+        .run(move |store| {
+            let _guard = token_guard;
+            store.set_oauth_tokens(&provider_name, &tokens)?;
+            crate::auth::invalidate_cached_tokens(&provider_name);
+            if let (Some(api_key), Some(key_name)) = (api_key_to_store, key_name)
+                && let Err(error) = store.set(&key_name, api_key)
+            {
+                log::warn!(
+                    "Failed to persist API key for provider '{provider_name}' ({key_name}): {error}"
+                );
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| format!("Failed to save OAuth tokens: {error}"))
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn auth_provider_names(registry: &querymt::plugin::host::PluginRegistry) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for provider in &registry.config.providers {
+        if seen.insert(provider.name.clone()) {
+            names.push(provider.name.clone());
+        }
+    }
+    for factory in registry.list() {
+        let name = factory.name().to_string();
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names
+}
+
+fn validate_provider_configured(config: &AgentConfig, provider: &str) -> Result<(), String> {
+    let registry = config.provider.plugin_registry();
+    let is_known = registry
+        .config
+        .providers
+        .iter()
+        .any(|configured| configured.name == provider)
+        || registry
+            .list()
+            .iter()
+            .any(|factory| factory.name() == provider);
+    if is_known {
+        Ok(())
+    } else {
+        Err(format!("Provider '{}' is not configured", provider))
+    }
+}
+
+/// Resolve the secret-store key name for a provider's API token via the plugin
+/// factory's `api_key_name()`. Returns `None` for unknown or OAuth-only providers.
+async fn resolve_api_key_name(config: &AgentConfig, provider: &str) -> Option<String> {
+    let registry = config.provider.plugin_registry();
+    let factory = registry.get(provider).await;
+    factory
+        .as_ref()
+        .and_then(|f| f.as_http())
+        .and_then(|h| h.api_key_name())
+}
+
+#[cfg(feature = "oauth")]
+fn oauth_mode_for_provider(provider: &str) -> Option<&'static str> {
+    if provider == "anthropic" {
+        Some("max")
+    } else {
+        None
+    }
+}
+
+/// Resolves the loopback port a redirect flow should listen on.
+///
+/// Returns `None` unless the flow is a `RedirectCode` flow whose provider
+/// declares a loopback callback port. Providers with a hosted callback (e.g.
+/// Anthropic) return `None`; their flows complete via [`OAuthService::complete_flow`]
+/// and must not claim a loopback port.
+#[cfg(feature = "oauth")]
+fn callback_listener_port(
+    flow_kind: crate::auth::OAuthFlowKind,
+    callback_port: Option<u16>,
+) -> Option<u16> {
+    match flow_kind {
+        crate::auth::OAuthFlowKind::RedirectCode => callback_port,
+        crate::auth::OAuthFlowKind::DevicePoll => None,
+    }
+}
+
+// ── Callback listener task (free fn for 'static tokio::spawn) ─────────────────
+
+#[cfg(feature = "oauth")]
+enum WaitResult {
+    Stopped,
+    Timeout,
+    Callback(CallbackResult),
+}
+
+#[cfg(feature = "oauth")]
+async fn wait_for_oauth_callback(
+    stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    callback_rx: tokio::sync::oneshot::Receiver<CallbackResult>,
+) -> WaitResult {
+    use std::time::Duration;
+
+    tokio::select! {
+        _ = &mut *stop_rx => WaitResult::Stopped,
+        result = tokio::time::timeout(Duration::from_secs(OAUTH_CALLBACK_TIMEOUT_SECS), callback_rx) => {
+            match result {
+                Ok(Ok(cb)) => WaitResult::Callback(cb),
+                Ok(Err(_)) => WaitResult::Callback(Err("Callback listener closed unexpectedly".to_string())),
+                Err(_) => WaitResult::Timeout,
+            }
+        }
+    }
+}
+
+/// Serve the loopback OAuth redirect on `callback_port` until a callback
+/// arrives, the listener is stopped, or the wait times out. Returns a valid
+/// callback (state already checked against `state_param`). The `iss` parameter
+/// is kept: servers that advertise
+/// `authorization_response_iss_parameter_supported` (e.g. Linear) are rejected
+/// by the token exchange without it.
+#[cfg(feature = "oauth")]
+async fn await_loopback_callback(
+    flow_id: &str,
+    provider: &str,
+    callback_port: u16,
+    state_param: String,
+    stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
+) -> Option<LoopbackCallback> {
+    use axum::{
+        Router,
+        extract::{Query, State},
+        response::Html,
+        routing::get,
+    };
+
+    let callback_bind_addr = format!("{}:{}", OAUTH_CALLBACK_HOST, callback_port);
+
+    #[derive(Clone)]
+    struct CbHttpState {
+        expected_state: String,
+        result_tx: CallbackResultSender,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CbQuery {
+        code: Option<String>,
+        state: Option<String>,
+        error: Option<String>,
+        iss: Option<String>,
+    }
+
+    async fn cb_handler(
+        Query(params): Query<CbQuery>,
+        State(st): State<CbHttpState>,
+    ) -> Html<String> {
+        let result = if let Some(error) = params.error {
+            Err(format!("OAuth error: {}", error))
+        } else if let Some(code) = params.code {
+            let received_state = params.state.unwrap_or_default();
+            if received_state != st.expected_state {
+                Err("State mismatch - possible CSRF attack".to_string())
+            } else {
+                Ok(LoopbackCallback {
+                    code,
+                    state: received_state,
+                    issuer: params.iss.filter(|iss| !iss.is_empty()),
+                })
+            }
+        } else {
+            Err("No authorization code received".to_string())
+        };
+
+        let success = result.is_ok();
+        {
+            let mut tx = st.result_tx.lock().await;
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(result);
+            }
+        }
+
+        if success {
+            Html("<html><head><title>Authorization Successful</title></head><body><h1>Authorization Successful</h1><p>You can close this window.</p></body></html>".to_string())
+        } else {
+            Html("<html><head><title>Authorization Failed</title></head><body><h1>Authorization Failed</h1><p>You can close this window.</p></body></html>".to_string())
+        }
+    }
+
+    let (result_tx, callback_rx) = tokio::sync::oneshot::channel();
+    let http_state = CbHttpState {
+        expected_state: state_param,
+        result_tx: Arc::new(Mutex::new(Some(result_tx))),
+    };
+
+    let app = Router::new()
+        .route("/", get(cb_handler))
+        .route("/auth/callback", get(cb_handler))
+        .route("/callback", get(cb_handler))
+        .with_state(http_state);
+
+    let tcp_listener = match tokio::net::TcpListener::bind(&callback_bind_addr).await {
+        Ok(l) => l,
+        Err(err) => {
+            log::debug!(
+                "OAuth callback listener for flow '{}' failed to bind {}: {}",
+                flow_id,
+                callback_bind_addr,
+                err
+            );
+            return None;
+        }
+    };
+
+    log::debug!(
+        "OAuth callback listener started for flow '{}' (provider='{}') on {}",
+        flow_id,
+        provider,
+        callback_bind_addr
+    );
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        let _ = axum::serve(tcp_listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let wait = wait_for_oauth_callback(&mut *stop_rx, callback_rx).await;
+
+    let _ = shutdown_tx.send(());
+    let _ = server_task.await;
+
+    let callback = match wait {
+        WaitResult::Stopped => {
+            log::debug!(
+                "OAuth callback listener stopped for flow '{}' (provider='{}')",
+                flow_id,
+                provider
+            );
+            return None;
+        }
+        WaitResult::Timeout => {
+            log::debug!(
+                "OAuth callback listener timed out for flow '{}' (provider='{}')",
+                flow_id,
+                provider
+            );
+            return None;
+        }
+        WaitResult::Callback(Ok(callback)) => callback,
+        WaitResult::Callback(Err(err)) => {
+            log::debug!("OAuth callback error for flow '{}': {}", flow_id, err);
+            return None;
+        }
+    };
+    Some(callback)
+}
+
+#[cfg(feature = "oauth")]
+async fn run_callback_listener_task(
+    svc: OAuthService,
+    identity: FlowIdentity,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    callback_port: u16,
+) {
+    let FlowIdentity {
+        flow_id,
+        owner,
+        provider,
+    } = identity;
+
+    let (state_param, verifier) = {
+        let map = svc.flows.lock().await;
+        let Some(flow) = map.get(&flow_id) else {
+            return;
+        };
+        if flow.owner != owner || flow.provider != provider {
+            return;
+        }
+        (flow.state.clone(), flow.verifier.clone())
+    };
+
+    let Some(LoopbackCallback {
+        code,
+        state: cb_state,
+        ..
+    }) = await_loopback_callback(
+        &flow_id,
+        &provider,
+        callback_port,
+        state_param,
+        &mut stop_rx,
+    )
+    .await
+    else {
+        return;
+    };
+
+    // Verify the flow is still active.
+    let flow_active = {
+        let map = svc.flows.lock().await;
+        map.get(&flow_id)
+            .is_some_and(|f| f.owner == owner && f.provider == provider)
+    };
+    if !flow_active {
+        return;
+    }
+
+    // Exchange tokens and persist.
+    let mode = oauth_mode_for_provider(&provider);
+    let oauth_provider = match crate::auth::get_oauth_provider(&provider, mode) {
+        Ok(p) => p,
+        Err(err) => {
+            log::warn!("OAuth provider lookup failed for '{}': {}", provider, err);
+            return;
+        }
+    };
+
+    let result = async {
+        let tokens = oauth_provider
+            .exchange_code(&code, &cb_state, &verifier)
+            .await
+            .map_err(|e| format!("Token exchange failed: {}", e))?;
+        persist_oauth_credentials(oauth_provider.as_ref(), &tokens, None).await?;
+        Ok::<(), String>(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            let should_finalize = {
+                let mut map = svc.flows.lock().await;
+                map.remove(&flow_id).is_some()
+            };
+            if !should_finalize {
+                return;
+            }
+
+            // Clear the listener slot since we're done.
+            {
+                let mut active = svc.listener_slot.lock().await;
+                if active.as_ref().is_some_and(|l| l.flow_id == flow_id) {
+                    active.take();
+                }
+            }
+
+            svc.config.invalidate_provider_cache().await;
+            svc.model_inventory.invalidate_all().await;
+
+            log::info!(
+                "OAuth callback flow completed successfully for provider '{}' (flow '{}')",
+                provider,
+                flow_id
+            );
+        }
+        Err(err) => {
+            log::warn!(
+                "OAuth callback token exchange failed for '{}': {}",
+                provider,
+                err
+            );
+        }
+    }
+}
+
+// ── Listener stop helpers ─────────────────────────────────────────────────────
+
+#[cfg(feature = "oauth")]
+async fn stop_listener(
+    listener_slot: &CallbackListenerSlot,
+    flows: &OAuthFlowMap,
+    remove_flow: bool,
+) {
+    let active = {
+        let mut slot = listener_slot.lock().await;
+        slot.take()
+    };
+    if let Some(active) = active {
+        if remove_flow {
+            let mut map = flows.lock().await;
+            map.remove(&active.flow_id);
+        }
+        let _ = active.stop_tx.send(());
+        let _ = active.task.await;
+    }
+}
+
+#[cfg(feature = "oauth")]
+async fn stop_listener_for_flow(
+    listener_slot: &CallbackListenerSlot,
+    flows: &OAuthFlowMap,
+    flow_id: &str,
+    remove_flow: bool,
+) {
+    let active = {
+        let mut slot = listener_slot.lock().await;
+        if slot.as_ref().is_some_and(|l| l.flow_id == flow_id) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(active) = active {
+        if remove_flow {
+            let mut map = flows.lock().await;
+            map.remove(&active.flow_id);
+        }
+        let _ = active.stop_tx.send(());
+        let _ = active.task.await;
+    }
+}
+
+#[cfg(feature = "oauth")]
+async fn stop_listener_for_owner_provider(
+    listener_slot: &CallbackListenerSlot,
+    owner: &str,
+    provider: &str,
+) {
+    let active = {
+        let mut slot = listener_slot.lock().await;
+        if slot
+            .as_ref()
+            .is_some_and(|l| l.owner == owner && l.provider == provider)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(active) = active {
+        let _ = active.stop_tx.send(());
+        let _ = active.task.await;
+    }
+}
+
+#[cfg(all(test, feature = "oauth"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_listener_port_follows_provider_declarations() {
+        // Loopback redirect providers listen on their declared port.
+        let codex = crate::auth::get_oauth_provider("codex", None).unwrap();
+        assert_eq!(
+            callback_listener_port(codex.flow_kind(), codex.callback_port()),
+            Some(1455)
+        );
+        let xai = crate::auth::get_oauth_provider("xai", None).unwrap();
+        assert_eq!(
+            callback_listener_port(xai.flow_kind(), xai.callback_port()),
+            Some(56121)
+        );
+
+        // Hosted-callback providers (Anthropic) must not spawn a listener:
+        // their redirect completes via `complete_flow`, and claiming a loopback
+        // port here would cancel a pending loopback flow for another provider.
+        let anthropic = crate::auth::get_oauth_provider("anthropic", None).unwrap();
+        assert_eq!(
+            callback_listener_port(anthropic.flow_kind(), anthropic.callback_port()),
+            None
+        );
+
+        // Device-poll flows never listen on a loopback port.
+        let kimi = crate::auth::get_oauth_provider("kimi-code", None).unwrap();
+        assert_eq!(
+            callback_listener_port(kimi.flow_kind(), kimi.callback_port()),
+            None
+        );
+    }
+
+    struct NamedStaticFactory {
+        name: String,
+        inner: crate::test_utils::TestProviderFactory,
+    }
+
+    impl querymt::plugin::LLMProviderFactory for NamedStaticFactory {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn config_schema(&self) -> String {
+            self.inner.config_schema()
+        }
+        fn from_config(
+            &self,
+            cfg: &str,
+        ) -> Result<Box<dyn querymt::LLMProvider>, querymt::error::LLMError> {
+            self.inner.from_config(cfg)
+        }
+        fn list_models<'a>(
+            &'a self,
+            cfg: &str,
+        ) -> querymt::plugin::Fut<'a, Result<Vec<String>, querymt::error::LLMError>> {
+            self.inner.list_models(cfg)
+        }
+        fn as_http(&self) -> Option<&dyn querymt::plugin::http::HTTPLLMProviderFactory> {
+            self.inner.as_http()
+        }
+    }
+
+    struct OwnedAuthKeys {
+        store: crate::auth::SecretStore,
+        keys: [String; 2],
+    }
+
+    impl Drop for OwnedAuthKeys {
+        fn drop(&mut self) {
+            for key in &self.keys {
+                let _ = self.store.delete(key);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn static_auth_status_and_mutations_use_only_test_owned_credentials() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let name = format!("qmt_test_{}", uuid::Uuid::new_v4().as_simple());
+        let key = format!("QMT_TEST_KEY_{name}");
+        let preference = format!("auth_method_{name}");
+        let owned = OwnedAuthKeys {
+            store: crate::auth::SecretStore::new().expect("native store initialization"),
+            keys: [key.clone(), preference.clone()],
+        };
+        let registry = fixture.config.provider.plugin_registry();
+        let shared = crate::test_utils::SharedLlmProvider::new(
+            crate::test_utils::MockLlmProvider::new(),
+            vec![],
+        );
+        registry.register_static(Arc::new(NamedStaticFactory {
+            name: name.clone(),
+            inner: crate::test_utils::TestProviderFactory::new(shared).with_api_key_name(&key),
+        }));
+        assert!(registry.config.providers.is_empty(), "static-only fixture");
+        let service = OAuthService::new(
+            fixture.config.clone(),
+            ModelInventory::new(fixture.config.clone()),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(None)),
+        );
+        assert!(
+            service
+                .auth_status(Some("not-this-test-provider"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!service.set_auth_method(&name, "password").await.success);
+        assert!(
+            !service
+                .clear_api_token("not-this-test-provider")
+                .await
+                .success
+        );
+        let stored = service.set_api_token(&name, "test-owned-token").await;
+        assert!(!stored.message.contains("test-owned-token"));
+        if !stored.success {
+            assert!(
+                stored.message.contains("Failed to store API key"),
+                "{stored:?}"
+            );
+            let status = service.auth_status(Some(&name)).await;
+            match status {
+                Ok(providers) => assert!(!providers[0].has_stored_api_key),
+                Err(error) => assert!(error.contains("Failed to read"), "{error}"),
+            }
+            eprintln!(
+                "native keyring unavailable; static persistence/cache assertions not exercised"
+            );
+            return;
+        }
+        assert_eq!(
+            owned.store.try_get(&key).unwrap().as_deref(),
+            Some("test-owned-token")
+        );
+        let providers = service.auth_status(Some(&name)).await.unwrap();
+        assert_eq!(providers.len(), 1);
+        let provider = &providers[0];
+        assert_eq!(provider.provider, name);
+        assert_eq!(provider.env_var_name.as_deref(), Some(key.as_str()));
+        assert!(provider.has_stored_api_key);
+        assert!(!provider.has_env_api_key);
+        assert!(!provider.supports_oauth);
+        assert!(provider.oauth_status.is_none());
+        assert!(provider.preferred_method.is_none());
+        assert!(provider.display_name.starts_with("Qmt_test_"));
+        assert!(service.set_auth_method(&name, "api_key").await.success);
+        assert_eq!(
+            owned.store.try_get(&preference).unwrap().as_deref(),
+            Some("api_key")
+        );
+        assert_eq!(
+            service.auth_status(Some(&name)).await.unwrap()[0]
+                .preferred_method
+                .as_deref(),
+            Some("api_key")
+        );
+        assert!(service.clear_api_token(&name).await.success);
+        assert!(owned.store.try_get(&key).unwrap().is_none());
+        assert!(!service.auth_status(Some(&name)).await.unwrap()[0].has_stored_api_key);
+        assert!(service.clear_api_token(&name).await.success);
+    }
+
+    #[tokio::test]
+    async fn auth_provider_names_include_registered_static_factories() {
+        let registry = querymt::plugin::host::PluginRegistry::empty();
+        let shared = crate::test_utils::SharedLlmProvider::new(
+            crate::test_utils::MockLlmProvider::new(),
+            vec![],
+        );
+        registry.register_static(std::sync::Arc::new(
+            crate::test_utils::TestProviderFactory::new(shared),
+        ));
+        assert_eq!(auth_provider_names(&registry), vec!["mock"]);
+    }
+}

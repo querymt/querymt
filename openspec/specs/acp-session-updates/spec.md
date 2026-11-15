@@ -137,7 +137,7 @@ QueryMT SHALL derive Preview update support from each ACP connection's negotiate
 - **THEN** QueryMT treats that capability as unsupported
 
 ### Requirement: Replay semantics
-QueryMT SHALL replay durable session-update state in materialized form when session history is replayed. Replayed plans and compactions SHALL retain their original identities and final content without duplicating streamed chunks. QueryMT SHALL NOT replay live-only notices or transient in-progress compaction states.
+QueryMT SHALL replay durable session-update state in materialized form when session history is replayed. Replayed plans and compactions SHALL retain their original identities and final content without duplicating streamed chunks. QueryMT SHALL NOT replay live-only notices or transient in-progress compaction states. For a remote-hosted session, replay SHALL be built from the local copy of the session's events and SHALL NOT cause events already transferred for the load to be transferred again.
 
 #### Scenario: Replay includes a current plan
 - **WHEN** a capable client loads a session with a retained plan
@@ -152,6 +152,11 @@ QueryMT SHALL replay durable session-update state in materialized form when sess
 - **WHEN** QueryMT replays retained session history
 - **THEN** it does not replay prior notices
 - **AND** it does not replay an obsolete `in_progress` compaction state before a retained terminal state
+
+#### Scenario: Replay of a remote session after attach
+- **WHEN** a client that receives history as session updates loads a remote-hosted session whose events were transferred during attach
+- **THEN** it receives the same updates as for a local session with the same events
+- **AND** no event crosses the mesh a second time for the replay
 
 ### Requirement: Run stops are reported to clients
 When a prompt's run ends on a stop rather than normal completion, QueryMT SHALL return the matching ACP stop reason in the prompt response. Clients that advertise notice support SHALL also receive a live warning `notice` naming the cause. Stop notices are live-only and SHALL NOT be replayed. The prompt response SHALL NOT carry QueryMT-specific stop metadata: the ACP stop reason is the protocol-level signal, and the cause is conveyed by the notice and by QueryMT's own event stream.
@@ -223,7 +228,7 @@ QueryMT SHALL carry `_meta.querymt.accounting` on `usage_update` when reliable m
 - **AND** QueryMT does not pair a stale measurement or obsolete limit with the new model merely to emit a usage update
 
 ### Requirement: Load snapshots contain authoritative ordered accounting
-`SessionLoadSnapshot.accounting` SHALL contain the shared reducer's authoritative replacement DTO at the existing snapshot cursor, without requiring historical replay or known context limits. Snapshot and captured-live application SHALL respect existing local/remote ordering and deduplication. Older state SHALL NOT overwrite newer accounting or restore an invalidated complete total.
+`SessionLoadSnapshot.accounting` SHALL contain the shared reducer's authoritative replacement DTO at the existing snapshot cursor, without requiring historical replay or known context limits. Snapshot and captured-live application SHALL respect existing local/remote ordering and deduplication. Older state SHALL NOT overwrite newer accounting or restore an invalidated complete total. When a client requests a load window, `accounting` SHALL still cover the entire session, not only the events in the window. When older history of a remote-hosted session is not yet held locally, `accounting` SHALL cover the locally held events and SHALL report the missing history through the existing completeness metadata: `complete` false, `completeTotalUsd` null and a reason identifying untransferred history. Once that history is local, the reason SHALL be absent.
 
 #### Scenario: Desktop follow-up consumes backend accounting
 - **WHEN** the backend client contract is documented for desktop implementation
@@ -244,6 +249,15 @@ QueryMT SHALL carry `_meta.querymt.accounting` on `usage_update` when reliable m
 - **WHEN** manual budget rates cannot price a used cache category but API pricing can
 - **THEN** accounting preserves the complete API estimate separately from the incomplete budget valuation and budget-specific reason
 - **AND** ordinary in-flight attempts alone do not trigger a missing-price budget warning
+
+#### Scenario: Windowed load reports whole-session accounting
+- **WHEN** the same session is loaded once with a load window that excludes older turns and once without a window, and the same history is held locally for both
+- **THEN** both snapshots carry identical accounting values and completeness metadata
+
+#### Scenario: Remote older history not yet local
+- **WHEN** a windowed load of a remote-hosted session is answered before its older history is held locally
+- **THEN** `accounting` reports `complete` false, a null `completeTotalUsd` and a reason identifying untransferred history
+- **AND** a later load after the history is local reports the exact accounting without that reason
 
 ### Requirement: Budget uncertainty is advisory and visible
 A configured USD budget with incomplete cycle pricing SHALL surface a best-effort warning identifying unavailable pricing or usage. Execution SHALL continue against the known subtotal unless it reaches the cap. Notices SHALL follow negotiated capability rules and SHALL NOT require acknowledgement. Missing context size SHALL NOT suppress this warning, and repeated usage snapshots SHALL NOT flood clients with duplicate warnings.

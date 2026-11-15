@@ -1,0 +1,1073 @@
+//! Module F — Event relay + mesh integration tests.
+//!
+//! Tests the full `EventForwarder → EventRelayActor → local EventSink/Fanout` chain
+//! using real remote actor messaging (full msgpack serialization).
+
+#[cfg(all(test, feature = "remote"))]
+#[allow(clippy::module_inception)]
+mod event_relay_mesh_tests {
+    use crate::agent::core::SessionRuntime;
+    use crate::agent::remote::SessionActorRef;
+    use crate::agent::remote::event_forwarder::EventForwarder;
+    use crate::agent::remote::event_relay::{EventRelayActor, RelayedEvent};
+    use crate::agent::remote::test_helpers::fixtures::{AgentConfigFixture, get_test_mesh};
+    use crate::agent::session_actor::SessionActor;
+    use crate::session::backend::StorageBackend;
+    use crate::session::sqlite_storage::SqliteStorage;
+    use kameo::actor::Spawn;
+    use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventEnvelope, EventOrigin};
+    use querymt_agent_index::{FileIndexConfig, FunctionIndexConfig, WorkspaceIndexActor};
+    use querymt_agent_services::event_fanout::EventFanout;
+    use querymt_agent_services::event_sink::EventSink;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    // ── Fixture ───────────────────────────────────────────────────────────────
+
+    /// Set up a local EventRelayActor registered in the DHT and return
+    /// (relay_ref, event_sink, dht_name).
+    async fn setup_relay(
+        label: &str,
+        _test_id: &str,
+        session_id: &str,
+    ) -> (
+        kameo::actor::ActorRef<EventRelayActor>,
+        Arc<EventSink>,
+        String,
+    ) {
+        let mesh = get_test_mesh().await;
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let journal = storage.event_journal();
+        let fanout = Arc::new(EventFanout::new());
+        let event_sink = Arc::new(EventSink::new(journal, fanout));
+        let relay = EventRelayActor::new(
+            event_sink.clone(),
+            session_id.to_string(),
+            label.to_string(),
+            None,
+            None,
+        );
+        let relay_ref = EventRelayActor::spawn(relay);
+
+        let dht_name = crate::agent::remote::scope::scoped_event_relay(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            session_id,
+            mesh.peer_id(),
+        );
+        mesh.register_actor(relay_ref.clone(), dht_name.clone())
+            .await;
+
+        (relay_ref, event_sink, dht_name)
+    }
+
+    // ── F.1 ──────────────────────────────────────────────────────────────────
+
+    /// Tests that EventForwarder::start() subscribes to a fanout and forwards
+    /// events to the relay actor via mesh.
+    #[tokio::test]
+    async fn test_event_forwarder_sends_to_registered_relay() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+        let (relay_ref, event_sink, dht_name) = setup_relay("f1", &test_id, "s-f1").await;
+        let _ = relay_ref; // keep alive
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Resolve relay via DHT (simulates the remote side looking it up).
+        let remote_relay = mesh
+            .lookup_actor::<EventRelayActor>(&dht_name)
+            .await
+            .expect("DHT lookup")
+            .expect("relay not in DHT");
+
+        // Create a source fanout to publish events into
+        let source_fanout = Arc::new(EventFanout::new());
+
+        // Subscribe to the relay's sink fanout to verify events arrive
+        let mut rx = event_sink.fanout().subscribe();
+
+        // Start the forwarder (subscribes to source_fanout, forwards to remote_relay)
+        let _handle = EventForwarder::start(
+            source_fanout.clone(),
+            remote_relay,
+            "test-source-f1".to_string(),
+            "s-f1".to_string(),
+        );
+
+        // Publish a durable event to the source fanout
+        source_fanout.publish(EventEnvelope::Durable(
+            querymt_agent_core::events::DurableEvent {
+                session_seq: 0,
+                event_id: "e-f1".into(),
+                stream_seq: 1,
+                session_id: "s-f1".into(),
+                timestamp: 1000,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::SessionCreated,
+            },
+        ));
+
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("recv");
+
+        assert_eq!(received.session_id(), "s-f1");
+        assert!(received.is_durable());
+        if let EventEnvelope::Durable(de) = &received {
+            assert!(matches!(de.origin, EventOrigin::Remote));
+            assert_eq!(de.source_node.as_deref(), Some("f1"));
+            assert!(matches!(de.kind, AgentEventKind::SessionCreated));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_event_forwarder_stops_after_relay_actor_dies() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+        let (relay_ref, _event_sink, dht_name) =
+            setup_relay("f1-dead", &test_id, "s-f1-dead").await;
+
+        let remote_relay = mesh
+            .lookup_actor::<EventRelayActor>(&dht_name)
+            .await
+            .expect("DHT lookup")
+            .expect("relay not in DHT");
+        let source_fanout = Arc::new(EventFanout::new());
+        let handle = EventForwarder::start(
+            source_fanout.clone(),
+            remote_relay,
+            "test-source-f1-dead".to_string(),
+            "s-f1-dead".to_string(),
+        );
+
+        relay_ref.kill();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        source_fanout.publish(EventEnvelope::Durable(
+            querymt_agent_core::events::DurableEvent {
+                session_seq: 0,
+                event_id: "e-f1-dead".into(),
+                stream_seq: 1,
+                session_id: "s-f1-dead".into(),
+                timestamp: 1000,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::SessionCreated,
+            },
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !handle.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("forwarder should stop after ActorNotRunning");
+    }
+
+    // ── F.2 ──────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_event_forwarding_multiple_events_ordered() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+        let (relay_ref, event_sink, dht_name) = setup_relay("f2", &test_id, "s-f2").await;
+        let _ = relay_ref;
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let remote_relay = mesh
+            .lookup_actor::<EventRelayActor>(&dht_name)
+            .await
+            .expect("lookup")
+            .expect("not found");
+
+        let source_fanout = Arc::new(EventFanout::new());
+        let mut rx = event_sink.fanout().subscribe();
+
+        let _handle = EventForwarder::start(
+            source_fanout.clone(),
+            remote_relay,
+            "source-f2".to_string(),
+            "s-f2".to_string(),
+        );
+
+        for i in 1i64..=5 {
+            source_fanout.publish(EventEnvelope::Durable(
+                querymt_agent_core::events::DurableEvent {
+                    session_seq: 0,
+                    event_id: format!("e-f2-{}", i),
+                    stream_seq: i,
+                    session_id: "s-f2".into(),
+                    timestamp: i * 100,
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::SessionCreated,
+                },
+            ));
+        }
+
+        // All 5 durable events (SessionCreated) should arrive on fanout.
+        // Each gets a new journal-assigned stream_seq (monotonic).
+        let mut received_seqs = Vec::new();
+        for _ in 0..5 {
+            let env = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("timeout")
+                .expect("recv");
+            if let EventEnvelope::Durable(de) = env {
+                received_seqs.push(de.stream_seq);
+            }
+        }
+
+        // Journal assigns monotonically increasing seqs.
+        for window in received_seqs.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "stream_seq must be monotonically increasing"
+            );
+        }
+        assert_eq!(received_seqs.len(), 5);
+    }
+
+    /// ordered-session-events 1.3: one `EventForwarder` → one
+    /// `EventRelayActor` over the mesh preserves `tell` order for a burst of
+    /// 1,000 numbered events (durable and ephemeral interleaved).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_event_forwarding_preserves_order_for_1000_events() {
+        const COUNT: usize = 1000;
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+        let (relay_ref, event_sink, dht_name) = setup_relay("f2-1000", &test_id, "s-f2-1000").await;
+        let _ = relay_ref;
+
+        let remote_relay = mesh
+            .lookup_actor::<EventRelayActor>(&dht_name)
+            .await
+            .expect("lookup")
+            .expect("not found");
+
+        let source_fanout = Arc::new(EventFanout::new());
+        let mut rx = event_sink.fanout().subscribe();
+        let collector = tokio::spawn(async move {
+            let mut order = Vec::with_capacity(COUNT);
+            while order.len() < COUNT {
+                match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {
+                    Ok(Ok(envelope)) => {
+                        let id = match envelope.kind() {
+                            AgentEventKind::AssistantContentDelta { message_id, .. } => {
+                                message_id.clone()
+                            }
+                            AgentEventKind::AssistantMessageStored {
+                                message_id: Some(message_id),
+                                ..
+                            } => message_id.clone(),
+                            _ => continue,
+                        };
+                        order.push(id.parse::<usize>().expect("numbered event"));
+                    }
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                        panic!("collector lagged by {n}")
+                    }
+                    other => panic!("relay stream ended early: {other:?}"),
+                }
+            }
+            order
+        });
+
+        let _handle = EventForwarder::start(
+            source_fanout.clone(),
+            remote_relay,
+            "source-f2-1000".to_string(),
+            "s-f2-1000".to_string(),
+        );
+
+        for i in 0..COUNT {
+            let envelope = if i % 5 == 4 {
+                EventEnvelope::Durable(querymt_agent_core::events::DurableEvent {
+                    session_seq: 0,
+                    event_id: format!("e-{i}"),
+                    stream_seq: i as i64 + 1,
+                    session_id: "s-f2-1000".into(),
+                    timestamp: 0,
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::AssistantMessageStored {
+                        content: "x".into(),
+                        thinking: None,
+                        reasoning_parts: Vec::new(),
+                        message_id: Some(i.to_string()),
+                    },
+                })
+            } else {
+                EventEnvelope::Ephemeral(querymt_agent_core::events::EphemeralEvent {
+                    session_seq: 0,
+                    session_id: "s-f2-1000".into(),
+                    timestamp: 0,
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::AssistantContentDelta {
+                        content: "tok".into(),
+                        message_id: i.to_string(),
+                    },
+                })
+            };
+            source_fanout.publish(envelope);
+            // Keep the source fanout (1024 slots) from lagging the forwarder.
+            if i % 64 == 63 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let order = collector.await.expect("collector");
+        let expected: Vec<usize> = (0..COUNT).collect();
+        assert_eq!(order, expected, "relay must preserve forwarder tell order");
+    }
+
+    // ── F.3 ──────────────────────────────────────────────────────────────────
+    //
+    // The `received` counter on `EventRelayActor` is private.  We verify it
+    // indirectly: N events sent → N events arrive on the local bus.  If the
+    // counter were accessible, we'd assert `relay.received == N`.
+
+    #[tokio::test]
+    async fn test_event_relay_received_counter_increments() {
+        let test_id = Uuid::now_v7().to_string();
+        let (_relay_ref, event_sink, _dht_name) = setup_relay("f3", &test_id, "s-f3").await;
+
+        let mut rx = event_sink.fanout().subscribe();
+
+        // Send 3 events directly to the relay's local actor ref (no DHT needed).
+        for i in 1i64..=3 {
+            _relay_ref
+                .tell(RelayedEvent {
+                    event: AgentEvent {
+                        session_seq: 0,
+                        seq: i,
+                        timestamp: 0,
+                        session_id: "s-f3".to_string(),
+                        origin: EventOrigin::Local,
+                        source_node: None,
+                        kind: AgentEventKind::SessionCreated,
+                    },
+                })
+                .await
+                .expect("tell");
+        }
+
+        let mut count = 0usize;
+        for _ in 0..3 {
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .expect("timeout")
+                .expect("recv");
+            count += 1;
+        }
+        assert_eq!(count, 3, "all 3 relayed events should arrive on fanout");
+    }
+
+    // ── F.4 ──────────────────────────────────────────────────────────────────
+
+    /// Tests that SubscribeEvents starts a forwarder task.
+    /// We verify indirectly: after subscribe, events published to the session's
+    /// EventFanout should arrive at the relay.
+    #[tokio::test]
+    async fn test_subscribe_events_direct_installs_forwarder_without_dht() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+
+        let f = AgentConfigFixture::new().await;
+        let session_id = format!("s-f4-{}", test_id);
+
+        let runtime = SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime)
+            .with_mesh(Some(mesh.clone()));
+        let session_ref_local = SessionActor::spawn(actor);
+        let session_ref = SessionActorRef::Local(session_ref_local);
+
+        let relay_dht_name =
+            crate::agent::remote::dht_name::event_relay(&session_id, mesh.peer_id());
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let journal = storage.event_journal();
+        let fanout = Arc::new(EventFanout::new());
+        let relay_sink = Arc::new(EventSink::new(journal, fanout));
+        let relay = EventRelayActor::new(
+            relay_sink.clone(),
+            session_id.clone(),
+            "f4-relay".to_string(),
+            None,
+            None,
+        );
+        let relay_ref = EventRelayActor::spawn(relay);
+        let relay_remote_ref = relay_ref.into_remote_ref().await;
+
+        // The fallback name is deliberately not registered. A successful reply
+        // proves the direct capability installed the forwarder without DHT propagation.
+        session_ref
+            .subscribe_events_direct(1, relay_remote_ref, relay_dht_name)
+            .await
+            .expect("direct subscription should install the forwarder");
+
+        // Verify the acknowledged forwarder is already able to relay events.
+        let mut rx = relay_sink.fanout().subscribe();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut attempt: u32 = 0;
+        loop {
+            // Wait before publishing so the forwarder task has time to be
+            // installed (and so DHT lookup inside subscribe_events can finish).
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            attempt += 1;
+
+            f.config.event_sink.fanout().publish(EventEnvelope::Durable(
+                querymt_agent_core::events::DurableEvent {
+                    session_seq: 0,
+                    event_id: format!("e-f4-{attempt}"),
+                    stream_seq: attempt as i64,
+                    session_id: session_id.clone(),
+                    timestamp: 100,
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::SessionCreated,
+                },
+            ));
+
+            match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+                Ok(Ok(_)) => break, // forwarder is up and forwarded the event
+                _ if tokio::time::Instant::now() >= deadline => {
+                    panic!(
+                        "forwarder should forward events from session fanout to relay \
+                         (gave up after {attempt} attempts / 5 s)"
+                    );
+                }
+                _ => {
+                    // recv timed out or channel closed — forwarder not ready yet,
+                    // re-subscribe to drain any missed messages and retry.
+                    rx = relay_sink.fanout().subscribe();
+                }
+            }
+        }
+    }
+
+    // ── F.5 ──────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_subscribe_events_without_relay_in_dht_returns_error() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+
+        let f = AgentConfigFixture::new().await;
+        let session_id = format!("s-f5-{}", test_id);
+
+        let runtime = SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime)
+            .with_mesh(Some(mesh.clone()));
+        let session_ref_local = SessionActor::spawn(actor);
+        let session_ref = SessionActorRef::Local(session_ref_local);
+
+        // Intentionally do NOT register the relay in the DHT.
+        let relay_dht_name =
+            crate::agent::remote::dht_name::event_relay(&session_id, mesh.peer_id());
+
+        let result = session_ref.subscribe_events(99, relay_dht_name).await;
+        assert!(
+            result.is_err(),
+            "subscription must not acknowledge before a forwarder is installed"
+        );
+    }
+
+    /// If the workspace index became ready before SubscribeEvents installs the
+    /// forwarder, the session should emit a catch-up WorkspaceIndexReady once
+    /// subscribe completes so the local side eventually observes readiness.
+    #[tokio::test]
+    async fn test_subscribe_events_reemits_workspace_index_ready_if_already_ready() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+
+        let f = AgentConfigFixture::new().await;
+        let session_id = format!("s-f5-ready-{}", test_id);
+
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let root = temp_dir.path().to_path_buf();
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").expect("write fixture file");
+
+        let runtime = SessionRuntime::new(
+            Some(root.clone()),
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+
+        // Simulate "index was already built" before SubscribeEvents by pre-setting
+        // runtime.workspace_handle.
+        let workspace = WorkspaceIndexActor::create(
+            root.clone(),
+            FileIndexConfig::default(),
+            FunctionIndexConfig::default(),
+        )
+        .await
+        .expect("create workspace index");
+        assert!(
+            runtime.workspace_handle.set(workspace).is_ok(),
+            "workspace handle should be unset"
+        );
+
+        let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime)
+            .with_mesh(Some(mesh.clone()));
+        let session_ref_local = SessionActor::spawn(actor);
+        let session_ref = SessionActorRef::Local(session_ref_local);
+
+        // Register relay expected by SubscribeEvents.
+        let relay_dht_name =
+            crate::agent::remote::dht_name::event_relay(&session_id, mesh.peer_id());
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let journal = storage.event_journal();
+        let fanout = Arc::new(EventFanout::new());
+        let relay_sink = Arc::new(EventSink::new(journal, fanout));
+        let relay = EventRelayActor::new(
+            relay_sink.clone(),
+            session_id.clone(),
+            "f5-ready-relay".to_string(),
+            None,
+            None,
+        );
+        let relay_ref = EventRelayActor::spawn(relay);
+        mesh.register_actor(relay_ref.clone(), relay_dht_name.clone())
+            .await;
+        let _ = relay_ref;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut rx = relay_sink.fanout().subscribe();
+
+        session_ref
+            .subscribe_events(123, relay_dht_name.clone())
+            .await
+            .expect("subscribe_events should succeed");
+
+        // Catch-up event should be forwarded shortly after subscribe.
+        let mut saw_ready = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv()).await {
+                Ok(Ok(EventEnvelope::Durable(de)))
+                    if matches!(de.kind, AgentEventKind::WorkspaceIndexReady { .. })
+                        && de.session_id == session_id =>
+                {
+                    saw_ready = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+
+        assert!(
+            saw_ready,
+            "expected catch-up WorkspaceIndexReady after SubscribeEvents for pre-ready workspace"
+        );
+    }
+
+    // ── F.5b — Session-id filtering ─────────────────────────────────────────
+
+    /// EventForwarder must only forward events whose session_id matches the
+    /// session it was created for.  Events for other sessions on the same
+    /// global fanout must be silently dropped.
+    #[tokio::test]
+    async fn test_event_forwarder_filters_by_session_id() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+        let (relay_ref, event_sink, dht_name) =
+            setup_relay("f5b", &test_id, "target-session").await;
+        let _ = relay_ref; // keep alive
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let remote_relay = mesh
+            .lookup_actor::<EventRelayActor>(&dht_name)
+            .await
+            .expect("DHT lookup")
+            .expect("relay not in DHT");
+
+        let source_fanout = Arc::new(EventFanout::new());
+        let mut rx = event_sink.fanout().subscribe();
+
+        // Forwarder is scoped to "target-session" only
+        let _handle = EventForwarder::start(
+            source_fanout.clone(),
+            remote_relay,
+            "test-source-f5b".to_string(),
+            "target-session".to_string(),
+        );
+
+        // Publish event for a DIFFERENT session — must be dropped by forwarder
+        source_fanout.publish(EventEnvelope::Durable(
+            querymt_agent_core::events::DurableEvent {
+                session_seq: 0,
+                event_id: "e-other".into(),
+                stream_seq: 1,
+                session_id: "other-session".into(),
+                timestamp: 100,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::SessionCreated,
+            },
+        ));
+
+        // Publish event for the TARGET session — must be forwarded
+        source_fanout.publish(EventEnvelope::Durable(
+            querymt_agent_core::events::DurableEvent {
+                session_seq: 0,
+                event_id: "e-target".into(),
+                stream_seq: 2,
+                session_id: "target-session".into(),
+                timestamp: 200,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::SessionCreated,
+            },
+        ));
+
+        // We should receive exactly the target-session event
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timeout — target event should arrive")
+            .expect("recv");
+
+        assert_eq!(
+            received.session_id(),
+            "target-session",
+            "forwarder must only forward events for its session_id"
+        );
+
+        // Give a generous window for any spurious second event to arrive
+        let spurious = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await;
+        assert!(
+            spurious.is_err(),
+            "no second event should arrive — the other-session event must have been filtered out"
+        );
+    }
+
+    /// When multiple forwarders subscribe to the same fanout (simulating N
+    /// attached remote sessions), each must only forward events for its own
+    /// session.  This is the exact regression scenario: 3 sessions attached,
+    /// prompt on session A should NOT appear 3x.
+    #[tokio::test]
+    async fn test_multiple_forwarders_no_cross_session_duplication() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+
+        // Set up 3 relays (simulating 3 attached remote sessions on local side)
+        let (relay_ref_a, sink_a, dht_a) = setup_relay("multi-a", &test_id, "session-a").await;
+        let (relay_ref_b, sink_b, dht_b) = setup_relay("multi-b", &test_id, "session-b").await;
+        let (relay_ref_c, sink_c, dht_c) = setup_relay("multi-c", &test_id, "session-c").await;
+        let _ = (relay_ref_a, relay_ref_b, relay_ref_c);
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let remote_a = mesh
+            .lookup_actor::<EventRelayActor>(&dht_a)
+            .await
+            .unwrap()
+            .unwrap();
+        let remote_b = mesh
+            .lookup_actor::<EventRelayActor>(&dht_b)
+            .await
+            .unwrap()
+            .unwrap();
+        let remote_c = mesh
+            .lookup_actor::<EventRelayActor>(&dht_c)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Shared source fanout (the global EventFanout on the NAS)
+        let source_fanout = Arc::new(EventFanout::new());
+
+        let mut rx_a = sink_a.fanout().subscribe();
+        let mut rx_b = sink_b.fanout().subscribe();
+        let mut rx_c = sink_c.fanout().subscribe();
+
+        // Each forwarder is scoped to its own session
+        let _h_a = EventForwarder::start(
+            source_fanout.clone(),
+            remote_a,
+            "fwd-a".to_string(),
+            "session-a".to_string(),
+        );
+        let _h_b = EventForwarder::start(
+            source_fanout.clone(),
+            remote_b,
+            "fwd-b".to_string(),
+            "session-b".to_string(),
+        );
+        let _h_c = EventForwarder::start(
+            source_fanout.clone(),
+            remote_c,
+            "fwd-c".to_string(),
+            "session-c".to_string(),
+        );
+
+        // Publish event for session-a only
+        source_fanout.publish(EventEnvelope::Durable(
+            querymt_agent_core::events::DurableEvent {
+                session_seq: 0,
+                event_id: "e-a".into(),
+                stream_seq: 1,
+                session_id: "session-a".into(),
+                timestamp: 100,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::SessionCreated,
+            },
+        ));
+
+        // Relay A should receive it
+        let got_a = tokio::time::timeout(std::time::Duration::from_millis(500), rx_a.recv())
+            .await
+            .expect("relay A should receive session-a event")
+            .expect("recv");
+        assert_eq!(got_a.session_id(), "session-a");
+
+        // Relay B and C must NOT receive it
+        let got_b = tokio::time::timeout(std::time::Duration::from_millis(300), rx_b.recv()).await;
+        assert!(
+            got_b.is_err(),
+            "relay B must not receive session-a events (cross-session leak)"
+        );
+
+        let got_c = tokio::time::timeout(std::time::Duration::from_millis(300), rx_c.recv()).await;
+        assert!(
+            got_c.is_err(),
+            "relay C must not receive session-a events (cross-session leak)"
+        );
+    }
+
+    // ── F.6 — Unsubscribe lifecycle ──────────────────────────────────────────
+
+    /// Verifies subscribe+unsubscribe stops the forwarder task.
+    #[tokio::test]
+    async fn test_unsubscribe_events_stops_forwarder() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+
+        let f = AgentConfigFixture::new().await;
+        let session_id = format!("s-f6-{}", test_id);
+
+        let runtime = SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime)
+            .with_mesh(Some(mesh.clone()));
+        let session_ref_local = SessionActor::spawn(actor);
+        let session_ref = SessionActorRef::Local(session_ref_local);
+
+        // Register a relay so subscribe actually starts a forwarder.
+        let relay_dht_name =
+            crate::agent::remote::dht_name::event_relay(&session_id, mesh.peer_id());
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let journal = storage.event_journal();
+        let fanout = Arc::new(EventFanout::new());
+        let relay_sink = Arc::new(EventSink::new(journal, fanout));
+        let relay = EventRelayActor::new(
+            relay_sink,
+            session_id.clone(),
+            "f6-relay".to_string(),
+            None,
+            None,
+        );
+        let relay_ref = EventRelayActor::spawn(relay);
+        mesh.register_actor(relay_ref.clone(), relay_dht_name.clone())
+            .await;
+        let _ = relay_ref;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        session_ref
+            .subscribe_events(7, relay_dht_name.clone())
+            .await
+            .expect("subscribe");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Unsubscribe — the forwarder task should be aborted.
+        let result = session_ref.unsubscribe_events(7, relay_dht_name).await;
+        assert!(result.is_ok(), "unsubscribe_events should return Ok");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // After unsubscribe, the forwarder task is aborted. We can't easily
+        // observe this externally, but at minimum unsubscribe must succeed
+        // without error.
+    }
+
+    #[tokio::test]
+    async fn transactional_replacement_keeps_old_until_commit_and_rejects_stale_commit() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+        let fixture = AgentConfigFixture::new().await;
+        let session_id = format!("s-replace-{test_id}");
+        let actor = SessionActor::new(
+            fixture.config.clone(),
+            session_id.clone(),
+            SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        )
+        .with_mesh(Some(mesh.clone()));
+        let local_ref = SessionActor::spawn(actor);
+        let session_dht = crate::agent::remote::scope::scoped_session(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &session_id,
+        );
+        mesh.register_actor(local_ref, session_dht.clone()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let remote_ref = mesh
+            .lookup_actor::<SessionActor>(&session_dht)
+            .await
+            .expect("DHT lookup")
+            .expect("remote session");
+
+        let mut registry = crate::agent::session_registry::SessionRegistry::new(fixture.config);
+        let first = crate::agent::session_registry::prepare_remote_attachment(
+            registry.remote_attachment_prepare_context(),
+            session_id.clone(),
+            remote_ref.clone(),
+            "peer".to_string(),
+            Some(mesh.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect("prepare first");
+        let first_id = first.attachment_id();
+        assert!(registry.install_remote_attachment(first, None).is_ok());
+
+        let second = crate::agent::session_registry::prepare_remote_attachment(
+            registry.remote_attachment_prepare_context(),
+            session_id.clone(),
+            remote_ref.clone(),
+            "peer".to_string(),
+            Some(mesh.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect("prepare second");
+        let second_id = second.attachment_id();
+        assert_eq!(registry.remote_attachment_id(&session_id), Some(first_id));
+        let replacement = registry.install_remote_attachment(second, Some(first_id));
+        assert!(replacement.is_ok(), "matching replacement commit");
+        let old = replacement.ok().flatten().expect("old attachment returned");
+        assert_eq!(old.attachment_id, first_id);
+        assert_eq!(registry.remote_attachment_id(&session_id), Some(second_id));
+
+        let stale = crate::agent::session_registry::prepare_remote_attachment(
+            registry.remote_attachment_prepare_context(),
+            session_id.clone(),
+            remote_ref,
+            "peer".to_string(),
+            Some(mesh.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect("prepare stale candidate");
+        let stale_commit = registry.install_remote_attachment(stale, Some(first_id));
+        assert!(stale_commit.is_err(), "stale commit must be rejected");
+        let (stale, conflict) = *stale_commit.err().unwrap();
+        assert_eq!(conflict.current_attachment_id, Some(second_id));
+        assert_eq!(registry.remote_attachment_id(&session_id), Some(second_id));
+
+        crate::agent::session_registry::abort_prepared_remote_attachment(stale).await;
+        crate::agent::session_registry::cleanup_installed_remote_attachment(old, true).await;
+        let current = registry.take_remote_attachment(&session_id).unwrap();
+        crate::agent::session_registry::cleanup_installed_remote_attachment(current, true).await;
+    }
+
+    // ── F.7 — Detach lifecycle (unsubscribe on remove) ───────────────────────
+
+    /// When a remote session is detached via `SessionRegistry::detach_remote_session`,
+    /// the registry must send `UnsubscribeEvents` to the remote session actor so
+    /// the forwarder task is stopped.  After detach, events published to the
+    /// session's fanout must NOT arrive at the local relay.
+    #[tokio::test]
+    async fn test_detach_remote_session_unsubscribes_and_stops_forwarding() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+
+        let f = AgentConfigFixture::new().await;
+        let session_id = format!("s-f7-{}", test_id);
+
+        // --- remote side: spawn SessionActor with mesh ---
+        let runtime = SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime)
+            .with_mesh(Some(mesh.clone()));
+        let session_ref_local = SessionActor::spawn(actor);
+
+        // Register session in DHT so attach can find it
+        let session_dht = crate::agent::remote::scope::scoped_session(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &session_id,
+        );
+        mesh.register_actor(session_ref_local.clone(), session_dht)
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Resolve as RemoteActorRef (simulates the attach path)
+        let session_dht_lookup = crate::agent::remote::scope::scoped_session(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &session_id,
+        );
+        let remote_session = mesh
+            .lookup_actor::<SessionActor>(&session_dht_lookup)
+            .await
+            .expect("DHT lookup")
+            .expect("session not in DHT");
+
+        // --- local side: attach via registry ---
+        let mut registry = crate::agent::session_registry::SessionRegistry::new(f.config.clone());
+        let context = registry.remote_attachment_prepare_context();
+        let prepared = crate::agent::session_registry::prepare_remote_attachment(
+            context,
+            session_id.clone(),
+            remote_session,
+            "test-peer".to_string(),
+            Some(mesh.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect("prepare remote attachment");
+        assert!(
+            registry.install_remote_attachment(prepared, None).is_ok(),
+            "install remote attachment"
+        );
+
+        // Verify events flow before detach: publish → relay → local fanout
+        let mut rx = f.config.event_sink.fanout().subscribe();
+
+        // Wait for the forwarder to fully start
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut flowing = false;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            f.config.event_sink.fanout().publish(EventEnvelope::Durable(
+                querymt_agent_core::events::DurableEvent {
+                    session_seq: 0,
+                    event_id: "e-f7-pre".into(),
+                    stream_seq: 1,
+                    session_id: session_id.clone(),
+                    timestamp: 100,
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::SessionCreated,
+                },
+            ));
+            // We'll see our own publish on the local fanout plus potentially the relayed copy.
+            // Drain and look for a Remote-origin event (relayed back from the forwarder).
+            match tokio::time::timeout(std::time::Duration::from_millis(300), async {
+                loop {
+                    match rx.recv().await {
+                        Ok(env) if env.is_durable() => {
+                            if let EventEnvelope::Durable(de) = &env
+                                && matches!(de.origin, EventOrigin::Remote)
+                            {
+                                return true;
+                            }
+                        }
+                        Ok(_) => continue,
+                        Err(_) => return false,
+                    }
+                }
+            })
+            .await
+            {
+                Ok(true) => {
+                    flowing = true;
+                    break;
+                }
+                _ => {
+                    rx = f.config.event_sink.fanout().subscribe();
+                }
+            }
+        }
+        assert!(flowing, "events should flow through relay before detach");
+
+        // --- detach ---
+        let attachment = registry
+            .take_remote_attachment(&session_id)
+            .expect("installed attachment");
+        crate::agent::session_registry::cleanup_installed_remote_attachment(attachment, true).await;
+
+        // After detach the session should be removed from the registry
+        assert!(
+            registry.get(&session_id).is_none(),
+            "session must be removed from registry after detach"
+        );
+
+        // Give the forwarder task time to be aborted
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Re-subscribe to get a clean receiver after unsubscribe handling.
+        let mut rx2 = f.config.event_sink.fanout().subscribe();
+
+        // Publish a fresh event — it should NOT be relayed back anymore.
+        // Only treat a Remote-origin copy of this specific post-detach event
+        // as a failure so delayed delivery of an earlier probe event does not
+        // make the test flaky under suite load.
+        let post_detach_event_id = "e-f7-post";
+        f.config.event_sink.fanout().publish(EventEnvelope::Durable(
+            querymt_agent_core::events::DurableEvent {
+                session_seq: 0,
+                event_id: post_detach_event_id.into(),
+                stream_seq: 99,
+                session_id: session_id.clone(),
+                timestamp: 999,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::SessionCreated,
+            },
+        ));
+
+        // We should see the local publish but NO Remote-origin relay copy of
+        // the post-detach event.
+        let mut saw_remote = false;
+        let check_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while tokio::time::Instant::now() < check_deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx2.recv()).await {
+                Ok(Ok(EventEnvelope::Durable(de)))
+                    if matches!(de.origin, EventOrigin::Remote)
+                        && de.session_id == session_id
+                        && de.event_id == post_detach_event_id =>
+                {
+                    saw_remote = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(
+            !saw_remote,
+            "after detach_remote_session, no Remote-origin events should arrive"
+        );
+    }
+}

@@ -1,0 +1,1862 @@
+use async_trait::async_trait;
+use time::OffsetDateTime;
+
+use crate::session::repo_artifact::SqliteArtifactRepository;
+use crate::session::repo_decision::SqliteDecisionRepository;
+use crate::session::repo_delegation::SqliteDelegationRepository;
+use crate::session::repo_intent::SqliteIntentRepository;
+use crate::session::repo_progress::SqliteProgressRepository;
+use crate::session::repo_session::SqliteSessionRepository;
+use crate::session::repo_task::SqliteTaskRepository;
+use querymt::chat::FinishReason;
+use querymt_agent_core::events::AgentEvent;
+use querymt_agent_core::session::domain::TaskStatus;
+use querymt_agent_core::session::error::SessionResult;
+use querymt_agent_core::session::lifecycle::{
+    ArchiveFilter, ResolutionFilter, SessionLifecycle, SessionLifecycleFilter,
+};
+use querymt_agent_core::session::projection::{
+    AuditView, DefaultRedactor, EventJournal, FilterExpr, PredicateOp, RecentModelEntry,
+    RecentModelsView, RedactedArtifact, RedactedProgress, RedactedTask, RedactedView,
+    RedactionPolicy, Redactor, SessionGroup, SessionListFilter, SessionListItem,
+    SessionListMetaStats, SessionListView, SessionScope, SummaryView, ViewStore,
+};
+use querymt_agent_core::session::repository::{
+    ArtifactRepository, DecisionRepository, DelegationRepository, IntentRepository,
+    ProgressRepository, SessionRepository, TaskRepository,
+};
+use querymt_agent_core::session::store::{Session, SessionStore};
+use rusqlite::{OptionalExtension, params, params_from_iter};
+use std::collections::HashMap;
+
+use super::SqliteStorage;
+
+/// Truncate a session title / intent summary to at most 80 bytes (UTF-8-safe).
+fn truncate_title(summary: String) -> String {
+    querymt_agent_core::session::projection::truncate_with_ellipsis(&summary, 80)
+}
+
+fn parse_rfc3339_option(raw: Option<String>) -> Option<OffsetDateTime> {
+    raw.and_then(|value| {
+        time::OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339).ok()
+    })
+}
+
+fn map_session_list_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionListItem> {
+    let fork_count = row.get::<_, i64>(8)? as usize;
+    Ok(SessionListItem {
+        session_id: row.get(0)?,
+        workspace: None,
+        name: row.get(1)?,
+        cwd: row.get(2)?,
+        title: row.get::<_, Option<String>>(9)?.map(truncate_title),
+        created_at: parse_rfc3339_option(row.get(3)?),
+        updated_at: parse_rfc3339_option(row.get(4)?),
+        parent_session_id: row.get(5)?,
+        fork_origin: row.get(6)?,
+        session_kind: row.get(7)?,
+        has_children: fork_count > 0,
+        fork_count,
+        pending_isolation: false,
+    })
+}
+
+fn load_workspace_views(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<HashMap<String, querymt_agent_core::session::projection::SessionWorkspaceView>>
+{
+    // Current owners, then previous owners (via the durable handoff markers):
+    // a previous owner keeps its workspace view with `handedOffTo` naming the
+    // session it gave the checkout to, so it stays in its project group.
+    const COLUMNS: &str = "w.public_id, w.common_dir, w.project_name, w.checkout_path, w.branch, w.baseline_mode, w.baseline_commit, w.lifecycle, w.last_error, COALESCE(w.source_cwd, ''), w.owner_session_id";
+    let map_row = |row: &rusqlite::Row<'_>,
+                   handed_off_to: Option<String>|
+     -> rusqlite::Result<
+        querymt_agent_core::session::projection::SessionWorkspaceView,
+    > {
+        Ok(
+            querymt_agent_core::session::projection::SessionWorkspaceView {
+                workspace_id: row.get(0)?,
+                repository_id: row.get(1)?,
+                project_name: row.get(2)?,
+                checkout_path: row.get(3)?,
+                branch: row.get(4)?,
+                baseline_mode: row.get(5)?,
+                baseline_commit: row.get(6)?,
+                lifecycle: row.get(7)?,
+                last_error: row.get(8)?,
+                source_cwd: row.get(9)?,
+                owner_session_id: row.get(10)?,
+                handed_off_to,
+            },
+        )
+    };
+    let mut views = HashMap::new();
+    let mut owners = conn.prepare(&format!(
+        "SELECT {COLUMNS}, w.owner_session_id FROM workspaces w WHERE w.owner_session_id IS NOT NULL"
+    ))?;
+    let rows = owners.query_map([], |row| {
+        let owner: String = row.get(11)?;
+        Ok((owner, map_row(row, None)?))
+    })?;
+    for row in rows {
+        let (owner, view) = row?;
+        views.insert(owner, view);
+    }
+    let mut previous = conn.prepare(&format!(
+        "SELECT {COLUMNS}, h.from_session_id, h.to_session_id \
+         FROM workspace_handoffs h JOIN workspaces w ON w.public_id = h.workspace_public_id"
+    ))?;
+    let rows = previous.query_map([], |row| {
+        let from: String = row.get(11)?;
+        let to: String = row.get(12)?;
+        Ok((from, map_row(row, Some(to))?))
+    })?;
+    for row in rows {
+        let (from, view) = row?;
+        views.insert(from, view);
+    }
+    Ok(views)
+}
+
+fn enrich_workspace_views(
+    conn: &rusqlite::Connection,
+    items: &mut [SessionListItem],
+) -> rusqlite::Result<()> {
+    let views = load_workspace_views(conn)?;
+    for item in items {
+        item.workspace = views.get(&item.session_id).cloned();
+    }
+    Ok(())
+}
+
+/// Sessions with an outstanding fork-isolation intent are not runnable;
+/// expose that pending/failed creation state on the list item so consumers
+/// never mistake an isolated fork for a legacy local session.
+fn enrich_fork_isolation_state(
+    conn: &rusqlite::Connection,
+    items: &mut [SessionListItem],
+) -> rusqlite::Result<()> {
+    let pending: std::collections::HashSet<String> = conn
+        .prepare(
+            "SELECT s.public_id FROM session_fork_isolation_intents i
+             JOIN sessions s ON s.id = i.session_id",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    for item in items.iter_mut() {
+        if pending.contains(&item.session_id) {
+            item.pending_isolation = true;
+        }
+    }
+    Ok(())
+}
+
+/// Enrich items with durable workspace provenance and pending fork-isolation
+/// state.
+fn enrich_workspace_and_isolation_views(
+    conn: &rusqlite::Connection,
+    items: &mut [SessionListItem],
+) -> rusqlite::Result<()> {
+    enrich_workspace_views(conn, items)?;
+    enrich_fork_isolation_state(conn, items)
+}
+
+fn parse_finish_reason(value: &str) -> Option<FinishReason> {
+    match value {
+        "Stop" | "stop" => Some(FinishReason::Stop),
+        "Length" | "length" => Some(FinishReason::Length),
+        "ContentFilter" | "content_filter" => Some(FinishReason::ContentFilter),
+        "ToolCalls" | "tool_calls" => Some(FinishReason::ToolCalls),
+        "Error" | "error" => Some(FinishReason::Error),
+        "Other" | "other" => Some(FinishReason::Other),
+        "Unknown" | "unknown" => Some(FinishReason::Unknown),
+        _ => None,
+    }
+}
+
+/// SQL expression yielding the project grouping key of session alias `alias`.
+///
+/// Managed sessions group under the cwd their workspace was created from
+/// (`workspaces.source_cwd`, kept after archive and removal); every other
+/// session groups under its own cwd. One definition keeps browse, list,
+/// search, counts and latest-activity queries in agreement.
+fn group_key_sql(alias: &str) -> String {
+    format!(
+        "COALESCE(NULLIF((SELECT w.source_cwd FROM workspaces w WHERE w.owner_session_id = {alias}.public_id), ''), \
+         NULLIF((SELECT w.source_cwd FROM workspace_handoffs h JOIN workspaces w ON w.public_id = h.workspace_public_id WHERE h.from_session_id = {alias}.public_id), ''), \
+         {alias}.cwd)"
+    )
+}
+
+/// Fork origins listed as visible children (forks and worktree siblings).
+/// Delegates are deliberately absent. Every fork scope, `fork_count`
+/// subquery and children listing interpolates this one constant.
+pub(super) const VISIBLE_FORK_ORIGINS: &str = "('user', 'worktree')";
+
+fn session_scope_where(scope: SessionScope, alias: &str) -> String {
+    match scope {
+        SessionScope::All => "1 = 1".to_string(),
+        SessionScope::Root => format!("{alias}.parent_session_id IS NULL"),
+        SessionScope::Forks => format!(
+            "{alias}.parent_session_id IS NOT NULL AND {alias}.fork_origin IN {VISIBLE_FORK_ORIGINS}"
+        ),
+        SessionScope::Children => format!("{alias}.parent_session_id IS NOT NULL"),
+        SessionScope::Delegates => format!(
+            "{}.parent_session_id IS NOT NULL AND {}.fork_origin = 'delegation'",
+            alias, alias
+        ),
+    }
+}
+
+fn lifecycle_filter_where(filter: SessionLifecycleFilter, alias: &str) -> String {
+    let resolution = match filter.resolution {
+        ResolutionFilter::Any => "1 = 1".to_string(),
+        ResolutionFilter::Open => format!(
+            "NOT EXISTS (SELECT 1 FROM session_lifecycle l WHERE l.session_id = {alias}.id AND l.resolved_at IS NOT NULL)"
+        ),
+        ResolutionFilter::Resolved => format!(
+            "EXISTS (SELECT 1 FROM session_lifecycle l WHERE l.session_id = {alias}.id AND l.resolved_at IS NOT NULL)"
+        ),
+    };
+    let archive = match filter.archive {
+        ArchiveFilter::Any => "1 = 1".to_string(),
+        ArchiveFilter::Excluded => format!(
+            "NOT EXISTS (SELECT 1 FROM session_lifecycle l WHERE l.session_id = {alias}.id AND l.archived_at IS NOT NULL)"
+        ),
+        ArchiveFilter::Only => format!(
+            "EXISTS (SELECT 1 FROM session_lifecycle l WHERE l.session_id = {alias}.id AND l.archived_at IS NOT NULL)"
+        ),
+    };
+    format!("({resolution}) AND ({archive})")
+}
+
+fn session_pin_filter_where(pinned: Option<bool>, alias: &str) -> String {
+    match pinned {
+        Some(true) => format!("{alias}.session_id IS NOT NULL"),
+        Some(false) => format!("{alias}.session_id IS NULL"),
+        None => "1 = 1".to_owned(),
+    }
+}
+
+#[async_trait]
+impl ViewStore for SqliteStorage {
+    async fn get_audit_view(
+        &self,
+        session_id: &str,
+        include_children: bool,
+    ) -> SessionResult<AuditView> {
+        let mut view = self.get_audit_view_metadata(session_id).await?;
+        let mut events: Vec<AgentEvent> = self
+            .load_session_stream(session_id, None, None)
+            .await?
+            .into_iter()
+            .map(AgentEvent::from)
+            .collect();
+
+        // Include child session events (delegations) if requested
+        if include_children {
+            let session_repo = SqliteSessionRepository::new(self.conn.clone());
+            let child_session_ids = session_repo.list_child_sessions(session_id).await?;
+            for child_id in &child_session_ids {
+                let child_events: Vec<AgentEvent> = self
+                    .load_session_stream(child_id, None, None)
+                    .await?
+                    .into_iter()
+                    .map(AgentEvent::from)
+                    .collect();
+                events.extend(child_events);
+            }
+        }
+
+        // Sort by sequence number for correct chronological order
+        events.sort_by_key(|e| e.seq);
+        view.events = events;
+        Ok(view)
+    }
+
+    async fn get_audit_view_metadata(&self, session_id: &str) -> SessionResult<AuditView> {
+        let task_repo = SqliteTaskRepository::new(self.conn.clone());
+        let intent_repo = SqliteIntentRepository::new(self.conn.clone());
+        let decision_repo = SqliteDecisionRepository::new(self.conn.clone());
+        let progress_repo = SqliteProgressRepository::new(self.conn.clone());
+        let artifact_repo = SqliteArtifactRepository::new(self.conn.clone());
+        let delegation_repo = SqliteDelegationRepository::new(self.conn.clone());
+
+        let tasks = task_repo.list_tasks(session_id).await?;
+        let intent_snapshots = intent_repo.list_intent_snapshots(session_id).await?;
+        let decisions = decision_repo.list_decisions(session_id, None).await?;
+        let progress_entries = progress_repo
+            .list_progress_entries(session_id, None)
+            .await?;
+        let artifacts = artifact_repo.list_artifacts(session_id, None).await?;
+        let delegations = delegation_repo.list_delegations(session_id).await?;
+
+        Ok(AuditView {
+            session_id: session_id.to_string(),
+            events: Vec::new(),
+            tasks,
+            intent_snapshots,
+            decisions,
+            progress_entries,
+            artifacts,
+            delegations,
+            generated_at: OffsetDateTime::now_utc(),
+        })
+    }
+
+    async fn get_redacted_view(
+        &self,
+        session_id: &str,
+        policy: RedactionPolicy,
+    ) -> SessionResult<RedactedView> {
+        let redactor = DefaultRedactor;
+
+        let intent_repo = SqliteIntentRepository::new(self.conn.clone());
+        let task_repo = SqliteTaskRepository::new(self.conn.clone());
+        let progress_repo = SqliteProgressRepository::new(self.conn.clone());
+        let artifact_repo = SqliteArtifactRepository::new(self.conn.clone());
+
+        // Get current intent
+        let intent_snapshots = intent_repo.list_intent_snapshots(session_id).await?;
+        let current_intent = intent_snapshots
+            .last()
+            .map(|s| redactor.redact(&s.summary, policy));
+
+        // Resolve the selected task through the session pointer, not active status alone.
+        let session = SqliteSessionRepository::new(self.conn.clone())
+            .get_session(session_id)
+            .await?;
+        let tasks = task_repo.list_tasks(session_id).await?;
+        let active_task = session
+            .and_then(|session| session.active_task_id)
+            .and_then(|current_id| {
+                tasks
+                    .iter()
+                    .find(|task| task.id == current_id && matches!(task.status, TaskStatus::Active))
+            })
+            .map(|task| RedactedTask {
+                id: task.public_id.clone(),
+                status: format!("{:?}", task.status),
+                revision: task.revision,
+                current_task: true,
+                expected_deliverable: task
+                    .expected_deliverable
+                    .as_ref()
+                    .map(|deliverable| redactor.redact(deliverable, policy)),
+            });
+
+        // Get recent progress (last 10 entries)
+        let all_progress = progress_repo
+            .list_progress_entries(session_id, None)
+            .await?;
+        let recent_progress: Vec<RedactedProgress> = all_progress
+            .iter()
+            .rev()
+            .take(10)
+            .map(|p| RedactedProgress {
+                kind: format!("{:?}", p.kind),
+                summary: redactor.redact(&p.content, policy),
+                created_at: p.created_at,
+            })
+            .collect();
+
+        // Get artifacts
+        let all_artifacts = artifact_repo.list_artifacts(session_id, None).await?;
+        let artifacts: Vec<RedactedArtifact> = all_artifacts
+            .iter()
+            .map(|a| RedactedArtifact {
+                kind: a.kind.clone(),
+                summary: a.summary.as_ref().map(|s| redactor.redact(s, policy)),
+                created_at: a.created_at,
+            })
+            .collect();
+
+        Ok(RedactedView {
+            session_id: session_id.to_string(),
+            current_intent,
+            active_task,
+            recent_progress,
+            artifacts,
+            generated_at: OffsetDateTime::now_utc(),
+        })
+    }
+
+    async fn get_summary_view(&self, session_id: &str) -> SessionResult<SummaryView> {
+        let intent_repo = SqliteIntentRepository::new(self.conn.clone());
+        let task_repo = SqliteTaskRepository::new(self.conn.clone());
+        let decision_repo = SqliteDecisionRepository::new(self.conn.clone());
+        let progress_repo = SqliteProgressRepository::new(self.conn.clone());
+        let artifact_repo = SqliteArtifactRepository::new(self.conn.clone());
+
+        // Get current intent
+        let intent_snapshots = intent_repo.list_intent_snapshots(session_id).await?;
+        let current_intent = intent_snapshots.last().map(|s| s.summary.clone());
+
+        // Get active task status
+        let tasks = task_repo.list_tasks(session_id).await?;
+        let active_task_status = tasks
+            .iter()
+            .find(|t| matches!(t.status, TaskStatus::Active))
+            .map(|t| format!("{:?}", t.status));
+
+        // Count entities
+        let decisions = decision_repo.list_decisions(session_id, None).await?;
+        let progress_entries = progress_repo
+            .list_progress_entries(session_id, None)
+            .await?;
+        let artifacts = artifact_repo.list_artifacts(session_id, None).await?;
+
+        // Get last activity
+        let last_activity = progress_entries.last().map(|p| {
+            format!(
+                "{:?}: {}",
+                p.kind,
+                p.content.chars().take(50).collect::<String>()
+            )
+        });
+
+        Ok(SummaryView {
+            session_id: session_id.to_string(),
+            current_intent,
+            active_task_status,
+            progress_count: progress_entries.len(),
+            artifact_count: artifacts.len(),
+            decision_count: decisions.len(),
+            last_activity,
+            generated_at: OffsetDateTime::now_utc(),
+        })
+    }
+
+    async fn get_session_list_view(
+        &self,
+        filter: Option<SessionListFilter>,
+    ) -> SessionResult<SessionListView> {
+        self.get_session_list_view_with_lifecycle(filter, SessionLifecycleFilter::default())
+            .await
+    }
+
+    #[tracing::instrument(
+        name = "session.get_session_list_view",
+        skip(self, filter),
+        fields(
+            session_count = tracing::field::Empty,
+            filtered_out_count = tracing::field::Empty,
+            total_count = tracing::field::Empty,
+            group_count = tracing::field::Empty,
+            title_lookup_count = tracing::field::Empty,
+            total_ms = tracing::field::Empty,
+            list_sessions_ms = tracing::field::Empty,
+            filter_ms = tracing::field::Empty,
+            title_lookup_ms = tracing::field::Empty,
+            hierarchy_build_ms = tracing::field::Empty,
+            group_build_ms = tracing::field::Empty
+        )
+    )]
+    async fn get_session_list_view_with_lifecycle(
+        &self,
+        filter: Option<SessionListFilter>,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<SessionListView> {
+        use std::collections::{HashMap, HashSet};
+        use std::time::Instant;
+
+        let started = Instant::now();
+
+        // ---------------------------------------------------------------------------
+        // Single query: fetch sessions with their initial intent title, recurring
+        // flag, and direct user-fork count — replacing the old N+1 per-session lookups.
+        // ---------------------------------------------------------------------------
+        let list_sessions_started = Instant::now();
+
+        struct RawRow {
+            id: i64,
+            public_id: String,
+            name: Option<String>,
+            cwd: Option<String>,
+            created_at: Option<String>,
+            updated_at: Option<String>,
+            parent_session_id_internal: Option<i64>,
+            parent_session_public_id: Option<String>,
+            fork_origin: Option<String>,
+            session_kind: Option<String>,
+            initial_intent: Option<String>,
+            is_recurring: bool,
+            fork_count: usize,
+        }
+
+        // Extract SQL-level limit from filter before moving into the closure.
+        // A limit without a filter expression can be pushed straight into SQL,
+        // avoiding deserializing rows we'll discard anyway.
+        let sql_limit: Option<usize> = filter.as_ref().and_then(|f| {
+            if f.filter.is_none() && f.offset.unwrap_or(0) == 0 {
+                f.limit
+            } else {
+                None
+            }
+        });
+        let lifecycle_where = lifecycle_filter_where(lifecycle, "s");
+
+        let raw_rows: Vec<RawRow> = self
+            .run_blocking(move |conn| {
+                // Build query with optional LIMIT pushed into SQL when there is
+                // no predicate filter (predicates still require in-memory eval).
+                let sql = if let Some(_limit) = sql_limit {
+                    format!(
+                        r#"
+                        SELECT
+                            s.id,
+                            s.public_id,
+                            s.name,
+                            s.cwd,
+                            s.created_at,
+                            s.updated_at,
+                            s.parent_session_id,
+                            parent.public_id,
+                            s.fork_origin,
+                            s.session_kind,
+                            i.summary                                    AS initial_intent,
+                            EXISTS(
+                                SELECT 1 FROM tasks t
+                                WHERE t.session_id = s.id AND t.kind = 'recurring'
+                            )                                            AS is_recurring,
+                            (SELECT COUNT(*) FROM sessions c
+                                WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}
+                            )                                            AS fork_count
+                        FROM sessions s
+                        LEFT JOIN intent_snapshots i
+                            ON i.id = (
+                                SELECT MIN(id) FROM intent_snapshots
+                                WHERE session_id = s.id
+                            )
+                        LEFT JOIN sessions parent ON parent.id = s.parent_session_id
+                        WHERE {lifecycle_where}
+                        ORDER BY s.updated_at DESC
+                        LIMIT ?1
+                        "#
+                    )
+                } else {
+                    format!(
+                        r#"
+                    SELECT
+                        s.id,
+                        s.public_id,
+                        s.name,
+                        s.cwd,
+                        s.created_at,
+                        s.updated_at,
+                        s.parent_session_id,
+                        parent.public_id,
+                        s.fork_origin,
+                        s.session_kind,
+                        i.summary                                    AS initial_intent,
+                        EXISTS(
+                            SELECT 1 FROM tasks t
+                            WHERE t.session_id = s.id AND t.kind = 'recurring'
+                        )                                            AS is_recurring,
+                        (SELECT COUNT(*) FROM sessions c
+                            WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}
+                        )                                            AS fork_count
+                    FROM sessions s
+                    LEFT JOIN intent_snapshots i
+                        ON i.id = (
+                            SELECT MIN(id) FROM intent_snapshots
+                            WHERE session_id = s.id
+                        )
+                    LEFT JOIN sessions parent ON parent.id = s.parent_session_id
+                    WHERE {lifecycle_where}
+                    ORDER BY s.updated_at DESC
+                    LIMIT ?1
+                    "#
+                    )
+                };
+
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(
+                    params![sql_limit.map(|limit| limit as i64).unwrap_or(-1)],
+                    |row| {
+                        Ok(RawRow {
+                            id: row.get(0)?,
+                            public_id: row.get(1)?,
+                            name: row.get(2)?,
+                            cwd: row.get(3)?,
+                            created_at: row.get(4)?,
+                            updated_at: row.get(5)?,
+                            parent_session_id_internal: row.get(6)?,
+                            parent_session_public_id: row.get(7)?,
+                            fork_origin: row.get(8)?,
+                            session_kind: row.get(9)?,
+                            initial_intent: row.get(10)?,
+                            is_recurring: row.get::<_, i64>(11)? != 0,
+                            fork_count: row.get::<_, i64>(12)? as usize,
+                        })
+                    },
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .await?;
+
+        let list_sessions_ms = list_sessions_started.elapsed().as_millis() as u64;
+        let session_count_before_filter = raw_rows.len();
+
+        let filter_started = Instant::now();
+
+        // Apply in-memory filter/limit (filter_expr needs the full Session struct;
+        // convert only the subset we need to evaluate the predicate).
+        let mut raw_rows = raw_rows;
+        let mut total_count = session_count_before_filter;
+        if let Some(filter_spec) = filter {
+            if let Some(filter_expr) = filter_spec.filter {
+                // Build minimal Session values for predicate evaluation.
+                // evaluate_session_filter only uses fields available in RawRow.
+                raw_rows.retain(|r| {
+                    // evaluate_session_filter only reads: public_id, name, cwd,
+                    // created_at, updated_at — so only those fields need values.
+                    let session = Session {
+                        id: r.id,
+                        public_id: r.public_id.clone(),
+                        name: r.name.clone(),
+                        cwd: r.cwd.as_deref().map(std::path::PathBuf::from),
+                        created_at: r.created_at.as_deref().and_then(|s| {
+                            time::OffsetDateTime::parse(
+                                s,
+                                &time::format_description::well_known::Rfc3339,
+                            )
+                            .ok()
+                        }),
+                        updated_at: r.updated_at.as_deref().and_then(|s| {
+                            time::OffsetDateTime::parse(
+                                s,
+                                &time::format_description::well_known::Rfc3339,
+                            )
+                            .ok()
+                        }),
+                        current_intent_snapshot_id: None,
+                        active_task_id: None,
+                        llm_config_id: None,
+                        parent_session_id: r.parent_session_id_internal,
+                        fork_origin: r.fork_origin.as_deref().and_then(|s| s.parse().ok()),
+                        session_kind: r.session_kind.clone(),
+                        fork_point_type: None,
+                        fork_point_ref: None,
+                        fork_instructions: None,
+                    };
+                    evaluate_session_filter(&session, &filter_expr)
+                });
+            }
+            total_count = raw_rows.len();
+            let offset = filter_spec.offset.unwrap_or(0);
+            if offset > 0 {
+                raw_rows = raw_rows.into_iter().skip(offset).collect();
+            }
+            if let Some(limit) = filter_spec.limit {
+                raw_rows.truncate(limit);
+            }
+        }
+
+        let filter_ms = filter_started.elapsed().as_millis() as u64;
+
+        // Build session list items
+        let title_lookup_started = Instant::now();
+        let mut items = Vec::with_capacity(raw_rows.len());
+
+        for row in raw_rows {
+            let title = row.initial_intent.map(truncate_title);
+
+            let parent_session_id = row.parent_session_public_id;
+
+            let session_kind = if row.is_recurring {
+                Some("recurring".to_string())
+            } else {
+                row.session_kind
+            };
+
+            items.push(SessionListItem {
+                session_id: row.public_id,
+                workspace: None,
+                pending_isolation: false,
+                name: row.name,
+                cwd: row.cwd,
+                title,
+                created_at: row.created_at.as_deref().and_then(|s| {
+                    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                        .ok()
+                }),
+                updated_at: row.updated_at.as_deref().and_then(|s| {
+                    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                        .ok()
+                }),
+                parent_session_id,
+                fork_origin: row.fork_origin,
+                session_kind,
+                has_children: row.fork_count > 0,
+                fork_count: row.fork_count,
+            });
+        }
+        let workspace_views = self.run_blocking(|conn| load_workspace_views(conn)).await?;
+        let pending_isolation: std::collections::HashSet<String> = self
+            .run_blocking(|conn| {
+                conn.prepare(
+                    "SELECT s.public_id FROM session_fork_isolation_intents i
+                         JOIN sessions s ON s.id = i.session_id",
+                )?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
+            })
+            .await?
+            .into_iter()
+            .collect();
+        for item in &mut items {
+            item.workspace = workspace_views.get(&item.session_id).cloned();
+            if pending_isolation.contains(&item.session_id) {
+                item.pending_isolation = true;
+            }
+        }
+        let title_lookup_ms = title_lookup_started.elapsed().as_millis() as u64;
+
+        // Build a parent-child map to organize sessions hierarchically
+        let hierarchy_started = Instant::now();
+        let mut parent_children_map: HashMap<String, Vec<SessionListItem>> = HashMap::new();
+        let mut root_sessions: Vec<SessionListItem> = Vec::new();
+        let included_session_ids: HashSet<String> =
+            items.iter().map(|item| item.session_id.clone()).collect();
+
+        for item in items {
+            if let Some(parent_id) = item
+                .parent_session_id
+                .as_ref()
+                .filter(|parent_id| included_session_ids.contains(*parent_id))
+            {
+                parent_children_map
+                    .entry(parent_id.clone())
+                    .or_default()
+                    .push(item);
+            } else {
+                root_sessions.push(item);
+            }
+        }
+
+        // Recursively attach children to their parents
+        fn attach_children(
+            session: &mut SessionListItem,
+            children_map: &HashMap<String, Vec<SessionListItem>>,
+        ) -> Vec<SessionListItem> {
+            let mut all_sessions = vec![session.clone()];
+
+            if let Some(children) = children_map.get(&session.session_id) {
+                for mut child in children.clone() {
+                    let child_descendants = attach_children(&mut child, children_map);
+                    all_sessions.extend(child_descendants);
+                }
+            }
+
+            all_sessions
+        }
+
+        // Flatten hierarchy while maintaining parent-child order
+        // Filter out delegated child sessions to prevent empty groups
+        let mut flat_items = Vec::new();
+        for mut root in root_sessions {
+            let sessions_with_descendants = attach_children(&mut root, &parent_children_map);
+            for session in sessions_with_descendants {
+                // Only include parent sessions or non-delegated children
+                let is_delegated_child = session.parent_session_id.is_some()
+                    && session.fork_origin.as_deref() == Some("delegation");
+                if !is_delegated_child {
+                    flat_items.push(session);
+                }
+            }
+        }
+
+        let hierarchy_build_ms = hierarchy_started.elapsed().as_millis() as u64;
+
+        // Group by CWD
+        let group_build_started = Instant::now();
+        let mut groups_map: HashMap<Option<String>, Vec<SessionListItem>> = HashMap::new();
+        for item in flat_items {
+            groups_map.entry(item.group_key()).or_default().push(item);
+        }
+
+        // Convert to SessionGroup vec and sort
+        let mut groups: Vec<SessionGroup> = groups_map
+            .into_iter()
+            .map(|(cwd, sessions)| {
+                let latest_activity = sessions.iter().filter_map(|s| s.updated_at).max();
+                SessionGroup {
+                    cwd,
+                    sessions,
+                    latest_activity,
+                    total_count: None,
+                    next_cursor: None,
+                }
+            })
+            .collect();
+
+        // Sort groups: No-CWD first, then by latest_activity desc
+        groups.sort_by(|a, b| {
+            match (&a.cwd, &b.cwd) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(_), Some(_)) => {
+                    // Both have CWD, sort by latest activity (most recent first)
+                    b.latest_activity.cmp(&a.latest_activity)
+                }
+            }
+        });
+
+        let group_count = groups.len();
+        let group_build_ms = group_build_started.elapsed().as_millis() as u64;
+        let total_ms = started.elapsed().as_millis() as u64;
+        let span = tracing::Span::current();
+        span.record("session_count", session_count_before_filter);
+        span.record(
+            "filtered_out_count",
+            session_count_before_filter.saturating_sub(total_count),
+        );
+        span.record("total_count", total_count);
+        span.record("group_count", group_count);
+        span.record("title_lookup_count", total_count);
+        span.record("total_ms", total_ms);
+        span.record("list_sessions_ms", list_sessions_ms);
+        span.record("filter_ms", filter_ms);
+        span.record("title_lookup_ms", title_lookup_ms);
+        span.record("hierarchy_build_ms", hierarchy_build_ms);
+        span.record("group_build_ms", group_build_ms);
+
+        Ok(SessionListView {
+            groups,
+            total_count,
+            generated_at: OffsetDateTime::now_utc(),
+        })
+    }
+
+    async fn browse_session_groups(
+        &self,
+        cursor: Option<String>,
+        group_limit: usize,
+        session_limit_per_group: usize,
+        session_scope: SessionScope,
+    ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
+        self.browse_session_groups_with_lifecycle(
+            cursor,
+            group_limit,
+            session_limit_per_group,
+            session_scope,
+            SessionLifecycleFilter::default(),
+        )
+        .await
+    }
+
+    async fn browse_session_groups_with_lifecycle(
+        &self,
+        cursor: Option<String>,
+        group_limit: usize,
+        session_limit_per_group: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
+        let group_offset = cursor
+            .as_deref()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(0);
+        let group_limit = group_limit.clamp(1, 100);
+        let preview_limit = session_limit_per_group.clamp(1, 100);
+
+        self.run_blocking(move |conn| {
+            let group_key = group_key_sql("s");
+            let scope_where = format!(
+                "{} AND {}",
+                session_scope_where(session_scope, "s"),
+                lifecycle_filter_where(lifecycle, "s")
+            );
+            let total_sessions: usize = conn.query_row(
+                &format!("SELECT COUNT(*) FROM sessions s WHERE {}", scope_where),
+                [],
+                |row| row.get::<_, i64>(0).map(|v| v as usize),
+            )?;
+
+            let mut summary_stmt = conn.prepare(&format!(
+                r#"
+                SELECT
+                    {group_key},
+                    COUNT(*) as total_count,
+                    MAX(s.updated_at) as latest_activity
+                FROM sessions s
+                WHERE {}
+                GROUP BY {group_key}
+                ORDER BY ({group_key} IS NOT NULL), MAX(s.updated_at) DESC
+                LIMIT ?1 OFFSET ?2
+                "#,
+                scope_where
+            ))?;
+
+            let summaries = summary_stmt
+                .query_map(params![group_limit as i64, group_offset as i64], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, i64>(1)? as usize,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let total_groups: usize = conn.query_row(
+                &format!(
+                    "SELECT COUNT(DISTINCT COALESCE({group_key}, '__none__')) FROM sessions s WHERE {}",
+                    scope_where
+                ),
+                [],
+                |row| row.get::<_, i64>(0).map(|v| v as usize),
+            )?;
+
+            let mut groups = Vec::with_capacity(summaries.len());
+            for (cwd, total_count, latest_raw) in summaries {
+                let latest_activity = parse_rfc3339_option(latest_raw);
+
+                let mut session_stmt = if cwd.is_some() {
+                    conn.prepare(&format!(
+                        r#"
+                        SELECT
+                            s.public_id,
+                            s.name,
+                            s.cwd,
+                            s.created_at,
+                            s.updated_at,
+                            p.public_id,
+                            s.fork_origin,
+                            s.session_kind,
+                            (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
+                            i.summary
+                        FROM sessions s
+                        LEFT JOIN sessions p ON p.id = s.parent_session_id
+                        LEFT JOIN intent_snapshots i
+                            ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
+                        WHERE {group_key} = ?1 AND {}
+                        ORDER BY s.updated_at DESC
+                        LIMIT ?2
+                        "#,
+                        scope_where
+                    ))?
+                } else {
+                    conn.prepare(&format!(
+                        r#"
+                        SELECT
+                            s.public_id,
+                            s.name,
+                            s.cwd,
+                            s.created_at,
+                            s.updated_at,
+                            p.public_id,
+                            s.fork_origin,
+                            s.session_kind,
+                            (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
+                            i.summary
+                        FROM sessions s
+                        LEFT JOIN sessions p ON p.id = s.parent_session_id
+                        LEFT JOIN intent_snapshots i
+                            ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
+                        WHERE s.cwd IS NULL AND {}
+                        ORDER BY s.updated_at DESC
+                        LIMIT ?1
+                        "#,
+                        scope_where
+                    ))?
+                };
+
+                let mut sessions = if let Some(ref cwd_value) = cwd {
+                    session_stmt
+                        .query_map(params![cwd_value, preview_limit as i64], map_session_list_item_row)?
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    session_stmt
+                        .query_map(params![preview_limit as i64], map_session_list_item_row)?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+
+                enrich_workspace_and_isolation_views(conn, &mut sessions)?;
+                let next_cursor = if sessions.len() < total_count {
+                    Some(sessions.len().to_string())
+                } else {
+                    None
+                };
+
+                groups.push(SessionGroup {
+                    cwd,
+                    sessions,
+                    latest_activity,
+                    total_count: Some(total_count),
+                    next_cursor,
+                });
+            }
+
+            let next_group_cursor = if group_offset + groups.len() < total_groups {
+                Some((group_offset + groups.len()).to_string())
+            } else {
+                None
+            };
+
+            Ok((groups, next_group_cursor, total_sessions))
+        })
+        .await
+    }
+
+    async fn list_group_sessions(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+    ) -> SessionResult<(SessionGroup, usize)> {
+        self.list_group_sessions_with_lifecycle(
+            cwd,
+            cursor,
+            limit,
+            session_scope,
+            SessionLifecycleFilter::default(),
+        )
+        .await
+    }
+
+    async fn list_group_sessions_with_lifecycle(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(SessionGroup, usize)> {
+        let offset = cursor
+            .as_deref()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = limit.clamp(1, 200);
+
+        self.run_blocking(move |conn| {
+            let group_key = group_key_sql("s");
+            let scope_where = format!(
+                "{} AND {}",
+                session_scope_where(session_scope, "s"),
+                lifecycle_filter_where(lifecycle, "s")
+            );
+            let total_count: usize = if let Some(ref cwd_value) = cwd {
+                conn.query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM sessions s WHERE {group_key} = ?1 AND {}",
+                        scope_where
+                    ),
+                    params![cwd_value],
+                    |row| row.get::<_, i64>(0).map(|v| v as usize),
+                )?
+            } else {
+                conn.query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM sessions s WHERE s.cwd IS NULL AND {}",
+                        scope_where
+                    ),
+                    [],
+                    |row| row.get::<_, i64>(0).map(|v| v as usize),
+                )?
+            };
+
+            let latest_raw: Option<String> = if let Some(ref cwd_value) = cwd {
+                conn.query_row(
+                    &format!(
+                        "SELECT MAX(s.updated_at) FROM sessions s WHERE {group_key} = ?1 AND {}",
+                        scope_where
+                    ),
+                    params![cwd_value],
+                    |row| row.get(0),
+                )?
+            } else {
+                conn.query_row(
+                    &format!(
+                        "SELECT MAX(s.updated_at) FROM sessions s WHERE s.cwd IS NULL AND {}",
+                        scope_where
+                    ),
+                    [],
+                    |row| row.get(0),
+                )?
+            };
+
+            let latest_activity = parse_rfc3339_option(latest_raw);
+
+            let mut session_stmt = if cwd.is_some() {
+                conn.prepare(&format!(
+                    r#"
+                    SELECT
+                        s.public_id,
+                        s.name,
+                        s.cwd,
+                        s.created_at,
+                        s.updated_at,
+                        p.public_id,
+                        s.fork_origin,
+                        s.session_kind,
+                        (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
+                        i.summary
+                    FROM sessions s
+                    LEFT JOIN sessions p ON p.id = s.parent_session_id
+                    LEFT JOIN intent_snapshots i
+                        ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
+                    WHERE {group_key} = ?1 AND {}
+                    ORDER BY s.updated_at DESC
+                    LIMIT ?2 OFFSET ?3
+                    "#,
+                    scope_where
+                ))?
+            } else {
+                conn.prepare(&format!(
+                    r#"
+                    SELECT
+                        s.public_id,
+                        s.name,
+                        s.cwd,
+                        s.created_at,
+                        s.updated_at,
+                        p.public_id,
+                        s.fork_origin,
+                        s.session_kind,
+                        (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
+                        i.summary
+                    FROM sessions s
+                    LEFT JOIN sessions p ON p.id = s.parent_session_id
+                    LEFT JOIN intent_snapshots i
+                        ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
+                    WHERE s.cwd IS NULL AND {}
+                    ORDER BY s.updated_at DESC
+                    LIMIT ?1 OFFSET ?2
+                    "#,
+                    scope_where
+                ))?
+            };
+
+            let mut sessions = if let Some(ref cwd_value) = cwd {
+                session_stmt
+                    .query_map(params![cwd_value, limit as i64, offset as i64], map_session_list_item_row)?
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                session_stmt
+                    .query_map(params![limit as i64, offset as i64], map_session_list_item_row)?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+
+            enrich_workspace_and_isolation_views(conn, &mut sessions)?;
+            let next_cursor = if offset + sessions.len() < total_count {
+                Some((offset + sessions.len()).to_string())
+            } else {
+                None
+            };
+
+            Ok((
+                SessionGroup {
+                    cwd,
+                    sessions,
+                    latest_activity,
+                    total_count: Some(total_count),
+                    next_cursor,
+                },
+                total_count,
+            ))
+        })
+        .await
+    }
+
+    async fn list_session_children(
+        &self,
+        parent_session_id: String,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> SessionResult<(SessionGroup, usize)> {
+        self.list_session_children_with_lifecycle(
+            parent_session_id,
+            cursor,
+            limit,
+            SessionLifecycleFilter::default(),
+        )
+        .await
+    }
+
+    async fn list_session_children_with_lifecycle(
+        &self,
+        parent_session_id: String,
+        cursor: Option<String>,
+        limit: usize,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(SessionGroup, usize)> {
+        let offset = cursor
+            .as_deref()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = limit.clamp(1, 200);
+        let lifecycle_where = lifecycle_filter_where(lifecycle, "s");
+
+        self.run_blocking(move |conn| {
+            let parent_db_id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM sessions WHERE public_id = ?1",
+                    params![parent_session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(parent_db_id) = parent_db_id else {
+                return Ok((
+                    SessionGroup {
+                        cwd: None,
+                        sessions: Vec::new(),
+                        latest_activity: None,
+                        total_count: Some(0),
+                        next_cursor: None,
+                    },
+                    0,
+                ));
+            };
+
+            let total_count: usize = conn.query_row(
+                &format!("SELECT COUNT(*) FROM sessions s WHERE s.parent_session_id = ?1 AND s.fork_origin IN {VISIBLE_FORK_ORIGINS} AND {lifecycle_where}"),
+                params![parent_db_id],
+                |row| row.get::<_, i64>(0).map(|v| v as usize),
+            )?;
+
+            let latest_raw: Option<String> = conn.query_row(
+                &format!("SELECT MAX(s.updated_at) FROM sessions s WHERE s.parent_session_id = ?1 AND s.fork_origin IN {VISIBLE_FORK_ORIGINS} AND {lifecycle_where}"),
+                params![parent_db_id],
+                |row| row.get(0),
+            )?;
+
+            let latest_activity = parse_rfc3339_option(latest_raw);
+
+            let mut stmt = conn.prepare(&format!(
+                r#"
+                SELECT
+                    s.public_id,
+                    s.name,
+                    s.cwd,
+                    s.created_at,
+                    s.updated_at,
+                    p.public_id,
+                    s.fork_origin,
+                    s.session_kind,
+                    (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
+                    i.summary
+                FROM sessions s
+                LEFT JOIN sessions p ON p.id = s.parent_session_id
+                LEFT JOIN intent_snapshots i
+                    ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
+                WHERE s.parent_session_id = ?1 AND s.fork_origin IN {VISIBLE_FORK_ORIGINS} AND {lifecycle_where}
+                ORDER BY s.updated_at DESC
+                LIMIT ?2 OFFSET ?3
+                "#
+            ))?;
+
+            let mut sessions = stmt
+                .query_map(params![parent_db_id, limit as i64, offset as i64], map_session_list_item_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            enrich_workspace_and_isolation_views(conn, &mut sessions)?;
+            let next_cursor = if offset + sessions.len() < total_count {
+                Some((offset + sessions.len()).to_string())
+            } else {
+                None
+            };
+
+            Ok((
+                SessionGroup {
+                    cwd: None,
+                    sessions,
+                    latest_activity,
+                    total_count: Some(total_count),
+                    next_cursor,
+                },
+                total_count,
+            ))
+        })
+        .await
+    }
+
+    async fn list_session_items(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+    ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)> {
+        self.list_session_items_with_lifecycle(
+            cwd,
+            cursor,
+            limit,
+            session_scope,
+            SessionLifecycleFilter::default(),
+        )
+        .await
+    }
+
+    async fn list_session_items_with_lifecycle(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)> {
+        self.list_session_items_with_pins(cwd, cursor, limit, session_scope, lifecycle, None)
+            .await
+    }
+
+    async fn list_session_items_with_pins(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+        pinned: Option<bool>,
+    ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)> {
+        let offset = cursor
+            .as_deref()
+            .and_then(|cursor| cursor.parse::<i64>().ok())
+            .filter(|offset| *offset >= 0)
+            .unwrap_or(0);
+        let limit = limit.clamp(
+            1,
+            querymt_agent_core::session::projection::MAX_SESSION_ITEMS_PAGE,
+        );
+        let scope_where = format!(
+            "{} AND {} AND {}",
+            session_scope_where(session_scope, "s"),
+            lifecycle_filter_where(lifecycle, "s"),
+            session_pin_filter_where(pinned, "sp")
+        );
+        let order_by = if pinned == Some(true) {
+            "sp.pinned_at DESC, s.id DESC"
+        } else {
+            "s.updated_at DESC, s.id DESC"
+        };
+
+        self.run_blocking(move |conn| {
+            let group_key = group_key_sql("s");
+            let total_count: usize = if let Some(ref cwd_value) = cwd {
+                conn.query_row(
+                    &format!("SELECT COUNT(*) FROM sessions s LEFT JOIN session_pins sp ON sp.session_id = s.id WHERE {group_key} = ?1 AND {}", scope_where),
+                    params![cwd_value],
+                    |row| row.get::<_, i64>(0).map(|v| v as usize),
+                )?
+            } else {
+                conn.query_row(
+&format!("SELECT COUNT(*) FROM sessions s LEFT JOIN session_pins sp ON sp.session_id = s.id WHERE {}", scope_where),
+                    [],
+                    |row| row.get::<_, i64>(0).map(|v| v as usize),
+                )?
+            };
+
+            let mut stmt = if cwd.is_some() {
+                conn.prepare(&format!(
+                    r#"
+                    SELECT
+                        s.public_id,
+                        s.name,
+                        s.cwd,
+                        s.created_at,
+                        s.updated_at,
+                        p.public_id,
+                        s.fork_origin,
+                        CASE WHEN EXISTS(
+                            SELECT 1 FROM tasks t
+                            WHERE t.session_id = s.id AND t.kind = 'recurring'
+                        ) THEN 'recurring' ELSE s.session_kind END,
+                        (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
+                        i.summary
+                    FROM sessions s
+                    LEFT JOIN session_pins sp ON sp.session_id = s.id
+                    LEFT JOIN sessions p ON p.id = s.parent_session_id
+                    LEFT JOIN intent_snapshots i
+                        ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
+                    WHERE {group_key} = ?1 AND {}
+                    ORDER BY {}
+                    LIMIT ?2 OFFSET ?3
+                    "#,
+                    scope_where,
+                    order_by
+                ))?
+            } else {
+                conn.prepare(&format!(
+                    r#"
+                    SELECT
+                        s.public_id,
+                        s.name,
+                        s.cwd,
+                        s.created_at,
+                        s.updated_at,
+                        p.public_id,
+                        s.fork_origin,
+                        CASE WHEN EXISTS(
+                            SELECT 1 FROM tasks t
+                            WHERE t.session_id = s.id AND t.kind = 'recurring'
+                        ) THEN 'recurring' ELSE s.session_kind END,
+                        (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
+                        i.summary
+                    FROM sessions s
+                    LEFT JOIN session_pins sp ON sp.session_id = s.id
+                    LEFT JOIN sessions p ON p.id = s.parent_session_id
+                    LEFT JOIN intent_snapshots i
+                        ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
+                    WHERE {}
+                    ORDER BY {}
+                    LIMIT ?1 OFFSET ?2
+                    "#,
+                    scope_where,
+                    order_by
+                ))?
+            };
+
+            let mut sessions = if let Some(ref cwd_value) = cwd {
+                stmt.query_map(params![cwd_value, limit as i64, offset], map_session_list_item_row)?
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                stmt.query_map(params![limit as i64, offset], map_session_list_item_row)?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+
+            enrich_workspace_and_isolation_views(conn, &mut sessions)?;
+            let next_cursor = offset.checked_add(sessions.len() as i64).and_then(|next_offset| {
+                (usize::try_from(next_offset).ok()? < total_count).then_some(next_offset.to_string())
+            });
+
+            Ok((sessions, next_cursor, total_count))
+        })
+        .await
+    }
+
+    async fn get_session_list_meta_stats(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, SessionListMetaStats>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let session_ids = session_ids.to_vec();
+        self.run_blocking(move |conn| {
+            let mut stats: HashMap<String, SessionListMetaStats> = session_ids
+                .iter()
+                .map(|id| (id.clone(), SessionListMetaStats::default()))
+                .collect();
+            let placeholders = std::iter::repeat_n("?", session_ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let mut stmt = conn.prepare(&format!(
+                r#"
+                SELECT
+                    s.public_id,
+                    COUNT(m.id) AS message_count,
+                    COALESCE(SUM(CASE WHEN m.role = 'User' THEN 1 ELSE 0 END), 0) AS user_message_count
+                FROM sessions s
+                LEFT JOIN messages m ON m.session_id = s.id
+                WHERE s.public_id IN ({})
+                GROUP BY s.public_id
+                "#,
+                placeholders
+            ))?;
+            let rows = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (session_id, message_count, user_message_count) = row?;
+                if let Some(entry) = stats.get_mut(&session_id) {
+                    entry.message_count = message_count.max(0) as u32;
+                    entry.user_message_count = user_message_count.max(0) as u32;
+                }
+            }
+
+            let mut stmt = conn.prepare(&format!(
+                r#"
+                SELECT
+                    session_id,
+                    json_extract(payload_json, '$.data.finish_reason') AS finish_reason
+                FROM event_journal
+                WHERE kind = '{kind}'
+                  AND session_id IN ({placeholders})
+                ORDER BY stream_seq DESC
+                "#,
+                kind = querymt_agent_core::events::AgentEventKind::LLM_REQUEST_END_TAG,
+            ))?;
+            let rows = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (session_id, finish_reason) = row?;
+                let Some(entry) = stats.get_mut(&session_id) else {
+                    continue;
+                };
+                if entry.last_finish_reason.is_none() {
+                    entry.last_finish_reason = finish_reason.as_deref().and_then(parse_finish_reason);
+                }
+            }
+
+            Ok(stats)
+        })
+        .await
+    }
+
+    async fn search_sessions(
+        &self,
+        query: String,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+    ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
+        self.search_sessions_with_lifecycle(
+            query,
+            cursor,
+            limit,
+            session_scope,
+            SessionLifecycleFilter::default(),
+        )
+        .await
+    }
+
+    async fn search_sessions_with_lifecycle(
+        &self,
+        query: String,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
+        let offset = cursor
+            .as_deref()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = limit.clamp(1, 200);
+        let fts_query = build_session_fts_query(&query);
+        if fts_query.is_empty() {
+            return Ok((Vec::new(), None, 0));
+        }
+
+        self.run_blocking(move |conn| {
+            let group_key = group_key_sql("s");
+            let scope_where = format!(
+                "{} AND {}",
+                session_scope_where(session_scope, "s"),
+                lifecycle_filter_where(lifecycle, "s")
+            );
+            let total_count: usize = match conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM sessions_fts f JOIN sessions s ON s.id = f.rowid WHERE sessions_fts MATCH ?1 AND {}",
+                    scope_where
+                ),
+                params![fts_query.clone()],
+                |row| row.get::<_, i64>(0).map(|v| v as usize),
+            ) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok((Vec::new(), None, 0));
+                }
+            };
+
+            let mut group_counts_stmt = conn.prepare(&format!(
+                r#"
+                SELECT {group_key}, COUNT(*), MAX(s.updated_at)
+                FROM sessions_fts f
+                JOIN sessions s ON s.id = f.rowid
+                WHERE sessions_fts MATCH ?1 AND {}
+                GROUP BY {group_key}
+                "#,
+                scope_where
+            ))?;
+            let group_counts = group_counts_stmt
+                .query_map(params![fts_query.clone()], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, i64>(1)? as usize,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let group_counts_map: std::collections::HashMap<
+                Option<String>,
+                (usize, Option<String>),
+            > = group_counts
+                .into_iter()
+                .map(|(cwd, count, latest)| (cwd, (count, latest)))
+                .collect();
+
+            let mut stmt = conn.prepare(&format!(
+                r#"
+                SELECT
+                    s.public_id,
+                    s.name,
+                    s.cwd,
+                    s.created_at,
+                    s.updated_at,
+                    p.public_id,
+                    s.fork_origin,
+                    s.session_kind,
+                    (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
+                    i.summary
+                FROM sessions_fts f
+                JOIN sessions s ON s.id = f.rowid
+                LEFT JOIN sessions p ON p.id = s.parent_session_id
+                LEFT JOIN intent_snapshots i
+                    ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
+                WHERE sessions_fts MATCH ?1 AND {}
+                ORDER BY bm25(sessions_fts), s.updated_at DESC
+                LIMIT ?2 OFFSET ?3
+                "#,
+                scope_where
+            ))?;
+
+            let mut items = stmt
+                .query_map(params![fts_query, limit as i64, offset as i64], map_session_list_item_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            enrich_workspace_and_isolation_views(conn, &mut items)?;
+
+            let mut by_cwd: std::collections::HashMap<Option<String>, Vec<SessionListItem>> =
+                std::collections::HashMap::new();
+            for item in items {
+                by_cwd.entry(item.group_key()).or_default().push(item);
+            }
+
+            let mut groups: Vec<SessionGroup> = by_cwd
+                .into_iter()
+                .map(|(cwd, sessions)| {
+                    let group_count = group_counts_map.get(&cwd);
+                    let total_count = group_count
+                        .map(|(count, _)| *count)
+                        .unwrap_or(sessions.len());
+                    let latest_activity = parse_rfc3339_option(
+                        group_count.and_then(|(_, latest)| latest.clone()),
+                    );
+                    SessionGroup {
+                        total_count: Some(total_count),
+                        next_cursor: None,
+                        cwd,
+                        sessions,
+                        latest_activity,
+                    }
+                })
+                .collect();
+
+            groups.sort_by(|a, b| match (&a.cwd, &b.cwd) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(_), Some(_)) => b.latest_activity.cmp(&a.latest_activity),
+            });
+
+            let next_cursor = if offset + limit < total_count {
+                Some((offset + limit).to_string())
+            } else {
+                None
+            };
+
+            Ok((groups, next_cursor, total_count))
+        })
+        .await
+    }
+
+    async fn get_recent_models_view(
+        &self,
+        limit_per_workspace: usize,
+    ) -> SessionResult<RecentModelsView> {
+        use std::collections::HashMap;
+
+        let results =
+            super::blocking::with_conn_sqlite(
+                &self.conn,
+                move |conn| -> Result<
+                    Vec<(Option<String>, String, String, i64, u32)>,
+                    rusqlite::Error,
+                > {
+                    // Query all ProviderChanged events with workspace info.
+                    // Uses event_journal (the legacy `events` table was dropped
+                    // by migration 0002).
+                    // Note: payload_json uses adjacently tagged serde format
+                    // (tag="type", content="data"), so variant payload is under $.data.*
+                    let mut stmt = conn.prepare(
+                        r#"
+                SELECT
+                    s.cwd,
+                    json_extract(e.payload_json, '$.data.provider') as provider,
+                    json_extract(e.payload_json, '$.data.model') as model,
+                    MAX(e.timestamp) as last_used_ts,
+                    COUNT(*) as use_count
+                FROM event_journal e
+                JOIN sessions s ON s.public_id = e.session_id
+                WHERE e.kind = ?1
+                  AND provider IS NOT NULL
+                  AND model IS NOT NULL
+                GROUP BY s.cwd, provider, model
+                ORDER BY last_used_ts DESC
+                "#,
+                    )?;
+
+                    let rows = stmt.query_map(
+                        [querymt_agent_core::events::AgentEventKind::PROVIDER_CHANGED_TAG],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, u32>(4)?,
+                            ))
+                        },
+                    )?;
+
+                    let mut results = Vec::new();
+                    for row in rows {
+                        results.push(row?);
+                    }
+                    Ok(results)
+                },
+            )
+            .await?;
+
+        // Group by workspace and limit per workspace
+        let mut by_workspace: HashMap<Option<String>, Vec<RecentModelEntry>> = HashMap::new();
+
+        for (cwd, provider, model, last_used_ts, use_count) in results {
+            let entry = RecentModelEntry {
+                provider,
+                model,
+                last_used: OffsetDateTime::from_unix_timestamp(last_used_ts / 1000)
+                    .unwrap_or_else(|_| OffsetDateTime::now_utc()),
+                use_count,
+            };
+
+            let workspace_entries = by_workspace.entry(cwd).or_default();
+            if workspace_entries.len() < limit_per_workspace {
+                workspace_entries.push(entry);
+            }
+        }
+
+        Ok(RecentModelsView {
+            by_workspace,
+            generated_at: OffsetDateTime::now_utc(),
+        })
+    }
+
+    fn supports_session_lifecycle(&self) -> bool {
+        SessionStore::supports_session_lifecycle(self)
+    }
+
+    fn supports_session_lifecycle_filtering(&self) -> bool {
+        SessionStore::supports_session_lifecycle(self)
+    }
+
+    async fn get_session_list_lifecycles(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, SessionLifecycle>> {
+        SessionStore::get_session_lifecycles(self, session_ids).await
+    }
+}
+
+// ============================================================================
+// Session filter evaluation (used by get_session_list_view)
+// ============================================================================
+
+/// Evaluate a filter expression against a session
+fn build_session_fts_query(input: &str) -> String {
+    let terms: Vec<String> = input
+        .split_whitespace()
+        .map(|t| t.replace('"', ""))
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{}\"*", t))
+        .collect();
+    terms.join(" AND ")
+}
+
+fn evaluate_session_filter(session: &Session, expr: &FilterExpr) -> bool {
+    match expr {
+        FilterExpr::Predicate(pred) => evaluate_predicate(session, pred),
+        FilterExpr::And(exprs) => exprs.iter().all(|e| evaluate_session_filter(session, e)),
+        FilterExpr::Or(exprs) => exprs.iter().any(|e| evaluate_session_filter(session, e)),
+        FilterExpr::Not(expr) => !evaluate_session_filter(session, expr),
+    }
+}
+
+/// Evaluate a single predicate against a session
+fn evaluate_predicate(
+    session: &Session,
+    pred: &querymt_agent_core::session::projection::FieldPredicate,
+) -> bool {
+    use serde_json::json;
+
+    let field_value = match pred.field.as_str() {
+        "session_id" | "public_id" => Some(json!(session.public_id)),
+        "name" => session.name.as_ref().map(|n| json!(n)),
+        "cwd" => session.cwd.as_ref().map(|p| json!(p.display().to_string())),
+        "created_at" => session.created_at.map(|t| {
+            json!(
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default()
+            )
+        }),
+        "updated_at" => session.updated_at.map(|t| {
+            json!(
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default()
+            )
+        }),
+        _ => None,
+    };
+
+    match &pred.op {
+        PredicateOp::IsNull => field_value.is_none(),
+        PredicateOp::IsNotNull => field_value.is_some(),
+        PredicateOp::Eq(val) => field_value.as_ref() == Some(val),
+        PredicateOp::Ne(val) => field_value.as_ref() != Some(val),
+        PredicateOp::Gt(val) => {
+            // For string timestamps, compare lexicographically
+            match (field_value.as_ref().and_then(|v| v.as_str()), val.as_str()) {
+                (Some(fv), Some(v)) => fv > v,
+                _ => false,
+            }
+        }
+        PredicateOp::Gte(val) => {
+            match (field_value.as_ref().and_then(|v| v.as_str()), val.as_str()) {
+                (Some(fv), Some(v)) => fv >= v,
+                _ => false,
+            }
+        }
+        PredicateOp::Lt(val) => {
+            match (field_value.as_ref().and_then(|v| v.as_str()), val.as_str()) {
+                (Some(fv), Some(v)) => fv < v,
+                _ => false,
+            }
+        }
+        PredicateOp::Lte(val) => {
+            match (field_value.as_ref().and_then(|v| v.as_str()), val.as_str()) {
+                (Some(fv), Some(v)) => fv <= v,
+                _ => false,
+            }
+        }
+        PredicateOp::Contains(s) => {
+            if let Some(fv) = field_value.as_ref().and_then(|v| v.as_str()) {
+                fv.contains(s.as_str())
+            } else {
+                false
+            }
+        }
+        PredicateOp::StartsWith(s) => {
+            if let Some(fv) = field_value.as_ref().and_then(|v| v.as_str()) {
+                fv.starts_with(s.as_str())
+            } else {
+                false
+            }
+        }
+        PredicateOp::In(vals) => field_value.as_ref().is_some_and(|fv| vals.contains(fv)),
+    }
+}

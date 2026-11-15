@@ -1,6 +1,5 @@
 //! Multi-agent quorum implementation
 
-use super::callbacks::EventCallbacksState;
 use super::config::{AgentConfig, DelegateConfigBuilder, PlannerConfigBuilder};
 use super::utils::{
     build_llm_config, default_registry, infer_required_capabilities, latest_assistant_message,
@@ -11,10 +10,12 @@ use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::SnapshotPolicy;
 use crate::agent::core::ToolPolicy;
-use crate::config::{MiddlewareEntry, QuorumConfig, ToolSpec, resolve_tools};
+use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
 use crate::delegation::AgentInfo;
+use querymt_agent_runtime::api::callbacks::EventCallbacksState;
 
 use crate::acp::protocol::{ContentBlock, PromptRequest, TextContent};
+use crate::agent::builtin_tools::all_builtin_tools;
 use crate::agent::handle::AgentHandle as AgentHandleTrait;
 use crate::runner::ChatSession;
 use crate::session::backend::resolve_agent_db_path;
@@ -23,7 +24,6 @@ use crate::session::store::SessionStore;
 use crate::session::{SqliteStorage, StorageBackend};
 use crate::snapshot::GitSnapshotBackend;
 use crate::tools::CapabilityRequirement;
-use crate::tools::builtins::all_builtin_tools;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 #[cfg(feature = "remote")]
@@ -57,6 +57,8 @@ pub struct QuorumBuilder {
     workspace: Option<crate::config::WorkspaceSettings>,
     /// Prebuilt workspace service; wins over `workspace`.
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    /// Portable repository knowledge settings; disabled when omitted.
+    repository_knowledge: Option<crate::config::RepositoryKnowledgeSettings>,
     /// Pre-built registry entries to merge before building (Phase 7: remote agents).
     ///
     /// When `Some`, the entries in this registry are merged with the local delegate agents
@@ -114,6 +116,7 @@ impl QuorumBuilder {
             dotagents_task_approver: None,
             workspace: None,
             workspace_service: None,
+            repository_knowledge: None,
             initial_registry: None,
             #[cfg(feature = "remote")]
             mesh: None,
@@ -181,7 +184,23 @@ impl QuorumBuilder {
         self
     }
 
-    /// Enable `.agents` loading with default discovery options.
+    /// Configure portable repository knowledge for the whole quorum
+    /// (disabled unless `enabled`). Performs no repository reads or writes.
+    pub fn repository_knowledge(
+        mut self,
+        settings: crate::config::RepositoryKnowledgeSettings,
+    ) -> Self {
+        self.repository_knowledge = Some(settings);
+        self
+    }
+
+    /// Inspect the configured repository knowledge settings, if any.
+    pub fn configured_repository_knowledge(
+        &self,
+    ) -> Option<&crate::config::RepositoryKnowledgeSettings> {
+        self.repository_knowledge.as_ref()
+    }
+
     /// Configure managed Git worktree workspaces for the whole quorum.
     ///
     /// A single service is built and shared by the planner and every delegate.
@@ -196,6 +215,7 @@ impl QuorumBuilder {
         self
     }
 
+    /// Enable `.agents` loading with default discovery options.
     pub fn enable_dotagents(mut self) -> Self {
         self.dotagents_options = Some(crate::dotagents::DotagentsLoadOptions::enabled());
         self
@@ -477,6 +497,13 @@ impl QuorumBuilder {
                 None => None,
             },
         };
+        // One lazy registry for the whole quorum, so planner and delegates
+        // sharing a checkout share one serialized service. Nothing is resolved
+        // or opened until a session uses it.
+        let repository_knowledge = self
+            .repository_knowledge
+            .as_ref()
+            .and_then(crate::knowledge::host::registry_from_settings);
         if workspace_service.is_none()
             && let Some(delegate) = self
                 .delegates
@@ -570,6 +597,7 @@ impl QuorumBuilder {
             let delegation_wait_timeout_for_delegate = self.delegation_wait_timeout_secs;
             let delegation_cancel_grace_for_delegate = self.delegation_cancel_grace_secs;
             let workspace_for_delegate = workspace_service.clone();
+            let repository_for_delegate = repository_knowledge.clone();
             builder = builder.add_delegate_agent(agent_info, move |storage, event_fanout| {
                 let mut b =
                     AgentConfigBuilder::new(registry.clone(), storage.clone(), llm_config.clone())
@@ -589,26 +617,24 @@ impl QuorumBuilder {
                             .iter()
                             .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME)))
                 {
-                    b.tool_registry_mut().add(crate::skills::build_skill_tool(
+                    b = b.with_skill_catalog(crate::skills::SkillCatalog::from_config(
                         skills,
                         &skills_project_root_for_delegate,
                     ));
                 }
 
+                // Infer the policy like the single-agent path: any external
+                // tool spec, resolved MCP selection or attached MCP server
+                // needs BuiltInAndProvider so MCP tools and skills reach the
+                // LLM, even when the tool list is empty; otherwise
+                // BuiltInOnly is sufficient.
+                let policy = crate::agent::tools::infer_restricted_tool_policy(
+                    &tools,
+                    &delegate_mcp_servers,
+                );
+                b = b.with_tool_policy(policy);
                 if !tools.is_empty() {
-                    // The resolved tool list contains local tool names plus
-                    // normalized MCP selectors. Infer the policy like the
-                    // single-agent path: any external tool spec or resolved
-                    // MCP selection needs BuiltInAndProvider so MCP tool
-                    // definitions reach the LLM; otherwise BuiltInOnly is
-                    // sufficient.
-                    let has_external_tools = tools.iter().any(ToolSpec::is_mcp);
-                    let policy = if has_external_tools || !delegate_mcp_servers.is_empty() {
-                        ToolPolicy::BuiltInAndProvider
-                    } else {
-                        ToolPolicy::BuiltInOnly
-                    };
-                    b = b.with_tool_policy(policy).with_allowed_tools(tools.clone());
+                    b = b.with_allowed_tools(tools.clone());
                 }
 
                 // Attach resolved MCP servers through the existing lifecycle.
@@ -627,6 +653,7 @@ impl QuorumBuilder {
                 if let Some(service) = workspace_for_delegate.clone() {
                     b = b.with_workspace_service(service);
                 }
+                b = b.with_repository_knowledge(repository_for_delegate.clone());
 
                 let config = Arc::new(b.build());
                 Ok(Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>)
@@ -682,7 +709,8 @@ impl QuorumBuilder {
                 let info = plan.info.clone();
                 let target_plan = plan.clone();
                 let factory: Arc<dyn crate::dotagents::ProtocolTargetFactory> = Arc::new(
-                    super::DotagentsTargetFactory::new(registry.clone(), backend.clone()),
+                    super::DotagentsTargetFactory::new(registry.clone(), backend.clone())
+                        .with_skills(planner_config.skills.clone(), skills_project_root.clone()),
                 );
                 let registry_for_fallback = registry.clone();
                 builder = builder.add_delegate_agent(
@@ -800,6 +828,7 @@ impl QuorumBuilder {
         let delegation_wait_timeout_for_planner = self.delegation_wait_timeout_secs;
         let delegation_cancel_grace_for_planner = self.delegation_cancel_grace_secs;
         let workspace_for_planner = workspace_service.clone();
+        let repository_for_planner = repository_knowledge.clone();
         builder = builder.with_planner(move |storage, agent_registry, event_fanout| {
             let mut b = AgentConfigBuilder::new(
                 registry_for_planner.clone(),
@@ -822,7 +851,7 @@ impl QuorumBuilder {
                         .iter()
                         .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME)))
             {
-                b.tool_registry_mut().add(crate::skills::build_skill_tool(
+                b = b.with_skill_catalog(crate::skills::SkillCatalog::from_config(
                     skills,
                     &skills_project_root_for_planner,
                 ));
@@ -834,12 +863,10 @@ impl QuorumBuilder {
                 // single-agent path: any external tool spec or resolved MCP
                 // selection needs BuiltInAndProvider so MCP tool definitions
                 // reach the LLM; otherwise BuiltInOnly is sufficient.
-                let has_external_tools = planner_tools.iter().any(ToolSpec::is_mcp);
-                let policy = if has_external_tools || !planner_mcp_servers.is_empty() {
-                    ToolPolicy::BuiltInAndProvider
-                } else {
-                    ToolPolicy::BuiltInOnly
-                };
+                let policy = crate::agent::tools::infer_restricted_tool_policy(
+                    &planner_tools,
+                    &planner_mcp_servers,
+                );
                 b = b
                     .with_tool_policy(policy)
                     .with_allowed_tools(planner_tools.clone());
@@ -862,7 +889,7 @@ impl QuorumBuilder {
             // Register routing planner tools if RoutingActor is available.
             #[cfg(feature = "remote")]
             if let Some(actor_ref) = routing_actor_for_planner {
-                use crate::tools::builtins::{RouteDelegationToPeerTool, UseRemoteProviderTool};
+                use crate::agent::builtin_tools::{RouteDelegationToPeerTool, UseRemoteProviderTool};
                 b.extend_tool_registry([
                     Arc::new(RouteDelegationToPeerTool::new(actor_ref.clone()))
                         as Arc<dyn crate::tools::Tool>,
@@ -877,6 +904,7 @@ impl QuorumBuilder {
             if let Some(service) = workspace_for_planner.clone() {
                 b = b.with_workspace_service(service);
             }
+            b = b.with_repository_knowledge(repository_for_planner.clone());
 
             // Wire schedule repository and knowledge store into the planner config.
             if let Some(ref repo) = schedule_repo_for_planner {
@@ -1248,6 +1276,9 @@ impl super::agent::Agent {
         if config.quorum.workspace.enabled {
             builder.workspace = Some(config.quorum.workspace);
         }
+        if config.quorum.repository_knowledge.enabled {
+            builder.repository_knowledge = Some(config.quorum.repository_knowledge);
+        }
         builder.snapshot_policy = snapshot_policy;
         builder.initial_registry = initial_registry;
         #[cfg(feature = "remote")]
@@ -1443,6 +1474,7 @@ mod tests {
     #[cfg(feature = "remote")]
     use crate::agent::remote::test_helpers::fixtures::{get_test_mesh, random_node_id};
     use crate::config::McpServerConfig;
+    use crate::config::ToolSpec;
     use crate::test_utils::helpers::empty_plugin_registry;
 
     fn skill_quorum_config(skills_enabled: bool) -> QuorumConfig {
@@ -1827,12 +1859,15 @@ include_external = false
             .as_any()
             .downcast_ref::<AgentHandle>()
             .expect("local planner");
+        // The skill tool is session-bound: it comes from the catalog, never
+        // from the agent-level registry.
+        assert!(planner.config.skill_catalog.is_some());
         assert!(
             planner
                 .config
                 .tool_registry
                 .find(crate::skills::SkillTool::NAME)
-                .is_some()
+                .is_none()
         );
         assert!(
             planner
@@ -1847,12 +1882,15 @@ include_external = false
             .as_any()
             .downcast_ref::<AgentHandle>()
             .expect("local delegate");
+        // The skill tool is session-bound: it comes from the catalog, never
+        // from the agent-level registry.
+        assert!(delegate.config.skill_catalog.is_some());
         assert!(
             delegate
                 .config
                 .tool_registry
                 .find(crate::skills::SkillTool::NAME)
-                .is_some()
+                .is_none()
         );
         assert!(
             delegate
@@ -2380,6 +2418,94 @@ model = "gpt-4"
             isolation("reviewer"),
             crate::worktree::DelegationIsolation::Inherit
         );
+    }
+
+    /// 2.4: planner and every delegate share one lazy repository registry when
+    /// the host enabled it, so sessions on one checkout share one service; a
+    /// quorum without the setting binds nothing. Building resolves nothing.
+    #[tokio::test]
+    async fn quorum_shares_one_lazy_repository_registry_only_when_enabled() {
+        let root = tempfile::TempDir::new().unwrap();
+        let registry_of = |agent: &crate::api::agent::Agent, id: Option<&str>| {
+            let handle = match id {
+                None => agent.planner().expect("planner"),
+                Some(id) => agent.delegate(id).expect("delegate"),
+            };
+            handle
+                .as_any()
+                .downcast_ref::<AgentHandle>()
+                .expect("local handle")
+                .config
+                .repository_knowledge()
+        };
+
+        let (infra, _dir) = quorum_infra().await;
+        let enabled = crate::api::agent::Agent::builder_from_quorum_config(
+            workspace_quorum_config(root.path(), ""),
+            None,
+        )
+        .expect("builder")
+        .infra(infra)
+        .repository_knowledge(crate::config::RepositoryKnowledgeSettings::enabled())
+        .build()
+        .await
+        .expect("quorum builds");
+        let planner = registry_of(&enabled, None).expect("planner has registry");
+        let coder = registry_of(&enabled, Some("coder")).expect("coder has registry");
+        let reviewer = registry_of(&enabled, Some("reviewer")).expect("reviewer has registry");
+        assert!(Arc::ptr_eq(&planner, &coder) && Arc::ptr_eq(&planner, &reviewer));
+        assert_eq!(planner.open_services(), 0, "no builder-time discovery");
+
+        let (infra, _dir) = quorum_infra().await;
+        let disabled = crate::api::agent::Agent::builder_from_quorum_config(
+            workspace_quorum_config(root.path(), ""),
+            None,
+        )
+        .expect("builder")
+        .infra(infra)
+        .build()
+        .await
+        .expect("quorum builds");
+        assert!(registry_of(&disabled, None).is_none());
+        assert!(registry_of(&disabled, Some("coder")).is_none());
+    }
+
+    /// 5.12: the retrieval policy applies to quorum members exactly as to a
+    /// standalone agent: only when enabled and query/get are usable.
+    #[tokio::test]
+    async fn quorum_members_get_the_retrieval_policy_only_when_enabled() {
+        let root = tempfile::TempDir::new().unwrap();
+        let applies = |agent: &crate::api::agent::Agent, id: Option<&str>| {
+            let handle = match id {
+                None => agent.planner().expect("planner"),
+                Some(id) => agent.delegate(id).expect("delegate"),
+            };
+            let local = handle
+                .as_any()
+                .downcast_ref::<AgentHandle>()
+                .expect("local handle");
+            crate::agent::repository_delivery::policy_applies(&local.config)
+        };
+        for enabled in [true, false] {
+            let (infra, _dir) = quorum_infra().await;
+            let mut builder = crate::api::agent::Agent::builder_from_quorum_config(
+                workspace_quorum_config(root.path(), ""),
+                None,
+            )
+            .expect("builder")
+            .infra(infra);
+            if enabled {
+                builder = builder
+                    .repository_knowledge(crate::config::RepositoryKnowledgeSettings::enabled());
+            }
+            let agent = builder.build().await.expect("quorum builds");
+            // The planner's explicit `tools = ["delegate"]` allowlist stays
+            // authoritative: it never gets retrieval guidance for tools it
+            // cannot call. Unrestricted delegates follow the host setting.
+            assert!(!applies(&agent, None));
+            assert_eq!(applies(&agent, Some("coder")), enabled);
+            assert_eq!(applies(&agent, Some("reviewer")), enabled);
+        }
     }
 
     /// 21.6/21.8: a quorum without workspace settings builds without a

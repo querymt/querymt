@@ -1,0 +1,481 @@
+//! Agent-specific implementation of ToolContext
+
+use async_trait::async_trait;
+use serde_json::json;
+use std::any::Any;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+
+use crate::event_sink::EventSink;
+use crate::knowledge::{KnowledgeStore, ScopePolicy};
+use crate::tools::context::{QuestionOption, ToolContext, ToolError};
+use querymt_agent_core::elicitation::{ElicitationAction, ElicitationResponse};
+
+/// A request to elicit information from the user, sent from tool context to the agent
+pub struct ElicitationRequest {
+    pub elicitation_id: String,
+    pub message: String,
+    pub requested_schema: serde_json::Value,
+    pub source: String,
+    pub response_tx: oneshot::Sender<ElicitationResponse>,
+}
+
+fn question_option_schema(label: &str, description: &str) -> serde_json::Value {
+    json!({
+        "const": label,
+        "title": label,
+        "_meta": {
+            "querymt": {
+                "description": description
+            }
+        }
+    })
+}
+
+fn question_schema(
+    question: &str,
+    header: &str,
+    options: &[QuestionOption],
+    multiple: bool,
+) -> serde_json::Value {
+    let choices: Vec<serde_json::Value> = options
+        .iter()
+        .map(|option| question_option_schema(&option.label, &option.description))
+        .collect();
+    let selection = if multiple {
+        json!({
+            "type": "array",
+            "title": header,
+            "description": question,
+            "items": { "anyOf": choices }
+        })
+    } else {
+        json!({
+            "type": "string",
+            "title": header,
+            "description": question,
+            "oneOf": choices
+        })
+    };
+
+    json!({
+        "type": "object",
+        "properties": {
+            "selection": selection
+        },
+        "required": ["selection"]
+    })
+}
+
+/// Implementation of ToolContext that provides access to agent services
+pub struct AgentToolContext {
+    session_id: String,
+    cwd: Option<PathBuf>,
+    extensions: http::Extensions,
+    elicitation_tx: Option<mpsc::Sender<ElicitationRequest>>,
+    cancellation_token: CancellationToken,
+    workspace_query_bridge: Option<Arc<dyn crate::workspace_query::WorkspaceQueryBridge>>,
+    knowledge_store: Option<Arc<dyn KnowledgeStore>>,
+    scope_policy: Arc<dyn ScopePolicy>,
+    event_sink: Option<Arc<EventSink>>,
+    task_service: Option<crate::session::TaskService>,
+    mutation_gate: Option<Arc<crate::worktree::gate::CheckoutMutationGate>>,
+    workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    session_store: Option<Arc<dyn crate::session::store::SessionStore>>,
+    todo_store: Option<Arc<crate::tools::builtins::todo::TodoStore>>,
+    repository_knowledge: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
+    tool_call_id: Option<String>,
+}
+
+impl AgentToolContext {
+    pub fn new(
+        session_id: String,
+        cwd: Option<PathBuf>,
+        elicitation_tx: Option<mpsc::Sender<ElicitationRequest>>,
+    ) -> Self {
+        Self {
+            session_id,
+            cwd,
+            extensions: http::Extensions::new(),
+            elicitation_tx,
+            cancellation_token: CancellationToken::new(),
+            workspace_query_bridge: None,
+            knowledge_store: None,
+            scope_policy: Arc::new(crate::knowledge::PermissiveScopePolicy),
+            event_sink: None,
+            task_service: None,
+            mutation_gate: None,
+            workspace_service: None,
+            session_store: None,
+            todo_store: None,
+            repository_knowledge: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// Store a typed value in this context's extensions.
+    ///
+    /// Runtime uses this to hand services to tools that the tool layer cannot
+    /// name, such as `Arc<dyn AgentRegistry>`.
+    pub fn with_extension<T: Clone + Send + Sync + 'static>(mut self, value: T) -> Self {
+        self.extensions.insert(value);
+        self
+    }
+
+    /// Attach the agent's per-session todo store.
+    pub fn with_todo_store(mut self, store: Arc<crate::tools::builtins::todo::TodoStore>) -> Self {
+        self.todo_store = Some(store);
+        self
+    }
+
+    /// Attach repository knowledge (only when the host enabled it).
+    pub fn with_repository_knowledge(
+        mut self,
+        registry: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
+    ) -> Self {
+        self.repository_knowledge = registry;
+        self
+    }
+
+    /// Record the tool call this context serves.
+    pub fn with_tool_call_id(mut self, id: impl Into<String>) -> Self {
+        self.tool_call_id = Some(id.into());
+        self
+    }
+
+    /// Attach the managed worktree workspace service (when configured).
+    pub fn with_workspace_service(
+        mut self,
+        service: Option<Arc<crate::worktree::WorkspaceService>>,
+    ) -> Self {
+        self.workspace_service = service;
+        self
+    }
+
+    /// Attach the durable session store.
+    pub fn with_session_store(
+        mut self,
+        store: Arc<dyn crate::session::store::SessionStore>,
+    ) -> Self {
+        self.session_store = Some(store);
+        self
+    }
+
+    /// Create a context with an explicit cancellation token.
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = token;
+        self
+    }
+
+    /// Set the workspace query bridge for language intelligence queries.
+    ///
+    /// When set, the `language_query` tool can access VS Code's language APIs
+    /// (diagnostics, references, definitions, etc.) through this bridge.
+    pub fn with_workspace_query_bridge(
+        mut self,
+        bridge: Arc<dyn crate::workspace_query::WorkspaceQueryBridge>,
+    ) -> Self {
+        self.workspace_query_bridge = Some(bridge);
+        self
+    }
+
+    /// Attach a knowledge store to this context.
+    pub fn with_knowledge_store(&mut self, knowledge_store: Arc<dyn KnowledgeStore>) {
+        self.knowledge_store = Some(knowledge_store);
+    }
+
+    /// Set the scope policy for knowledge tools.
+    pub fn with_scope_policy(&mut self, policy: Arc<dyn ScopePolicy>) {
+        self.scope_policy = policy;
+    }
+
+    /// Attach an event sink so tools can emit agent events.
+    pub fn with_event_sink(&mut self, sink: Arc<EventSink>) {
+        self.event_sink = Some(sink);
+    }
+
+    pub fn with_task_service(mut self, service: crate::session::TaskService) -> Self {
+        self.task_service = Some(service);
+        self
+    }
+
+    /// Attach the checkout-scoped cooperative mutation gate for this
+    /// session's workspace. Mutating built-ins then serialize their file
+    /// writes with baseline capture and undo/redo.
+    pub fn with_mutation_gate(
+        mut self,
+        gate: Arc<crate::worktree::gate::CheckoutMutationGate>,
+    ) -> Self {
+        self.mutation_gate = Some(gate);
+        self
+    }
+
+    /// Create a basic context for testing or simple operations
+    pub fn basic(session_id: String, cwd: Option<PathBuf>) -> Self {
+        Self::new(session_id, cwd, None)
+    }
+}
+
+#[async_trait]
+impl ToolContext for AgentToolContext {
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
+    }
+
+    fn tool_call_id(&self) -> Option<&str> {
+        self.tool_call_id.as_deref()
+    }
+
+    fn extensions(&self) -> &http::Extensions {
+        &self.extensions
+    }
+
+    fn session_public_id(&self) -> Option<String> {
+        Some(self.session_id.clone())
+    }
+
+    fn task_service(&self) -> Option<crate::session::TaskService> {
+        self.task_service.clone()
+    }
+
+    fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
+        self.knowledge_store.clone()
+    }
+
+    fn todo_store(&self) -> Option<Arc<crate::tools::builtins::todo::TodoStore>> {
+        self.todo_store.clone()
+    }
+
+    fn scope_policy(&self) -> Arc<dyn ScopePolicy> {
+        self.scope_policy.clone()
+    }
+
+    fn emit_event(&self, kind: querymt_agent_core::events::AgentEventKind) {
+        if let Some(ref sink) = self.event_sink {
+            sink.session_stream(&self.session_id).emit(kind);
+        }
+    }
+
+    async fn record_progress(
+        &self,
+        _kind: &str,
+        _content: String,
+        _metadata: Option<serde_json::Value>,
+    ) -> Result<String, ToolError> {
+        Ok(format!("progress_{}", uuid::Uuid::new_v4()))
+    }
+
+    async fn ask_question(
+        &self,
+        question_id: &str,
+        question: &str,
+        header: &str,
+        options: &[QuestionOption],
+        multiple: bool,
+    ) -> Result<Vec<String>, ToolError> {
+        if let Some(tx) = &self.elicitation_tx {
+            let schema = question_schema(question, header, options, multiple);
+
+            // Send through elicitation channel
+            let (response_tx, response_rx) = oneshot::channel();
+            let request = ElicitationRequest {
+                elicitation_id: question_id.to_string(),
+                message: question.to_string(),
+                requested_schema: schema,
+                source: "builtin:question".to_string(),
+                response_tx,
+            };
+
+            tx.send(request)
+                .await
+                .map_err(|_| ToolError::Other(anyhow::anyhow!("Elicitation channel closed")))?;
+
+            let response = response_rx.await.map_err(|_| {
+                ToolError::Other(anyhow::anyhow!("Elicitation response channel dropped"))
+            })?;
+
+            // Extract answers from the MCP response
+            match response.action {
+                ElicitationAction::Accept => {
+                    if let Some(content) = response.content {
+                        // Extract "selection" from content
+                        match content.get("selection") {
+                            Some(serde_json::Value::Array(arr)) => Ok(arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()),
+                            Some(serde_json::Value::String(s)) => Ok(vec![s.clone()]),
+                            _ => Err(ToolError::ProviderError(
+                                "Invalid elicitation response format".into(),
+                            )),
+                        }
+                    } else {
+                        Err(ToolError::ProviderError(
+                            "No content in accepted elicitation response".into(),
+                        ))
+                    }
+                }
+                ElicitationAction::Decline => {
+                    Err(ToolError::ProviderError("User declined question".into()))
+                }
+                ElicitationAction::Cancel => {
+                    Err(ToolError::ProviderError("User cancelled question".into()))
+                }
+            }
+        } else {
+            // Fall back to default stdin/stdout implementation
+            <dyn ToolContext>::ask_question(self, question_id, question, header, options, multiple)
+                .await
+        }
+    }
+
+    fn workspace_query_bridge(&self) -> Option<&dyn crate::workspace_query::WorkspaceQueryBridge> {
+        self.workspace_query_bridge.as_deref()
+    }
+
+    fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.clone()
+    }
+
+    fn checkout_mutation_gate(&self) -> Option<Arc<crate::worktree::gate::CheckoutMutationGate>> {
+        self.mutation_gate.clone()
+    }
+
+    fn workspace_service(&self) -> Option<Arc<crate::worktree::WorkspaceService>> {
+        self.workspace_service.clone()
+    }
+
+    fn session_store(&self) -> Option<Arc<dyn crate::session::store::SessionStore>> {
+        self.session_store.clone()
+    }
+
+    fn repository_knowledge(
+        &self,
+    ) -> Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>> {
+        self.repository_knowledge.clone()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_path_resolution() {
+        let temp_dir = TempDir::new().unwrap();
+        let context = AgentToolContext::basic(
+            "test_session".to_string(),
+            Some(temp_dir.path().to_path_buf()),
+        );
+
+        // Test relative path resolution
+        let resolved = context.resolve_path("test.txt").unwrap();
+        assert_eq!(resolved, temp_dir.path().join("test.txt"));
+
+        // Test absolute path passthrough
+        let abs_path = "/absolute/path.txt";
+        let resolved = context.resolve_path(abs_path).unwrap();
+        assert_eq!(resolved, PathBuf::from(abs_path));
+    }
+
+    #[test]
+    fn test_path_resolution_without_cwd() {
+        let context = AgentToolContext::basic("test_session".to_string(), None);
+
+        // Test that relative path fails without cwd
+        let result = context.resolve_path("test.txt");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no working directory")
+        );
+
+        // Test that absolute path still works
+        let abs_path = "/absolute/path.txt";
+        let resolved = context.resolve_path(abs_path).unwrap();
+        assert_eq!(resolved, PathBuf::from(abs_path));
+    }
+
+    #[test]
+    fn test_session_id() {
+        let context =
+            AgentToolContext::basic("test_session_123".to_string(), Some(PathBuf::from("/tmp")));
+
+        assert_eq!(context.session_id(), "test_session_123");
+    }
+
+    #[test]
+    fn test_cwd() {
+        let cwd = PathBuf::from("/workspace");
+        let context = AgentToolContext::basic("session".to_string(), Some(cwd.clone()));
+
+        assert_eq!(context.cwd(), Some(cwd.as_path()));
+    }
+
+    #[test]
+    fn test_cwd_none() {
+        let context = AgentToolContext::basic("session".to_string(), None);
+
+        assert_eq!(context.cwd(), None);
+    }
+
+    #[test]
+    fn question_schema_uses_labels_as_titles_and_preserves_descriptions() {
+        let schema = question_schema(
+            "Choose a deployment target",
+            "Target",
+            &[QuestionOption::new(
+                "Production",
+                "Deploy to the customer-facing environment",
+            )],
+            false,
+        );
+
+        let option = &schema["properties"]["selection"]["oneOf"][0];
+        assert_eq!(option["const"], "Production");
+        assert_eq!(option["title"], "Production");
+        assert_eq!(
+            option["_meta"]["querymt"]["description"],
+            "Deploy to the customer-facing environment"
+        );
+        serde_json::from_value::<querymt_agent_core::protocol::ElicitationSchema>(schema)
+            .expect("question schema should be valid ACP elicitation schema");
+    }
+
+    #[test]
+    fn multi_select_question_schema_uses_titled_any_of_options() {
+        let schema = question_schema(
+            "Choose environments",
+            "Environments",
+            &[
+                QuestionOption::new("Staging", "Internal validation"),
+                QuestionOption::new("Production", "Customer traffic"),
+            ],
+            true,
+        );
+
+        let selection = &schema["properties"]["selection"];
+        assert_eq!(selection["type"], "array");
+        assert_eq!(selection["items"]["anyOf"][1]["const"], "Production");
+        assert_eq!(selection["items"]["anyOf"][1]["title"], "Production");
+        assert_eq!(
+            selection["items"]["anyOf"][1]["_meta"]["querymt"]["description"],
+            "Customer traffic"
+        );
+        serde_json::from_value::<querymt_agent_core::protocol::ElicitationSchema>(schema)
+            .expect("multi-select schema should be valid ACP elicitation schema");
+    }
+}

@@ -1,0 +1,89 @@
+name: Test querymt-utils, service-client and cli
+
+# These crates are dependencies of the agent stack but were not tested by any
+# workflow (the agent workflow only runs agent packages).
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'crates/querymt-utils/**'
+      - 'crates/service-client/**'
+      - 'crates/cli/**'
+      - 'crates/querymt/**'
+      - 'crates/provider-common/**'
+      - 'crates/workspace-hack/**'
+      - '.config/nextest.toml'
+      - '.cargo/**'
+      - 'rust-toolchain.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/actions/rust-setup/**'
+      - '.github/workflows/test-support-crates.yml'
+  pull_request:
+    paths:
+      - 'crates/querymt-utils/**'
+      - 'crates/service-client/**'
+      - 'crates/cli/**'
+      - 'crates/querymt/**'
+      - 'crates/provider-common/**'
+      - 'crates/workspace-hack/**'
+      - '.config/nextest.toml'
+      - '.cargo/**'
+      - 'rust-toolchain.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/actions/rust-setup/**'
+      - '.github/workflows/test-support-crates.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # FIXME: querymt-cli does not pass clippy yet (dead code, large enum variant,
+  # `&Box<dyn _>`); add `-p querymt-cli` once it does.
+  clippy:
+    name: Clippy lints
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          components: clippy
+          cache-key: support-crates-clippy
+
+      - name: Run Clippy
+        run: >
+          cargo clippy
+          --package querymt-utils
+          --package querymt-service-client
+          --all-targets -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          cache-key: support-crates-test
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Run tests
+        run: >
+          cargo nextest run --profile ci
+          --package querymt-utils
+          --package querymt-service-client
+          --package querymt-cli

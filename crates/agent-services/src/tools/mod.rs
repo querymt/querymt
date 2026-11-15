@@ -1,0 +1,35 @@
+pub mod args;
+pub mod builtins;
+pub mod context;
+pub mod context_impl;
+pub mod path;
+pub mod read_scope;
+pub mod registry;
+mod tool;
+mod tool_context;
+pub mod tool_set;
+#[doc(hidden)]
+pub mod trace;
+#[cfg(any(test, feature = "test-support"))]
+pub mod trace_support;
+pub mod validation;
+
+pub use builtins::{
+    BrowseTool, CompleteTaskTool, CreateTaskTool, DeleteFileTool, GetFunctionTool, GetSymbolTool,
+    KnowledgeConsolidateTool, KnowledgeIngestTool, KnowledgeListTool, KnowledgeQueryTool,
+    KnowledgeStatsTool, ReadTaskTool, ReadTool, SearchTextTool, ShellTool, UpdateTaskTool,
+    WebFetchTool, WriteFileTool,
+};
+pub use context::{
+    AliasScope, ArgAlias, CapabilityRequirement, FileAccess, QuestionOption, Tool, ToolContext,
+    ToolError, ToolExecutionClass, WrapRule, run_under_mutation_gate,
+};
+pub use context_impl::{AgentToolContext, ElicitationRequest};
+pub use path::{
+    collect_read_paths, effective_root, normalize_tool_path, path_list_read_access,
+    path_or_cwd_filtered_read_access, path_or_cwd_read_access, paths_overlap, resolve_arg_path,
+    root_arg_resolves, single_path_read_access, single_path_write_access,
+};
+pub use read_scope::{ReadFilter, ReadScope};
+pub use registry::ToolRegistry;
+pub use tool_set::ToolSet;

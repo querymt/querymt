@@ -19,6 +19,10 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/test-providers.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # Job 1: Detect which providers (or their shared deps) have changed.
   # Outputs one boolean per provider; downstream jobs use these to skip

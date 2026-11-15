@@ -4,6 +4,48 @@
 
 ### Behavior changes
 
+- **BREAKING (log filtering):** the agent is split into `querymt-agent-core`,
+  `-index`, `-knowledge`, `-sqlite`, `-services` and `-runtime`, with
+  `querymt-agent` as the facade. `log` and `tracing` targets come from module
+  paths, so they gain the crate prefix: `querymt_agent::agent::remote` is now
+  `querymt_agent_runtime::agent::remote`. A filter on the bare crate name
+  (`RUST_LOG=querymt_agent=debug`) is a string-prefix match and still covers
+  every agent crate; a filter on a deeper old path matches nothing. Update
+  deeper filters (see `docs/docs/agent/mesh.md`).
+- **BREAKING (Rust API):** `ViewStore` loses `get_atif`. ATIF export is a
+  function over the existing audit-view query.
+- **BREAKING (Rust API):** `SessionError::Database` holds a database-neutral
+  `DbError` (boxed source plus a `NoRows` / `Busy` / `Other` kind) instead of
+  `rusqlite::Error`, and `From<rusqlite::Error>` for `SessionError` and
+  `KnowledgeError` is removed. `is_no_rows()`, `is_transient()` and the
+  `source()` chain behave as before.
+- Existing `querymt_agent::…` module paths keep working through the facade.
+  `querymt-agent` features (`remote`, `oauth`, `plugin-loaders`, `api`) forward
+  to `querymt-agent-runtime`. Session database schema, config, hooks, ACP wire
+  shapes and typeshare output are unchanged.
+- **BREAKING (Rust API, journal):** `querymt_agent::events::AgentEventKind` gains
+  `ElicitationResolved { elicitation_id, session_id, outcome, selection }`
+  (kind `elicitation_resolved`, durable) and the `ElicitationOutcome` enum
+  (`accepted`, `declined`, `cancelled`). The enum is not `#[non_exhaustive]`, so
+  exhaustive matches downstream stop compiling. Built-in questions, skill
+  approvals and MCP server elicitations now journal how they ended; MCP form
+  content is never recorded. An older binary cannot decode journals that
+  contain the new event, so downgrading over existing sessions is not
+  supported. Typeshare output gains the types (UI follow-up for
+  querymt-desktop, not done here).
+- **BREAKING (Rust API):** `ToolContext::ask_question` takes `&[QuestionOption]`
+  instead of `&[(String, String)]` (`QuestionOption` moves to
+  `querymt_agent::tools`; the `question` tool re-exports it).
+  `SkillCatalog::bind` and the skill tool binding take the session's skill
+  grant set.
+- Skill approval prompts offer "Allow", "Allow for this session" and "Deny".
+  "Allow for this session" skips later prompts for the same skill ID, and its
+  supporting-file reads, in that session only. Configured `deny` still wins,
+  non-interactive agents still fail at once, and denials and one-time allows
+  are never remembered.
+- An invalid skill `file` path now fails before any approval prompt, for local
+  and MCP skills (a configured `deny` still reports the denial first).
+- The skill registry refresh debug log now says "local skills".
 - **BREAKING (Rust API):** `querymt_agent::tasks::run_verification` and
   `tasks::extract_verification_commands` are removed. Nothing called them, and
   they ran substrings of model output through `sh -c`. `TaskWatcher` is
@@ -121,6 +163,41 @@
 - Hook tool matchers also match the server-qualified MCP name
   (`server.tool`); hook input gained `mcp_server`; hook commands get
   `QMT_PROFILE_DIR`.
+- **BREAKING (storage, mesh wire): session events are delivered and replayed in
+  production order.** Every event now carries a per-session `session_seq`,
+  assigned when the session produces it. Each session has one ordered writer
+  that persists durable events in batches (up to 64 per transaction) and
+  publishes them after commit. Ephemeral deltas wait only for earlier durable
+  events. Replay uses the same order as live delivery, so back-to-back events
+  such as a tool-call start and end no longer swap. Relayed events keep the
+  host's `session_seq`.
+  - **`session/prompt` responses follow their updates.** The prompt reply
+    carries an internal `event_tip`, and the connection holds the response until
+    it has delivered every update of the run. The wait is released on
+    disconnect, lag-recovery failure, connection close or a 30 s safety limit.
+    The client-facing `PromptResponse` is unchanged.
+  - **Lagging consumers recover.** The WebSocket forwarder used to stop
+    delivering session updates for the rest of the connection once it fell
+    behind the live buffer. The WebSocket and stdio forwarders and the remote
+    relay now reload the missed durable range from the journal (the relay
+    fetches it from the host) and keep receiving. Ephemeral deltas missed while
+    lagging are not replayed. The recovered durable event supersedes them.
+  - **Journal migration `0024_event_journal_session_seq`** adds the
+    `session_seq` column and a unique index on `(session_id, session_seq)` for
+    locally produced rows, and backfills existing local rows. Relayed legacy
+    rows stay unnumbered.
+  - **File databases now use WAL with `synchronous=NORMAL`.** The latest commits
+    can be lost on power loss, but the database cannot be corrupted.
+    In-memory databases are unchanged.
+  - **Upgrade all mesh nodes together.** A node that does not send `event_tip`
+    is treated as "no watermark", but ordering across mixed versions is not
+    guaranteed. An older binary cannot read a migrated journal correctly, so
+    roll back by restoring a pre-upgrade database copy together with the
+    matching binary.
+  - **UI follow-up:** `session_seq` is added to the typeshare types for
+    `DurableEvent`, `EphemeralEvent` and `AgentEvent`. querymt-desktop should
+    regenerate its types (not done here).
+  - See `docs/docs/agent/event-ordering.md`.
 
 ### Fixed
 
@@ -147,6 +224,43 @@
 
 ### Added
 
+- **Git worktree isolation** (opt-in via `[agent.workspace]` /
+  `[quorum.workspace]`, `AgentBuilder`/`QuorumBuilder` and Python keyword
+  arguments). Sessions can be started in their own linked worktree and managed
+  branch (ACP `session/new` metadata, native `/worktree create`, simple API,
+  Python `agent.worktrees`), and delegates can run isolated through the
+  per-delegate `isolation` setting (`inherit` | `isolated` | `shared`). Isolated
+  delegates start from a private baseline that includes the parent's uncommitted
+  edits, results are reviewed baseline-relative, and
+  `accept_delegation_result` integrates a reviewed delta as one commit on
+  explicit request. Existing undo/redo works inside each workspace. Sessions
+  without an explicit isolation request keep running locally. Also adds
+  `querymt/worktree/*` ACP extensions, handoff to a fresh owner, archive from
+  any session, and recovery, with stable error codes on every surface. See
+  `docs/docs/agent/worktrees.md`. Typeshare/ACP additions need a querymt-desktop
+  follow-up (not done here). `gix` is upgraded to 0.90; isolation creation is
+  refused for sparse sources until sparse-checkout support lands.
+- **Portable repository knowledge (opt-in).** Index a checkout's Markdown notes
+  and source declarations from a committed `.qmt/knowledge.toml` manifest into a
+  disposable local cache, and search it with `repo_knowledge_query`,
+  `repo_knowledge_get`, `repo_knowledge_list` and `repo_knowledge_stats`. It is
+  off unless `[agent.repository_knowledge] enabled = true`; repository files can
+  never enable it, widen it or grant tools. Two separate delivery stages can
+  attach bounded, cited cards: `orientation` before a prompt's first model
+  request and `index_context` after a successful `index` call. Manifest
+  `[orientation] retrieval_only` keeps documents searchable but never attached
+  automatically. Session creation warms the index in the background when a
+  delivery stage is on, and the first prompt waits up to 8 s for it. Notes may
+  carry evidence (`knowledge_sources`) that the maintenance example
+  (`cargo run -p querymt-agent --example repository_knowledge -- check`) reports
+  as changed. See `docs/docs/agent/repository_knowledge.md` and the
+  `repository_knowledge_coder.toml` profile. On the five covered questions in
+  the pilot, median fresh tokens fell 14% with similar rubric coverage; the
+  feature adds a fixed per-request cost (tool schemas, policy text) and, with
+  `entrypoints` configured, a map card on first prompts nothing matched.
+- **A plain `cargo build/run/test` at the workspace root selects only the native
+  crates** (`default-members`); the WASM provider plugins and heavy native
+  providers need `-p <package>` or `--workspace`.
 - **`accept_delegation_result` asks by default** before it integrates a
   delegate's result into the checkout, offering Allow once, Allow for this
   session and Reject. List it in `permissions.always_ask` to ask on every call.

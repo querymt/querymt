@@ -1,0 +1,1914 @@
+use super::*;
+
+#[tokio::test]
+async fn status_consistency_idle_actor_does_not_mask_external_lease() {
+    let f = RealStorageHandleFixture::new().await;
+    let sid = seed_session_with_reasoning(&f, None).await;
+    f.handle
+        .load_session(LoadSessionRequest::new(
+            sid.clone(),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .unwrap();
+    let before = f
+        .handle
+        .observe_session_runtimes(std::slice::from_ref(&sid))
+        .await
+        .remove(&sid)
+        .unwrap();
+    assert_eq!(
+        before.phase,
+        crate::agent::messages::SessionRuntimePhase::Idle
+    );
+    let root = crate::session::run_lease::RunLeaseRoot::new(
+        f.handle.config.storage.run_lease_root().unwrap(),
+    );
+    let lease = root.acquire(&sid).await.unwrap().unwrap();
+    let state = f
+        .handle
+        .observe_session_runtimes(std::slice::from_ref(&sid))
+        .await
+        .remove(&sid)
+        .unwrap();
+    assert_eq!(
+        state.phase,
+        crate::agent::messages::SessionRuntimePhase::Unknown
+    );
+    assert_eq!(
+        state.observation.reason.as_deref(),
+        Some("live_owner_elsewhere")
+    );
+    let response = f
+        .handle
+        .handle_ext_session_runtime_state(ExtRequest::new(
+            "querymt/session/runtimeState",
+            Arc::from(
+                serde_json::value::to_raw_value(&serde_json::json!({"session_id": sid})).unwrap(),
+            ),
+        ))
+        .await
+        .unwrap();
+    let direct: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+    assert_eq!(direct, serde_json::to_value(&state).unwrap());
+    let listing = f
+        .handle
+        .list_sessions(ListSessionsRequest::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        listing
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id.to_string() == sid)
+            .unwrap()
+            .meta
+            .as_ref()
+            .unwrap()["runtimeStatus"],
+        direct
+    );
+    let snapshot = crate::session::load_snapshot::load_session_snapshot(
+        &f.handle,
+        f.storage.view_store().unwrap(),
+        &sid,
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot.runtime_status, state);
+    let sdk_session = crate::api::AgentSession::new(Arc::new(f.handle), sid);
+    assert_eq!(sdk_session.runtime_state().await.unwrap(), state);
+    drop(lease);
+}
+
+#[tokio::test]
+async fn status_observer_probes_do_not_report_each_other_as_execution() {
+    for materialized in [false, true] {
+        let f = RealStorageHandleFixture::new().await;
+        let sid = seed_session_with_reasoning(&f, None).await;
+        if materialized {
+            f.handle
+                .load_session(LoadSessionRequest::new(
+                    sid.clone(),
+                    std::path::PathBuf::new(),
+                ))
+                .await
+                .unwrap();
+        }
+        let root = f.storage.run_lease_root().unwrap();
+        let pause = crate::agent::handle::runtime_observation::pause_next_probe(&root, &sid);
+        let ids = [sid.clone()];
+        let first = f.handle.observe_session_runtimes(&ids);
+        tokio::pin!(first);
+        tokio::select! { _ = pause.entered.notified() => {}, _ = &mut first => panic!("probe did not pause") }
+        let (listed, direct, snapshot) = tokio::join!(
+            f.handle.list_sessions(ListSessionsRequest::new()),
+            f.handle.observe_session_runtimes(&ids),
+            crate::session::load_snapshot::load_session_snapshot(
+                &f.handle,
+                f.storage.view_store().unwrap(),
+                &sid
+            ),
+        );
+        pause.release.notify_one();
+        let first = first.await;
+        assert_eq!(
+            first[&sid].phase,
+            crate::agent::messages::SessionRuntimePhase::Idle
+        );
+        assert_eq!(
+            direct[&sid].phase,
+            crate::agent::messages::SessionRuntimePhase::Idle,
+            "observer's completed probe must not masquerade as a live run"
+        );
+        assert_eq!(
+            snapshot.unwrap().runtime_status.phase,
+            crate::agent::messages::SessionRuntimePhase::Idle
+        );
+        let row = listed
+            .unwrap()
+            .sessions
+            .into_iter()
+            .find(|row| row.session_id.to_string() == sid)
+            .unwrap();
+        assert_eq!(row.meta.unwrap()["runtimeStatus"]["phase"], "idle");
+        let lease = crate::session::run_lease::RunLeaseRoot::new(root)
+            .acquire(&sid)
+            .await
+            .unwrap()
+            .unwrap();
+        let external = f.handle.observe_session_runtimes(&ids).await;
+        assert_eq!(
+            external[&sid].observation.reason.as_deref(),
+            Some("live_owner_elsewhere")
+        );
+        drop(lease);
+    }
+}
+
+#[tokio::test]
+async fn status_observation_page_uses_one_deadline_including_owner_locks() {
+    let f = RealStorageHandleFixture::new().await;
+    let ids: Vec<_> = (0..100).map(|id| format!("blocked-page-{id}")).collect();
+    let _registry = f.handle.registry.lock().await;
+    let observed = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        f.handle.observe_session_runtimes(&ids),
+    )
+    .await
+    .expect("page must not spend a fresh timeout on every row");
+    assert_eq!(observed.len(), ids.len());
+    assert!(observed.values().all(|runtime| runtime.phase
+        == crate::agent::messages::SessionRuntimePhase::Unknown
+        && runtime.observation.reason.as_deref() == Some("observation_timeout")));
+}
+
+#[tokio::test]
+async fn status_observation_does_not_materialize_persisted_profile() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountingCatalog(Arc<AtomicUsize>);
+    #[async_trait]
+    impl ProfileCatalog for CountingCatalog {
+        async fn list_profiles(&self) -> anyhow::Result<Vec<crate::profiles::ProfileMetadata>> {
+            Ok(vec![])
+        }
+        async fn load_profile(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<crate::profiles::ProfileDocument> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("observation must not build this historical profile")
+        }
+    }
+    let f = RealStorageHandleFixture::new().await;
+    let session_id = seed_session_with_reasoning(&f, None).await;
+    f.storage
+        .session_store()
+        .set_profile_binding(&session_id, "unmaterialized")
+        .await
+        .unwrap();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(CountingCatalog(builds.clone()));
+    let (plugins, _dir) = empty_plugin_registry().unwrap();
+    let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        catalog,
+        "unmaterialized",
+        AgentInfra {
+            plugin_registry: Arc::new(plugins),
+            storage: Some(f.storage.clone()),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        },
+    ));
+    f.handle.set_profiles(profiles.clone());
+    let listing = f
+        .handle
+        .list_sessions(ListSessionsRequest::new())
+        .await
+        .unwrap();
+    let listed = listing
+        .sessions
+        .iter()
+        .find(|s| s.session_id.to_string() == session_id)
+        .unwrap();
+    let direct = f
+        .handle
+        .observe_session_runtimes(std::slice::from_ref(&session_id))
+        .await
+        .remove(&session_id)
+        .unwrap();
+    assert_eq!(
+        listed.meta.as_ref().unwrap()["runtimeStatus"],
+        serde_json::to_value(&direct).unwrap()
+    );
+    assert_eq!(builds.load(Ordering::SeqCst), 0);
+    assert!(profiles.materialized_runtimes().await.is_empty());
+    assert!(f.handle.registry.lock().await.is_empty());
+    let lease = crate::session::run_lease::RunLeaseRoot::new(
+        f.handle.config.storage.run_lease_root().unwrap(),
+    )
+    .acquire(&session_id)
+    .await
+    .unwrap()
+    .unwrap();
+    let other_owner = f
+        .handle
+        .observe_session_runtimes(std::slice::from_ref(&session_id))
+        .await
+        .remove(&session_id)
+        .unwrap();
+    assert_eq!(
+        other_owner.phase,
+        crate::agent::messages::SessionRuntimePhase::Unknown
+    );
+    assert_eq!(
+        other_owner.observation.reason.as_deref(),
+        Some("live_owner_elsewhere")
+    );
+    drop(lease);
+}
+
+#[tokio::test]
+async fn local_load_and_resume_replace_stopped_actors() {
+    for resume in [false, true] {
+        let f = RealStorageHandleFixture::new().await;
+        let session_id = seed_session_with_reasoning(&f, None).await;
+        f.handle
+            .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                SessionId::from(session_id.clone()),
+                std::path::PathBuf::new(),
+            ))
+            .await
+            .unwrap();
+        let dead = f
+            .handle
+            .registry
+            .lock()
+            .await
+            .local_actor_ref(&session_id)
+            .cloned()
+            .unwrap();
+        let old_id = dead.id();
+        dead.kill();
+        dead.wait_for_shutdown().await;
+        if resume {
+            f.handle
+                .resume_session(crate::acp::protocol::ResumeSessionRequest::new(
+                    SessionId::from(session_id.clone()),
+                    std::path::PathBuf::new(),
+                ))
+                .await
+                .expect("local resume rematerializes");
+        } else {
+            f.handle
+                .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                    SessionId::from(session_id.clone()),
+                    std::path::PathBuf::new(),
+                ))
+                .await
+                .expect("local load rematerializes");
+        }
+        let fresh = f
+            .handle
+            .registry
+            .lock()
+            .await
+            .local_actor_ref(&session_id)
+            .cloned()
+            .unwrap();
+        assert!(fresh.is_alive());
+        assert_ne!(fresh.id(), old_id);
+        fresh.kill();
+    }
+}
+
+#[tokio::test]
+async fn stopped_actor_is_evicted_without_another_load() {
+    let f = RealStorageHandleFixture::new().await;
+    let session_id = seed_session_with_reasoning(&f, None).await;
+    f.handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            SessionId::from(session_id.clone()),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .unwrap();
+    let actor = f
+        .handle
+        .registry
+        .lock()
+        .await
+        .local_actor_ref(&session_id)
+        .cloned()
+        .unwrap();
+    actor.kill();
+    actor.wait_for_shutdown().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while f.handle.registry.lock().await.get(&session_id).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shared registration installs a stop watcher");
+}
+
+#[test]
+fn test_should_return_without_force_stop_only_for_idle() {
+    assert!(should_return_without_force_stop(
+        crate::agent::messages::SessionRuntimeStatus::Idle
+    ));
+    assert!(!should_return_without_force_stop(
+        crate::agent::messages::SessionRuntimeStatus::Running
+    ));
+    assert!(!should_return_without_force_stop(
+        crate::agent::messages::SessionRuntimeStatus::CancelRequested
+    ));
+}
+
+#[tokio::test]
+async fn test_from_config_creates_empty_registry() {
+    let f = HandleFixture::new().await;
+    let registry = f.handle.registry.lock().await;
+    assert!(registry.is_empty());
+}
+
+#[tokio::test]
+async fn test_from_config_does_not_trigger_background_model_refresh() {
+    let f = HandleFixture::new().await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let (_, meta) = f.handle.model_inventory.get_snapshot().await;
+    assert!(
+        meta.local_updated_at.is_none(),
+        "constructing a handle should not eagerly refresh models"
+    );
+    assert!(
+        !meta.refresh_in_progress,
+        "constructing a handle should not start a background refresh"
+    );
+}
+
+#[tokio::test]
+async fn test_initialize_returns_latest_protocol() {
+    let f = HandleFixture::new().await;
+    let req = InitializeRequest::new(ProtocolVersion::LATEST);
+    let resp = f.handle.initialize(req).await.expect("initialize");
+    assert!(resp.protocol_version <= ProtocolVersion::LATEST);
+}
+
+#[tokio::test]
+async fn test_initialize_downgrades_newer_client_protocol() {
+    let f = HandleFixture::new().await;
+    // Simulate a client claiming a future protocol version by using LATEST
+    // (we can't construct a truly higher version, but LATEST is still valid)
+    let req = InitializeRequest::new(ProtocolVersion::LATEST);
+    let resp = f.handle.initialize(req).await.expect("initialize");
+    // Server caps at LATEST
+    assert_eq!(resp.protocol_version, ProtocolVersion::LATEST);
+}
+
+#[tokio::test]
+async fn test_initialize_advertises_session_capabilities() {
+    let f = HandleFixture::new().await;
+    let req = InitializeRequest::new(ProtocolVersion::LATEST);
+    let resp = f.handle.initialize(req).await.expect("initialize");
+
+    assert!(resp.agent_capabilities.load_session);
+    assert!(resp.agent_capabilities.prompt_capabilities.image);
+    assert!(resp.agent_capabilities.prompt_capabilities.embedded_context);
+    assert!(resp.agent_capabilities.session_capabilities.list.is_some());
+    assert!(resp.agent_capabilities.session_capabilities.fork.is_some());
+    assert!(
+        resp.agent_capabilities
+            .session_capabilities
+            .resume
+            .is_some()
+    );
+    assert!(resp.agent_capabilities.session_capabilities.close.is_some());
+    assert!(
+        resp.agent_capabilities
+            .session_capabilities
+            .delete
+            .is_some()
+    );
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn test_acp_set_model_routes_local_provider_back_to_caller() {
+    use crate::agent::core::SessionRuntime;
+    use crate::agent::remote::scope::{MeshScopeId, scoped_session};
+
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let fixture = RealStorageHandleFixture::new().await;
+    fixture.handle.set_mesh(mesh.clone());
+    let host = RealStorageHandleFixture::new().await;
+    let store = host.storage.session_store();
+    let session = store
+        .create_session(None, None, None, None)
+        .await
+        .expect("create session");
+    let config = store
+        .create_or_get_llm_config(&LLMParams::new().provider("mock").model("mock-model"))
+        .await
+        .expect("create config");
+    store
+        .set_session_llm_config(&session.public_id, config.id)
+        .await
+        .expect("bind config");
+
+    let actor = SessionActor::new(
+        host.handle.config.clone(),
+        session.public_id.clone(),
+        SessionRuntime::new(
+            None,
+            std::collections::HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        ),
+    )
+    .with_mesh(Some(mesh.clone()));
+    let local_ref = SessionActor::spawn(actor);
+    let dht_name = scoped_session(&MeshScopeId::lan_default(), &session.public_id);
+    mesh.register_actor(local_ref, dht_name.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let remote_ref = mesh
+        .lookup_actor::<SessionActor>(&dht_name)
+        .await
+        .expect("DHT lookup")
+        .expect("remote actor");
+    fixture
+        .handle
+        .attach_remote_session(
+            session.public_id.clone(),
+            remote_ref,
+            "remote-peer".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect("attach remote session");
+
+    SendAgent::set_session_model(
+        &fixture.handle,
+        crate::acp::protocol::SetSessionModelRequest::new(
+            SessionId::from(session.public_id.clone()),
+            crate::acp::protocol::ModelId::from("mock/local-only".to_string()),
+        ),
+    )
+    .await
+    .expect("set remote session model");
+
+    let session_ref = fixture
+        .handle
+        .registry
+        .lock()
+        .await
+        .get(&session.public_id)
+        .expect("attached session")
+        .clone();
+    let control = session_ref
+        .get_session_control()
+        .await
+        .expect("session control");
+    assert_eq!(control.effective_model.provider, "mock");
+    assert_eq!(control.effective_model.model, "local-only");
+    assert_eq!(
+        control.effective_model.provider_node_id,
+        Some(crate::agent::remote::NodeId::from_peer_id(*mesh.peer_id()).to_string())
+    );
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn test_cancel_known_remote_session_routes_cancel_to_session_ref() {
+    use crate::agent::core::SessionRuntime;
+    use crate::agent::remote::scope::{MeshScopeId, scoped_session};
+
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let f = HandleFixture::new().await;
+    f.handle.set_mesh(mesh.clone());
+
+    let session_id = "remote-cancel-known".to_string();
+    let actor = SessionActor::new(
+        f.handle.config.clone(),
+        session_id.clone(),
+        SessionRuntime::new(
+            None,
+            std::collections::HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        ),
+    )
+    .with_mesh(Some(mesh.clone()));
+    let local_ref = SessionActor::spawn(actor);
+    let dht_name = scoped_session(&MeshScopeId::lan_default(), &session_id);
+    mesh.register_actor(local_ref, dht_name.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let remote_ref = mesh
+        .lookup_actor::<SessionActor>(&dht_name)
+        .await
+        .expect("DHT lookup should succeed")
+        .expect("remote actor should be available");
+
+    f.handle
+        .config
+        .provider
+        .history_store()
+        .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+            session_id: session_id.clone(),
+            node_id: mesh.peer_id().to_string(),
+            peer_label: "remote-peer".to_string(),
+            cwd: None,
+            created_at: 1,
+            title: None,
+        })
+        .await
+        .expect("save remote bookmark");
+    f.handle
+        .attach_remote_session(
+            session_id.clone(),
+            remote_ref,
+            "remote-peer".to_string(),
+            None,
+            Some(mesh.peer_id().to_string()),
+        )
+        .await
+        .expect("attach remote session");
+
+    let mut rx = f.handle.subscribe_events();
+    let notif = CancelNotification::new(SessionId::from(session_id.clone()));
+    SendAgent::cancel(&f.handle, notif)
+        .await
+        .expect("cancel should succeed");
+
+    // Attach spawns the Phase-10 backfill, which publishes an ephemeral
+    // RemoteSessionSyncCompleted signal (a legacy sync boundary here: the
+    // journal holds no source cursor yet). Skip sync-status signals; the
+    // cancel-routed Cancelled event must still arrive.
+    let event = loop {
+        let envelope = tokio::time::timeout(tokio::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("should receive event in time")
+            .expect("event channel should remain open");
+        if matches!(
+            envelope.kind(),
+            crate::events::AgentEventKind::RemoteSessionSyncCompleted { .. }
+        ) {
+            continue;
+        }
+        break envelope;
+    };
+
+    assert_eq!(event.session_id(), session_id);
+    assert!(matches!(
+        event.kind(),
+        crate::events::AgentEventKind::Cancelled
+    ));
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn test_list_remote_nodes_prefers_per_peer_lookup() {
+    use crate::agent::remote::RemoteNodeManager;
+    use crate::agent::remote::scope::{MeshScopeId, scoped_node_manager_for_peer};
+    use kameo::actor::Spawn;
+
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let f = HandleFixture::new().await;
+    f.handle.set_mesh(mesh.clone());
+
+    let remote_cfg = HandleFixture::new().await;
+    let peer_id = libp2p::identity::Keypair::generate_ed25519()
+        .public()
+        .to_peer_id();
+    let node_manager = RemoteNodeManager::new(
+        remote_cfg.handle.config.clone(),
+        remote_cfg.handle.registry.clone(),
+        Some(mesh.clone()),
+        remote_cfg.handle.scheduler_handle.clone(),
+    )
+    .with_node_name("peer-alpha".to_string());
+    let node_manager_ref = RemoteNodeManager::spawn(node_manager);
+
+    let per_peer_name = scoped_node_manager_for_peer(&MeshScopeId::lan_default(), &peer_id);
+    mesh.register_actor(node_manager_ref, per_peer_name).await;
+    mesh.inject_known_peer_for_test(peer_id);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let nodes = crate::control::remote::list_remote_nodes(&f.handle).await;
+    let labels: HashSet<_> = nodes.into_iter().map(|node| node.label).collect();
+
+    assert!(
+        labels.contains("peer-alpha"),
+        "per-peer DHT registrations should be visible in list_remote_nodes"
+    );
+}
+
+#[tokio::test]
+async fn test_list_sessions_empty() {
+    let f = HandleFixture::new().await;
+    let req = ListSessionsRequest::new();
+    let resp = f.handle.list_sessions(req).await.expect("list_sessions");
+    assert!(resp.sessions.is_empty());
+}
+
+#[tokio::test]
+async fn test_list_sessions_cwd_pagination_and_cursor_errors() {
+    let f = RealStorageHandleFixture::new().await;
+    let workspace = std::env::temp_dir().join("querymt-list-sessions-workspace");
+    let other_workspace = std::env::temp_dir().join("querymt-list-sessions-other-workspace");
+    let session_store = f.storage.session_store();
+    let mut workspace_session_ids = HashSet::new();
+
+    for index in 0..12 {
+        let session = session_store
+            .create_session(
+                Some(format!("Workspace Session {index}")),
+                Some(workspace.clone()),
+                None,
+                None,
+            )
+            .await
+            .expect("create workspace session");
+        workspace_session_ids.insert(session.public_id);
+    }
+    for index in 0..2 {
+        session_store
+            .create_session(
+                Some(format!("Other Workspace Session {index}")),
+                Some(other_workspace.clone()),
+                None,
+                None,
+            )
+            .await
+            .expect("create other workspace session");
+    }
+
+    let first_page = f
+        .handle
+        .list_sessions(ListSessionsRequest::new().cwd(workspace.clone()))
+        .await
+        .expect("list first workspace page");
+    assert_eq!(first_page.sessions.len(), 10);
+    assert!(
+        first_page
+            .sessions
+            .iter()
+            .all(|session| session.cwd == workspace)
+    );
+    let first_page_ids: HashSet<_> = first_page
+        .sessions
+        .iter()
+        .map(|session| session.session_id.to_string())
+        .collect();
+    assert_eq!(first_page_ids.len(), 10);
+    let next_cursor = first_page
+        .next_cursor
+        .expect("workspace page should continue");
+
+    let second_page = f
+        .handle
+        .list_sessions(
+            ListSessionsRequest::new()
+                .cwd(workspace.clone())
+                .cursor(next_cursor),
+        )
+        .await
+        .expect("list second workspace page");
+    assert_eq!(second_page.sessions.len(), 2);
+    assert!(
+        second_page
+            .sessions
+            .iter()
+            .all(|session| session.cwd == workspace)
+    );
+    let second_page_ids: HashSet<_> = second_page
+        .sessions
+        .iter()
+        .map(|session| session.session_id.to_string())
+        .collect();
+    assert!(first_page_ids.is_disjoint(&second_page_ids));
+    assert_eq!(
+        first_page_ids
+            .union(&second_page_ids)
+            .cloned()
+            .collect::<HashSet<_>>(),
+        workspace_session_ids
+    );
+    assert!(second_page.next_cursor.is_none());
+
+    for cursor in ["not-a-number", "9223372036854775808"] {
+        let error = f
+            .handle
+            .list_sessions(ListSessionsRequest::new().cursor(cursor))
+            .await
+            .expect_err("invalid ACP cursor should fail");
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+    }
+}
+
+#[tokio::test]
+async fn test_cancel_unknown_session_is_noop() {
+    let f = HandleFixture::new().await;
+    let notif = CancelNotification::new(SessionId::from("no-such-session".to_string()));
+    // Should not return an error — stop for unknown sessions is a no-op
+    let result = SendAgent::cancel(&f.handle, notif).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_close_unknown_session_is_noop() {
+    let f = HandleFixture::new().await;
+    let req = CloseSessionRequest::new(SessionId::from("no-such-session".to_string()));
+    let result = SendAgent::close_session(&f.handle, req).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_delete_unknown_session_is_noop() {
+    let f = HandleFixture::new().await;
+    let req = DeleteSessionRequest::new(SessionId::from("no-such-session".to_string()));
+    let result = SendAgent::delete_session(&f.handle, req).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_prompt_unknown_session_returns_error() {
+    let f = HandleFixture::new().await;
+    let req = crate::acp::protocol::PromptRequest::new(
+        SessionId::from("no-such-session".to_string()),
+        vec![],
+    );
+    let result = SendAgent::prompt(&f.handle, req).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_profile_config_option_absent_without_profiles() {
+    let f = HandleFixture::new().await;
+
+    let options = profile_config_options(&f, None).await;
+
+    assert!(
+        !options
+            .iter()
+            .any(|option| option.id.0.as_ref() == "profile")
+    );
+    assert_eq!(options[0].id.0.as_ref(), "mode");
+}
+
+#[tokio::test]
+async fn test_profile_config_option_includes_configured_profiles() {
+    let profile_dir = tempfile::tempdir().expect("profile dir");
+    write_profile(
+        profile_dir.path(),
+        "alpha.toml",
+        r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "alpha"
+"#,
+    );
+    write_profile(
+        profile_dir.path(),
+        "beta.toml",
+        r#"
+[profile]
+name = "Beta"
+description = "Beta profile"
+
+[agent]
+provider = "test"
+model = "test-model"
+system = "beta"
+"#,
+    );
+    let f = HandleFixture::new()
+        .await
+        .with_profiles("alpha", profile_dir.path())
+        .await;
+    register_bound_test_session(&f, "session-1", "alpha").await;
+
+    let options = profile_config_options(&f, Some("session-1")).await;
+
+    assert_eq!(options[0].id.0.as_ref(), "profile");
+    assert_eq!(select_option_values(&options[0]), vec!["alpha", "beta"]);
+    assert_eq!(options[1].id.0.as_ref(), "mode");
+}
+
+#[tokio::test]
+async fn test_profile_config_option_omits_unbound_sessions() {
+    let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+    register_test_session(&f, "session-1").await;
+
+    let options = profile_config_options(&f, Some("session-1")).await;
+
+    assert!(
+        !options
+            .iter()
+            .any(|option| option.id.0.as_ref() == "profile")
+    );
+    assert_eq!(options[0].id.0.as_ref(), "mode");
+}
+
+#[test]
+fn test_config_options_with_profiles_uses_profile_metadata() {
+    let profiles = vec![
+        test_profile_metadata("alpha", "Alpha", None),
+        test_profile_metadata("beta", "Beta", Some("Beta profile")),
+    ];
+
+    let options = crate::agent::session_registry::config_options_with_profiles(
+        AgentMode::Build,
+        None,
+        Some("beta"),
+        &profiles,
+    );
+
+    assert_eq!(options[0].id.0.as_ref(), "profile");
+    let select = match &options[0].kind {
+        crate::acp::protocol::SessionConfigKind::Select(select) => select,
+        _ => panic!("expected select config option"),
+    };
+    assert_eq!(select.current_value.0.as_ref(), "beta");
+    let profile_options = select_options(&options[0]);
+    assert_eq!(profile_options[1].name, "Beta");
+    assert_eq!(
+        profile_options[1].description.as_deref(),
+        Some("Beta profile")
+    );
+}
+
+#[tokio::test]
+async fn test_new_session_binds_requested_profile_from_querymt_meta() {
+    let (f, _profile_dir) = profile_fixture_with_files(&[
+        ("alpha.toml", ALPHA_PROFILE_TOML),
+        ("beta.toml", BETA_PROFILE_TOML),
+    ])
+    .await;
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "querymt".to_string(),
+        serde_json::json!({ "profile_id": "beta" }),
+    );
+    let req = crate::acp::protocol::NewSessionRequest::new(std::path::PathBuf::new()).meta(meta);
+
+    let response = f.handle.new_session(req).await.expect("new session");
+    let session_id = response.session_id.to_string();
+    let binding = f
+        .handle
+        .profiles()
+        .expect("profiles configured")
+        .session_binding(&session_id)
+        .await
+        .expect("session binding");
+
+    assert_eq!(binding.profile_id, "beta");
+    let options = response.config_options.expect("config options");
+    assert_eq!(options[0].id.0.as_ref(), "profile");
+    let model = options
+        .iter()
+        .find(|option| option.id.0.as_ref() == "model")
+        .expect("profile creation includes the effective model");
+    let loaded = f
+        .handle
+        .load_session(LoadSessionRequest::new(
+            session_id,
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .expect("reload profile session");
+    let loaded_options = loaded.config_options.expect("loaded config options");
+    let loaded_model = loaded_options
+        .iter()
+        .find(|option| option.id.0.as_ref() == "model")
+        .expect("profile reload includes model");
+    assert_eq!(
+        serde_json::to_value(model).unwrap(),
+        serde_json::to_value(loaded_model).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_profile_bound_session_discards_its_todo_list() {
+    use crate::tools::builtins::todo::{TodoItem, TodoPriority, TodoStatus};
+
+    let (f, _profile_dir) = profile_fixture_with_files(&[
+        ("alpha.toml", ALPHA_PROFILE_TOML),
+        ("beta.toml", BETA_PROFILE_TOML),
+    ])
+    .await;
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "querymt".to_string(),
+        serde_json::json!({ "profile_id": "beta" }),
+    );
+    let req = crate::acp::protocol::NewSessionRequest::new(std::path::PathBuf::new()).meta(meta);
+    let session_id = f
+        .handle
+        .new_session(req)
+        .await
+        .expect("new session")
+        .session_id
+        .to_string();
+
+    // The bound session runs with its runtime's own config, so its list lives
+    // in that runtime's store, not the main handle's.
+    let runtime = f
+        .handle
+        .profiles()
+        .expect("profiles configured")
+        .runtime_for_profile("beta")
+        .await
+        .unwrap();
+    let owner = runtime.session_handle(None).unwrap();
+    let owner = owner.as_any().downcast_ref::<LocalAgentHandle>().unwrap();
+    assert!(!Arc::ptr_eq(
+        &owner.config.todo_store,
+        &f.handle.config.todo_store
+    ));
+    owner.config.todo_store.replace(
+        &session_id,
+        vec![TodoItem {
+            id: "1".into(),
+            content: "leftover".into(),
+            status: TodoStatus::Pending,
+            priority: TodoPriority::Low,
+        }],
+    );
+
+    f.handle
+        .delete_session(crate::acp::protocol::DeleteSessionRequest::new(
+            session_id.clone(),
+        ))
+        .await
+        .expect("delete session");
+
+    assert!(
+        owner.config.todo_store.get(&session_id).is_empty(),
+        "profile runtime kept the deleted session's todo list"
+    );
+}
+
+#[tokio::test]
+async fn profile_reopen_preserves_the_owning_actor_and_event_sequence() {
+    use crate::session::projection::EventJournal;
+
+    for (profile_id, agent_id) in [("alpha", None), ("quorum", Some("coder"))] {
+        let f = RealStorageHandleFixture::new().await;
+        let profile_dir = tempfile::tempdir().unwrap();
+        write_profile(profile_dir.path(), "alpha.toml", ALPHA_PROFILE_TOML);
+        write_profile(profile_dir.path(), "quorum.toml", QUORUM_PROFILE_TOML);
+        let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+            crate::profiles::LocalProfileCatalog::builder()
+                .include_embedded_default(false)
+                .include_default_user_dir(false)
+                .local_dir(profile_dir.path())
+                .build(),
+        );
+        let (registry, _registry_dir) = empty_plugin_registry().unwrap();
+        let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+            catalog,
+            "alpha",
+            AgentInfra {
+                plugin_registry: Arc::new(registry),
+                storage: Some(f.storage.clone()),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            },
+        ));
+        f.handle.set_profiles(profiles.clone());
+        let runtime = profiles.runtime_for_profile(profile_id).await.unwrap();
+        let owner = runtime.session_handle(agent_id).unwrap();
+        let owner = owner.as_any().downcast_ref::<LocalAgentHandle>().unwrap();
+        let created = owner
+            .new_session(NewSessionRequest::new(std::path::PathBuf::new()))
+            .await
+            .unwrap();
+        let session_id = created.session_id.to_string();
+        let mut binding = runtime.session_binding();
+        binding.agent_id = agent_id.map(str::to_string);
+        profiles
+            .set_session_binding(&session_id, binding)
+            .await
+            .unwrap();
+        let direct = owner
+            .registry
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .unwrap()
+            .get_runtime_status()
+            .await
+            .unwrap();
+        assert!(
+            owner.profiles().is_none(),
+            "direct bound owner must not need a profiles manager"
+        );
+        let own_observation = owner
+            .observe_session_runtimes(std::slice::from_ref(&session_id))
+            .await
+            .remove(&session_id)
+            .unwrap();
+        assert_eq!(
+            own_observation, direct,
+            "direct bound-owner observation must use its own registered actor"
+        );
+        let own_response = owner
+            .handle_ext_session_runtime_state(ExtRequest::new(
+                "querymt/session/runtimeState",
+                Arc::from(
+                    serde_json::value::to_raw_value(&serde_json::json!({"session_id": session_id}))
+                        .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(own_response.0.get()).unwrap(),
+            serde_json::to_value(&direct).unwrap()
+        );
+        if agent_id.is_none() {
+            let sdk = runtime
+                .agent()
+                .sessions()
+                .load(session_id.clone())
+                .await
+                .unwrap();
+            assert_eq!(sdk.runtime_state().await.unwrap(), direct);
+        }
+        let observed = f
+            .handle
+            .observe_session_runtimes(std::slice::from_ref(&session_id))
+            .await
+            .remove(&session_id)
+            .unwrap();
+        assert_eq!(
+            observed, direct,
+            "bound profile/delegate lookup must use its real actor"
+        );
+        assert_eq!(
+            observed.observation.availability,
+            crate::agent::messages::RuntimeAvailability::Live
+        );
+        let listed = f
+            .handle
+            .list_sessions(ListSessionsRequest::new())
+            .await
+            .unwrap();
+        let entry = listed
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id.to_string() == session_id)
+            .unwrap();
+        assert_eq!(
+            entry.meta.as_ref().unwrap()["runtimeStatus"],
+            serde_json::to_value(&direct).unwrap()
+        );
+        let stream = owner.config.event_sink.session_stream(&session_id);
+        stream.flush().await;
+        let tip = stream.tip();
+        f.handle
+            .load_session(LoadSessionRequest::new(
+                session_id.clone(),
+                std::path::PathBuf::new(),
+            ))
+            .await
+            .unwrap();
+        let resumed = SendAgent::resume_session(
+            &f.handle,
+            crate::acp::protocol::ResumeSessionRequest::new(
+                session_id.clone(),
+                std::path::PathBuf::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            resumed
+                .config_options
+                .unwrap()
+                .iter()
+                .any(|option| option.id.0.as_ref() == "profile")
+        );
+        assert!(
+            f.handle.registry.lock().await.get(&session_id).is_none(),
+            "reopening must not create an actor outside the owning profile"
+        );
+        assert_eq!(
+            stream.tip(),
+            tip,
+            "warm reopen must not write duplicate setup events"
+        );
+        owner
+            .config
+            .emit_event_persisted(&session_id, crate::events::AgentEventKind::SessionCreated)
+            .await
+            .expect("owning profile keeps its authoritative event sequence");
+        if agent_id.is_none() {
+            // The server's active profile can itself be the root handle.
+            owner.set_profiles(profiles.clone());
+            SendAgent::resume_session(
+                owner,
+                crate::acp::protocol::ResumeSessionRequest::new(
+                    session_id.clone(),
+                    std::path::PathBuf::new(),
+                ),
+            )
+            .await
+            .expect("same-runtime ownership must not recurse");
+        }
+        // Cold reopen still materializes in the bound owner, not the server root.
+        let stopped = owner
+            .registry
+            .lock()
+            .await
+            .local_actor_ref(&session_id)
+            .cloned()
+            .unwrap();
+        stopped.kill();
+        stopped.wait_for_shutdown().await;
+        stream.flush().await;
+        let count_materializations = |events: Vec<crate::events::DurableEvent>| {
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, crate::events::AgentEventKind::SessionCreated))
+                .count()
+        };
+        let before = count_materializations(
+            f.storage
+                .load_session_stream(&session_id, None, None)
+                .await
+                .unwrap(),
+        );
+        let (loaded, resumed, resumed_again) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(
+                    f.handle.load_session(LoadSessionRequest::new(
+                        session_id.clone(),
+                        std::path::PathBuf::new(),
+                    )),
+                    SendAgent::resume_session(
+                        &f.handle,
+                        crate::acp::protocol::ResumeSessionRequest::new(
+                            session_id.clone(),
+                            std::path::PathBuf::new(),
+                        ),
+                    ),
+                    SendAgent::resume_session(
+                        &f.handle,
+                        crate::acp::protocol::ResumeSessionRequest::new(
+                            session_id.clone(),
+                            std::path::PathBuf::new(),
+                        ),
+                    ),
+                )
+            })
+            .await
+            .expect("concurrent owner reopen must finish");
+        loaded.unwrap();
+        resumed.unwrap();
+        resumed_again.unwrap();
+        stream.flush().await;
+        assert_eq!(
+            count_materializations(
+                f.storage
+                    .load_session_stream(&session_id, None, None)
+                    .await
+                    .unwrap(),
+            ),
+            before + 1,
+            "concurrent cold reopen must materialize exactly one actor"
+        );
+        assert!(f.handle.registry.lock().await.get(&session_id).is_none());
+        owner
+            .config
+            .emit_event_persisted(&session_id, crate::events::AgentEventKind::SessionCreated)
+            .await
+            .unwrap();
+        f.handle.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn test_set_profile_config_option_rejects_unknown_profile() {
+    let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+    register_bound_test_session(&f, "session-1", "alpha").await;
+
+    let req =
+        crate::acp::protocol::SetSessionConfigOptionRequest::new("session-1", "profile", "missing");
+
+    let err = f
+        .handle
+        .set_session_config_option(req)
+        .await
+        .expect_err("unknown profile should fail");
+    assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+}
+
+#[tokio::test]
+async fn test_set_profile_config_option_rejects_different_bound_profile() {
+    let (f, _profile_dir) = profile_fixture_with_files(&[
+        ("alpha.toml", ALPHA_PROFILE_TOML),
+        ("beta.toml", BETA_PROFILE_TOML),
+    ])
+    .await;
+    register_bound_test_session(&f, "session-1", "alpha").await;
+
+    let req =
+        crate::acp::protocol::SetSessionConfigOptionRequest::new("session-1", "profile", "beta");
+
+    let err = f
+        .handle
+        .set_session_config_option(req)
+        .await
+        .expect_err("different profile should fail");
+    assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+}
+
+async fn register_profile_bound_delegate_session(
+    f: &HandleFixture,
+    runtime: &Arc<crate::profile_host::ProfileRuntimeView>,
+    session_id: &str,
+) -> (Arc<dyn AgentHandle>, SessionActorRef) {
+    let delegate_handle = runtime.delegate("coder").expect("coder delegate");
+    let local_handle = delegate_handle
+        .as_any()
+        .downcast_ref::<LocalAgentHandle>()
+        .expect("local delegate");
+    let actor = SessionActor::new(
+        local_handle.config.clone(),
+        session_id.to_string(),
+        crate::agent::core::SessionRuntime::new(
+            None,
+            std::collections::HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        ),
+    );
+    let actor_ref: SessionActorRef = SessionActor::spawn(actor).into();
+    local_handle
+        .registry
+        .lock()
+        .await
+        .insert(session_id.to_string(), actor_ref.clone());
+    let mut binding = runtime.session_binding();
+    binding.agent_id = Some("coder".to_string());
+    f.handle
+        .profiles()
+        .expect("profiles configured")
+        .set_session_binding(session_id, binding)
+        .await
+        .expect("bind delegate session");
+    (delegate_handle, actor_ref)
+}
+
+#[tokio::test]
+async fn test_profile_bound_delegate_session_resolves_delegate_actor() {
+    let (f, _profile_dir) =
+        profile_fixture_with_files(&[("quorum.toml", QUORUM_PROFILE_TOML)]).await;
+    let runtime = f
+        .handle
+        .profiles()
+        .expect("profiles configured")
+        .runtime_for_profile("quorum")
+        .await
+        .expect("quorum runtime");
+    let session_id = "delegate-session";
+    register_profile_bound_delegate_session(&f, &runtime, session_id).await;
+
+    let resolved = f
+        .handle
+        .session_ref_for_agent_session(session_id)
+        .await
+        .expect("delegate actor should resolve");
+
+    assert_eq!(resolved.get_mode().await.unwrap(), AgentMode::Build);
+}
+
+#[tokio::test]
+async fn test_clear_session_bridge_finds_profile_route_after_binding_is_forgotten() {
+    let (f, _profile_dir) =
+        profile_fixture_with_files(&[("quorum.toml", QUORUM_PROFILE_TOML)]).await;
+    let profiles = f.handle.profiles().expect("profiles configured");
+    let runtime = profiles
+        .runtime_for_profile("quorum")
+        .await
+        .expect("quorum runtime");
+    let session_id = "delegate-bridge-session";
+    register_profile_bound_delegate_session(&f, &runtime, session_id).await;
+    let (bridge_tx, _bridge_rx) = tokio::sync::mpsc::channel(4);
+    f.handle
+        .set_session_bridge(
+            session_id,
+            crate::acp::client_bridge::ClientBridgeSender::for_connection(bridge_tx, "conn"),
+        )
+        .await
+        .expect("set session bridge");
+    profiles.forget_session_binding(session_id).await;
+
+    assert!(
+        f.handle
+            .clear_session_bridge(session_id, Arc::from("conn"))
+            .await,
+        "materialized profile runtime should retain enough routing state to clear the bridge"
+    );
+    let delegate_handle = runtime
+        .delegate("coder")
+        .expect("coder delegate")
+        .as_any()
+        .downcast_ref::<LocalAgentHandle>()
+        .expect("local delegate")
+        .config
+        .clone();
+    assert!(
+        !delegate_handle
+            .session_bridges
+            .lock()
+            .expect("bridge routes lock")
+            .contains_key(session_id),
+        "profile delegate bridge route should be removed"
+    );
+}
+
+#[tokio::test]
+async fn test_close_profile_bound_delegate_session_stops_delegate_actor() {
+    let (f, _profile_dir) =
+        profile_fixture_with_files(&[("quorum.toml", QUORUM_PROFILE_TOML)]).await;
+    let runtime = f
+        .handle
+        .profiles()
+        .expect("profiles configured")
+        .runtime_for_profile("quorum")
+        .await
+        .expect("quorum runtime");
+    let session_id = "delegate-close-session";
+    let (delegate_handle, actor_ref) =
+        register_profile_bound_delegate_session(&f, &runtime, session_id).await;
+
+    SendAgent::close_session(
+        &f.handle,
+        CloseSessionRequest::new(SessionId::from(session_id.to_string())),
+    )
+    .await
+    .expect("close delegate session");
+
+    let delegate_handle = delegate_handle
+        .as_any()
+        .downcast_ref::<LocalAgentHandle>()
+        .expect("local delegate");
+    assert!(
+        delegate_handle
+            .registry
+            .lock()
+            .await
+            .get(session_id)
+            .is_none()
+    );
+    assert!(
+        actor_ref.get_mode().await.is_err(),
+        "delegate actor should stop"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_profile_bound_delegate_session_releases_runtime() {
+    let (f, _profile_dir) =
+        profile_fixture_with_files(&[("quorum.toml", QUORUM_PROFILE_TOML)]).await;
+    let runtime = f
+        .handle
+        .profiles()
+        .expect("profiles configured")
+        .runtime_for_profile("quorum")
+        .await
+        .expect("quorum runtime");
+    let session_id = "delegate-delete-session";
+    let (delegate_handle, actor_ref) =
+        register_profile_bound_delegate_session(&f, &runtime, session_id).await;
+
+    SendAgent::delete_session(
+        &f.handle,
+        DeleteSessionRequest::new(SessionId::from(session_id.to_string())),
+    )
+    .await
+    .expect("delete delegate session");
+
+    let delegate_handle = delegate_handle
+        .as_any()
+        .downcast_ref::<LocalAgentHandle>()
+        .expect("local delegate");
+    assert!(
+        delegate_handle
+            .registry
+            .lock()
+            .await
+            .get(session_id)
+            .is_none()
+    );
+    assert!(
+        actor_ref.get_mode().await.is_err(),
+        "delegate actor should stop"
+    );
+    assert!(
+        f.handle
+            .profiles()
+            .expect("profiles configured")
+            .session_binding(session_id)
+            .await
+            .is_none(),
+        "delete should forget the runtime binding"
+    );
+}
+
+#[tokio::test]
+async fn test_profile_handle_adopts_stored_unbound_session_on_load_and_resume() {
+    let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+    let profiles = f.handle.profiles().expect("profiles configured");
+
+    // Stored session without a binding (e.g. created by an older config-file run).
+    let load_session = f
+        .handle
+        .config
+        .provider
+        .history_store()
+        .create_session(None, None, None, None)
+        .await
+        .expect("create unbound session");
+    assert!(
+        profiles
+            .session_binding(&load_session.public_id)
+            .await
+            .is_none()
+    );
+    let _ = f
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            SessionId::from(load_session.public_id.clone()),
+            std::path::PathBuf::new(),
+        ))
+        .await;
+    // Whatever happens when materializing, the session must no longer be rejected
+    // for lacking a binding: it is adopted by the active profile.
+    let binding = profiles
+        .session_binding(&load_session.public_id)
+        .await
+        .expect("load adopts unbound session");
+    assert_eq!(binding.profile_id, "alpha");
+
+    let resume_session = f
+        .handle
+        .config
+        .provider
+        .history_store()
+        .create_session(None, None, None, None)
+        .await
+        .expect("create second unbound session");
+    let result = SendAgent::resume_session(
+        &f.handle,
+        crate::acp::protocol::ResumeSessionRequest::new(
+            SessionId::from(resume_session.public_id.clone()),
+            std::path::PathBuf::new(),
+        ),
+    )
+    .await;
+    if let Err(err) = result {
+        assert!(!err.to_string().contains("no profile binding"), "{err}");
+    }
+    assert_eq!(
+        profiles
+            .session_binding(&resume_session.public_id)
+            .await
+            .expect("resume adopts unbound session")
+            .profile_id,
+        "alpha"
+    );
+}
+
+#[tokio::test]
+async fn test_profile_handle_does_not_bind_unknown_session_ids() {
+    let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+    let err = f
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            SessionId::from("does-not-exist"),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .expect_err("unknown session must fail");
+    assert!(err.to_string().contains("profile binding"));
+    assert!(
+        f.handle
+            .profiles()
+            .expect("profiles configured")
+            .session_binding("does-not-exist")
+            .await
+            .is_none()
+    );
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn test_load_session_resolves_remote_bookmark_before_local_or_profile_load() {
+    use crate::session::store::RemoteSessionBookmark;
+
+    let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+    f.handle
+        .config
+        .provider
+        .history_store()
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: "remote-reload".into(),
+            node_id: "peer-offline".into(),
+            peer_label: "Laptop".into(),
+            cwd: Some("/remote/work".into()),
+            title: Some("Remote task".into()),
+            created_at: 1,
+        })
+        .await
+        .expect("bookmark remote session");
+
+    let request = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from("remote-reload"),
+        std::path::PathBuf::new(),
+    );
+    let error = f
+        .handle
+        .load_session(request)
+        .await
+        .expect_err("offline peer");
+    assert!(
+        error
+            .to_string()
+            .contains("remote mesh is not bootstrapped")
+    );
+    assert!(!error.to_string().contains("profile binding"));
+    assert!(!error.to_string().contains("session not found"));
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn test_load_and_resume_reject_conflicting_remote_and_local_identity() {
+    use crate::session::store::RemoteSessionBookmark;
+
+    let f = HandleFixture::new().await;
+    let store = f.handle.config.provider.history_store();
+    let local = store
+        .create_session(None, None, None, None)
+        .await
+        .expect("local session");
+    store
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: local.public_id.clone(),
+            node_id: "peer-1".into(),
+            peer_label: "Laptop".into(),
+            cwd: None,
+            title: None,
+            created_at: 1,
+        })
+        .await
+        .expect("conflicting bookmark");
+    let request = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from(local.public_id.clone()),
+        std::path::PathBuf::new(),
+    );
+    let error = f
+        .handle
+        .load_session(request)
+        .await
+        .expect_err("location conflict");
+    assert!(error.to_string().contains("both locally and remotely"));
+    let error = SendAgent::resume_session(
+        &f.handle,
+        crate::acp::protocol::ResumeSessionRequest::new(
+            SessionId::from(local.public_id.clone()),
+            std::path::PathBuf::new(),
+        ),
+    )
+    .await
+    .expect_err("resume location conflict");
+    assert!(error.to_string().contains("both locally and remotely"));
+    assert!(
+        f.handle
+            .registry
+            .lock()
+            .await
+            .get(&local.public_id)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_load_session_reports_persisted_reasoning_effort() {
+    let f = RealStorageHandleFixture::new().await;
+    let session_id = seed_session_with_reasoning(&f, Some(ReasoningEffort::High)).await;
+    let req = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from(session_id),
+        std::path::PathBuf::new(),
+    );
+
+    let response = f.handle.load_session(req).await.expect("load session");
+
+    assert_eq!(
+        config_option_value(
+            response.config_options.as_deref().expect("config options"),
+            "reasoning_effort",
+        )
+        .as_deref(),
+        Some("high")
+    );
+}
+
+#[tokio::test]
+async fn test_load_session_reports_auto_when_reasoning_effort_is_unset() {
+    let f = RealStorageHandleFixture::new_with_initial_reasoning(Some(ReasoningEffort::Low)).await;
+    let session_id = seed_session_with_reasoning(&f, None).await;
+    let req = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from(session_id),
+        std::path::PathBuf::new(),
+    );
+
+    let response = f.handle.load_session(req).await.expect("load session");
+
+    assert_eq!(
+        config_option_value(
+            response.config_options.as_deref().expect("config options"),
+            "reasoning_effort",
+        )
+        .as_deref(),
+        Some("auto")
+    );
+}
+
+#[tokio::test]
+async fn test_load_session_falls_back_to_initial_reasoning_when_config_is_missing() {
+    let f = RealStorageHandleFixture::new_with_initial_reasoning(Some(ReasoningEffort::Low)).await;
+    let session = f
+        .storage
+        .create_session(None, None, None, None)
+        .await
+        .expect("create session");
+    let req = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from(session.public_id),
+        std::path::PathBuf::new(),
+    );
+
+    let response = f.handle.load_session(req).await.expect("load session");
+
+    assert_eq!(
+        config_option_value(
+            response.config_options.as_deref().expect("config options"),
+            "reasoning_effort",
+        )
+        .as_deref(),
+        Some("low")
+    );
+}
+
+#[tokio::test]
+async fn test_reasoning_query_failure_falls_back_to_initial_config() {
+    let f = RealStorageHandleFixture::new_with_initial_reasoning(Some(ReasoningEffort::Low)).await;
+    let actor = SessionActor::new(
+        f.handle.config.clone(),
+        "stopped-session".to_string(),
+        crate::agent::core::SessionRuntime::new(
+            None,
+            std::collections::HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        ),
+    );
+    let session_ref = SessionActorRef::from(SessionActor::spawn(actor));
+    session_ref.shutdown().await.expect("shutdown actor");
+
+    assert_eq!(
+        f.handle
+            .session_reasoning_effort(&session_ref, "stopped-session")
+            .await,
+        Some(ReasoningEffort::Low)
+    );
+}
+
+#[tokio::test]
+async fn test_set_profile_config_option_accepts_same_bound_profile() {
+    let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+    register_bound_test_session(&f, "session-1", "alpha").await;
+    let req =
+        crate::acp::protocol::SetSessionConfigOptionRequest::new("session-1", "profile", "alpha");
+
+    let resp = f
+        .handle
+        .set_session_config_option(req)
+        .await
+        .expect("same profile should succeed");
+
+    assert_eq!(resp.config_options[0].id.0.as_ref(), "profile");
+    assert!(
+        resp.config_options
+            .iter()
+            .any(|option| option.id.0.as_ref() == "mode")
+    );
+    assert!(
+        resp.config_options
+            .iter()
+            .any(|option| option.id.0.as_ref() == "reasoning_effort")
+    );
+}
+
+fn advertised_command_names(
+    notification: &crate::acp::protocol::SessionNotification,
+) -> Vec<String> {
+    serde_json::to_value(notification).expect("serialize catalog")["update"]["availableCommands"]
+        .as_array()
+        .expect("availableCommands")
+        .iter()
+        .map(|command| command["name"].as_str().expect("command name").to_string())
+        .collect()
+}
+
+fn test_slash_command(name: &str, description: &str) -> crate::slash_commands::SlashCommand {
+    crate::slash_commands::SlashCommand {
+        name: name.to_string(),
+        source: crate::slash_commands::SlashCommandSource::Global(std::path::PathBuf::from("/tmp")),
+        path: std::path::PathBuf::from(format!("/tmp/{name}.md")),
+        description: description.to_string(),
+        argument_hint: None,
+        tags: Vec::new(),
+        template: description.to_string(),
+        script: None,
+        requires_script: false,
+    }
+}
+
+#[tokio::test]
+async fn test_slash_command_catalog_uses_profile_registry_and_skips_failed_lookup() {
+    let mut root_registry = crate::slash_commands::SlashCommandRegistry::new();
+    root_registry.register(test_slash_command("root", "Root command"));
+    let fixture = crate::test_utils::TestAgent::with_slash_command_registry(root_registry).await;
+
+    let profile_dir = tempfile::TempDir::new().expect("profile dir");
+    let commands = profile_dir.path().join("commands");
+    std::fs::create_dir_all(&commands).expect("commands dir");
+    std::fs::write(
+        commands.join("docs.md"),
+        "---\ndescription: Read the docs\n---\nBody\n",
+    )
+    .expect("docs command");
+    std::fs::write(
+        profile_dir.path().join("alpha.toml"),
+        format!(
+            r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "alpha"
+
+[agent.slash_commands]
+enabled = true
+include_global = false
+include_project = false
+paths = ["{}"]
+"#,
+            commands.display()
+        ),
+    )
+    .expect("alpha profile");
+
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+        crate::profiles::LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(profile_dir.path())
+            .build(),
+    );
+    let (plugin_registry, _temp_dir) = empty_plugin_registry().expect("plugin registry");
+    let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        catalog,
+        "alpha",
+        AgentInfra {
+            plugin_registry: Arc::new(plugin_registry),
+            storage: None,
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        },
+    ));
+    fixture.handle.set_profiles(profiles.clone());
+
+    let unbound = fixture.handle.slash_command_catalog("unbound").await;
+    assert_eq!(
+        advertised_command_names(&unbound),
+        vec!["/root".to_string(), "/compact".to_string()]
+    );
+
+    profiles
+        .bind_session_to_profile("bound", "alpha")
+        .await
+        .expect("bind alpha");
+    let bound = fixture.handle.slash_command_catalog("bound").await;
+    assert_eq!(
+        advertised_command_names(&bound),
+        vec!["/docs".to_string(), "/compact".to_string()]
+    );
+
+    profiles
+        .set_session_binding(
+            "ghost",
+            test_profile_metadata("ghost", "ghost", None).session_binding(),
+        )
+        .await
+        .expect("bind missing profile");
+    // A failed profile lookup must not borrow this handle's registry, but the
+    // built-ins are not registry entries: every session advertises them.
+    let ghost = fixture.handle.slash_command_catalog("ghost").await;
+    assert_eq!(
+        advertised_command_names(&ghost),
+        vec!["/compact".to_string()],
+        "failed profile lookup must not fall back to this handle's registry"
+    );
+}
+
+#[tokio::test]
+async fn catalog_without_workspace_service_lists_compact_but_not_worktree() {
+    let mut registry = crate::slash_commands::SlashCommandRegistry::new();
+    registry.register(test_slash_command("deploy", "Deploy"));
+    // A user command named like a built-in is reserved: never registered,
+    // so it can never be advertised as something that will not run.
+    registry.register(test_slash_command("worktree", "Mine"));
+    registry.register(test_slash_command("compact", "Mine"));
+    let fixture = crate::test_utils::TestAgent::with_slash_command_registry(registry).await;
+    let catalog = fixture.handle.slash_command_catalog("any-session").await;
+    assert_eq!(
+        advertised_command_names(&catalog),
+        vec!["/deploy".to_string(), "/compact".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn steering_compact_is_rejected_but_queueing_it_is_allowed() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let session = fixture
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new("/tmp"))
+        .await
+        .expect("session");
+    let params = serde_json::json!({
+        "session_id": session.session_id.to_string(),
+        "prompt": [{"type": "text", "text": "/compact"}],
+        "expected_run_id": "run-1",
+    })
+    .to_string();
+    let err = fixture
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/session/steer",
+            serde_json::value::RawValue::from_string(params.clone())
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .expect_err("steering /compact must be rejected before reaching the model");
+    assert_eq!(
+        err.message,
+        crate::slash_commands::builtin::BuiltinError::NotAccepted {
+            builtin: crate::slash_commands::builtin::Builtin::Compact,
+            via: crate::slash_commands::builtin::Submission::Steer,
+        }
+        .to_string(),
+        "unexpected error: {err:?}"
+    );
+    // Queueing is not rejected by the built-in guard (it runs when its turn starts).
+    let queued = fixture
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/session/queue",
+            serde_json::value::RawValue::from_string(params)
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .expect("queueing /compact must be accepted");
+    let body: serde_json::Value = serde_json::from_str(queued.0.get()).expect("valid JSON");
+    assert_eq!(body["status"], "started", "unexpected receipt: {body}");
+    assert!(
+        body["data"]["input_id"].is_string(),
+        "missing input_id: {body}"
+    );
+}

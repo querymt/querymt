@@ -5,6 +5,11 @@
 
 use crate::api::{Agent, AgentInfra};
 use crate::config::{Config, load_config};
+pub use crate::profile_host::{
+    ProfileCatalog, ProfileConfigKind, ProfileDocument, ProfileMetadata, ProfileProviderMode,
+    ProfileProviderRequirement, ProfileRuntimeHost, ProfileRuntimeView, ProfileSource,
+    ResolvedProfileProviderLock, ResolvedProviderLockEntry, SessionProfileBinding,
+};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -41,62 +46,6 @@ const STANDARD_CODER_DELEGATE_CONFIG: &str = include_str!("../examples/confs/cod
 #[include = "prompts/*"]
 struct EmbeddedExampleAssets;
 
-/// Existing config shape that a profile resolves to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProfileConfigKind {
-    Single,
-    Quorum,
-}
-
-/// Location of a profile config.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProfileSource {
-    Embedded { key: String },
-    EmbeddedToml { key: String },
-    LocalPath { path: PathBuf },
-}
-
-/// Metadata exposed by the profile catalog without requiring full config loading.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProfileMetadata {
-    pub id: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub tags: Vec<String>,
-    pub source: ProfileSource,
-    pub config_kind: Option<ProfileConfigKind>,
-    pub fingerprint: Option<String>,
-}
-
-/// Optional top-level `[profile]` TOML metadata used only by local catalogs.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProfileProviderMode {
-    #[default]
-    Legacy,
-    Overlay,
-    Locked,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProfileProviderRequirement {
-    pub artifact: String,
-    pub factory: String,
-    #[serde(default = "default_native_provider_kind")]
-    pub kind: String,
-    #[serde(default)]
-    pub plugin_api: Option<u32>,
-    #[serde(default)]
-    pub features: Vec<String>,
-    #[serde(default)]
-    pub signer: Option<String>,
-}
-
-fn default_native_provider_kind() -> String {
-    "native".to_string()
-}
-
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProfileFileMetadata {
     pub id: Option<String>,
@@ -115,31 +64,6 @@ struct ProfileMetadataEnvelope {
     profile: Option<ProfileFileMetadata>,
 }
 
-/// Loaded profile document backed by the existing config model.
-#[derive(Debug)]
-pub struct ProfileDocument {
-    pub metadata: ProfileMetadata,
-    pub provider_mode: ProfileProviderMode,
-    pub providers: BTreeMap<String, ProfileProviderRequirement>,
-    pub config: Config,
-}
-
-/// Binding between a session id and the profile runtime that owns it.
-///
-/// This matters because resume/routing code must know which profile runtime and
-/// concrete agent own a session. Root sessions leave `agent_id` unset; delegated
-/// sessions name the sub-agent that must materialize them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionProfileBinding {
-    pub profile_id: String,
-    pub agent_id: Option<String>,
-    pub profile_fingerprint: Option<String>,
-    pub profile_source: Option<String>,
-    pub profile_config_kind: Option<String>,
-    pub provider_lock_digest: Option<String>,
-    pub provider_locks_json: Option<String>,
-}
-
 /// Materialized runtime for a selected profile.
 pub struct ProfileRuntime {
     pub metadata: ProfileMetadata,
@@ -147,24 +71,28 @@ pub struct ProfileRuntime {
     pub provider_lock: Option<ResolvedProfileProviderLock>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResolvedProviderLockEntry {
-    pub logical_name: String,
-    pub factory: String,
-    pub artifact: String,
-    pub kind: String,
-    pub plugin_api: Option<u32>,
-    pub features: Vec<String>,
-    pub signer: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResolvedProfileProviderLock {
-    pub digest: String,
-    pub providers: BTreeMap<String, ResolvedProviderLockEntry>,
-}
-
 impl ProfileRuntime {
+    /// Runtime-side view of this profile runtime (root handle plus delegates).
+    pub fn view(&self) -> Arc<ProfileRuntimeView> {
+        let delegates = self
+            .agent
+            .quorum()
+            .map(|quorum| {
+                quorum
+                    .delegates()
+                    .iter()
+                    .map(|entry| (entry.info.id.clone(), entry.agent.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Arc::new(ProfileRuntimeView {
+            metadata: self.metadata.clone(),
+            handle: self.agent.handle(),
+            delegates,
+            provider_lock: self.provider_lock.clone(),
+        })
+    }
+
     pub fn profile_id(&self) -> &str {
         &self.metadata.id
     }
@@ -190,70 +118,6 @@ impl ProfileRuntime {
             Some(agent_id) => self.agent.delegate(agent_id),
             None => Some(self.agent.handle()),
         }
-    }
-}
-
-impl ProfileMetadata {
-    pub fn session_binding(&self) -> SessionProfileBinding {
-        SessionProfileBinding {
-            profile_id: self.id.clone(),
-            agent_id: None,
-            profile_fingerprint: self.fingerprint.clone(),
-            profile_source: Some(self.source.storage_label()),
-            profile_config_kind: self
-                .config_kind
-                .map(|kind| kind.storage_label().to_string()),
-            provider_lock_digest: None,
-            provider_locks_json: None,
-        }
-    }
-}
-
-impl ProfileConfigKind {
-    pub fn storage_label(self) -> &'static str {
-        match self {
-            ProfileConfigKind::Single => "single",
-            ProfileConfigKind::Quorum => "quorum",
-        }
-    }
-}
-
-impl ProfileSource {
-    pub fn storage_label(&self) -> String {
-        match self {
-            ProfileSource::Embedded { key } | ProfileSource::EmbeddedToml { key } => {
-                format!("embedded:{key}")
-            }
-            ProfileSource::LocalPath { path } => format!("local:{}", path.display()),
-        }
-    }
-}
-
-#[async_trait]
-pub trait ProfileCatalog: Send + Sync {
-    async fn list_profiles(&self) -> Result<Vec<ProfileMetadata>>;
-    async fn load_profile(&self, id: &str) -> Result<ProfileDocument>;
-
-    fn watch_roots(&self) -> Vec<PathBuf> {
-        Vec::new()
-    }
-}
-
-#[async_trait]
-impl<T> ProfileCatalog for Arc<T>
-where
-    T: ProfileCatalog + ?Sized,
-{
-    async fn list_profiles(&self) -> Result<Vec<ProfileMetadata>> {
-        (**self).list_profiles().await
-    }
-
-    async fn load_profile(&self, id: &str) -> Result<ProfileDocument> {
-        (**self).load_profile(id).await
-    }
-
-    fn watch_roots(&self) -> Vec<PathBuf> {
-        (**self).watch_roots()
     }
 }
 
@@ -720,7 +584,7 @@ impl ProfileCatalog for LocalProfileCatalog {
                     &config,
                 )?;
                 let mut metadata = metadata.clone();
-                metadata.config_kind = Some(ProfileConfigKind::from_config(&config));
+                metadata.config_kind = Some(profile_config_kind_of(&config));
                 Ok(ProfileDocument {
                     metadata,
                     provider_mode: profile_spec.provider_mode,
@@ -834,12 +698,10 @@ fn profile_provider_references(config: &Config) -> Vec<(String, String)> {
     references
 }
 
-impl ProfileConfigKind {
-    fn from_config(config: &Config) -> Self {
-        match config {
-            Config::Single(_) => ProfileConfigKind::Single,
-            Config::Multi(_) => ProfileConfigKind::Quorum,
-        }
+fn profile_config_kind_of(config: &Config) -> ProfileConfigKind {
+    match config {
+        Config::Single(_) => ProfileConfigKind::Single,
+        Config::Multi(_) => ProfileConfigKind::Quorum,
     }
 }
 
@@ -1441,6 +1303,93 @@ where
     #[cfg(test)]
     async fn building_runtime_count(&self) -> usize {
         self.building_runtimes.lock().await.len()
+    }
+}
+
+#[async_trait]
+impl<C> ProfileRuntimeHost for ProfileRuntimeManager<C>
+where
+    C: ProfileCatalog + 'static,
+{
+    async fn list_profiles(&self) -> Result<Vec<ProfileMetadata>> {
+        ProfileRuntimeManager::list_profiles(self).await
+    }
+
+    async fn active_profile_id(&self) -> String {
+        ProfileRuntimeManager::active_profile_id(self).await
+    }
+
+    async fn set_active_profile(&self, profile_id: &str) -> Result<()> {
+        ProfileRuntimeManager::set_active_profile(self, profile_id).await
+    }
+
+    async fn active_runtime(&self) -> Result<Arc<ProfileRuntimeView>> {
+        Ok(ProfileRuntimeManager::active_runtime(self).await?.view())
+    }
+
+    async fn runtime_for_profile(&self, profile_id: &str) -> Result<Arc<ProfileRuntimeView>> {
+        Ok(ProfileRuntimeManager::runtime_for_profile(self, profile_id)
+            .await?
+            .view())
+    }
+
+    async fn bind_session_to_runtime(
+        &self,
+        session_id: &str,
+        runtime: &ProfileRuntimeView,
+    ) -> Result<SessionProfileBinding> {
+        let binding = runtime.session_binding();
+        ProfileRuntimeManager::set_session_binding(self, session_id, binding.clone()).await?;
+        Ok(binding)
+    }
+
+    async fn set_session_binding(
+        &self,
+        session_id: &str,
+        binding: SessionProfileBinding,
+    ) -> Result<()> {
+        ProfileRuntimeManager::set_session_binding(self, session_id, binding).await
+    }
+
+    async fn session_binding(&self, session_id: &str) -> Option<SessionProfileBinding> {
+        ProfileRuntimeManager::session_binding(self, session_id).await
+    }
+
+    async fn adopt_unbound_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionProfileBinding>> {
+        ProfileRuntimeManager::adopt_unbound_session(self, session_id).await
+    }
+
+    async fn materialized_runtimes(&self) -> Vec<Arc<ProfileRuntimeView>> {
+        ProfileRuntimeManager::materialized_runtimes(self)
+            .await
+            .iter()
+            .map(|runtime| runtime.view())
+            .collect()
+    }
+
+    async fn mcp_servers(&self) -> Vec<(String, crate::config::McpServerConfig)> {
+        ProfileRuntimeManager::mcp_servers(self).await
+    }
+
+    #[cfg(feature = "remote")]
+    fn set_mesh_handle(&self, mesh: crate::agent::remote::MeshHandle) {
+        ProfileRuntimeManager::set_mesh_handle(self, mesh)
+    }
+
+    #[cfg(feature = "remote")]
+    async fn set_mesh(&self, mesh: crate::agent::remote::MeshHandle) {
+        ProfileRuntimeManager::set_mesh(self, mesh).await
+    }
+
+    async fn forget_session_binding(&self, session_id: &str) -> Option<SessionProfileBinding> {
+        ProfileRuntimeManager::forget_session_binding(self, session_id).await
+    }
+
+    async fn shutdown(&self) {
+        ProfileRuntimeManager::shutdown(self).await
     }
 }
 

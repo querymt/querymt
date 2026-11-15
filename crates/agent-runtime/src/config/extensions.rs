@@ -1,0 +1,92 @@
+use super::*;
+
+// ============================================================================
+// Skills Configuration
+// ============================================================================
+
+/// Configuration for skills system
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsConfig {
+    /// Enable skills system (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Check external paths (Claude Code, agents conventions)
+    #[serde(default = "default_true")]
+    pub include_external: bool,
+
+    /// Custom search paths (added to defaults)
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+
+    /// Remote skill URLs (Phase 2 - not yet implemented)
+    #[serde(default)]
+    pub urls: Vec<String>,
+
+    /// Skill permissions
+    #[serde(default)]
+    pub permissions: crate::skills::SkillPermissions,
+
+    /// Offer skills published by connected MCP servers (default: true)
+    #[serde(default = "default_true")]
+    pub mcp: bool,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            include_external: true,
+            paths: vec![],
+            urls: vec![],
+            permissions: crate::skills::SkillPermissions::default(),
+            mcp: true,
+        }
+    }
+}
+
+// ============================================================================
+// End Skills Configuration
+// ============================================================================
+
+// ============================================================================
+// Slash Commands Configuration
+// ============================================================================
+
+/// Configuration for the slash commands system
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SlashCommandsConfig {
+    /// Enable slash commands system (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Search global paths (`~/.qmt/commands`)
+    #[serde(default = "default_true")]
+    pub include_global: bool,
+
+    /// Search project paths (`<PROJECT_ROOT>/.qmt/commands`)
+    #[serde(default = "default_true")]
+    pub include_project: bool,
+
+    /// Custom search paths (added to defaults)
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+
+    /// Script execution configuration
+    #[serde(default)]
+    pub scripts: crate::slash_commands::SlashCommandScriptsConfig,
+}
+
+impl Default for SlashCommandsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            include_global: true,
+            include_project: true,
+            paths: vec![],
+            scripts: crate::slash_commands::SlashCommandScriptsConfig::default(),
+        }
+    }
+}

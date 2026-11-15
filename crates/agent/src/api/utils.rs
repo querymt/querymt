@@ -1,13 +1,10 @@
 //! Shared utility functions for the simple API
 
-use crate::agent::utils::render_prompt_for_display;
-use crate::model::{AgentMessage, MessagePart};
+use crate::agent::builtin_tools::all_builtin_tools;
 use crate::tools::CapabilityRequirement;
-use crate::tools::builtins::all_builtin_tools;
 use anyhow::{Result, anyhow};
 use once_cell::sync::Lazy;
 use querymt::LLMParams;
-use querymt::chat::ChatRole;
 #[cfg(feature = "plugin-loaders")]
 use querymt::dynamic::PluginRegistryDynamicExt;
 use querymt::plugin::host::PluginRegistry;
@@ -49,23 +46,7 @@ pub(super) async fn default_registry() -> Result<PluginRegistry> {
     }
 }
 
-pub(super) fn latest_assistant_message(messages: &[AgentMessage]) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .find(|msg| msg.role == ChatRole::Assistant)
-        .map(|msg| {
-            msg.parts
-                .iter()
-                .filter_map(|part| match part {
-                    MessagePart::Text { content } => Some(content.clone()),
-                    MessagePart::Prompt { blocks } => Some(render_prompt_for_display(blocks)),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        })
-}
+pub(super) use crate::agent::utils::latest_assistant_message;
 
 pub(super) fn infer_required_capabilities(
     tools: &[crate::config::ToolSpec],

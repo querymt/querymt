@@ -16,7 +16,19 @@
 
 - Workspace members and toolchain are defined in `Cargo.toml` and `rust-toolchain.toml`.
 - `querymt`: core library; `querymt-cli`: the `qmt` CLI.
-- `querymt-agent`: agent runtime and optional embedded dashboard.
+- Agent packages, bottom to top (Cargo enforces the layering):
+  - `querymt-agent-core`: plain types, events, config contracts, storage traits.
+  - `querymt-agent-index`, `querymt-agent-knowledge`: code index and repository knowledge.
+  - `querymt-agent-sqlite`: SQLite session and knowledge storage (the only `rusqlite` user).
+  - `querymt-agent-services`: accounting, worktrees, snapshots, export, built-in tools.
+  - `querymt-agent-runtime`: agent handle, session actors, ACP, mesh, auth, config, hooks.
+    Features: `remote`, `oauth`, `plugin-loaders`, `api`, `test-support`.
+  - `querymt-agent`: facade that re-exports the old `querymt_agent::…` paths, plus the
+    runner, quorum, profiles, WebSocket server, examples and the embedded dashboard. Its
+    features forward to the runtime.
+- Test the package you changed. For facade or downstream changes (`querymt-agent-py`,
+  `querymt-mobile-ffi`, examples) also test `querymt-agent`. Log targets carry the crate
+  prefix (`querymt_agent_runtime::…`); `RUST_LOG=querymt_agent=debug` covers every agent crate.
 - `querymt-remote`: shared mesh and remote-provider primitives.
 - `querymt-service-client`: service OAuth and API client primitives, not a server.
 - Provider crates live under `crates/providers/`.
@@ -28,6 +40,23 @@
 - Without Nix, use the supported native toolchain and dependencies. Check `flake.nix`
   for supported Nix platforms; diagnose setup failures rather than silently
   switching toolchains or environments.
+- Leave `CARGO_INCREMENTAL` unset for local work. `CARGO_INCREMENTAL=0` makes every
+  agent-crate edit cost about 60 s more (75-79 s instead of 8-16 s for the facade test
+  build), and `CARGO_INCREMENTAL=1` makes `RUSTC_WRAPPER=sccache` refuse to run
+  ("incremental compilation is prohibited"). Unset gives incremental builds for
+  workspace crates while sccache still caches dependencies. Incremental caches grow
+  `target/`; run `scripts/clean-target.sh` (`--all` removes all of `target/debug`).
+- `crates/workspace-hack` (`querymt-workspace-hack`) is managed by `cargo hakari`
+  (config in `.config/hakari.toml`); it unifies third-party features across the agent
+  stack so switching between the aliases below does not recompile dependencies. After
+  changing dependencies or features, run `cargo hakari generate` and
+  `cargo hakari manage-deps` (`cargo install cargo-hakari --locked`); the `Lint`
+  workflow runs `cargo hakari verify` on every pull request. Provider crates and `querymt` must not depend on it (wasm32).
+- `querymt-agent` has a dev-dependency on `querymt-agent-runtime` with `test-support`
+  (122 references in 22 facade files, mostly `runtime_tests/` and `acp/websocket_tests.rs`,
+  which sit in the facade because they need top-layer types). That is why the runtime is
+  built in a second variant (with `test-support`) for facade tests; removing it means
+  moving those tests or their helpers.
 - Run the commands below from the repository root inside the selected environment.
 
 ## Validation
@@ -53,6 +82,28 @@
   Use `cargo nextest run`, not `cargo test`. nextest skips doctests, so run
   `cargo test -p <package> --doc` when doc examples change. If cargo-nextest is
   not installed, say so and fall back to `cargo test` with the same scope.
+- Agent packages have aliases in `.cargo/config.toml` that use the CI feature sets, so
+  runs share build artifacts: `cargo t-<pkg> [filter args]` (nextest) and
+  `cargo cl-<pkg>` (clippy, `-D warnings`) for `agent`, `runtime`, `services`, `sqlite`,
+  `knowledge`, `index` and `core`; for example `cargo t-runtime -E 'test(/compaction/)'`.
+  `agent` builds with `dashboard`, so set `QMT_UI_DIST` (see Dashboard Boundary).
+  Loop: test the package you changed with its `t-<pkg>` alias, and build the facade
+  (`cargo t-agent --no-run`) before pushing. Measured edit cost with incremental on:
+  runtime/sqlite/services/facade edits 5-16 s and core edits 15-19 s (everything above
+  core rebuilds); use `scripts/measure-agent-edit-loop.sh` to reproduce the numbers.
+- A trait that another crate uses as `dyn` (`SessionStore`, `EventJournal`, `Tool`,
+  `AgentHandle`, `TokenEstimator`, ...) lives in its own file, re-exported from the old
+  module. A line shift above such a trait costs 50-68 s in the facade build (measured on
+  11 traits), against 10-16 s once it has its own file. Keep new `dyn` traits out of
+  files with other frequently edited code, and do not add code above them in their file;
+  editing the trait itself still rebuilds everything above it.
+- CI (`.github/workflows/test-agent.yml`) tests only the agent packages a change
+  reaches: `scripts/ci-agent-affected.sh` maps changed paths to packages through the
+  dependency edges (sqlite is a dev-dependency of services and runtime, so a sqlite
+  change retests both). Mirror that locally. Standalone builds run with the
+  workspace-hack disabled (`cargo hakari disable`, never commit the result) so a
+  package that forgets a feature it needs fails. `querymt-mobile-ffi` is not built
+  in CI yet (deferred while it is under heavy development).
 - Expand validation to affected consumers and feature combinations. Consult the
   relevant `.github/workflows/` file for CI commands/features and `.config/nextest.toml`
   for test timeouts.
@@ -67,7 +118,7 @@
 - UI implementation and testing belong to the separate `querymt-desktop` repository.
   Report required UI follow-up rather than expanding backend work into that repo.
 - For backend-only checks with `dashboard` enabled, use the `QMT_UI_DIST` fixture
-  in `.github/workflows/test-agent.yml` instead of rebuilding the frontend.
+  from `.github/actions/rust-setup/action.yml` instead of rebuilding the frontend.
 
 ## Code Conventions
 
@@ -77,8 +128,8 @@
 - Implement backward compatibility only when explicitly requested by the user.
   Do not add compatibility layers or preserve legacy behavior by default. If a change
   appears to require backward compatibility, flag it for user review before implementing it.
-- SQLite schema changes (`crates/agent/src/session/schema.rs`) need a new migration in
-  `crates/agent/src/session/sqlite_storage/migrations.rs`; `init_schema` only covers fresh
+- SQLite schema changes (`crates/agent-sqlite/src/session/schema.rs`) need a new migration in
+  `crates/agent-sqlite/src/session/sqlite_storage/migrations.rs`; `init_schema` only covers fresh
   installs. Never edit a released migration. The schema drift test enforces this.
 - Draw diagrams (flows, sequences, state machines, architecture) as ` ```mermaid `
   code blocks, never as ASCII art or box drawings. This applies to docs, OpenSpec

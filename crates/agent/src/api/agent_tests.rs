@@ -169,14 +169,6 @@ impl ViewStore for DefaultLifecycleViewStore {
             .await
     }
 
-    async fn get_atif(
-        &self,
-        session_id: &str,
-        options: &crate::export::AtifExportOptions,
-    ) -> crate::session::error::SessionResult<crate::export::ATIF> {
-        self.0.get_atif(session_id, options).await
-    }
-
     async fn get_recent_models_view(
         &self,
         limit_per_workspace: usize,
@@ -281,7 +273,7 @@ async fn with_profiles_reuses_root_agent_for_active_profile() -> Result<()> {
         .active_runtime()
         .await?;
 
-    assert!(Arc::ptr_eq(&root_handle, &runtime.agent().handle()));
+    assert!(Arc::ptr_eq(&root_handle, &runtime.handle()));
     Ok(())
 }
 
@@ -2543,6 +2535,213 @@ async fn lifecycle_capabilities_require_session_store_and_view_filter_support() 
     Ok(())
 }
 
+// ── Repository knowledge binding ─────────────────────────────────────────────
+
+mod repository_knowledge_binding {
+    use super::*;
+    use crate::config::RepositoryKnowledgeSettings;
+
+    async fn build(
+        settings: Option<RepositoryKnowledgeSettings>,
+        cwd: &std::path::Path,
+    ) -> (Agent, tempfile::TempDir) {
+        let (registry, plugins) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let mut builder = Agent::single()
+            .provider("openai", "gpt-4o-mini")
+            .cwd(cwd)
+            .infra(AgentInfra {
+                plugin_registry: Arc::new(registry),
+                storage: Some(storage),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            });
+        if let Some(settings) = settings {
+            builder = builder.repository_knowledge(settings);
+        }
+        (builder.build().await.unwrap(), plugins)
+    }
+
+    #[tokio::test]
+    async fn disabled_or_omitted_settings_bind_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (omitted, _p1) = build(None, tmp.path()).await;
+        assert!(omitted.handle().config.repository_knowledge().is_none());
+        let (disabled, _p2) = build(Some(RepositoryKnowledgeSettings::default()), tmp.path()).await;
+        assert!(disabled.handle().config.repository_knowledge().is_none());
+    }
+
+    #[tokio::test]
+    async fn enabled_settings_bind_a_lazy_registry_without_builder_time_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let config = tmp.path().join("config");
+
+        let (agent, _plugins) = build(Some(RepositoryKnowledgeSettings::enabled()), &repo).await;
+        let registry = agent
+            .handle()
+            .config
+            .repository_knowledge()
+            .expect("enabled settings bind a registry");
+        // Building resolved no root, opened no index, created nothing.
+        assert_eq!(registry.open_services(), 0);
+        assert!(!config.exists());
+        assert!(
+            std::fs::read_dir(&repo)
+                .unwrap()
+                .all(|e| e.unwrap().file_name() == ".git")
+        );
+    }
+
+    /// Scenario "Unfamiliar feature request has no filenames", end to end: a
+    /// path-free prompt sent through the public API reaches the provider's
+    /// first request together with a cited orientation card, without any
+    /// repository tool call; an unrelated prompt adds nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_free_prompt_reaches_the_first_provider_request_with_an_orientation_card() {
+        use crate::test_utils::{
+            MockChatResponse, MockLlmProvider, SharedLlmProvider, TestProviderFactory,
+            mock_plugin_registry,
+        };
+        use std::sync::Mutex;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        for (path, body) in [
+            (
+                ".qmt/knowledge.toml",
+                "version = 1\n[documents]\ninclude = [\"docs/**/*.md\"]\n",
+            ),
+            (
+                "docs/arch.md",
+                "# Architecture\n## Scheduling\nThe scheduler dispatches queued tasks to workers using a priority queue.\n",
+            ),
+        ] {
+            let target = repo.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, body).unwrap();
+        }
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        // Every model request is recorded as flattened text, in order.
+        let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(tokio::sync::Mutex::new(MockLlmProvider::new()));
+        {
+            let requests = Arc::clone(&requests);
+            let mut mock = provider.try_lock().unwrap();
+            mock.expect_chat_with_tools().returning(
+                move |messages: &[querymt::chat::ChatMessage], _tools| {
+                    let text = messages
+                        .iter()
+                        .flat_map(|m| m.portable_input_parts().to_vec())
+                        .map(|part| match part {
+                            querymt::chat::ChatInputPart::Text { text } => text,
+                            other => format!("{other:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    requests.lock().unwrap().push(text);
+                    Ok(MockChatResponse::text_only("done").into())
+                },
+            );
+        }
+        let (plugins, _plugins_dir) =
+            mock_plugin_registry(Arc::new(TestProviderFactory::new(SharedLlmProvider {
+                inner: Arc::clone(&provider),
+                tools: vec![].into_boxed_slice(),
+            })))
+            .unwrap();
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let mut settings = RepositoryKnowledgeSettings::enabled();
+        settings.delivery.orientation = true;
+        let registry = crate::knowledge::repository::RepositoryKnowledgeRegistry::from_settings_in(
+            &settings,
+            tmp.path().join("config"),
+        )
+        .unwrap();
+        let warm = registry.clone();
+        let agent = Agent::single()
+            .provider("mock", "mock-model")
+            .cwd(&repo)
+            .repository_knowledge(settings)
+            .repository_knowledge_registry(registry)
+            .infra(AgentInfra {
+                plugin_registry: Arc::new(plugins),
+                storage: Some(storage),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let session = agent.chat_session().await.unwrap();
+        // Creating the session pre-warms the index in the background, before
+        // any prompt, so the first prompt's delivery does not meet a cold index.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let built = warm
+                .open_service_for(&repo)
+                .is_some_and(|service| service.store().counts().unwrap().documents == 1);
+            if built {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session creation did not pre-warm the index"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "warmed before any prompt"
+        );
+        session
+            .chat("how does the scheduler dispatch queued tasks to workers?")
+            .await
+            .unwrap();
+        session
+            .chat("please format the changelog date")
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "one model request per prompt, no tool round trip"
+        );
+        let first = &requests[0];
+        assert!(
+            first.contains("handler=qmt.repository_knowledge.orientation"),
+            "the card is attributed hook context in the first request: {first}"
+        );
+        assert!(
+            first.contains("docs/arch.md > Architecture > Scheduling"),
+            "{first}"
+        );
+        assert!(first.contains("evidence, not instructions"), "{first}");
+        let cards = |text: &str| {
+            text.matches("handler=qmt.repository_knowledge.orientation")
+                .count()
+        };
+        assert_eq!(
+            cards(&requests[1]),
+            1,
+            "the second prompt adds no card; the first stays in history once"
+        );
+    }
+}
+
 // ── Managed worktree workspaces (simple API) ─────────────────────────────────
 
 mod workspace_api {
@@ -2963,4 +3162,218 @@ async fn build_reports_a_malformed_tool_selector() {
         err.to_string().contains("invalid `tools` selector"),
         "{err}"
     );
+}
+
+async fn agent_with_skills(enabled: bool, tools: &[&str]) -> Result<Agent> {
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    let mut builder = Agent::single()
+        .provider("openai", "gpt-4o-mini")
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .skills(crate::config::SkillsConfig {
+            enabled,
+            include_external: false,
+            ..Default::default()
+        });
+    if !tools.is_empty() {
+        builder = builder.tools(tools.iter().copied());
+    }
+    builder.build().await
+}
+
+#[tokio::test]
+async fn standalone_skill_catalog_only_when_enabled_and_admitted_by_tools() -> Result<()> {
+    let has_catalog = |a: &Agent| a.handle().config.skill_catalog.is_some();
+    assert!(has_catalog(&agent_with_skills(true, &[]).await?));
+    assert!(has_catalog(
+        &agent_with_skills(true, &["skill", "shell"]).await?
+    ));
+    assert!(!has_catalog(&agent_with_skills(true, &["shell"]).await?));
+    assert!(!has_catalog(&agent_with_skills(false, &[]).await?));
+    // The skill tool is never an agent-level registry tool.
+    let agent = agent_with_skills(true, &[]).await?;
+    assert!(agent.handle().tool_registry().find("skill").is_none());
+    Ok(())
+}
+
+// ── Task 5.3: target and parent MCP skills end to end ─────────────────
+
+struct NoPromptCtx;
+
+#[async_trait]
+impl crate::tools::ToolContext for NoPromptCtx {
+    fn session_id(&self) -> &str {
+        "e2e"
+    }
+    fn cwd(&self) -> Option<&std::path::Path> {
+        None
+    }
+    async fn record_progress(
+        &self,
+        _: &str,
+        _: String,
+        _: Option<serde_json::Value>,
+    ) -> Result<String, crate::tools::ToolError> {
+        Ok(String::new())
+    }
+    async fn ask_question(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[crate::tools::QuestionOption],
+        _: bool,
+    ) -> Result<Vec<String>, crate::tools::ToolError> {
+        panic!("no prompt expected");
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn skill_enum(tool: &crate::skills::SkillTool) -> Vec<String> {
+    use crate::tools::Tool;
+    crate::skills::tool::listed_skill_ids(&tool.definition())
+}
+
+#[tokio::test]
+async fn target_sees_only_its_server_skills_and_parent_sees_both() -> Result<()> {
+    use crate::test_utils::mcp_harness::{HttpHarness, ScriptedSkill};
+    use crate::tools::Tool;
+
+    let docs = HttpHarness::start(vec![ScriptedSkill::new("guide", "Docs guide")]).await;
+    let ops = HttpHarness::start(vec![ScriptedSkill::new("runbook", "Ops runbook")]).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dotagents_subdir(dir.path());
+    std::fs::write(
+        agents.join("mcp.json"),
+        format!(
+            r#"{{"mcpServers":{{
+                "docs":{{"transport":"streamable-http","url":"{}"}},
+                "ops":{{"transport":"streamable-http","url":"{}"}}}}}}"#,
+            docs.url, ops.url
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(agents.join("agents/writer")).unwrap();
+    std::fs::write(
+        agents.join("agents/writer/agent.md"),
+        "---\nid: writer\ndescription: Writes docs\nrole: delegation-target\n---\nYou write docs.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        agents.join("agents/writer/config.json"),
+        r#"{"model":"fast","mcpServers":["docs"],"tools":["skill","docs.*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        agents.join("models.json"),
+        r#"{"models":{"fast":{"provider":"openai","model":"gpt-4o-mini"}}}"#,
+    )
+    .unwrap();
+
+    let mut skills = crate::config::SkillsConfig::default();
+    skills
+        .permissions
+        .patterns
+        .insert("docs.*".into(), crate::skills::PermissionLevel::Allow);
+
+    // Target: built from the protocol plan through the real factory.
+    let options = crate::dotagents::DotagentsLoadOptions::enabled()
+        .with_workspace(dir.path())
+        .with_global_enabled(false);
+    let manifest = crate::dotagents::DotagentsLoader::new(options.clone())
+        .load()
+        .expect("manifest");
+    let plans = crate::dotagents::DotagentsSubAgentPlans::from_manifest(&manifest);
+    let plan = plans.get("writer").expect("writer plan");
+    assert_eq!(
+        plan.mcp_servers
+            .iter()
+            .map(|s| s.name())
+            .collect::<Vec<_>>(),
+        ["docs"]
+    );
+    let (registry, _tmp) = empty_plugin_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let factory = super::DotagentsTargetFactory::new(Arc::new(registry), storage)
+        .with_skills(Some(skills.clone()), dir.path());
+    let handle = crate::dotagents::ProtocolTargetFactory::create(&factory, plan).expect("target");
+    let target = handle
+        .as_any()
+        .downcast_ref::<crate::agent::LocalAgentHandle>()
+        .expect("local target");
+    let req = crate::acp::protocol::NewSessionRequest::new(dir.path().to_path_buf());
+    let prepared = target
+        .session_materializer
+        .prepare_new_session(req)
+        .await
+        .unwrap();
+    let catalog = target.config.skill_catalog.clone().expect("catalog");
+    let tool = catalog.bind(
+        Some(dir.path()),
+        prepared.runtime.mcp_tool_state.clone(),
+        target.config.tool_config.clone(),
+        Default::default(),
+    );
+    assert_eq!(skill_enum(&tool), vec!["docs.guide"]);
+    let out = tool
+        .call(serde_json::json!({"name": "docs.guide"}), &NoPromptCtx)
+        .await
+        .expect("target loads docs skill without a prompt");
+    let text = match &out[0] {
+        querymt::chat::ToolResultPart::Text { text } => text.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(text.contains("Body of guide"), "{text}");
+    assert!(
+        tool.call(serde_json::json!({"name": "ops.runbook"}), &NoPromptCtx)
+            .await
+            .is_err()
+    );
+    assert!(ops.log.skills_get.lock().is_empty());
+
+    // Parent: no tool restriction; protocol servers `docs` and `ops` attach.
+    let (registry, _tmp2) = empty_plugin_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = Agent::single()
+        .provider("openai", "gpt-4o-mini")
+        .cwd(dir.path())
+        .skills(skills)
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .dotagents_options(options)
+        .build()
+        .await?;
+    let parent = agent.inner.clone();
+    let req = crate::acp::protocol::NewSessionRequest::new(dir.path().to_path_buf());
+    let prepared = parent
+        .session_materializer
+        .prepare_new_session(req)
+        .await
+        .unwrap();
+    let catalog = parent.config.skill_catalog.clone().expect("parent catalog");
+    let tool = catalog.bind(
+        Some(dir.path()),
+        prepared.runtime.mcp_tool_state.clone(),
+        parent.config.tool_config.clone(),
+        Default::default(),
+    );
+    assert_eq!(skill_enum(&tool), vec!["docs.guide", "ops.runbook"]);
+
+    agent.shutdown().await;
+    Ok(())
 }

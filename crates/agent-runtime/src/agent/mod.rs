@@ -1,0 +1,79 @@
+//! Agent module - Core agent functionality split across focused submodules
+//!
+//! This module provides the agent implementation, broken down into logical
+//! components for better maintainability and testing. The public API uses
+//! `AgentHandle` which wraps the kameo actor-based session management.
+//!
+//! ## Kameo Actor Architecture
+//!
+//! The agent uses a one-actor-per-session design:
+//! - `AgentConfig`: Shared configuration (not an actor)
+//! - `SessionActor`: One per session, owns all session state
+//! - `SessionRegistry`: Manages session actors (server layer)
+//! - Messages: Type-safe message structs for actor communication
+
+#[cfg(test)]
+mod accounting_e2e_tests;
+pub mod agent_config;
+pub mod agent_config_builder;
+pub mod builtin_tools;
+pub mod core;
+#[cfg(test)]
+mod dispatch_coverage_tests;
+pub(crate) mod event_chunk;
+pub mod execution;
+pub mod execution_context;
+pub mod file_proxy;
+pub mod handle;
+pub(crate) mod load_telemetry;
+pub mod mcp;
+pub mod messages;
+pub(crate) mod objective;
+pub mod protocol;
+pub mod remote;
+#[doc(hidden)]
+pub mod repository_delivery;
+pub mod session_actor;
+pub use querymt_agent_core::session_control;
+pub mod session_materializer;
+pub mod session_mcp;
+pub mod session_registry;
+pub mod snapshots;
+pub mod tools;
+pub mod turn_control;
+pub mod undo;
+pub mod utils;
+
+// Re-export main types for convenience
+pub use agent_config_builder::AgentConfigBuilder;
+pub use core::{
+    ClientState, DelegationContextConfig, DelegationContextTiming, SessionRuntime, SnapshotPolicy,
+    ToolConfig, ToolPolicy,
+};
+pub use execution::CycleOutcome;
+pub use snapshots::SnapshotState;
+pub use turn_control::{InputDelivery, SubmitInput, SubmitInputResult, TurnControlError};
+
+// Re-export kameo actor types
+pub use agent_config::AgentConfig;
+pub use handle::{AgentHandle, LocalAgentHandle};
+pub use remote::SessionActorRef;
+pub use session_actor::SessionActor;
+pub use session_control::{
+    SessionControlState, SessionControlTransition, SessionModelBinding, SessionModelSelection,
+};
+pub use session_materializer::{PreparedSession, SessionMaterializer};
+pub use session_registry::SessionRegistry;
+
+#[cfg(test)]
+mod delegation_loop_tests;
+#[cfg(test)]
+mod execution_tests;
+#[cfg(test)]
+mod local_session_concurrency_tests;
+#[cfg(test)]
+mod registry_lock_tests;
+#[cfg(test)]
+mod undo_integration_tests;
+#[cfg(test)]
+mod undo_tests;

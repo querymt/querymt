@@ -1,0 +1,3195 @@
+use crate::protocol::{ContentBlock, StopReason};
+use querymt::Usage;
+use querymt::chat::FinishReason;
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, path::PathBuf};
+use typeshare::typeshare;
+
+use crate::config::mcp::McpServerConfig;
+use crate::hash::RapidHash;
+use crate::session::domain::{
+    Alternative, Artifact, Decision, Delegation, ForkOrigin, ForkPointType, IntentSnapshot,
+    ProgressEntry, Task,
+};
+
+/// Why execution was stopped.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StopType {
+    /// Step limit reached (max LLM calls)
+    StepLimit,
+    /// Turn limit reached (max user/assistant exchanges)
+    TurnLimit,
+    /// Price/cost limit exceeded
+    PriceLimit,
+    /// Context token threshold reached (compaction needed)
+    ContextThreshold,
+    /// Model hit its token limit
+    ModelTokenLimit,
+    /// Content filter blocked the response
+    ContentFilter,
+    /// Delegation was blocked
+    DelegationBlocked,
+    /// Generic/unknown stop reason
+    Other,
+}
+
+/// What an output-limit recovery step did.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputLimitRecoveryAction {
+    /// The cut-off reply was discarded and the request retried at the model's output ceiling.
+    Escalate,
+    /// The run continued with an instruction to resume without recap.
+    Continue,
+}
+
+impl From<StopType> for StopReason {
+    fn from(stop_type: StopType) -> Self {
+        match stop_type {
+            StopType::StepLimit | StopType::TurnLimit | StopType::DelegationBlocked => {
+                StopReason::MaxTurnRequests
+            }
+            StopType::PriceLimit | StopType::ContextThreshold | StopType::ModelTokenLimit => {
+                StopReason::MaxTokens
+            }
+            StopType::ContentFilter | StopType::Other => StopReason::EndTurn,
+        }
+    }
+}
+
+/// Outcome recorded in `AgentEventKind::RunCompleted`.
+///
+/// The wire field stays a `String`; this enum is the single source of the
+/// values written by run owners and by orphaned-run reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+    /// The run ended on a middleware stop (e.g. the model's output limit).
+    Stopped,
+    /// The owning process died before closing the run.
+    Interrupted,
+}
+
+impl RunOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RunOutcome::Completed => "completed",
+            RunOutcome::Failed => "failed",
+            RunOutcome::Cancelled => "cancelled",
+            RunOutcome::Stopped => "stopped",
+            RunOutcome::Interrupted => "interrupted",
+        }
+    }
+}
+
+impl From<RunOutcome> for String {
+    fn from(outcome: RunOutcome) -> Self {
+        outcome.as_str().to_string()
+    }
+}
+
+/// Execution progress metrics.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExecutionMetrics {
+    /// Number of LLM calls made
+    pub steps: u32,
+    /// Number of user/assistant turns
+    pub turns: u32,
+}
+
+/// One visible reasoning part stored with an assistant message.
+///
+/// Summary titles use `:summary:N`. Plaintext reasoning uses `:content:N`.
+/// Encrypted continuation is not included. The same `id` appends; a new `id`
+/// is a new part.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningPartStored {
+    pub id: String,
+    pub text: String,
+}
+
+/// Stable id for one provider summary part.
+pub fn reasoning_summary_part_id(item_id: &str, part_index: usize) -> String {
+    format!("{item_id}:summary:{part_index}")
+}
+
+/// Stable id for one provider plaintext reasoning part.
+pub fn reasoning_content_part_id(item_id: &str, part_index: usize) -> String {
+    format!("{item_id}:content:{part_index}")
+}
+
+/// Deserialize a nested `Option<Option<T>>` so that an absent field, an explicit
+/// `null`, and a concrete value stay distinct. The `#[serde(default)]` on the
+/// field supplies `None` for an absent key; this function only handles the
+/// present cases, mapping JSON `null` to `Some(None)` (an explicit clear) and a
+/// concrete value to `Some(Some(value))` (a new value).
+fn deserialize_double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// Session limits configuration (exposed to UI)
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionLimits {
+    /// Maximum number of LLM calls
+    pub max_steps: Option<u32>,
+    /// Maximum number of user/assistant turns
+    pub max_turns: Option<u32>,
+    /// Maximum cost in USD
+    pub max_cost_usd: Option<f64>,
+}
+
+/// MCP configuration as emitted in the session event stream.
+///
+/// This flat DTO preserves the serialized `McpServerConfig` shape while avoiding
+/// Typeshare's lack of support for internally tagged enums.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerInfo {
+    pub transport: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
+}
+
+impl From<McpServerConfig> for McpServerInfo {
+    fn from(config: McpServerConfig) -> Self {
+        match config {
+            McpServerConfig::Stdio {
+                name,
+                command,
+                args,
+                env,
+                ..
+            } => Self {
+                transport: "stdio".into(),
+                name,
+                command: Some(command),
+                args: Some(args),
+                env: Some(env),
+                url: None,
+                headers: None,
+            },
+            McpServerConfig::Http {
+                name, url, headers, ..
+            } => Self {
+                transport: "http".into(),
+                name,
+                command: None,
+                args: None,
+                env: None,
+                url: Some(url),
+                headers: Some(headers),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EventOrigin {
+    #[default]
+    Local,
+    Remote,
+    Unknown(String),
+}
+
+impl Serialize for EventOrigin {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let value = match self {
+            EventOrigin::Local => "local",
+            EventOrigin::Remote => "remote",
+            EventOrigin::Unknown(other) => other.as_str(),
+        };
+        serializer.serialize_str(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for EventOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "local" => EventOrigin::Local,
+            "remote" => EventOrigin::Remote,
+            _ => EventOrigin::Unknown(value),
+        })
+    }
+}
+
+/// A single agent event with metadata.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentEvent {
+    /// Journal `stream_seq` of the producing node (0 for ephemeral events).
+    /// For relayed events this is the host cursor used for dedup and backfill.
+    #[typeshare(serialized_as = "number")]
+    pub seq: i64,
+    /// Producer-assigned per-session sequence (see [`DurableEvent::session_seq`]).
+    /// `0` when unknown (payloads from older nodes).
+    #[serde(default)]
+    #[typeshare(serialized_as = "number")]
+    pub session_seq: i64,
+    #[typeshare(serialized_as = "number")]
+    pub timestamp: i64,
+    pub session_id: String,
+    #[serde(default)]
+    #[typeshare(serialized_as = "string")]
+    pub origin: EventOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node: Option<String>,
+    pub kind: AgentEventKind,
+}
+
+/// How a form question ended.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElicitationOutcome {
+    /// The user answered the form.
+    Accepted,
+    /// The user declined to answer.
+    Declined,
+    /// The question ended without an answer (run cancelled, entry dropped).
+    Cancelled,
+}
+
+impl ElicitationOutcome {
+    /// Map a client's response action to an outcome.
+    pub fn from_action(action: &crate::elicitation::ElicitationAction) -> Self {
+        use crate::elicitation::ElicitationAction;
+        match action {
+            ElicitationAction::Accept => Self::Accepted,
+            ElicitationAction::Decline => Self::Declined,
+            ElicitationAction::Cancel => Self::Cancelled,
+        }
+    }
+}
+
+/// All agent event kinds.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+/// Uses adjacently tagged serde (`tag = "type", content = "data"`) for typeshare compatibility.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum AgentEventKind {
+    SessionCreated,
+    RuntimeChanged {
+        runtime: crate::runtime_status::SessionRuntimeStatus,
+    },
+    DelegationStageChanged {
+        delegation_id: String,
+        stage: Option<crate::delegation_update::DelegationStage>,
+        source_epoch: String,
+    },
+    SessionWorkspaceBound {
+        workspace: crate::session::projection::SessionWorkspaceView,
+        #[typeshare(serialized_as = "Option<string>")]
+        cwd: Option<PathBuf>,
+    },
+    PromptReceived {
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+    /// Transient structured prompt block for live ACP delivery. Durable prompt
+    /// content remains in MessagePart::Prompt rather than the event journal.
+    UserPromptBlock {
+        message_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_prompt_id: Option<String>,
+        #[typeshare(serialized_as = "any")]
+        block: ContentBlock,
+    },
+    UserMessageStored {
+        content: String,
+    },
+    /// Emitted after the user message is stored and before the execution
+    /// state machine begins. Signals the UI that preparation is underway
+    /// (loading history, snapshotting, building tools, running middleware).
+    TurnStarted,
+    RunStarted {
+        run_id: String,
+        origin: String,
+    },
+    RunCompleted {
+        run_id: String,
+        outcome: String,
+        /// Why the run stopped; set only when `outcome` is `"stopped"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_type: Option<StopType>,
+        /// Human-readable stop reason; set only when `outcome` is `"stopped"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    SteeringAccepted {
+        run_id: String,
+        input_id: String,
+        position: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[typeshare(serialized_as = "any")]
+        blocks: Vec<ContentBlock>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        accepted_at_ms: Option<u64>,
+    },
+    SteeringApplied {
+        run_id: String,
+        input_id: String,
+        boundary: String,
+        #[typeshare(serialized_as = "number")]
+        latency_ms: u64,
+    },
+    SteeringDiscarded {
+        run_id: String,
+        input_id: String,
+        reason: String,
+    },
+    InputQueued {
+        input_id: String,
+        position: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[typeshare(serialized_as = "any")]
+        blocks: Vec<ContentBlock>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        accepted_at_ms: Option<u64>,
+    },
+    QueuedInputStarted {
+        input_id: String,
+        run_id: String,
+    },
+    QueuedInputDiscarded {
+        input_id: String,
+        reason: String,
+    },
+    ObjectiveInitialized {
+        run_id: String,
+        #[typeshare(serialized_as = "number")]
+        revision: u64,
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_ref: Option<String>,
+    },
+    ObjectiveUpdated {
+        run_id: String,
+        #[typeshare(serialized_as = "number")]
+        revision: u64,
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_ref: Option<String>,
+    },
+    ObjectiveCheckpoint {
+        run_id: String,
+        reason: String,
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        objective_revision: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_task_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        current_task_revision: Option<u64>,
+    },
+    TaskCompletionGuardTriggered {
+        run_id: String,
+        task_id: String,
+    },
+    TaskCompletionGuardExhausted {
+        run_id: String,
+        task_id: String,
+    },
+    AssistantMessageStored {
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
+        /// Visible summary parts. Historical events omit this and keep `thinking`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reasoning_parts: Vec<ReasoningPartStored>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+    /// Streaming text delta emitted per token/chunk during streaming.
+    /// Ephemeral — must not be persisted to the event store.
+    AssistantContentDelta {
+        content: String,
+        message_id: String,
+    },
+    /// Streaming thinking/reasoning delta emitted during streaming.
+    /// Ephemeral — must not be persisted to the event store.
+    AssistantThinkingDelta {
+        content: String,
+        message_id: String,
+        /// Stable summary part. The same id appends; a new id is a new part.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_id: Option<String>,
+    },
+    /// Ephemeral transport signal for remote streaming over mesh.
+    RemoteStreamDisconnected {
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+    /// Ephemeral signal emitted when a remote stream resumes after reconnect.
+    RemoteStreamReconnected {
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+    /// Ephemeral signal emitted when an attached remote session disconnects.
+    RemoteSessionDisconnected {
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        node_id: Option<String>,
+    },
+    /// Ephemeral signal emitted when cursor-based event backfill for a remote
+    /// session finishes after (re)connect (plan §10/§16). Connection and sync
+    /// progress are transient state, never durable history.
+    RemoteSessionSyncCompleted {
+        /// Number of durable events newly persisted by the backfill.
+        #[typeshare(serialized_as = "number")]
+        backfilled: u64,
+        /// True when no source cursor existed (legacy boundary): no exact
+        /// backfill was possible and history may be missing events emitted
+        /// before the first post-upgrade attachment.
+        boundary: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        node_id: Option<String>,
+    },
+    /// Ephemeral signal emitted when a remote provider host reports liveness while waiting.
+    RemoteProviderHeartbeat {
+        phase: String,
+        #[typeshare(serialized_as = "number")]
+        elapsed_ms: u64,
+        #[typeshare(serialized_as = "number")]
+        idle_ms: u64,
+        #[typeshare(serialized_as = "number")]
+        chunk_count: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+    /// Ephemeral signal emitted when a retryable mid-stream error recreates the stream.
+    /// Accumulated server-side state is discarded before the fresh request.
+    StreamRecovering {
+        /// Human-readable error message that triggered the retry
+        message: String,
+        /// Current attempt (1-indexed)
+        #[typeshare(serialized_as = "number")]
+        attempt: u32,
+        /// Maximum attempts
+        #[typeshare(serialized_as = "number")]
+        max_attempts: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+    LlmRequestStart {
+        message_count: u32,
+    },
+    LlmRequestEnd {
+        #[typeshare(serialized_as = "Option<Usage>")]
+        usage: Option<Usage>,
+        tool_calls: u32,
+        #[typeshare(serialized_as = "Option<string>")]
+        finish_reason: Option<FinishReason>,
+        /// Cost information for this request in USD
+        cost_usd: Option<f64>,
+        /// Cumulative cost for the session in USD
+        cumulative_cost_usd: Option<f64>,
+        /// Current context size (input + output tokens)
+        #[typeshare(serialized_as = "number")]
+        context_tokens: u64,
+        /// Execution progress metrics (steps/turns)
+        metrics: ExecutionMetrics,
+        /// Operation/attempt identities and known subtotal behind `cost_usd`.
+        /// Absent on events written before accounting records existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accounting: Option<crate::accounting::RequestAccounting>,
+    },
+    ProviderChanged {
+        provider: String,
+        model: String,
+        #[typeshare(serialized_as = "number")]
+        config_id: i64,
+        #[typeshare(serialized_as = "Option<number>")]
+        context_limit: Option<u64>,
+        /// Mesh node that owns this provider. `None` = local node.
+        /// Included so the UI can display a node badge next to the model label.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(alias = "provider_node")]
+        provider_node_id: Option<String>,
+    },
+    ToolCallStart {
+        tool_call_id: String,
+        tool_name: String,
+        arguments: String,
+    },
+    ToolCallEnd {
+        tool_call_id: String,
+        tool_name: String,
+        is_error: bool,
+        result: String,
+    },
+    /// Progress of an in-flight MCP tool call. Transient: throttled, never
+    /// persisted or replayed, and never published after the call's
+    /// `ToolCallEnd`.
+    ToolCallProgress {
+        tool_call_id: String,
+        tool_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        progress: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        total: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// An OAuth MCP server was skipped (or failed a call) because it needs
+    /// authorization, or because its authorization could not be checked
+    /// (`error`). Transient: clients log in with `provider_id`
+    /// (`mcp:<server>`) through the `_querymt/auth/*` methods.
+    McpServerAuthRequired {
+        server_name: String,
+        provider_id: String,
+        /// Set when authorization could not be checked at all (for example
+        /// the authorization server is unreachable) rather than merely
+        /// missing. The server was skipped either way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    HookNotice {
+        event_name: String,
+        message: String,
+        is_error: bool,
+    },
+    SnapshotStart {
+        policy: String,
+    },
+    SnapshotEnd {
+        summary: Option<String>,
+    },
+    CompactionStart {
+        token_estimate: u32,
+        /// Opaque lifecycle identity for this compaction, unique per session.
+        /// Legacy persisted records omit it; consumers derive a deterministic
+        /// identity from the record itself in that case.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_id: Option<String>,
+    },
+    CompactionEnd {
+        summary: String,
+        summary_len: u32,
+        /// Opaque lifecycle identity matching the originating compaction start.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_id: Option<String>,
+        /// Authoritative post-compaction context-token count, once recalculated.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        context_tokens: Option<u64>,
+    },
+    /// One user-displayable summary fragment appended to an in-progress compaction.
+    CompactionSummaryChunk {
+        compaction_id: String,
+        content: String,
+    },
+    /// Terminal unsuccessful outcome for a previously started compaction.
+    CompactionFailed {
+        compaction_id: String,
+        reason: String,
+        /// `true` when the compaction was cancelled rather than failed.
+        #[serde(default)]
+        cancelled: bool,
+    },
+    MiddlewareInjected {
+        message: String,
+    },
+    MiddlewareStopped {
+        /// Type of stop (for UI to handle differently)
+        stop_type: StopType,
+        /// Human-readable reason message
+        reason: String,
+        /// Execution metrics at time of stop
+        metrics: ExecutionMetrics,
+    },
+    /// A reply was cut off by the output-token limit and the agent recovered
+    /// instead of stopping. Emitted once per escalation or continuation.
+    OutputLimitRecovery {
+        /// Turn the recovery belongs to (conversation turn count at the time).
+        #[typeshare(serialized_as = "number")]
+        turn: u32,
+        /// 1-based attempt number within the turn, per action.
+        #[typeshare(serialized_as = "number")]
+        attempt: u32,
+        action: OutputLimitRecoveryAction,
+        /// Output-token cap of the request that was cut off, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        from_max_tokens: Option<u32>,
+        /// Output-token cap requested next, when the recovery changes it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        to_max_tokens: Option<u32>,
+        /// The cut-off reply carried only reasoning.
+        #[serde(default)]
+        thinking_only: bool,
+        /// Streamed message that was discarded; clients should drop it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        discarded_message_id: Option<String>,
+    },
+    /// Emitted when a prompt is queued because another operation is executing
+    SessionQueued {
+        /// Reason for queueing (e.g., "waiting for previous operation to complete")
+        reason: String,
+    },
+    SessionStopRequested,
+    SessionForceStopped {
+        #[typeshare(serialized_as = "number")]
+        escalated_after_ms: u64,
+        reason: String,
+    },
+    Cancelled,
+    Error {
+        message: String,
+    },
+    // Phase 2: New event types for structured domain tracking
+    // Domain events embed full domain structs for completeness
+    IntentUpdated {
+        intent_snapshot: IntentSnapshot,
+    },
+    TaskCreated {
+        task: Task,
+    },
+    TaskUpdated {
+        task: Task,
+    },
+    TaskStatusChanged {
+        task: Task,
+    },
+    DecisionRecorded {
+        decision: Decision,
+    },
+    AlternativeRecorded {
+        alternative: Alternative,
+    },
+    AlternativeDiscarded {
+        #[typeshare(serialized_as = "number")]
+        alternative_id: i64,
+        #[typeshare(serialized_as = "Option<number>")]
+        task_id: Option<i64>,
+    },
+    ProgressRecorded {
+        progress_entry: ProgressEntry,
+    },
+    ArtifactRecorded {
+        artifact: Artifact,
+    },
+    /// Invalidation hint; clients read the authoritative assignment snapshot after this event.
+    DelegateModelsChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        revision: Option<u64>,
+    },
+    /// Output of a native `/worktree` command, delivered to the issuing
+    /// session as an agent message. Transient: the authoritative state lives in
+    /// the workspace registry, so it is neither journaled nor replayed.
+    WorktreeCommandOutput {
+        text: String,
+    },
+    /// Ownership of the session's managed checkout moved to a successor
+    /// session. Emitted on the previous owner's stream and replayed on load.
+    WorktreeOwnershipTransferred {
+        workspace_id: String,
+        successor_session_id: String,
+        summary_seeded: bool,
+    },
+    /// The session's managed workspace was archived: the session is now
+    /// read-only. Emitted on the owner's stream and replayed on load.
+    WorktreeArchived {
+        workspace_id: String,
+        /// The session that issued the archive, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by_session_id: Option<String>,
+    },
+    DelegationRequested {
+        delegation: Delegation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        /// Parent execution cycle that requested the delegation. Auxiliary
+        /// generation (the planning summary) is charged to this cycle even if
+        /// it settles after a newer cycle began. Absent on older events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cycle_id: Option<String>,
+    },
+    DelegationCompleted {
+        delegation_id: String,
+        result: Option<String>,
+    },
+    DelegationFailed {
+        delegation_id: String,
+        error: String,
+    },
+    DelegationCancelled {
+        delegation_id: String,
+    },
+    DelegationCancelRequested {
+        delegation_id: String,
+    },
+    UncertaintyEscalated {
+        task_id: Option<String>,
+        description: String,
+        options: Vec<String>,
+    },
+    PermissionRequested {
+        /// Interaction ID of the pending permission request.
+        permission_id: String,
+        task_id: Option<String>,
+        tool_name: String,
+        reason: String,
+        /// Tool call awaiting the decision. Empty for events journaled before
+        /// permission became a pending interaction.
+        #[serde(default)]
+        tool_call_id: String,
+        /// Full ACP `session/request_permission` payload (tool-call update and
+        /// options) so any attached client can render and answer it, local or
+        /// remote. Absent for events journaled before permission became a
+        /// pending interaction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "any")]
+        request: Option<crate::protocol::RequestPermissionRequest>,
+    },
+    PermissionGranted {
+        permission_id: String,
+        granted: bool,
+    },
+    ElicitationRequested {
+        elicitation_id: String,
+        session_id: String,
+        message: String,
+        #[typeshare(serialized_as = "any")]
+        requested_schema: serde_json::Value,
+        source: String,
+    },
+    /// How a form question announced by `ElicitationRequested` ended.
+    ///
+    /// Emitted exactly once per announced question. `selection` carries the
+    /// chosen option labels for built-in questions and skill approvals; it is
+    /// never set for MCP server elicitations, so submitted form content is
+    /// not recorded.
+    ElicitationResolved {
+        elicitation_id: String,
+        session_id: String,
+        outcome: ElicitationOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selection: Option<Vec<String>>,
+    },
+    SessionForked {
+        parent_session_id: String,
+        child_session_id: String,
+        target_agent_id: String,
+        #[typeshare(serialized_as = "string")]
+        origin: ForkOrigin,
+        #[typeshare(serialized_as = "string")]
+        fork_point_type: ForkPointType,
+        fork_point_ref: String,
+        instructions: Option<String>,
+        /// Model confirmed by the child session before its first prompt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_model_id: Option<String>,
+        /// Mesh node confirmed with the selected model, or None for local execution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_provider_node_id: Option<String>,
+    },
+    /// Emitted once at session creation with environment configuration
+    SessionConfigured {
+        #[typeshare(serialized_as = "Option<string>")]
+        cwd: Option<PathBuf>,
+        mcp_servers: Vec<McpServerInfo>,
+        /// Session limits configuration (if any)
+        limits: Option<SessionLimits>,
+    },
+    /// Emitted at session start and whenever available tools change
+    ToolsAvailable {
+        #[typeshare(serialized_as = "Vec<Tool>")]
+        tools: Vec<querymt::chat::Tool>,
+        #[typeshare(serialized_as = "string")]
+        tools_hash: RapidHash,
+    },
+    /// Emitted when duplicate/similar code is detected in newly written code
+    DuplicateCodeDetected {
+        /// Compacted list of duplicate code warnings (body_text stripped, matches capped)
+        warnings: Vec<crate::dedup::DuplicateWarning>,
+        /// Path to the full overflow report file (if written), readable via read_file
+        overflow_path: Option<String>,
+    },
+    /// Emitted when the agent's operating mode changes at runtime
+    ModeChanged {
+        mode: String,
+        previous_mode: String,
+    },
+    /// Emitted when a session's mode changes (per-session mode in actor model)
+    SessionModeChanged {
+        #[typeshare(serialized_as = "string")]
+        mode: crate::agent_mode::AgentMode,
+    },
+    /// Emitted after a session-control transition commits successfully, carrying
+    /// the authoritative post-commit configuration snapshot values. Consumers
+    /// derive the complete configuration-option set from these values.
+    SessionConfigChanged {
+        #[typeshare(serialized_as = "string")]
+        mode: crate::agent_mode::AgentMode,
+        /// Current reasoning effort as its wire string; `None` means auto.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+    },
+    /// Emitted after mutable session metadata (title / last-activity) persists
+    /// successfully. Fields follow patch semantics: an absent field is
+    /// unchanged, a present title is the new value, and `None` inside
+    /// `Some` is an explicit clear.
+    SessionMetadataUpdated {
+        #[typeshare(serialized_as = "Option<string>")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        title: Option<Option<String>>,
+        /// RFC 3339 last-activity timestamp as persisted.
+        #[typeshare(serialized_as = "Option<string>")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_at: Option<String>,
+    },
+    /// LLM request was rate limited, execution is paused and waiting.
+    /// Retained as a stable wire event for rate-limit-specific UI behavior.
+    RateLimited {
+        /// Human-readable message from the provider
+        message: String,
+        /// Seconds until retry will be attempted
+        #[typeshare(serialized_as = "number")]
+        wait_secs: u64,
+        /// When the wait started (Unix timestamp in seconds)
+        #[typeshare(serialized_as = "number")]
+        started_at: i64,
+        /// Current retry attempt (1-indexed)
+        attempt: u32,
+        /// Maximum retry attempts configured
+        max_attempts: u32,
+    },
+    /// Rate limit wait completed, resuming execution.
+    RateLimitResume {
+        /// Which attempt is now being made
+        attempt: u32,
+    },
+    /// A non-rate-limit retryable LLM failure is waiting before the next attempt.
+    LlmRetryWait {
+        /// Human-readable error that triggered the retry
+        message: String,
+        /// Seconds until retry will be attempted
+        #[typeshare(serialized_as = "number")]
+        wait_secs: u64,
+        /// When the wait started (Unix timestamp in seconds)
+        #[typeshare(serialized_as = "number")]
+        started_at: i64,
+        /// Current retry attempt (1-indexed)
+        attempt: u32,
+        /// Maximum retry attempts configured
+        max_attempts: u32,
+    },
+    /// Non-rate-limit LLM retry wait completed, resuming execution.
+    LlmRetryResume {
+        /// Which attempt is now being made
+        attempt: u32,
+    },
+    /// Emitted on the remote node once its workspace index has finished
+    /// building and is available via `GetFileIndex`.  Flows through the
+    /// EventForwarder → EventRelayActor → local EventSink chain so local
+    /// clients can react without polling.
+    WorkspaceIndexReady {
+        workspace_root: String,
+    },
+
+    // ── Schedule lifecycle events ───────────────────────────────────────
+    /// A new schedule was created and armed.
+    ScheduleCreated {
+        schedule_public_id: String,
+        session_public_id: String,
+        task_public_id: String,
+    },
+    /// A schedule cycle was fired (ScheduledPrompt sent to SessionActor).
+    ScheduleFired {
+        schedule_public_id: String,
+        session_public_id: String,
+    },
+    /// A scheduled cycle completed successfully.
+    ScheduleCycleCompleted {
+        schedule_public_id: String,
+        turn_id: String,
+        run_count: u32,
+    },
+    /// A scheduled cycle failed.
+    ScheduleCycleFailed {
+        schedule_public_id: String,
+        turn_id: Option<String>,
+        error: String,
+    },
+    /// A schedule was paused by user/API.
+    SchedulePaused {
+        schedule_public_id: String,
+    },
+    /// A schedule was resumed by user/API.
+    ScheduleResumed {
+        schedule_public_id: String,
+    },
+    /// A schedule reached max_runs and is now exhausted.
+    ScheduleExhausted {
+        schedule_public_id: String,
+    },
+    /// A schedule exceeded its failure threshold.
+    ScheduleFailed {
+        schedule_public_id: String,
+        consecutive_failures: u32,
+    },
+
+    // ── Explicit scheduled execution terminal events ────────────────────
+    // Emitted by SessionActor so SchedulerActor does not infer completion
+    // from generic task events. Correlation is deterministic.
+    /// SessionActor finished a scheduled execution cycle successfully.
+    ScheduledExecutionCompleted {
+        schedule_public_id: String,
+        turn_id: String,
+    },
+    /// SessionActor's scheduled execution cycle failed.
+    ScheduledExecutionFailed {
+        schedule_public_id: String,
+        turn_id: Option<String>,
+        error: String,
+    },
+
+    // ── Internal scheduler events ────────────────────────────────────────
+    /// Debounce window completed for an event-driven schedule.
+    /// Internal event used by the scheduler to trigger after debounce.
+    ScheduleDebounceCompleted {
+        schedule_public_id: String,
+    },
+
+    // ── Knowledge layer events ───────────────────────────────────────────
+    /// A new knowledge entry was ingested.
+    KnowledgeIngested {
+        scope: String,
+        entry_public_id: String,
+        source: String,
+    },
+    /// Knowledge entries were consolidated into an insight.
+    KnowledgeConsolidated {
+        scope: String,
+        consolidation_public_id: String,
+        #[typeshare(serialized_as = "number")]
+        source_count: u32,
+    },
+
+    // ── LLM accounting lifecycle ─────────────────────────────────────────
+    // Durable ledger records. Start is appended before dispatch, settlement
+    // once usage is known. See `crate::accounting`.
+    /// A provider attempt is about to be dispatched. An unmatched start is
+    /// unresolved spend, not proof of a charge.
+    LlmAttemptStarted {
+        start: crate::accounting::AttemptStart,
+    },
+    /// Accounting for a dispatched attempt (identified by `attempt_id`).
+    LlmAttemptSettled {
+        settlement: crate::accounting::AttemptSettlement,
+    },
+}
+
+impl AgentEventKind {
+    pub const RUN_STARTED_TAG: &'static str = "run_started";
+    pub const RUN_COMPLETED_TAG: &'static str = "run_completed";
+    pub const DELEGATION_COMPLETED_TAG: &'static str = "delegation_completed";
+    pub const DELEGATION_FAILED_TAG: &'static str = "delegation_failed";
+    pub const DELEGATION_CANCELLED_TAG: &'static str = "delegation_cancelled";
+    pub const LLM_REQUEST_END_TAG: &'static str = "llm_request_end";
+    pub const PROVIDER_CHANGED_TAG: &'static str = "provider_changed";
+    pub const LLM_ATTEMPT_STARTED_TAG: &'static str = "llm_attempt_started";
+    pub const LLM_ATTEMPT_SETTLED_TAG: &'static str = "llm_attempt_settled";
+    pub const PROMPT_RECEIVED_TAG: &'static str = "prompt_received";
+    pub const ASSISTANT_MESSAGE_STORED_TAG: &'static str = "assistant_message_stored";
+
+    /// The serde `"type"` tag of this event kind, as stored in the journal's
+    /// `kind` column. The match is exhaustive so a new variant must add its
+    /// tag here; `event_kind_tag_matches_serde_tag` checks it against serde.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::SessionCreated => "session_created",
+            Self::RuntimeChanged { .. } => "runtime_changed",
+            Self::DelegationStageChanged { .. } => "delegation_stage_changed",
+            Self::SessionWorkspaceBound { .. } => "session_workspace_bound",
+            Self::PromptReceived { .. } => "prompt_received",
+            Self::UserPromptBlock { .. } => "user_prompt_block",
+            Self::UserMessageStored { .. } => "user_message_stored",
+            Self::TurnStarted => "turn_started",
+            Self::RunStarted { .. } => "run_started",
+            Self::RunCompleted { .. } => "run_completed",
+            Self::SteeringAccepted { .. } => "steering_accepted",
+            Self::SteeringApplied { .. } => "steering_applied",
+            Self::SteeringDiscarded { .. } => "steering_discarded",
+            Self::InputQueued { .. } => "input_queued",
+            Self::QueuedInputStarted { .. } => "queued_input_started",
+            Self::QueuedInputDiscarded { .. } => "queued_input_discarded",
+            Self::ObjectiveInitialized { .. } => "objective_initialized",
+            Self::ObjectiveUpdated { .. } => "objective_updated",
+            Self::ObjectiveCheckpoint { .. } => "objective_checkpoint",
+            Self::TaskCompletionGuardTriggered { .. } => "task_completion_guard_triggered",
+            Self::TaskCompletionGuardExhausted { .. } => "task_completion_guard_exhausted",
+            Self::AssistantMessageStored { .. } => "assistant_message_stored",
+            Self::AssistantContentDelta { .. } => "assistant_content_delta",
+            Self::AssistantThinkingDelta { .. } => "assistant_thinking_delta",
+            Self::RemoteStreamDisconnected { .. } => "remote_stream_disconnected",
+            Self::RemoteStreamReconnected { .. } => "remote_stream_reconnected",
+            Self::RemoteSessionDisconnected { .. } => "remote_session_disconnected",
+            Self::RemoteSessionSyncCompleted { .. } => "remote_session_sync_completed",
+            Self::RemoteProviderHeartbeat { .. } => "remote_provider_heartbeat",
+            Self::StreamRecovering { .. } => "stream_recovering",
+            Self::LlmRequestStart { .. } => "llm_request_start",
+            Self::LlmRequestEnd { .. } => "llm_request_end",
+            Self::ProviderChanged { .. } => "provider_changed",
+            Self::ToolCallStart { .. } => "tool_call_start",
+            Self::ToolCallEnd { .. } => "tool_call_end",
+            Self::ToolCallProgress { .. } => "tool_call_progress",
+            Self::McpServerAuthRequired { .. } => "mcp_server_auth_required",
+            Self::HookNotice { .. } => "hook_notice",
+            Self::SnapshotStart { .. } => "snapshot_start",
+            Self::SnapshotEnd { .. } => "snapshot_end",
+            Self::CompactionStart { .. } => "compaction_start",
+            Self::CompactionEnd { .. } => "compaction_end",
+            Self::CompactionSummaryChunk { .. } => "compaction_summary_chunk",
+            Self::CompactionFailed { .. } => "compaction_failed",
+            Self::MiddlewareInjected { .. } => "middleware_injected",
+            Self::MiddlewareStopped { .. } => "middleware_stopped",
+            Self::OutputLimitRecovery { .. } => "output_limit_recovery",
+            Self::SessionQueued { .. } => "session_queued",
+            Self::SessionStopRequested => "session_stop_requested",
+            Self::SessionForceStopped { .. } => "session_force_stopped",
+            Self::Cancelled => "cancelled",
+            Self::Error { .. } => "error",
+            Self::IntentUpdated { .. } => "intent_updated",
+            Self::TaskCreated { .. } => "task_created",
+            Self::TaskUpdated { .. } => "task_updated",
+            Self::TaskStatusChanged { .. } => "task_status_changed",
+            Self::DecisionRecorded { .. } => "decision_recorded",
+            Self::AlternativeRecorded { .. } => "alternative_recorded",
+            Self::AlternativeDiscarded { .. } => "alternative_discarded",
+            Self::ProgressRecorded { .. } => "progress_recorded",
+            Self::ArtifactRecorded { .. } => "artifact_recorded",
+            Self::DelegateModelsChanged { .. } => "delegate_models_changed",
+            Self::WorktreeCommandOutput { .. } => "worktree_command_output",
+            Self::WorktreeOwnershipTransferred { .. } => "worktree_ownership_transferred",
+            Self::WorktreeArchived { .. } => "worktree_archived",
+            Self::DelegationRequested { .. } => "delegation_requested",
+            Self::DelegationCompleted { .. } => "delegation_completed",
+            Self::DelegationFailed { .. } => "delegation_failed",
+            Self::DelegationCancelled { .. } => "delegation_cancelled",
+            Self::DelegationCancelRequested { .. } => "delegation_cancel_requested",
+            Self::UncertaintyEscalated { .. } => "uncertainty_escalated",
+            Self::PermissionRequested { .. } => "permission_requested",
+            Self::PermissionGranted { .. } => "permission_granted",
+            Self::ElicitationRequested { .. } => "elicitation_requested",
+            Self::ElicitationResolved { .. } => "elicitation_resolved",
+            Self::SessionForked { .. } => "session_forked",
+            Self::SessionConfigured { .. } => "session_configured",
+            Self::ToolsAvailable { .. } => "tools_available",
+            Self::DuplicateCodeDetected { .. } => "duplicate_code_detected",
+            Self::ModeChanged { .. } => "mode_changed",
+            Self::SessionModeChanged { .. } => "session_mode_changed",
+            Self::SessionConfigChanged { .. } => "session_config_changed",
+            Self::SessionMetadataUpdated { .. } => "session_metadata_updated",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::RateLimitResume { .. } => "rate_limit_resume",
+            Self::LlmRetryWait { .. } => "llm_retry_wait",
+            Self::LlmRetryResume { .. } => "llm_retry_resume",
+            Self::WorkspaceIndexReady { .. } => "workspace_index_ready",
+            Self::ScheduleCreated { .. } => "schedule_created",
+            Self::ScheduleFired { .. } => "schedule_fired",
+            Self::ScheduleCycleCompleted { .. } => "schedule_cycle_completed",
+            Self::ScheduleCycleFailed { .. } => "schedule_cycle_failed",
+            Self::SchedulePaused { .. } => "schedule_paused",
+            Self::ScheduleResumed { .. } => "schedule_resumed",
+            Self::ScheduleExhausted { .. } => "schedule_exhausted",
+            Self::ScheduleFailed { .. } => "schedule_failed",
+            Self::ScheduledExecutionCompleted { .. } => "scheduled_execution_completed",
+            Self::ScheduledExecutionFailed { .. } => "scheduled_execution_failed",
+            Self::ScheduleDebounceCompleted { .. } => "schedule_debounce_completed",
+            Self::KnowledgeIngested { .. } => "knowledge_ingested",
+            Self::KnowledgeConsolidated { .. } => "knowledge_consolidated",
+            Self::LlmAttemptStarted { .. } => "llm_attempt_started",
+            Self::LlmAttemptSettled { .. } => "llm_attempt_settled",
+        }
+    }
+}
+
+// ============================================================================
+// Event Bus Refactor: Durability classification + Envelope types
+// ============================================================================
+
+/// Whether an event must be persisted to the journal (durable) or is
+/// live-only (ephemeral).
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Durability {
+    /// Must be persisted; replayable via journal.
+    Durable,
+    /// Live-only; never written to journal, never replayed.
+    Ephemeral,
+}
+
+/// A durable event that has been persisted to the journal.
+///
+/// Contains a DB-assigned `event_id` and monotonic `stream_seq`.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurableEvent {
+    pub event_id: String,
+    #[typeshare(serialized_as = "number")]
+    pub stream_seq: i64,
+    /// Per-session sequence assigned at production time. Strictly increasing
+    /// in production order within a session and shared with ephemeral events;
+    /// relayed events keep the host's value. `0` means unsequenced (legacy
+    /// payloads and events produced outside a session sequencer).
+    #[serde(default)]
+    #[typeshare(serialized_as = "number")]
+    pub session_seq: i64,
+    pub session_id: String,
+    #[typeshare(serialized_as = "number")]
+    pub timestamp: i64,
+    #[typeshare(serialized_as = "string")]
+    pub origin: EventOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node: Option<String>,
+    pub kind: AgentEventKind,
+}
+
+impl From<DurableEvent> for AgentEvent {
+    fn from(de: DurableEvent) -> Self {
+        AgentEvent {
+            seq: de.stream_seq,
+            session_seq: de.session_seq,
+            timestamp: de.timestamp,
+            session_id: de.session_id,
+            origin: de.origin,
+            source_node: de.source_node,
+            kind: de.kind,
+        }
+    }
+}
+
+/// An ephemeral event — live delivery only, no persistence.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EphemeralEvent {
+    pub session_id: String,
+    /// Per-session sequence shared with durable events (see
+    /// [`DurableEvent::session_seq`]); `0` when unsequenced.
+    #[serde(default)]
+    #[typeshare(serialized_as = "number")]
+    pub session_seq: i64,
+    #[typeshare(serialized_as = "number")]
+    pub timestamp: i64,
+    #[typeshare(serialized_as = "string")]
+    pub origin: EventOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node: Option<String>,
+    pub kind: AgentEventKind,
+}
+
+impl From<EphemeralEvent> for AgentEvent {
+    fn from(ee: EphemeralEvent) -> Self {
+        AgentEvent {
+            seq: 0,
+            session_seq: ee.session_seq,
+            timestamp: ee.timestamp,
+            session_id: ee.session_id,
+            origin: ee.origin,
+            source_node: ee.source_node,
+            kind: ee.kind,
+        }
+    }
+}
+
+impl From<AgentEvent> for EventEnvelope {
+    fn from(event: AgentEvent) -> Self {
+        EventEnvelope::Durable(DurableEvent {
+            event_id: format!("legacy-{}", event.seq),
+            stream_seq: event.seq,
+            session_seq: event.session_seq,
+            session_id: event.session_id,
+            timestamp: event.timestamp,
+            origin: event.origin,
+            source_node: event.source_node,
+            kind: event.kind,
+        })
+    }
+}
+
+/// A tagged union of durable and ephemeral events for the fanout layer.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum EventEnvelope {
+    Durable(DurableEvent),
+    Ephemeral(EphemeralEvent),
+}
+
+impl EventEnvelope {
+    pub fn session_id(&self) -> &str {
+        match self {
+            EventEnvelope::Durable(e) => &e.session_id,
+            EventEnvelope::Ephemeral(e) => &e.session_id,
+        }
+    }
+
+    pub fn kind(&self) -> &AgentEventKind {
+        match self {
+            EventEnvelope::Durable(e) => &e.kind,
+            EventEnvelope::Ephemeral(e) => &e.kind,
+        }
+    }
+
+    pub fn timestamp(&self) -> i64 {
+        match self {
+            EventEnvelope::Durable(e) => e.timestamp,
+            EventEnvelope::Ephemeral(e) => e.timestamp,
+        }
+    }
+
+    pub fn is_durable(&self) -> bool {
+        matches!(self, EventEnvelope::Durable(_))
+    }
+
+    pub fn is_ephemeral(&self) -> bool {
+        matches!(self, EventEnvelope::Ephemeral(_))
+    }
+
+    /// Sequence number: `stream_seq` for durable events, `0` for ephemeral.
+    pub fn seq(&self) -> i64 {
+        match self {
+            EventEnvelope::Durable(e) => e.stream_seq,
+            EventEnvelope::Ephemeral(_) => 0,
+        }
+    }
+
+    /// Per-session production sequence (`0` when unsequenced).
+    pub fn session_seq(&self) -> i64 {
+        match self {
+            EventEnvelope::Durable(e) => e.session_seq,
+            EventEnvelope::Ephemeral(e) => e.session_seq,
+        }
+    }
+
+    pub fn origin(&self) -> &EventOrigin {
+        match self {
+            EventEnvelope::Durable(e) => &e.origin,
+            EventEnvelope::Ephemeral(e) => &e.origin,
+        }
+    }
+
+    pub fn source_node(&self) -> Option<&str> {
+        match self {
+            EventEnvelope::Durable(e) => e.source_node.as_deref(),
+            EventEnvelope::Ephemeral(e) => e.source_node.as_deref(),
+        }
+    }
+}
+
+/// Classify an `AgentEventKind` as durable or ephemeral.
+///
+/// **Policy**: durable by default. Only explicitly transient signal types
+/// are ephemeral. Each ephemeral entry has a rationale comment.
+pub fn classify_durability(kind: &AgentEventKind) -> Durability {
+    match kind {
+        // ── Ephemeral: high-frequency streaming deltas ──────────────
+        // Rationale: per-token chunks; the full content is captured by
+        // AssistantMessageStored which IS durable.
+        // Live owner observations, not persisted evidence that work survives a restart.
+        AgentEventKind::RuntimeChanged { .. } | AgentEventKind::DelegationStageChanged { .. } => {
+            Durability::Ephemeral
+        }
+        AgentEventKind::UserPromptBlock { .. } => Durability::Ephemeral,
+        AgentEventKind::AssistantContentDelta { .. } => Durability::Ephemeral,
+        AgentEventKind::AssistantThinkingDelta { .. } => Durability::Ephemeral,
+        AgentEventKind::RemoteStreamDisconnected { .. } => Durability::Ephemeral,
+        AgentEventKind::RemoteStreamReconnected { .. } => Durability::Ephemeral,
+        AgentEventKind::RemoteSessionDisconnected { .. } => Durability::Ephemeral,
+        // Rationale: sync progress is transient connection state (plan §12/§16);
+        // the backfilled events themselves are durable through the journal.
+        AgentEventKind::RemoteSessionSyncCompleted { .. } => Durability::Ephemeral,
+        AgentEventKind::RemoteProviderHeartbeat { .. } => Durability::Ephemeral,
+        AgentEventKind::StreamRecovering { .. } => Durability::Ephemeral,
+        // Rationale: the assignment table is authoritative. This is a live
+        // ACP invalidation hint, not a commit record, and must not pollute
+        // the durable journal or break older journal loaders.
+        AgentEventKind::DelegateModelsChanged { .. } => Durability::Ephemeral,
+        // Rationale: command output is a transient reply to one prompt; the
+        // registry is authoritative and the handoff has its own durable event.
+        AgentEventKind::WorktreeCommandOutput { .. } => Durability::Ephemeral,
+        // Rationale: live MCP progress hint, superseded by ToolCallEnd; must
+        // not be journaled or replayed.
+        AgentEventKind::ToolCallProgress { .. } => Durability::Ephemeral,
+        // Rationale: live login prompt; authoritative state is the credential
+        // store (`auth_status`), so it must not be journaled or replayed.
+        AgentEventKind::McpServerAuthRequired { .. } => Durability::Ephemeral,
+
+        // ── Durable: accounting ledger ──────────────────────────────
+        // Rationale: the start must survive a crash to expose unresolved
+        // spend, and settlements are the only source of recorded charges.
+        // They must never be downgraded to ephemeral.
+        AgentEventKind::LlmAttemptStarted { .. } => Durability::Durable,
+        AgentEventKind::LlmAttemptSettled { .. } => Durability::Durable,
+
+        // Everything else is durable by default.
+        _ => Durability::Durable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One JSON value per `AgentEventKind` variant. Deserializing the value
+    /// proves the variant exists; `tag()` must then equal the serde tag.
+    fn one_value_per_variant() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({ "type": "session_created" }),
+            serde_json::json!({
+                "type": "runtime_changed",
+                "data": {
+                    "runtime": {"phase":"idle","active_run_id":null,"steerable":false,"pending_steering_count":0,"queued_input_count":0,"run_started_at_ms":null,"observation":{"availability":"inactive"},"delegation_activity":[]}
+                }
+            }),
+            serde_json::json!({
+                "type": "delegation_stage_changed",
+                "data": {
+                    "delegation_id": "x",
+                    "stage": null,
+                    "source_epoch": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "session_workspace_bound",
+                "data": {
+                    "workspace": {"workspace_id":"w","repository_id":"r","source_cwd":"/","project_name":"p","checkout_path":"/c","branch":"b","baseline_mode":"commit","baseline_commit":null,"lifecycle":"ready","last_error":null},
+                    "cwd": null
+                }
+            }),
+            serde_json::json!({
+                "type": "prompt_received",
+                "data": {
+                    "content": "x",
+                    "message_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "user_prompt_block",
+                "data": {
+                    "message_id": "x",
+                    "client_prompt_id": null,
+                    "block": {"type":"text","text":"x"}
+                }
+            }),
+            serde_json::json!({
+                "type": "user_message_stored",
+                "data": {
+                    "content": "x"
+                }
+            }),
+            serde_json::json!({ "type": "turn_started" }),
+            serde_json::json!({
+                "type": "run_started",
+                "data": {
+                    "run_id": "x",
+                    "origin": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "run_completed",
+                "data": {
+                    "run_id": "x",
+                    "outcome": "x",
+                    "stop_type": null,
+                    "reason": null
+                }
+            }),
+            serde_json::json!({
+                "type": "steering_accepted",
+                "data": {
+                    "run_id": "x",
+                    "input_id": "x",
+                    "position": 0,
+                    "blocks": [],
+                    "accepted_at_ms": null
+                }
+            }),
+            serde_json::json!({
+                "type": "steering_applied",
+                "data": {
+                    "run_id": "x",
+                    "input_id": "x",
+                    "boundary": "x",
+                    "latency_ms": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "steering_discarded",
+                "data": {
+                    "run_id": "x",
+                    "input_id": "x",
+                    "reason": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "input_queued",
+                "data": {
+                    "input_id": "x",
+                    "position": 0,
+                    "blocks": [],
+                    "accepted_at_ms": null
+                }
+            }),
+            serde_json::json!({
+                "type": "queued_input_started",
+                "data": {
+                    "input_id": "x",
+                    "run_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "queued_input_discarded",
+                "data": {
+                    "input_id": "x",
+                    "reason": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "objective_initialized",
+                "data": {
+                    "run_id": "x",
+                    "revision": 0,
+                    "source": "x",
+                    "source_ref": null
+                }
+            }),
+            serde_json::json!({
+                "type": "objective_updated",
+                "data": {
+                    "run_id": "x",
+                    "revision": 0,
+                    "source": "x",
+                    "source_ref": null
+                }
+            }),
+            serde_json::json!({
+                "type": "objective_checkpoint",
+                "data": {
+                    "run_id": "x",
+                    "reason": "x",
+                    "action": "x",
+                    "objective_revision": null,
+                    "current_task_id": null,
+                    "current_task_revision": null
+                }
+            }),
+            serde_json::json!({
+                "type": "task_completion_guard_triggered",
+                "data": {
+                    "run_id": "x",
+                    "task_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "task_completion_guard_exhausted",
+                "data": {
+                    "run_id": "x",
+                    "task_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant_message_stored",
+                "data": {
+                    "content": "x",
+                    "thinking": null,
+                    "reasoning_parts": [],
+                    "message_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant_content_delta",
+                "data": {
+                    "content": "x",
+                    "message_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant_thinking_delta",
+                "data": {
+                    "content": "x",
+                    "message_id": "x",
+                    "part_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "remote_stream_disconnected",
+                "data": {
+                    "message": "x",
+                    "message_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "remote_stream_reconnected",
+                "data": {
+                    "message": "x",
+                    "message_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "remote_session_disconnected",
+                "data": {
+                    "message": "x",
+                    "node_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "remote_session_sync_completed",
+                "data": {
+                    "backfilled": 0,
+                    "boundary": false,
+                    "node_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "remote_provider_heartbeat",
+                "data": {
+                    "phase": "x",
+                    "elapsed_ms": 0,
+                    "idle_ms": 0,
+                    "chunk_count": 0,
+                    "message_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "stream_recovering",
+                "data": {
+                    "message": "x",
+                    "attempt": 0,
+                    "max_attempts": 0,
+                    "message_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "llm_request_start",
+                "data": {
+                    "message_count": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "llm_request_end",
+                "data": {
+                    "usage": null,
+                    "tool_calls": 0,
+                    "finish_reason": null,
+                    "cost_usd": null,
+                    "cumulative_cost_usd": null,
+                    "context_tokens": 0,
+                    "metrics": {"steps":0,"turns":0},
+                    "accounting": null
+                }
+            }),
+            serde_json::json!({
+                "type": "provider_changed",
+                "data": {
+                    "provider": "x",
+                    "model": "x",
+                    "config_id": 0,
+                    "context_limit": null,
+                    "provider_node_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "tool_call_start",
+                "data": {
+                    "tool_call_id": "x",
+                    "tool_name": "x",
+                    "arguments": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "tool_call_end",
+                "data": {
+                    "tool_call_id": "x",
+                    "tool_name": "x",
+                    "is_error": false,
+                    "result": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "tool_call_progress",
+                "data": {
+                    "tool_call_id": "x",
+                    "tool_name": "x",
+                    "progress": null,
+                    "total": null,
+                    "message": null
+                }
+            }),
+            serde_json::json!({
+                "type": "mcp_server_auth_required",
+                "data": {
+                    "server_name": "x",
+                    "provider_id": "x",
+                    "error": null
+                }
+            }),
+            serde_json::json!({
+                "type": "hook_notice",
+                "data": {
+                    "event_name": "x",
+                    "message": "x",
+                    "is_error": false
+                }
+            }),
+            serde_json::json!({
+                "type": "snapshot_start",
+                "data": {
+                    "policy": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "snapshot_end",
+                "data": {
+                    "summary": null
+                }
+            }),
+            serde_json::json!({
+                "type": "compaction_start",
+                "data": {
+                    "token_estimate": 0,
+                    "compaction_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "compaction_end",
+                "data": {
+                    "summary": "x",
+                    "summary_len": 0,
+                    "compaction_id": null,
+                    "context_tokens": null
+                }
+            }),
+            serde_json::json!({
+                "type": "compaction_summary_chunk",
+                "data": {
+                    "compaction_id": "x",
+                    "content": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "compaction_failed",
+                "data": {
+                    "compaction_id": "x",
+                    "reason": "x",
+                    "cancelled": false
+                }
+            }),
+            serde_json::json!({
+                "type": "middleware_injected",
+                "data": {
+                    "message": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "middleware_stopped",
+                "data": {
+                    "stop_type": "step_limit",
+                    "reason": "x",
+                    "metrics": {"steps":0,"turns":0}
+                }
+            }),
+            serde_json::json!({
+                "type": "output_limit_recovery",
+                "data": {
+                    "turn": 0,
+                    "attempt": 0,
+                    "action": "escalate",
+                    "from_max_tokens": null,
+                    "to_max_tokens": null,
+                    "thinking_only": false,
+                    "discarded_message_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "session_queued",
+                "data": {
+                    "reason": "x"
+                }
+            }),
+            serde_json::json!({ "type": "session_stop_requested" }),
+            serde_json::json!({
+                "type": "session_force_stopped",
+                "data": {
+                    "escalated_after_ms": 0,
+                    "reason": "x"
+                }
+            }),
+            serde_json::json!({ "type": "cancelled" }),
+            serde_json::json!({
+                "type": "error",
+                "data": {
+                    "message": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "intent_updated",
+                "data": {
+                    "intent_snapshot": {"summary":"s","constraints":null,"next_step_hint":null,"revision":0,"source":"x","source_ref":null,"created_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "task_created",
+                "data": {
+                    "task": {"public_id":"t","kind":"finite","status":"active","expected_deliverable":null,"acceptance_criteria":null,"revision":0,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "task_updated",
+                "data": {
+                    "task": {"public_id":"t","kind":"finite","status":"active","expected_deliverable":null,"acceptance_criteria":null,"revision":0,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "task_status_changed",
+                "data": {
+                    "task": {"public_id":"t","kind":"finite","status":"active","expected_deliverable":null,"acceptance_criteria":null,"revision":0,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "decision_recorded",
+                "data": {
+                    "decision": {"description":"d","rationale":null,"status":"accepted","created_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "alternative_recorded",
+                "data": {
+                    "alternative": {"description":"d","status":"active","created_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "alternative_discarded",
+                "data": {
+                    "alternative_id": 0,
+                    "task_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "progress_recorded",
+                "data": {
+                    "progress_entry": {"kind":"tool_call","content":"c","metadata":null,"created_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "artifact_recorded",
+                "data": {
+                    "artifact": {"kind":"k","uri":null,"path":null,"summary":null,"created_at":"2026-01-01T00:00:00Z"}
+                }
+            }),
+            serde_json::json!({
+                "type": "delegate_models_changed",
+                "data": {
+                    "revision": null
+                }
+            }),
+            serde_json::json!({
+                "type": "worktree_command_output",
+                "data": {
+                    "text": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "worktree_ownership_transferred",
+                "data": {
+                    "workspace_id": "x",
+                    "successor_session_id": "x",
+                    "summary_seeded": false
+                }
+            }),
+            serde_json::json!({
+                "type": "worktree_archived",
+                "data": {
+                    "workspace_id": "x",
+                    "by_session_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "delegation_requested",
+                "data": {
+                    "delegation": {"public_id":"d","target_agent_id":"a","objective":"o","objective_hash":"0000000000000000","context":null,"constraints":null,"expected_output":null,"verification_spec":null,"planning_summary":null,"status":"requested","retry_count":0,"created_at":"2026-01-01T00:00:00Z","completed_at":null},
+                    "batch_id": null,
+                    "tool_call_id": null,
+                    "cycle_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "delegation_completed",
+                "data": {
+                    "delegation_id": "x",
+                    "result": null
+                }
+            }),
+            serde_json::json!({
+                "type": "delegation_failed",
+                "data": {
+                    "delegation_id": "x",
+                    "error": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "delegation_cancelled",
+                "data": {
+                    "delegation_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "delegation_cancel_requested",
+                "data": {
+                    "delegation_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "uncertainty_escalated",
+                "data": {
+                    "task_id": null,
+                    "description": "x",
+                    "options": []
+                }
+            }),
+            serde_json::json!({
+                "type": "permission_requested",
+                "data": {
+                    "permission_id": "x",
+                    "task_id": null,
+                    "tool_name": "x",
+                    "reason": "x",
+                    "tool_call_id": "x",
+                    "request": null
+                }
+            }),
+            serde_json::json!({
+                "type": "permission_granted",
+                "data": {
+                    "permission_id": "x",
+                    "granted": false
+                }
+            }),
+            serde_json::json!({
+                "type": "elicitation_requested",
+                "data": {
+                    "elicitation_id": "x",
+                    "session_id": "x",
+                    "message": "x",
+                    "requested_schema": null,
+                    "source": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "elicitation_resolved",
+                "data": {
+                    "elicitation_id": "x",
+                    "session_id": "x",
+                    "outcome": "accepted",
+                    "selection": ["x"]
+                }
+            }),
+            serde_json::json!({
+                "type": "session_forked",
+                "data": {
+                    "parent_session_id": "x",
+                    "child_session_id": "x",
+                    "target_agent_id": "x",
+                    "origin": "user",
+                    "fork_point_type": "message_index",
+                    "fork_point_ref": "x",
+                    "instructions": null,
+                    "selected_model_id": null,
+                    "selected_provider_node_id": null
+                }
+            }),
+            serde_json::json!({
+                "type": "session_configured",
+                "data": {
+                    "cwd": null,
+                    "mcp_servers": [],
+                    "limits": null
+                }
+            }),
+            serde_json::json!({
+                "type": "tools_available",
+                "data": {
+                    "tools": [],
+                    "tools_hash": "0000000000000000"
+                }
+            }),
+            serde_json::json!({
+                "type": "duplicate_code_detected",
+                "data": {
+                    "warnings": [],
+                    "overflow_path": null
+                }
+            }),
+            serde_json::json!({
+                "type": "mode_changed",
+                "data": {
+                    "mode": "x",
+                    "previous_mode": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "session_mode_changed",
+                "data": {
+                    "mode": "build"
+                }
+            }),
+            serde_json::json!({
+                "type": "session_config_changed",
+                "data": {
+                    "mode": "build",
+                    "reasoning_effort": null
+                }
+            }),
+            serde_json::json!({
+                "type": "session_metadata_updated",
+                "data": {
+                    "title": null,
+                    "updated_at": null
+                }
+            }),
+            serde_json::json!({
+                "type": "rate_limited",
+                "data": {
+                    "message": "x",
+                    "wait_secs": 0,
+                    "started_at": 0,
+                    "attempt": 0,
+                    "max_attempts": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "rate_limit_resume",
+                "data": {
+                    "attempt": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "llm_retry_wait",
+                "data": {
+                    "message": "x",
+                    "wait_secs": 0,
+                    "started_at": 0,
+                    "attempt": 0,
+                    "max_attempts": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "llm_retry_resume",
+                "data": {
+                    "attempt": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "workspace_index_ready",
+                "data": {
+                    "workspace_root": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_created",
+                "data": {
+                    "schedule_public_id": "x",
+                    "session_public_id": "x",
+                    "task_public_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_fired",
+                "data": {
+                    "schedule_public_id": "x",
+                    "session_public_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_cycle_completed",
+                "data": {
+                    "schedule_public_id": "x",
+                    "turn_id": "x",
+                    "run_count": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_cycle_failed",
+                "data": {
+                    "schedule_public_id": "x",
+                    "turn_id": null,
+                    "error": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_paused",
+                "data": {
+                    "schedule_public_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_resumed",
+                "data": {
+                    "schedule_public_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_exhausted",
+                "data": {
+                    "schedule_public_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_failed",
+                "data": {
+                    "schedule_public_id": "x",
+                    "consecutive_failures": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "scheduled_execution_completed",
+                "data": {
+                    "schedule_public_id": "x",
+                    "turn_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "scheduled_execution_failed",
+                "data": {
+                    "schedule_public_id": "x",
+                    "turn_id": null,
+                    "error": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "schedule_debounce_completed",
+                "data": {
+                    "schedule_public_id": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "knowledge_ingested",
+                "data": {
+                    "scope": "x",
+                    "entry_public_id": "x",
+                    "source": "x"
+                }
+            }),
+            serde_json::json!({
+                "type": "knowledge_consolidated",
+                "data": {
+                    "scope": "x",
+                    "consolidation_public_id": "x",
+                    "source_count": 0
+                }
+            }),
+            serde_json::json!({
+                "type": "llm_attempt_started",
+                "data": {
+                    "start": serde_json::to_value(crate::accounting::samples::sample_start()).unwrap()
+                }
+            }),
+            serde_json::json!({
+                "type": "llm_attempt_settled",
+                "data": {
+                    "settlement": serde_json::to_value(crate::accounting::samples::sample_settlement()).unwrap()
+                }
+            }),
+        ]
+    }
+
+    #[test]
+    fn event_kind_tag_matches_serde_tag() {
+        let samples = one_value_per_variant();
+        // Update when a variant is added: `tag()`'s exhaustive match forces
+        // the new tag, and this count forces a sample for it.
+        assert_eq!(samples.len(), 103, "one sample per AgentEventKind variant");
+        let mut seen = std::collections::HashSet::new();
+        for sample in samples {
+            let expected = sample["type"].as_str().unwrap().to_string();
+            let kind: AgentEventKind = serde_json::from_value(sample.clone())
+                .unwrap_or_else(|err| panic!("sample for {expected} does not decode: {err}"));
+            let serialized = serde_json::to_value(&kind).unwrap();
+            assert_eq!(serialized["type"], expected.as_str());
+            assert_eq!(kind.tag(), expected, "tag() disagrees with the serde tag");
+            assert!(
+                seen.insert(expected.clone()),
+                "duplicate sample for {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_stdio_info_preserves_config_wire_shape() {
+        let config = McpServerConfig::stdio("filesystem", "npx")
+            .with_args(["-y", "server-filesystem"])
+            .with_env(HashMap::from([("TOKEN".into(), "secret".into())]));
+        let expected = serde_json::to_value(&config).unwrap();
+        let info = McpServerInfo::from(config);
+
+        assert_eq!(serde_json::to_value(&info).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<McpServerInfo>(expected).unwrap(),
+            info
+        );
+    }
+
+    #[test]
+    fn mcp_http_info_preserves_config_wire_shape() {
+        let config = McpServerConfig::http("remote", "https://example.test/mcp").with_headers(
+            HashMap::from([("Authorization".into(), "Bearer secret".into())]),
+        );
+        let expected = serde_json::to_value(&config).unwrap();
+        let info = McpServerInfo::from(config);
+
+        assert_eq!(serde_json::to_value(&info).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<McpServerInfo>(expected).unwrap(),
+            info
+        );
+    }
+
+    #[test]
+    fn tool_call_progress_is_ephemeral() {
+        let kind = AgentEventKind::ToolCallProgress {
+            tool_call_id: "c".into(),
+            tool_name: "t".into(),
+            progress: Some(1.0),
+            total: None,
+            message: None,
+        };
+        assert_eq!(classify_durability(&kind), Durability::Ephemeral);
+    }
+
+    #[test]
+    fn mcp_server_auth_required_is_ephemeral() {
+        let kind = AgentEventKind::McpServerAuthRequired {
+            server_name: "linear".into(),
+            provider_id: "mcp:linear".into(),
+            error: None,
+        };
+        assert_eq!(classify_durability(&kind), Durability::Ephemeral);
+    }
+
+    // ── StopType -> StopReason conversion ──────────────────────────────────
+
+    #[test]
+    fn stop_type_step_limit_converts_to_max_turn_requests() {
+        let stop_reason: StopReason = StopType::StepLimit.into();
+        assert_eq!(stop_reason, StopReason::MaxTurnRequests);
+    }
+
+    #[test]
+    fn stop_type_turn_limit_converts_to_max_turn_requests() {
+        let stop_reason: StopReason = StopType::TurnLimit.into();
+        assert_eq!(stop_reason, StopReason::MaxTurnRequests);
+    }
+
+    #[test]
+    fn stop_type_delegation_blocked_converts_to_max_turn_requests() {
+        let stop_reason: StopReason = StopType::DelegationBlocked.into();
+        assert_eq!(stop_reason, StopReason::MaxTurnRequests);
+    }
+
+    #[test]
+    fn stop_type_price_limit_converts_to_max_tokens() {
+        let stop_reason: StopReason = StopType::PriceLimit.into();
+        assert_eq!(stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn stop_type_context_threshold_converts_to_max_tokens() {
+        let stop_reason: StopReason = StopType::ContextThreshold.into();
+        assert_eq!(stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn stop_type_model_token_limit_converts_to_max_tokens() {
+        let stop_reason: StopReason = StopType::ModelTokenLimit.into();
+        assert_eq!(stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn stop_type_content_filter_converts_to_end_turn() {
+        let stop_reason: StopReason = StopType::ContentFilter.into();
+        assert_eq!(stop_reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn stop_type_other_converts_to_end_turn() {
+        let stop_reason: StopReason = StopType::Other.into();
+        assert_eq!(stop_reason, StopReason::EndTurn);
+    }
+
+    // ── StopType serialization round-trip ──────────────────────────────────
+
+    #[test]
+    fn stop_type_serializes_as_snake_case() {
+        let stop_type = StopType::StepLimit;
+        let json = serde_json::to_string(&stop_type).unwrap();
+        assert_eq!(json, r#""step_limit""#);
+    }
+
+    #[test]
+    fn stop_type_deserializes_from_snake_case() {
+        let json = r#""turn_limit""#;
+        let stop_type: StopType = serde_json::from_str(json).unwrap();
+        assert_eq!(stop_type, StopType::TurnLimit);
+    }
+
+    #[test]
+    fn all_stop_type_variants_round_trip() {
+        let variants = vec![
+            StopType::StepLimit,
+            StopType::TurnLimit,
+            StopType::PriceLimit,
+            StopType::ContextThreshold,
+            StopType::ModelTokenLimit,
+            StopType::ContentFilter,
+            StopType::DelegationBlocked,
+            StopType::Other,
+        ];
+
+        for original in variants {
+            let json = serde_json::to_string(&original).unwrap();
+            let restored: StopType = serde_json::from_str(&json).unwrap();
+            assert_eq!(original, restored);
+        }
+    }
+
+    // ── AgentEventKind variant construction ────────────────────────────────
+
+    #[test]
+    fn agent_event_kind_session_created_construction() {
+        let kind = AgentEventKind::SessionCreated;
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "session_created");
+    }
+
+    #[test]
+    fn agent_event_kind_prompt_received_construction() {
+        let kind = AgentEventKind::PromptReceived {
+            content: "test prompt".to_string(),
+            message_id: Some("msg-1".to_string()),
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "prompt_received");
+        // adjacently tagged: payload is under "data"
+        assert_eq!(json["data"]["content"], "test prompt");
+        assert_eq!(json["data"]["message_id"], "msg-1");
+    }
+
+    #[test]
+    fn user_prompt_block_client_id_is_optional_for_compatibility() {
+        let value = serde_json::json!({
+            "type": "user_prompt_block",
+            "data": {
+                "message_id": "msg-1",
+                "block": {"type": "text", "text": "hello"}
+            }
+        });
+        let kind: AgentEventKind = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            kind,
+            AgentEventKind::UserPromptBlock {
+                client_prompt_id: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn historical_pending_input_events_default_missing_content() {
+        for value in [
+            serde_json::json!({
+                "type": "steering_accepted",
+                "data": {"run_id": "run-1", "input_id": "input-1", "position": 1}
+            }),
+            serde_json::json!({
+                "type": "input_queued",
+                "data": {"input_id": "input-2", "position": 2}
+            }),
+        ] {
+            let kind: AgentEventKind = serde_json::from_value(value).unwrap();
+            match kind {
+                AgentEventKind::SteeringAccepted {
+                    blocks,
+                    accepted_at_ms,
+                    ..
+                }
+                | AgentEventKind::InputQueued {
+                    blocks,
+                    accepted_at_ms,
+                    ..
+                } => {
+                    assert!(blocks.is_empty());
+                    assert_eq!(accepted_at_ms, None);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn delegate_models_changed_without_revision_omits_event_field() {
+        let value =
+            serde_json::to_value(AgentEventKind::DelegateModelsChanged { revision: None }).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type": "delegate_models_changed", "data": {}})
+        );
+    }
+
+    #[test]
+    fn historical_session_fork_without_model_provenance_deserializes() {
+        let value = serde_json::json!({
+            "type": "session_forked",
+            "data": {
+                "parent_session_id": "parent",
+                "child_session_id": "child",
+                "target_agent_id": "coder",
+                "origin": "delegation",
+                "fork_point_type": "progress_entry",
+                "fork_point_ref": "delegation-1",
+                "instructions": null
+            }
+        });
+        let kind: AgentEventKind = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            kind,
+            AgentEventKind::SessionForked {
+                selected_model_id: None,
+                selected_provider_node_id: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn run_completed_reports_stop_fields_only_when_stopped() {
+        let stopped = AgentEventKind::RunCompleted {
+            run_id: "r".into(),
+            outcome: "stopped".into(),
+            stop_type: Some(StopType::ModelTokenLimit),
+            reason: Some("output limit".into()),
+        };
+        let json = serde_json::to_value(&stopped).unwrap();
+        assert_eq!(json["data"]["outcome"], "stopped");
+        assert_eq!(json["data"]["stop_type"], "model_token_limit");
+        assert_eq!(json["data"]["reason"], "output limit");
+        let parsed: AgentEventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEventKind::RunCompleted {
+                stop_type: Some(StopType::ModelTokenLimit),
+                ..
+            }
+        ));
+
+        let completed = AgentEventKind::RunCompleted {
+            run_id: "r".into(),
+            outcome: "completed".into(),
+            stop_type: None,
+            reason: None,
+        };
+        let json = serde_json::to_value(&completed).unwrap();
+        assert!(json["data"].get("stop_type").is_none());
+        assert!(json["data"].get("reason").is_none());
+
+        // Events journaled before this change still decode.
+        let legacy = serde_json::json!({
+            "type": "run_completed",
+            "data": {"run_id": "r", "outcome": "completed"}
+        });
+        let parsed: AgentEventKind = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEventKind::RunCompleted {
+                stop_type: None,
+                reason: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn agent_event_kind_middleware_stopped_construction() {
+        let kind = AgentEventKind::MiddlewareStopped {
+            stop_type: StopType::StepLimit,
+            reason: "max steps reached".to_string(),
+            metrics: ExecutionMetrics {
+                steps: 10,
+                turns: 5,
+            },
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "middleware_stopped");
+        // adjacently tagged: payload is under "data"
+        assert_eq!(json["data"]["stop_type"], "step_limit");
+        assert_eq!(json["data"]["reason"], "max steps reached");
+        assert_eq!(json["data"]["metrics"]["steps"], 10);
+        assert_eq!(json["data"]["metrics"]["turns"], 5);
+    }
+
+    #[test]
+    fn output_limit_recovery_serializes_with_snake_case_action() {
+        let kind = AgentEventKind::OutputLimitRecovery {
+            turn: 2,
+            attempt: 1,
+            action: OutputLimitRecoveryAction::Escalate,
+            from_max_tokens: Some(32_000),
+            to_max_tokens: Some(128_000),
+            thinking_only: true,
+            discarded_message_id: Some("m-1".into()),
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "output_limit_recovery");
+        assert_eq!(json["data"]["action"], "escalate");
+        assert_eq!(json["data"]["from_max_tokens"], 32_000);
+        assert_eq!(json["data"]["to_max_tokens"], 128_000);
+        assert_eq!(json["data"]["thinking_only"], true);
+        assert_eq!(json["data"]["discarded_message_id"], "m-1");
+
+        let back: AgentEventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            back,
+            AgentEventKind::OutputLimitRecovery {
+                action: OutputLimitRecoveryAction::Escalate,
+                turn: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn output_limit_recovery_omits_unset_options_and_decodes_without_them() {
+        let kind = AgentEventKind::OutputLimitRecovery {
+            turn: 1,
+            attempt: 1,
+            action: OutputLimitRecoveryAction::Continue,
+            from_max_tokens: None,
+            to_max_tokens: None,
+            thinking_only: false,
+            discarded_message_id: None,
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        let data = json["data"].as_object().unwrap();
+        assert!(!data.contains_key("from_max_tokens"));
+        assert!(!data.contains_key("to_max_tokens"));
+        assert!(!data.contains_key("discarded_message_id"));
+
+        let minimal = serde_json::json!({
+            "type": "output_limit_recovery",
+            "data": {"turn": 1, "attempt": 2, "action": "continue"}
+        });
+        assert!(serde_json::from_value::<AgentEventKind>(minimal).is_ok());
+    }
+
+    #[test]
+    fn output_limit_recovery_is_durable() {
+        let kind = AgentEventKind::OutputLimitRecovery {
+            turn: 1,
+            attempt: 1,
+            action: OutputLimitRecoveryAction::Escalate,
+            from_max_tokens: None,
+            to_max_tokens: None,
+            thinking_only: false,
+            discarded_message_id: None,
+        };
+        assert_eq!(classify_durability(&kind), Durability::Durable);
+    }
+
+    #[test]
+    fn agent_event_kind_error_construction() {
+        let kind = AgentEventKind::Error {
+            message: "test error".to_string(),
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "error");
+        // adjacently tagged: payload is under "data"
+        assert_eq!(json["data"]["message"], "test error");
+    }
+
+    // ── EventOrigin serialization/compatibility ────────────────────────────
+
+    #[test]
+    fn event_origin_deserializes_unknown_value_to_unknown_variant() {
+        let origin: EventOrigin = serde_json::from_str("\"mesh_bridge\"").unwrap();
+        assert_eq!(origin, EventOrigin::Unknown("mesh_bridge".to_string()));
+    }
+
+    #[test]
+    fn event_origin_serializes_unknown_value_verbatim() {
+        let origin = EventOrigin::Unknown("mesh_bridge".to_string());
+        let json = serde_json::to_string(&origin).unwrap();
+        assert_eq!(json, "\"mesh_bridge\"");
+    }
+
+    // ── AgentEvent clone + debug ───────────────────────────────────────────
+
+    #[test]
+    fn payloads_without_session_seq_still_parse() {
+        let durable: DurableEvent = serde_json::from_str(
+            r#"{"event_id":"e1","stream_seq":4,"session_id":"s","timestamp":1,
+                "origin":"local","kind":{"type":"session_created"}}"#,
+        )
+        .expect("legacy durable payload");
+        assert_eq!(durable.session_seq, 0);
+        assert_eq!(durable.stream_seq, 4);
+
+        let ephemeral: EphemeralEvent = serde_json::from_str(
+            r#"{"session_id":"s","timestamp":1,"origin":"local",
+                "kind":{"type":"cancelled"}}"#,
+        )
+        .expect("legacy ephemeral payload");
+        assert_eq!(ephemeral.session_seq, 0);
+
+        let agent_event: AgentEvent = serde_json::from_str(
+            r#"{"seq":9,"timestamp":1,"session_id":"s","kind":{"type":"cancelled"}}"#,
+        )
+        .expect("legacy relayed payload");
+        assert_eq!((agent_event.seq, agent_event.session_seq), (9, 0));
+    }
+
+    #[test]
+    fn session_seq_round_trips_through_serialization() {
+        let event = DurableEvent {
+            event_id: "e".into(),
+            stream_seq: 2,
+            session_seq: 7,
+            session_id: "s".into(),
+            timestamp: 1,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::SessionCreated,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: DurableEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session_seq, 7);
+        let relayed: AgentEvent = event.into();
+        assert_eq!((relayed.seq, relayed.session_seq), (2, 7));
+    }
+
+    #[test]
+    fn agent_event_implements_clone() {
+        let original = AgentEvent {
+            session_seq: 0,
+            seq: 1,
+            timestamp: 1234567890,
+            session_id: "sess-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::SessionCreated,
+        };
+        let cloned = original.clone();
+        assert_eq!(cloned.seq, 1);
+        assert_eq!(cloned.session_id, "sess-1");
+    }
+
+    #[test]
+    fn agent_event_implements_debug() {
+        let event = AgentEvent {
+            session_seq: 0,
+            seq: 42,
+            timestamp: 1234567890,
+            session_id: "sess-debug".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::Cancelled,
+        };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("seq: 42"));
+        assert!(debug_str.contains("sess-debug"));
+        assert!(debug_str.contains("Cancelled"));
+    }
+
+    // ── ExecutionMetrics defaults and serialization ────────────────────────
+
+    #[test]
+    fn execution_metrics_default_is_zero() {
+        let metrics = ExecutionMetrics::default();
+        assert_eq!(metrics.steps, 0);
+        assert_eq!(metrics.turns, 0);
+    }
+
+    #[test]
+    fn execution_metrics_serializes_correctly() {
+        let metrics = ExecutionMetrics { steps: 5, turns: 3 };
+        let json = serde_json::to_value(&metrics).unwrap();
+        assert_eq!(json["steps"], 5);
+        assert_eq!(json["turns"], 3);
+    }
+
+    #[test]
+    fn llm_request_start_keeps_its_original_shape() {
+        let kind = AgentEventKind::LlmRequestStart { message_count: 3 };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["data"], serde_json::json!({"message_count": 3}));
+        let parsed: AgentEventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEventKind::LlmRequestStart { message_count: 3 }
+        ));
+    }
+
+    // ── SessionLimits defaults and serialization ───────────────────────────
+
+    #[test]
+    fn session_limits_default_has_all_none() {
+        let limits = SessionLimits::default();
+        assert!(limits.max_steps.is_none());
+        assert!(limits.max_turns.is_none());
+        assert!(limits.max_cost_usd.is_none());
+    }
+
+    #[test]
+    fn session_limits_serializes_correctly() {
+        let limits = SessionLimits {
+            max_steps: Some(100),
+            max_turns: Some(50),
+            max_cost_usd: Some(1.5),
+        };
+        let json = serde_json::to_value(&limits).unwrap();
+        assert_eq!(json["max_steps"], 100);
+        assert_eq!(json["max_turns"], 50);
+        assert_eq!(json["max_cost_usd"], 1.5);
+    }
+
+    // ── Durability classification ──────────────────────────────────────────
+
+    #[test]
+    fn durability_serde_round_trip() {
+        let durable = Durability::Durable;
+        let json = serde_json::to_string(&durable).unwrap();
+        assert_eq!(json, "\"durable\"");
+        let restored: Durability = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, Durability::Durable);
+
+        let ephemeral = Durability::Ephemeral;
+        let json = serde_json::to_string(&ephemeral).unwrap();
+        assert_eq!(json, "\"ephemeral\"");
+        let restored: Durability = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, Durability::Ephemeral);
+    }
+
+    #[test]
+    fn classify_content_delta_is_ephemeral() {
+        let kind = AgentEventKind::AssistantContentDelta {
+            content: "hello".into(),
+            message_id: "m1".into(),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Ephemeral);
+    }
+
+    #[test]
+    fn classify_thinking_delta_is_ephemeral() {
+        let kind = AgentEventKind::AssistantThinkingDelta {
+            content: "hmm".into(),
+            message_id: "m1".into(),
+            part_id: None,
+        };
+        assert_eq!(classify_durability(&kind), Durability::Ephemeral);
+    }
+
+    #[test]
+    fn classify_remote_session_disconnected_is_ephemeral() {
+        let kind = AgentEventKind::RemoteSessionDisconnected {
+            message: "peer disconnected".into(),
+            node_id: Some("node-1".into()),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Ephemeral);
+    }
+
+    #[test]
+    fn classify_delegate_models_changed_is_ephemeral() {
+        assert_eq!(
+            classify_durability(&AgentEventKind::DelegateModelsChanged { revision: Some(1) }),
+            Durability::Ephemeral
+        );
+        assert_eq!(
+            classify_durability(&AgentEventKind::DelegateModelsChanged { revision: None }),
+            Durability::Ephemeral
+        );
+    }
+
+    #[test]
+    fn classify_session_created_is_durable() {
+        assert_eq!(
+            classify_durability(&AgentEventKind::SessionCreated),
+            Durability::Durable
+        );
+    }
+
+    #[test]
+    fn run_completed_interrupted_round_trips() {
+        let json = r#"{"type":"run_completed","data":{"run_id":"r","outcome":"interrupted"}}"#;
+        let kind: AgentEventKind = serde_json::from_str(json).expect("run_completed");
+        assert!(matches!(
+            &kind,
+            AgentEventKind::RunCompleted { run_id, outcome, .. }
+                if run_id == "r" && outcome == RunOutcome::Interrupted.as_str()
+        ));
+        assert_eq!(
+            serde_json::to_value(&kind).unwrap(),
+            serde_json::from_str::<serde_json::Value>(json).unwrap()
+        );
+    }
+
+    #[test]
+    fn classify_run_lifecycle_events_are_durable() {
+        assert_eq!(
+            classify_durability(&AgentEventKind::RunStarted {
+                run_id: "r".into(),
+                origin: "interactive".into(),
+            }),
+            Durability::Durable
+        );
+        assert_eq!(
+            classify_durability(&AgentEventKind::RunCompleted {
+                run_id: "r".into(),
+                outcome: RunOutcome::Interrupted.into(),
+                stop_type: None,
+                reason: None,
+            }),
+            Durability::Durable
+        );
+    }
+
+    #[test]
+    fn classify_cancelled_is_durable() {
+        assert_eq!(
+            classify_durability(&AgentEventKind::Cancelled),
+            Durability::Durable
+        );
+    }
+
+    #[test]
+    fn classify_stop_events_are_durable() {
+        assert_eq!(
+            classify_durability(&AgentEventKind::SessionStopRequested),
+            Durability::Durable
+        );
+        assert_eq!(
+            classify_durability(&AgentEventKind::SessionForceStopped {
+                escalated_after_ms: 3000,
+                reason: "timeout".into(),
+            }),
+            Durability::Durable
+        );
+    }
+
+    #[test]
+    fn classify_error_is_durable() {
+        let kind = AgentEventKind::Error {
+            message: "fail".into(),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Durable);
+    }
+
+    #[test]
+    fn classify_assistant_message_stored_is_durable() {
+        let kind = AgentEventKind::AssistantMessageStored {
+            content: "hi".into(),
+            thinking: None,
+            reasoning_parts: Vec::new(),
+            message_id: None,
+        };
+        assert_eq!(classify_durability(&kind), Durability::Durable);
+    }
+
+    #[test]
+    fn historical_assistant_message_without_reasoning_parts_deserializes() {
+        let json =
+            r#"{"type":"assistant_message_stored","data":{"content":"hi","thinking":"old"}}"#;
+        let kind: AgentEventKind = serde_json::from_str(json).expect("old event");
+        match kind {
+            AgentEventKind::AssistantMessageStored {
+                content,
+                thinking,
+                reasoning_parts,
+                message_id,
+            } => {
+                assert_eq!(content, "hi");
+                assert_eq!(thinking.as_deref(), Some("old"));
+                assert!(reasoning_parts.is_empty());
+                assert!(message_id.is_none());
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_tool_call_start_is_durable() {
+        let kind = AgentEventKind::ToolCallStart {
+            tool_call_id: "tc1".into(),
+            tool_name: "shell".into(),
+            arguments: "{}".into(),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Durable);
+    }
+
+    #[test]
+    fn classify_hook_notice_is_durable() {
+        let kind = AgentEventKind::HookNotice {
+            event_name: "post_tool_use".into(),
+            message: "invalid hook output".into(),
+            is_error: true,
+        };
+        assert_eq!(classify_durability(&kind), Durability::Durable);
+    }
+
+    #[test]
+    fn classify_elicitation_requested_is_durable() {
+        let kind = AgentEventKind::ElicitationRequested {
+            elicitation_id: "e1".into(),
+            session_id: "s1".into(),
+            message: "what?".into(),
+            requested_schema: serde_json::json!({}),
+            source: "test".into(),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Durable);
+    }
+
+    #[test]
+    fn elicitation_resolved_is_durable_and_round_trips() {
+        let kind = AgentEventKind::ElicitationResolved {
+            elicitation_id: "e1".into(),
+            session_id: "s1".into(),
+            outcome: ElicitationOutcome::Accepted,
+            selection: Some(vec!["Allow for this session".into()]),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Durable);
+        assert_eq!(kind.tag(), "elicitation_resolved");
+
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "elicitation_resolved");
+        assert_eq!(json["data"]["outcome"], "accepted");
+        let restored: AgentEventKind = serde_json::from_value(json).unwrap();
+        match restored {
+            AgentEventKind::ElicitationResolved {
+                elicitation_id,
+                outcome,
+                selection,
+                ..
+            } => {
+                assert_eq!(elicitation_id, "e1");
+                assert_eq!(outcome, ElicitationOutcome::Accepted);
+                assert_eq!(selection, Some(vec!["Allow for this session".to_string()]));
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+
+        // Without a selection the key is omitted, and still decodes.
+        let bare = AgentEventKind::ElicitationResolved {
+            elicitation_id: "e2".into(),
+            session_id: "s1".into(),
+            outcome: ElicitationOutcome::Cancelled,
+            selection: None,
+        };
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json["data"].get("selection").is_none());
+        assert_eq!(json["data"]["outcome"], "cancelled");
+        serde_json::from_value::<AgentEventKind>(json).unwrap();
+    }
+
+    fn sample_permission_request() -> crate::protocol::RequestPermissionRequest {
+        use crate::protocol::{
+            PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionRequest,
+            ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        RequestPermissionRequest::new(
+            "s1".to_string(),
+            ToolCallUpdate::new(ToolCallId::from("call-1".to_string()), {
+                ToolCallUpdateFields::new().title("Run shell")
+            }),
+            vec![PermissionOption::new(
+                PermissionOptionId::from("allow_once"),
+                "Allow once",
+                PermissionOptionKind::AllowOnce,
+            )],
+        )
+    }
+
+    #[test]
+    fn classify_permission_requested_is_durable() {
+        let kind = AgentEventKind::PermissionRequested {
+            permission_id: "call-1".into(),
+            task_id: None,
+            tool_name: "shell".into(),
+            reason: "needs permission".into(),
+            tool_call_id: "call-1".into(),
+            request: Some(sample_permission_request()),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Durable);
+    }
+
+    #[test]
+    fn permission_requested_round_trips_full_request_payload() {
+        let kind = AgentEventKind::PermissionRequested {
+            permission_id: "call-1".into(),
+            task_id: Some("t1".into()),
+            tool_name: "shell".into(),
+            reason: "needs permission".into(),
+            tool_call_id: "call-1".into(),
+            request: Some(sample_permission_request()),
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "permission_requested");
+        assert_eq!(json["data"]["tool_call_id"], "call-1");
+        assert_eq!(json["data"]["request"]["toolCall"]["toolCallId"], "call-1");
+        assert_eq!(
+            json["data"]["request"]["options"][0]["optionId"],
+            "allow_once"
+        );
+
+        let restored: AgentEventKind = serde_json::from_value(json).unwrap();
+        let AgentEventKind::PermissionRequested {
+            tool_call_id,
+            request,
+            ..
+        } = restored
+        else {
+            panic!("expected PermissionRequested");
+        };
+        assert_eq!(tool_call_id, "call-1");
+        let request = request.expect("request payload survives round trip");
+        assert_eq!(request.options.len(), 1);
+        assert_eq!(request.tool_call.tool_call_id.0.as_ref(), "call-1");
+    }
+
+    #[test]
+    fn permission_requested_loads_legacy_journal_entries() {
+        let legacy = serde_json::json!({
+            "type": "permission_requested",
+            "data": {
+                "permission_id": "p1",
+                "task_id": null,
+                "tool_name": "shell",
+                "reason": "Tool shell requires explicit permission"
+            }
+        });
+        let restored: AgentEventKind = serde_json::from_value(legacy).unwrap();
+        let AgentEventKind::PermissionRequested {
+            tool_call_id,
+            request,
+            ..
+        } = restored
+        else {
+            panic!("expected PermissionRequested");
+        };
+        assert!(tool_call_id.is_empty());
+        assert!(request.is_none());
+    }
+
+    // ── DurableEvent construction ──────────────────────────────────────────
+
+    #[test]
+    fn durable_event_construction_and_fields() {
+        let event = DurableEvent {
+            session_seq: 0,
+            event_id: "evt-1".into(),
+            stream_seq: 42,
+            session_id: "sess-1".into(),
+            timestamp: 1700000000,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::SessionCreated,
+        };
+        assert_eq!(event.stream_seq, 42);
+        assert_eq!(event.event_id, "evt-1");
+        assert_eq!(event.session_id, "sess-1");
+    }
+
+    #[test]
+    fn durable_event_serde_round_trip() {
+        let event = DurableEvent {
+            session_seq: 0,
+            event_id: "evt-2".into(),
+            stream_seq: 7,
+            session_id: "sess-2".into(),
+            timestamp: 1700000001,
+            origin: EventOrigin::Remote,
+            source_node: Some("node-a".into()),
+            kind: AgentEventKind::Cancelled,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let restored: DurableEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.event_id, "evt-2");
+        assert_eq!(restored.stream_seq, 7);
+        assert!(matches!(restored.origin, EventOrigin::Remote));
+        assert_eq!(restored.source_node.as_deref(), Some("node-a"));
+    }
+
+    // ── EphemeralEvent construction ────────────────────────────────────────
+
+    #[test]
+    fn ephemeral_event_construction() {
+        let event = EphemeralEvent {
+            session_seq: 0,
+            session_id: "sess-e".into(),
+            timestamp: 123,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::AssistantContentDelta {
+                content: "tok".into(),
+                message_id: "m1".into(),
+            },
+        };
+        assert_eq!(event.session_id, "sess-e");
+    }
+
+    // ── EventEnvelope ──────────────────────────────────────────────────────
+
+    #[test]
+    fn envelope_durable_accessors() {
+        let env = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
+            event_id: "e1".into(),
+            stream_seq: 1,
+            session_id: "s1".into(),
+            timestamp: 100,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::SessionCreated,
+        });
+        assert_eq!(env.session_id(), "s1");
+        assert_eq!(env.timestamp(), 100);
+        assert!(env.is_durable());
+        assert!(!env.is_ephemeral());
+        assert!(matches!(env.kind(), AgentEventKind::SessionCreated));
+    }
+
+    #[test]
+    fn envelope_ephemeral_accessors() {
+        let env = EventEnvelope::Ephemeral(EphemeralEvent {
+            session_seq: 0,
+            session_id: "s2".into(),
+            timestamp: 200,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::AssistantContentDelta {
+                content: "x".into(),
+                message_id: "m".into(),
+            },
+        });
+        assert_eq!(env.session_id(), "s2");
+        assert!(!env.is_durable());
+        assert!(env.is_ephemeral());
+    }
+
+    // ── SessionMetadataUpdated title patch semantics ───────────────────────
+
+    #[test]
+    fn session_metadata_updated_title_preserves_absent_null_and_value() {
+        let kind = |json: &str| -> AgentEventKind { serde_json::from_str(json).unwrap() };
+
+        // Absent field: leave the title unchanged.
+        let absent = kind(r#"{"type":"session_metadata_updated","data":{"updated_at":"t"}}"#);
+        match absent {
+            AgentEventKind::SessionMetadataUpdated { title, .. } => assert_eq!(title, None),
+            other => panic!("unexpected kind: {other:?}"),
+        }
+
+        // Explicit null: clear the title.
+        let null =
+            kind(r#"{"type":"session_metadata_updated","data":{"title":null,"updated_at":"t"}}"#);
+        match null {
+            AgentEventKind::SessionMetadataUpdated { title, .. } => assert_eq!(title, Some(None)),
+            other => panic!("unexpected kind: {other:?}"),
+        }
+
+        // Concrete string: set the title.
+        let value =
+            kind(r#"{"type":"session_metadata_updated","data":{"title":"hi","updated_at":"t"}}"#);
+        match value {
+            AgentEventKind::SessionMetadataUpdated { title, .. } => {
+                assert_eq!(title, Some(Some("hi".into())))
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_metadata_updated_title_clear_survives_persisted_round_trip() {
+        let event = DurableEvent {
+            session_seq: 0,
+            event_id: "evt-title".into(),
+            stream_seq: 7,
+            session_id: "sess-title".into(),
+            timestamp: 1700000000,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::SessionMetadataUpdated {
+                title: Some(None),
+                updated_at: Some("2024-01-01T00:00:00Z".into()),
+            },
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        // The explicit clear must be persisted as an emitted `null`, not dropped.
+        assert!(
+            json.contains(r#""title":null"#),
+            "expected explicit null in {json}"
+        );
+
+        let restored: DurableEvent = serde_json::from_str(&json).unwrap();
+        match restored.kind {
+            AgentEventKind::SessionMetadataUpdated { title, .. } => {
+                assert_eq!(title, Some(None), "title clear must survive round trip");
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+}

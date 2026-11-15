@@ -1,0 +1,57 @@
+name: Lint
+
+# Cheap checks that apply to the whole workspace. They run on every pull request
+# (no `paths:` filter), so a change to any Cargo.toml is checked against the
+# workspace-hack, and a skipped workflow can never block a required check.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  format:
+    name: Check formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # The workspace-hack crate unifies third-party features across the agent stack
+  # (design D8 of speed-up-agent-dev-loop); regenerate it with
+  # `cargo hakari generate` and `cargo hakari manage-deps` when this fails.
+  hakari:
+    name: Verify workspace-hack
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-hakari
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hakari
+
+      - name: Verify workspace-hack
+        run: |
+          cargo hakari generate --diff
+          cargo hakari manage-deps --dry-run
+          cargo hakari verify

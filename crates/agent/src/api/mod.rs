@@ -58,40 +58,39 @@
 //! ```
 
 mod agent;
-mod callbacks;
 mod config;
 mod dotagents_runtime;
 mod dotagents_targets;
-pub mod mesh;
 mod profiles;
 mod quorum;
-mod session;
-mod sessions;
 mod utils;
 mod worktrees;
+
+/// The session, mesh and callback parts of the API live in the runtime crate.
+pub use querymt_agent_runtime::api::{mesh, sessions};
 
 // Re-export public API types
 pub use agent::{Agent, AgentBuilder, AgentInfra};
 pub use config::{DelegateConfigBuilder, PlannerConfigBuilder};
 pub use dotagents_targets::DotagentsTargetFactory;
-pub use mesh::{AgentMesh, Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec};
 pub use profiles::{AgentProfiles, ProfileRuntimeHandle};
-pub use quorum::QuorumBuilder;
-pub use session::AgentSession;
-pub(crate) use sessions::AcpSessionListError;
-pub use sessions::{
+pub use querymt_agent_runtime::api::AgentSession;
+pub use querymt_agent_runtime::api::sessions::AcpSessionListError;
+pub use querymt_agent_runtime::api::sessions::{
     AgentLoadedSession, AgentSessions, ArchiveFilter, ListSessionsOptions,
     RemoteSessionConnectionState, RemoteSessionMode, ResolutionFilter, SessionChildrenPage,
     SessionChildrenPageWithLifecycle, SessionGroup, SessionGroupWithLifecycle, SessionLifecycle,
     SessionLifecycleFilter, SessionLifecyclePatch, SessionListMode, SessionListPage,
     SessionListPageWithLifecycle, SessionMeta, SessionSummary, SessionSummaryWithLifecycle,
 };
+pub use querymt_agent_runtime::api::{AgentMesh, Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec};
+pub use quorum::QuorumBuilder;
 pub use worktrees::{AgentWorktrees, SessionOptions};
 
 #[cfg(test)]
 mod agent_tests;
 
 // Re-export callback types for public use
-pub use callbacks::{
+pub use querymt_agent_runtime::api::callbacks::{
     DelegationCallback, ErrorCallback, MessageCallback, ToolCallCallback, ToolCompleteCallback,
 };

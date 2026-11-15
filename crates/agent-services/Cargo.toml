@@ -1,0 +1,81 @@
+[package]
+name = "querymt-agent-services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Services layer of the querymt agent: accounting, worktrees, snapshots, export and the built-in tools"
+
+[lib]
+name = "querymt_agent_services"
+path = "src/lib.rs"
+
+[features]
+# Test helpers for the layers above (design D6): worktree fixtures, the trace
+# capture helper and the accounting samples.
+test-support = ["querymt-agent-core/test-support", "dep:tracing-subscriber", "dep:tracing-log"]
+
+[dependencies]
+querymt = { path = "../querymt", default-features = false, features = ["runtime"] }
+querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "secret-store"] }
+querymt-agent-core = { path = "../agent-core" }
+querymt-agent-index = { path = "../agent-index" }
+querymt-agent-knowledge = { path = "../agent-knowledge" }
+typeshare.workspace = true
+agent-client-protocol.workspace = true
+async-trait.workspace = true
+http.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+tracing = { version = "0.1", features = ["attributes", "release_max_level_debug"] }
+serde.workspace = true
+serde_json.workspace = true
+jsonschema = "0.60"
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "gzip", "brotli", "deflate"] }
+time.workspace = true
+uuid.workspace = true
+url.workspace = true
+ignore = "0.4.25"
+glob = "0.3"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+strsim = "0.11"
+parking_lot = "0.13"
+imara-diff = "0.2"
+futures-util = "0.3"
+toml.workspace = true
+regex.workspace = true
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
+base64.workspace = true
+hex = "0.4"
+infer = "0.22"
+imagesize = "0.15"
+indexmap = { version = "2", features = ["serde"] }
+fast_html2md = { package = "fast_html2md", version = "0.0.63", features = ["scraper"] }
+mdq = "0.10.0"
+gix = { version = "0.90", default-features = false, features = ["basic", "worktree-mutation", "attributes", "sha1", "status", "merge"] }
+gix-error = "0.5"
+dirs.workspace = true
+dunce = "1"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
+tracing-opentelemetry = "0.33"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tempfile = "3.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+tracing-log = { version = "0.2", optional = true }
+querymt-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+querymt-agent-core = { path = "../agent-core", features = ["test-support"] }
+querymt-agent-sqlite = { path = "../agent-sqlite", features = ["test-support"] }
+rusqlite = { workspace = true, features = ["uuid", "time"] }
+qmt-openai = { path = "../providers/openai", default-features = false, features = ["api"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
+opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "testing"] }

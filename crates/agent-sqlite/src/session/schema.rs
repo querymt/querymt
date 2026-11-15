@@ -1,0 +1,929 @@
+//! Database schema initialization used by the migration framework.
+//!
+//! Hybrid ID Strategy:
+//! - INTEGER PRIMARY KEYS for fast internal operations and foreign keys
+//! - UUID v7 `public_id` columns for external exposure (sessions, tasks, delegations, messages)
+//! - Internal-only tables skip public_id to save space
+
+use rusqlite::Connection;
+use std::collections::HashSet;
+
+/// Initialize the hybrid INTEGER PK + UUID v7 public_id schema
+///
+/// This is the fresh-install path only (called by `0001_initial_reset` and
+/// tests). Existing databases never re-run it, so every object or column added
+/// here must also get a new migration in `sqlite_storage/migrations.rs`; the
+/// `legacy_baseline_upgrade_matches_fresh_install` test fails otherwise.
+pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        r#"
+        -- ========================================================================
+        -- TIER 1: EXTERNALLY EXPOSED TABLES (with public_id)
+        -- ========================================================================
+
+        -- Sessions - heavily exposed externally
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT UNIQUE NOT NULL,
+            name TEXT,
+            cwd TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            current_intent_snapshot_id INTEGER,
+            active_task_id INTEGER,
+            llm_config_id INTEGER,
+            parent_session_id INTEGER,
+            fork_origin TEXT,
+            session_kind TEXT,
+            fork_point_type TEXT,
+            fork_point_ref TEXT,
+            fork_instructions TEXT,
+            provider_node_id TEXT,
+            FOREIGN KEY(parent_session_id) REFERENCES sessions(id) ON DELETE SET NULL,
+            FOREIGN KEY(llm_config_id) REFERENCES llm_configs(id) ON DELETE SET NULL,
+            FOREIGN KEY(current_intent_snapshot_id) REFERENCES intent_snapshots(id) ON DELETE SET NULL,
+            FOREIGN KEY(active_task_id) REFERENCES tasks(id) ON DELETE SET NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_public_id ON sessions(public_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_cwd_updated ON sessions(cwd, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS session_lifecycle (
+            session_id INTEGER PRIMARY KEY,
+            resolved_at TEXT,
+            archived_at TEXT,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS session_pins (
+            session_id INTEGER PRIMARY KEY,
+            pinned_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        -- Full-text session search index (all sessions, not just loaded pages).
+        -- The 'title' column is populated from intent_snapshots.summary so that
+        -- session titles are searchable even though the title is derived data.
+        -- Standalone FTS5 table — contentless, so delete/rebuild commands work
+        -- without requiring a content table with matching columns.
+        CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+            public_id,
+            name,
+            cwd,
+            title,
+            content='',
+            tokenize='porter unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS sessions_ai AFTER INSERT ON sessions BEGIN
+            INSERT INTO sessions_fts(rowid, public_id, name, cwd, title)
+            VALUES (
+                new.id,
+                new.public_id,
+                COALESCE(new.name, ''),
+                COALESCE(new.cwd, ''),
+                COALESCE((SELECT i.summary FROM intent_snapshots i WHERE i.session_id = new.id ORDER BY i.id ASC LIMIT 1), '')
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions BEGIN
+            INSERT INTO sessions_fts(sessions_fts, rowid) VALUES ('delete', old.id);
+            INSERT INTO sessions_fts(rowid, public_id, name, cwd, title)
+            VALUES (
+                new.id, new.public_id, COALESCE(new.name, ''), COALESCE(new.cwd, ''),
+                COALESCE((SELECT i.summary FROM intent_snapshots i WHERE i.session_id = new.id ORDER BY i.id ASC LIMIT 1), '')
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
+            INSERT INTO sessions_fts(sessions_fts, rowid) VALUES ('delete', old.id);
+        END;
+
+        -- Tasks - referenced externally in UIs/APIs
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT UNIQUE NOT NULL,
+            session_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            expected_deliverable TEXT,
+            acceptance_criteria TEXT,
+            revision INTEGER NOT NULL DEFAULT 1,
+            creation_key TEXT,
+            completion_evidence TEXT,
+            completed_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_public_id ON tasks(public_id);
+        CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
+        CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status) WHERE status IN ('active', 'paused');
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_session_creation_key
+            ON tasks(session_id, creation_key) WHERE creation_key IS NOT NULL;
+
+        -- Delegations - external agent references
+        CREATE TABLE IF NOT EXISTS delegations (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT UNIQUE NOT NULL,
+            session_id INTEGER NOT NULL,
+            task_id INTEGER,
+            target_agent_id TEXT NOT NULL,
+            objective TEXT NOT NULL,
+            objective_hash TEXT NOT NULL,
+            context TEXT,
+            constraints TEXT,
+            expected_output TEXT,
+            verification_spec TEXT,  -- Structured verification specification (JSON)
+            planning_summary TEXT,  -- AI-generated summary of parent planning conversation
+            isolation TEXT,  -- Delegation execution isolation: inherit | shared | isolated (NULL = inherit)
+            status TEXT NOT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_delegations_public_id ON delegations(public_id);
+        CREATE INDEX IF NOT EXISTS idx_delegations_session ON delegations(session_id);
+        CREATE INDEX IF NOT EXISTS idx_delegations_hash ON delegations(objective_hash, session_id, status);
+
+        -- Legacy messages table (with public_id for API compatibility)
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT UNIQUE NOT NULL,
+            session_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            parent_message_id INTEGER,
+            source_provider TEXT,
+            source_model TEXT,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY(parent_message_id) REFERENCES messages(id) ON DELETE SET NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_public_id ON messages(public_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+
+        -- ========================================================================
+        -- TIER 2: INTERNAL TABLES (no public_id)
+        -- ========================================================================
+
+        -- LLM Configs - internal configuration
+        CREATE TABLE IF NOT EXISTS llm_configs (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            params TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(provider, model, params)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_llm_configs_provider_model ON llm_configs(provider, model);
+
+        -- Session execution config snapshot (runtime knobs persisted per session)
+        CREATE TABLE IF NOT EXISTS session_execution_configs (
+            id INTEGER PRIMARY KEY,
+            session_id INTEGER NOT NULL UNIQUE,
+            config_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_execution_configs_session
+            ON session_execution_configs(session_id);
+
+        -- Authoritative per-session mode/model/reasoning control state.
+        CREATE TABLE IF NOT EXISTS session_control_states (
+            session_id INTEGER PRIMARY KEY,
+            active_mode TEXT NOT NULL,
+            reasoning_effort TEXT,
+            revision INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS session_mode_model_bindings (
+            session_id INTEGER NOT NULL,
+            mode TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            llm_config_id INTEGER NOT NULL,
+            provider_node_id TEXT,
+            PRIMARY KEY(session_id, mode),
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY(llm_config_id) REFERENCES llm_configs(id) ON DELETE RESTRICT
+        );
+
+        -- Intent snapshots - internal state tracking
+        CREATE TABLE IF NOT EXISTS intent_snapshots (
+            id INTEGER PRIMARY KEY,
+            session_id INTEGER NOT NULL,
+            task_id INTEGER,
+            summary TEXT NOT NULL,
+            constraints TEXT,
+            next_step_hint TEXT,
+            revision INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'legacy',
+            source_ref TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_intent_session ON intent_snapshots(session_id);
+        -- Composite index to make MIN(id) per session lookup O(1) during session list view
+        CREATE INDEX IF NOT EXISTS idx_intent_session_id ON intent_snapshots(session_id, id);
+
+        -- Decisions - internal tracking
+        CREATE TABLE IF NOT EXISTS decisions (
+            id INTEGER PRIMARY KEY,
+            session_id INTEGER NOT NULL,
+            task_id INTEGER,
+            description TEXT NOT NULL,
+            rationale TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_decisions_session ON decisions(session_id);
+
+        -- Alternatives - internal tracking
+        CREATE TABLE IF NOT EXISTS alternatives (
+            id INTEGER PRIMARY KEY,
+            session_id INTEGER NOT NULL,
+            task_id INTEGER,
+            description TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
+        );
+
+        -- Progress entries - internal logging
+        CREATE TABLE IF NOT EXISTS progress_entries (
+            id INTEGER PRIMARY KEY,
+            session_id INTEGER NOT NULL,
+            task_id INTEGER,
+            kind TEXT NOT NULL,
+            content TEXT NOT NULL,
+            metadata TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_progress_session ON progress_entries(session_id);
+        CREATE INDEX IF NOT EXISTS idx_progress_task ON progress_entries(task_id) WHERE task_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_progress_created ON progress_entries(created_at);
+        CREATE INDEX IF NOT EXISTS idx_progress_kind ON progress_entries(session_id, kind);
+
+        -- Artifacts - internal file tracking
+        CREATE TABLE IF NOT EXISTS artifacts (
+            id INTEGER PRIMARY KEY,
+            session_id INTEGER NOT NULL,
+            task_id INTEGER,
+            kind TEXT NOT NULL,
+            uri TEXT,
+            path TEXT,
+            summary TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
+        );
+
+        -- Event journal (durable events with full envelope semantics)
+        CREATE TABLE IF NOT EXISTS event_journal (
+            event_id TEXT PRIMARY KEY,
+            stream_seq INTEGER UNIQUE NOT NULL,
+            session_id TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            origin TEXT NOT NULL DEFAULT 'local',
+            source_node TEXT,
+            kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_event_journal_session_seq
+            ON event_journal(session_id, stream_seq);
+        CREATE INDEX IF NOT EXISTS idx_event_journal_timestamp
+            ON event_journal(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_event_journal_origin
+            ON event_journal(origin, source_node);
+
+        -- Sequence generator for stream_seq (single-row table)
+        CREATE TABLE IF NOT EXISTS event_journal_seq (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            next_seq INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT OR IGNORE INTO event_journal_seq (id, next_seq) VALUES (1, 1);
+
+        -- Revert states for undo/redo support
+        CREATE TABLE IF NOT EXISTS revert_states (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT NOT NULL UNIQUE,
+            session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            message_id TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            backend_id TEXT NOT NULL DEFAULT 'git',
+            workspace_root TEXT,
+            restore_failed INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_revert_states_session ON revert_states(session_id);
+
+        -- Legacy message parts
+        CREATE TABLE IF NOT EXISTS message_parts (
+            id INTEGER PRIMARY KEY,
+            message_id INTEGER NOT NULL,
+            part_type TEXT NOT NULL,
+            content_json TEXT NOT NULL,
+            sort_order INTEGER NOT NULL,
+            FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_message_parts_message ON message_parts(message_id, sort_order);
+
+        -- User-managed custom local models per provider
+        CREATE TABLE IF NOT EXISTS custom_models (
+            id INTEGER PRIMARY KEY,
+            provider TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            config_json TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_ref TEXT,
+            family TEXT,
+            quant TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(provider, model_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_custom_models_provider
+            ON custom_models(provider);
+
+        -- ========================================================================
+        -- TIER 1: SCHEDULES (with public_id) — Autonomous scheduled work
+        -- ========================================================================
+
+        CREATE TABLE IF NOT EXISTS schedules (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT UNIQUE NOT NULL,
+            task_id INTEGER NOT NULL,
+            task_public_id TEXT NOT NULL,
+            session_id INTEGER NOT NULL,
+            session_public_id TEXT NOT NULL,
+            trigger_json TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'armed',
+            last_run_at TEXT,
+            next_run_at TEXT,
+            run_count INTEGER NOT NULL DEFAULT 0,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            config_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_schedules_state_next_run
+            ON schedules(state, next_run_at) WHERE state = 'armed';
+        CREATE INDEX IF NOT EXISTS idx_schedules_running_last_run
+            ON schedules(last_run_at) WHERE state = 'running';
+        CREATE INDEX IF NOT EXISTS idx_schedules_terminal_updated
+            ON schedules(state, updated_at) WHERE state IN ('failed', 'exhausted');
+        CREATE INDEX IF NOT EXISTS idx_schedules_session_public
+            ON schedules(session_public_id);
+        CREATE INDEX IF NOT EXISTS idx_schedules_task_public
+            ON schedules(task_public_id);
+
+        -- Protocol ownership is separate so records without a row remain user-created.
+        CREATE TABLE IF NOT EXISTS dotagents_task_ownership (
+            source_key TEXT PRIMARY KEY,
+            task_creation_key TEXT UNIQUE NOT NULL,
+            schedule_creation_key TEXT UNIQUE NOT NULL,
+            layer TEXT NOT NULL CHECK (layer IN ('global', 'workspace')),
+            canonical_workspace TEXT,
+            task_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            task_public_id TEXT UNIQUE,
+            schedule_public_id TEXT UNIQUE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(task_public_id) REFERENCES tasks(public_id) ON DELETE SET NULL,
+            FOREIGN KEY(schedule_public_id) REFERENCES schedules(public_id) ON DELETE SET NULL,
+            CHECK ((layer = 'workspace' AND canonical_workspace IS NOT NULL) OR layer = 'global')
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_dotagents_task_ownership_identity
+            ON dotagents_task_ownership(layer, canonical_workspace, task_id);
+
+        CREATE TABLE IF NOT EXISTS dotagents_task_approvals (
+            canonical_workspace TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            decision TEXT NOT NULL CHECK (decision IN ('approve', 'deny')),
+            decided_at TEXT NOT NULL,
+            PRIMARY KEY(canonical_workspace, task_id, fingerprint)
+        );
+
+        -- Protocol-owned automation sessions. One durable session per protocol
+        -- scope + target profile, reused across restarts so reconciliation never
+        -- creates duplicate sessions, tasks, or schedules.
+        CREATE TABLE IF NOT EXISTS dotagents_automation_bindings (
+            binding_key TEXT PRIMARY KEY,
+            layer TEXT NOT NULL CHECK (layer IN ('global', 'workspace')),
+            canonical_workspace TEXT,
+            profile_id TEXT,
+            session_public_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(session_public_id) REFERENCES sessions(public_id) ON DELETE CASCADE,
+            CHECK ((layer = 'workspace' AND canonical_workspace IS NOT NULL) OR layer = 'global')
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_dotagents_automation_bindings_session
+            ON dotagents_automation_bindings(session_public_id);
+
+        -- Scheduler lease table (single-row, DB-backed leadership)
+        CREATE TABLE IF NOT EXISTS scheduler_lease (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            owner_id TEXT NOT NULL,
+            acquired_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+
+        -- ========================================================================
+        -- TIER 1: KNOWLEDGE LAYER (with public_id) — Pluggable structured memory
+        -- ========================================================================
+
+        CREATE TABLE IF NOT EXISTS knowledge_entries (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT UNIQUE NOT NULL,
+            scope TEXT NOT NULL,
+            source TEXT NOT NULL,
+            raw_text TEXT,
+            summary TEXT NOT NULL,
+            entities_json TEXT NOT NULL DEFAULT '[]',
+            topics_json TEXT NOT NULL DEFAULT '[]',
+            connections_json TEXT NOT NULL DEFAULT '[]',
+            importance REAL NOT NULL DEFAULT 0.5,
+            consolidated_at TEXT,
+            created_at TEXT NOT NULL,
+            protocol_source_key TEXT,
+            protocol_fingerprint TEXT,
+            protocol_active INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_knowledge_entries_scope
+            ON knowledge_entries(scope);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_entries_unconsolidated
+            ON knowledge_entries(scope, consolidated_at)
+            WHERE consolidated_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_knowledge_entries_created
+            ON knowledge_entries(scope, created_at);
+        -- Protocol-owned entries are unique per scope+source; user-created
+        -- entries keep a NULL protocol_source_key and are never constrained.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_entries_protocol_source
+            ON knowledge_entries(scope, protocol_source_key)
+            WHERE protocol_source_key IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS knowledge_consolidations (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT UNIQUE NOT NULL,
+            scope TEXT NOT NULL,
+            source_entry_public_ids_json TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            insight TEXT NOT NULL,
+            connections_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_knowledge_consolidations_scope
+            ON knowledge_consolidations(scope);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_consolidations_created
+            ON knowledge_consolidations(scope, created_at);
+
+        -- Junction tables for normalized entity/topic matching.
+        -- Stores both original and normalized (lowercased + stemmed) forms
+        -- so queries can match via indexed exact lookups instead of LIKE scans.
+        CREATE TABLE IF NOT EXISTS knowledge_entry_entities (
+            entry_id INTEGER NOT NULL REFERENCES knowledge_entries(id) ON DELETE CASCADE,
+            entity TEXT NOT NULL,
+            entity_normalized TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_kee_entry
+            ON knowledge_entry_entities(entry_id);
+        CREATE INDEX IF NOT EXISTS idx_kee_normalized
+            ON knowledge_entry_entities(entity_normalized);
+
+        CREATE TABLE IF NOT EXISTS knowledge_entry_topics (
+            entry_id INTEGER NOT NULL REFERENCES knowledge_entries(id) ON DELETE CASCADE,
+            topic TEXT NOT NULL,
+            topic_normalized TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ket_entry
+            ON knowledge_entry_topics(entry_id);
+        CREATE INDEX IF NOT EXISTS idx_ket_normalized
+            ON knowledge_entry_topics(topic_normalized);
+
+        CREATE TABLE IF NOT EXISTS knowledge_ingestion_log (
+            id INTEGER PRIMARY KEY,
+            scope TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            processed_at TEXT NOT NULL,
+            UNIQUE(scope, source_key)
+        );
+
+        -- ========================================================================
+        -- FTS5 INDEXES — BM25-ranked full-text search for knowledge layer
+        -- ========================================================================
+
+        -- FTS5 index for knowledge entries (summary + raw_text + source).
+        -- External-content table: data lives in knowledge_entries, FTS only
+        -- maintains the inverted index. The porter tokenizer adds English
+        -- stemming (e.g. "configured" matches "configuration").
+        CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_entries_fts USING fts5(
+            summary, raw_text, source,
+            content='knowledge_entries',
+            content_rowid='id',
+            tokenize='porter unicode61'
+        );
+
+        -- FTS5 index for knowledge consolidations (summary + insight).
+        CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_consolidations_fts USING fts5(
+            summary, insight,
+            content='knowledge_consolidations',
+            content_rowid='id',
+            tokenize='porter unicode61'
+        );
+
+        -- Sync triggers: keep FTS indexes in sync with base tables.
+        -- INSERT trigger for knowledge_entries
+        CREATE TRIGGER IF NOT EXISTS knowledge_entries_ai AFTER INSERT ON knowledge_entries BEGIN
+            INSERT INTO knowledge_entries_fts(rowid, summary, raw_text, source)
+            VALUES (new.id, new.summary, COALESCE(new.raw_text, ''), new.source);
+        END;
+
+        -- UPDATE trigger for knowledge_entries
+        CREATE TRIGGER IF NOT EXISTS knowledge_entries_au AFTER UPDATE ON knowledge_entries BEGIN
+            INSERT INTO knowledge_entries_fts(knowledge_entries_fts, rowid, summary, raw_text, source)
+            VALUES ('delete', old.id, old.summary, COALESCE(old.raw_text, ''), old.source);
+            INSERT INTO knowledge_entries_fts(rowid, summary, raw_text, source)
+            VALUES (new.id, new.summary, COALESCE(new.raw_text, ''), new.source);
+        END;
+
+        -- DELETE trigger for knowledge_entries
+        CREATE TRIGGER IF NOT EXISTS knowledge_entries_ad AFTER DELETE ON knowledge_entries BEGIN
+            INSERT INTO knowledge_entries_fts(knowledge_entries_fts, rowid, summary, raw_text, source)
+            VALUES ('delete', old.id, old.summary, COALESCE(old.raw_text, ''), old.source);
+        END;
+
+        -- INSERT trigger for knowledge_consolidations
+        CREATE TRIGGER IF NOT EXISTS knowledge_consolidations_ai AFTER INSERT ON knowledge_consolidations BEGIN
+            INSERT INTO knowledge_consolidations_fts(rowid, summary, insight)
+            VALUES (new.id, new.summary, new.insight);
+        END;
+
+        -- UPDATE trigger for knowledge_consolidations
+        CREATE TRIGGER IF NOT EXISTS knowledge_consolidations_au AFTER UPDATE ON knowledge_consolidations BEGIN
+            INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts, rowid, summary, insight)
+            VALUES ('delete', old.id, old.summary, old.insight);
+            INSERT INTO knowledge_consolidations_fts(rowid, summary, insight)
+            VALUES (new.id, new.summary, new.insight);
+        END;
+
+        -- DELETE trigger for knowledge_consolidations
+        CREATE TRIGGER IF NOT EXISTS knowledge_consolidations_ad AFTER DELETE ON knowledge_consolidations BEGIN
+            INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts, rowid, summary, insight)
+            VALUES ('delete', old.id, old.summary, old.insight);
+        END;
+
+        "#,
+    )?;
+
+    conn.execute_batch(WORKSPACE_TABLES_DDL)?;
+    ensure_workspace_provisioning_columns(conn)?;
+    ensure_workspace_source_cwd(conn)?;
+    ensure_workspace_handoff(conn)?;
+
+    Ok(())
+}
+
+/// Add the ownership-handoff schema: `workspaces.handed_off_to` and the
+/// `workspace_handoffs` marker table.
+///
+/// `handed_off_to` records the session the workspace was most recently handed
+/// to. Each row of `workspace_handoffs` marks one previous owner as
+/// transferred (`from_session_id` is the primary key, because a session can
+/// only be handed off once: afterwards it no longer owns anything). Kept out
+/// of [`WORKSPACE_TABLES_DDL`] for the same reason as the other additive
+/// workspace columns. Idempotent.
+pub fn ensure_workspace_handoff(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let has_column = {
+        let mut stmt = conn.prepare("PRAGMA table_info(workspaces)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .try_fold(false, |found, name| {
+                name.map(|n| found || n == "handed_off_to")
+            })?
+    };
+    if !has_column {
+        conn.execute("ALTER TABLE workspaces ADD COLUMN handed_off_to TEXT", [])?;
+    }
+    conn.execute_batch(WORKSPACE_HANDOFFS_DDL)
+}
+
+/// `to_session_id` deliberately has no foreign key: deleting a successor must
+/// not erase the marker that keeps its predecessors read-only previous owners.
+const WORKSPACE_HANDOFFS_DDL: &str = "CREATE TABLE IF NOT EXISTS workspace_handoffs (
+        from_session_id TEXT PRIMARY KEY,
+        workspace_public_id TEXT NOT NULL,
+        to_session_id TEXT NOT NULL,
+        transferred_at TEXT NOT NULL,
+        FOREIGN KEY(from_session_id) REFERENCES sessions(public_id) ON DELETE CASCADE,
+        FOREIGN KEY(workspace_public_id) REFERENCES workspaces(public_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_workspace_handoffs_workspace
+        ON workspace_handoffs(workspace_public_id);";
+
+/// Rebuild `workspace_handoffs` without the `to_session_id` foreign key that
+/// the first revision of the table carried. Idempotent.
+pub fn ensure_workspace_handoff_survives_successor_delete(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    ensure_workspace_handoff(conn)?;
+    let has_to_fk = {
+        let mut stmt = conn.prepare("PRAGMA foreign_key_list(workspace_handoffs)")?;
+        stmt.query_map([], |row| row.get::<_, String>(3))?
+            .try_fold(false, |found, from| {
+                from.map(|from| found || from == "to_session_id")
+            })?
+    };
+    if !has_to_fk {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE workspace_handoffs RENAME TO workspace_handoffs_old;
+         DROP INDEX IF EXISTS idx_workspace_handoffs_workspace;",
+    )?;
+    tx.execute_batch(WORKSPACE_HANDOFFS_DDL)?;
+    tx.execute_batch(
+        "INSERT INTO workspace_handoffs
+            (from_session_id, workspace_public_id, to_session_id, transferred_at)
+         SELECT from_session_id, workspace_public_id, to_session_id, transferred_at
+         FROM workspace_handoffs_old;
+         DROP TABLE workspace_handoffs_old;",
+    )?;
+    tx.commit()
+}
+
+/// Add `workspaces.source_cwd` and backfill existing rows.
+///
+/// `source_cwd` is the cwd of the session (or request) a workspace was
+/// created from, normalized like session cwds. It is the project grouping key
+/// for managed sessions and survives archive and removal. Existing rows are
+/// backfilled from `origin_path` joined with `relative_cwd`, the best durable
+/// reconstruction of the source cwd. Idempotent: only NULL rows are touched.
+pub fn ensure_workspace_source_cwd(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let has_column = {
+        let mut stmt = conn.prepare("PRAGMA table_info(workspaces)")?;
+        let mut names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        names.try_fold(false, |found, name| {
+            name.map(|n| found || n == "source_cwd")
+        })?
+    };
+    if !has_column {
+        conn.execute("ALTER TABLE workspaces ADD COLUMN source_cwd TEXT", [])?;
+    }
+
+    let missing: Vec<(i64, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, origin_path, relative_cwd FROM workspaces WHERE source_cwd IS NULL",
+        )?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    {
+        let mut update = tx.prepare("UPDATE workspaces SET source_cwd = ?1 WHERE id = ?2")?;
+        for (id, origin, relative) in missing {
+            let source_cwd = querymt_agent_core::worktree::domain::source_cwd_from(
+                std::path::Path::new(&origin),
+                std::path::Path::new(&relative),
+            );
+            update.execute(rusqlite::params![source_cwd, id])?;
+        }
+    }
+    tx.commit()
+}
+
+/// Additive provisioning-intent columns for the `workspaces` table.
+///
+/// Persist the replayable provisioning inputs (requested baseline ref,
+/// operation id, and the last completed provisioning phase) so an
+/// interrupted allocation can be recovered without a fabricated baseline.
+/// Kept out of [`WORKSPACE_TABLES_DDL`]'s `workspaces` CREATE TABLE because
+/// the `0025_workspace_archival` rebuild copies rows with
+/// `INSERT ... SELECT *`; guarding each `ALTER TABLE` keeps this idempotent
+/// for both fresh installs (where [`init_schema`] calls it right after
+/// creating the tables) and existing databases (via the
+/// `0027_workspace_provisioning_intent` migration).
+pub fn ensure_workspace_provisioning_columns(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let existing: HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(workspaces)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?
+    };
+    for (column, definition) in [
+        ("requested_base_ref", "TEXT"),
+        ("operation_id", "TEXT"),
+        ("provisioning_phase", "TEXT"),
+    ] {
+        if !existing.contains(column) {
+            conn.execute(
+                &format!("ALTER TABLE workspaces ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Add the `captured_head` column to `workspace_results` when an existing
+/// database predates it.
+///
+/// Fresh installs get the column from [`WORKSPACE_TABLES_DDL`]; guarded so
+/// the paired migration stays idempotent. Existing rows keep NULL and review
+/// falls back to the workspace baseline commit.
+pub fn ensure_workspace_result_columns(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let existing: HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(workspace_results)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?
+    };
+    if !existing.contains("captured_head") {
+        conn.execute(
+            "ALTER TABLE workspace_results ADD COLUMN captured_head TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// DDL for managed worktree workspaces and their retained result provenance.///
+/// Shared between `init_schema` (fresh installs) and the additive
+/// `0022_worktree_workspaces` migration (existing databases) so the two can
+/// never drift. All statements are `IF NOT EXISTS` and safe to re-run.
+/// The `CREATE TABLE IF NOT EXISTS workspaces (...)` statement from
+/// [`WORKSPACE_TABLES_DDL`], located by the statement itself rather than by
+/// a neighbouring comment so reflowing comments cannot break the
+/// table-rebuild migrations that reuse it.
+pub fn workspaces_create_table_statement() -> &'static str {
+    const START: &str = "CREATE TABLE IF NOT EXISTS workspaces (";
+    let start = WORKSPACE_TABLES_DDL
+        .find(START)
+        .expect("WORKSPACE_TABLES_DDL defines the workspaces table");
+    let rest = &WORKSPACE_TABLES_DDL[start..];
+    let end = rest
+        .find(");")
+        .expect("the workspaces CREATE TABLE statement is terminated");
+    &rest[..end + 2]
+}
+
+pub const WORKSPACE_TABLES_DDL: &str = r#"
+    -- ========================================================================
+    -- TIER 1: WORKTREE WORKSPACES (with public_id) — isolated Git workspaces
+    -- ========================================================================
+
+    -- One managed workspace per linked-worktree checkout. Repository identity
+    -- is the canonical common directory; checkout identity is the checkout
+    -- path (never reused after removal). `owner_session_id` is the nullable
+    -- session association: a workspace has at most one writable owner.
+    CREATE TABLE IF NOT EXISTS workspaces (
+        id INTEGER PRIMARY KEY,
+        public_id TEXT UNIQUE NOT NULL,
+        common_dir TEXT NOT NULL,
+        origin_path TEXT NOT NULL,
+        project_name TEXT NOT NULL,
+        checkout_path TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        relative_cwd TEXT NOT NULL DEFAULT '',
+        execution TEXT NOT NULL CHECK (execution IN ('local', 'worktree')),
+        baseline_mode TEXT NOT NULL CHECK (baseline_mode IN ('commit', 'current_working_tree')),
+        source_head TEXT,
+        baseline_commit TEXT,
+        lifecycle TEXT NOT NULL CHECK (lifecycle IN ('provisioning', 'ready', 'failed', 'missing', 'archived', 'removing', 'removed')),
+        owner_session_id TEXT,
+        parent_workspace_id TEXT,
+        parent_session_id TEXT,
+        delegation_id TEXT,
+        delegation_batch_id TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(parent_workspace_id) REFERENCES workspaces(public_id) ON DELETE SET NULL,
+        FOREIGN KEY(owner_session_id) REFERENCES sessions(public_id) ON DELETE SET NULL
+    );
+
+    -- A managed workspace has at most one writable session owner.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_owner
+        ON workspaces(owner_session_id) WHERE owner_session_id IS NOT NULL;
+    -- Checkout paths are never reused, including after removal.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_checkout
+        ON workspaces(checkout_path);
+    CREATE INDEX IF NOT EXISTS idx_workspaces_common_dir
+        ON workspaces(common_dir, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_workspaces_batch
+        ON workspaces(delegation_batch_id) WHERE delegation_batch_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_workspaces_parent
+        ON workspaces(parent_workspace_id) WHERE parent_workspace_id IS NOT NULL;
+
+    -- Retained result provenance for delegates working in a workspace:
+    -- baseline-relative result commits and verification outcome. Absent rows
+    -- never imply integration.
+    CREATE TABLE IF NOT EXISTS workspace_results (
+        id INTEGER PRIMARY KEY,
+        workspace_public_id TEXT NOT NULL,
+        baseline_commit TEXT NOT NULL,
+        result_commit TEXT,
+        result_ref TEXT,
+        verification TEXT CHECK (verification IN ('pending', 'passed', 'failed', 'skipped')),
+        captured_at TEXT NOT NULL,
+        -- Checkout HEAD at capture time, kept distinct from live HEAD so
+        -- review stays accurate after later commits. NULL for rows written
+        -- before the column existed.
+        captured_head TEXT,
+        FOREIGN KEY(workspace_public_id) REFERENCES workspaces(public_id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_workspace_results_workspace
+        ON workspace_results(workspace_public_id, captured_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_results_result_ref
+        ON workspace_results(result_ref) WHERE result_ref IS NOT NULL;
+"#;
+
+#[cfg(test)]
+mod fts_trigger_tests {
+    use super::*;
+
+    /// Deleting a consolidation must remove *both* indexed columns from the
+    /// external-content FTS index. The delete trigger has to replay the
+    /// original `summary` and `insight` values; omitting `summary` leaves
+    /// stale postings and corrupts the index.
+    #[test]
+    fn consolidation_delete_removes_summary_and_insight_postings() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_schema(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO knowledge_consolidations \
+             (public_id, scope, source_entry_public_ids_json, summary, insight, created_at) \
+             VALUES ('c1', 'scope', '[]', 'zebrafish summary', 'quokka insight', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let hits = |conn: &Connection, term: &str| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM knowledge_consolidations_fts WHERE knowledge_consolidations_fts MATCH ?1",
+                [term],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(hits(&conn, "zebrafish"), 1);
+        assert_eq!(hits(&conn, "quokka"), 1);
+
+        conn.execute(
+            "DELETE FROM knowledge_consolidations WHERE public_id = 'c1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(hits(&conn, "zebrafish"), 0, "summary postings removed");
+        assert_eq!(hits(&conn, "quokka"), 0, "insight postings removed");
+
+        // The index must remain structurally consistent after the delete.
+        conn.execute(
+            "INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts) VALUES('integrity-check')",
+            [],
+        )
+        .expect("FTS index integrity check passes after delete");
+    }
+}

@@ -1,0 +1,1092 @@
+use crate::session::domain::ForkOrigin;
+pub use querymt_agent_core::delegation_update::{
+    DelegationActivity, DelegationStage, DelegationUpdateNotification, DelegationUpdateState,
+};
+use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventEnvelope};
+use std::collections::HashMap;
+
+const TERMINAL_SUMMARY_MAX_CHARS: usize = 512;
+const LIVE_MAX_TRACKED_DELEGATIONS: usize = 1024;
+
+#[derive(Debug, Clone, Default)]
+pub struct DelegationUpdateProjector {
+    snapshots: HashMap<String, DelegationUpdateNotification>,
+    pending: HashMap<String, Vec<PendingDelegationTransition>>,
+    stage_order: HashMap<String, (String, i64)>,
+    max_tracked: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+enum PendingDelegationTransition {
+    Forked {
+        session_id: String,
+        child_session_id: String,
+        selected_model_id: Option<String>,
+        selected_provider_node_id: Option<String>,
+        timestamp: i64,
+    },
+    Stage {
+        timestamp: i64,
+        stage: Option<DelegationStage>,
+        source_epoch: String,
+    },
+    Finished {
+        timestamp: i64,
+        state: DelegationUpdateState,
+        result_summary: Option<String>,
+        error: Option<String>,
+    },
+}
+
+impl PendingDelegationTransition {
+    fn timestamp(&self) -> i64 {
+        match self {
+            Self::Forked { timestamp, .. }
+            | Self::Finished { timestamp, .. }
+            | Self::Stage { timestamp, .. } => *timestamp,
+        }
+    }
+
+    fn same_kind(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Forked { .. }, Self::Forked { .. })
+                | (Self::Finished { .. }, Self::Finished { .. })
+                | (Self::Stage { .. }, Self::Stage { .. })
+        )
+    }
+}
+
+impl DelegationUpdateProjector {
+    pub fn for_live_stream() -> Self {
+        Self {
+            max_tracked: Some(LIVE_MAX_TRACKED_DELEGATIONS),
+            ..Self::default()
+        }
+    }
+
+    pub fn project_envelope(
+        &mut self,
+        event: &EventEnvelope,
+    ) -> Option<DelegationUpdateNotification> {
+        let id = match event.kind() {
+            AgentEventKind::DelegationRequested { delegation, .. } => {
+                Some(delegation.public_id.as_str())
+            }
+            AgentEventKind::SessionForked {
+                origin: ForkOrigin::Delegation,
+                fork_point_ref,
+                ..
+            } => Some(fork_point_ref.as_str()),
+            AgentEventKind::DelegationStageChanged { delegation_id, .. }
+            | AgentEventKind::DelegationCompleted { delegation_id, .. }
+            | AgentEventKind::DelegationFailed { delegation_id, .. }
+            | AgentEventKind::DelegationCancelled { delegation_id } => Some(delegation_id.as_str()),
+            _ => None,
+        };
+        // Replayed history cannot alter an already newer owned observation at the same order.
+        if let Some(current) = id.and_then(|id| self.snapshots.get(id))
+            && current.source_epoch.is_some()
+            && event.session_seq() > 0
+            && current
+                .session_seq
+                .is_some_and(|seq| event.session_seq() <= seq)
+        {
+            return None;
+        }
+        if let AgentEventKind::DelegationStageChanged {
+            delegation_id,
+            source_epoch,
+            ..
+        } = event.kind()
+        {
+            if event.session_seq() <= 0
+                || self
+                    .stage_order
+                    .get(delegation_id)
+                    .is_some_and(|(epoch, seq)| {
+                        epoch != source_epoch || event.session_seq() <= *seq
+                    })
+            {
+                return None;
+            }
+            self.stage_order.insert(
+                delegation_id.clone(),
+                (source_epoch.clone(), event.session_seq()),
+            );
+        }
+        let update = self.project(event.session_id(), event.timestamp(), event.kind())?;
+        if let Some(snapshot) = self.snapshots.get_mut(&update.delegation_id) {
+            let stage_seq = self
+                .stage_order
+                .get(&update.delegation_id)
+                .map_or(0, |(_, seq)| *seq);
+            let seq = event
+                .session_seq()
+                .max(stage_seq)
+                .max(snapshot.session_seq.unwrap_or(0));
+            if seq > 0 {
+                snapshot.session_seq = Some(seq);
+            }
+            return Some(snapshot.clone());
+        }
+        Some(update)
+    }
+
+    pub fn project_event(&mut self, event: &AgentEvent) -> Option<DelegationUpdateNotification> {
+        self.project_envelope(&event.clone().into())
+    }
+
+    /// Hydrate durable lifecycle facts without treating the latest live stage
+    /// watermark as evidence that older, not-yet-seeded metadata was observed.
+    #[doc(hidden)]
+    pub fn seed_history(&mut self, session_id: &str, events: &[AgentEvent]) {
+        for event in events.iter().filter(|event| event.session_id == session_id) {
+            if let AgentEventKind::SessionForked {
+                parent_session_id, ..
+            } = &event.kind
+                && parent_session_id != session_id
+            {
+                continue;
+            }
+            let id = match &event.kind {
+                AgentEventKind::DelegationRequested { delegation, .. } => &delegation.public_id,
+                AgentEventKind::SessionForked {
+                    origin: ForkOrigin::Delegation,
+                    fork_point_ref,
+                    ..
+                } => fork_point_ref,
+                AgentEventKind::DelegationCompleted { delegation_id, .. }
+                | AgentEventKind::DelegationFailed { delegation_id, .. }
+                | AgentEventKind::DelegationCancelled { delegation_id } => delegation_id,
+                _ => continue,
+            };
+            let previous = self.snapshots.get(id).cloned();
+            if let Some(current) = &previous {
+                if current.session_id != event.session_id {
+                    continue;
+                }
+                match &event.kind {
+                    AgentEventKind::DelegationRequested {
+                        delegation,
+                        tool_call_id,
+                        ..
+                    } if current.target_agent_id != delegation.target_agent_id
+                        || current.objective != delegation.objective
+                        || current
+                            .tool_call_id
+                            .as_ref()
+                            .zip(tool_call_id.as_ref())
+                            .is_some_and(|(current, incoming)| current != incoming) =>
+                    {
+                        continue;
+                    }
+                    AgentEventKind::SessionForked {
+                        child_session_id,
+                        target_agent_id,
+                        ..
+                    } if current.target_agent_id != *target_agent_id
+                        || current
+                            .child_session_id
+                            .as_ref()
+                            .is_some_and(|id| id != child_session_id) =>
+                    {
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            // This path accepts only persisted lifecycle history. Live envelopes
+            // still use project_envelope's sequence and epoch rejection guards.
+            self.project(&event.session_id, event.timestamp, &event.kind);
+            if let Some(snapshot) = self.snapshots.get_mut(id) {
+                if let Some(previous) = previous {
+                    snapshot.child_session_id = previous
+                        .child_session_id
+                        .or(snapshot.child_session_id.take());
+                    snapshot.selected_model_id = previous
+                        .selected_model_id
+                        .or(snapshot.selected_model_id.take());
+                    snapshot.selected_provider_node_id = previous
+                        .selected_provider_node_id
+                        .or(snapshot.selected_provider_node_id.take());
+                }
+                let stage_seq = self.stage_order.get(id).map_or(0, |(_, seq)| *seq);
+                let seq = event
+                    .session_seq
+                    .max(stage_seq)
+                    .max(snapshot.session_seq.unwrap_or(0));
+                if seq > 0 {
+                    snapshot.session_seq = Some(seq);
+                }
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn restore_observation(&mut self, update: DelegationUpdateNotification) {
+        if self
+            .snapshots
+            .get(&update.delegation_id)
+            .is_some_and(|current| {
+                current.session_seq.unwrap_or(0) > update.session_seq.unwrap_or(0)
+            })
+        {
+            return;
+        }
+        if let (Some(epoch), Some(seq)) = (&update.source_epoch, update.session_seq) {
+            self.stage_order
+                .insert(update.delegation_id.clone(), (epoch.clone(), seq));
+        }
+        self.snapshots.insert(update.delegation_id.clone(), update);
+        self.prune_snapshots();
+    }
+
+    pub fn snapshots(&self) -> Vec<DelegationUpdateNotification> {
+        let mut snapshots = self.snapshots.values().cloned().collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| {
+            left.requested_at
+                .cmp(&right.requested_at)
+                .then_with(|| left.delegation_id.cmp(&right.delegation_id))
+        });
+        snapshots
+    }
+
+    fn project(
+        &mut self,
+        session_id: &str,
+        timestamp: i64,
+        kind: &AgentEventKind,
+    ) -> Option<DelegationUpdateNotification> {
+        match kind {
+            AgentEventKind::DelegationRequested {
+                delegation,
+                tool_call_id,
+                ..
+            } => {
+                if let Some(snapshot) = self.snapshots.get_mut(&delegation.public_id) {
+                    if snapshot.tool_call_id.is_none() {
+                        snapshot.tool_call_id = tool_call_id.clone();
+                    }
+                    return Some(snapshot.clone());
+                }
+
+                let snapshot = DelegationUpdateNotification {
+                    version: 1,
+                    session_id: session_id.to_string(),
+                    delegation_id: delegation.public_id.clone(),
+                    tool_call_id: tool_call_id.clone(),
+                    state: DelegationUpdateState::Requested,
+                    target_agent_id: delegation.target_agent_id.clone(),
+                    objective: delegation.objective.clone(),
+                    child_session_id: None,
+                    selected_model_id: None,
+                    selected_provider_node_id: None,
+                    requested_at: timestamp,
+                    forked_at: None,
+                    finished_at: None,
+                    updated_at: timestamp,
+                    result_summary: None,
+                    error: None,
+                    activity: DelegationActivity::Historical,
+                    stage: None,
+                    session_seq: None,
+                    source_epoch: None,
+                };
+                self.snapshots
+                    .insert(delegation.public_id.clone(), snapshot.clone());
+                if let Some(mut transitions) = self.pending.remove(&delegation.public_id) {
+                    transitions.sort_by_key(PendingDelegationTransition::timestamp);
+                    for transition in transitions {
+                        self.apply_transition(&delegation.public_id, transition);
+                    }
+                }
+                let update = self.snapshots.get(&delegation.public_id).cloned();
+                self.prune_snapshots();
+                update
+            }
+            AgentEventKind::SessionForked {
+                parent_session_id,
+                child_session_id,
+                origin: ForkOrigin::Delegation,
+                fork_point_ref,
+                selected_model_id,
+                selected_provider_node_id,
+                ..
+            } => {
+                let transition = PendingDelegationTransition::Forked {
+                    session_id: parent_session_id.clone(),
+                    child_session_id: child_session_id.clone(),
+                    selected_model_id: selected_model_id.clone(),
+                    selected_provider_node_id: selected_provider_node_id.clone(),
+                    timestamp,
+                };
+                if !self.apply_transition(fork_point_ref, transition.clone()) {
+                    self.queue_pending(fork_point_ref, transition);
+                    return None;
+                }
+                self.snapshots.get(fork_point_ref).cloned()
+            }
+            AgentEventKind::DelegationStageChanged {
+                delegation_id,
+                stage,
+                source_epoch,
+            } => {
+                let transition = PendingDelegationTransition::Stage {
+                    timestamp,
+                    stage: *stage,
+                    source_epoch: source_epoch.clone(),
+                };
+                if !self.apply_transition(delegation_id, transition.clone()) {
+                    self.queue_pending(delegation_id, transition);
+                    return None;
+                }
+                self.snapshots.get(delegation_id).cloned()
+            }
+            AgentEventKind::DelegationCompleted {
+                delegation_id,
+                result,
+            } => self.finish(
+                delegation_id,
+                timestamp,
+                DelegationUpdateState::Completed,
+                result.as_deref().map(bounded_summary),
+                None,
+            ),
+            AgentEventKind::DelegationFailed {
+                delegation_id,
+                error,
+            } => self.finish(
+                delegation_id,
+                timestamp,
+                DelegationUpdateState::Failed,
+                None,
+                Some(bounded_summary(error)),
+            ),
+            AgentEventKind::DelegationCancelled { delegation_id } => self.finish(
+                delegation_id,
+                timestamp,
+                DelegationUpdateState::Cancelled,
+                None,
+                None,
+            ),
+            _ => None,
+        }
+    }
+
+    fn finish(
+        &mut self,
+        delegation_id: &str,
+        timestamp: i64,
+        state: DelegationUpdateState,
+        result_summary: Option<String>,
+        error: Option<String>,
+    ) -> Option<DelegationUpdateNotification> {
+        let transition = PendingDelegationTransition::Finished {
+            timestamp,
+            state,
+            result_summary,
+            error,
+        };
+        if !self.apply_transition(delegation_id, transition.clone()) {
+            self.queue_pending(delegation_id, transition);
+            return None;
+        }
+        self.snapshots.get(delegation_id).cloned()
+    }
+
+    fn apply_transition(
+        &mut self,
+        delegation_id: &str,
+        transition: PendingDelegationTransition,
+    ) -> bool {
+        let Some(snapshot) = self.snapshots.get_mut(delegation_id) else {
+            return false;
+        };
+        match transition {
+            PendingDelegationTransition::Stage {
+                timestamp,
+                stage,
+                source_epoch,
+            } => {
+                snapshot.stage = stage;
+                snapshot.activity = if stage.is_some() {
+                    DelegationActivity::Live
+                } else {
+                    DelegationActivity::Historical
+                };
+                snapshot.source_epoch = Some(source_epoch);
+                snapshot.updated_at = snapshot.updated_at.max(timestamp);
+            }
+            PendingDelegationTransition::Forked {
+                session_id,
+                child_session_id,
+                selected_model_id,
+                selected_provider_node_id,
+                timestamp,
+            } => {
+                if timestamp < snapshot.requested_at
+                    || snapshot
+                        .finished_at
+                        .is_some_and(|finished_at| timestamp > finished_at)
+                {
+                    return true;
+                }
+                snapshot.session_id = session_id;
+                snapshot.child_session_id = Some(child_session_id);
+                snapshot.selected_model_id = selected_model_id;
+                snapshot.selected_provider_node_id = selected_provider_node_id;
+                snapshot.forked_at = Some(
+                    snapshot
+                        .forked_at
+                        .map_or(timestamp, |current| current.min(timestamp)),
+                );
+                if !snapshot.state.is_terminal() {
+                    snapshot.state = DelegationUpdateState::Forked;
+                    snapshot.updated_at = snapshot.updated_at.max(timestamp);
+                }
+            }
+            PendingDelegationTransition::Finished {
+                timestamp,
+                state,
+                result_summary,
+                error,
+            } => {
+                if timestamp < snapshot.requested_at || snapshot.state.is_terminal() {
+                    return true;
+                }
+                snapshot.state = state;
+                snapshot.finished_at = Some(timestamp);
+                snapshot.updated_at = snapshot.updated_at.max(timestamp);
+                snapshot.result_summary = result_summary;
+                snapshot.error = error;
+            }
+        }
+        true
+    }
+
+    fn queue_pending(&mut self, delegation_id: &str, transition: PendingDelegationTransition) {
+        let transitions = self.pending.entry(delegation_id.to_string()).or_default();
+        if let Some(existing) = transitions
+            .iter_mut()
+            .find(|existing| existing.same_kind(&transition))
+        {
+            if matches!(transition, PendingDelegationTransition::Stage { .. })
+                || transition.timestamp() < existing.timestamp()
+            {
+                *existing = transition;
+            }
+        } else {
+            transitions.push(transition);
+        }
+        self.prune_pending();
+    }
+
+    fn prune_snapshots(&mut self) {
+        let Some(max_tracked) = self.max_tracked else {
+            return;
+        };
+        while self.snapshots.len() > max_tracked {
+            let Some(oldest) = self
+                .snapshots
+                .iter()
+                .filter(|(_, snapshot)| snapshot.activity != DelegationActivity::Live)
+                .min_by_key(|(_, snapshot)| snapshot.updated_at)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.snapshots.remove(&oldest);
+            self.stage_order.remove(&oldest);
+        }
+    }
+
+    fn prune_pending(&mut self) {
+        let Some(max_tracked) = self.max_tracked else {
+            return;
+        };
+        while self.pending.len() > max_tracked {
+            let Some(oldest) = self
+                .pending
+                .iter()
+                .min_by_key(|(_, transitions)| {
+                    transitions
+                        .iter()
+                        .map(PendingDelegationTransition::timestamp)
+                        .max()
+                        .unwrap_or(i64::MIN)
+                })
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.pending.remove(&oldest);
+        }
+    }
+}
+
+pub fn delegation_updates_from_events(events: &[AgentEvent]) -> Vec<DelegationUpdateNotification> {
+    let mut projector = DelegationUpdateProjector::default();
+    for event in events {
+        projector.project_event(event);
+    }
+    projector.snapshots()
+}
+
+fn bounded_summary(value: &str) -> String {
+    let mut chars = value.chars();
+    let summary = chars
+        .by_ref()
+        .take(TERMINAL_SUMMARY_MAX_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        let mut bounded = summary
+            .chars()
+            .take(TERMINAL_SUMMARY_MAX_CHARS.saturating_sub(3))
+            .collect::<String>();
+        bounded.push_str("...");
+        bounded
+    } else {
+        summary
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::domain::{Delegation, DelegationStatus, ForkPointType};
+    use querymt_agent_core::events::{AgentEvent, EventOrigin};
+    use time::OffsetDateTime;
+
+    fn delegation() -> Delegation {
+        Delegation {
+            isolation: Default::default(),
+            id: 0,
+            public_id: "delegation-1".into(),
+            session_id: 0,
+            task_id: None,
+            target_agent_id: "coder".into(),
+            objective: "Implement it".into(),
+            objective_hash: querymt_agent_core::hash::RapidHash::default(),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: None,
+            planning_summary: None,
+            status: DelegationStatus::Requested,
+            retry_count: 0,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            completed_at: None,
+        }
+    }
+
+    fn event(timestamp: i64, kind: AgentEventKind) -> AgentEvent {
+        AgentEvent {
+            session_seq: 0,
+            seq: timestamp,
+            timestamp,
+            session_id: "parent-1".into(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind,
+        }
+    }
+
+    #[test]
+    fn status_consistency_terminal_update_advances_stage_order() {
+        let mut projector = DelegationUpdateProjector::for_live_stream();
+        projector.project_event(&event(
+            1,
+            AgentEventKind::DelegationRequested {
+                delegation: delegation(),
+                tool_call_id: None,
+                batch_id: None,
+                cycle_id: None,
+            },
+        ));
+        let mut stage = event(
+            2,
+            AgentEventKind::DelegationStageChanged {
+                delegation_id: "delegation-1".into(),
+                stage: Some(DelegationStage::Finalizing),
+                source_epoch: "workflow-1".into(),
+            },
+        );
+        stage.session_seq = 10;
+        let before = projector.project_envelope(&stage.into()).unwrap();
+        let mut fork = event(
+            2,
+            AgentEventKind::SessionForked {
+                parent_session_id: "parent-1".into(),
+                child_session_id: "child-1".into(),
+                target_agent_id: "coder".into(),
+                origin: ForkOrigin::Delegation,
+                fork_point_type: ForkPointType::MessageIndex,
+                fork_point_ref: "delegation-1".into(),
+                instructions: None,
+                selected_model_id: None,
+                selected_provider_node_id: None,
+            },
+        );
+        fork.session_seq = 11;
+        let linked = projector.project_envelope(&fork.clone().into()).unwrap();
+        assert!(linked.session_seq > before.session_seq);
+        assert_eq!(linked.child_session_id.as_deref(), Some("child-1"));
+        let mut terminal = event(
+            2,
+            AgentEventKind::DelegationCompleted {
+                delegation_id: "delegation-1".into(),
+                result: Some("done".into()),
+            },
+        );
+        terminal.session_seq = 12;
+        let after = projector.project_envelope(&terminal.into()).unwrap();
+        assert!(
+            after.session_seq > before.session_seq,
+            "terminal result cannot share stale stage ordering"
+        );
+        assert_eq!(after.activity, DelegationActivity::Live);
+        assert!(after.session_seq > linked.session_seq);
+        assert!(
+            projector.project_event(&fork).is_none(),
+            "history cannot emit changed data at a stale/equal live order"
+        );
+        assert_eq!(projector.snapshots()[0], after);
+    }
+
+    #[test]
+    fn late_stage_cannot_resurrect_cleaned_workflow() {
+        let mut projector = DelegationUpdateProjector::for_live_stream();
+        projector.project_event(&event(
+            1,
+            AgentEventKind::DelegationRequested {
+                delegation: delegation(),
+                tool_call_id: None,
+                batch_id: None,
+                cycle_id: None,
+            },
+        ));
+        let stage = |seq, value| {
+            EventEnvelope::Ephemeral(querymt_agent_core::events::EphemeralEvent {
+                session_id: "parent-1".into(),
+                session_seq: seq,
+                timestamp: 2,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::DelegationStageChanged {
+                    delegation_id: "delegation-1".into(),
+                    stage: value,
+                    source_epoch: "workflow-1".into(),
+                },
+            })
+        };
+        projector.project_envelope(&stage(10, Some(DelegationStage::Verifying)));
+        projector.project_event(&event(
+            2,
+            AgentEventKind::DelegationCancelled {
+                delegation_id: "delegation-1".into(),
+            },
+        ));
+        assert_eq!(
+            projector.snapshots()[0].activity,
+            DelegationActivity::Live,
+            "terminal record must not hide owned cleanup"
+        );
+        projector.project_envelope(&stage(12, None));
+        assert_eq!(
+            projector.snapshots()[0].activity,
+            DelegationActivity::Historical
+        );
+        projector.project_envelope(&stage(11, Some(DelegationStage::Verifying)));
+        assert_eq!(
+            projector.snapshots()[0].activity,
+            DelegationActivity::Historical,
+            "late same-timestamp stage must not revive cleanup"
+        );
+        assert_eq!(projector.snapshots()[0].session_seq, Some(12));
+    }
+
+    #[test]
+    fn projects_full_idempotent_lifecycle_snapshots() {
+        let requested = event(
+            1,
+            AgentEventKind::DelegationRequested {
+                delegation: delegation(),
+                tool_call_id: Some("call-1".into()),
+                batch_id: None,
+                cycle_id: None,
+            },
+        );
+        let forked = event(
+            2,
+            AgentEventKind::SessionForked {
+                parent_session_id: "parent-1".into(),
+                child_session_id: "child-1".into(),
+                target_agent_id: "coder".into(),
+                origin: ForkOrigin::Delegation,
+                fork_point_type: ForkPointType::MessageIndex,
+                fork_point_ref: "delegation-1".into(),
+                instructions: None,
+                selected_model_id: Some("provider/model".into()),
+                selected_provider_node_id: Some("node".into()),
+            },
+        );
+        let completed = event(
+            3,
+            AgentEventKind::DelegationCompleted {
+                delegation_id: "delegation-1".into(),
+                result: Some("done".into()),
+            },
+        );
+        let mut projector = DelegationUpdateProjector::default();
+
+        let first = projector.project_event(&requested).unwrap();
+        assert_eq!(first.state, DelegationUpdateState::Requested);
+        assert_eq!(first.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(projector.project_event(&requested), Some(first));
+
+        let forked = projector.project_event(&forked).unwrap();
+        assert_eq!(forked.state, DelegationUpdateState::Forked);
+        assert_eq!(forked.child_session_id.as_deref(), Some("child-1"));
+        assert_eq!(forked.selected_model_id.as_deref(), Some("provider/model"));
+        assert_eq!(forked.selected_provider_node_id.as_deref(), Some("node"));
+        assert_eq!(forked.target_agent_id, "coder");
+
+        let completed = projector.project_event(&completed).unwrap();
+        assert_eq!(completed.state, DelegationUpdateState::Completed);
+        assert_eq!(completed.child_session_id.as_deref(), Some("child-1"));
+        assert_eq!(completed.result_summary.as_deref(), Some("done"));
+        assert_eq!(
+            completed.selected_model_id.as_deref(),
+            Some("provider/model")
+        );
+        assert_eq!(completed.selected_provider_node_id.as_deref(), Some("node"));
+        assert_eq!(completed.finished_at, Some(3));
+        assert_eq!(projector.project_event(&requested), Some(completed));
+    }
+
+    #[test]
+    fn historical_fork_without_model_provenance_projects_unknown() {
+        let mut projector = DelegationUpdateProjector::default();
+        projector.project_event(&event(
+            1,
+            AgentEventKind::DelegationRequested {
+                delegation: delegation(),
+                tool_call_id: None,
+                batch_id: None,
+                cycle_id: None,
+            },
+        ));
+        let update = projector
+            .project_event(&event(
+                2,
+                AgentEventKind::SessionForked {
+                    parent_session_id: "parent-1".into(),
+                    child_session_id: "child-1".into(),
+                    target_agent_id: "coder".into(),
+                    origin: ForkOrigin::Delegation,
+                    fork_point_type: ForkPointType::ProgressEntry,
+                    fork_point_ref: "delegation-1".into(),
+                    instructions: None,
+                    selected_model_id: None,
+                    selected_provider_node_id: None,
+                },
+            ))
+            .unwrap();
+        assert!(update.selected_model_id.is_none());
+        assert!(update.selected_provider_node_id.is_none());
+    }
+
+    #[test]
+    fn concurrent_delegations_with_same_target_remain_distinct() {
+        let mut second = delegation();
+        second.public_id = "delegation-2".into();
+        let mut projector = DelegationUpdateProjector::default();
+        projector.project_event(&event(
+            1,
+            AgentEventKind::DelegationRequested {
+                delegation: delegation(),
+                tool_call_id: Some("call-1".into()),
+                batch_id: None,
+                cycle_id: None,
+            },
+        ));
+        projector.project_event(&event(
+            1,
+            AgentEventKind::DelegationRequested {
+                delegation: second,
+                tool_call_id: Some("call-2".into()),
+                batch_id: None,
+                cycle_id: None,
+            },
+        ));
+
+        let snapshots = projector.snapshots();
+        assert_eq!(snapshots.len(), 2);
+        assert_ne!(snapshots[0].delegation_id, snapshots[1].delegation_id);
+        assert_ne!(snapshots[0].tool_call_id, snapshots[1].tool_call_id);
+    }
+
+    #[test]
+    fn terminal_summaries_are_utf8_safe_and_bounded() {
+        let mut projector = DelegationUpdateProjector::default();
+        projector.project_event(&event(
+            1,
+            AgentEventKind::DelegationRequested {
+                delegation: delegation(),
+                tool_call_id: None,
+                batch_id: None,
+                cycle_id: None,
+            },
+        ));
+        let update = projector
+            .project_event(&event(
+                2,
+                AgentEventKind::DelegationFailed {
+                    delegation_id: "delegation-1".into(),
+                    error: "界".repeat(600),
+                },
+            ))
+            .unwrap();
+
+        let error = update.error.unwrap();
+        assert_eq!(error.chars().count(), TERMINAL_SUMMARY_MAX_CHARS);
+        assert!(error.ends_with("..."));
+    }
+
+    #[test]
+    fn projection_recovers_when_fanout_delivers_fork_before_request() {
+        let mut projector = DelegationUpdateProjector::default();
+        projector.project_event(&event(
+            2,
+            AgentEventKind::SessionForked {
+                parent_session_id: "parent-1".into(),
+                child_session_id: "child-1".into(),
+                target_agent_id: "coder".into(),
+                origin: ForkOrigin::Delegation,
+                fork_point_type: ForkPointType::ProgressEntry,
+                fork_point_ref: "delegation-1".into(),
+                instructions: None,
+                selected_model_id: Some("provider/model".into()),
+                selected_provider_node_id: Some("node".into()),
+            },
+        ));
+
+        let update = projector
+            .project_event(&event(
+                1,
+                AgentEventKind::DelegationRequested {
+                    delegation: delegation(),
+                    tool_call_id: Some("call-1".into()),
+                    batch_id: None,
+                    cycle_id: None,
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(update.state, DelegationUpdateState::Forked);
+        assert_eq!(update.child_session_id.as_deref(), Some("child-1"));
+        assert_eq!(update.tool_call_id.as_deref(), Some("call-1"));
+    }
+
+    #[test]
+    fn pending_transitions_are_applied_in_timestamp_order() {
+        let mut projector = DelegationUpdateProjector::default();
+        projector.project_event(&event(
+            3,
+            AgentEventKind::DelegationCompleted {
+                delegation_id: "delegation-1".into(),
+                result: Some("done".into()),
+            },
+        ));
+        projector.project_event(&event(
+            2,
+            AgentEventKind::SessionForked {
+                parent_session_id: "parent-1".into(),
+                child_session_id: "child-1".into(),
+                target_agent_id: "coder".into(),
+                origin: ForkOrigin::Delegation,
+                fork_point_type: ForkPointType::ProgressEntry,
+                fork_point_ref: "delegation-1".into(),
+                instructions: None,
+                selected_model_id: Some("provider/model".into()),
+                selected_provider_node_id: Some("node".into()),
+            },
+        ));
+
+        let update = projector
+            .project_event(&event(
+                1,
+                AgentEventKind::DelegationRequested {
+                    delegation: delegation(),
+                    tool_call_id: Some("call-1".into()),
+                    batch_id: None,
+                    cycle_id: None,
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(update.state, DelegationUpdateState::Completed);
+        assert_eq!(update.child_session_id.as_deref(), Some("child-1"));
+        assert_eq!(update.finished_at, Some(3));
+        assert_eq!(update.updated_at, 3);
+    }
+
+    #[test]
+    fn terminal_state_is_not_regressed_by_out_of_order_fork() {
+        let mut projector = DelegationUpdateProjector::default();
+        projector.project_event(&event(
+            1,
+            AgentEventKind::DelegationRequested {
+                delegation: delegation(),
+                tool_call_id: Some("call-1".into()),
+                batch_id: None,
+                cycle_id: None,
+            },
+        ));
+        let completed = projector
+            .project_event(&event(
+                3,
+                AgentEventKind::DelegationCompleted {
+                    delegation_id: "delegation-1".into(),
+                    result: Some("done".into()),
+                },
+            ))
+            .unwrap();
+
+        let update = projector
+            .project_event(&event(
+                2,
+                AgentEventKind::SessionForked {
+                    parent_session_id: "parent-1".into(),
+                    child_session_id: "child-1".into(),
+                    target_agent_id: "coder".into(),
+                    origin: ForkOrigin::Delegation,
+                    fork_point_type: ForkPointType::ProgressEntry,
+                    fork_point_ref: "delegation-1".into(),
+                    instructions: None,
+                    selected_model_id: Some("provider/model".into()),
+                    selected_provider_node_id: Some("node".into()),
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(update.state, DelegationUpdateState::Completed);
+        assert_eq!(update.finished_at, completed.finished_at);
+        assert_eq!(update.result_summary, completed.result_summary);
+        assert_eq!(update.child_session_id.as_deref(), Some("child-1"));
+        assert_eq!(update.selected_model_id.as_deref(), Some("provider/model"));
+        assert_eq!(update.selected_provider_node_id.as_deref(), Some("node"));
+    }
+
+    #[test]
+    fn live_projector_bounds_snapshots_and_pending_transitions() {
+        let mut projector = DelegationUpdateProjector {
+            max_tracked: Some(2),
+            ..DelegationUpdateProjector::default()
+        };
+
+        for id in 1..=3 {
+            let mut requested = delegation();
+            requested.public_id = format!("delegation-{id}");
+            projector.project_event(&event(
+                id,
+                AgentEventKind::DelegationRequested {
+                    delegation: requested,
+                    tool_call_id: None,
+                    batch_id: None,
+                    cycle_id: None,
+                },
+            ));
+        }
+        assert_eq!(projector.snapshots.len(), 2);
+        assert!(!projector.snapshots.contains_key("delegation-1"));
+
+        for id in 4..=6 {
+            projector.project_event(&event(
+                id,
+                AgentEventKind::DelegationCancelled {
+                    delegation_id: format!("delegation-{id}"),
+                },
+            ));
+        }
+        assert_eq!(projector.pending.len(), 2);
+        assert!(!projector.pending.contains_key("delegation-4"));
+    }
+
+    #[test]
+    fn load_snapshot_projection_keeps_latest_state_only() {
+        let events = vec![
+            event(
+                1,
+                AgentEventKind::DelegationRequested {
+                    delegation: delegation(),
+                    tool_call_id: Some("call-1".into()),
+                    batch_id: None,
+                    cycle_id: None,
+                },
+            ),
+            event(
+                2,
+                AgentEventKind::SessionForked {
+                    parent_session_id: "parent-1".into(),
+                    child_session_id: "child-1".into(),
+                    target_agent_id: "coder".into(),
+                    origin: ForkOrigin::Delegation,
+                    fork_point_type: ForkPointType::ProgressEntry,
+                    fork_point_ref: "delegation-1".into(),
+                    instructions: None,
+                    selected_model_id: Some("provider/model".into()),
+                    selected_provider_node_id: Some("node".into()),
+                },
+            ),
+            event(
+                3,
+                AgentEventKind::DelegationCompleted {
+                    delegation_id: "delegation-1".into(),
+                    result: Some("done".into()),
+                },
+            ),
+        ];
+
+        let updates = delegation_updates_from_events(&events);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].state, DelegationUpdateState::Completed);
+        assert_eq!(updates[0].child_session_id.as_deref(), Some("child-1"));
+        assert_eq!(updates[0].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(
+            updates[0].selected_model_id.as_deref(),
+            Some("provider/model")
+        );
+        assert_eq!(
+            updates[0].selected_provider_node_id.as_deref(),
+            Some("node")
+        );
+    }
+
+    #[test]
+    fn historical_requested_event_without_tool_call_id_deserializes() {
+        let value = serde_json::to_value(AgentEventKind::DelegationRequested {
+            delegation: delegation(),
+            tool_call_id: None,
+            batch_id: None,
+            cycle_id: None,
+        })
+        .unwrap();
+        let mut value = value.as_object().unwrap().clone();
+        value.remove("tool_call_id");
+
+        let decoded: AgentEventKind =
+            serde_json::from_value(serde_json::Value::Object(value)).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentEventKind::DelegationRequested {
+                tool_call_id: None,
+                batch_id: None,
+                cycle_id: None,
+                ..
+            }
+        ));
+    }
+}

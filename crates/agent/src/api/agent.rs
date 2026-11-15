@@ -1,11 +1,9 @@
 //! Single agent implementation
 
-use super::callbacks::EventCallbacksState;
 #[cfg(feature = "remote")]
 use super::mesh::{AgentMesh, Mesh, MeshSpec};
 use super::profiles::{AgentProfiles, ProfileRuntimeHandle};
 use super::quorum::QuorumBuilder;
-use super::session::AgentSession;
 use super::sessions::{AgentSessions, ListSessionsOptions, SessionListPage};
 use super::utils::{default_registry, latest_assistant_message, to_absolute_path};
 use super::worktrees::{AgentWorktrees, SessionOptions};
@@ -15,7 +13,7 @@ use crate::acp::stdio::serve_stdio;
 use crate::acp::websocket::serve_websocket;
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
-use crate::agent::core::{SnapshotPolicy, ToolPolicy};
+use crate::agent::core::SnapshotPolicy;
 use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{
     ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, SingleAgentConfig,
@@ -34,6 +32,8 @@ use crate::session::store::SessionStore;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use querymt::LLMParams;
+use querymt_agent_runtime::api::AgentSession;
+use querymt_agent_runtime::api::callbacks::EventCallbacksState;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -125,6 +125,12 @@ pub struct AgentBuilder {
     workspace: Option<crate::config::WorkspaceSettings>,
     /// Prebuilt workspace service; wins over `workspace`.
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    /// Portable repository knowledge settings; disabled when omitted.
+    repository_knowledge: Option<crate::config::RepositoryKnowledgeSettings>,
+    /// Prebuilt repository knowledge registry; wins over `repository_knowledge`
+    /// (hosts and tests that place the index outside the shared config dir).
+    repository_knowledge_registry:
+        Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
     /// MCP servers from TOML `[[mcp]]` config, attached to every new session.
     mcp_servers: Vec<McpServerConfig>,
     /// Runtime MCP attachment source (e.g., mobile in-process MCP peers).
@@ -171,6 +177,8 @@ impl AgentBuilder {
             dotagents_task_approver: None,
             workspace: None,
             workspace_service: None,
+            repository_knowledge: None,
+            repository_knowledge_registry: None,
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: None,
             agent_registry: None,
@@ -322,6 +330,36 @@ impl AgentBuilder {
     pub fn workspace_service(mut self, service: Arc<crate::worktree::WorkspaceService>) -> Self {
         self.workspace_service = Some(service);
         self
+    }
+
+    /// Configure portable repository knowledge (disabled unless `enabled`).
+    ///
+    /// Only host configuration can enable the feature. Setting this performs
+    /// no repository reads or writes; discovery happens lazily per session.
+    pub fn repository_knowledge(
+        mut self,
+        settings: crate::config::RepositoryKnowledgeSettings,
+    ) -> Self {
+        self.repository_knowledge = Some(settings);
+        self
+    }
+
+    /// Use a prebuilt repository knowledge registry instead of building one
+    /// from settings, for example one whose index lives in a chosen directory.
+    #[cfg(test)]
+    pub(crate) fn repository_knowledge_registry(
+        mut self,
+        registry: Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>,
+    ) -> Self {
+        self.repository_knowledge_registry = Some(registry);
+        self
+    }
+
+    /// Inspect the configured repository knowledge settings, if any.
+    pub fn configured_repository_knowledge(
+        &self,
+    ) -> Option<&crate::config::RepositoryKnowledgeSettings> {
+        self.repository_knowledge.as_ref()
     }
 
     /// Enable `.agents` loading with default discovery options.
@@ -595,10 +633,13 @@ impl AgentBuilder {
             let registry = crate::dotagents::DotagentsTargetRegistry::new(
                 &plans,
                 explicit_registry,
-                Arc::new(super::DotagentsTargetFactory::new(
-                    plugin_registry.clone(),
-                    backend.clone(),
-                )),
+                Arc::new(
+                    super::DotagentsTargetFactory::new(plugin_registry.clone(), backend.clone())
+                        .with_skills(
+                            self.skills_config.clone(),
+                            cwd.clone().unwrap_or_else(|| std::path::PathBuf::from(".")),
+                        ),
+                ),
             );
             for diagnostic in registry.diagnostics() {
                 log::warn!("dotagents: {diagnostic}");
@@ -623,6 +664,15 @@ impl AgentBuilder {
         if let Some(service) = workspace_service {
             builder = builder.with_workspace_service(service);
         }
+
+        // Repository knowledge: a lazy registry only when the host enabled it.
+        // Nothing is resolved, created or read until a session uses it.
+        let repository_knowledge = self.repository_knowledge_registry.clone().or_else(|| {
+            self.repository_knowledge
+                .as_ref()
+                .and_then(crate::knowledge::host::registry_from_settings)
+        });
+        builder = builder.with_repository_knowledge(repository_knowledge);
 
         // Wire schedule repository and knowledge store from the storage backend.
         // These are optional — backends that don't support them return None.
@@ -655,34 +705,19 @@ impl AgentBuilder {
                     .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME)))
         {
             let project_root = cwd.as_deref().unwrap_or_else(|| std::path::Path::new("."));
-            builder
-                .tool_registry_mut()
-                .add(crate::skills::build_skill_tool(
-                    &skills_config,
-                    project_root,
-                ));
+            builder = builder.with_skill_catalog(crate::skills::SkillCatalog::from_config(
+                &skills_config,
+                project_root,
+            ));
         }
 
         if !self.tools.is_empty() {
-            // Infer tool policy from the tools list:
-            // - If any tool spec looks like an external/MCP pattern (contains a
-            //   dot separator like "server.*" or "server.tool"), use
-            //   BuiltInAndProvider so MCP tool definitions reach the LLM.
-            // - Otherwise BuiltInOnly is sufficient.
-            //
-            // This handles both config-based MCP servers and preconnected
-            // runtime MCP peers (e.g. mobile in-process MCP), since the tools
-            // list already declares the intended tool scope.
-            let has_external_tools = self.tools.iter().any(|t| {
-                // MCP-style specs contain a dot: "server.*" or "server.tool_name"
-                // while builtins are plain names like "create_task", "read_tool".
-                t.is_mcp() || self.mcp_servers.iter().any(|m| t.is_builtin(m.name()))
-            });
-            let policy = if has_external_tools || !self.mcp_servers.is_empty() {
-                ToolPolicy::BuiltInAndProvider
-            } else {
-                ToolPolicy::BuiltInOnly
-            };
+            // Restricted tool lists infer the policy from the selectors and
+            // attached servers (see `infer_restricted_tool_policy`). This
+            // covers config-based MCP servers and preconnected runtime MCP
+            // peers (e.g. mobile in-process MCP).
+            let policy =
+                crate::agent::tools::infer_restricted_tool_policy(&self.tools, &self.mcp_servers);
             builder = builder
                 .with_tool_policy(policy)
                 .with_allowed_tools(self.tools.clone());
@@ -1582,6 +1617,9 @@ impl Agent {
         builder.hooks_config = Some(config.agent.hooks);
         if config.agent.workspace.enabled {
             builder.workspace = Some(config.agent.workspace);
+        }
+        if config.agent.repository_knowledge.enabled {
+            builder.repository_knowledge = Some(config.agent.repository_knowledge);
         }
 
         // Wire MCP servers from TOML `[[mcp]]` config.

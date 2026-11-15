@@ -1070,6 +1070,8 @@ Tool permission requests and form questions (elicitation) follow the same lifecy
 3. **Resolution.** The client's answer is submitted to the owning session. Only the first valid answer for an interaction is accepted; later answers get a not-pending or stale result. An invalid form answer is rejected, the tool keeps waiting and the question is re-delivered for correction.
 4. **Retirement.** Cancelling the run, or the tool exiting, retires the interaction. A late answer is rejected as not pending and a reconnect cannot revive it.
 
+Every form question that was announced with `ElicitationRequested` ends with exactly one durable `ElicitationResolved` event carrying the same `elicitation_id` and an outcome of `accepted`, `declined` or `cancelled`. Built-in questions and skill approvals also record the selected option labels. The content of MCP server elicitations is never recorded. ACP clients receive no notification for it; it is a journal record.
+
 Sessions and prompts carry no per-connection client bridge. `session/prompt` works the same for remote sessions as for local ones.
 
 **Unanswered permission waits.** A permission-required tool call that is not decided by a session allow, tool policy or hook waits for an explicit user answer. It is not granted because no client is attached, delivery failed, the client disconnected, the response timed out or the answer was malformed. The request stays pending and is delivered again to the next authorized client that attaches.
@@ -1425,7 +1427,10 @@ Enable detailed stream logging:
 
 ```bash
 # Enable mesh stream logging
-RUST_LOG=querymt_agent::agent::remote=debug cargo run --features remote -- --mesh
+RUST_LOG=querymt_agent_runtime::agent::remote=debug cargo run --features remote -- --mesh
+
+# Enable debug logging for every querymt-agent crate (prefix match)
+RUST_LOG=querymt_agent=debug cargo run --features remote -- --mesh
 
 # Enable all libp2p logging
 RUST_LOG=libp2p=info,querymt=debug cargo run --features remote -- --mesh

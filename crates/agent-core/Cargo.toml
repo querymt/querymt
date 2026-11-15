@@ -1,0 +1,51 @@
+[package]
+name = "querymt-agent-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bottom layer of the querymt agent: shared domain types, storage contracts and helpers"
+
+[lib]
+name = "querymt_agent_core"
+path = "src/lib.rs"
+
+[features]
+# Mocks and sample values for tests in the layers above (design D6).
+test-support = ["dep:mockall"]
+
+[dependencies]
+# `default-features = false`: core uses only `chat`, `providers` and `error`,
+# so this keeps `querymt/mcp` and `rmcp` out of the bottom layer.
+querymt = { path = "../querymt", default-features = false }
+agent-client-protocol = { workspace = true }
+anyhow = { workspace = true }
+async-trait.workspace = true
+base64.workspace = true
+dunce = "1"
+hex = "0.4"
+mockall = { workspace = true, optional = true }
+rapidhash = "4.2"
+rust-stemmers = { workspace = true }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11"
+stop-words = "0.10"
+thiserror = { workspace = true }
+time = { workspace = true, features = ["parsing"] }
+tokio = { version = "1.0", features = ["rt", "sync"] }
+typeshare.workspace = true
+uuid = { workspace = true }
+whatlang = "0.18"
+querymt-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+# querymt-workspace-hack is only there to unify features (cargo hakari).
+[lints.cargo]
+unused_dependencies = "allow"
+
+[dev-dependencies]
+qmt-openai = { path = "../providers/openai", default-features = false, features = ["api"] }
+mockall = { workspace = true }
+rmp-serde = "1.3"
+tempfile = "3.0"
+tokio = { version = "1.0", features = ["rt", "sync", "macros", "time"] }

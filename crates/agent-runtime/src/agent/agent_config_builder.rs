@@ -1,0 +1,1103 @@
+//! Builder for `AgentConfig`.
+//!
+//! `AgentConfigBuilder` is the direct replacement for the `QueryMTAgent` +
+//! `AgentBuilderExt` pattern. It constructs an `AgentConfig` without going
+//! through the old fat-struct intermediate.
+
+use crate::acp::protocol::AuthMethod;
+use crate::agent::agent_config::AgentConfig;
+use crate::agent::core::{
+    AgentMode, ClientState, DelegationContextConfig, DelegationContextTiming, SnapshotPolicy,
+    ToolConfig, ToolPolicy,
+};
+use crate::agent::session_mcp::{NoopSessionMcpAttachmentSource, SessionMcpAttachmentSource};
+use crate::config::{
+    CompactionConfig, DelegationWaitPolicy, McpServerConfig, Permissions, PruningConfig,
+    RateLimitConfig, RuntimeExecutionPolicy, ToolOutputConfig, ToolSpec,
+};
+use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
+use crate::hooks::Hooks;
+use crate::middleware::{
+    AgentModeMiddleware, ContextConfig, ContextMiddleware, DelegationConfig, DelegationMiddleware,
+    LimitsConfig, LimitsMiddleware, MiddlewareDriver,
+};
+use crate::session::backend::StorageBackend;
+use crate::session::compaction::SessionCompaction;
+use crate::session::projection::EventJournal;
+use crate::session::provider::SessionProvider;
+use crate::tools::ToolRegistry;
+use arc_swap::ArcSwap;
+use querymt::LLMParams;
+use querymt::plugin::host::PluginRegistry;
+use querymt_agent_index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
+use querymt_agent_services::event_fanout::EventFanout;
+use querymt_agent_services::event_sink::EventSink;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::Mutex;
+
+/// Builder that constructs an [`AgentConfig`] directly.
+///
+/// Replaces the old `QueryMTAgent` + `AgentBuilderExt` pattern: instead of
+/// building a fat intermediate struct that then copies ~25 fields into
+/// `AgentConfig`, callers use this builder and call `build()` to get the
+/// config directly.
+pub struct AgentConfigBuilder {
+    storage: Arc<dyn StorageBackend>,
+    provider: Arc<SessionProvider>,
+    event_journal: Arc<dyn EventJournal>,
+    event_fanout: Arc<EventFanout>,
+    default_mode: Arc<StdMutex<AgentMode>>,
+    max_steps: Option<usize>,
+    snapshot_policy: SnapshotPolicy,
+    permissions: Permissions,
+    max_prompt_bytes: Option<usize>,
+    tool_config: ToolConfig,
+    tool_registry: ToolRegistry,
+    skill_catalog: Option<Arc<crate::skills::SkillCatalog>>,
+    middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,
+    auth_methods: Vec<AuthMethod>,
+    agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
+    delegate_model_overrides: crate::delegation::DelegateModelOverrideStore,
+    delegation_context_config: DelegationContextConfig,
+    workspace_manager_actor: kameo::actor::ActorRef<WorkspaceIndexManagerActor>,
+    execution_timeout_secs: u64,
+    delegation_wait_policy: DelegationWaitPolicy,
+    delegation_wait_timeout_secs: u64,
+    delegation_cancel_grace_secs: u64,
+    execution_policy: RuntimeExecutionPolicy,
+    compaction: SessionCompaction,
+    snapshot_backend: Option<Arc<dyn querymt_agent_services::snapshot::SnapshotBackend>>,
+    snapshot_gc_config: querymt_agent_services::snapshot::GcConfig,
+    pending_elicitations: crate::elicitation::PendingElicitationMap,
+    mcp_servers: Vec<McpServerConfig>,
+    session_mcp_attachment_source: Arc<dyn SessionMcpAttachmentSource>,
+    schedule_repository: Option<Arc<dyn crate::session::repository::ScheduleRepository>>,
+    knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
+    slash_command_registry: crate::slash_commands::SlashCommandRegistry,
+    slash_commands_config: Option<crate::config::SlashCommandsConfig>,
+    hooks: Hooks,
+    workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    repository_knowledge: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
+}
+
+impl AgentConfigBuilder {
+    /// Create a new builder with the required infrastructure.
+    ///
+    /// Registers all built-in tools in the default tool registry.
+    pub fn new(
+        plugin_registry: Arc<PluginRegistry>,
+        storage: Arc<dyn StorageBackend>,
+        initial_config: LLMParams,
+    ) -> Self {
+        let provider = Arc::new(SessionProvider::new(
+            Arc::clone(&plugin_registry),
+            storage.session_store(),
+            initial_config,
+        ));
+        let event_journal = storage.event_journal();
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.extend(crate::agent::builtin_tools::all_builtin_tools());
+
+        Self {
+            storage: storage.clone(),
+            provider,
+            event_journal,
+            event_fanout: Arc::new(EventFanout::new()),
+            default_mode: Arc::new(StdMutex::new(AgentMode::Build)),
+            max_steps: None,
+            snapshot_policy: SnapshotPolicy::None,
+            permissions: Permissions::default(),
+            max_prompt_bytes: None,
+            tool_config: ToolConfig::default(),
+            tool_registry,
+            skill_catalog: None,
+            middleware_drivers: Vec::new(),
+            auth_methods: Vec::new(),
+            agent_registry: Arc::new(DefaultAgentRegistry::new()),
+            delegate_model_overrides: crate::delegation::DelegateModelOverrideStore::default(),
+            delegation_context_config: DelegationContextConfig {
+                timing: DelegationContextTiming::FirstTurnOnly,
+                auto_inject: true,
+            },
+            workspace_manager_actor: WorkspaceIndexManagerActor::new(
+                WorkspaceIndexManagerConfig::default(),
+            ),
+            execution_timeout_secs: 300,
+            delegation_wait_policy: DelegationWaitPolicy::default(),
+            delegation_wait_timeout_secs: 120,
+            delegation_cancel_grace_secs: 5,
+            execution_policy: RuntimeExecutionPolicy::default(),
+            compaction: SessionCompaction::new(),
+            snapshot_backend: None,
+            snapshot_gc_config: querymt_agent_services::snapshot::GcConfig::default(),
+            pending_elicitations: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            mcp_servers: Vec::new(),
+            session_mcp_attachment_source: Arc::new(NoopSessionMcpAttachmentSource),
+            schedule_repository: storage.schedule_repository(),
+            knowledge_store: storage.knowledge_store(),
+            slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
+            slash_commands_config: None,
+            hooks: Hooks::disabled(),
+            workspace_service: None,
+            repository_knowledge: None,
+        }
+    }
+
+    /// Create a builder from a pre-built [`SessionProvider`] and event journal.
+    ///
+    /// Use this when you already have a `SessionProvider` (e.g. with a mock
+    /// store or a custom LLM provider) and want builder defaults for
+    /// everything else.  Does **not** register built-in tools — call
+    /// [`with_tool_registry`] if you need them.
+    pub fn from_provider(
+        storage: Arc<dyn StorageBackend>,
+        provider: Arc<SessionProvider>,
+        event_journal: Arc<dyn EventJournal>,
+    ) -> Self {
+        Self {
+            storage: storage.clone(),
+            provider,
+            event_journal,
+            event_fanout: Arc::new(EventFanout::new()),
+            default_mode: Arc::new(StdMutex::new(AgentMode::Build)),
+            max_steps: None,
+            snapshot_policy: SnapshotPolicy::None,
+            permissions: Permissions::default(),
+            max_prompt_bytes: None,
+            tool_config: ToolConfig::default(),
+            tool_registry: ToolRegistry::new(),
+            skill_catalog: None,
+            middleware_drivers: Vec::new(),
+            auth_methods: Vec::new(),
+            agent_registry: Arc::new(DefaultAgentRegistry::new()),
+            delegate_model_overrides: crate::delegation::DelegateModelOverrideStore::default(),
+            delegation_context_config: DelegationContextConfig {
+                timing: DelegationContextTiming::FirstTurnOnly,
+                auto_inject: true,
+            },
+            workspace_manager_actor: WorkspaceIndexManagerActor::new(
+                WorkspaceIndexManagerConfig::default(),
+            ),
+            execution_timeout_secs: 300,
+            delegation_wait_policy: DelegationWaitPolicy::default(),
+            delegation_wait_timeout_secs: 120,
+            delegation_cancel_grace_secs: 5,
+            execution_policy: RuntimeExecutionPolicy::default(),
+            compaction: SessionCompaction::new(),
+            snapshot_backend: None,
+            snapshot_gc_config: querymt_agent_services::snapshot::GcConfig::default(),
+            pending_elicitations: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            mcp_servers: Vec::new(),
+            session_mcp_attachment_source: Arc::new(NoopSessionMcpAttachmentSource),
+            schedule_repository: storage.schedule_repository(),
+            knowledge_store: storage.knowledge_store(),
+            slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
+            slash_commands_config: None,
+            hooks: Hooks::disabled(),
+            workspace_service: None,
+            repository_knowledge: None,
+        }
+    }
+
+    /// Build the final [`AgentConfig`].
+    pub fn build(self) -> AgentConfig {
+        let event_sink = Arc::new(EventSink::new(
+            self.event_journal.clone(),
+            self.event_fanout.clone(),
+        ));
+        let tool_registry = Arc::new(self.tool_registry);
+        for driver in &self.middleware_drivers {
+            driver.bind_agent(&tool_registry, &event_sink);
+        }
+        AgentConfig {
+            provider: self.provider,
+            storage: self.storage,
+            event_sink,
+            agent_registry: self.agent_registry,
+            delegate_model_overrides: self.delegate_model_overrides,
+            workspace_manager_actor: self.workspace_manager_actor,
+            session_bridges: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            default_mode: self.default_mode,
+            default_reasoning_effort: Arc::new(ArcSwap::from_pointee(None)),
+            tool_config: self.tool_config,
+            tool_registry,
+            skill_catalog: self.skill_catalog,
+            middleware_drivers: self.middleware_drivers,
+            auth_methods: self.auth_methods,
+            max_steps: self.max_steps,
+            snapshot_policy: self.snapshot_policy,
+            permissions: self.permissions,
+            max_prompt_bytes: self.max_prompt_bytes,
+            execution_timeout_secs: self.execution_timeout_secs,
+            delegation_wait_policy: self.delegation_wait_policy,
+            delegation_wait_timeout_secs: self.delegation_wait_timeout_secs,
+            delegation_cancel_grace_secs: self.delegation_cancel_grace_secs,
+            execution_policy: self.execution_policy,
+            compaction: self.compaction,
+            snapshot_backend: self.snapshot_backend,
+            snapshot_gc_config: self.snapshot_gc_config,
+            delegation_context_config: self.delegation_context_config,
+            pending_elicitations: self.pending_elicitations,
+            mcp_servers: self.mcp_servers,
+            session_mcp_attachment_source: self.session_mcp_attachment_source,
+            schedule_repository: self.schedule_repository,
+            knowledge_store: self.knowledge_store,
+            todo_store: Arc::new(crate::tools::builtins::todo::TodoStore::new()),
+            slash_command_registry: self.slash_command_registry,
+            slash_commands_config: self.slash_commands_config,
+            hooks: self.hooks,
+            workspace_service: self.workspace_service,
+            repository_knowledge: self.repository_knowledge,
+        }
+    }
+
+    // ── Template context ──────────────────────────────────────────────────
+
+    /// Use a caller-provided live event bus instead of creating an isolated fanout.
+    pub fn with_event_fanout(mut self, event_fanout: Arc<EventFanout>) -> Self {
+        self.event_fanout = event_fanout;
+        self
+    }
+
+    /// Set the agent ID used for `{{ agent_id }}` template resolution in
+    /// system prompts.  Must be called before `build()` and before the
+    /// `Arc<SessionProvider>` is shared (i.e. while refcount is 1).
+    pub fn with_agent_id(mut self, id: impl Into<String>) -> Self {
+        if let Some(provider) = Arc::get_mut(&mut self.provider) {
+            provider.agent_id = Some(id.into());
+        }
+        self
+    }
+
+    // ── Delegation ────────────────────────────────────────────────────────
+
+    /// Sets the agent registry for delegation functionality.
+    ///
+    /// Also auto-registers `DelegationMiddleware` when the registry is non-empty
+    /// and `auto_inject` is enabled.
+    pub fn with_agent_registry(mut self, registry: Arc<dyn AgentRegistry + Send + Sync>) -> Self {
+        self.agent_registry = registry.clone();
+
+        // Remove old DelegateTool and add new one with registry
+        self.tool_registry.remove("delegate");
+        self.tool_registry
+            .add(Arc::new(crate::agent::builtin_tools::DelegateTool::new()));
+
+        if self.delegation_context_config.auto_inject && !registry.list_agents().is_empty() {
+            let middleware = DelegationMiddleware::new(
+                self.provider.history_store(),
+                registry,
+                DelegationConfig {
+                    context_timing: self.delegation_context_config.timing,
+                    prevent_duplicates: false,
+                    auto_inject: true,
+                },
+            );
+            self.middleware_drivers.push(Arc::new(middleware));
+        }
+
+        self
+    }
+
+    /// Sets the agent registry without auto-registering `DelegateTool` or
+    /// `DelegationMiddleware`. Use this when you wire delegation externally
+    /// (e.g. via a `DelegationOrchestrator` added as an observer).
+    pub fn with_agent_registry_only(
+        mut self,
+        registry: Arc<dyn AgentRegistry + Send + Sync>,
+    ) -> Self {
+        self.agent_registry = registry;
+        self
+    }
+
+    pub fn with_delegate_model_overrides(
+        mut self,
+        overrides: crate::delegation::DelegateModelOverrideStore,
+    ) -> Self {
+        self.delegate_model_overrides = overrides;
+        self
+    }
+
+    /// Sets the delegation context timing.
+    pub fn with_delegation_context_timing(mut self, timing: DelegationContextTiming) -> Self {
+        self.delegation_context_config.timing = timing;
+        self
+    }
+
+    /// Enables or disables auto delegation context injection.
+    pub fn with_auto_delegation_context(mut self, enabled: bool) -> Self {
+        self.delegation_context_config.auto_inject = enabled;
+        self
+    }
+
+    /// Sets the delegation context config directly.
+    pub fn with_delegation_context_config(mut self, config: DelegationContextConfig) -> Self {
+        self.delegation_context_config = config;
+        self
+    }
+
+    // ── Execution limits ──────────────────────────────────────────────────
+
+    /// Sets the maximum number of execution steps.
+    pub fn with_max_steps(mut self, max_steps: usize) -> Self {
+        self.max_steps = Some(max_steps);
+        self
+    }
+
+    /// Sets the maximum prompt size in bytes.
+    pub fn with_max_prompt_bytes(mut self, bytes: usize) -> Self {
+        self.max_prompt_bytes = Some(bytes);
+        self
+    }
+
+    /// Sets the execution timeout in seconds.
+    pub fn with_execution_timeout_secs(mut self, secs: u64) -> Self {
+        self.execution_timeout_secs = secs;
+        self
+    }
+
+    /// Configure delegation wait behavior for this agent.
+    pub fn with_delegation_wait_policy(mut self, policy: DelegationWaitPolicy) -> Self {
+        self.delegation_wait_policy = policy;
+        self
+    }
+
+    /// Configure timeout used when waiting for delegated work.
+    pub fn with_delegation_wait_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.delegation_wait_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Configure cancellation grace period for timed-out delegation cleanup.
+    pub fn with_delegation_cancel_grace_secs(mut self, grace_secs: u64) -> Self {
+        self.delegation_cancel_grace_secs = grace_secs;
+        self
+    }
+
+    // ── Middleware ─────────────────────────────────────────────────────────
+
+    /// Adds limits middleware.
+    pub fn with_limits(mut self, config: LimitsConfig) -> Self {
+        self.middleware_drivers
+            .push(Arc::new(LimitsMiddleware::new(config)));
+        self
+    }
+
+    /// Adds context management middleware.
+    pub fn with_context_management(mut self, config: ContextConfig) -> Self {
+        self.middleware_drivers
+            .push(Arc::new(ContextMiddleware::new(config)));
+        self
+    }
+
+    /// Adds delegation middleware.
+    pub fn with_delegation(mut self, config: DelegationConfig) -> Self {
+        let middleware = DelegationMiddleware::new(
+            self.provider.history_store(),
+            self.agent_registry.clone(),
+            config,
+        );
+        self.middleware_drivers.push(Arc::new(middleware));
+        self
+    }
+
+    /// Adds a single middleware.
+    pub fn with_middleware<M: MiddlewareDriver + 'static>(mut self, middleware: M) -> Self {
+        self.middleware_drivers.push(Arc::new(middleware));
+        self
+    }
+
+    /// Adds multiple middlewares.
+    pub fn with_middlewares(mut self, middlewares: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
+        self.middleware_drivers.extend(middlewares);
+        self
+    }
+
+    /// Adds agent mode middleware with a custom plan-mode reminder.
+    pub fn with_agent_mode_middleware<T: Into<String>>(mut self, reminder: T) -> Self {
+        self.middleware_drivers
+            .push(Arc::new(AgentModeMiddleware::new(reminder.into())));
+        self
+    }
+
+    // ── Auth ──────────────────────────────────────────────────────────────
+
+    /// Sets authentication methods.
+    pub fn with_auth_methods<I>(mut self, methods: I) -> Self
+    where
+        I: IntoIterator<Item = AuthMethod>,
+    {
+        self.auth_methods = methods.into_iter().collect();
+        self
+    }
+
+    /// Sets the client state.
+    pub fn with_client_state(self, _state: ClientState) -> Self {
+        // ClientState lives on AgentHandle (connection level), not AgentConfig.
+        // Accept the call for API compatibility but do nothing here.
+        self
+    }
+
+    // ── Snapshot ──────────────────────────────────────────────────────────
+
+    /// Sets the snapshot policy.
+    pub fn with_snapshot_policy(mut self, policy: SnapshotPolicy) -> Self {
+        self.snapshot_policy = policy;
+        self
+    }
+
+    /// Sets the snapshot backend for undo/redo support.
+    pub fn with_snapshot_backend(
+        mut self,
+        backend: Arc<dyn querymt_agent_services::snapshot::SnapshotBackend>,
+    ) -> Self {
+        self.snapshot_backend = Some(backend);
+        self
+    }
+
+    /// Sets the snapshot GC configuration.
+    pub fn with_snapshot_gc_config(
+        mut self,
+        config: querymt_agent_services::snapshot::GcConfig,
+    ) -> Self {
+        self.snapshot_gc_config = config;
+        self
+    }
+
+    // ── MCP servers ───────────────────────────────────────────────────────
+
+    /// Sets the MCP servers to attach to every new session (from TOML `[[mcp]]` config).
+    pub fn with_mcp_servers(mut self, servers: Vec<McpServerConfig>) -> Self {
+        self.mcp_servers = servers;
+        self
+    }
+
+    // ── Session MCP attachment source ──────────────────────────────────────
+
+    /// Sets the source of runtime MCP attachments (e.g., mobile in-process MCP
+    /// peers) that should be added to every session materialized on this node.
+    ///
+    /// Defaults to [`NoopSessionMcpAttachmentSource`] if not called.
+    pub fn with_session_mcp_attachment_source(
+        mut self,
+        source: Arc<dyn SessionMcpAttachmentSource>,
+    ) -> Self {
+        self.session_mcp_attachment_source = source;
+        self
+    }
+
+    // ── Scheduling & Knowledge ────────────────────────────────────────────
+
+    /// Set the schedule repository (from storage backend).
+    pub fn with_schedule_repository(
+        mut self,
+        repo: Arc<dyn crate::session::repository::ScheduleRepository>,
+    ) -> Self {
+        self.schedule_repository = Some(repo);
+        self
+    }
+
+    /// Set the knowledge store (from storage backend).
+    pub fn with_knowledge_store(
+        mut self,
+        store: Arc<dyn crate::knowledge::KnowledgeStore>,
+    ) -> Self {
+        self.knowledge_store = Some(store);
+        self
+    }
+
+    /// Set the slash command registry.
+    pub fn with_slash_command_registry(
+        mut self,
+        registry: crate::slash_commands::SlashCommandRegistry,
+    ) -> Self {
+        self.slash_command_registry = registry;
+        self
+    }
+
+    /// Set the hooks runtime.
+    pub fn with_hooks(mut self, hooks: Hooks) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    /// Retain the slash command discovery configuration alongside the built
+    /// registry so workspace-bound sessions can re-resolve prompt sources
+    /// from their bound checkout.
+    pub fn with_slash_commands_config(
+        mut self,
+        config: Option<crate::config::SlashCommandsConfig>,
+    ) -> Self {
+        self.slash_commands_config = config;
+        self
+    }
+
+    /// Set the managed Git worktree workspace service.
+    ///
+    /// When configured, new sessions may request isolated worktree execution
+    /// and load/resume resolve persisted workspace bindings before startup.
+    /// Omitted (default): every session executes locally.
+    pub fn with_workspace_service(
+        mut self,
+        service: Arc<crate::worktree::WorkspaceService>,
+    ) -> Self {
+        self.workspace_service = Some(service);
+        self
+    }
+
+    /// Bind portable repository knowledge. Pass the registry only when the
+    /// host enabled the feature; omitted (default) means no repository reads,
+    /// writes, tools, or prompt changes. Nothing is resolved or opened here.
+    pub fn with_repository_knowledge(
+        mut self,
+        registry: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
+    ) -> Self {
+        // The repository tools exist only while the feature is enabled, so a
+        // disabled configuration advertises nothing new to the model.
+        if registry.is_some() {
+            self.tool_registry
+                .extend(crate::tools::builtins::repository_knowledge_tools());
+        } else {
+            for name in crate::tools::builtins::REPOSITORY_TOOL_NAMES {
+                self.tool_registry.remove(name);
+            }
+        }
+        self.repository_knowledge = registry;
+        self
+    }
+
+    // ── Tools ─────────────────────────────────────────────────────────────
+
+    /// Sets the tool policy.
+    pub fn with_tool_policy(mut self, policy: ToolPolicy) -> Self {
+        self.tool_config.policy = policy;
+        self
+    }
+
+    /// Sets the tool configuration.
+    pub fn with_tool_config(mut self, config: ToolConfig) -> Self {
+        self.tool_config = config;
+        self
+    }
+
+    /// Sets the tool registry (replaces the default one).
+    pub fn with_tool_registry(mut self, registry: ToolRegistry) -> Self {
+        self.tool_registry = registry;
+        self
+    }
+
+    /// Sets the allowlist; only tools matched by these selectors are available.
+    pub fn with_allowed_tools(mut self, tools: impl IntoIterator<Item = ToolSpec>) -> Self {
+        self.tool_config.allow = Some(tools.into_iter().collect());
+        self
+    }
+
+    /// Sets the deny list; tools matched by these selectors are never available.
+    pub fn with_denied_tools(mut self, tools: impl IntoIterator<Item = ToolSpec>) -> Self {
+        self.tool_config.deny = tools.into_iter().collect();
+        self
+    }
+
+    /// Sets the tool approval policy.
+    pub fn with_permissions(mut self, permissions: Permissions) -> Self {
+        self.permissions = permissions;
+        self
+    }
+
+    // ── Compaction ────────────────────────────────────────────────────────
+
+    /// Sets the full execution policy at once (tool output, pruning, compaction, rate limit).
+    pub fn with_execution_policy(mut self, policy: RuntimeExecutionPolicy) -> Self {
+        self.execution_policy = policy;
+        self
+    }
+
+    /// Sets the tool output truncation configuration (Layer 1).
+    pub fn with_tool_output_config(mut self, config: ToolOutputConfig) -> Self {
+        self.execution_policy.tool_output = config;
+        self
+    }
+
+    /// Sets the pruning configuration (Layer 2).
+    pub fn with_pruning_config(mut self, config: PruningConfig) -> Self {
+        self.execution_policy.pruning = config;
+        self
+    }
+
+    /// Sets the AI compaction configuration (Layer 3).
+    pub fn with_compaction_config(mut self, config: CompactionConfig) -> Self {
+        self.execution_policy.compaction = config;
+        self
+    }
+
+    /// Enables full compaction with default settings.
+    pub fn with_compaction_enabled(self) -> Self {
+        self.with_pruning_config(PruningConfig::default())
+            .with_compaction_config(CompactionConfig::default())
+    }
+
+    // ── Rate limiting ─────────────────────────────────────────────────────
+
+    /// Sets the rate limit retry configuration.
+    pub fn with_rate_limit_config(mut self, config: RateLimitConfig) -> Self {
+        self.execution_policy.rate_limit = config;
+        self
+    }
+
+    // ── Mode ──────────────────────────────────────────────────────────────
+
+    /// Sets the initial agent mode.
+    pub fn with_agent_mode(self, mode: AgentMode) -> Self {
+        *self
+            .default_mode
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = mode;
+        self
+    }
+
+    // ── Remote mesh routing ───────────────────────────────────────────────────
+
+    // ── Internal accessors (used by simple::agent and quorum) ─────────────
+
+    /// Read the current `event_journal`.
+    pub fn event_journal(&self) -> Arc<dyn EventJournal> {
+        self.event_journal.clone()
+    }
+
+    /// Read the current `compaction_config` (for auto-ContextMiddleware check).
+    pub fn compaction_config(&self) -> &CompactionConfig {
+        &self.execution_policy.compaction
+    }
+
+    /// Read the current `default_mode` (for AgentHandle construction).
+    pub fn default_mode_value(&self) -> AgentMode {
+        self.default_mode
+            .lock()
+            .map(|m| *m)
+            .unwrap_or(AgentMode::Build)
+    }
+
+    /// Extend the tool registry with additional tools.
+    pub fn extend_tool_registry(
+        &mut self,
+        tools: impl IntoIterator<Item = Arc<dyn crate::tools::Tool>>,
+    ) {
+        for tool in tools {
+            self.tool_registry.add(tool);
+        }
+    }
+
+    /// Offer the session-owned `skill` tool backed by `catalog`.
+    pub fn with_skill_catalog(mut self, catalog: Arc<crate::skills::SkillCatalog>) -> Self {
+        self.skill_catalog = Some(catalog);
+        self
+    }
+
+    /// Mutably access the tool registry (for adding tools during build).
+    pub fn tool_registry_mut(&mut self) -> &mut ToolRegistry {
+        &mut self.tool_registry
+    }
+
+    /// Mutably push a middleware driver (for quorum helper function).
+    pub fn push_middleware(&mut self, driver: Arc<dyn MiddlewareDriver>) {
+        self.middleware_drivers.push(driver);
+    }
+
+    /// Clone of the middleware drivers pushed so far.
+    pub fn middleware_snapshot(&self) -> Vec<Arc<dyn MiddlewareDriver>> {
+        self.middleware_drivers.clone()
+    }
+
+    /// Clone of the current tool registry.
+    pub fn tool_registry_snapshot(&self) -> ToolRegistry {
+        self.tool_registry.clone()
+    }
+
+    /// Borrow the `SessionProvider` (used by `DelegationMiddleware` constructor in quorum).
+    pub fn provider(&self) -> &Arc<SessionProvider> {
+        &self.provider
+    }
+
+    /// Borrow the `StorageBackend` used to build this config.
+    pub fn storage(&self) -> &Arc<dyn StorageBackend> {
+        &self.storage
+    }
+
+    /// Borrow the `agent_registry` (used by `DelegationMiddleware` constructor in quorum).
+    pub fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
+        self.agent_registry.clone()
+    }
+
+    /// Borrow the `delegation_context_config` (used when building DelegationMiddleware).
+    pub fn delegation_context_config(&self) -> &DelegationContextConfig {
+        &self.delegation_context_config
+    }
+
+    /// Apply execution policy and snapshot backend from an `ExecutionPolicy`.
+    ///
+    /// Sets the runtime execution policy and, if the snapshot backend is "git",
+    /// wires up a `GitSnapshotBackend`. This replaces 4+ copy-pasted match blocks.
+    pub fn with_snapshot_from_execution(mut self, exec: &crate::config::ExecutionPolicy) -> Self {
+        self = self.with_execution_policy(RuntimeExecutionPolicy::from(exec));
+        match exec.snapshot.backend.as_str() {
+            "git" => {
+                use querymt_agent_services::snapshot::git::GitSnapshotBackend;
+                self.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()))
+                    .with_snapshot_gc_config(querymt_agent_services::snapshot::GcConfig::from(
+                        &exec.snapshot,
+                    ))
+            }
+            "none" | "" => self,
+            other => {
+                tracing::warn!(backend = other, "unknown snapshot backend, ignoring");
+                self
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::core::{AgentMode, SnapshotPolicy, ToolPolicy};
+    use crate::config::PruningConfig;
+    use crate::config::ToolRef;
+    use crate::session::sqlite_storage::SqliteStorage;
+    use crate::test_utils::helpers::empty_plugin_registry;
+    use querymt::LLMParams;
+    use std::sync::Arc;
+
+    async fn make_builder() -> (AgentConfigBuilder, tempfile::TempDir) {
+        let (registry, temp_dir) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let llm = LLMParams::new().provider("mock").model("mock-model");
+        let builder = AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm);
+        (builder, temp_dir)
+    }
+
+    // ── Defaults ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn default_mode_is_build() {
+        let (builder, _td) = make_builder().await;
+        assert_eq!(builder.default_mode_value(), AgentMode::Build);
+    }
+
+    #[tokio::test]
+    async fn default_tool_registry_has_builtin_tools() {
+        let (builder, _td) = make_builder().await;
+        let config = builder.build();
+        // Built-in tools should include at minimum "shell", "read_tool", etc.
+        let names: Vec<_> = config
+            .tool_registry
+            .definitions()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
+        assert!(!names.is_empty(), "default tool registry should have tools");
+    }
+
+    #[tokio::test]
+    async fn repository_tools_are_registered_only_when_the_feature_is_enabled() {
+        use crate::config::RepositoryKnowledgeSettings;
+        use crate::tools::builtins::REPOSITORY_TOOL_NAMES;
+
+        let names_of =
+            |config: &crate::agent::agent_config::AgentConfig| config.tool_registry.names();
+
+        let (builder, _td) = make_builder().await;
+        let default_names = names_of(&builder.build());
+        for name in REPOSITORY_TOOL_NAMES {
+            assert!(!default_names.contains(&name.to_string()), "{name}");
+        }
+
+        let registry =
+            crate::knowledge::host::registry_from_settings(&RepositoryKnowledgeSettings::enabled());
+        assert!(registry.is_some());
+        let (builder, _td) = make_builder().await;
+        let enabled = builder.with_repository_knowledge(registry);
+        let enabled_names = names_of(&enabled.build());
+        for name in REPOSITORY_TOOL_NAMES {
+            assert!(enabled_names.contains(&name.to_string()), "{name}");
+        }
+
+        // Disabling again removes them; disabled settings yield no registry.
+        let (builder, _td) = make_builder().await;
+        let registry =
+            crate::knowledge::host::registry_from_settings(&RepositoryKnowledgeSettings::enabled());
+        let off = builder
+            .with_repository_knowledge(registry)
+            .with_repository_knowledge(None);
+        let off_names = names_of(&off.build());
+        for name in REPOSITORY_TOOL_NAMES {
+            assert!(!off_names.contains(&name.to_string()), "{name}");
+        }
+    }
+
+    /// Scenario "Profile allowlists only repository tools": with an allowlist
+    /// naming only the repository tools, those are registered and allowed at
+    /// runtime, while the registered session-memory tools stay unavailable.
+    #[tokio::test]
+    async fn an_allowlist_of_repository_tools_keeps_session_memory_tools_unavailable() {
+        use crate::config::{RepositoryKnowledgeSettings, ToolRef, ToolSpec};
+        use crate::tools::builtins::REPOSITORY_TOOL_NAMES;
+
+        let (builder, _td) = make_builder().await;
+        let config = builder
+            .with_repository_knowledge(crate::knowledge::host::registry_from_settings(
+                &RepositoryKnowledgeSettings::enabled(),
+            ))
+            .with_allowed_tools(
+                REPOSITORY_TOOL_NAMES
+                    .iter()
+                    .map(|name| ToolSpec::Builtin(name.to_string())),
+            )
+            .build();
+
+        for name in REPOSITORY_TOOL_NAMES {
+            assert!(
+                config.tool_registry.find(name).is_some(),
+                "{name} registered"
+            );
+            assert!(
+                config.is_tool_allowed(ToolRef::builtin(name)),
+                "{name} allowed"
+            );
+        }
+        for name in [
+            "knowledge_query",
+            "knowledge_list_unconsolidated",
+            "knowledge_stats",
+            "knowledge_ingest",
+            "knowledge_consolidate",
+        ] {
+            assert!(
+                !config.is_tool_allowed(ToolRef::builtin(name)),
+                "{name} must stay unavailable"
+            );
+        }
+        assert!(crate::agent::repository_delivery::policy_applies(&config));
+    }
+
+    // ── Builder setters ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn with_agent_mode_overrides_default() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_agent_mode(AgentMode::Plan);
+        assert_eq!(builder.default_mode_value(), AgentMode::Plan);
+    }
+
+    #[tokio::test]
+    async fn with_max_steps_sets_value() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_max_steps(42);
+        let config = builder.build();
+        assert_eq!(config.max_steps, Some(42));
+    }
+
+    #[tokio::test]
+    async fn with_max_prompt_bytes_sets_value() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_max_prompt_bytes(8192);
+        let config = builder.build();
+        assert_eq!(config.max_prompt_bytes, Some(8192));
+    }
+
+    #[tokio::test]
+    async fn with_snapshot_policy_sets_value() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_snapshot_policy(SnapshotPolicy::Diff);
+        let config = builder.build();
+        assert_eq!(config.snapshot_policy, SnapshotPolicy::Diff);
+    }
+
+    #[tokio::test]
+    async fn with_tool_policy_changes_policy() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_tool_policy(ToolPolicy::BuiltInOnly);
+        let config = builder.build();
+        assert_eq!(config.tool_config.policy, ToolPolicy::BuiltInOnly);
+    }
+
+    #[tokio::test]
+    async fn with_allowed_tools_sets_allowlist() {
+        let (builder, _td) = make_builder().await;
+        let builder =
+            builder.with_allowed_tools(["shell".parse().unwrap(), "read_tool".parse().unwrap()]);
+        let config = builder.build();
+        let allow = config.tool_config.allow.unwrap();
+        assert!(allow.contains(ToolRef::builtin("shell")));
+        assert!(allow.contains(ToolRef::builtin("read_tool")));
+        assert!(!allow.contains(ToolRef::builtin("delete_file")));
+    }
+
+    #[tokio::test]
+    async fn with_denied_tools_sets_denylist() {
+        let (builder, _td) = make_builder().await;
+        let builder =
+            builder.with_denied_tools(["shell".parse().unwrap(), "github.*".parse().unwrap()]);
+        let config = builder.build();
+        assert!(config.tool_config.deny.contains(ToolRef::builtin("shell")));
+        assert!(
+            config
+                .tool_config
+                .deny
+                .contains(ToolRef::mcp("github", "x"))
+        );
+    }
+
+    #[tokio::test]
+    async fn with_compaction_enabled_sets_defaults() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_compaction_enabled();
+        let config = builder.build();
+        // Should have a non-default compaction config
+        let _ = config.execution_policy.compaction;
+        let _ = config.execution_policy.pruning;
+        // Just confirm build succeeds
+    }
+
+    #[tokio::test]
+    async fn with_pruning_config_sets_value() {
+        let (builder, _td) = make_builder().await;
+        let pruning = PruningConfig::default();
+        let builder = builder.with_pruning_config(pruning);
+        let config = builder.build();
+        let _ = config.execution_policy.pruning;
+    }
+
+    #[tokio::test]
+    async fn with_permissions_sets_policy() {
+        let (builder, _td) = make_builder().await;
+        let perms = Permissions::new()
+            .ask(["shell".parse().unwrap()])
+            .timeout(std::time::Duration::from_secs(5));
+        let config = builder.with_permissions(perms.clone()).build();
+        assert_eq!(config.permissions, perms);
+    }
+
+    // ── build() produces valid AgentConfig ──────────────────────────────────
+
+    #[tokio::test]
+    async fn build_produces_valid_config_with_defaults() {
+        let (builder, _td) = make_builder().await;
+        let config = builder.build();
+        // Default execution timeout
+        assert_eq!(config.execution_timeout_secs, 300);
+        // Default: no max steps
+        assert!(config.max_steps.is_none());
+        // Default: no max prompt bytes
+        assert!(config.max_prompt_bytes.is_none());
+        // Default: snapshot disabled
+        assert_eq!(config.snapshot_policy, SnapshotPolicy::None);
+    }
+
+    #[tokio::test]
+    async fn event_journal_accessor_works() {
+        let (builder, _td) = make_builder().await;
+        let journal = builder.event_journal();
+        // Just verify we get an Arc back
+        let _ = Arc::strong_count(&journal);
+    }
+
+    #[tokio::test]
+    async fn provider_accessor_works() {
+        let (builder, _td) = make_builder().await;
+        let _provider = builder.provider();
+    }
+
+    // ── Middleware integration ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn with_middleware_adds_to_chain() {
+        use crate::middleware::{LimitsConfig, LimitsMiddleware};
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_middleware(LimitsMiddleware::new(LimitsConfig::default()));
+        let config = builder.build();
+        assert_eq!(config.middleware_drivers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn with_middlewares_adds_multiple() {
+        use crate::middleware::{LimitsConfig, LimitsMiddleware};
+        let (builder, _td) = make_builder().await;
+        let drivers: Vec<Arc<dyn MiddlewareDriver>> = vec![
+            Arc::new(LimitsMiddleware::new(LimitsConfig::default())),
+            Arc::new(LimitsMiddleware::new(LimitsConfig::default())),
+        ];
+        let builder = builder.with_middlewares(drivers);
+        let config = builder.build();
+        assert_eq!(config.middleware_drivers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_driver_from_config_with_max_steps() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_max_steps(50);
+        let config = builder.build();
+        let _driver = config.create_driver();
+    }
+
+    // ── MCP servers ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn with_mcp_servers_stores_and_builds() {
+        let (builder, _td) = make_builder().await;
+        let servers = vec![
+            McpServerConfig::http("test-server", "https://mcp.example.com/mcp").with_headers(
+                std::collections::HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer token".to_string(),
+                )]),
+            ),
+            McpServerConfig::stdio("local-server", "npx").with_args(["-y", "@example/mcp-server"]),
+        ];
+        let builder = builder.with_mcp_servers(servers);
+        let config = builder.build();
+        assert_eq!(config.mcp_servers.len(), 2);
+        assert!(
+            matches!(&config.mcp_servers[0], McpServerConfig::Http { name, .. } if name == "test-server")
+        );
+        assert!(
+            matches!(&config.mcp_servers[1], McpServerConfig::Stdio { name, .. } if name == "local-server")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_servers_empty_by_default() {
+        let (builder, _td) = make_builder().await;
+        let config = builder.build();
+        assert!(config.mcp_servers.is_empty());
+    }
+
+    // ── Snapshot retention ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn configured_retention_reaches_the_snapshot_store() {
+        use crate::config::ExecutionPolicy;
+        use querymt_agent_services::snapshot::GcConfig;
+        use std::num::{NonZeroU64, NonZeroUsize};
+
+        let mut exec = ExecutionPolicy::default();
+        exec.snapshot.backend = "git".to_string();
+        exec.snapshot.max_snapshots = NonZeroUsize::new(5);
+        exec.snapshot.max_age_days = NonZeroU64::new(2);
+        let (builder, _td) = make_builder().await;
+        let config = builder.with_snapshot_from_execution(&exec).build();
+        assert_eq!(
+            config.snapshot_gc_config,
+            GcConfig {
+                max_snapshots: NonZeroUsize::new(5),
+                max_age_days: NonZeroU64::new(2),
+            }
+        );
+
+        let mut unset = ExecutionPolicy::default();
+        unset.snapshot.backend = "git".to_string();
+        let (builder, _td) = make_builder().await;
+        let config = builder.with_snapshot_from_execution(&unset).build();
+        assert_eq!(config.snapshot_gc_config, GcConfig::default());
+        assert!(!config.snapshot_gc_config.is_enabled());
+    }
+}

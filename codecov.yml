@@ -1,0 +1,27 @@
+# Agent packages are tested selectively (scripts/ci-agent-affected.sh): a pull
+# request only uploads the packages its change reaches. `carryforward` keeps the
+# last known coverage of the others, so skipped packages do not read as 0%.
+flag_management:
+  default_rules:
+    carryforward: true
+  individual_flags:
+    - name: agent
+      paths: [crates/agent/]
+    - name: agent-core
+      paths: [crates/agent-core/]
+    - name: agent-index
+      paths: [crates/agent-index/]
+    - name: agent-knowledge
+      paths: [crates/agent-knowledge/]
+    - name: agent-sqlite
+      paths: [crates/agent-sqlite/]
+    - name: agent-services
+      paths: [crates/agent-services/]
+    - name: agent-runtime
+      paths: [crates/agent-runtime/]
+    - name: querymt
+      paths: [crates/querymt/]
+    - name: querymt-remote
+      paths: [crates/querymt-remote/]
+    - name: providers
+      paths: [crates/providers/]

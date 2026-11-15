@@ -298,7 +298,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -309,7 +309,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -958,13 +958,13 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "log",
- "prettyplease 0.3.0",
+ "prettyplease 0.2.37",
  "proc-macro2",
  "quote",
  "regex",
  "rustc-hash 2.1.3",
  "shlex 2.0.1",
- "syn 2.0.119",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -1523,7 +1523,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "winx",
 ]
 
@@ -1887,7 +1887,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -3206,7 +3206,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.3",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3657,7 +3657,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4612,8 +4612,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
+ "windows-link 0.1.3",
+ "windows-result 0.3.4",
 ]
 
 [[package]]
@@ -6370,7 +6370,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -9394,7 +9394,7 @@ dependencies = [
  "pin-project-lite",
  "rustc-hash 2.1.3",
  "rustls 0.23.46",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -9438,7 +9438,7 @@ checksum = "4dc50afea61aff926e150a36c31f06094608848e114a3fe667d76ec233163b1c"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -9486,7 +9486,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9655,7 +9655,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http 1.5.0",
@@ -11937,69 +11937,34 @@ dependencies = [
  "clap",
  "criterion",
  "dirs 7.0.0",
- "dunce",
  "env_logger",
- "fast_html2md",
  "flate2",
  "futures-util",
- "gix",
- "gix-error",
- "glob",
- "gray_matter",
- "grep-regex",
- "grep-searcher",
  "hex",
  "http 1.5.0",
- "iana-time-zone",
  "ignore",
- "imagesize",
- "imara-diff",
- "indexmap 2.14.2",
- "infer",
- "jsonschema",
  "kameo",
- "kameo_actors",
- "libc",
  "libp2p",
  "log",
- "mdq",
  "mime_guess",
- "minijinja 3.0.5",
- "mockall",
- "moka",
  "notify",
  "once_cell",
- "opentelemetry",
- "opentelemetry-semantic-conventions",
- "opentelemetry_sdk",
  "parking_lot 0.13.0",
- "qmt-openai",
  "querymt",
+ "querymt-agent-core",
+ "querymt-agent-index",
+ "querymt-agent-runtime",
+ "querymt-agent-services",
+ "querymt-agent-sqlite",
  "querymt-provider-common",
  "querymt-remote",
  "querymt-utils",
- "rand 0.10.3",
- "rapidhash",
- "rayon",
- "regex",
- "reqwest 0.13.5",
- "rmcp",
- "rmp-serde",
+ "querymt-workspace-hack",
  "rusqlite",
  "rust-embed",
- "rust-stemmers",
- "rustix",
- "schemars 1.2.3",
  "serde",
  "serde_json",
- "serde_path_to_error",
  "sha2 0.11.1",
- "similarity-core",
- "similarity-py",
- "similarity-rs",
- "stop-words 0.10.1",
- "strsim 0.11.1",
- "syn 2.0.119",
  "tar",
  "tempfile",
  "thiserror 2.0.21",
@@ -12010,9 +11975,68 @@ dependencies = [
  "toml 1.2.1+spec-1.1.0",
  "tower",
  "tracing",
- "tracing-log",
- "tracing-opentelemetry",
- "tracing-subscriber",
+ "ureq 3.5.1",
+ "url",
+ "uuid 1.29.0",
+]
+
+[[package]]
+name = "querymt-agent-core"
+version = "0.6.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "async-trait",
+ "base64 0.23.1",
+ "dunce",
+ "hex",
+ "mockall",
+ "qmt-openai",
+ "querymt",
+ "querymt-workspace-hack",
+ "rapidhash",
+ "rmp-serde",
+ "rust-stemmers",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "stop-words 0.10.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "typeshare",
+ "uuid 1.29.0",
+ "whatlang",
+]
+
+[[package]]
+name = "querymt-agent-index"
+version = "0.6.0"
+dependencies = [
+ "arc-swap",
+ "gix",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "kameo",
+ "log",
+ "notify",
+ "querymt-agent-core",
+ "querymt-workspace-hack",
+ "rapidhash",
+ "rayon",
+ "serde",
+ "serde_json",
+ "similarity-core",
+ "similarity-py",
+ "similarity-rs",
+ "syn 2.0.119",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",
@@ -12036,10 +12060,30 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-yaml",
  "typeshare",
- "ureq 3.5.1",
- "url",
- "uuid 1.29.0",
- "whatlang",
+]
+
+[[package]]
+name = "querymt-agent-knowledge"
+version = "0.6.0"
+dependencies = [
+ "glob",
+ "hex",
+ "ignore",
+ "libc",
+ "querymt-agent-core",
+ "querymt-agent-index",
+ "querymt-workspace-hack",
+ "rusqlite",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 1.2.1+spec-1.1.0",
+ "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -12053,6 +12097,160 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "querymt-agent-runtime"
+version = "0.6.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "dirs 7.0.0",
+ "dunce",
+ "env_logger",
+ "futures-util",
+ "gix",
+ "glob",
+ "gray_matter",
+ "hex",
+ "http 1.5.0",
+ "iana-time-zone",
+ "ignore",
+ "infer",
+ "jsonschema",
+ "kameo",
+ "kameo_actors",
+ "libc",
+ "libp2p",
+ "log",
+ "mdq",
+ "minijinja 3.0.5",
+ "mockall",
+ "moka",
+ "once_cell",
+ "opentelemetry",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+ "parking_lot 0.13.0",
+ "querymt",
+ "querymt-agent-core",
+ "querymt-agent-index",
+ "querymt-agent-knowledge",
+ "querymt-agent-services",
+ "querymt-agent-sqlite",
+ "querymt-provider-common",
+ "querymt-remote",
+ "querymt-utils",
+ "querymt-workspace-hack",
+ "rand 0.10.3",
+ "regex",
+ "reqwest 0.13.5",
+ "rmcp",
+ "rmp-serde",
+ "rusqlite",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "toml 1.2.1+spec-1.1.0",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "typeshare",
+ "url",
+ "uuid 1.29.0",
+]
+
+[[package]]
+name = "querymt-agent-services"
+version = "0.6.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "async-trait",
+ "base64 0.23.1",
+ "dirs 7.0.0",
+ "dunce",
+ "fast_html2md",
+ "flate2",
+ "futures-util",
+ "gix",
+ "gix-error",
+ "glob",
+ "grep-regex",
+ "grep-searcher",
+ "hex",
+ "http 1.5.0",
+ "ignore",
+ "imagesize",
+ "imara-diff",
+ "indexmap 2.14.2",
+ "infer",
+ "jsonschema",
+ "libc",
+ "log",
+ "mdq",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "parking_lot 0.13.0",
+ "qmt-openai",
+ "querymt",
+ "querymt-agent-core",
+ "querymt-agent-index",
+ "querymt-agent-knowledge",
+ "querymt-agent-sqlite",
+ "querymt-utils",
+ "querymt-workspace-hack",
+ "regex",
+ "reqwest 0.13.5",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "strsim 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-util",
+ "toml 1.2.1+spec-1.1.0",
+ "tracing",
+ "tracing-log",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "typeshare",
+ "url",
+ "uuid 1.29.0",
+]
+
+[[package]]
+name = "querymt-agent-sqlite"
+version = "0.6.0"
+dependencies = [
+ "async-trait",
+ "log",
+ "parking_lot 0.13.0",
+ "querymt",
+ "querymt-agent-core",
+ "querymt-workspace-hack",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid 1.29.0",
 ]
 
 [[package]]
@@ -12175,6 +12373,7 @@ dependencies = [
  "qrcode",
  "querymt",
  "querymt-utils",
+ "querymt-workspace-hack",
  "rmp-serde",
  "schemars 1.2.3",
  "serde",
@@ -12195,6 +12394,7 @@ version = "0.6.0"
 dependencies = [
  "oauth2",
  "querymt-utils",
+ "querymt-workspace-hack",
  "serde",
  "serde_json",
  "tokio",
@@ -12227,6 +12427,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
+ "querymt-workspace-hack",
  "reqwest 0.13.5",
  "rustix",
  "secret-service",
@@ -12244,6 +12445,199 @@ dependencies = [
  "url",
  "windows-native-keyring-store",
  "zbus",
+]
+
+[[package]]
+name = "querymt-workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "aead 0.5.2",
+ "aho-corasick",
+ "allocator-api2",
+ "anyhow",
+ "aws-lc-rs",
+ "axum",
+ "base16ct 1.0.0",
+ "base64 0.23.1",
+ "bitflags 2.13.2",
+ "bstr",
+ "bytemuck",
+ "byteorder",
+ "cbc",
+ "cc",
+ "chrono",
+ "cipher 0.4.4",
+ "cipher 0.5.2",
+ "clap",
+ "clap_builder",
+ "const-oid 0.10.2",
+ "crc32fast",
+ "crossbeam-channel",
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "crypto-common 0.1.7",
+ "crypto-common 0.2.2",
+ "ctutils",
+ "data-encoding",
+ "der 0.8.2",
+ "deranged",
+ "derive_more",
+ "derive_more-impl",
+ "digest 0.10.7",
+ "digest 0.11.3",
+ "displaydoc",
+ "ed25519 2.2.3",
+ "ed25519-dalek 2.2.0",
+ "either",
+ "errno",
+ "event-listener-strategy",
+ "fastrand",
+ "flate2",
+ "fnv",
+ "foldhash 0.2.0",
+ "form_urlencoded",
+ "futures",
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-lite",
+ "futures-sink",
+ "futures-util",
+ "generic-array",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
+ "gimli",
+ "hashbrown 0.15.5",
+ "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
+ "hex",
+ "hmac 0.12.1",
+ "http 1.5.0",
+ "httparse",
+ "hybrid-array",
+ "hyper 1.12.0",
+ "hyper-rustls 0.27.10",
+ "hyper-util",
+ "icu_locale_core",
+ "icu_provider",
+ "idna",
+ "indexmap 2.14.2",
+ "iroh",
+ "iroh-metrics",
+ "iroh-relay",
+ "jiff",
+ "kameo",
+ "lazy_static",
+ "libc",
+ "libp2p",
+ "libp2p-iroh",
+ "linux-raw-sys",
+ "litemap",
+ "log",
+ "memchr",
+ "mime_guess",
+ "mio",
+ "moka",
+ "netlink-proto",
+ "noq",
+ "noq-proto",
+ "num",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+ "oauth2",
+ "objc2",
+ "objc2-core-foundation",
+ "object",
+ "once_cell",
+ "opentelemetry",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+ "pem 4.0.0",
+ "percent-encoding",
+ "phf 0.13.1",
+ "phf_shared 0.11.3",
+ "phf_shared 0.13.1",
+ "pkcs8 0.11.0",
+ "portable-atomic",
+ "postcard",
+ "potential_utf",
+ "proc-macro2",
+ "pulley-interpreter",
+ "quote",
+ "rand 0.10.3",
+ "rand 0.8.8",
+ "rand 0.9.5",
+ "rand_core 0.6.4",
+ "regex",
+ "regex-automata",
+ "regex-syntax",
+ "reqwest 0.12.28",
+ "reqwest 0.13.5",
+ "ring",
+ "rmcp",
+ "rusqlite",
+ "rust-embed-utils",
+ "rustix",
+ "rustls 0.23.46",
+ "rustls-webpki 0.103.15",
+ "schemars 1.2.3",
+ "scrypt",
+ "security-framework-sys",
+ "semver",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "serde_with",
+ "serde_with_macros",
+ "sha1 0.11.0",
+ "sha2 0.10.9",
+ "signature 2.2.0",
+ "signature 3.0.0",
+ "simdutf8",
+ "siphasher",
+ "slab",
+ "smallvec 1.16.3",
+ "spki 0.8.1",
+ "stable_deref_trait",
+ "subtle",
+ "syn 2.0.119",
+ "syn 3.0.9",
+ "tar",
+ "thiserror 2.0.21",
+ "time",
+ "time-macros",
+ "tinystr",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "tokio-stream",
+ "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
+ "toml_datetime 1.1.3+spec-1.1.0",
+ "toml_parser",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
+ "typenum",
+ "unicode-normalization",
+ "ureq 3.5.1",
+ "uuid 1.29.0",
+ "wasm-encoder 0.258.3",
+ "wasmparser 0.258.3",
+ "wasmtime-environ",
+ "wasmtime-internal-core",
+ "winnow 1.0.4",
+ "writeable",
+ "yoke 0.8.3",
+ "zerocopy",
+ "zerofrom",
+ "zeroize",
+ "zerotrie",
+ "zerovec",
 ]
 
 [[package]]
@@ -12303,7 +12697,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls 0.23.46",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -12343,9 +12737,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -13003,9 +13397,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.8.0"
+version = "3.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8be15815186873ea063bf005011d16c356804973489e40c39116ae3a2878d1f"
+checksum = "b5949e504d5ab9944a168259afc0c39ac0230627b6ec5367ace194c59bcbe163"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -13013,6 +13407,7 @@ dependencies = [
  "chrono",
  "futures",
  "http 1.5.0",
+ "http-body 1.1.0",
  "http-body-util",
  "hyper 1.12.0",
  "hyper-util",
@@ -13022,16 +13417,19 @@ dependencies = [
  "pastey 0.2.3",
  "pin-project-lite",
  "process-wrap",
+ "rand 0.10.3",
  "reqwest 0.13.5",
  "rmcp-macros",
  "schemars 1.2.3",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "sse-stream",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower-service",
  "tracing",
  "url",
  "uuid 1.29.0",
@@ -13039,9 +13437,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "3.8.0"
+version = "3.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b0748e054a5f5598b3213cf72099ae6b2745ba4d996c59ccf455150a7dbb839"
+checksum = "b98a686693ee91b665c6f89f182fca6e141c8a63dc113b11b38c1bf3491606b7"
 dependencies = [
  "darling 0.24.1",
  "proc-macro2",
@@ -13276,7 +13674,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -13400,7 +13798,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -13848,7 +14246,7 @@ checksum = "4db5a4a562bcc0017c34cd0efbabf447be783f00576a2a516947f884e6a7ed57"
 dependencies = [
  "ahash",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "nohash-hasher",
  "num-traits",
@@ -14497,7 +14895,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -14689,7 +15087,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -15287,10 +15685,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -15329,7 +15727,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -16544,7 +16942,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -17685,7 +18083,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -18348,8 +18746,8 @@ dependencies = [
  "log",
  "serde",
  "thiserror 2.0.21",
- "windows 0.62.2",
- "windows-core 0.62.2",
+ "windows 0.61.3",
+ "windows-core 0.61.2",
 ]
 
 [[package]]

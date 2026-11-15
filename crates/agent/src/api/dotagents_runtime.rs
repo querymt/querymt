@@ -44,7 +44,7 @@ impl DotagentsExecutionTargetResolver for SingleAgentTargetResolver {
         let runtime = profiles.runtime_for_profile(profile_id).await.ok()?;
         Some(DotagentsExecutionTarget::new(
             Some(profile_id.to_string()),
-            runtime.agent().handle().scheduler().is_some(),
+            runtime.handle().scheduler().is_some(),
         ))
     }
 }

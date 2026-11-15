@@ -64,7 +64,7 @@ const DEFAULT_MESH_STREAM_RECONNECT_GRACE: std::time::Duration =
     std::time::Duration::from_secs(120);
 #[derive(Debug, Parser)]
 #[command(name = "qmtcode")]
-#[command(version = env!("QMT_BUILD_VERSION"))]
+#[command(version = querymt_utils::BUILD_VERSION)]
 #[command(
     about = "Run QueryMT coder agent in ACP mode, API mode, dashboard mode, or as a mesh node"
 )]
@@ -551,7 +551,7 @@ async fn run(
     // Setup telemetry: ACP mode writes console logs to stderr (stdout is
     // reserved for JSON-RPC); dashboard/mesh modes use stdout.
     // OTLP export (traces + logs over gRPC) is active in all modes.
-    querymt_utils::telemetry::setup_telemetry("qmtcode", env!("QMT_BUILD_VERSION"), is_acp);
+    querymt_utils::telemetry::setup_telemetry("qmtcode", querymt_utils::BUILD_VERSION, is_acp);
 
     #[cfg(target_os = "linux")]
     if let Err(error) = querymt_utils::secret_store::SecretStore::new_async().await {
