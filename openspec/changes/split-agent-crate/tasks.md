@@ -276,7 +276,29 @@ Each task moves the listed definitions inside `crates/agent/src` into a staging 
   - `AGENTS.md` and `openspec/config.yaml`: package list bottom to top, runtime features, the rule "test the package you changed, plus `querymt-agent` for facade or downstream changes", and the log-prefix note; schema, migration and config paths now point at `agent-sqlite` and `agent-runtime`. Doc references to moved files fixed (`hooks.md` schemas, `event-ordering.md`, `api_reference.md`, `repository_knowledge.md`).
   - `CHANGELOG.md` Unreleased: BREAKING log filtering, `ViewStore::get_atif` removal, `SessionError::Database`/`DbError`, plus a note that old `querymt_agent::…` paths keep working.
   - Verify: `mkdocs` is not installed here, so the docs build was not run; the diff was reviewed by hand and `rg "crates/agent/src"` over docs, AGENTS.md and config.yaml now returns nothing.
-- [ ] 9.3 Repeat the 0.1 timing runs, with edits in a services file, a sqlite file and a runtime file, plus the per-package clippy and nextest runs. Record them below this task, next to the baseline. Verify: the numbers are recorded; this is not a pass/fail gate.
+- [x] 9.3 Repeat the 0.1 timing runs, with edits in a services file, a sqlite file and a runtime file, plus the per-package clippy and nextest runs. Record them below this task, next to the baseline. Verify: the numbers are recorded; this is not a pass/fail gate.
+  - Measured at `e07adcb9` on macOS, `AGENT_FEATURES`, `QMT_UI_DIST=/tmp/qmt-dashboard-ui`, `CARGO_INCREMENTAL=0`, `QUERYMT_REMOTE_CONNECT_OPEN_BUDGET_MS` unset, a one-line edit (an unused `let`) in a function body, warm dependencies. Not a pass/fail gate. The `--timings` HTML reports were not saved.
+  - Whole-agent loop, same command as 0.1 (`cargo test -p querymt-agent --features AGENT_FEATURES --no-run`; baseline 36.1 s with the single crate):
+
+    | Edit in | Wall |
+    |---|---|
+    | `agent-services/src/session/pruning.rs` | 77.4 s |
+    | `agent-sqlite/src/session/schema.rs` | 76.0 s |
+    | `agent-runtime/src/session/compaction.rs` | 73.6 s |
+
+    An edit anywhere below the facade now takes about 75 s to rebuild what `querymt-agent` tests need, about twice the 36 s baseline. The runtime (the largest crate, about 2400 unit tests) is rebuilt in both its `lib` and `lib test` forms and then each `querymt-agent` target relinks. Possible causes, not investigated: feature unification (the facade's dev-dependency enables runtime `test-support`) and the runtime being built twice. This is the number to weigh before splitting the runtime further.
+  - Per-package loop (`cargo test -p <pkg> --no-run`, edit in that package):
+
+    | Package | Wall |
+    |---|---|
+    | `querymt-agent-sqlite` | 5.6 s |
+    | `querymt-agent-services` | 9.9 s |
+    | `querymt-agent-runtime` (`RUNTIME_FEATURES`) | 70.2 s |
+
+    So the gain from the split is in the sqlite and services loops; a runtime edit costs about what the whole crate did.
+  - Per-package `cargo clippy --all-targets -- -D warnings` (warm): core 6.4 s, index 12.0 s, knowledge 6.3 s, sqlite 2.3 s, services 6.5 s, runtime (`RUNTIME_FEATURES`) 35.3 s, agent (`AGENT_FEATURES`) 13.7 s.
+  - Per-package `cargo nextest run` including the build (warm), tests passed: core 10.4 s (271), index 15.1 s (122), knowledge 8.2 s (443), sqlite 9.4 s (214), services 43.3 s (1006), runtime 19.0 s for the run alone (2414), agent 17.9 s (525). Total 4995 passed. The runtime package took 125.8 s including its build.
+  - One run with the operator variable `QUERYMT_REMOTE_CONNECT_OPEN_BUDGET_MS=20000` set in the shell failed `connect_budget_defaults_are_bounded_and_reason_specific` (its guard only checks the open override, not the reconnect default it compares against). With the variable unset, as in the baseline, all 2414 runtime tests pass. Existing test behaviour; not changed here.
 
 ## 10. Downstream and validation
 
