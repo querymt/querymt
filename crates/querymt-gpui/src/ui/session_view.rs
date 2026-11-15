@@ -2575,7 +2575,10 @@ impl QmtApp {
                     }
                     _ => kit::icon(IconName::Info, kit::TITLE_ICON, p.muted).into_any_element(),
                 })
-                .on_click(cx.listener(|this, _, _, cx| {
+                .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
+                    if this.dismissed.closed_by("session-details", ev) {
+                        return;
+                    }
                     this.session_details_open = !this.session_details_open;
                     this.session_menu_open = false;
                     this.plan_open = false;
@@ -2745,7 +2748,8 @@ impl QmtApp {
                 .border_color(p.border)
                 .shadow_lg()
                 .occlude()
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    this.dismissed.record("session-details", ev);
                     this.session_details_open = false;
                     this.usage_hovered = None;
                     cx.notify();
@@ -2770,7 +2774,10 @@ impl QmtApp {
             p,
         )
         .when(self.session_menu_open, |el| el.bg(p.card))
-        .on_click(cx.listener(|this, _, _, cx| {
+        .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
+            if this.dismissed.closed_by("session-menu", ev) {
+                return;
+            }
             this.session_menu_open = !this.session_menu_open;
             this.session_details_open = false;
             this.plan_open = false;
@@ -2800,7 +2807,8 @@ impl QmtApp {
                 .border_color(p.border)
                 .shadow_lg()
                 .occlude()
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    this.dismissed.record("session-menu", ev);
                     this.session_menu_open = false;
                     cx.notify();
                 }))
@@ -2933,7 +2941,10 @@ impl QmtApp {
                         kit::wrap_tip(text).build(window, cx)
                     })
                 })
-                .on_click(cx.listener(|this, _, _, cx| {
+                .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
+                    if this.dismissed.closed_by("plan", ev) {
+                        return;
+                    }
                     this.plan_open = !this.plan_open;
                     this.session_details_open = false;
                     this.session_menu_open = false;
@@ -2956,7 +2967,8 @@ impl QmtApp {
                     .border_color(p.border)
                     .shadow_lg()
                     .occlude()
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                        this.dismissed.record("plan", ev);
                         this.plan_open = false;
                         cx.notify();
                     }))
@@ -3079,7 +3091,8 @@ impl QmtApp {
             .border_color(p.border)
             .shadow_lg()
             .occlude()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                this.dismissed.record("session-options", ev);
                 this.session_options_open = false;
                 cx.notify();
             }))
@@ -3209,7 +3222,10 @@ impl QmtApp {
             .child(kit::icon(IconName::Settings2, 14., p.muted))
             .child("Options")
             .child(kit::icon(IconName::ChevronDown, 13., p.dim))
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
+                if this.dismissed.closed_by("session-options", ev) {
+                    return;
+                }
                 this.session_options_open = !this.session_options_open;
                 cx.notify();
             }));

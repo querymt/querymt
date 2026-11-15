@@ -1134,7 +1134,10 @@ impl QmtApp {
                         kit::icon(if menu_open { IconName::ChevronUp } else { IconName::ChevronDown }, 13., p.muted).into_any_element()
                     })
                     .when(select_enabled, |el| {
-                        el.on_click(cx.listener(move |this, _, _, cx| {
+                        el.on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                            if this.dismissed.closed_by(&format!("method:{prov}"), ev) {
+                                return;
+                            }
                             this.method_menu = if this.method_menu.as_deref() == Some(prov.as_str()) { None } else { Some(prov.clone()) };
                             cx.notify();
                         }))
@@ -1181,8 +1184,10 @@ impl QmtApp {
                             .border_color(p.border)
                             .shadow_lg()
                             .occlude()
-                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                this.method_menu = None;
+                            .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                                if let Some(prov) = this.method_menu.take() {
+                                    this.dismissed.record(format!("method:{prov}"), ev);
+                                }
                                 cx.notify();
                             }))
                             .children(items),

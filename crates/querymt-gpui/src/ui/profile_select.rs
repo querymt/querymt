@@ -56,6 +56,8 @@ fn search(items: Vec<ProfileItem>, query: &str) -> Vec<ProfileItem> {
     scored.into_iter().map(|(_, p)| p).collect()
 }
 
+/// Popover key of the profile menu (see [`kit::Dismissed`]).
+const PROFILE_MENU: &str = "profile-menu";
 /// Gap between the menu and the window edge.
 const MENU_MARGIN: f32 = 8.;
 /// Bounds of the scrolling row list (about 3 to 9 rows).
@@ -166,7 +168,16 @@ impl QmtApp {
                 13.,
                 p.muted,
             ))
-            .on_click(cx.listener(|this, _, window, cx| this.open_profile_menu(window, cx)));
+            .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| {
+                if this.dismissed.closed_by(PROFILE_MENU, ev) {
+                    return;
+                }
+                if this.profile_menu_open {
+                    this.close_profile_menu(window, cx);
+                } else {
+                    this.open_profile_menu(window, cx);
+                }
+            }));
 
         // Below the trigger, flipped above it when the window is too short,
         // and kept inside the window either way.
@@ -175,7 +186,11 @@ impl QmtApp {
                 .placement(Placement::Bottom)
                 .align(Align::Start)
                 .offset(px(4.))
-                .margin(px(MENU_MARGIN));
+                .margin(px(MENU_MARGIN))
+                .on_position({
+                    let bounds = self.profile_menu_bounds.clone();
+                    move |pos| bounds.set(pos.bounds)
+                });
             deferred(positioner.child(self.render_profile_menu(&choices.selected, p, cx)))
                 .with_priority(2)
         });
@@ -291,9 +306,10 @@ impl QmtApp {
             .border_color(p.border)
             .shadow_lg()
             .occlude()
-            .on_mouse_down_out(
-                cx.listener(|this, _, window, cx| this.close_profile_menu(window, cx)),
-            )
+            .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                this.dismissed.record(PROFILE_MENU, ev);
+                this.close_profile_menu(window, cx);
+            }))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 match ev.keystroke.key.as_str() {
                     "up" => this.move_profile_cursor(false, cx),

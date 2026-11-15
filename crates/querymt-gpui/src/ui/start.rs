@@ -19,6 +19,9 @@ use crate::store::{
 use crate::theme::{Palette, palette};
 use crate::util::{now_ms, short_time, workspace_name};
 
+/// Popover key of the Start composer's Options (see [`kit::Dismissed`]).
+const START_OPTIONS: &str = "start-options";
+
 /// Attachment limits, same as the desktop composer.
 const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
@@ -850,9 +853,12 @@ impl QmtApp {
                     .child(name)
             }))
             .child(kit::icon(IconName::ChevronDown, 13., p.dim))
-            .on_click(cx.listener(|this, _, window, cx| {
+            .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| {
+                if this.dismissed.closed_by(START_OPTIONS, ev) {
+                    return;
+                }
                 this.close_profile_menu(window, cx);
-                this.options_open = true;
+                this.options_open = !this.options_open;
                 cx.notify();
             }));
         let options = div()
@@ -1214,11 +1220,13 @@ impl QmtApp {
             .border_color(p.border)
             .shadow_lg()
             .occlude()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                // The profile menu overhangs the panel and closes itself first.
-                if this.profile_menu_open {
+            .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                // The profile menu overhangs the panel: a click in it is not outside.
+                if this.profile_menu_open && this.profile_menu_bounds.get().contains(&ev.position) {
                     return;
                 }
+                this.dismissed.record(START_OPTIONS, ev);
+                this.close_profile_menu(window, cx);
                 this.options_open = false;
                 cx.notify();
             }))
