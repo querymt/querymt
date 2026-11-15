@@ -237,7 +237,7 @@ pub async fn take_pending_elicitation_sender_for_session(
 /// from the root agent handle.
 pub async fn take_pending_elicitation_sender_for_session_with_profiles(
     agent: &crate::agent::LocalAgentHandle,
-    profiles: Option<&crate::api::ProfileRuntimeHandle>,
+    profiles: Option<&crate::profile_host::ProfileRuntimeHandle>,
     session_id: &str,
     elicitation_id: &str,
 ) -> Option<oneshot::Sender<ElicitationResponse>> {

@@ -258,3 +258,6 @@ pub trait ProfileRuntimeHost: Send + Sync {
     async fn forget_session_binding(&self, session_id: &str) -> Option<SessionProfileBinding>;
     async fn shutdown(&self);
 }
+
+/// Shared handle to the profile runtime manager.
+pub type ProfileRuntimeHandle = Arc<dyn ProfileRuntimeHost>;

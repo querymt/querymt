@@ -39,6 +39,7 @@ pub mod middleware;
 pub use querymt_agent_core::model;
 pub use querymt_agent_services::model_heuristics;
 pub use querymt_agent_services::model_info;
+pub mod chat_session;
 pub mod model_inventory;
 pub mod model_registry;
 #[cfg(feature = "plugin-loaders")]

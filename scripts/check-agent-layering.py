@@ -109,7 +109,11 @@ RULES: List[Tuple[str, str]] = [
         r"session_event_stream|tasks)\.rs$",
         "services",
     ),
-    (r"^(api/sessions\.rs|api/mesh/(invite|types)\.rs|plugin_update\.rs)$", "runtime"),
+    (
+        r"^(api/(sessions|session|callbacks)\.rs|api/mesh/(invite|types|runtime|runtime_config)\.rs|"
+        r"plugin_update\.rs)$",
+        "runtime",
+    ),
     (r"^acp/websocket", "top"),
     (r"^(api|server|runner|quorum|profiles)(/|\.rs$)", "top"),
 ]

@@ -1,10 +1,10 @@
-use crate::profiles::{ProfileCatalog, ProfileRuntime, ProfileRuntimeHost, ProfileRuntimeManager};
+use crate::profiles::{ProfileCatalog, ProfileRuntime, ProfileRuntimeManager};
 use notify::RecommendedWatcher;
 use std::sync::Arc;
 
 use super::AgentInfra;
 
-pub type ProfileRuntimeHandle = Arc<dyn ProfileRuntimeHost>;
+pub use crate::profile_host::ProfileRuntimeHandle;
 
 /// Public wrapper for attaching a profile catalog to an agent runtime.
 ///

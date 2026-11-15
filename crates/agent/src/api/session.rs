@@ -1,10 +1,10 @@
 //! Agent session implementation
 
 use super::callbacks::EventCallbacksState;
-use super::utils::latest_assistant_message;
 use crate::acp::protocol::{ContentBlock, PromptRequest, TextContent};
 use crate::agent::LocalAgentHandle as AgentHandle;
-use crate::runner::ChatSession;
+use crate::agent::utils::latest_assistant_message;
+use crate::chat_session::ChatSession;
 use crate::send_agent::SendAgent;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;

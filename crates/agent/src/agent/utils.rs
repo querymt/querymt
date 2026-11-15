@@ -4,7 +4,9 @@ use crate::acp::protocol::{ContentBlock, EmbeddedResourceResource, ToolCallLocat
 pub use crate::core_staging::prompt_text::{
     format_prompt_user_text_only, render_prompt_for_display, truncate_to_bytes,
 };
+use crate::model::{AgentMessage, MessagePart};
 use log::warn;
+use querymt::chat::ChatRole;
 
 /// Latency histograms for the model call and the work that precedes it.
 ///
@@ -755,6 +757,24 @@ pub fn u32_from_usize(value: usize, field_name: &str, session_id: Option<&str>) 
             u32::MAX
         }
     }
+}
+
+pub(crate) fn latest_assistant_message(messages: &[AgentMessage]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|msg| msg.role == ChatRole::Assistant)
+        .map(|msg| {
+            msg.parts
+                .iter()
+                .filter_map(|part| match part {
+                    MessagePart::Text { content } => Some(content.clone()),
+                    MessagePart::Prompt { blocks } => Some(render_prompt_for_display(blocks)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
 }
 
 #[cfg(test)]

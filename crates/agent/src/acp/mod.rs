@@ -19,7 +19,6 @@ pub(crate) mod websocket_tests;
 
 // Public re-exports
 pub use transport::AcpTransport;
-pub use websocket::serve_websocket;
 
 pub use stdio::{AcpSessionLoadOutcome, load_session_with_replay, serve_stdio};
 
