@@ -1,4 +1,5 @@
 use crate::acp::protocol::{ContentBlock, PromptRequest, StopReason, TextContent};
+pub use crate::delegation::agent_registry::AgentRegistry;
 use crate::hooks::{
     DelegationFailureRequest, DelegationStartRequest, HookNotice, Hooks, PostDelegationRequest,
 };
@@ -98,26 +99,6 @@ pub struct AgentInfo {
     pub isolation: crate::worktree::DelegationIsolation,
     #[serde(skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub meta: Option<serde_json::Value>,
-}
-
-/// AgentRegistry stores both agent metadata (AgentInfo) and agent handles.
-///
-/// This enables:
-/// 1. Listing available agents for delegation (via AgentInfo)
-/// 2. Actually delegating to agents (via AgentHandle)
-/// 3. Thread-safe access from multiple sessions
-pub trait AgentRegistry: Send + Sync {
-    /// List all available agents (metadata only).
-    fn list_agents(&self) -> Vec<AgentInfo>;
-
-    /// Get agent metadata by ID.
-    fn get_agent(&self, id: &str) -> Option<AgentInfo>;
-
-    /// Get an agent handle for delegation.
-    ///
-    /// Returns an `Arc<dyn AgentHandle>` that can be used to interact with the agent
-    /// via session management, prompting, and event subscription.
-    fn get_handle(&self, id: &str) -> Option<Arc<dyn crate::agent::handle::AgentHandle>>;
 }
 
 /// Builder for verification specifications from structured verification_spec only.

@@ -19,6 +19,7 @@ members = [
     "crates/querymt-mobile-ffi",
     "crates/py/querymt-py",
     "crates/py/querymt-agent-py",
+    "crates/workspace-hack",
 ]
 # What plain `cargo build/run/test/check` selects from the repository root.
 # Deliberately excludes the WASM provider plugins (`crates/providers/*`, built

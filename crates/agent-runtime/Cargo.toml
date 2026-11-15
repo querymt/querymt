@@ -96,6 +96,7 @@ tempfile = "3.0"
 querymt-agent-sqlite = { path = "../agent-sqlite", optional = true }
 mockall = { workspace = true, optional = true }
 rusqlite = { workspace = true, features = ["uuid", "time"], optional = true }
+querymt-workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

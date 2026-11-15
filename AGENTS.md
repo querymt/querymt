@@ -40,6 +40,23 @@
 - Without Nix, use the supported native toolchain and dependencies. Check `flake.nix`
   for supported Nix platforms; diagnose setup failures rather than silently
   switching toolchains or environments.
+- Leave `CARGO_INCREMENTAL` unset for local work. `CARGO_INCREMENTAL=0` makes every
+  agent-crate edit cost about 60 s more (75-79 s instead of 8-16 s for the facade test
+  build), and `CARGO_INCREMENTAL=1` makes `RUSTC_WRAPPER=sccache` refuse to run
+  ("incremental compilation is prohibited"). Unset gives incremental builds for
+  workspace crates while sccache still caches dependencies. Incremental caches grow
+  `target/`; run `scripts/clean-target.sh` (`--all` removes all of `target/debug`).
+- `crates/workspace-hack` (`querymt-workspace-hack`) is managed by `cargo hakari`
+  (config in `.config/hakari.toml`); it unifies third-party features across the agent
+  stack so switching between the aliases below does not recompile dependencies. After
+  changing dependencies or features, run `cargo hakari generate` and
+  `cargo hakari manage-deps` (`cargo install cargo-hakari --locked`); CI runs
+  `cargo hakari verify`. Provider crates and `querymt` must not depend on it (wasm32).
+- `querymt-agent` has a dev-dependency on `querymt-agent-runtime` with `test-support`
+  (122 references in 22 facade files, mostly `runtime_tests/` and `acp/websocket_tests.rs`,
+  which sit in the facade because they need top-layer types). That is why the runtime is
+  built in a second variant (with `test-support`) for facade tests; removing it means
+  moving those tests or their helpers.
 - Run the commands below from the repository root inside the selected environment.
 
 ## Validation
@@ -65,6 +82,21 @@
   Use `cargo nextest run`, not `cargo test`. nextest skips doctests, so run
   `cargo test -p <package> --doc` when doc examples change. If cargo-nextest is
   not installed, say so and fall back to `cargo test` with the same scope.
+- Agent packages have aliases in `.cargo/config.toml` that use the CI feature sets, so
+  runs share build artifacts: `cargo t-<pkg> [filter args]` (nextest) and
+  `cargo cl-<pkg>` (clippy, `-D warnings`) for `agent`, `runtime`, `services`, `sqlite`,
+  `knowledge`, `index` and `core`; for example `cargo t-runtime -E 'test(/compaction/)'`.
+  `agent` builds with `dashboard`, so set `QMT_UI_DIST` (see Dashboard Boundary).
+  Loop: test the package you changed with its `t-<pkg>` alias, and build the facade
+  (`cargo t-agent --no-run`) before pushing. Measured edit cost with incremental on:
+  runtime/sqlite/services/facade edits 5-16 s and core edits 15-19 s (everything above
+  core rebuilds); use `scripts/measure-agent-edit-loop.sh` to reproduce the numbers.
+- A trait that another crate uses as `dyn` (`SessionStore`, `EventJournal`, `Tool`,
+  `AgentHandle`, `TokenEstimator`, ...) lives in its own file, re-exported from the old
+  module. A line shift above such a trait costs 50-68 s in the facade build (measured on
+  11 traits), against 10-16 s once it has its own file. Keep new `dyn` traits out of
+  files with other frequently edited code, and do not add code above them in their file;
+  editing the trait itself still rebuilds everything above it.
 - Expand validation to affected consumers and feature combinations. Consult the
   relevant `.github/workflows/` file for CI commands/features and `.config/nextest.toml`
   for test timeouts.

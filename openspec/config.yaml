@@ -21,6 +21,7 @@ context: |
   - nextest does not run doctests. When doc examples change, also run `cargo test -p <package> --doc`.
   - nextest fails when a filter matches no tests. Fix the filter; never drop it.
   - nextest is not in the Nix devShell. If `cargo nextest --version` fails, tell the user (`cargo install cargo-nextest --locked`), then fall back to `cargo test` with the same scope and record the fallback.
+  - .cargo/config.toml has aliases with the CI feature sets for the agent packages: `cargo t-<pkg>` (nextest) and `cargo cl-<pkg>` (clippy -D warnings) for agent, runtime, services, sqlite, knowledge, index, core. Use them so local builds share artifacts. Loop: test the package you changed, build the facade (`cargo t-agent --no-run`) before pushing. `t-agent`/`cl-agent` need QMT_UI_DIST.
   - Never run `cargo nextest run --workspace`, or `--all-features` on querymt-agent. Default-feature (extism) provider test builds can fail to link, and native providers are expensive.
 
   Features (mirror .github/workflows):

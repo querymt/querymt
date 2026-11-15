@@ -37,6 +37,11 @@ tokio = { version = "1.0", features = ["rt", "sync"] }
 typeshare.workspace = true
 uuid = { workspace = true }
 whatlang = "0.18"
+querymt-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+# querymt-workspace-hack is only there to unify features (cargo hakari).
+[lints.cargo]
+unused_dependencies = "allow"
 
 [dev-dependencies]
 qmt-openai = { path = "../providers/openai", default-features = false, features = ["api"] }

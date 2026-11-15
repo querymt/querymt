@@ -56,6 +56,7 @@ sha2 = { version = "0.11", optional = true }
 getrandom = { version = "0.4", optional = true }
 dirs = { workspace = true, optional = true }
 oauth2 = { version = "5.0", default-features = false, features = ["reqwest", "rustls-tls"] }
+querymt-workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 # Platform-native keyring stores (optional, behind secret-store feature)
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -73,6 +74,10 @@ futures-lite = { version = "2", optional = true }
 socket2 = { version = "0.6", optional = true }
 rustix = { version = "1", features = ["net", "process"], optional = true }
 libc = { version = "0.2", optional = true }
+
+# querymt-workspace-hack is only there to unify features (cargo hakari).
+[lints.cargo]
+unused_dependencies = "allow"
 
 [dev-dependencies]
 opentelemetry_sdk = { version = "0.32", features = ["testing"] }

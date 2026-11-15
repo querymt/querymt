@@ -5,6 +5,8 @@ pub mod context_impl;
 pub mod path;
 pub mod read_scope;
 pub mod registry;
+mod tool;
+mod tool_context;
 pub mod tool_set;
 #[doc(hidden)]
 pub mod trace;

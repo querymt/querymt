@@ -9,6 +9,8 @@ on:
       - 'crates/cli/**'
       - 'crates/service-client/**'
       - 'crates/querymt/**'
+      - 'crates/workspace-hack/**'
+      - '.config/hakari.toml'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/test-agent.yml'
@@ -19,6 +21,8 @@ on:
       - 'crates/cli/**'
       - 'crates/service-client/**'
       - 'crates/querymt/**'
+      - 'crates/workspace-hack/**'
+      - '.config/hakari.toml'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/test-agent.yml'
@@ -27,6 +31,8 @@ permissions:
   contents: read
 
 env:
+  # Keep `features` and `runtime_features` in sync with the aliases in
+  # .cargo/config.toml (t-agent, cl-agent, t-runtime, cl-runtime).
   features: 'dashboard,oauth,zbus-secret-service,systemd-credentials,remote'
   runtime_features: 'remote,oauth,plugin-loaders,api'
 
@@ -46,6 +52,18 @@ jobs:
       
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      # The workspace-hack crate unifies third-party features across the agent
+      # stack (design D8); regenerate it with `cargo hakari generate` and
+      # `cargo hakari manage-deps` when this fails.
+      - name: Install cargo-hakari
+        uses: taiki-e/install-action@cargo-hakari
+
+      - name: Verify workspace-hack
+        run: |
+          cargo hakari generate --diff
+          cargo hakari manage-deps --dry-run
+          cargo hakari verify
 
   # Job 2: Run Clippy (parallel with format)
   clippy:
@@ -183,6 +201,15 @@ jobs:
             --package querymt-agent \
             --example repository_knowledge \
             --features "${features}"
+
+      # This repository's own knowledge corpus must stay consistent: a moved
+      # note or an include pattern that matches nothing fails here.
+      - name: Check repository knowledge corpus
+        run: |
+          cargo run --package querymt-agent \
+            --example repository_knowledge \
+            --features "${features}" \
+            -- --root . check
       
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7

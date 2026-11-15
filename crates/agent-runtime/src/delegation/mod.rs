@@ -1,4 +1,5 @@
 // Delegation orchestration module
+mod agent_registry;
 mod core;
 use querymt_agent_core::delegation::model_overrides;
 mod summarizer;

@@ -12,6 +12,8 @@ use querymt::chat::{
 use querymt_agent_core::model::{AgentMessage, MessagePart};
 use tracing::instrument;
 
+pub use crate::session::token_estimator::TokenEstimator;
+
 // Payload-independent reserves, not exact model-specific vision token counts.
 const IMAGE_TOKENS_ESTIMATE: usize = 2_048;
 const ORIGINAL_IMAGE_TOKENS_ESTIMATE: usize = 10_000;
@@ -251,11 +253,6 @@ impl Default for PruneConfig {
                 .collect(),
         }
     }
-}
-
-/// Trait for estimating token counts from text.
-pub trait TokenEstimator: Send + Sync {
-    fn estimate(&self, text: &str) -> usize;
 }
 
 /// Trait for estimating pruning cost from canonical tool-result parts.

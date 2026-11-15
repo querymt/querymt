@@ -3,6 +3,7 @@ mod assembly;
 pub mod driver;
 pub mod error;
 pub mod factory;
+mod middleware_driver;
 pub mod state;
 
 // Keep existing exports during transition

@@ -16,6 +16,7 @@ pub mod remote_sync;
 pub mod run_lease;
 pub mod runtime;
 pub mod task_service;
+pub mod token_estimator;
 pub mod turns;
 
 pub use pruning::{

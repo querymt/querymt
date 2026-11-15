@@ -1,5 +1,3 @@
-#![cfg(feature = "remote")]
-
 use querymt::LLMParams;
 use querymt::plugin::host::PluginRegistry;
 use querymt_agent::LocalAgentHandle;

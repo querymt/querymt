@@ -90,7 +90,7 @@ Run from the repository root on `feat/kb`; CI feature set `dashboard,oauth,remot
 | `cargo fmt --all -- --check` | clean |
 | `cargo clippy -p querymt-agent --all-targets --features "dashboard,oauth,remote" -- -D warnings` | clean |
 | `cargo nextest run -p querymt-agent --features "dashboard,oauth,remote" --no-fail-fast` | 4181 run: 4180 passed, 1 failed, 9 skipped |
-| `cargo nextest run -p querymt-agent --test repository_knowledge_matrix` (7.1 matrix) | 10/10 passed (also within the full run) |
+| `cargo nextest run -p querymt-agent --test it -E 'test(/repository_knowledge_matrix/)'` (7.1 matrix) | 10/10 passed (also within the full run) |
 | `openspec validate add-portable-repository-knowledge` | valid |
 
 The one failure, `agent::handle::remote_connect::tests::connect_budget_defaults_are_bounded_and_reason_specific`, also fails on a clean `HEAD` worktree, so it predates this change and is unrelated to repository knowledge. Under plain `cargo test` two further `remote_ext` tests also failed; they fail on a clean `HEAD` too and pass under nextest's per-test process isolation.

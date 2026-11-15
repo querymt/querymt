@@ -13,6 +13,20 @@ See proposal.md – Why. The measurements behind this design were taken on `refa
 | incremental | services (`session/pruning.rs`), lines shift | 55 s (2 runs) |
 | incremental | services, no lines shift | 16 s (2 runs) |
 
+Final measurements after this change (2026-11-15, rustc 1.100.0, same machine, `CARGO_INCREMENTAL` unset, hakari workspace-hack, merged `tests/it`, `TokenEstimator` in its own file; facade command, warm-up on the original first, two runs each; probes are the first function of the named file unless noted):
+
+| Edit in | Probe | Facade command wall | Peak RSS | Max procs | `t-<pkg> --no-run` wall |
+|---|---|---|---|---|---|
+| runtime (`session/compaction.rs`) | shift | 12.0 / 10.9 s | 4.5 GB | 8 | 17.6 / 16.1 s |
+| sqlite (`session/schema.rs`) | shift | 10.7 / 9.8 s | 6.1 GB | 8 | 3.0 / 3.0 s |
+| services (`accounting/pricing.rs`, line 11) | shift | 11.2 / 10.9 s | 6.1 GB | 8 | 5.2 / 5.2 s |
+| services (same) | literal | 10.7 / 10.7 s | 6.1 GB | 8 | - |
+| services (`session/pruning.rs`, top) | shift | 13 / 9 s (task 4.4) | - | - | - |
+| core (`events.rs`) | shift | 16.0 / 15.3 s | 3.8 GB | 8 | 4.6 / 4.6 s |
+| facade (`runner.rs`) | shift | 5.0 / 5.0 s | 5.8 GB | 8 | 16.5 / 15.3 s (`t-agent` builds all targets: 53 procs, 28-30 GB) |
+
+The 55 s services case is gone (13 / 9 s); runtime, sqlite and facade edits are at or under the 16 s goal, core is at 15-16 s. Peak memory of the facade command fell from 17-20 GB / 30 processes to 4-6 GB / 8 processes. Merging the test binaries and the workspace-hack both contribute; the split between them was not measured separately. `cargo t-agent --no-run` is a different command (`nextest`, all test targets including examples) and stays memory-hungry.
+
 Other observations that shape the decisions:
 
 - **Runtime crate `-Ztime-passes`** (non-incremental, 57 s total):

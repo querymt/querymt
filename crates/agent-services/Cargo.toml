@@ -65,6 +65,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 tempfile = "3.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 tracing-log = { version = "0.2", optional = true }
+querymt-workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

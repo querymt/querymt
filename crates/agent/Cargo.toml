@@ -90,6 +90,7 @@ dirs.workspace = true
 
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tempfile = "3.0"
+querymt-workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [lib]
 name = "querymt_agent"
