@@ -57,7 +57,9 @@ jobs:
       # stack (design D8); regenerate it with `cargo hakari generate` and
       # `cargo hakari manage-deps` when this fails.
       - name: Install cargo-hakari
-        uses: taiki-e/install-action@cargo-hakari
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hakari
 
       - name: Verify workspace-hack
         run: |
