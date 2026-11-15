@@ -9,7 +9,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::kit::ButtonExt as _;
-use super::{AgentDialog, QmtApp, kit};
+use super::{AgentDialog, Page, QmtApp, kit};
 use crate::store::{AgentConfig, ConnState, Endpoint, normalize_address};
 use crate::theme::{Palette, palette};
 
@@ -528,6 +528,46 @@ impl QmtApp {
                 .bg(gpui_kit::black().opacity(if p.dark { 0.55 } else { 0.28 }))
                 .occlude()
         };
+
+        if self.confirm_reset {
+            let card = self
+                .modal_card(&p)
+                .w(px(460.))
+                .child(div().text_lg().font_semibold().child("Reset app data?"))
+                .child(div().text_sm().text_color(p.muted).child(
+                    "Configured agents and preferences are removed and the app starts over \
+                     like a fresh install. This cannot be undone.",
+                ))
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .text_xs()
+                        .text_color(p.muted)
+                        .child("Removed: configured agents, recent models and workspaces, appearance and chat preferences.")
+                        .child("Kept: sessions on the agents, provider sign-ins and API keys, project files."),
+                )
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(kit::button("reset-cancel").label("Cancel").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.confirm_reset = false;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(kit::button("reset-ok").danger().label("Reset").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.confirm_reset = false;
+                                this.general_danger_open = false;
+                                this.page = Page::Start;
+                                this.store.update(cx, |s, cx| s.reset_app_data(cx));
+                                this.apply_theme(window, cx);
+                            }),
+                        )),
+                );
+            return Some(self.centered(scrim("scrim-reset"), card, cx));
+        }
 
         if let Some(id) = self.confirm_delete.clone() {
             let name = self
