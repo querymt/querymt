@@ -953,7 +953,18 @@ fn test_concurrent_snapshots_leave_valid_cache_and_no_temp_files() {
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use crate::test_utils::noise;
+/// Deterministic incompressible bytes (xorshift), so test files do not deflate.
+fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
 
 /// Shared in-memory sink for captured tracing output.
 #[derive(Clone, Default)]

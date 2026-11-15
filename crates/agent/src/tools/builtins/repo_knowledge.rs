@@ -1843,7 +1843,7 @@ mod tests {
             "# Arch\nThe zebra scheduler dispatches work.\n",
         );
         let store = Arc::new(SqliteKnowledgeStore::new(
-            crate::test_utils::sqlite_conn_with_schema(),
+            querymt_agent_sqlite::test_support::sqlite_conn_with_schema(),
         ));
         let entry = store
             .ingest(

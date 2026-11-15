@@ -161,8 +161,8 @@ mod tests {
     }
     use crate::knowledge::sqlite::SqliteKnowledgeStore;
     use crate::knowledge::{IngestRequest, KnowledgeStore};
-    use crate::test_utils::sqlite_conn_with_schema;
     use crate::tools::AgentToolContext;
+    use querymt_agent_sqlite::test_support::sqlite_conn_with_schema;
     use std::sync::Arc;
     use tempfile::TempDir;
 
