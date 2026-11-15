@@ -104,6 +104,14 @@ jobs:
       - name: Run Clippy (querymt-agent-sqlite)
         run: cargo clippy --package querymt-agent-sqlite --all-targets -- -D warnings
 
+      - name: Check querymt-agent-services standalone
+        run: |
+          cargo check --package querymt-agent-services --no-default-features
+          cargo check --package querymt-agent-services --features test-support
+
+      - name: Run Clippy (querymt-agent-services)
+        run: cargo clippy --package querymt-agent-services --all-targets -- -D warnings
+
       - name: Run Clippy (querymt-agent-index)
         run: cargo clippy --package querymt-agent-index --all-targets -- -D warnings
 
@@ -155,6 +163,7 @@ jobs:
             --package querymt-agent-sqlite \
             --package querymt-agent-index \
             --package querymt-agent-knowledge \
+            --package querymt-agent-services \
             --lib --tests \
             --features "${features}" \
             --codecov --output-path ./coverage/codecov.json
