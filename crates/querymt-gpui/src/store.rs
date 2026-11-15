@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::rpc::{Incoming, RpcClient};
-use crate::session::{SessionView, UndoFrame, UserAttachment};
+use crate::session::{ParentSession, SessionView, UndoFrame, UserAttachment};
 use crate::transport::{self, Inbound, Target};
 use crate::util::now_ms;
 
@@ -2265,6 +2265,64 @@ impl AgentsStore {
             return;
         };
         self.open_session(&view.agent_id, &view.session_id, &view.cwd, &view.title, cx);
+        if let Some(v) = self.session.as_mut() {
+            v.parent = view.parent;
+        }
+    }
+
+    /// Open delegated session `child` of the open session, remembering the
+    /// open one so Back returns to it. Uses the child's own title and
+    /// workspace when the session list knows them.
+    pub fn open_child_session(&mut self, agent_id: &str, child: &str, cx: &mut Context<Self>) {
+        let Some(current) = self.session.as_ref() else {
+            return;
+        };
+        let parent = ParentSession {
+            agent_id: current.agent_id.clone(),
+            session_id: current.session_id.clone(),
+            cwd: current.cwd.clone(),
+            title: current.title.clone(),
+            parent: current.parent.clone(),
+        };
+        let (cwd, title) = match self.session_summary(agent_id, child) {
+            Some(s) if !s.cwd.is_empty() => (s.cwd.clone(), s.title.clone()),
+            Some(s) => (parent.cwd.clone(), s.title.clone()),
+            None => (parent.cwd.clone(), String::new()),
+        };
+        self.open_session(agent_id, child, &cwd, &title, cx);
+        if let Some(v) = self
+            .session
+            .as_mut()
+            .filter(|v| v.agent_id == agent_id && v.session_id == child)
+        {
+            v.parent = Some(Box::new(parent));
+        }
+    }
+
+    /// Back from a delegated session: reopen its parent (keeping the chain).
+    /// Returns false when the open session has no parent.
+    pub fn open_parent_session(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(parent) = self.session.as_mut().and_then(|v| v.parent.take()) else {
+            return false;
+        };
+        let ParentSession {
+            agent_id,
+            session_id,
+            cwd,
+            title,
+            parent: grand,
+        } = *parent;
+        // Prefer the list's current title; the stored one may be stale.
+        let title = self
+            .session_summary(&agent_id, &session_id)
+            .map(|s| s.title.clone())
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or(title);
+        self.open_session(&agent_id, &session_id, &cwd, &title, cx);
+        if let Some(v) = self.session.as_mut() {
+            v.parent = grand;
+        }
+        true
     }
 
     /// Whether the open session's agent supports steering / queueing input.
@@ -2798,6 +2856,21 @@ impl AgentsStore {
                         && let Some(update) = params.get("update")
                     {
                         view.apply(update);
+                        cx.notify();
+                    }
+                }
+                if method.ends_with("session/delegationUpdate") {
+                    let sid = params
+                        .get("sessionId")
+                        .or_else(|| params.get("session_id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if let Some(view) = self
+                        .session
+                        .as_mut()
+                        .filter(|v| v.agent_id == id && v.session_id == sid)
+                    {
+                        view.apply_child_links(std::slice::from_ref(&params));
                         cx.notify();
                     }
                 }
