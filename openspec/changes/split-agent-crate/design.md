@@ -294,7 +294,7 @@ flowchart TD
   - Mitigation: a `cargo check` of the facade, examples, benches, `tests/`, `querymt-agent-py` and `querymt-mobile-ffi` catches it, and the fix is an explicit re-export.
 - **Log filters on deep module paths change (BREAKING).**
   - Risk: user filters below the crate name stop matching.
-  - Mitigation: a test in the runtime package asserts that a known log site's `module_path!()` starts with `querymt_agent`, so the bare `querymt_agent=` prefix filter keeps matching. Docs and CHANGELOG are updated.
+  - Mitigation: tests in the runtime package assert that a known log site's `module_path!()` is `querymt_agent_runtime::agent::remote::…` (so it starts with `querymt_agent`), and that both `env_logger` and `tracing_subscriber::EnvFilter` match it for `querymt_agent=debug` and `querymt_agent_runtime::agent::remote=debug` but not for the old `querymt_agent::agent::remote=debug`. Both filter engines match targets by string prefix, so the bare `querymt_agent=` filter keeps matching every agent crate. Docs and CHANGELOG are updated.
 - **Merge conflicts with open branches.**
   - Mitigation: pure `git mv` commits, the D8 gates, and merging the phases quickly.
 - **Runtime stays large.**

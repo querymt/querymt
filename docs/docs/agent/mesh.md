@@ -1427,7 +1427,10 @@ Enable detailed stream logging:
 
 ```bash
 # Enable mesh stream logging
-RUST_LOG=querymt_agent::agent::remote=debug cargo run --features remote -- --mesh
+RUST_LOG=querymt_agent_runtime::agent::remote=debug cargo run --features remote -- --mesh
+
+# Enable debug logging for every querymt-agent crate (prefix match)
+RUST_LOG=querymt_agent=debug cargo run --features remote -- --mesh
 
 # Enable all libp2p logging
 RUST_LOG=libp2p=info,querymt=debug cargo run --features remote -- --mesh

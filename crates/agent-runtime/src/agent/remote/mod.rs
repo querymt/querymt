@@ -169,3 +169,90 @@ pub use routing::{
 pub use scope::{MeshScopeId, MeshTransportKind};
 #[cfg(feature = "remote")]
 pub use transport::{DynMeshTransport, MeshTransport};
+
+/// Log and tracing targets come from module paths. After the crate split the
+/// runtime's paths start with `querymt_agent_runtime`, so a bare
+/// `querymt_agent=debug` filter keeps matching every agent crate (both
+/// `env_logger` and `tracing_subscriber::EnvFilter` match targets by string
+/// prefix), while a deeper filter written against the old facade path does not.
+#[cfg(test)]
+mod log_target_tests {
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    const REMOTE_PATH: &str = module_path!();
+
+    fn node_manager_target() -> String {
+        // The module path of `remote::node_manager`, a real log site.
+        let parent = REMOTE_PATH
+            .strip_suffix("::log_target_tests")
+            .expect("test module path ends with ::log_target_tests");
+        format!("{parent}::node_manager")
+    }
+
+    fn env_logger_enables(filter: &str, target: &str) -> bool {
+        use log::Log;
+        let logger = env_logger::Builder::new().parse_filters(filter).build();
+        let metadata = log::Metadata::builder()
+            .level(log::Level::Debug)
+            .target(target)
+            .build();
+        logger.enabled(&metadata)
+    }
+
+    /// Evaluates `tracing::enabled!` at a fresh call site (tracing caches
+    /// interest per call site) under an `EnvFilter` built from `$filter`.
+    macro_rules! tracing_enables {
+        ($filter:expr) => {{
+            let subscriber = tracing_subscriber::registry().with(EnvFilter::new($filter));
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::enabled!(target: REMOTE_PATH, tracing::Level::DEBUG)
+            })
+        }};
+    }
+
+    #[test]
+    fn agent_log_targets_keep_querymt_agent_prefix() {
+        assert!(
+            REMOTE_PATH.starts_with("querymt_agent"),
+            "runtime log targets must keep the `querymt_agent` prefix, got {REMOTE_PATH}"
+        );
+        assert_eq!(
+            REMOTE_PATH,
+            "querymt_agent_runtime::agent::remote::log_target_tests"
+        );
+        assert_eq!(
+            node_manager_target(),
+            "querymt_agent_runtime::agent::remote::node_manager"
+        );
+    }
+
+    #[test]
+    fn env_logger_filters_match_runtime_targets() {
+        let target = node_manager_target();
+        // The documented bare filter covers the runtime crate.
+        assert!(env_logger_enables("querymt_agent=debug", &target));
+        // The documented deep filter (docs/docs/agent/mesh.md) uses the new path.
+        assert!(env_logger_enables(
+            "querymt_agent_runtime::agent::remote=debug",
+            &target
+        ));
+        // A deep filter written against the old facade path no longer matches.
+        assert!(!env_logger_enables(
+            "querymt_agent::agent::remote=debug",
+            &target
+        ));
+        // Unrelated filters stay off.
+        assert!(!env_logger_enables("libp2p=debug", &target));
+    }
+
+    #[test]
+    fn tracing_env_filters_match_runtime_targets() {
+        assert!(tracing_enables!("querymt_agent=debug"));
+        assert!(tracing_enables!(
+            "querymt_agent_runtime::agent::remote=debug"
+        ));
+        assert!(!tracing_enables!("querymt_agent::agent::remote=debug"));
+        assert!(!tracing_enables!("libp2p=debug"));
+    }
+}
