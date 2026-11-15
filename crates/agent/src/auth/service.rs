@@ -89,7 +89,7 @@ pub struct OAuthService {
 }
 
 #[cfg(feature = "oauth")]
-mod mcp;
+pub(crate) mod mcp;
 
 impl OAuthService {
     /// Construct a new `OAuthService` from the shared dependencies.

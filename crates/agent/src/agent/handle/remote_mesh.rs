@@ -214,7 +214,7 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    pub(super) fn remote_node_info_timeout() -> std::time::Duration {
+    pub(crate) fn remote_node_info_timeout() -> std::time::Duration {
         let default_ms = 3_000_u64;
         let timeout_ms = std::env::var("QUERYMT_REMOTE_NODE_INFO_TIMEOUT_MS")
             .ok()
@@ -236,7 +236,7 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    pub(super) fn remote_node_lookup_parallelism() -> usize {
+    pub(crate) fn remote_node_lookup_parallelism() -> usize {
         std::env::var("QUERYMT_REMOTE_NODE_LOOKUP_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -245,7 +245,7 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    pub(super) fn remote_node_cache_ttl() -> std::time::Duration {
+    pub(crate) fn remote_node_cache_ttl() -> std::time::Duration {
         let default_ms = 10_000_u64;
         let ttl_ms = std::env::var("QUERYMT_REMOTE_NODE_CACHE_TTL_MS")
             .ok()
@@ -256,7 +256,7 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    pub(super) fn should_skip_stale_dht_record(
+    pub(crate) fn should_skip_stale_dht_record(
         scope: &crate::agent::remote::scope::MeshScopeId,
         is_peer_alive: bool,
     ) -> bool {
@@ -264,7 +264,7 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    pub(super) fn stale_lan_probe_ttl() -> std::time::Duration {
+    pub(crate) fn stale_lan_probe_ttl() -> std::time::Duration {
         let default_ms = 1_500_u64;
         let ttl_ms = std::env::var("QUERYMT_REMOTE_NODE_STALE_LAN_TTL_MS")
             .ok()
@@ -275,7 +275,7 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    pub(super) fn mark_cached_remote_node_unreachable(
+    pub(crate) fn mark_cached_remote_node_unreachable(
         &self,
         cache_key: String,
         ttl: std::time::Duration,
@@ -301,7 +301,7 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    pub(super) fn get_cached_remote_node(
+    pub(crate) fn get_cached_remote_node(
         &self,
         cache_key: &str,
     ) -> Option<crate::agent::remote::NodeInfo> {
@@ -327,7 +327,7 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    pub(super) fn is_remote_node_temporarily_unreachable(&self, cache_key: &str) -> bool {
+    pub(crate) fn is_remote_node_temporarily_unreachable(&self, cache_key: &str) -> bool {
         let now = std::time::Instant::now();
         if let Some(entry) = self
             .remote_node_cache

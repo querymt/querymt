@@ -7,8 +7,6 @@
 
 pub mod catalog;
 pub mod discovery;
-#[cfg(test)]
-mod e2e_reload_tests;
 pub mod mcp;
 pub mod parser;
 pub mod permissions;

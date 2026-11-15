@@ -5,39 +5,36 @@
 //! agents, bundling shared config, the kameo session registry, and
 //! connection-level mutable state.
 
-mod agent_handle_impl;
-mod core;
-mod ext;
-mod ext_auth;
-mod ext_mesh;
-mod ext_models;
-mod ext_plugins;
-mod ext_profiles;
-mod ext_remote;
-mod ext_schedules;
-mod ext_session_history;
-mod ext_session_ops;
-mod ext_worktree_ops;
+pub(crate) mod agent_handle_impl;
+pub(crate) mod core;
+pub(crate) mod ext;
+pub(crate) mod ext_auth;
+pub(crate) mod ext_mesh;
+pub(crate) mod ext_models;
+pub(crate) mod ext_plugins;
+pub(crate) mod ext_profiles;
+pub(crate) mod ext_remote;
+pub(crate) mod ext_schedules;
+pub(crate) mod ext_session_history;
+pub(crate) mod ext_session_ops;
+pub(crate) mod ext_worktree_ops;
 pub(crate) mod model_registry;
 #[cfg(feature = "remote")]
 pub(crate) mod remote_connect;
-mod remote_mesh;
-mod remote_nodes;
-mod remote_sessions;
-mod runtime_observation;
-mod scheduler;
-mod send_agent_config;
-mod send_agent_impl;
-mod send_agent_lifecycle;
-mod session_config;
-mod session_control;
+pub(crate) mod remote_mesh;
+pub(crate) mod remote_nodes;
+pub(crate) mod remote_sessions;
+pub(crate) mod runtime_observation;
+pub(crate) mod scheduler;
+pub(crate) mod send_agent_config;
+pub(crate) mod send_agent_impl;
+pub(crate) mod send_agent_lifecycle;
+pub(crate) mod session_config;
+pub(crate) mod session_control;
 pub(crate) mod session_lifecycle;
 #[cfg(feature = "remote")]
 pub(crate) mod session_operation;
-mod utils;
-
-#[cfg(test)]
-mod tests;
+pub(crate) mod utils;
 
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::acp::protocol::{
@@ -60,8 +57,6 @@ use crate::events::{AgentEventKind, EventEnvelope};
 use crate::index::WorkspaceIndexManagerActor;
 use crate::middleware::CompositeDriver;
 use crate::profile_host::ProfileRuntimeHost;
-#[cfg(test)]
-use crate::profiles::{ProfileCatalog, ProfileRuntimeManager};
 use crate::send_agent::SendAgent;
 use crate::session::store::LLMConfig;
 use crate::tools::ToolRegistry;
@@ -182,7 +177,7 @@ pub trait AgentHandle: Send + Sync {
 /// mutable state. Not an actor — just a convenient bundle.
 #[cfg(feature = "remote")]
 #[derive(Clone, Debug)]
-enum CachedNodeEntry {
+pub(crate) enum CachedNodeEntry {
     Ready {
         info: crate::agent::remote::NodeInfo,
         expires_at: std::time::Instant,
@@ -194,8 +189,8 @@ enum CachedNodeEntry {
 
 #[cfg(feature = "remote")]
 #[derive(Debug)]
-struct RemoteNodeMetadataCache {
-    by_label: parking_lot::RwLock<std::collections::HashMap<String, CachedNodeEntry>>,
+pub(crate) struct RemoteNodeMetadataCache {
+    pub(crate) by_label: parking_lot::RwLock<std::collections::HashMap<String, CachedNodeEntry>>,
     invalidation_task_started: AtomicBool,
 }
 
@@ -247,7 +242,7 @@ pub struct LocalAgentHandle {
     published_mesh_scopes: StdMutex<std::collections::HashSet<crate::agent::remote::MeshScopeId>>,
 
     #[cfg(feature = "remote")]
-    remote_node_cache: Arc<RemoteNodeMetadataCache>,
+    pub(crate) remote_node_cache: Arc<RemoteNodeMetadataCache>,
 
     /// Per-session single-flight gates for the remote connection coordinator
     /// (`remote_connect`). Kept independent of the registry mutex so recovery

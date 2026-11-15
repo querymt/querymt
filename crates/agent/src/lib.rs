@@ -83,6 +83,10 @@ pub mod worktree {
 #[cfg(test)]
 pub mod test_utils;
 
+/// Runtime tests that exercise the top layer (`api`, `profiles`, websocket).
+#[cfg(test)]
+mod runtime_tests;
+
 // Re-export top-level error type
 pub use error::AgentError;
 

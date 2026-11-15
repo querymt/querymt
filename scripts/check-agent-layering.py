@@ -114,7 +114,7 @@ RULES: List[Tuple[str, str]] = [
         r"plugin_update\.rs)$",
         "runtime",
     ),
-    (r"^acp/websocket", "top"),
+    (r"^(acp/websocket|runtime_tests/)", "top"),
     (r"^(api|server|runner|quorum|profiles)(/|\.rs$)", "top"),
 ]
 DEFAULT_LAYER = "runtime"

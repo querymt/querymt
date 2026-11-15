@@ -278,7 +278,7 @@ impl LocalAgentHandle {
         Ok(false)
     }
 
-    pub(super) async fn stop_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {
+    pub(crate) async fn stop_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {
         use crate::agent::messages::{SessionRuntimePhase, SessionRuntimeStatus};
 
         const STOP_ESCALATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);

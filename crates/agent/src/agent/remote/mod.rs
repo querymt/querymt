@@ -62,7 +62,7 @@ pub mod remote_setup;
 mod remote_actor_impl;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 mod actor_ref_tests;
@@ -83,9 +83,6 @@ mod remote_agent_stub_tests;
 
 #[cfg(all(test, feature = "remote"))]
 mod remote_setup_tests;
-
-#[cfg(all(test, feature = "remote"))]
-mod session_actor_ref_remote_tests;
 
 #[cfg(all(test, feature = "remote"))]
 mod event_relay_mesh_tests;

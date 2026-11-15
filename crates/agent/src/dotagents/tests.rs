@@ -64,29 +64,6 @@ fn load_options_builders_round_trip() {
 }
 
 #[test]
-fn programmatic_builders_default_disabled_and_accept_protocol_inputs() {
-    let single = crate::api::AgentBuilder::new();
-    assert!(single.configured_dotagents_options().is_none());
-    assert!(single.configured_dotagents_manifest().is_none());
-
-    let single = single
-        .enable_dotagents()
-        .dotagents_manifest(DotagentsManifest::empty());
-    assert!(single.configured_dotagents_options().unwrap().is_enabled());
-    assert!(single.configured_dotagents_manifest().is_some());
-
-    let quorum = crate::api::QuorumBuilder::new();
-    assert!(quorum.configured_dotagents_options().is_none());
-    assert!(quorum.configured_dotagents_manifest().is_none());
-
-    let quorum = quorum
-        .dotagents_options(DotagentsLoadOptions::enabled())
-        .dotagents_manifest(DotagentsManifest::empty());
-    assert!(quorum.configured_dotagents_options().unwrap().is_enabled());
-    assert!(quorum.configured_dotagents_manifest().is_some());
-}
-
-#[test]
 fn strictness_is_strict() {
     assert!(!DotagentsStrictness::Compatibility.is_strict());
     assert!(DotagentsStrictness::Strict.is_strict());

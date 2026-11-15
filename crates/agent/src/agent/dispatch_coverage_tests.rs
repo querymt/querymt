@@ -34,7 +34,7 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         if path.is_dir() {
-            if name != "tests" && name != "test_utils" {
+            if name != "tests" && name != "test_utils" && name != "runtime_tests" {
                 rust_files(&path, out);
             }
         } else if name.ends_with(".rs") && !name.ends_with("_tests.rs") && name != "tests.rs" {

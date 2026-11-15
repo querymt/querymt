@@ -1,25 +1,59 @@
-use super::*;
+#![allow(unused_imports)]
+use crate::acp::client_bridge::ClientBridgeSender;
 use crate::acp::protocol::{
-    CancelNotification, CloseSessionRequest, DeleteSessionRequest, InitializeRequest,
-    ListSessionsRequest, ProtocolVersion, SessionId,
+    AuthenticateRequest, AuthenticateResponse, CancelNotification, CloseSessionRequest,
+    CloseSessionResponse, DeleteSessionRequest, DeleteSessionResponse, Error, ExtNotification,
+    ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption, SetSessionModelRequest,
+    SetSessionModelResponse,
 };
+use crate::agent::agent_config::AgentConfig;
+use crate::agent::core::{AgentMode, ClientState};
+use crate::agent::handle::*;
+use crate::agent::remote::SessionActorRef;
+use crate::agent::session_materializer::{PreparedSessionResult, SessionMaterializer};
+use crate::agent::session_registry::SessionRegistry;
+use crate::delegation::AgentRegistry;
+use crate::event_fanout::EventFanout;
+use crate::events::{AgentEventKind, EventEnvelope};
+use crate::index::WorkspaceIndexManagerActor;
+use crate::middleware::CompositeDriver;
+use crate::profile_host::ProfileRuntimeHost;
+use crate::profiles::{ProfileCatalog, ProfileRuntimeManager};
+use crate::send_agent::SendAgent;
+use crate::session::store::LLMConfig;
+use crate::tools::ToolRegistry;
+use anyhow::Result;
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use kameo::actor::ActorRef;
+use parking_lot::Mutex as ParkingMutex;
+use querymt::LLMParams;
+use querymt::chat::ReasoningEffort;
+use std::any::Any;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+#[cfg(feature = "remote")]
+use tokio::sync::OnceCell;
+#[cfg(feature = "remote")]
+use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, broadcast};
+
+use crate::acp::protocol::{ProtocolVersion, SessionId};
 use crate::agent::SessionActor;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::ToolPolicy;
 use crate::api::AgentInfra;
-use crate::send_agent::SendAgent;
 use crate::session::backend::StorageBackend;
 use crate::session::store::SessionStore;
 use crate::test_utils::{
     MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory,
     empty_plugin_registry, mock_llm_config, mock_plugin_registry, mock_session,
 };
-use querymt::LLMParams;
-use querymt::chat::ReasoningEffort;
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use kameo::actor::Spawn;
 

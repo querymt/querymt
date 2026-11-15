@@ -347,7 +347,7 @@ impl LocalAgentHandle {
             .await
     }
 
-    pub(super) async fn session_profile_config_options(
+    pub(crate) async fn session_profile_config_options(
         &self,
         session_id: Option<&str>,
         mode: AgentMode,
@@ -640,7 +640,7 @@ impl LocalAgentHandle {
         self.shutdown_done.load(Ordering::SeqCst)
     }
 
-    pub(super) fn clear_scheduler_handle(&self) {
+    pub(crate) fn clear_scheduler_handle(&self) {
         *self.scheduler_handle.lock() = None;
     }
 
