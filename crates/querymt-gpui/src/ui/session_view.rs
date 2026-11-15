@@ -12,11 +12,11 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::Duration;
 
+use super::md;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::input::{Enter, IndentInline, OutdentInline, Textarea};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarMode};
-use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -1272,7 +1272,9 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
         )
         .into_any_element()
     } else if call.failed() {
-        kit::icon(IconName::TriangleAlert, 13., p.danger).into_any_element()
+        // Yellow like the desktop's `.session-tool-status-failed` and the
+        // group's failed count.
+        kit::icon(IconName::TriangleAlert, 13., p.running).into_any_element()
     } else {
         kit::icon(IconName::Check, 13., p.success).into_any_element()
     };
@@ -1471,9 +1473,10 @@ fn render_thought(id: &str, text: &str, live: bool, rc: &RenderCtx) -> AnyElemen
                     .opacity(0.78)
                     .text_xs()
                     .text_color(p.muted)
-                    .child(TextView::markdown(
-                        SharedString::from(format!("th-md-{id}")),
+                    .child(md::markdown(
+                        format!("th-md-{id}"),
                         text.trim().to_string(),
+                        p,
                     )),
             )
         })
@@ -1540,9 +1543,11 @@ fn render_work(ix: usize, item: &Item, entries: &[WorkEntry], rc: &RenderCtx) ->
                 el.child(
                     h_flex()
                         .gap_1()
-                        .text_color(p.danger)
-                        .child(kit::icon(IconName::TriangleAlert, 12., p.danger))
-                        .child(format!("{failed} failed")),
+                        // Yellow like the desktop app (`--status-running`); the
+                        // icon says what the count is.
+                        .text_color(p.running)
+                        .child(kit::icon(IconName::TriangleAlert, 12., p.running))
+                        .child(failed.to_string()),
                 )
             })
             .child(kit::icon(IconName::ChevronRight, 13., p.dim))
@@ -1854,7 +1859,14 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
                             .when(text.is_empty(), |el| {
                                 el.text_color(p.dim).child("No message body")
                             })
-                            .when(!text.is_empty(), |el| el.child(text.clone())),
+                            // Markdown like the desktop app's user messages.
+                            .when(!text.is_empty(), |el| {
+                                el.min_w_0().child(md::markdown(
+                                    format!("umd-{}", item.key),
+                                    text.clone(),
+                                    p,
+                                ))
+                            }),
                     )
                 })
                 .child(
@@ -1888,10 +1900,7 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
             .w_full()
             .px_1()
             .text_sm()
-            .child(TextView::markdown(
-                SharedString::from(format!("md-{}", item.key)),
-                text.clone(),
-            ))
+            .child(md::markdown(format!("md-{}", item.key), text.clone(), p))
             .when_some(actions, |el, stats| {
                 el.child(turn_actions(ix, item, stats, rc))
             })
@@ -2067,9 +2076,10 @@ fn render_compaction(item: &Item, c: &Compaction, rc: &RenderCtx) -> AnyElement 
         } else {
             div()
                 .text_sm()
-                .child(TextView::markdown(
-                    SharedString::from(format!("cmd-{}", item.key)),
+                .child(md::markdown(
+                    format!("cmd-{}", item.key),
                     c.summary.clone(),
+                    p,
                 ))
                 .into_any_element()
         };

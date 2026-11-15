@@ -6,6 +6,7 @@ mod code;
 mod inbox;
 mod keys;
 mod kit;
+mod md;
 mod mesh;
 mod preview;
 mod profile_select;
