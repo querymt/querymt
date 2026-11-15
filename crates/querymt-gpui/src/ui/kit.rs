@@ -207,6 +207,14 @@ pub fn title_chip(id: impl Into<ElementId>, p: &Palette) -> Stateful<Div> {
         .rounded(px(6.))
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
+        .on_mouse_down(MouseButton::Left, claim_press)
+}
+
+/// Mouse-down handler for custom title-bar controls: claims the press so the
+/// bar does not start a window drag, without stopping propagation (the same
+/// convention as GPUI Kit's `Button`).
+pub fn claim_press(_: &MouseDownEvent, window: &mut Window, _: &mut App) {
+    window.prevent_default();
 }
 
 /// Title-bar icon button: [`title_chip`] with a muted icon and a tooltip.

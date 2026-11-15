@@ -2868,14 +2868,9 @@ impl QmtApp {
         let usage = view.usage;
         let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
 
-        // Swallow mouse-down so a click never starts a window drag.
-        let back = div()
-            .flex_none()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
-                kit::title_icon_button("session-back", IconName::ArrowLeft, "Back to sessions", p)
-                    .on_click(cx.listener(|this, _, _, cx| this.go(Page::Sessions, cx))),
-            );
+        let back =
+            kit::title_icon_button("session-back", IconName::ArrowLeft, "Back to sessions", p)
+                .on_click(cx.listener(|this, _, _, cx| this.go(Page::Sessions, cx)));
         // Copy feedback follows the desktop's copy chips: for 1.2s the chip shows
         // an accent check + "copied" over itself and the tooltip says "Copied".
         let copied = |key: &str| self.copied.as_deref() == Some(key);
@@ -2903,7 +2898,7 @@ impl QmtApp {
                 .tooltip(move |window, cx| {
                     copy_tooltip(tip.clone(), "Click to copy path", dim, false).build(window, cx)
                 })
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Left, kit::claim_press)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
                     this.flash_copied(COPIED_TITLE_PATH.into(), cx);
@@ -2930,7 +2925,6 @@ impl QmtApp {
                     copy_tooltip(tip.clone(), "Click to copy session ID", dim, true)
                         .build(window, cx)
                 })
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(sid.clone()));
                     this.flash_copied(COPIED_TITLE_ID.into(), cx);
@@ -3349,6 +3343,7 @@ impl QmtApp {
                 .text_xs()
                 .text_color(p.muted)
                 .hover(move |s| s.bg(hover))
+                .on_mouse_down(MouseButton::Left, kit::claim_press)
                 .when(open, |el| el.bg(p.card))
                 .child(kit::icon(
                     IconName::ListChecks,

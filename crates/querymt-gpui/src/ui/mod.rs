@@ -82,6 +82,8 @@ pub struct QmtApp {
     d_command: Entity<InputState>,
     d_address: Entity<InputState>,
     header_drag: bool,
+    /// The last header press landed on a control rather than the bare bar.
+    header_press_claimed: bool,
     invite_form: bool,
     invite_ttl: &'static str,
     invite_uses: Entity<InputState>,
@@ -289,6 +291,7 @@ impl QmtApp {
             d_command,
             d_address,
             header_drag: false,
+            header_press_claimed: false,
             invite_form: false,
             invite_ttl: "24h",
             invite_uses,
