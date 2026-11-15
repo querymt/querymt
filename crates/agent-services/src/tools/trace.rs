@@ -13,17 +13,17 @@ tokio::task_local! {
 }
 
 /// Run `future` with `span` as the current tool span.
-pub(crate) async fn tool_scope<T>(span: Span, future: impl std::future::Future<Output = T>) -> T {
+pub async fn tool_scope<T>(span: Span, future: impl std::future::Future<Output = T>) -> T {
     TOOL_SPAN.scope(span, future).await
 }
 
 /// Call `f` with the current tool span, if the caller runs inside [`tool_scope`].
-pub(crate) fn with_tool_span(f: impl FnOnce(&Span)) {
+pub fn with_tool_span(f: impl FnOnce(&Span)) {
     let _ = TOOL_SPAN.try_with(f);
 }
 
 /// Rename the tool span, including the already started OpenTelemetry span.
-pub(crate) fn rename_tool(span: &Span, name: String) {
+pub fn rename_tool(span: &Span, name: String) {
     span.record("otel.name", &name);
     // Updating the tracing field alone cannot rename the started OTel span in 0.33.
     span.context().span().update_name(name);

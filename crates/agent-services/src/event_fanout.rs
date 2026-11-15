@@ -50,7 +50,8 @@ impl EventFanout {
         )
     }
 
-    pub(crate) fn subscribe_delegation(
+    #[doc(hidden)]
+    pub fn subscribe_delegation(
         &self,
     ) -> broadcast::Receiver<(EventEnvelope, Option<tracing::Span>)> {
         self.delegation_sender.subscribe()
@@ -69,7 +70,8 @@ impl EventFanout {
         let _ = self.sender.send(envelope);
     }
 
-    pub(crate) fn live_delegation_activity(
+    #[doc(hidden)]
+    pub fn live_delegation_activity(
         &self,
         session_id: &str,
     ) -> Vec<crate::control::delegation_notifications::DelegationUpdateNotification> {
@@ -85,7 +87,8 @@ impl EventFanout {
             .collect()
     }
 
-    pub(crate) fn delegation_snapshots(
+    #[doc(hidden)]
+    pub fn delegation_snapshots(
         &self,
         session_ids: &[String],
     ) -> Vec<crate::control::delegation_notifications::DelegationUpdateNotification> {

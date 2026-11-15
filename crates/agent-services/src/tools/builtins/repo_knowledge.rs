@@ -1122,8 +1122,8 @@ impl ToolTrait for RepoKnowledgeStatsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RepositoryKnowledgeSettings;
     use crate::knowledge::repository::RepositoryKnowledgeRegistry;
+    use querymt_agent_knowledge::settings::RepositoryKnowledgeSettings;
     use std::any::Any;
     use std::fs;
     use std::path::{Path, PathBuf};

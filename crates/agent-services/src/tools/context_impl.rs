@@ -451,7 +451,7 @@ mod tests {
             option["_meta"]["querymt"]["description"],
             "Deploy to the customer-facing environment"
         );
-        serde_json::from_value::<crate::acp::protocol::ElicitationSchema>(schema)
+        serde_json::from_value::<crate::core_staging::protocol::ElicitationSchema>(schema)
             .expect("question schema should be valid ACP elicitation schema");
     }
 
@@ -475,7 +475,7 @@ mod tests {
             selection["items"]["anyOf"][1]["_meta"]["querymt"]["description"],
             "Customer traffic"
         );
-        serde_json::from_value::<crate::acp::protocol::ElicitationSchema>(schema)
+        serde_json::from_value::<crate::core_staging::protocol::ElicitationSchema>(schema)
             .expect("multi-select schema should be valid ACP elicitation schema");
     }
 }

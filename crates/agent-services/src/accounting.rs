@@ -100,8 +100,6 @@ mod budget_warning;
 mod cycle;
 mod dispatch;
 #[cfg(test)]
-mod dispatch_coverage_tests;
-#[cfg(test)]
 mod failure_tests;
 mod pricing;
 mod projection;
@@ -117,7 +115,8 @@ pub use dispatch::{
     ActiveAttempt, AttemptOperation, DispatchLedger, PricingLookup, accounting_llm_error,
     classify_error, merge_usage, run_attempt,
 };
-pub(crate) use pricing::is_non_billable_oauth_provider;
+#[doc(hidden)]
+pub use pricing::is_non_billable_oauth_provider;
 pub use pricing::{pricing_for, resolve_billing_basis};
 pub use projection::{PAGE_SIZE, SessionAccounting};
 pub use recorder::{AccountingError, AttemptHandle, AttemptRecorder};

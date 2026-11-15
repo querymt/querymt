@@ -366,7 +366,8 @@ impl ContentCostEstimator for GenericContentCostEstimator {
 // TODO: Prefer provider/model-specific estimation, including token-counting APIs when supported.
 // This local heuristic (especially image reserves) is neither an exact count nor an upper bound;
 // retain it as a fallback for providers without a counting API.
-pub(crate) fn estimate_chat_tokens(messages: &[ChatMessage]) -> usize {
+#[doc(hidden)]
+pub fn estimate_chat_tokens(messages: &[ChatMessage]) -> usize {
     let estimator = GenericContentCostEstimator;
     messages.iter().fold(0usize, |total, message| {
         let content_tokens = match message.output() {

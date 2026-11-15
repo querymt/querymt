@@ -98,8 +98,8 @@ impl GcConfig {
     }
 }
 
-impl From<&crate::config::SnapshotBackendConfig> for GcConfig {
-    fn from(config: &crate::config::SnapshotBackendConfig) -> Self {
+impl From<&crate::core_staging::config::execution::SnapshotBackendConfig> for GcConfig {
+    fn from(config: &crate::core_staging::config::execution::SnapshotBackendConfig) -> Self {
         Self {
             max_snapshots: config.max_snapshots,
             max_age_days: config.max_age_days,

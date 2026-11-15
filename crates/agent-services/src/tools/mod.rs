@@ -6,9 +6,10 @@ pub mod path;
 pub mod read_scope;
 pub mod registry;
 pub mod tool_set;
-pub(crate) mod trace;
-#[cfg(test)]
-pub(crate) mod trace_support;
+#[doc(hidden)]
+pub mod trace;
+#[cfg(any(test, feature = "test-support"))]
+pub mod trace_support;
 pub mod validation;
 
 pub use builtins::{

@@ -139,7 +139,8 @@ impl DelegationUpdateProjector {
 
     /// Hydrate durable lifecycle facts without treating the latest live stage
     /// watermark as evidence that older, not-yet-seeded metadata was observed.
-    pub(crate) fn seed_history(&mut self, session_id: &str, events: &[AgentEvent]) {
+    #[doc(hidden)]
+    pub fn seed_history(&mut self, session_id: &str, events: &[AgentEvent]) {
         for event in events.iter().filter(|event| event.session_id == session_id) {
             if let AgentEventKind::SessionForked {
                 parent_session_id, ..
@@ -222,7 +223,8 @@ impl DelegationUpdateProjector {
         }
     }
 
-    pub(crate) fn restore_observation(&mut self, update: DelegationUpdateNotification) {
+    #[doc(hidden)]
+    pub fn restore_observation(&mut self, update: DelegationUpdateNotification) {
         if self
             .snapshots
             .get(&update.delegation_id)

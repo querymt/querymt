@@ -93,7 +93,8 @@ impl EventSink {
         .cloned()
     }
 
-    pub(crate) fn live_delegation_activity(
+    #[doc(hidden)]
+    pub fn live_delegation_activity(
         &self,
         session_id: &str,
     ) -> Vec<crate::control::delegation_notifications::DelegationUpdateNotification> {
@@ -935,13 +936,12 @@ mod tests {
         let sink = make_sink().await;
         let mut rx = sink.fanout().subscribe();
         let blocks = [
-            crate::acp::protocol::ContentBlock::Text(crate::acp::protocol::TextContent::new(
-                "before",
-            )),
-            crate::acp::protocol::ContentBlock::Image(crate::acp::protocol::ImageContent::new(
-                "AQID",
-                "image/png",
-            )),
+            crate::core_staging::protocol::ContentBlock::Text(
+                crate::core_staging::protocol::TextContent::new("before"),
+            ),
+            crate::core_staging::protocol::ContentBlock::Image(
+                crate::core_staging::protocol::ImageContent::new("AQID", "image/png"),
+            ),
         ];
 
         for block in blocks {

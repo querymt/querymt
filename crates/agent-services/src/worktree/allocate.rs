@@ -857,11 +857,11 @@ mod tests {
     use crate::worktree::GixRepoOps;
     use crate::worktree::git::CliGit;
     use crate::worktree::repo_ops::{FailurePoint, FaultInjectingRepoOps};
-    use crate::worktree::repo_workspace::SqliteWorkspaceRepository;
     use crate::worktree::test_support::{
         FaultInjectingWorkspaceRepository, RegistryFaultPoint, init_repo_with_subdir, materialize,
     };
     use parking_lot::Mutex;
+    use querymt_agent_sqlite::repo_workspace::SqliteWorkspaceRepository;
     use rusqlite::Connection;
     use std::time::SystemTime;
     use tempfile::TempDir;

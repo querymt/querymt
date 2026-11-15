@@ -140,7 +140,7 @@ impl WorkspaceService {
     /// storage root must be creatable and a directory, and it must be on the
     /// local filesystem.
     pub fn from_settings(
-        settings: &crate::config::WorkspaceSettings,
+        settings: &crate::core_staging::config::workspace::WorkspaceSettings,
         storage: &dyn crate::session::backend::StorageBackend,
     ) -> WorktreeResult<Option<Arc<Self>>> {
         if !settings.enabled {
@@ -875,9 +875,9 @@ mod tests {
     use crate::worktree::GixRepoOps;
     use crate::worktree::domain::{BaselineMode, baseline_ref_for};
     use crate::worktree::git::CliGit;
-    use crate::worktree::repo_workspace::SqliteWorkspaceRepository;
     use crate::worktree::test_support::{commit_files, init_repo, materialize};
     use parking_lot::Mutex as StdMutex;
+    use querymt_agent_sqlite::repo_workspace::SqliteWorkspaceRepository;
     use rusqlite::Connection;
     use std::fs;
     use std::path::PathBuf;
@@ -3202,7 +3202,7 @@ mod tests {
 #[cfg(test)]
 mod settings_tests {
     use super::*;
-    use crate::config::WorkspaceSettings;
+    use crate::core_staging::config::workspace::WorkspaceSettings;
     use crate::session::sqlite_storage::SqliteStorage;
 
     async fn storage() -> (tempfile::TempDir, Arc<SqliteStorage>) {

@@ -7,14 +7,14 @@
 //! sessions and the owner's `source_seq` for remote ones.
 
 use crate::accounting::{AccountingReducer, ScopeTotals};
-use crate::acp::protocol::ContentBlock;
 use crate::control::delegation_notifications::{
     DelegationUpdateNotification, DelegationUpdateProjector,
 };
+use crate::core_staging::protocol::ContentBlock;
+use crate::core_staging::stream_cursor::{StreamCursor, observe_cursor};
 use crate::events::{AgentEvent, AgentEventKind};
 use crate::session::domain::ForkOrigin;
 use crate::session::error::SessionResult;
-use crate::session::load_snapshot::{StreamCursor, observe_cursor};
 use crate::session::projection::{EventJournal, HistoryPageDirection};
 use crate::session::turns::turn_start_indices;
 use serde::{Deserialize, Serialize};
@@ -76,7 +76,7 @@ pub fn load_window_from_meta(
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<LoadWindow> {
     let window = meta?
-        .get(crate::acp::shared::QUERYMT_META_NAMESPACE)?
+        .get(crate::core_staging::meta::QUERYMT_META_NAMESPACE)?
         .get("loadWindow")?
         .as_object()?;
     let field = |key: &str, default: usize| -> usize {

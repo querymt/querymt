@@ -31,11 +31,11 @@ use crate::worktree::domain::{
 use crate::worktree::identity::{relative_cwd, resolve_repository};
 use crate::worktree::lock::admin_lock_path;
 use crate::worktree::repo_ops::{GixRepoOps, RepositoryOps};
-use crate::worktree::repo_workspace::SqliteWorkspaceRepository;
 use crate::worktree::service::WorkspaceService;
 use crate::worktree::session_options::SessionCreationOptions;
 use crate::worktree::test_support::{commit_files, init_repo_with_subdir, materialize};
 use parking_lot::Mutex;
+use querymt_agent_sqlite::repo_workspace::SqliteWorkspaceRepository;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

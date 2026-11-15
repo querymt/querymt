@@ -8,7 +8,7 @@ use crate::model_info::get_model_info;
 use querymt::providers::{BillingClass, ModelPricing};
 
 /// Subscription/OAuth providers whose usage is never billed per token.
-pub(crate) fn is_non_billable_oauth_provider(provider: &str) -> bool {
+pub fn is_non_billable_oauth_provider(provider: &str) -> bool {
     matches!(provider, "codex" | "kimi-code")
 }
 

@@ -668,8 +668,8 @@ mod tests {
     };
     use crate::worktree::git::CliGit;
     use crate::worktree::identity::resolve_repository;
-    use crate::worktree::repo_workspace::SqliteWorkspaceRepository;
     use crate::worktree::test_support::{commit_files, init_repo, materialize};
+    use querymt_agent_sqlite::repo_workspace::SqliteWorkspaceRepository;
     use std::fs;
     use tempfile::TempDir;
 
