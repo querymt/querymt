@@ -243,6 +243,7 @@ mod web {
             ExternalLink,
             Brain,
             RotateCcw,
+            FoldVertical,
             Undo2,
             Redo2,
             ToggleLeft,
