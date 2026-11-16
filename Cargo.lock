@@ -964,7 +964,7 @@ dependencies = [
  "regex",
  "rustc-hash 2.1.3",
  "shlex 2.0.1",
- "syn 3.0.9",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1580,9 +1580,9 @@ dependencies = [
 
 [[package]]
 name = "cbor4ii"
-version = "1.2.4"
+version = "1.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cae341ca01ee91c1e68cbcbd9f08e5c9fb6171c7daed060625563232520d37ae"
+checksum = "bdf8ceac45b2b267e889b7210129e47d3b82f3020877f24473ea0fc055488ffa"
 dependencies = [
  "serde",
 ]
@@ -12358,7 +12358,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.23.1",
- "cbor4ii 1.2.4",
+ "cbor4ii 1.2.5",
  "futures-util",
  "hex",
  "iroh",
