@@ -369,9 +369,6 @@ mod tests {
             id: id.into(),
             name: name.into(),
             description: description.into(),
-            tags: vec![],
-            kind: String::new(),
-            source: String::new(),
         }
     }
 

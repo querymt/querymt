@@ -43,18 +43,22 @@ const TABS: [(SettingsTab, IconName, &str, &str); 5] = [
         "Keyboard shortcuts",
     ),
     (
+        SettingsTab::Profiles,
+        IconName::WandSparkles,
+        "Profiles",
+        "Ready-made agent configurations",
+    ),
+    (
         SettingsTab::Providers,
         IconName::KeyRound,
         "Providers",
         "Authentication for models and services.",
     ),
-    (
-        SettingsTab::Profiles,
-        IconName::Bot,
-        "Profiles",
-        "Agent profiles on the server",
-    ),
 ];
+
+/// Curated profile templates are files on this computer: not in the web build
+/// (the desktop app hides the section in its embedded UI too).
+const HAS_PROFILE_TEMPLATES: bool = cfg!(not(target_family = "wasm"));
 
 /// Rounded card that groups [`simple_row`]s (desktop `.settings-simple-row` list).
 fn settings_card(p: &Palette) -> Div {
@@ -155,6 +159,60 @@ fn disclosure(
                 .on_click(on_toggle),
         )
         .children(content.map(|c| c.mt(px(5.6))))
+}
+
+/// Desktop `.state-panel`: icon, title and explanation, an action on the right.
+fn profile_state_panel(
+    title: &'static str,
+    body: String,
+    error: bool,
+    action: AnyElement,
+    p: &Palette,
+) -> AnyElement {
+    let (_, subtle_surface) = subtle(p);
+    let (icon_bg, icon_fg) = if error {
+        (p.danger.opacity(0.12), p.danger)
+    } else {
+        (subtle_surface, p.muted)
+    };
+    h_flex()
+        .min_h(px(84.))
+        .gap(px(12.8))
+        .px_4()
+        .py(px(14.4))
+        .rounded(px(12.))
+        .bg(if error {
+            p.danger.opacity(0.08)
+        } else {
+            p.card
+        })
+        .child(
+            div()
+                .flex_none()
+                .size(px(34.4))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .bg(icon_bg)
+                .child(kit::icon(IconName::WandSparkles, 17., icon_fg)),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(2.9))
+                .child(
+                    div()
+                        .text_size(px(13.4))
+                        .font_semibold()
+                        .text_color(p.text)
+                        .child(title),
+                )
+                .child(div().text_size(px(12.)).text_color(p.muted).child(body)),
+        )
+        .child(action)
+        .into_any_element()
 }
 
 /// Title and help above a group of settings that is not a card row.
@@ -275,19 +333,27 @@ fn theme_preview(mode: Option<bool>, accent: &str, p: &Palette) -> Div {
     }
 }
 
-/// [`action_btn`] in the destructive tone (Clear API key, Reset app data).
+/// Borderless settings button: [`action_btn`] sizing on a soft fill, the
+/// style of the flat buttons used across the app.
+fn flat_btn(id: impl Into<ElementId>, enabled: bool, compact: bool, p: &Palette) -> Stateful<Div> {
+    let (fill, fill_hover) = if p.dark {
+        (hsla(0., 0., 1., 0.045), hsla(0., 0., 1., 0.09))
+    } else {
+        (p.muted.opacity(0.07), p.muted.opacity(0.13))
+    };
+    action_btn(id, enabled, compact, p)
+        .border_color(transparent_black())
+        .bg(fill)
+        .when(enabled, |el| el.hover(move |s| s.bg(fill_hover)))
+}
+
+/// [`flat_btn`] in the destructive tone (Clear API key, Reset app data).
 fn danger_btn(id: impl Into<ElementId>, enabled: bool, p: &Palette) -> Stateful<Div> {
     let danger = p.danger;
-    action_btn(id, enabled, true, p)
-        .border_color(danger.opacity(0.35))
+    flat_btn(id, enabled, true, p)
         .bg(danger.opacity(0.1))
         .text_color(danger)
-        .when(enabled, |el| {
-            el.hover(move |s| {
-                s.border_color(danger.opacity(0.65))
-                    .bg(danger.opacity(0.16))
-            })
-        })
+        .when(enabled, |el| el.hover(move |s| s.bg(danger.opacity(0.16))))
 }
 
 /// Key combination and what it does, for the Keybindings tab.
@@ -313,42 +379,45 @@ impl QmtApp {
         let p = *palette(cx);
         let tab = self.settings_tab;
 
-        let nav = v_flex()
-            .w(px(220.))
-            .flex_none()
-            .gap_0p5()
-            .children(TABS.iter().map(|(t, icon, label, desc)| {
-                let t = *t;
-                let active = t == tab;
-                let hover = p.card;
-                h_flex()
-                    .id(*label)
-                    .gap_2p5()
-                    .items_start()
-                    .px_3()
-                    .py_2()
-                    .rounded(px(10.))
-                    .cursor_pointer()
-                    .when(active, |el| el.bg(p.card))
-                    .hover(move |s| s.bg(hover))
-                    .child(div().pt_0p5().child(kit::icon(
-                        *icon,
-                        15.,
-                        if active { p.accent } else { p.muted },
-                    )))
-                    .child(
-                        // Constrained so long descriptions wrap inside the item.
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(div().text_sm().font_semibold().child(*label))
-                            .child(div().text_xs().text_color(p.dim).child(*desc)),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings_tab = t;
-                        cx.notify();
-                    }))
-            }));
+        let nav = v_flex().w(px(220.)).flex_none().gap_0p5().children(
+            TABS.iter()
+                .filter(|t| HAS_PROFILE_TEMPLATES || t.0 != SettingsTab::Profiles)
+                .map(|(t, icon, label, desc)| {
+                    let t = *t;
+                    let active = t == tab;
+                    let hover = p.card;
+                    h_flex()
+                        .id(*label)
+                        .gap_2p5()
+                        .items_start()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(10.))
+                        .cursor_pointer()
+                        .when(active, |el| el.bg(p.card))
+                        .hover(move |s| s.bg(hover))
+                        .child(div().pt_0p5().child(kit::icon(
+                            *icon,
+                            15.,
+                            if active { p.accent } else { p.muted },
+                        )))
+                        .child(
+                            // Constrained so long descriptions wrap inside the item.
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().text_sm().font_semibold().child(*label))
+                                .child(div().text_xs().text_color(p.dim).child(*desc)),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.settings_tab = t;
+                            if t == SettingsTab::Profiles {
+                                this.refresh_templates();
+                            }
+                            cx.notify();
+                        }))
+                }),
+        );
 
         let body = match tab {
             SettingsTab::General => self.settings_general(&p, cx).into_any_element(),
@@ -395,6 +464,23 @@ impl QmtApp {
                                             .child(div().text_lg().font_semibold().child(title))
                                             .child(div().text_sm().text_color(p.muted).child(desc)),
                                     )
+                                    .when(tab == SettingsTab::Profiles, |el| {
+                                        el.child(
+                                            kit::loading_icon_button(
+                                                "tpl-refresh",
+                                                IconName::RefreshCw,
+                                                "Refresh profiles",
+                                                false,
+                                                32.,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.refresh_templates();
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        )
+                                    })
                                     .when(tab == SettingsTab::Providers, |el| {
                                         let store = self.store.read(cx);
                                         let agent = store.primary_agent();
@@ -997,7 +1083,7 @@ impl QmtApp {
                 h_flex()
                     .gap_1()
                     .child(
-                        action_btn(kit::keyed("prov-signing", pkey.clone()), false, true, p)
+                        flat_btn(kit::keyed("prov-signing", pkey.clone()), false, true, p)
                             .child(kit::spinner(
                                 kit::keyed("prov-spin", pkey.clone()),
                                 14.,
@@ -1027,21 +1113,16 @@ impl QmtApp {
                     .gap_2()
                     .when(reconnect, |el| {
                         el.child(
-                            action_btn(
-                                kit::keyed("prov-reconnect", pkey.clone()),
-                                enabled,
-                                true,
-                                p,
-                            )
-                            .text_color(p.warn)
-                            .child(kit::icon(IconName::LogIn, 14., p.warn))
-                            .child("Reconnect")
-                            .when(enabled, |el| {
-                                el.on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.store.update(cx, |s, cx| s.start_oauth(&a, &prov, cx));
-                                }))
-                            }),
+                            flat_btn(kit::keyed("prov-reconnect", pkey.clone()), enabled, true, p)
+                                .text_color(p.warn)
+                                .child(kit::icon(IconName::LogIn, 14., p.warn))
+                                .child("Reconnect")
+                                .when(enabled, |el| {
+                                    el.on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.store.update(cx, |s, cx| s.start_oauth(&a, &prov, cx));
+                                    }))
+                                }),
                         )
                     })
                     .child(
@@ -1124,7 +1205,7 @@ impl QmtApp {
                 let menu_open = self.method_menu.as_deref() == Some(pr.provider.as_str());
                 let select_enabled = can_set_method && !method_pending;
                 let prov = pr.provider.clone();
-                let trigger = action_btn(kit::keyed("prov-method", pkey.clone()), select_enabled, true, p)
+                let trigger = flat_btn(kit::keyed("prov-method", pkey.clone()), select_enabled, true, p)
                     .min_w(px(128.))
                     .justify_between()
                     .child(current_label)
@@ -1203,7 +1284,7 @@ impl QmtApp {
                     let enabled = !pending && !sign_in_locked;
                     let (a, prov) = (agent.clone(), pr.provider.clone());
                     actions.push(
-                        action_btn(kit::keyed("prov-signin", pkey.clone()), enabled, true, p)
+                        flat_btn(kit::keyed("prov-signin", pkey.clone()), enabled, true, p)
                             .child(kit::icon(IconName::LogIn, 14., p.text))
                             .child(if pr.oauth_status.as_deref() == Some("expired") { "Reconnect OAuth" } else { "Sign in with OAuth" })
                             .when(enabled, |el| el.on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.start_oauth(&a, &prov, cx)))))
@@ -1213,7 +1294,7 @@ impl QmtApp {
                 if pr.supports_oauth && oauth_connected {
                     let (a, prov) = (agent.clone(), pr.provider.clone());
                     actions.push(
-                        action_btn(kit::keyed("prov-signout", pkey.clone()), !pending, true, p)
+                        flat_btn(kit::keyed("prov-signout", pkey.clone()), !pending, true, p)
                             .child(kit::icon(IconName::LogOut, 14., p.text))
                             .child("Disconnect OAuth")
                             .when(!pending, |el| el.on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.logout_provider(&a, &prov, cx)))))
@@ -1223,7 +1304,7 @@ impl QmtApp {
                 if show_set {
                     let prov = pr.provider.clone();
                     actions.push(
-                        action_btn(kit::keyed("prov-setkey", pkey.clone()), !pending, true, p)
+                        flat_btn(kit::keyed("prov-setkey", pkey.clone()), !pending, true, p)
                             .child(kit::icon(IconName::KeyRound, 14., p.text))
                             .child(if pr.has_stored_api_key { "Replace API key" } else { "Set API key" })
                             .when(!pending, |el| {
@@ -1424,7 +1505,7 @@ impl QmtApp {
         let content =
             maint_open.then(|| {
                 let (a, a2) = (agent.clone(), agent.clone());
-                let refresh = action_btn("maint-refresh", !refreshing_models, false, p)
+                let refresh = flat_btn("maint-refresh", !refreshing_models, false, p)
                     .child(if refreshing_models {
                         kit::spinner("maint-refresh-spin", 14., p.muted).into_any_element()
                     } else {
@@ -1440,7 +1521,7 @@ impl QmtApp {
                             this.store.update(cx, |s, cx| s.refresh_models(&a, cx))
                         }))
                     });
-                let update = action_btn("maint-update", !updating_plugins, false, p)
+                let update = flat_btn("maint-update", !updating_plugins, false, p)
                     .when(updating_plugins, |el| {
                         el.child(kit::spinner("maint-update-spin", 14., p.muted))
                     })
@@ -1591,88 +1672,267 @@ impl QmtApp {
             .into_any_element()
     }
 
+    /// Re-read the curated templates and their enabled state.
+    pub(super) fn refresh_templates(&mut self) {
+        self.templates = crate::profile_templates::list();
+    }
+
+    fn enable_template(&mut self, id: &str, cx: &mut Context<Self>) {
+        let feedback = match crate::profile_templates::enable(id) {
+            Ok(updated) => {
+                let message = format!("{} is ready to use.", updated.name);
+                if let Ok(list) = &mut self.templates
+                    && let Some(slot) = list.iter_mut().find(|t| t.id == updated.id)
+                {
+                    *slot = updated;
+                }
+                // Running agents pick the new file up; refresh their profile lists.
+                let agents = self.store.read(cx).connected_ids();
+                self.store.update(cx, |s, cx| {
+                    for a in &agents {
+                        s.refresh_extras(a, cx);
+                    }
+                });
+                (message, false)
+            }
+            Err(err) => (err, true),
+        };
+        self.template_feedback.insert(id.to_string(), feedback);
+        cx.notify();
+    }
+
+    /// Desktop `ProfilesSettingsPanel`: curated templates with Enable / Details,
+    /// then the "How profiles work" disclosure.
     fn settings_profiles(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let store = self.store.read(cx);
-        let profiles = store
-            .primary_agent()
-            .and_then(|a| store.runtime(&a))
-            .map(|r| r.profiles.clone())
-            .unwrap_or_default();
-        if profiles.is_empty() {
-            return panel(p)
-                .p_4()
-                .text_sm()
-                .text_color(p.dim)
-                .child("No profiles reported by the agent.")
-                .into_any_element();
-        }
-        panel(p)
-            .children(profiles.into_iter().enumerate().map(|(ix, pr)| {
-                let source = pr
-                    .source
-                    .split_once(':')
-                    .map(|(k, v)| (k.to_string(), v.to_string()));
-                v_flex()
-                    .gap_1()
-                    .px_4()
-                    .py_3()
-                    .when(ix > 0, |el| el.border_t_1().border_color(p.border))
-                    .child(
+        let (subtle_border, subtle_surface) = subtle(p);
+        let refresh = |id: &'static str, label: &'static str, cx: &mut Context<Self>| {
+            flat_btn(id, true, true, p)
+                .child(label)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.refresh_templates();
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
+
+        let list: AnyElement = match &self.templates {
+            Err(err) => profile_state_panel(
+                "Profiles could not be loaded",
+                err.clone(),
+                true,
+                refresh("tpl-retry", "Try again", cx),
+                p,
+            ),
+            Ok(templates) if templates.is_empty() => profile_state_panel(
+                "No curated profiles available",
+                "Refresh to check for ready-made configurations.".to_string(),
+                false,
+                refresh("tpl-empty-refresh", "Refresh", cx),
+                p,
+            ),
+            Ok(templates) => {
+                let count = templates.len();
+                let hover = p.card_hover;
+                let rows = templates.iter().enumerate().map(|(ix, t)| {
+                    let key: SharedString = t.id.clone().into();
+                    let open = self.template_details.contains(&t.id);
+                    let feedback = self.template_feedback.get(&t.id).cloned();
+
+                    let enable = (!t.enabled()).then(|| {
+                        let id = t.id.clone();
+                        flat_btn(kit::keyed("tpl-enable", key.clone()), true, true, p)
+                            .child("Enable")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.enable_template(&id, cx)
+                            }))
+                    });
+                    let end = h_flex().flex_none().gap_2().children(enable).child(
+                        div()
+                            .size(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(kit::icon(
+                                if open {
+                                    IconName::ChevronUp
+                                } else {
+                                    IconName::ChevronDown
+                                },
+                                15.,
+                                p.muted,
+                            )),
+                    );
+
+                    let detail_row = |label: &'static str, value: String| {
                         h_flex()
-                            .gap_2()
-                            .child(div().text_sm().font_semibold().child(pr.name.clone()))
-                            .when(pr.name != pr.id, |el| {
-                                el.child(
-                                    div()
-                                        .text_xs()
-                                        .font_family(kit::MONO)
-                                        .text_color(p.dim)
-                                        .child(pr.id.clone()),
-                                )
+                            .gap(px(11.2))
+                            .text_size(px(11.2))
+                            .text_color(p.muted)
+                            .child(
+                                div()
+                                    .w(px(88.))
+                                    .flex_none()
+                                    .font_semibold()
+                                    .text_color(p.dim)
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_family(kit::MONO)
+                                    .child(value),
+                            )
+                    };
+                    let details = open.then(|| {
+                        v_flex()
+                            .gap(px(5.6))
+                            .px(px(12.))
+                            .py(px(10.4))
+                            .rounded(px(8.))
+                            .bg(subtle_surface)
+                            .when(!t.tags.is_empty(), |el| {
+                                el.child(detail_row("Tags", t.tags.join(", ")))
                             })
-                            .child(kit::tone_chip(
-                                if pr.kind == "quorum" {
-                                    "multi-agent"
-                                } else {
-                                    "single"
-                                },
-                                if pr.kind == "quorum" {
-                                    p.accent
-                                } else {
-                                    p.status_muted
-                                },
-                            ))
-                            .child(div().flex_1())
-                            .children(pr.tags.iter().map(|t| kit::chip(t.clone(), p))),
-                    )
-                    .when(!pr.description.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .text_xs()
-                                .text_color(p.muted)
-                                .child(pr.description.clone()),
-                        )
-                    })
-                    .when_some(source, |el, (kind, path)| {
-                        el.child(
+                            .child(detail_row("Profile ID", t.id.clone()))
+                            .when_some(t.user_path.clone(), |el, path| {
+                                el.child(detail_row("Installed at", path))
+                            })
+                    });
+                    let feedback = feedback.map(|(message, error)| {
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(if error { p.danger } else { p.success })
+                            .child(message)
+                    });
+
+                    // GPUI's overflow mask is rectangular, so the list can't clip
+                    // its rows: the first and last rows round their own corners.
+                    let (first, last) = (ix == 0, ix + 1 == count);
+                    let has_body = details.is_some() || feedback.is_some();
+                    let id = t.id.clone();
+                    v_flex()
+                        .id(kit::keyed("tpl-row", key.clone()))
+                        .relative()
+                        .min_w_0()
+                        .bg(if open { hover } else { p.card })
+                        .when(first, |el| el.rounded_t(px(12.)))
+                        .when(last, |el| el.rounded_b(px(12.)))
+                        .when(!first, |el| el.border_t_1().border_color(subtle_border))
+                        .child(
                             h_flex()
-                                .gap_1p5()
-                                .text_xs()
-                                .text_color(p.dim)
-                                .child(kit::icon(
-                                    if kind == "embedded" {
-                                        IconName::Bot
-                                    } else {
-                                        IconName::FileText
-                                    },
-                                    11.,
-                                    p.dim,
-                                ))
-                                .child(div().font_family(kit::MONO).truncate().child(path)),
+                                .id(kit::keyed("tpl-head", key))
+                                .relative()
+                                .min_w_0()
+                                .gap_3()
+                                .pl(px(18.))
+                                .pr(px(10.))
+                                .py(px(12.))
+                                .cursor_pointer()
+                                .when(first, |el| el.rounded_t(px(12.)))
+                                .when(last && !has_body, |el| el.rounded_b(px(12.)))
+                                .hover(move |s| s.bg(hover))
+                                // Enabled: the same leading green bar as a
+                                // connected provider.
+                                .when(t.enabled(), |el| {
+                                    el.child(
+                                        div()
+                                            .absolute()
+                                            .left(px(7.))
+                                            .top(px(14.))
+                                            .bottom(px(14.))
+                                            .w(px(3.))
+                                            .rounded_full()
+                                            .bg(p.success),
+                                    )
+                                })
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(px(13.4))
+                                                .font_semibold()
+                                                .text_color(p.text)
+                                                .child(t.name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .mt(px(3.2))
+                                                .truncate()
+                                                .text_size(px(12.))
+                                                .text_color(p.muted)
+                                                .child(t.description.clone()),
+                                        ),
+                                )
+                                .child(end)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.template_details.remove(&id) {
+                                        this.template_details.insert(id.clone());
+                                    }
+                                    cx.notify();
+                                })),
                         )
-                    })
-            }))
-            .into_any_element()
+                        .when(has_body, |el| {
+                            el.child(
+                                v_flex()
+                                    .min_w_0()
+                                    .gap(px(7.2))
+                                    .px(px(12.))
+                                    .pb(px(12.))
+                                    .children(feedback)
+                                    .children(details),
+                            )
+                        })
+                        .into_any_element()
+                });
+                v_flex()
+                    .min_w_0()
+                    .rounded(px(12.))
+                    .bg(p.card)
+                    .children(rows)
+                    .into_any_element()
+            }
+        };
+
+        let help_open = self.templates_help_open;
+        let help = help_open.then(|| {
+            v_flex()
+                .px(px(14.4))
+                .py(px(12.))
+                .rounded(px(12.))
+                .bg(subtle_surface)
+                .child(
+                    div()
+                        .max_w(px(672.))
+                        .text_size(px(12.))
+                        .text_color(p.muted)
+                        .child(
+                            "Profiles are stored as TOML configuration files in ~/.qmt/profiles. \
+                             Enabling a curated profile never overwrites an existing copy, and \
+                             running agents pick up profile changes automatically.",
+                        ),
+                )
+        });
+        let help = disclosure(
+            "profiles-help",
+            "How profiles work",
+            "Storage, updates, and existing copies",
+            help_open,
+            cx.listener(|this, _, _, cx| {
+                this.templates_help_open = !this.templates_help_open;
+                cx.notify();
+            }),
+            help,
+            p,
+        );
+
+        v_flex().gap(px(12.8)).child(list).child(help)
     }
 }
 

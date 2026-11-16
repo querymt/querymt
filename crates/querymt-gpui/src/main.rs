@@ -12,6 +12,7 @@
 #![cfg_attr(target_family = "wasm", no_main)]
 
 mod highlight;
+mod profile_templates;
 mod rpc;
 mod session;
 mod store;
