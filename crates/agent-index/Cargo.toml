@@ -59,7 +59,7 @@ tree-sitter-toml-ng = "0.7"
 tree-sitter-md = "0.5"
 
 # Rust AST parsing for rich structural fingerprinting during function indexing
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 querymt-workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
