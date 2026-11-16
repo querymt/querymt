@@ -39,7 +39,7 @@ runs:
       id: sccache
       if: ${{ inputs.sccache == 'true' }}
       continue-on-error: true
-      uses: mozilla-actions/sccache-action@v0.0.9
+      uses: mozilla-actions/sccache-action@v0.0.11
 
     - name: Enable sccache
       if: ${{ steps.sccache.outcome == 'success' }}
