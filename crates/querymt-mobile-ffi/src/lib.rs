@@ -1343,7 +1343,7 @@ mod tests {
             session_mcp_attachment_source: None,
             event_fanout: Some(Arc::new(querymt_agent::event_fanout::EventFanout::new())),
         };
-        let agent = querymt_agent::api::Agent::single()
+        let agent = querymt_agent::api::Agent::builder()
             .provider("mock", "mock-model")
             .infra(infra)
             .build()

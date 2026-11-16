@@ -34,7 +34,7 @@ flowchart LR
 ```rust
 use querymt_agent::prelude::*;
 
-let agent = Agent::single()
+let agent = Agent::builder()
     .provider("anthropic", "claude-sonnet-4-5-20250929")
     .cwd(".")
     .tools(["read_tool", "shell", "edit"])

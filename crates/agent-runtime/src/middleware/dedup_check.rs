@@ -9,7 +9,7 @@
 //! ```ignore
 //! use querymt_agent::middleware::DedupCheckMiddleware;
 //!
-//! let agent = Agent::single()
+//! let agent = Agent::builder()
 //!     .provider("anthropic", "claude-sonnet")
 //!     .middleware(|agent| {
 //!         DedupCheckMiddleware::new()

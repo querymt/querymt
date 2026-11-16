@@ -2564,7 +2564,7 @@ capabilities = ["coding"]
         .await
         .expect("initial quorum runtime build hung")
         .expect("initial quorum runtime");
-        assert!(first.agent().is_multi());
+        assert!(first.agent().has_subagents());
         assert!(first.agent().delegate("coder").is_some());
         let subscriber_count = fanout.subscriber_count();
         for _ in 0..3 {
@@ -3333,7 +3333,7 @@ system = "inline"
             .await
             .expect("single runtime builds");
         assert_eq!(runtime.profile_id(), "single");
-        assert!(!runtime.agent().is_multi());
+        assert!(!runtime.agent().has_subagents());
         assert!(Arc::ptr_eq(&shared, &runtime.agent().storage_backend()));
 
         manager.shutdown().await;
@@ -3413,7 +3413,7 @@ capabilities = ["coding"]
             .await
             .expect("quorum runtime builds");
         assert_eq!(runtime.profile_id(), "team");
-        assert!(runtime.agent().is_multi());
+        assert!(runtime.agent().has_subagents());
         assert!(Arc::ptr_eq(&shared, &runtime.agent().storage_backend()));
 
         manager.shutdown().await;

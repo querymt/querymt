@@ -374,8 +374,12 @@ Every successful add or remove sends one notification to every connected client;
 failed request sends nothing:
 
 ```json
-{"method":"querymt/agents/changed","params":{"generation":3,"profileId":"quorum"}}
+{"method":"querymt/agents/changed","params":{"generation":3,"removed":"coder","profileId":"quorum"}}
 ```
+
+`added` or `removed` names the member the change concerned, so a client does not need to
+list again to learn what happened. The replies to `querymt/agents/add` and
+`querymt/agents/remove` carry the same fields.
 
 `profileId` is present when the change was made to a profile's runtime. Treat the
 notification as an invalidation hint and call `querymt/agents/list` for the state.
@@ -854,7 +858,7 @@ verification_spec = {
 
 ### Delegation Not Starting
 
-1. Check the delegate is in the roster: `Agent::is_multi()` is true when the root has members, and `Agent::delegate(id)` returns a member by ID
+1. Check the delegate is in the roster: `Agent::has_subagents()` is true when the root has members, and `Agent::delegate(id)` returns a member by ID
 2. Verify delegate configuration is valid
 3. Check for middleware errors
 4. Review logs for delegation events

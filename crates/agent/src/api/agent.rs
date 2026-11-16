@@ -50,7 +50,7 @@ use std::sync::{Arc, Mutex};
 /// use std::sync::Arc;
 ///
 /// # async fn example(registry: querymt::plugin::host::PluginRegistry, storage: Arc<dyn querymt_agent::session::backend::StorageBackend>) {
-/// let agent = Agent::single()
+/// let agent = Agent::builder()
 ///     .provider("anthropic", "claude-sonnet-4-20250514")
 ///     .infra(AgentInfra {
 ///         plugin_registry: Arc::new(registry),
@@ -269,6 +269,15 @@ impl AgentBuilder {
             }
         }
         self
+    }
+
+    /// Alias of [`delegate`](Self::delegate): add a subagent the root agent
+    /// can hand work to.
+    pub fn subagent<F>(self, id: impl Into<String>, configure: F) -> Self
+    where
+        F: FnOnce(super::config::DelegateConfigBuilder) -> super::config::DelegateConfigBuilder,
+    {
+        self.delegate(id, configure)
     }
 
     /// Turn delegation on or off (on by default). It also requires the root's
@@ -574,7 +583,7 @@ impl AgentBuilder {
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let agent = Agent::single()
+    /// let agent = Agent::builder()
     ///     .provider("openai", "gpt-4")
     ///     .cwd(".")
     ///     .middleware(|_agent| {
@@ -1078,7 +1087,26 @@ impl AgentDotagentsState {
     }
 }
 
+/// One subagent as listed by [`Agent::subagents`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SubagentInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub capabilities: Vec<String>,
+    pub origin: crate::delegation::roster::MemberOrigin,
+    pub location: crate::delegation::roster::MemberLocation,
+}
+
 impl Agent {
+    /// Starts building an agent. Every agent can have subagents: add them
+    /// here with [`AgentBuilder::subagent`] or later with
+    /// [`Agent::add_subagent`].
+    pub fn builder() -> AgentBuilder {
+        AgentBuilder::new()
+    }
+
+    #[deprecated(note = "use `Agent::builder()`; every agent can have subagents")]
     pub fn single() -> AgentBuilder {
         AgentBuilder::new()
     }
@@ -1250,6 +1278,40 @@ impl Agent {
     {
         self.callbacks.on_delegation(callback);
         self.callbacks.ensure_listener(self.subscribe());
+        self
+    }
+
+    /// Subscribes to subagents being added or removed, from any path: the
+    /// Rust API, `querymt/agents/add|remove`, or `add_member`. Only changes
+    /// made after this call are delivered.
+    pub fn subscribe_subagent_changes(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::delegation::roster::RosterChange> {
+        self.roster.subscribe_changes()
+    }
+
+    /// Calls `callback` for every subagent added or removed from now on, in
+    /// order. Call it more than once to register several callbacks. A
+    /// callback that falls far behind skips changes (and logs a warning);
+    /// it never delays the change itself. Must be called inside a Tokio
+    /// runtime.
+    pub fn on_subagents_changed<F>(&self, callback: F) -> &Self
+    where
+        F: Fn(&crate::delegation::roster::RosterChange) + Send + Sync + 'static,
+    {
+        use tokio::sync::broadcast::error::RecvError;
+        let mut changes = self.roster.subscribe_changes();
+        tokio::spawn(async move {
+            loop {
+                match changes.recv().await {
+                    Ok(change) => callback(&change),
+                    Err(RecvError::Lagged(skipped)) => {
+                        log::warn!("on_subagents_changed skipped {skipped} change(s)")
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
         self
     }
 
@@ -1471,7 +1533,7 @@ impl Agent {
     ///
     /// #[tokio::main]
     /// async fn main() -> anyhow::Result<()> {
-    ///     let agent = Agent::single()
+    ///     let agent = Agent::builder()
     ///         .provider("anthropic", "claude-sonnet-4-20250514")
     ///         .cwd("/tmp")
     ///         .tools(["read_tool", "write_file"])
@@ -1508,10 +1570,15 @@ impl Agent {
         self.inner.clone()
     }
 
-    /// Returns `true` when the roster lists members the root can delegate to.
-    /// That includes `.agents` delegation targets, not only configured delegates.
-    pub fn is_multi(&self) -> bool {
+    /// Returns `true` when the root has subagents it can delegate to. That
+    /// includes `.agents` delegation targets, not only configured delegates.
+    pub fn has_subagents(&self) -> bool {
         !self.roster.snapshot().is_empty()
+    }
+
+    #[deprecated(note = "use `has_subagents()`")]
+    pub fn is_multi(&self) -> bool {
+        self.has_subagents()
     }
 
     /// The members the root can delegate to. Read it with `snapshot()`.
@@ -1528,6 +1595,59 @@ impl Agent {
     ) -> Result<crate::delegation::roster::RosterGeneration, crate::delegation::roster::RosterError>
     {
         self.inner.add_roster_member(spec).await
+    }
+
+    /// Adds a subagent while the agent runs, configured with the same closure
+    /// builder as [`AgentBuilder::subagent`]. It is available to the root's
+    /// `delegate` tool from the next turn of every session. Returns the new
+    /// roster generation. The change lasts until the agent stops.
+    ///
+    /// Fails (leaving the roster unchanged) when delegation is disabled, the
+    /// ID is taken or the subagent cannot be built.
+    pub async fn add_subagent<F>(
+        &self,
+        id: impl Into<String>,
+        configure: F,
+    ) -> Result<crate::delegation::roster::RosterGeneration, crate::delegation::roster::RosterError>
+    where
+        F: FnOnce(super::config::DelegateConfigBuilder) -> super::config::DelegateConfigBuilder,
+    {
+        use crate::delegation::roster::{AgentId, RosterError};
+        let id = AgentId::try_from(id.into().as_str())?;
+        let spec = configure(super::config::DelegateConfigBuilder::new(id.clone()))
+            .build()
+            .map_err(|source| RosterError::Build { id, source })?;
+        self.inner.add_roster_spec(spec).await
+    }
+
+    /// Removes a subagent by ID. A delegation already running on it finishes.
+    pub async fn remove_subagent(
+        &self,
+        id: &str,
+    ) -> Result<crate::delegation::roster::RosterGeneration, crate::delegation::roster::RosterError>
+    {
+        self.remove_member(id).await
+    }
+
+    /// The current subagents, ordered by ID. Never builds one.
+    pub fn subagents(&self) -> Vec<SubagentInfo> {
+        self.roster
+            .snapshot()
+            .iter()
+            .map(|member| SubagentInfo {
+                id: member.id().to_string(),
+                name: member.info().name.clone(),
+                description: member.info().description.clone(),
+                capabilities: member.info().capabilities.clone(),
+                origin: member.origin(),
+                location: member.location(),
+            })
+            .collect()
+    }
+
+    /// How many times the roster has changed since the agent started.
+    pub fn roster_generation(&self) -> u64 {
+        self.roster.snapshot().generation().get()
     }
 
     /// Removes a member, whatever its origin. A delegation already running on
@@ -1661,7 +1781,7 @@ impl Agent {
                 Self::builder_from_config_with_dotagents(*config, dotagents_workspace)
             }
             crate::config::Config::Multi(config) => {
-                let builder = Self::builder_from_quorum_config(*config)?;
+                let builder = Self::lower_quorum_config(*config)?;
                 Ok(match dotagents_workspace {
                     Some(workspace) => builder.with_dotagents_workspace(workspace),
                     None => builder,
@@ -1761,26 +1881,40 @@ impl Agent {
 /// delegates are its members.
 impl Agent {
     /// Create an agent from a serializable quorum config + custom infrastructure.
+    #[deprecated(
+        note = "`[quorum]` is deprecated: use `[agent]` with `[[delegates]]`, or `Agent::builder().subagent(..)`"
+    )]
     pub async fn from_quorum_config_with_infra(
         config: crate::config::QuorumConfig,
         infra: AgentInfra,
     ) -> Result<Self> {
-        Self::builder_from_quorum_config(config)?
+        Self::lower_quorum_config(config)?
             .infra(infra)
             .build()
             .await
     }
 
     /// Build an Agent from a quorum config (default infrastructure).
+    #[deprecated(
+        note = "`[quorum]` is deprecated: use `[agent]` with `[[delegates]]`, or `Agent::builder().subagent(..)`"
+    )]
     pub async fn from_quorum_config(config: crate::config::QuorumConfig) -> Result<Self> {
-        Self::builder_from_quorum_config(config)?.build().await
+        Self::lower_quorum_config(config)?.build().await
     }
 
     /// Configure an `AgentBuilder` from a `QuorumConfig`.
     ///
     /// Returns the builder before `build()` is called, allowing further
     /// customization (e.g., `.infra()`).
+    #[deprecated(
+        note = "`[quorum]` is deprecated: use `[agent]` with `[[delegates]]`, or `Agent::builder().subagent(..)`"
+    )]
     pub fn builder_from_quorum_config(config: crate::config::QuorumConfig) -> Result<AgentBuilder> {
+        Self::lower_quorum_config(config)
+    }
+
+    /// The lowering behind the deprecated quorum entry points and `Config::Multi`.
+    pub(crate) fn lower_quorum_config(config: crate::config::QuorumConfig) -> Result<AgentBuilder> {
         let snapshot_policy = match config.quorum.snapshot_policy {
             Some(policy) => policy.parse().map_err(|error: String| anyhow!(error))?,
             None => SnapshotPolicy::None,

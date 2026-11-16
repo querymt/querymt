@@ -43,7 +43,7 @@ let options = DotagentsLoadOptions::enabled()
     .with_selected_model_preset("fast")
     .with_workspace_task_trust(DotagentsTaskTrustPolicy::Prompt);
 
-let agent = Agent::single()
+let agent = Agent::builder()
     .provider("anthropic", "claude-sonnet-4-5-20250929")
     .dotagents_options(options)
     .build()
@@ -53,7 +53,7 @@ let agent = Agent::single()
 A pre-resolved manifest can be supplied instead, which skips discovery entirely:
 
 ```rust
-let agent = Agent::single()
+let agent = Agent::builder()
     .provider("anthropic", "claude-sonnet-4-5-20250929")
     .dotagents_manifest(manifest)
     .build()

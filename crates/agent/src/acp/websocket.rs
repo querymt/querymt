@@ -12,7 +12,7 @@
 //! use querymt_agent::acp::websocket::serve_websocket;
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! let agent = Agent::single()
+//! let agent = Agent::builder()
 //!     .provider("anthropic", "claude-sonnet-4-20250514")
 //!     .build()
 //!     .await?;
@@ -1145,7 +1145,7 @@ pub(crate) async fn deliver_claimed_websocket_elicitation(
 /// use querymt_agent::acp::websocket::serve_websocket;
 ///
 /// # async fn example() -> anyhow::Result<()> {
-/// let agent = Agent::single()
+/// let agent = Agent::builder()
 ///     .provider("anthropic", "claude-sonnet-4-20250514")
 ///     .cwd("/tmp")
 ///     .tools(["read_tool", "write_file", "shell"])

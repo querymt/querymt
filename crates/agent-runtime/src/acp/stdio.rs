@@ -1002,7 +1002,7 @@ fn spawn_event_bridge_forwarder(
 ///
 /// #[tokio::main]
 /// async fn main() -> anyhow::Result<()> {
-///     let agent = Agent::single()
+///     let agent = Agent::builder()
 ///         .provider("anthropic", "claude-sonnet-4-20250514")
 ///         .cwd("/tmp")
 ///         .build()

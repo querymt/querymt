@@ -7,7 +7,7 @@ use querymt_agent::prelude::*;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build an agent with delegates, using closure-based configuration
-    let runner = Agent::single()
+    let runner = Agent::builder()
         .cwd(".")
         .db("./delegates.db")
         .provider("openai", "gpt-4")

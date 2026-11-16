@@ -10,7 +10,8 @@ use crate::delegation::member::{
     MemberBuildSpec, MemberSpec, available_local_tool_names, build_local_member,
 };
 use crate::delegation::roster::{
-    AgentId, AgentRoster, Member, MemberAgent, MemberOrigin, RosterError, RosterGeneration,
+    AgentId, AgentRoster, Member, MemberAgent, MemberOrigin, RosterChange, RosterChangeKind,
+    RosterError, RosterGeneration,
 };
 use std::sync::Arc;
 
@@ -20,8 +21,27 @@ use std::sync::Arc;
 #[serde(rename_all = "camelCase")]
 pub(super) struct RosterChanged<'a> {
     pub generation: RosterGeneration,
+    /// The member this change added (`querymt/agents/changed` and the reply
+    /// to `querymt/agents/add`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added: Option<&'a str>,
+    /// The member this change removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<&'a str>,
+}
+
+impl<'a> RosterChanged<'a> {
+    pub(super) fn of(change: &'a RosterChange, profile_id: Option<&'a str>) -> Self {
+        let id = Some(change.id.as_str());
+        Self {
+            generation: change.generation,
+            added: id.filter(|_| change.kind == RosterChangeKind::Added),
+            removed: id.filter(|_| change.kind == RosterChangeKind::Removed),
+            profile_id,
+        }
+    }
 }
 
 impl LocalAgentHandle {
@@ -35,26 +55,68 @@ impl LocalAgentHandle {
         &self,
         spec: MemberSpec,
     ) -> Result<RosterGeneration, RosterError> {
-        let generation = self.apply_roster_add(spec)?;
-        self.announce_roster_change(generation, None).await;
-        Ok(generation)
+        let change = self.apply_roster_add(spec)?;
+        self.after_roster_change(&change, None).await;
+        Ok(change.generation)
+    }
+
+    /// Adds a member described by an already lowered [`MemberBuildSpec`],
+    /// for in-process callers such as the closure builder. Same rules and
+    /// announcement as [`Self::add_roster_member`], except that nothing here
+    /// came from outside the process, so no external checks apply.
+    pub async fn add_roster_spec(
+        &self,
+        spec: MemberBuildSpec,
+    ) -> Result<RosterGeneration, RosterError> {
+        let roster = self
+            .config
+            .roster()
+            .filter(|roster| roster.delegation_enabled())
+            .ok_or(RosterError::DelegationDisabled)?;
+        if let Some(existing) = roster.snapshot().get(spec.id.as_str()) {
+            return Err(RosterError::DuplicateId {
+                id: spec.id.clone(),
+                origin: existing.origin(),
+            });
+        }
+        let member = Self::build_runtime_member(roster, spec)?;
+        let change = roster.add_change(member)?;
+        self.after_roster_change(&change, None).await;
+        Ok(change.generation)
+    }
+
+    fn build_runtime_member(
+        roster: &Arc<AgentRoster>,
+        spec: MemberBuildSpec,
+    ) -> Result<Member, RosterError> {
+        let handle = build_local_member(&spec, roster.context()).map_err(|source| match source
+            .downcast::<RosterError>(
+        ) {
+            Ok(error) => error,
+            Err(source) => RosterError::Build {
+                id: spec.id.clone(),
+                source,
+            },
+        })?;
+        Ok(Member::built(
+            spec.info(),
+            MemberOrigin::Runtime,
+            MemberAgent::Local(handle),
+        ))
     }
 
     /// Removes a member, whatever its origin, and announces the change. A
     /// delegation that already holds the member keeps it and finishes.
     pub async fn remove_roster_member(&self, id: &str) -> Result<RosterGeneration, RosterError> {
-        let generation = self.apply_roster_remove(id)?;
-        self.announce_roster_change(generation, None).await;
-        Ok(generation)
+        let change = self.apply_roster_remove(id)?;
+        self.after_roster_change(&change, None).await;
+        Ok(change.generation)
     }
 
     /// Adds the member without announcing it. `querymt/agents/add` uses this
     /// for a profile's runtime, because the announcement must come from the
     /// handle that serves the client and carry the profile ID.
-    pub(crate) fn apply_roster_add(
-        &self,
-        spec: MemberSpec,
-    ) -> Result<RosterGeneration, RosterError> {
+    pub(crate) fn apply_roster_add(&self, spec: MemberSpec) -> Result<RosterChange, RosterError> {
         let roster = self
             .config
             .roster()
@@ -72,17 +134,17 @@ impl LocalAgentHandle {
             MemberSpec::Local(delegate) => self.local_runtime_member(roster, id, *delegate)?,
             MemberSpec::Remote(remote) => self.remote_runtime_member(id, remote)?,
         };
-        roster.add(member)
+        roster.add_change(member)
     }
 
     /// Removes the member without announcing it; see [`Self::apply_roster_add`].
-    pub(crate) fn apply_roster_remove(&self, id: &str) -> Result<RosterGeneration, RosterError> {
+    pub(crate) fn apply_roster_remove(&self, id: &str) -> Result<RosterChange, RosterError> {
         let roster = self
             .config
             .roster()
             .filter(|roster| roster.delegation_enabled())
             .ok_or(RosterError::DelegationDisabled)?;
-        roster.remove(id)
+        roster.remove_change(id)
     }
 
     fn local_runtime_member(
@@ -113,12 +175,7 @@ impl LocalAgentHandle {
             &available_local_tool_names(),
         )
         .map_err(build_error)?;
-        let handle = build_local_member(&spec, roster.context()).map_err(build_error)?;
-        Ok(Member::built(
-            spec.info(),
-            MemberOrigin::Runtime,
-            MemberAgent::Local(handle),
-        ))
+        Self::build_runtime_member(roster, spec)
     }
 
     /// A remote member is listed without contacting its peer; the node is
@@ -161,15 +218,67 @@ impl LocalAgentHandle {
     /// Sends `querymt/agents/changed` to every connected client: the
     /// broadcast reaches transports that subscribe, and the bridge reaches
     /// the stdio connection, as for schedule changes.
-    pub(crate) async fn announce_roster_change(
+    /// What follows every successful roster change, from whichever path made
+    /// it: the client notification, then the `subagent_added` /
+    /// `subagent_removed` hooks of the runtime that changed. Hooks only
+    /// observe; a failure is logged and never undoes the change.
+    pub(crate) async fn after_roster_change(
         &self,
-        generation: RosterGeneration,
+        change: &RosterChange,
         profile_id: Option<&str>,
     ) {
-        let params = RosterChanged {
-            generation,
-            profile_id,
+        self.announce_roster_change(change, profile_id).await;
+        self.run_subagent_change_hooks(change, profile_id).await;
+    }
+
+    pub(super) async fn run_subagent_change_hooks(
+        &self,
+        change: &RosterChange,
+        profile_id: Option<&str>,
+    ) {
+        use crate::hooks::{HookEventConfig, SubagentChangeRequest};
+
+        let event = match change.kind {
+            RosterChangeKind::Added => HookEventConfig::SubagentAdded,
+            RosterChangeKind::Removed => HookEventConfig::SubagentRemoved,
         };
+        let label = event.label();
+        let request = SubagentChangeRequest {
+            event,
+            subagent_id: change.id.to_string(),
+            name: change.name.clone(),
+            description: change.description.clone(),
+            capabilities: change.capabilities.clone(),
+            origin: change.origin.to_string(),
+            location: match change.location {
+                crate::delegation::roster::MemberLocation::Local => "local",
+                crate::delegation::roster::MemberLocation::Remote => "remote",
+            }
+            .to_string(),
+            generation: change.generation.get(),
+            profile_id: profile_id.map(str::to_string),
+            cwd: None,
+        };
+        match self.config.hooks.run_subagent_change(request).await {
+            Ok(result) => {
+                for notice in result.notices {
+                    if notice.is_error {
+                        log::warn!("{label} hook for '{}': {}", change.id, notice.message);
+                    } else {
+                        log::info!("{label} hook for '{}': {}", change.id, notice.message);
+                    }
+                }
+            }
+            Err(error) => log::warn!("{label} hook for '{}' failed: {error}", change.id),
+        }
+    }
+
+    pub(crate) async fn announce_roster_change(
+        &self,
+        change: &RosterChange,
+        profile_id: Option<&str>,
+    ) {
+        let params = RosterChanged::of(change, profile_id);
         let raw = match serde_json::value::to_raw_value(&params) {
             Ok(raw) => raw,
             Err(error) => {

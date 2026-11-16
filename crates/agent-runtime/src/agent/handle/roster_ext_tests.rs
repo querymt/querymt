@@ -243,8 +243,23 @@ async fn clients_are_notified_of_a_roster_change() {
         assert_eq!(notification.method.as_ref(), "querymt/agents/changed");
         let params: Value = serde_json::from_str(notification.params.get()).unwrap();
         assert_eq!(params["generation"].as_u64(), Some(generation));
+        assert_eq!(params["added"], "coder");
+        assert!(params.get("removed").is_none());
         assert!(client.try_recv().is_err(), "exactly one notification");
     }
+    assert_eq!(response["added"], "coder");
+
+    let removed = call(&root, "querymt/agents/remove", json!({"id": "coder"}))
+        .await
+        .unwrap();
+    assert_eq!(removed["removed"], "coder");
+    assert!(removed.get("added").is_none());
+    let notification = first.try_recv().expect("notified of the removal");
+    let params: Value = serde_json::from_str(notification.params.get()).unwrap();
+    assert_eq!(params["removed"], "coder");
+    assert_eq!(params["generation"].as_u64(), Some(generation + 1));
+    // Drain what `second` also received so the failure check below is exact.
+    while second.try_recv().is_ok() {}
 
     // A failed request sends nothing.
     call(&root, "querymt/agents/remove", json!({"id": "ghost"}))

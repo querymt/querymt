@@ -38,7 +38,7 @@ no worktree, and is unchanged whether or not the service is enabled.
     use querymt_agent::api::Agent;
     use querymt_agent::config::WorkspaceSettings;
 
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("anthropic", "claude-sonnet-4-5-20250929")
         .cwd("/path/to/repo")
         .workspace(WorkspaceSettings::enabled())

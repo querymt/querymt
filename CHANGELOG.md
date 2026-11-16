@@ -4,6 +4,16 @@
 
 ### Behavior changes
 
+- **Subagents API (Rust, Python, hooks, ACP):** `Agent::builder()`,
+  `AgentBuilder::subagent`, `Agent::add_subagent` / `remove_subagent` /
+  `subagents` / `has_subagents` / `on_subagents_changed` /
+  `subscribe_subagent_changes`; Python `Agent.create`, `add_subagent`,
+  `remove_subagent`, `subagents`, `on_subagents_changed`, `SubagentError`.
+  New observe-only hooks `subagent_added` / `subagent_removed`;
+  `querymt/agents/changed` and the add/remove replies now carry `added` /
+  `removed`. Deprecated: `Agent::single`, `Agent::is_multi`,
+  `Agent::from_quorum_config*`, `Agent::builder_from_quorum_config`, and in
+  Python `Agent.single` and `is_multi()` (`DeprecationWarning`).
 - **BREAKING (Rust API, delegation):** every runtime has one root agent and a
   typed roster of members it can delegate to (`unify-agent-runtime`). A plain
   agent is a runtime with an empty roster and now gets the delegation service

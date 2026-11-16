@@ -18,7 +18,7 @@
 async fn main() -> anyhow::Result<()> {
     use querymt_agent::prelude::*;
     use querymt_agent::server::ServerMode;
-    let agent = Agent::single().provider("openai", "gpt-4").build().await?;
+    let agent = Agent::builder().provider("openai", "gpt-4").build().await?;
 
     let server = agent.server();
     let addr = "127.0.0.1:3030";

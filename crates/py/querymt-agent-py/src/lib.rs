@@ -1,5 +1,5 @@
 use anyhow::Result;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::sync::Arc;
@@ -10,6 +10,9 @@ use ::querymt_agent::config::{Permissions, ToolSpec, WorkspaceSettings};
 use ::querymt_agent::worktree::{
     BaselineMode, HandoffOptions, WorkspaceTarget, WorktreeCreateRequest, WorktreeOpError,
 };
+
+use ::querymt_agent::api::DelegateConfigBuilder;
+use ::querymt_agent::delegation::roster::RosterError;
 
 type AgentHandle = ::querymt_agent::api::Agent;
 type AgentSessionHandle = ::querymt_agent::api::AgentSession;
@@ -24,6 +27,168 @@ pyo3::create_exception!(
      `unpreserved_commits`, `workspace_archived`, `workspace_not_found`, \
      `isolation_unsupported_layout`)."
 );
+
+pyo3::create_exception!(
+    querymt_agent,
+    SubagentError,
+    PyRuntimeError,
+    "Changing the agent's subagents failed. `.code` is a stable machine-readable \
+     identifier (`invalid_id`, `duplicate_id`, `unknown_agent`, `delegation_disabled`, \
+     `mesh_required`, `peer_routing_unsupported`, `file_prompt_part`, \
+     `isolation_without_workspace`, `build_failed`)."
+);
+
+/// What a subagent is configured with, shared by `Agent.single(subagents=[...])`
+/// and `Agent.add_subagent(...)`.
+#[derive(Default)]
+struct SubagentOpts {
+    provider: String,
+    model: String,
+    system: Option<String>,
+    tools: Option<Vec<String>>,
+    description: Option<String>,
+    capabilities: Option<Vec<String>>,
+    mode: Option<AgentMode>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+}
+
+impl SubagentOpts {
+    fn configure(self, mut s: DelegateConfigBuilder) -> DelegateConfigBuilder {
+        s = s.provider(self.provider, self.model);
+        if let Some(system) = self.system {
+            s = s.system(system);
+        }
+        if let Some(tools) = self.tools {
+            s = s.tools(tools);
+        }
+        if let Some(description) = self.description {
+            s = s.description(description);
+        }
+        if let Some(capabilities) = self.capabilities {
+            s = s.capabilities(capabilities);
+        }
+        if let Some(mode) = self.mode {
+            s = s.mode(mode);
+        }
+        if let Some(api_key) = self.api_key {
+            s = s.api_key(api_key);
+        }
+        if let Some(base_url) = self.base_url {
+            s = s.base_url(base_url);
+        }
+        s
+    }
+}
+
+/// `{"id": ..., "provider": ..., "model": ..., ...}` -> (id, options).
+/// Unknown keys raise `ValueError`.
+fn parse_subagent_dict(item: &Bound<'_, PyAny>) -> PyResult<(String, SubagentOpts)> {
+    let dict = item
+        .cast::<PyDict>()
+        .map_err(|_| PyValueError::new_err("each subagent must be a dict"))?;
+    let mut id = None;
+    let mut opts = SubagentOpts::default();
+    let mut provider = None;
+    let mut model = None;
+    for (key, value) in dict.iter() {
+        let key: String = key.extract()?;
+        match key.as_str() {
+            "id" => id = Some(value.extract::<String>()?),
+            "provider" => provider = Some(value.extract::<String>()?),
+            "model" => model = Some(value.extract::<String>()?),
+            "system" => opts.system = value.extract()?,
+            "tools" => opts.tools = value.extract()?,
+            "description" => opts.description = value.extract()?,
+            "capabilities" => opts.capabilities = value.extract()?,
+            "api_key" => opts.api_key = value.extract()?,
+            "base_url" => opts.base_url = value.extract()?,
+            "mode" => {
+                opts.mode = value
+                    .extract::<Option<String>>()?
+                    .as_deref()
+                    .map(parse_mode)
+                    .transpose()?
+            }
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown subagent option `{other}` (expected id, provider, model, system, \
+                     tools, description, capabilities, mode, api_key or base_url)"
+                )));
+            }
+        }
+    }
+    let missing = |name: &str| PyValueError::new_err(format!("subagent is missing `{name}`"));
+    opts.provider = provider.ok_or_else(|| missing("provider"))?;
+    opts.model = model.ok_or_else(|| missing("model"))?;
+    Ok((id.ok_or_else(|| missing("id"))?, opts))
+}
+
+fn subagent_code(err: &RosterError) -> &'static str {
+    match err {
+        RosterError::InvalidId => "invalid_id",
+        RosterError::DuplicateId { .. } => "duplicate_id",
+        RosterError::UnknownAgent(_) => "unknown_agent",
+        RosterError::DelegationDisabled => "delegation_disabled",
+        RosterError::MeshRequired => "mesh_required",
+        RosterError::PeerRoutingUnsupported => "peer_routing_unsupported",
+        RosterError::FilePromptPart { .. } => "file_prompt_part",
+        RosterError::IsolationWithoutWorkspace { .. } => "isolation_without_workspace",
+        RosterError::Build { .. } => "build_failed",
+        _ => "error",
+    }
+}
+
+/// Raise `SubagentError` carrying the stable `.code`; the message includes
+/// the cause chain (for example which tool selector was invalid).
+fn subagent_err(err: RosterError) -> PyErr {
+    let mut message = err.to_string();
+    let mut source = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    Python::attach(|py| {
+        let py_err = SubagentError::new_err(message);
+        match py_err.value(py).setattr("code", subagent_code(&err)) {
+            Ok(()) => py_err,
+            Err(set_err) => set_err,
+        }
+    })
+}
+
+/// Wraps a Python callable so the runtime can call it from its event task.
+/// An exception in the callback is printed, never propagated.
+fn callable(callback: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    Python::attach(|py| {
+        if callback.bind(py).is_callable() {
+            Ok(callback)
+        } else {
+            Err(PyTypeError::new_err("callback must be callable"))
+        }
+    })
+}
+
+fn warn_deprecated(py: Python<'_>, message: &str) -> PyResult<()> {
+    py.import("warnings")?.call_method1(
+        "warn",
+        (
+            message,
+            py.get_type::<pyo3::exceptions::PyDeprecationWarning>(),
+            3,
+        ),
+    )?;
+    Ok(())
+}
+
+fn call_python(callback: &Py<PyAny>, args: impl for<'py> pyo3::call::PyCallArgs<'py>) {
+    Python::attach(|py| {
+        if let Err(err) = callback.call1(py, args) {
+            err.print(py);
+        }
+    });
+}
 
 #[pyclass(name = "Worktrees")]
 struct PyWorktrees {
@@ -42,9 +207,23 @@ struct PyAgentSession {
 
 #[pymethods]
 impl PyAgent {
+    /// Deprecated alias of `Agent.create(...)`: every agent can have subagents.
     #[staticmethod]
-    #[pyo3(signature = (provider, model, cwd=None, tools=None, system=None, api_key=None, base_url=None, db=None, ask=None, always_ask=None, approval_timeout_sec=None, mode=None, max_steps=None, max_prompt_bytes=None, execution_timeout_secs=None, worktrees=None))]
+    #[pyo3(signature = (*args, **kwargs))]
     fn single<'py>(
+        py: Python<'py>,
+        args: &Bound<'py, pyo3::types::PyTuple>,
+        kwargs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        warn_deprecated(py, "Agent.single() is deprecated; use Agent.create()")?;
+        py.get_type::<PyAgent>()
+            .getattr("create")?
+            .call(args, kwargs)
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (provider, model, cwd=None, tools=None, system=None, api_key=None, base_url=None, db=None, ask=None, always_ask=None, approval_timeout_sec=None, mode=None, max_steps=None, max_prompt_bytes=None, execution_timeout_secs=None, worktrees=None, subagents=None))]
+    fn create<'py>(
         py: Python<'py>,
         provider: String,
         model: String,
@@ -62,13 +241,22 @@ impl PyAgent {
         max_prompt_bytes: Option<usize>,
         execution_timeout_secs: Option<u64>,
         worktrees: Option<Bound<'py, PyAny>>,
+        subagents: Option<Vec<Bound<'py, PyAny>>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         // Parsed eagerly so a bad argument raises ValueError at the call site.
+        let subagents = subagents
+            .unwrap_or_default()
+            .iter()
+            .map(parse_subagent_dict)
+            .collect::<PyResult<Vec<_>>>()?;
         let workspace = parse_worktrees(worktrees.as_ref())?;
         let permissions = parse_permissions(ask, always_ask, approval_timeout_sec)?;
         let mode = mode.as_deref().map(parse_mode).transpose()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut builder = AgentHandle::single().provider(provider, model);
+            let mut builder = AgentHandle::builder().provider(provider, model);
+            for (id, opts) in subagents {
+                builder = builder.subagent(id, |s| opts.configure(s));
+            }
             if let Some(settings) = workspace {
                 builder = builder.workspace(settings);
             }
@@ -262,11 +450,124 @@ impl PyAgent {
         })
     }
 
-    /// True when the agent's roster has members it can delegate to, whether
-    /// they came from configuration, the `.agents` directory or were added
-    /// while running. A plain agent has an empty roster and returns False.
-    fn is_multi(&self) -> bool {
-        self.inner.is_multi()
+    /// True when the agent has subagents it can delegate to, whether they
+    /// came from configuration, the `.agents` directory or were added while
+    /// running.
+    fn has_subagents(&self) -> bool {
+        self.inner.has_subagents()
+    }
+
+    /// Deprecated alias of `has_subagents()`.
+    fn is_multi(&self, py: Python<'_>) -> PyResult<bool> {
+        warn_deprecated(py, "Agent.is_multi() is deprecated; use has_subagents()")?;
+        Ok(self.inner.has_subagents())
+    }
+
+    /// Add a subagent while the agent runs; the root's `delegate` tool lists
+    /// it from the next turn. Returns the new roster generation. Raises
+    /// `SubagentError` (see `.code`); the roster is unchanged on failure.
+    #[pyo3(signature = (id, provider, model, system=None, tools=None, description=None, capabilities=None, mode=None, api_key=None, base_url=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_subagent<'py>(
+        &self,
+        py: Python<'py>,
+        id: String,
+        provider: String,
+        model: String,
+        system: Option<String>,
+        tools: Option<Vec<String>>,
+        description: Option<String>,
+        capabilities: Option<Vec<String>>,
+        mode: Option<String>,
+        api_key: Option<String>,
+        base_url: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let opts = SubagentOpts {
+            provider,
+            model,
+            system,
+            tools,
+            description,
+            capabilities,
+            mode: mode.as_deref().map(parse_mode).transpose()?,
+            api_key,
+            base_url,
+        };
+        let agent = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let generation = agent
+                .add_subagent(id, |s| opts.configure(s))
+                .await
+                .map_err(subagent_err)?;
+            Python::attach(|py| Ok(generation.get().into_pyobject(py)?.into_any().unbind()))
+        })
+    }
+
+    /// Remove a subagent by ID, whatever its origin. A delegation already
+    /// running on it finishes. Returns the new roster generation.
+    fn remove_subagent<'py>(&self, py: Python<'py>, id: String) -> PyResult<Bound<'py, PyAny>> {
+        let agent = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let generation = agent.remove_subagent(&id).await.map_err(subagent_err)?;
+            Python::attach(|py| Ok(generation.get().into_pyobject(py)?.into_any().unbind()))
+        })
+    }
+
+    /// The current subagents, ordered by id: dicts with `id`, `name`,
+    /// `description`, `capabilities`, `origin` (`config`/`protocol`/`runtime`)
+    /// and `location` (`local`/`remote`).
+    #[getter]
+    fn subagents(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialize_to_py(py, &self.inner.subagents())
+    }
+
+    /// How many times the set of subagents changed since the agent started.
+    #[getter]
+    fn roster_generation(&self) -> u64 {
+        self.inner.roster_generation()
+    }
+
+    /// Call `callback(change)` whenever a subagent is added or removed, from
+    /// any path. `change` is a dict: `kind` (`added`/`removed`), `id`, `name`,
+    /// `description`, `capabilities`, `origin`, `location` and `generation`.
+    /// Refused changes are not reported. An exception in the callback is
+    /// printed and does not affect the change.
+    fn on_subagents_changed(&self, callback: Py<PyAny>) -> PyResult<()> {
+        let callback = callable(callback)?;
+        let _runtime = pyo3_async_runtimes::tokio::get_runtime().enter();
+        self.inner.on_subagents_changed(move |change| {
+            Python::attach(|py| match serialize_to_py(py, change) {
+                Ok(change) => call_python(&callback, (change,)),
+                Err(err) => err.print(py),
+            });
+        });
+        Ok(())
+    }
+
+    /// Call `callback(agent_id, objective)` whenever the root delegates.
+    fn on_delegation(&self, callback: Py<PyAny>) -> PyResult<()> {
+        let callback = callable(callback)?;
+        // Registering starts the event listener task, which needs a runtime
+        // even though this method is called synchronously from Python.
+        let _runtime = pyo3_async_runtimes::tokio::get_runtime().enter();
+        self.inner.on_delegation(move |agent_id, objective| {
+            call_python(&callback, (agent_id, objective));
+        });
+        Ok(())
+    }
+
+    /// Call `callback(tool_name, arguments)` for every tool call; `arguments`
+    /// is the decoded JSON value.
+    fn on_tool_call(&self, callback: Py<PyAny>) -> PyResult<()> {
+        let callback = callable(callback)?;
+        let _runtime = pyo3_async_runtimes::tokio::get_runtime().enter();
+        self.inner.on_tool_call(move |name, args| {
+            Python::attach(|py| match json_to_py(py, &args) {
+                Ok(args) => call_python(&callback, (name, args)),
+                Err(err) => err.print(py),
+            });
+        });
+        Ok(())
     }
 }
 
@@ -433,9 +734,16 @@ fn querymt_agent(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyAgentSession>()?;
     module.add_class::<PyWorktrees>()?;
     module.add("WorktreeError", py.get_type::<WorktreeError>())?;
+    module.add("SubagentError", py.get_type::<SubagentError>())?;
     module.add(
         "__all__",
-        vec!["Agent", "AgentSession", "Worktrees", "WorktreeError"],
+        vec![
+            "Agent",
+            "AgentSession",
+            "Worktrees",
+            "WorktreeError",
+            "SubagentError",
+        ],
     )?;
     Ok(())
 }

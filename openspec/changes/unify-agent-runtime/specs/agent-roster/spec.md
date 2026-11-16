@@ -85,11 +85,36 @@ Every agent runtime SHALL have exactly one roster: the list of member agents its
 - **AND** the generation is unchanged
 
 ### Requirement: Roster changes are announced to clients
-Each successful add or remove SHALL increase the roster generation by exactly one and SHALL send `querymt/agents/changed` with the new `generation` to every connected client. A failed request SHALL send nothing.
+Each successful add or remove SHALL increase the roster generation by exactly one and SHALL send `querymt/agents/changed` with the new `generation` to every connected client. The notification and the reply to `querymt/agents/add` SHALL carry `added` (the member ID) and the notification and the reply to `querymt/agents/remove` SHALL carry `removed`. A failed request SHALL send nothing.
 
 #### Scenario: Clients are notified of a roster change
 - **WHEN** a member is added while two clients are connected
-- **THEN** both clients receive `querymt/agents/changed` carrying the generation returned by the add request
+- **THEN** both clients receive `querymt/agents/changed` carrying the generation returned by the add request and `added` naming the member
+
+#### Scenario: Removal names the member
+- **WHEN** that member is removed
+- **THEN** the clients receive `querymt/agents/changed` with `removed` naming the member and the next generation
+
+### Requirement: Roster changes are observable in process
+The roster SHALL publish one change event for every successful add or remove, whichever path made it, in generation order, carrying the kind (`added` or `removed`), the member's ID, name, description, capabilities, origin and location, and the generation the change produced. A refused change SHALL publish nothing. A subscriber that falls behind SHALL skip events without delaying the change.
+
+#### Scenario: Callback sees changes from every path
+- **WHEN** a callback is registered, a subagent is added through the Rust API, a duplicate add is refused, and the subagent is removed
+- **THEN** the callback receives exactly two changes, `added` then `removed`, with generations 1 and 2
+
+### Requirement: Hooks observe subagent changes
+The hook events `subagent_added` and `subagent_removed` SHALL run after a successful add or removal, from whichever path made it, in the hooks of the runtime that changed. The matcher SHALL be a regex on the subagent ID. The input SHALL contain the subagent's ID, name, description, capabilities, origin, location, the generation, the profile ID and the working directory, and no session ID.
+
+#### Scenario: A matching hook receives the change
+- **WHEN** a `subagent_added` hook with matcher `^rev` is configured and subagents `coder` and `reviewer` are added
+- **THEN** the hook runs once, for `reviewer`, and its input validates against the generated schema
+
+### Requirement: Subagent hooks cannot change the outcome
+Hooks for `subagent_added` and `subagent_removed` SHALL only observe. A failure, a block request or an invalid reply SHALL be reported and SHALL NOT undo the change. An `mcp_tool` handler for these events SHALL be rejected when the configuration loads.
+
+#### Scenario: A failing hook does not undo the change
+- **WHEN** a `subagent_added` hook exits non-zero
+- **THEN** the subagent is still in the roster
 
 ### Requirement: The delegate tool lists the current roster
 WHEN delegation is enabled, the root agent's `delegate` tool definition SHALL list every current member with its ID, name, description, capabilities and default isolation, ordered by ID. A roster change SHALL appear in the tool definition offered on the next turn of every session of that runtime. The definition SHALL NOT change while the roster is unchanged.

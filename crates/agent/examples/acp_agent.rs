@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
     log::info!("================================================");
 
     // Build the agent with a simple API
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("anthropic", "claude-sonnet-4-20250514")
         .cwd("/tmp")
         .tools(["read_tool", "write_file", "shell", "list", "glob"])

@@ -41,7 +41,7 @@ async fn test_agent_with_storage(
 
 async fn test_agent_with_backend(storage: Arc<dyn StorageBackend>) -> Result<Agent> {
     let (registry, _temp_dir) = empty_plugin_registry()?;
-    Agent::single()
+    Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
@@ -198,7 +198,7 @@ async fn agent_with_slash_config(config: SlashCommandsConfig) -> Result<Agent> {
     let (registry, _temp_dir) = empty_plugin_registry()?;
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
-    Agent::single()
+    Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
@@ -283,7 +283,7 @@ async fn agent_with_middleware_entries(
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
     let (registry, _temp_dir) = empty_plugin_registry()?;
-    Agent::single()
+    Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
@@ -1614,7 +1614,7 @@ tools = []
 
     // Verify both profiles and quorum are present
     assert!(agent.profiles().is_some());
-    assert!(agent.is_multi());
+    assert!(agent.has_subagents());
 
     // Get references before shutdown
     let planner = agent.handle();
@@ -1658,7 +1658,7 @@ async fn protocol_prompt_overlay_appends_after_explicit_system_parts() -> Result
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
 
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .system("Explicit system prompt")
         .infra(AgentInfra {
@@ -1704,7 +1704,7 @@ async fn partial_protocol_overlay_preserves_explicit_settings() -> Result<()> {
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
 
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .system("Explicit system prompt")
         .infra(AgentInfra {
@@ -1757,7 +1757,7 @@ async fn selected_model_preset_overlays_only_llm_fields() -> Result<()> {
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
 
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .system("Explicit system prompt")
         .infra(AgentInfra {
@@ -1801,7 +1801,7 @@ async fn unknown_selected_preset_keeps_explicit_llm_configuration() -> Result<()
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
 
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
@@ -2548,7 +2548,7 @@ mod repository_knowledge_binding {
                 .await
                 .unwrap(),
         );
-        let mut builder = Agent::single()
+        let mut builder = Agent::builder()
             .provider("openai", "gpt-4o-mini")
             .cwd(cwd)
             .infra(AgentInfra {
@@ -2666,7 +2666,7 @@ mod repository_knowledge_binding {
         )
         .unwrap();
         let warm = registry.clone();
-        let agent = Agent::single()
+        let agent = Agent::builder()
             .provider("mock", "mock-model")
             .cwd(&repo)
             .repository_knowledge(settings)
@@ -2766,7 +2766,7 @@ mod workspace_api {
                 .await
                 .unwrap(),
         );
-        let mut builder = Agent::single()
+        let mut builder = Agent::builder()
             .provider("openai", "gpt-4o-mini")
             .cwd(repo.path())
             .infra(AgentInfra {
@@ -2951,7 +2951,7 @@ mod workspace_api {
                 .await
                 .unwrap(),
         );
-        let err = Agent::single()
+        let err = Agent::builder()
             .provider("openai", "gpt-4o-mini")
             .workspace(WorkspaceSettings {
                 storage_root: Some(file.path().join("nested")),
@@ -3082,7 +3082,7 @@ async fn invalid_middleware_fails_single_and_quorum_with_the_same_error() {
     let quorum_toml = "[quorum]\ncwd = \"/tmp\"\n\n[planner]\nprovider = \"openai\"\nmodel = \"gpt-4\"\ntools = [\"delegate\"]\n\n[[planner.middleware]]\ntype = \"limits\"\ncache_write_cost_per_million = -2.0\n";
     let config: crate::config::QuorumConfig = toml::from_str(quorum_toml).unwrap();
     let (registry, _dir) = empty_plugin_registry().unwrap();
-    let quorum = Agent::builder_from_quorum_config(config)
+    let quorum = Agent::lower_quorum_config(config)
         .unwrap()
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
@@ -3142,7 +3142,7 @@ async fn built_trading_desk_agent_has_a_120s_approval_timeout() -> Result<()> {
 #[tokio::test]
 async fn build_reports_a_malformed_tool_selector() {
     let (registry, _temp_dir) = empty_plugin_registry().unwrap();
-    let err = Agent::single()
+    let err = Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .tools(["github."])
         .infra(AgentInfra {
@@ -3165,7 +3165,7 @@ async fn agent_with_skills(enabled: bool, tools: &[&str]) -> Result<Agent> {
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
     let (registry, _temp_dir) = empty_plugin_registry()?;
-    let mut builder = Agent::single()
+    let mut builder = Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
@@ -3350,7 +3350,7 @@ async fn target_sees_only_its_server_skills_and_parent_sees_both() -> Result<()>
     let (registry, _tmp2) = empty_plugin_registry()?;
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .cwd(dir.path())
         .skills(skills)
@@ -3556,7 +3556,10 @@ async fn quorum_profiles_keep_their_runtime_shape() -> Result<()> {
                 let crate::config::Config::Multi(config) = config else {
                     panic!("{name}: expected a quorum config");
                 };
-                Agent::from_quorum_config_with_infra(*config, infra).await?
+                Agent::lower_quorum_config(*config)?
+                    .infra(infra)
+                    .build()
+                    .await?
             } else {
                 let config = crate::config::load_config(confs.join(format!("{name}.toml"))).await?;
                 let crate::config::Config::Single(config) = config else {
@@ -3765,7 +3768,7 @@ async fn delegation_from_a_plain_agent_runs() -> Result<()> {
         agent_info("helper"),
         build_delegate_handle(DelegateBehavior::AlwaysOk, store, None).await,
     )];
-    let mut builder = Agent::single()
+    let mut builder = Agent::builder()
         .provider("mock", "mock-model")
         .tools(["delegate"]);
     builder.preregistered = members;
@@ -3795,7 +3798,7 @@ async fn internal_sub_agent_extends_a_standalone_agent() -> Result<()> {
 
     let dir = writer_dotagents_workspace();
     let (registry, _reg_dir) = scripted_text_registry()?;
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("mock", "mock-model")
         .cwd(dir.path())
         .tools(["delegate"])
@@ -3855,7 +3858,7 @@ global_enabled = false
     );
     let config: crate::config::QuorumConfig = toml::from_str(&toml)?;
     let (registry, _reg_dir) = scripted_text_registry()?;
-    let agent = Agent::builder_from_quorum_config(config)?
+    let agent = Agent::lower_quorum_config(config)?
         .infra(AgentInfra {
             plugin_registry: registry,
             storage: Some(Arc::new(
@@ -3907,7 +3910,7 @@ global_enabled = false
     );
     let config: crate::config::QuorumConfig = toml::from_str(&toml)?;
     let (registry, _reg_dir) = scripted_text_registry()?;
-    let agent = Agent::builder_from_quorum_config(config)?
+    let agent = Agent::lower_quorum_config(config)?
         .infra(AgentInfra {
             plugin_registry: registry,
             storage: Some(Arc::new(
@@ -3956,7 +3959,7 @@ async fn session_bound_to_a_protocol_member_loads_after_restart() -> Result<()> 
     // member is never built in either until a session needs it.
     for _ in 0..2 {
         let (registry, _reg_dir) = scripted_text_registry()?;
-        let agent = Agent::single()
+        let agent = Agent::builder()
             .provider("mock", "mock-model")
             .cwd(dir.path())
             .tools(["delegate"])
@@ -4024,7 +4027,7 @@ async fn two_profiles_delegate_at_the_same_time() -> Result<()> {
             agent_info(member),
             build_delegate_handle(DelegateBehavior::AlwaysOk, store.clone(), None).await,
         )];
-        let mut builder = Agent::single()
+        let mut builder = Agent::builder()
             .provider("mock", "mock-model")
             .tools(["delegate"])
             .with_profile_id(profile);
@@ -4161,7 +4164,7 @@ async fn parent_clock_keeps_three_shell_delegations_terminal_on_wire() {
         ));
     }
     // The root's plugin registry also serves the delegation summarizer.
-    let mut builder = Agent::single()
+    let mut builder = Agent::builder()
         .cwd(dir.path())
         .provider("mock", "summary")
         .tools(["delegate"])
@@ -4493,7 +4496,7 @@ tools = ["read_tool", "stdio-tool.fetch"]
 
     #[tokio::test]
     async fn build_reports_a_malformed_tool_selector_of_the_root_or_a_delegate() {
-        let err = Agent::single()
+        let err = Agent::builder()
             .provider("openai", "gpt-4")
             .tools(["github."])
             .build()
@@ -4505,7 +4508,7 @@ tools = ["read_tool", "stdio-tool.fetch"]
             "{err}"
         );
 
-        let err = Agent::single()
+        let err = Agent::builder()
             .provider("openai", "gpt-4")
             .tools(["delegate"])
             .delegate("coder", |d| {
@@ -4520,7 +4523,7 @@ tools = ["read_tool", "stdio-tool.fetch"]
 
     #[test]
     fn delegates_are_stored_with_their_system_prompt_and_no_skills_by_default() {
-        let builder = Agent::single()
+        let builder = Agent::builder()
             .provider("test", "planner")
             .delegate("coder", |d| {
                 d.provider("ollama", "model")
@@ -4545,7 +4548,7 @@ tools = ["read_tool", "stdio-tool.fetch"]
         let mut config = skill_config(true);
         config.planner.skills = Default::default();
         config.planner.skills.enabled = false;
-        let error = Agent::builder_from_quorum_config(config)
+        let error = Agent::lower_quorum_config(config)
             .unwrap()
             .infra(infra)
             .build()
@@ -4563,7 +4566,7 @@ tools = ["read_tool", "stdio-tool.fetch"]
         let (infra, _dir) = test_infra().await;
         let mut config = skill_config(true);
         config.delegates[0].skills.enabled = false;
-        let error = Agent::builder_from_quorum_config(config)
+        let error = Agent::lower_quorum_config(config)
             .unwrap()
             .infra(infra)
             .build()
@@ -4579,7 +4582,10 @@ tools = ["read_tool", "stdio-tool.fetch"]
     #[tokio::test]
     async fn skill_tool_is_registered_for_root_and_delegate_when_enabled() {
         let (infra, _dir) = test_infra().await;
-        let agent = Agent::from_quorum_config_with_infra(skill_config(true), infra)
+        let agent = Agent::lower_quorum_config(skill_config(true))
+            .unwrap()
+            .infra(infra)
+            .build()
             .await
             .expect("skill quorum should build");
         for config in [
@@ -4605,7 +4611,7 @@ tools = ["read_tool", "stdio-tool.fetch"]
     #[tokio::test]
     async fn skill_tool_is_skipped_when_not_selected() {
         let (infra, _dir) = test_infra().await;
-        let agent = Agent::single()
+        let agent = Agent::builder()
             .infra(infra)
             .provider("test", "planner-model")
             .tools(["delegate"])
@@ -4659,7 +4665,7 @@ provider = "openai"
 model = "gpt-4"
 "#,
             );
-            let builder = Agent::builder_from_quorum_config(config).unwrap();
+            let builder = Agent::lower_quorum_config(config).unwrap();
             assert_eq!(
                 builder.peer_delegates,
                 vec![crate::delegation::PeerRoute {
@@ -4672,7 +4678,7 @@ model = "gpt-4"
 
     #[test]
     fn resolved_mcp_servers_and_selectors_are_kept_for_root_and_delegates() {
-        let builder = Agent::builder_from_quorum_config(quorum(MCP)).unwrap();
+        let builder = Agent::lower_quorum_config(quorum(MCP)).unwrap();
         let names: Vec<&str> = builder.mcp_servers.iter().map(|s| s.name()).collect();
         assert!(
             names.contains(&"stdio-tool") && names.contains(&"http-tool"),
@@ -4704,7 +4710,7 @@ model = "gpt-4"
     #[tokio::test]
     async fn runtime_config_admits_only_the_resolved_mcp_tools() {
         let (infra, _dir) = test_infra().await;
-        let agent = Agent::builder_from_quorum_config(quorum(MCP))
+        let agent = Agent::lower_quorum_config(quorum(MCP))
             .unwrap()
             .infra(infra)
             .build()
@@ -4774,7 +4780,7 @@ model = "gpt-4"
 tools = ["beta.lookup"]
 "#,
         );
-        let agent = Agent::builder_from_quorum_config(config)
+        let agent = Agent::lower_quorum_config(config)
             .unwrap()
             .infra(infra)
             .build()
@@ -4831,13 +4837,12 @@ model = "gpt-4"
     #[tokio::test]
     async fn agents_start_in_their_configured_mode() {
         let (infra, _dir) = test_infra().await;
-        let agent =
-            Agent::builder_from_quorum_config(mode_config("mode = \"plan\"", "mode = \"review\""))
-                .unwrap()
-                .infra(infra)
-                .build()
-                .await
-                .expect("builds");
+        let agent = Agent::lower_quorum_config(mode_config("mode = \"plan\"", "mode = \"review\""))
+            .unwrap()
+            .infra(infra)
+            .build()
+            .await
+            .expect("builds");
         let mode = |config: &crate::agent::AgentConfig| *config.default_mode.lock().unwrap();
         assert_eq!(mode(&agent.handle().config), AgentMode::Plan);
         assert_eq!(
@@ -4865,7 +4870,7 @@ model = "gpt-4"
         let (infra, _dir) = test_infra().await;
         let delegate =
             "[[delegates.middleware]]\ntype = \"limits\"\ncache_write_cost_per_million = -2.0\n";
-        let err = Agent::builder_from_quorum_config(mode_config("", delegate))
+        let err = Agent::lower_quorum_config(mode_config("", delegate))
             .unwrap()
             .infra(infra)
             .build()
@@ -4908,15 +4913,13 @@ model = "gpt-4"
     async fn members_share_one_workspace_service_and_carry_their_isolation() {
         let root = tempfile::TempDir::new().unwrap();
         let (infra, _dir) = test_infra().await;
-        let agent = Agent::builder_from_quorum_config(workspace_config(
-            root.path(),
-            "isolation = \"isolated\"",
-        ))
-        .unwrap()
-        .infra(infra)
-        .build()
-        .await
-        .expect("builds");
+        let agent =
+            Agent::lower_quorum_config(workspace_config(root.path(), "isolation = \"isolated\""))
+                .unwrap()
+                .infra(infra)
+                .build()
+                .await
+                .expect("builds");
         let service =
             |config: &crate::agent::AgentConfig| config.workspace_service().expect("service");
         let root_service = service(&agent.handle().config);
@@ -4942,7 +4945,7 @@ model = "gpt-4"
         let root = tempfile::TempDir::new().unwrap();
         for enabled in [true, false] {
             let (infra, _dir) = test_infra().await;
-            let mut builder = Agent::builder_from_quorum_config(workspace_config(root.path(), ""))
+            let mut builder = Agent::lower_quorum_config(workspace_config(root.path(), ""))
                 .unwrap()
                 .infra(infra);
             if enabled {
@@ -4981,7 +4984,7 @@ model = "gpt-4"
         let (infra, _dir) = test_infra().await;
         let mut config = workspace_config(std::path::Path::new("/unused"), "");
         config.quorum.workspace = crate::config::WorkspaceSettings::default();
-        let agent = Agent::builder_from_quorum_config(config)
+        let agent = Agent::lower_quorum_config(config)
             .unwrap()
             .infra(infra)
             .build()
@@ -4991,7 +4994,7 @@ model = "gpt-4"
         agent.shutdown().await;
 
         let (infra, _dir) = test_infra().await;
-        let err = Agent::single()
+        let err = Agent::builder()
             .cwd("/tmp")
             .provider("openai", "gpt-4")
             .tools(["delegate"])
@@ -5012,7 +5015,7 @@ model = "gpt-4"
         let parse = |p: Option<&str>| {
             let mut config = mode_config("", "");
             config.quorum.snapshot_policy = p.map(str::to_string);
-            Agent::builder_from_quorum_config(config).map(|b| b.snapshot_policy)
+            Agent::lower_quorum_config(config).map(|b| b.snapshot_policy)
         };
         use crate::agent::core::SnapshotPolicy;
         assert_eq!(parse(None).unwrap(), SnapshotPolicy::None);
@@ -5039,7 +5042,7 @@ model = "gpt-4"
             fingerprint: "agents".into(),
         });
         let (infra, _dir) = test_infra().await;
-        let agent = Agent::single()
+        let agent = Agent::builder()
             .infra(infra)
             .provider("test", "root")
             .system("root explicit")
@@ -5082,7 +5085,7 @@ async fn agent_roster_methods_forward_to_the_root() -> Result<()> {
     use crate::delegation::roster::{MemberOrigin, RosterError};
 
     let (registry, _reg_dir) = scripted_text_registry()?;
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("mock", "mock-model")
         .tools(["delegate"])
         .infra(AgentInfra {
@@ -5108,7 +5111,7 @@ async fn agent_roster_methods_forward_to_the_root() -> Result<()> {
         snapshot.get("reviewer").map(|member| member.origin()),
         Some(MemberOrigin::Runtime)
     );
-    assert!(agent.is_multi());
+    assert!(agent.has_subagents());
     let notification = notifications.try_recv().expect("clients are told");
     assert_eq!(notification.method.as_ref(), "querymt/agents/changed");
 
@@ -5119,6 +5122,133 @@ async fn agent_roster_methods_forward_to_the_root() -> Result<()> {
         agent.remove_member("reviewer").await,
         Err(RosterError::UnknownAgent(_))
     ));
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_subagent_aliases_add_list_and_remove_between_turns() -> Result<()> {
+    use crate::delegation::roster::{MemberOrigin, RosterError};
+
+    let (registry, _reg_dir) = scripted_text_registry()?;
+    let agent = Agent::builder()
+        .provider("mock", "mock-model")
+        .tools(["delegate"])
+        .subagent("coder", |s| {
+            s.provider("mock", "mock-model").description("writes code")
+        })
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+    assert_eq!(agent.roster_generation(), 0);
+    assert_eq!(agent.subagents().len(), 1);
+    let mut notifications = agent.inner().subscribe_ext_notifications();
+
+    let generation = agent
+        .add_subagent("reviewer", |s| {
+            s.provider("mock", "mock-model")
+                .description("reviews code")
+                .capabilities(["review"])
+        })
+        .await?;
+    assert_eq!(generation.get(), 1);
+    assert_eq!(agent.roster_generation(), 1);
+    let listed = agent.subagents();
+    assert_eq!(
+        listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["coder", "reviewer"]
+    );
+    assert_eq!(listed[0].origin, MemberOrigin::Config);
+    assert_eq!(listed[1].origin, MemberOrigin::Runtime);
+    assert_eq!(listed[1].capabilities, ["review"]);
+    let notification = notifications.try_recv().expect("clients are told");
+    assert_eq!(notification.method.as_ref(), "querymt/agents/changed");
+
+    assert!(matches!(
+        agent
+            .add_subagent("reviewer", |s| s.provider("mock", "m"))
+            .await,
+        Err(RosterError::DuplicateId { .. })
+    ));
+    assert_eq!(agent.roster_generation(), 1);
+
+    assert_eq!(agent.remove_subagent("coder").await?.get(), 2);
+    assert_eq!(agent.subagents().len(), 1);
+    assert!(matches!(
+        agent.remove_subagent("coder").await,
+        Err(RosterError::UnknownAgent(_))
+    ));
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_reports_subagent_changes_to_callbacks_and_subscribers() -> Result<()> {
+    use crate::delegation::roster::{MemberOrigin, RosterChangeKind};
+
+    let (registry, _reg_dir) = scripted_text_registry()?;
+    let agent = Agent::builder()
+        .provider("mock", "mock-model")
+        .tools(["delegate"])
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+    assert!(!agent.has_subagents());
+
+    let (tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    agent.on_subagents_changed(move |change| {
+        let _ = tx.send((change.kind, change.id.to_string(), change.origin));
+    });
+    let mut subscription = agent.subscribe_subagent_changes();
+
+    agent
+        .add_subagent("reviewer", |s| s.provider("mock", "mock-model"))
+        .await?;
+    // A refused change is not reported.
+    assert!(
+        agent
+            .add_subagent("reviewer", |s| s.provider("mock", "mock-model"))
+            .await
+            .is_err()
+    );
+    agent.remove_subagent("reviewer").await?;
+
+    let timeout = std::time::Duration::from_secs(5);
+    let first = tokio::time::timeout(timeout, seen.recv()).await?.unwrap();
+    let second = tokio::time::timeout(timeout, seen.recv()).await?.unwrap();
+    assert_eq!(
+        first,
+        (
+            RosterChangeKind::Added,
+            "reviewer".to_string(),
+            MemberOrigin::Runtime
+        )
+    );
+    assert_eq!(second.0, RosterChangeKind::Removed);
+    assert!(seen.try_recv().is_err(), "exactly two changes");
+
+    let added = subscription.try_recv()?;
+    assert_eq!(
+        (added.kind, added.generation.get()),
+        (RosterChangeKind::Added, 1)
+    );
+    let removed = subscription.try_recv()?;
+    assert_eq!(removed.generation.get(), 2);
+    assert!(subscription.try_recv().is_err());
     agent.shutdown().await;
     Ok(())
 }

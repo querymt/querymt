@@ -83,7 +83,7 @@ fn make_bench_config(provider: &str, model: &str) -> String {
 
 fn extract_handle(runner: &AgentRunner) -> Arc<LocalAgentHandle> {
     assert!(
-        !runner.is_multi(),
+        !runner.has_subagents(),
         "expected single-agent config in benchmark"
     );
     runner.handle()

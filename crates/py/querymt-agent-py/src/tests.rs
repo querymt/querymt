@@ -11,6 +11,41 @@ mod tests {
     }
 
     #[test]
+    fn subagent_dict_is_parsed_and_validated() {
+        with_python(|py| {
+            let ok = py
+                .eval(
+                    c"{'id': 'r', 'provider': 'p', 'model': 'm', 'tools': ['read_tool'], 'mode': 'plan'}",
+                    None,
+                    None,
+                )
+                .unwrap();
+            let (id, opts) = parse_subagent_dict(&ok).expect("valid spec");
+            assert_eq!(id, "r");
+            assert_eq!(opts.model, "m");
+            assert_eq!(opts.tools.as_deref(), Some(&["read_tool".to_string()][..]));
+
+            for bad in [
+                c"{'id': 'r', 'provider': 'p'}",
+                c"{'id': 'r', 'provider': 'p', 'model': 'm', 'nope': 1}",
+            ] {
+                let value = py.eval(bad, None, None).unwrap();
+                let err = parse_subagent_dict(&value).err().expect("rejected");
+                assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            }
+        });
+    }
+
+    #[test]
+    fn subagent_error_carries_a_stable_code() {
+        with_python(|py| {
+            let err = subagent_err(RosterError::DelegationDisabled);
+            let code: String = err.value(py).getattr("code").unwrap().extract().unwrap();
+            assert_eq!(code, "delegation_disabled");
+        });
+    }
+
+    #[test]
     fn session_list_page_to_python_dict() {
         with_python(|py| {
             let page = ::querymt_agent::api::SessionListPage {

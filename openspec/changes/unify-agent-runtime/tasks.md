@@ -370,6 +370,14 @@ Conventions used below. They are reference text, not tracked tasks.
 - [x] 9.6 `openspec validate unify-agent-runtime --strict` passes.
   - Done. `openspec validate unify-agent-runtime --strict` prints `Change 'unify-agent-runtime' is valid`.
 
+## 10. Simple API names, change events and hooks
+
+- [x] 10.1 Roster change channel: `RosterChange`, `RosterChangeKind`, `AgentRoster::subscribe_changes`, published from `update` (runtime `delegation/roster.rs`). Test: `changes_are_published_in_order_and_only_when_they_succeed`.
+- [x] 10.2 ACP: `added` / `removed` on `querymt/agents/changed` and on the add/remove replies (`RosterChanged::of`); `after_roster_change` is the one post-change step. Tests extend `clients_are_notified_of_a_roster_change`.
+- [x] 10.3 Hooks `subagent_added` / `subagent_removed`: config, `Hooks::run_subagent_change`, schema fixtures `subagent-change.command.{input,output}`, `docs/docs/agent/hooks.md`. Tests in `hooks/tests.rs`.
+- [x] 10.4 Rust API: `Agent::builder()`, `has_subagents()`, `on_subagents_changed`, `subscribe_subagent_changes`, `SubagentChange` re-exports; `single()`, `is_multi()`, `from_quorum_config*` and `builder_from_quorum_config` deprecated (internal path `lower_quorum_config`); call sites and docs migrated. Test: `agent_reports_subagent_changes_to_callbacks_and_subscribers`.
+- [x] 10.5 Python: `Agent.create`, `has_subagents`, `on_subagents_changed`, `DeprecationWarning` on `Agent.single` and `is_multi`; stubs, README, `tests/test_subagents.py`, `examples/dynamic_subagents.py`; Rust example `dynamic_subagents.rs`.
+
 ## Workflow follow-up
 
 - A live check of `querymt/agents/add` and `querymt/agents/remove` needs a client that can send extension methods; `qmacp` cannot yet. Add an `ext` command there or check from `querymt-desktop`.

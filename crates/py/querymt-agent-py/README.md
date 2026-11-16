@@ -22,7 +22,7 @@ from querymt_agent import Agent
 
 
 async def main() -> None:
-    agent = await Agent.single(
+    agent = await Agent.create(
         provider="openai",
         model="gpt-4o-mini",
         tools=["read_tool", "glob", "search_text"],
@@ -33,6 +33,42 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+## Subagents: change the team between turns
+
+An agent can delegate to subagents, and the set can change while it runs. The
+root's `delegate` tool lists the current subagents on every turn, so a change
+is visible from the next turn. Changes last until the agent stops. The root's
+`tools` must include `delegate`.
+
+```python
+agent = await Agent.create(
+    provider="anthropic", model="claude-sonnet-4-5",
+    tools=["delegate", "read_tool"],
+    subagents=[{"id": "coder", "provider": "anthropic", "model": "claude-haiku-4-5",
+                "description": "Writes code", "tools": ["edit", "read_tool"]}],  # optional
+)
+agent.on_delegation(lambda to, objective: print(to, objective))
+agent.on_subagents_changed(lambda c: print(c["kind"], c["id"], c["generation"]))
+
+await agent.chat("...")                                     # turn 1
+await agent.add_subagent("reviewer", provider="anthropic", model="claude-haiku-4-5",
+                         description="Reviews code", tools=["read_tool"])
+await agent.chat("...")                                     # turn 2 can use `reviewer`
+await agent.remove_subagent("reviewer")
+agent.subagents          # [{"id": ..., "origin": "config"|"runtime"|"protocol", ...}]
+agent.roster_generation  # +1 per add/remove
+```
+
+`on_subagents_changed` fires for every successful add or remove, whichever way it
+was made (including ACP clients), with `kind`, `id`, `name`, `description`,
+`capabilities`, `origin`, `location` and `generation`. Refused changes are not
+reported. `Agent.single(...)` and `is_multi()` still work but emit a
+`DeprecationWarning`; use `Agent.create(...)` and `has_subagents()`.
+
+Failures raise `SubagentError` with a stable `.code` (`duplicate_id`,
+`unknown_agent`, `delegation_disabled`, ...) and leave the team unchanged. See
+`examples/dynamic_subagents.py`.
+
 ## Git worktree isolation
 
 Managed Git worktrees give a session its own checkout of a repository. They are
@@ -40,7 +76,7 @@ opt-in twice: the agent must enable the service, **and** each session must ask
 for isolation. Enabling the service alone never changes a session.
 
 ```python
-agent = await Agent.single(
+agent = await Agent.create(
     provider="anthropic",
     model="claude-sonnet-4-5-20250929",
     cwd="/path/to/repo",

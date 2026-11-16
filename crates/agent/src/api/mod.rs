@@ -1,7 +1,8 @@
 //! Primary public API for agent creation and interaction.
 //!
-//! `Agent` is the single runtime type. `Agent::single()` returns the builder and
-//! `.delegate(..)` adds members the agent can delegate to.
+//! `Agent` is the single runtime type. `Agent::builder()` returns the builder and
+//! `.subagent(..)` adds subagents the agent can delegate to; `Agent::add_subagent` and
+//! `Agent::remove_subagent` change them while it runs.
 //!
 //! # Single Agent
 //!
@@ -10,7 +11,7 @@
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let agent = Agent::single()
+//! let agent = Agent::builder()
 //!     .provider("anthropic", "claude-sonnet-4-20250514")
 //!     .cwd(".")
 //!     .tools(["read_tool", "shell", "edit"])
@@ -29,7 +30,7 @@
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let agent = Agent::single()
+//! let agent = Agent::builder()
 //!     .cwd(".")
 //!     .provider("openai", "gpt-4")
 //!     .tools(["delegate"])
@@ -68,7 +69,10 @@ mod worktrees;
 pub use querymt_agent_runtime::api::{mesh, sessions};
 
 // Re-export public API types
-pub use agent::{Agent, AgentBuilder, AgentInfra};
+pub use crate::delegation::roster::{
+    RosterChange as SubagentChange, RosterChangeKind as SubagentChangeKind,
+};
+pub use agent::{Agent, AgentBuilder, AgentInfra, SubagentInfo};
 pub use config::DelegateConfigBuilder;
 pub use profiles::{AgentProfiles, ProfileRuntimeHandle};
 pub use querymt_agent_runtime::api::AgentSession;

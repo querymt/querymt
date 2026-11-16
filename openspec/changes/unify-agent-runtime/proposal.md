@@ -41,7 +41,10 @@ Public interface changes:
 - TOML: new `[[delegates]]` and `[agent.delegation]` under `[agent]` (additive). `[quorum]`/`[planner]` deprecated, behaviour unchanged.
 - ACP: three new extension methods and one notification (additive). No existing method changes shape.
 - Middleware: the built-in delegation middleware no longer exists; `DelegationGuardMiddleware` is unchanged.
-- Python: `is_multi()` reports whether the roster currently has members.
+- Rust naming: `Agent::builder()` is the entry point and `AgentBuilder::subagent(..)`, `Agent::add_subagent(..)`, `remove_subagent(..)`, `subagents()`, `has_subagents()`, `on_subagents_changed(..)` and `subscribe_subagent_changes()` are the simple API. They are aliases over the roster types (`delegate`, `add_member`, `remove_member` stay). `Agent::single()` and `is_multi()` are deprecated, as are `Agent::from_quorum_config*` and `builder_from_quorum_config`.
+- Hooks: two new observe-only events, `subagent_added` and `subagent_removed`, with two new generated schemas (`subagent-change.command.{input,output}`). They are not tied to a session.
+- ACP: `querymt/agents/changed` and the replies to `agents/add|remove` gain `added` / `removed` (the member ID), additively.
+- Python: `Agent.create(...)` (`Agent.single(...)` deprecated), `add_subagent`, `remove_subagent`, `subagents`, `roster_generation`, `has_subagents()` (`is_multi()` deprecated), `on_delegation`, `on_tool_call`, `on_subagents_changed`, `SubagentError` with a stable `.code`.
 - No change to the session database schema, the Extism plugin contract, hooks, typeshare types or log targets.
 
 ## Non-goals

@@ -483,7 +483,7 @@ option2 = 42
 use querymt_agent::prelude::*;
 use querymt_agent::middleware::MiddlewareDriver;
 
-let agent = Agent::single()
+let agent = Agent::builder()
     .provider("anthropic", "claude-sonnet-4-5-20250929")
     .cwd(".")
     .tools(["read_tool", "shell"])

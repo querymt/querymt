@@ -424,11 +424,11 @@ impl RosterSnapshot {
         Ok(())
     }
 
-    fn remove(&mut self, id: &str) -> Result<(), RosterError> {
-        if self.members.remove(id).is_none() {
-            return Err(RosterError::UnknownAgent(AgentId::try_from(id)?));
+    fn remove(&mut self, id: &str) -> Result<Arc<Member>, RosterError> {
+        match self.members.remove(id) {
+            Some(member) => Ok(member),
+            None => Err(RosterError::UnknownAgent(AgentId::try_from(id)?)),
         }
-        Ok(())
     }
 
     pub fn generation(&self) -> RosterGeneration {
@@ -466,6 +466,57 @@ impl RosterSnapshot {
     }
 }
 
+/// What happened to a member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum RosterChangeKind {
+    Added,
+    Removed,
+}
+
+impl RosterChangeKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Removed => "removed",
+        }
+    }
+}
+
+/// One member added to or removed from a roster, as published after the new
+/// roster is in place. `generation` is the generation the change produced.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RosterChange {
+    pub kind: RosterChangeKind,
+    pub id: AgentId,
+    pub name: String,
+    pub description: String,
+    pub capabilities: Vec<String>,
+    pub origin: MemberOrigin,
+    pub location: MemberLocation,
+    pub generation: RosterGeneration,
+}
+
+impl RosterChange {
+    fn new(kind: RosterChangeKind, member: &Member, generation: RosterGeneration) -> Self {
+        let info = member.info();
+        Self {
+            kind,
+            id: member.id().clone(),
+            name: info.name.clone(),
+            description: info.description.clone(),
+            capabilities: info.capabilities.clone(),
+            origin: member.origin(),
+            location: member.location(),
+            generation,
+        }
+    }
+}
+
+/// How many changes a slow subscriber may fall behind before it skips some.
+const CHANGE_BACKLOG: usize = 64;
+
 /// The members a root agent can delegate to.
 pub struct AgentRoster {
     /// What every member of the runtime shares; owned here so no member can
@@ -477,6 +528,8 @@ pub struct AgentRoster {
     state: ArcSwap<RosterSnapshot>,
     /// Serializes changes; never held across an `.await`.
     writer: parking_lot::Mutex<()>,
+    /// Every successful add or remove, in generation order.
+    changes: tokio::sync::broadcast::Sender<RosterChange>,
 }
 
 impl AgentRoster {
@@ -490,7 +543,14 @@ impl AgentRoster {
             delegation_enabled,
             state: ArcSwap::from_pointee(configured),
             writer: parking_lot::Mutex::new(()),
+            changes: tokio::sync::broadcast::channel(CHANGE_BACKLOG).0,
         }
+    }
+
+    /// Subscribes to member changes made from now on, whatever path made
+    /// them (the Rust API, `querymt/agents/add`, `querymt/agents/remove`).
+    pub fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<RosterChange> {
+        self.changes.subscribe()
     }
 
     pub(crate) fn context(&self) -> &MemberContext {
@@ -530,27 +590,48 @@ impl AgentRoster {
     /// the copy under the next generation. A failure leaves the roster as it was.
     fn update(
         &self,
-        change: impl FnOnce(&mut RosterSnapshot) -> Result<(), RosterError>,
-    ) -> Result<RosterGeneration, RosterError> {
+        change: impl FnOnce(&mut RosterSnapshot) -> Result<(RosterChangeKind, Arc<Member>), RosterError>,
+    ) -> Result<RosterChange, RosterError> {
         let _guard = self.writer.lock();
         let mut next = RosterSnapshot::clone(&self.state.load());
-        change(&mut next)?;
+        let (kind, member) = change(&mut next)?;
         next.generation = next.generation.next();
         let generation = next.generation;
         self.state.store(Arc::new(next));
-        Ok(generation)
+        // Sent under the writer lock so subscribers see changes in order.
+        // Nobody listening is not an error.
+        let change = RosterChange::new(kind, &member, generation);
+        let _ = self.changes.send(change.clone());
+        Ok(change)
     }
 
     /// Adds a member and returns the new generation. Fails, leaving the
     /// roster unchanged, when the ID is taken.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn add(&self, member: Member) -> Result<RosterGeneration, RosterError> {
-        self.update(|snapshot| snapshot.insert(member))
+        self.add_change(member).map(|change| change.generation)
+    }
+
+    /// [`Self::add`], returning what was published.
+    pub(crate) fn add_change(&self, member: Member) -> Result<RosterChange, RosterError> {
+        self.update(|snapshot| {
+            let id = member.id().clone();
+            snapshot.insert(member)?;
+            let added = snapshot.members[&id].clone();
+            Ok((RosterChangeKind::Added, added))
+        })
     }
 
     /// Removes a member and returns the new generation. A delegation that
     /// already holds the member keeps it.
+    #[cfg(test)]
     pub(crate) fn remove(&self, id: &str) -> Result<RosterGeneration, RosterError> {
-        self.update(|snapshot| snapshot.remove(id))
+        self.remove_change(id).map(|change| change.generation)
+    }
+
+    /// [`Self::remove`], returning what was published.
+    pub(crate) fn remove_change(&self, id: &str) -> Result<RosterChange, RosterError> {
+        self.update(|snapshot| Ok((RosterChangeKind::Removed, snapshot.remove(id)?)))
     }
 }
 
@@ -642,6 +723,26 @@ mod tests {
         assert_eq!(roster.snapshot().generation(), second);
         let removed = roster.remove("a").unwrap();
         assert_eq!(removed.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn changes_are_published_in_order_and_only_when_they_succeed() {
+        let (roster, _dir) = roster().await;
+        let mut changes = roster.subscribe_changes();
+        roster.add(member("a", MemberOrigin::Runtime)).unwrap();
+        let _ = roster.add(member("a", MemberOrigin::Runtime));
+        let _ = roster.remove("missing");
+        roster.remove("a").unwrap();
+
+        let added = changes.try_recv().unwrap();
+        assert_eq!(added.kind, RosterChangeKind::Added);
+        assert_eq!(added.id.as_str(), "a");
+        assert_eq!(added.origin, MemberOrigin::Runtime);
+        assert_eq!(added.generation.get(), 1);
+        let removed = changes.try_recv().unwrap();
+        assert_eq!(removed.kind, RosterChangeKind::Removed);
+        assert_eq!(removed.generation.get(), 2);
+        assert!(changes.try_recv().is_err(), "failures publish nothing");
     }
 
     #[tokio::test]

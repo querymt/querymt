@@ -6,13 +6,13 @@
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Single agent
-//! let agent = Agent::single()
+//! let agent = Agent::builder()
 //!     .provider("anthropic", "claude-sonnet-4-20250514")
 //!     .build()
 //!     .await?;
 //!
 //! // With members it can delegate to (same Agent type back)
-//! let agent = Agent::single()
+//! let agent = Agent::builder()
 //!     .provider("openai", "gpt-4")
 //!     .delegate("coder", |d| d.provider("anthropic", "claude-sonnet-4-20250514"))
 //!     .build()
@@ -27,7 +27,8 @@ pub use crate::error::AgentError;
 // High-level APIs
 pub use crate::api::{
     Agent, AgentBuilder, AgentInfra, AgentMesh, AgentProfiles, AgentSession, DelegateConfigBuilder,
-    Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec, ProfileRuntimeHandle,
+    Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec, ProfileRuntimeHandle, SubagentChange,
+    SubagentChangeKind, SubagentInfo,
 };
 // Config and runner APIs
 pub use crate::config::{

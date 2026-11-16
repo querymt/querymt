@@ -157,6 +157,8 @@ QueryMT currently supports these hook events:
 | `delegation_failure` | target agent regex | Append context to the failure message injected back into the planner |
 | `stop` | none | Request another LLM step (bounded by `execution.max_stop_hook_continuations`) |
 | `session_end` | none | Observe explicit session close or deletion |
+| `subagent_added` | subagent ID regex | Observe a subagent joining the roster (not tied to a session) |
+| `subagent_removed` | subagent ID regex | Observe a subagent leaving the roster (not tied to a session) |
 
 Handlers run in configuration order. Transform-capable events rebuild each handler's input from the last accepted value. A pre-operation block is sticky. Invalid JSON and invalid replacements emit a durable `hook_notice` and retain the last valid value.
 
@@ -168,6 +170,21 @@ Command exit behavior is:
 - `system_message`: emitted as a non-error durable notice and never inserted into model context
 
 `additional_context` defaults to an approximate 2500-token limit, configurable per handler with `additional_context_limit`. Prompt and tool contributions are persisted as typed, provenance-labeled message parts. Tool contributions are placed after every `tool_result` block in the combined result message. `context` contributions exist only in the prepared request and never mutate stored history.
+
+### Subagent change hooks
+
+`subagent_added` and `subagent_removed` run after a subagent is added to or removed from a running agent, by any path (the Rust or Python API, `querymt/agents/add`, `querymt/agents/remove`). A profile's own `[agent.hooks]` run for changes to that profile's runtime. They are observe-only and are not tied to a session: there is no `session_id`, and a failure, timeout, block request or invalid reply is logged and never undoes the change. `mcp_tool` handlers are rejected for these events. The only accepted output field is `system_message`.
+
+Input fields: `hook_event_name`, `subagent_id`, `name`, `description`, `capabilities`, `origin` (`config`, `protocol` or `runtime`), `location` (`local` or `remote`), `generation`, `profile_id` (or `null`) and `cwd`.
+
+```toml
+[[agent.hooks.subagent_added]]
+matcher = "^review"
+
+[[agent.hooks.subagent_added.hooks]]
+type = "command"
+command = "sh ./hooks/audit-subagent.sh"
+```
 
 ## Examples
 

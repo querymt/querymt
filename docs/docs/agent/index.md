@@ -308,7 +308,7 @@ use querymt_agent::prelude::*;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a single agent
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("anthropic", "claude-sonnet-4-5-20250929")
         .cwd(".")
         .tools(["read_tool", "shell", "edit"])

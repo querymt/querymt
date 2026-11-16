@@ -116,7 +116,7 @@ use querymt_agent::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .cwd(".")
         .provider("anthropic", "claude-sonnet-4-5-20250929")
         .tools(["delegate", "read_tool"])
@@ -176,7 +176,7 @@ cargo run --example closure_builder
 ```
 
 **What it demonstrates:**
-- `Agent::single()` with `.delegate(..)` builder patterns
+- `Agent::builder()` with `.delegate(..)` builder patterns
 - Inline system prompts
 - Inline middleware configuration
 - Callback hooks
@@ -186,7 +186,7 @@ use querymt_agent::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("anthropic", "claude-sonnet-4-5-20250929")
         .cwd(".")
         .tools(["read_tool", "shell", "edit", "glob", "search_text"])
@@ -229,7 +229,7 @@ use querymt_agent::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("anthropic", "claude-sonnet-4-5-20250929")
         .tools(["shell", "read_tool", "glob"])
         .system("You are an assistant that creates concise daily briefings.")
@@ -294,7 +294,7 @@ use querymt_agent::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("anthropic", "claude-sonnet-4-5-20250929")
         .tools(["read_tool"])
         .build()

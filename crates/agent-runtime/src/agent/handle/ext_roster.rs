@@ -150,16 +150,19 @@ impl LocalAgentHandle {
     ) -> Result<ExtResponse, Error> {
         let parsed: AddRequest = parse(&req, "agents/add params")?;
         let target = self.roster_target(parsed.profile_id.as_deref()).await?;
-        let generation = target
+        let change = target
             .handle(self)
             .apply_roster_add(parsed.agent)
             .map_err(roster_error)?;
-        self.announce_roster_change(generation, target.profile_id())
+        // The hooks that run are the changed runtime's own; the
+        // announcement is sent by the handle that serves the client.
+        self.announce_roster_change(&change, target.profile_id())
             .await;
-        ext_json_response(&RosterChanged {
-            generation,
-            profile_id: target.profile_id(),
-        })
+        target
+            .handle(self)
+            .run_subagent_change_hooks(&change, target.profile_id())
+            .await;
+        ext_json_response(&RosterChanged::of(&change, target.profile_id()))
     }
 
     pub(super) async fn handle_ext_agents_remove(
@@ -168,15 +171,16 @@ impl LocalAgentHandle {
     ) -> Result<ExtResponse, Error> {
         let parsed: RemoveRequest = parse(&req, "agents/remove params")?;
         let target = self.roster_target(parsed.profile_id.as_deref()).await?;
-        let generation = target
+        let change = target
             .handle(self)
             .apply_roster_remove(&parsed.id)
             .map_err(roster_error)?;
-        self.announce_roster_change(generation, target.profile_id())
+        self.announce_roster_change(&change, target.profile_id())
             .await;
-        ext_json_response(&RosterChanged {
-            generation,
-            profile_id: target.profile_id(),
-        })
+        target
+            .handle(self)
+            .run_subagent_change_hooks(&change, target.profile_id())
+            .await;
+        ext_json_response(&RosterChanged::of(&change, target.profile_id()))
     }
 }
