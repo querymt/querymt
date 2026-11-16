@@ -964,7 +964,7 @@ dependencies = [
  "regex",
  "rustc-hash 2.1.3",
  "shlex 2.0.1",
- "syn 3.0.9",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -8495,9 +8495,9 @@ dependencies = [
 
 [[package]]
 name = "minijinja"
-version = "3.0.5"
+version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00f5a04892e86ddb4fc254e9160835370b63a0d44042d3ab4725bc2dbcbab136"
+checksum = "509eeb2603a84eccabb4d75f6ec8ba23b46bbf441aaeb863d6b83a5887fd51e4"
 dependencies = [
  "serde",
 ]
@@ -8518,7 +8518,7 @@ version = "3.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f804cfd81c146ff898cbf3455071c417e8745907c77f3d5058bd9691b9ace3b8"
 dependencies = [
- "minijinja 3.0.5",
+ "minijinja 3.1.0",
 ]
 
 [[package]]
@@ -11720,7 +11720,7 @@ dependencies = [
  "llama-cpp-2",
  "llguidance",
  "log",
- "minijinja 3.0.5",
+ "minijinja 3.1.0",
  "minijinja-contrib 3.0.5",
  "querymt",
  "querymt-provider-common",
@@ -12128,7 +12128,7 @@ dependencies = [
  "libp2p",
  "log",
  "mdq",
- "minijinja 3.0.5",
+ "minijinja 3.1.0",
  "mockall",
  "moka",
  "once_cell",
