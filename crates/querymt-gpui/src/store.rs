@@ -475,50 +475,315 @@ pub struct PermOption {
     pub kind: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// JSON Schema type of an elicitation form field (the kinds ACP forms allow).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldKind {
-    Text,
+    String,
     Number,
     Integer,
-    Bool,
-    Enum(Vec<(String, String)>),
+    Boolean,
+    Array,
+}
+
+/// One choice of a single- or multi-select field.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FieldOption {
+    pub value: String,
+    pub label: String,
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-pub struct ElicitField {
+pub struct FormField {
     pub key: String,
-    pub title: String,
-    pub description: String,
+    pub label: String,
+    pub description: Option<String>,
     pub kind: FieldKind,
     pub required: bool,
+    /// Choices (`oneOf` / `enum`, or `items.anyOf` for arrays); empty for free input.
+    pub options: Vec<FieldOption>,
+    /// The agent accepts a typed answer instead of a listed option.
+    pub allow_custom: bool,
     pub default: Option<Value>,
+}
+
+impl FormField {
+    /// The schema default, else an empty value of the field's type.
+    pub fn initial_value(&self) -> Value {
+        if let Some(v) = &self.default {
+            return v.clone();
+        }
+        match self.kind {
+            FieldKind::Boolean => Value::Bool(false),
+            FieldKind::Array => Value::Array(Vec::new()),
+            _ => Value::from(""),
+        }
+    }
+}
+
+/// What the user entered for one field.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FieldDraft {
+    pub value: Value,
+    /// `Some` while "Custom answer…" is chosen.
+    pub custom: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub enum RequestKind {
     Permission {
-        title: String,
+        /// Command / path preview of the tool call (may be empty).
         summary: String,
-        kind: String,
         options: Vec<PermOption>,
     },
+    /// `fields` is empty for URL-mode requests and for forms that use field
+    /// types this app cannot display (`unsupported`).
     Elicitation {
-        message: String,
-        fields: Vec<ElicitField>,
+        fields: Vec<FormField>,
         url: Option<String>,
+        unsupported: bool,
     },
 }
 
-/// A permission or input request from an agent, waiting for the user.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RequestStatus {
+    Pending,
+    /// Answered or retired; the text is what the card shows (`Submitted`, `Declined`, …).
+    Resolved(String),
+}
+
+/// A button of a request card.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RequestAction {
+    pub id: String,
+    pub label: String,
+    pub primary: bool,
+}
+
+pub const RESOLVED_SUBMITTED: &str = "Submitted";
+const RESOLVED_GONE: &str = "No longer pending";
+/// Answered cards kept in the Inbox (the newest ones).
+const MAX_RESOLVED_REQUESTS: usize = 50;
+
+/// A permission or input request from an agent. It stays listed after it is
+/// answered (resolved), like the desktop inbox.
 #[derive(Clone, Debug)]
 pub struct PendingRequest {
+    /// Card identity: `agent:<querymt id>` when the agent gives one, so a
+    /// re-delivered request (reconnect, rejected answer) lands on the same
+    /// card and keeps its draft.
     pub key: String,
     pub agent_id: String,
-    rpc_id: Value,
+    /// JSON-RPC id of the delivery that can still be answered.
+    rpc_id: Option<Value>,
     pub session_id: Option<String>,
-    pub elicitation_id: Option<String>,
+    /// QueryMT elicitation / interaction id: compared with the agent's pending
+    /// set during recovery.
+    identity: Option<String>,
+    /// `key` survives a reconnect (identity or tool call based).
+    stable: bool,
     pub received_ms: f64,
+    pub title: String,
+    pub detail: String,
     pub kind: RequestKind,
+    pub status: RequestStatus,
+    /// The connection dropped; the card waits for the agent to re-deliver it.
+    pub offline: bool,
+    pub error: Option<String>,
+    /// Answered, and a re-delivery means the agent rejected the answer.
+    awaiting_ack: bool,
+    /// The agent rejected the answer (`validationFailed`); keep the error on re-delivery.
+    rejected: bool,
+    /// One entry per form field: the user's answer so far. Kept across
+    /// re-deliveries, so a reconnect or a rejected answer loses nothing.
+    pub drafts: Vec<FieldDraft>,
+}
+
+impl PendingRequest {
+    pub fn is_pending(&self) -> bool {
+        self.status == RequestStatus::Pending
+    }
+
+    /// Pending, connected and holding a delivery to answer.
+    pub fn answerable(&self) -> bool {
+        self.is_pending() && !self.offline && self.rpc_id.is_some()
+    }
+
+    pub fn is_elicitation(&self) -> bool {
+        matches!(self.kind, RequestKind::Elicitation { .. })
+    }
+
+    pub fn submitted(&self) -> bool {
+        self.status == RequestStatus::Resolved(RESOLVED_SUBMITTED.into())
+    }
+
+    pub fn fields(&self) -> &[FormField] {
+        match &self.kind {
+            RequestKind::Elicitation { fields, .. } => fields,
+            RequestKind::Permission { .. } => &[],
+        }
+    }
+
+    /// Buttons, as the desktop app: permission options, or Submit / Decline / Cancel.
+    pub fn actions(&self) -> Vec<RequestAction> {
+        let action = |id: &str, label: &str, primary: bool| RequestAction {
+            id: id.into(),
+            label: label.into(),
+            primary,
+        };
+        match &self.kind {
+            RequestKind::Permission { options, .. } => {
+                let primary = options
+                    .iter()
+                    .position(|o| o.kind == "allow_once")
+                    .or_else(|| options.iter().position(|o| o.kind.starts_with("allow")));
+                options
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, o)| action(&o.id, &o.name, Some(ix) == primary))
+                    .collect()
+            }
+            RequestKind::Elicitation {
+                unsupported: true, ..
+            } => vec![
+                action("decline", "Decline", false),
+                action("cancel", "Cancel", false),
+            ],
+            RequestKind::Elicitation { url: Some(_), .. } => vec![
+                action("accept", "Open flow", true),
+                action("cancel", "Cancel", false),
+            ],
+            RequestKind::Elicitation { .. } => vec![
+                action("accept", "Submit", true),
+                action("decline", "Decline", false),
+                action("cancel", "Cancel", false),
+            ],
+        }
+    }
+}
+
+fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Value::as_str)
+}
+
+/// `description` (or `_meta.querymt.description`, or the hoisted
+/// `optionDescriptions` entry) when it says more than the label.
+fn option_description(option: &Value, label: &str, fallback: Option<&str>) -> Option<String> {
+    [
+        str_at(option, "description"),
+        option
+            .pointer("/_meta/querymt/description")
+            .and_then(Value::as_str),
+        fallback,
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|d| !d.is_empty() && *d != label)
+    .map(str::to_owned)
+}
+
+fn field_options(prop: &Value, hoisted: Option<&Value>) -> Vec<FieldOption> {
+    let titled = |list: &Value| -> Vec<FieldOption> {
+        list.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| {
+                let value = str_at(o, "const")?.to_string();
+                let label = str_at(o, "title").unwrap_or(&value).to_string();
+                let fallback = hoisted.and_then(|h| h.get(&value)).and_then(Value::as_str);
+                Some(FieldOption {
+                    description: option_description(o, &label, fallback),
+                    value,
+                    label,
+                })
+            })
+            .collect()
+    };
+    let plain = |list: &Value, names: Option<&Value>| -> Vec<FieldOption> {
+        list.as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(ix, v)| {
+                let value = v.as_str()?.to_string();
+                let label = names
+                    .and_then(|n| n.get(ix))
+                    .and_then(Value::as_str)
+                    .unwrap_or(&value)
+                    .to_string();
+                Some(FieldOption {
+                    value,
+                    label,
+                    description: None,
+                })
+            })
+            .collect()
+    };
+    let source = match str_at(prop, "type") {
+        Some("array") => prop.get("items").unwrap_or(&Value::Null),
+        _ => prop,
+    };
+    for key in ["anyOf", "oneOf"] {
+        if let Some(list) = source.get(key) {
+            let options = titled(list);
+            if !options.is_empty() {
+                return options;
+            }
+        }
+    }
+    source
+        .get("enum")
+        .map(|list| plain(list, source.get("enumNames")))
+        .unwrap_or_default()
+}
+
+/// Fields of a form-mode `requestedSchema`, in schema order; `None` when a
+/// property has a type this app cannot represent faithfully.
+fn form_fields(
+    schema: &Value,
+    allow_custom: bool,
+    hoisted: Option<&Value>,
+) -> Option<Vec<FormField>> {
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return Some(Vec::new());
+    };
+    props
+        .iter()
+        .map(|(key, prop)| {
+            let kind = match str_at(prop, "type")? {
+                "string" => FieldKind::String,
+                "number" => FieldKind::Number,
+                "integer" => FieldKind::Integer,
+                "boolean" => FieldKind::Boolean,
+                "array" => FieldKind::Array,
+                _ => return None,
+            };
+            let options = field_options(prop, hoisted.and_then(|h| h.get(key)));
+            Some(FormField {
+                key: key.clone(),
+                label: str_at(prop, "title")
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or(key)
+                    .to_string(),
+                description: str_at(prop, "description")
+                    .filter(|d| !d.trim().is_empty())
+                    .map(str::to_owned),
+                kind,
+                required: required.contains(&key.as_str()),
+                allow_custom: allow_custom && !options.is_empty(),
+                options,
+                default: prop.get("default").cloned(),
+            })
+        })
+        .collect()
 }
 
 fn parse_request(
@@ -527,29 +792,21 @@ fn parse_request(
     method: &str,
     params: &Value,
 ) -> Option<PendingRequest> {
-    let text = |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or_default().to_string();
-    let session_id = params
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let kind = if method == "session/request_permission" {
-        let tool = params.get("toolCall").cloned().unwrap_or(Value::Null);
-        let mut call = crate::session::SessionView::default();
-        let mut update = tool.clone();
-        if let Some(obj) = update.as_object_mut() {
-            obj.insert("sessionUpdate".into(), Value::from("tool_call"));
-        }
-        call.apply(&update);
-        let (title, summary, kind) = match call.items.first().map(|i| &i.kind) {
-            Some(crate::session::ItemKind::Work(entries)) if !entries.is_empty() => {
-                match &entries[0] {
-                    crate::session::WorkEntry::Tool(c) => {
-                        (c.title.clone(), c.summary(), c.kind.clone())
-                    }
-                    _ => (text(tool.get("title")), String::new(), String::new()),
-                }
-            }
-            _ => (text(tool.get("title")), String::new(), String::new()),
+    let session_id = str_at(params, "sessionId").map(str::to_owned);
+    let meta = params.pointer("/_meta/querymt");
+    let meta_str = |k: &str| meta.and_then(|m| str_at(m, k)).filter(|s| !s.is_empty());
+    let (kind, title, detail, identity, fallback_key) = if method == "session/request_permission" {
+        let tool = params.get("toolCall").unwrap_or(&Value::Null);
+        let title = str_at(tool, "title")
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or("Permission request")
+            .to_string();
+        let tool_kind = str_at(tool, "kind").unwrap_or_default().to_string();
+        let detail = if tool_kind.is_empty() {
+            format!("{title} needs approval before the agent can continue.")
+        } else {
+            format!("{title} ({tool_kind}) needs approval before the agent can continue.")
         };
         let options = params
             .get("options")
@@ -557,120 +814,241 @@ fn parse_request(
             .into_iter()
             .flatten()
             .map(|o| PermOption {
-                id: text(o.get("optionId")),
-                name: text(o.get("name")),
-                kind: text(o.get("kind")),
+                id: str_at(o, "optionId").unwrap_or_default().to_string(),
+                name: str_at(o, "name").unwrap_or_default().to_string(),
+                kind: str_at(o, "kind").unwrap_or_default().to_string(),
             })
             .collect();
-        RequestKind::Permission {
-            title: if title.is_empty() {
-                "Tool call".into()
-            } else {
-                title
-            },
-            summary,
-            kind,
-            options,
-        }
-    } else if method.contains("elicitation") {
-        let schema = params.get("requestedSchema");
-        let required: Vec<String> = schema
-            .and_then(|s| s.get("required"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect();
-        let mut fields = Vec::new();
-        if let Some(props) = schema
-            .and_then(|s| s.get("properties"))
-            .and_then(Value::as_object)
-        {
-            for (key, prop) in props {
-                let enum_values: Vec<String> = prop
-                    .get("enum")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect();
-                let one_of: Vec<(String, String)> = prop
-                    .get("oneOf")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|o| {
-                        let v = o.get("const")?.as_str()?.to_string();
-                        Some((
-                            v.clone(),
-                            o.get("title")
-                                .and_then(Value::as_str)
-                                .unwrap_or(&v)
-                                .to_string(),
-                        ))
-                    })
-                    .collect();
-                let names: Vec<String> = prop
-                    .get("enumNames")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect();
-                let kind = if !one_of.is_empty() {
-                    FieldKind::Enum(one_of)
-                } else if !enum_values.is_empty() {
-                    FieldKind::Enum(
-                        enum_values
-                            .iter()
-                            .enumerate()
-                            .map(|(i, v)| (v.clone(), names.get(i).cloned().unwrap_or(v.clone())))
-                            .collect(),
-                    )
-                } else {
-                    match prop.get("type").and_then(Value::as_str) {
-                        Some("boolean") => FieldKind::Bool,
-                        Some("number") => FieldKind::Number,
-                        Some("integer") => FieldKind::Integer,
-                        _ => FieldKind::Text,
-                    }
-                };
-                fields.push(ElicitField {
-                    key: key.clone(),
-                    title: prop
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or(key)
-                        .to_string(),
-                    description: text(prop.get("description")),
-                    kind,
-                    required: required.contains(key),
-                    default: prop.get("default").cloned(),
-                });
+        // Reuse the transcript's tool parsing for the command / path preview.
+        let summary = {
+            let mut call = crate::session::SessionView::default();
+            let mut update = tool.clone();
+            if let Some(obj) = update.as_object_mut() {
+                obj.insert("sessionUpdate".into(), Value::from("tool_call"));
             }
-        }
-        RequestKind::Elicitation {
-            message: text(params.get("message")),
-            fields,
-            url: params.get("url").and_then(Value::as_str).map(str::to_owned),
-        }
+            call.apply(&update);
+            match call.items.first().map(|i| &i.kind) {
+                Some(crate::session::ItemKind::Work(entries)) => match entries.first() {
+                    Some(crate::session::WorkEntry::Tool(c)) => c.summary(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            }
+        };
+        let fallback = str_at(tool, "toolCallId")
+            .filter(|id| !id.is_empty())
+            .map(|tc| format!("tc:{}:{tc}", session_id.as_deref().unwrap_or_default()));
+        (
+            RequestKind::Permission { summary, options },
+            title,
+            detail,
+            meta_str("interaction_id").map(str::to_owned),
+            fallback,
+        )
+    } else if method.trim_start_matches('_') == "elicitation/create" {
+        let message = str_at(params, "message").unwrap_or_default().to_string();
+        let url = (str_at(params, "mode") == Some("url"))
+            .then(|| str_at(params, "url").map(str::to_owned))
+            .flatten();
+        let schema = params.get("requestedSchema");
+        let allow_custom = meta_str("source") == Some("builtin:question")
+            || [meta, schema.and_then(|s| s.pointer("/_meta/querymt"))]
+                .into_iter()
+                .flatten()
+                .any(|m| {
+                    m.get("allow_custom").and_then(Value::as_bool) == Some(true)
+                        || m.get("allowCustom").and_then(Value::as_bool) == Some(true)
+                });
+        let hoisted = meta.and_then(|m| m.get("optionDescriptions"));
+        let (fields, unsupported) = match (url.is_some(), schema) {
+            (false, Some(schema)) => match form_fields(schema, allow_custom, hoisted) {
+                Some(fields) => (fields, false),
+                None => (Vec::new(), true),
+            },
+            _ => (Vec::new(), false),
+        };
+        let title = schema
+            .and_then(|s| str_at(s, "title"))
+            .filter(|t| !t.is_empty())
+            .unwrap_or("Elicitation request")
+            .to_string();
+        let detail = if unsupported {
+            format!(
+                "{message}\n\nThis form uses field types this app cannot display, so it cannot be submitted here."
+            )
+        } else {
+            message
+        };
+        (
+            RequestKind::Elicitation {
+                fields,
+                url,
+                unsupported,
+            },
+            title,
+            detail,
+            meta_str("elicitation_id")
+                .or_else(|| str_at(params, "elicitationId"))
+                .map(str::to_owned),
+            None,
+        )
     } else {
         return None;
     };
-    let elicitation_id = params
-        .get("elicitationId")
-        .or_else(|| params.pointer("/_meta/querymt/elicitation_id"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let stable = identity.is_some() || fallback_key.is_some();
+    let key = match identity.as_ref().or(fallback_key.as_ref()) {
+        Some(id) => format!("{agent_id}:{id}"),
+        None => format!("{agent_id}:rpc:{rpc_id}"),
+    };
+    let drafts = match &kind {
+        RequestKind::Elicitation { fields, .. } => fields
+            .iter()
+            .map(|f| FieldDraft {
+                value: f.initial_value(),
+                custom: None,
+            })
+            .collect(),
+        RequestKind::Permission { .. } => Vec::new(),
+    };
     Some(PendingRequest {
-        key: format!("{agent_id}:{rpc_id}"),
+        drafts,
+        key,
         agent_id: agent_id.to_string(),
-        rpc_id,
+        rpc_id: Some(rpc_id),
         session_id,
-        elicitation_id,
+        identity,
+        stable,
         received_ms: now_ms(),
+        title,
+        detail,
         kind,
+        status: RequestStatus::Pending,
+        offline: false,
+        error: None,
+        awaiting_ack: false,
+        rejected: false,
     })
+}
+
+/// The `content` of an accepted elicitation, or the message to show (desktop
+/// `validateElicitationFields` + `buildElicitationResponse`).
+pub fn elicitation_content(fields: &[FormField], drafts: &[FieldDraft]) -> Result<Value, String> {
+    let mut content = serde_json::Map::new();
+    for (field, draft) in fields.iter().zip(drafts) {
+        let key = field.key.clone();
+        if let Some(custom) = &draft.custom {
+            let custom = custom.trim();
+            if custom.is_empty() {
+                return Err("Please enter a custom response.".into());
+            }
+            let value = if field.kind == FieldKind::Array {
+                json!([custom])
+            } else {
+                Value::from(custom)
+            };
+            content.insert(key, value);
+            continue;
+        }
+        let incomplete = || format!("Please complete {}.", field.label);
+        let text = match &draft.value {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        };
+        match field.kind {
+            FieldKind::Boolean => {
+                content.insert(key, Value::Bool(draft.value.as_bool().unwrap_or(false)));
+            }
+            FieldKind::Array => {
+                let items = draft.value.as_array().cloned().unwrap_or_default();
+                if field.required && items.is_empty() {
+                    return Err(incomplete());
+                }
+                content.insert(key, Value::Array(items));
+            }
+            FieldKind::Number | FieldKind::Integer => {
+                let text = text.trim();
+                if text.is_empty() {
+                    if field.required {
+                        return Err(incomplete());
+                    }
+                    continue;
+                }
+                let value = if field.kind == FieldKind::Integer {
+                    text.parse::<i64>()
+                        .map(Value::from)
+                        .map_err(|_| format!("{} must be a whole number.", field.label))?
+                } else {
+                    text.parse::<f64>()
+                        .ok()
+                        .filter(|n| n.is_finite())
+                        .map(Value::from)
+                        .ok_or_else(|| format!("{} must be a number.", field.label))?
+                };
+                content.insert(key, value);
+            }
+            FieldKind::String => {
+                if text.trim().is_empty() {
+                    if field.required {
+                        return Err(incomplete());
+                    }
+                    // An empty choice would not match the listed options.
+                    if !field.options.is_empty() {
+                        continue;
+                    }
+                }
+                content.insert(key, Value::from(text));
+            }
+        }
+    }
+    Ok(Value::Object(content))
+}
+
+/// Card text of an answered permission (desktop `describePermissionResolution`).
+fn permission_resolution(option: &PermOption) -> String {
+    match option.kind.as_str() {
+        "allow_once" => "Allowed once".into(),
+        "allow_always" => "Allowed always".into(),
+        "reject_once" => "Rejected once".into(),
+        "reject_always" => "Rejected always".into(),
+        _ => option.name.clone(),
+    }
+}
+
+/// Resume authorities for question recovery go only over an encrypted or
+/// loopback transport (desktop `supportsElicitationRecoveryTransport`).
+fn recovery_transport_ok(endpoint: &Endpoint) -> bool {
+    match endpoint {
+        Endpoint::Process { .. } => true,
+        Endpoint::WebSocket { secure: true, .. } => true,
+        Endpoint::WebSocket { address, .. } => {
+            let host = address
+                .rsplit_once(':')
+                .map_or(address.as_str(), |(h, _)| h)
+                .trim_matches(['[', ']'])
+                .to_ascii_lowercase();
+            matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
+                || host.ends_with(".localhost")
+        }
+    }
+}
+
+const ELICITATION_RECOVERY_VERSION: u64 = 1;
+const ELICITATION_RECOVERY_DENIED: i64 = -32003;
+
+/// `querymt/capabilities` advertises the v1 question-recovery contract.
+fn supports_elicitation_recovery(caps: &Value) -> bool {
+    let has = |list: &str, name: &str| {
+        caps.get(list)
+            .and_then(Value::as_array)
+            .is_some_and(|l| l.iter().any(|m| m.as_str() == Some(name)))
+    };
+    caps.pointer("/elicitation_recovery/version")
+        .and_then(Value::as_u64)
+        == Some(ELICITATION_RECOVERY_VERSION)
+        && has("methods", "querymt/elicitation/listPendingSessions")
+        && has("methods", "querymt/elicitation/attachSession")
+        && has("notifications", "querymt/elicitation/recoveryAuthority")
 }
 
 /// An OAuth flow waiting for the user to paste the callback code.
@@ -724,6 +1102,9 @@ pub struct AgentRuntime {
     tasks: Vec<Task<()>>,
     generation: u64,
     refresh_scheduled: bool,
+    /// Session id -> resume authority for re-attaching its pending questions
+    /// after a reconnect (`querymt/elicitation/recoveryAuthority`).
+    resume_authorities: HashMap<String, String>,
 }
 
 /// Direct children of one session, loaded on demand.
@@ -1999,6 +2380,7 @@ impl AgentsStore {
                             "fs": {},
                             "terminal": false,
                             "session": { "compaction": {} },
+                            "elicitation": { "form": {} },
                             "_meta": { "querymt": { "sessionLoadSnapshot": { "epoch": 1 } } },
                         },
                     }),
@@ -2049,7 +2431,7 @@ impl AgentsStore {
             rt.state = ConnState::Idle;
             rt.pid = None;
             rt.log("Disconnected.");
-            self.requests.retain(|r| r.agent_id != id);
+            self.retire_requests(id);
             cx.notify();
         }
     }
@@ -3039,16 +3421,30 @@ impl AgentsStore {
         if let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) {
             rpc.notify("session/cancel", json!({ "sessionId": view.session_id }));
         }
-        // Pending permission prompts of this session are moot now.
+        // Pending prompts of this session are moot now.
         let (agent, sid) = (view.agent_id.clone(), view.session_id.clone());
-        let keys: Vec<String> = self
+        let keys: Vec<(String, bool)> = self
             .requests
             .iter()
-            .filter(|r| r.agent_id == agent && r.session_id.as_deref() == Some(sid.as_str()))
-            .map(|r| r.key.clone())
+            .filter(|r| {
+                r.answerable()
+                    && r.agent_id == agent
+                    && r.session_id.as_deref() == Some(sid.as_str())
+            })
+            .map(|r| (r.key.clone(), r.is_elicitation()))
             .collect();
-        for key in keys {
-            self.respond_request(&key, json!({ "outcome": { "outcome": "cancelled" } }), cx);
+        for (key, elicitation) in keys {
+            if elicitation {
+                self.answer_elicitation(&key, "cancel", cx);
+            } else {
+                self.resolve_request(
+                    &key,
+                    json!({ "outcome": { "outcome": "cancelled" } }),
+                    "Cancelled".into(),
+                    false,
+                    cx,
+                );
+            }
         }
         cx.notify();
     }
@@ -3096,38 +3492,306 @@ impl AgentsStore {
 
     // ---- inbox --------------------------------------------------------------
 
-    fn respond_request(&mut self, key: &str, result: Value, cx: &mut Context<Self>) {
-        let Some(ix) = self.requests.iter().position(|r| r.key == key) else {
+    /// Answer the live delivery of `key` and keep the card as resolved.
+    fn resolve_request(
+        &mut self,
+        key: &str,
+        result: Value,
+        resolution: String,
+        expect_ack: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(req) = self
+            .requests
+            .iter_mut()
+            .find(|r| r.key == key && r.answerable())
+        else {
             return;
         };
-        let req = self.requests.remove(ix);
-        if let Some(rpc) = self.runtime.get(&req.agent_id).and_then(|r| r.rpc.clone()) {
-            rpc.respond(req.rpc_id, Ok(result));
+        let rpc_id = req.rpc_id.take();
+        req.status = RequestStatus::Resolved(resolution);
+        req.error = None;
+        req.rejected = false;
+        // Only a stable identity can be re-delivered to this card if the
+        // agent rejects the answer.
+        req.awaiting_ack = expect_ack && req.stable;
+        let agent = req.agent_id.clone();
+        if let (Some(id), Some(rpc)) =
+            (rpc_id, self.runtime.get(&agent).and_then(|r| r.rpc.clone()))
+        {
+            rpc.respond(id, Ok(result));
+        }
+        self.trim_resolved();
+        cx.notify();
+    }
+
+    /// Keep at most [`MAX_RESOLVED_REQUESTS`] answered cards (newest first).
+    fn trim_resolved(&mut self) {
+        let mut resolved: Vec<(f64, String)> = self
+            .requests
+            .iter()
+            .filter(|r| !r.is_pending() && !r.awaiting_ack)
+            .map(|r| (r.received_ms, r.key.clone()))
+            .collect();
+        if resolved.len() <= MAX_RESOLVED_REQUESTS {
+            return;
+        }
+        resolved.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let drop: std::collections::HashSet<String> = resolved
+            .into_iter()
+            .skip(MAX_RESOLVED_REQUESTS)
+            .map(|(_, k)| k)
+            .collect();
+        self.requests.retain(|r| !drop.contains(&r.key));
+    }
+
+    /// Requests still waiting for the user (the Inbox badge).
+    pub fn pending_request_count(&self) -> usize {
+        self.requests.iter().filter(|r| r.is_pending()).count()
+    }
+
+    /// A request from the agent: a new card, or the re-delivery of one already
+    /// shown (reconnect, rejected answer), which keeps its card and draft.
+    fn receive_request(&mut self, mut request: PendingRequest, cx: &mut Context<Self>) {
+        let rpc = self
+            .runtime
+            .get(&request.agent_id)
+            .and_then(|r| r.rpc.clone());
+        let Some(ix) = self.requests.iter().position(|r| r.key == request.key) else {
+            self.requests.push(request);
+            cx.notify();
+            return;
+        };
+        let existing = &mut self.requests[ix];
+        if existing.answerable() {
+            if existing.is_elicitation() {
+                // The question is already answerable here: dismiss the duplicate.
+                if let (Some(rpc), Some(id)) = (rpc, request.rpc_id.take()) {
+                    rpc.respond(id, Ok(json!({ "action": "cancel" })));
+                }
+                return;
+            }
+            // A newer delivery of the same permission supersedes the old one.
+            if let (Some(rpc), Some(id)) = (rpc, existing.rpc_id.take()) {
+                rpc.respond(id, Ok(json!({ "outcome": { "outcome": "cancelled" } })));
+            }
+            existing.rpc_id = request.rpc_id.take();
+        } else if existing.is_pending() || existing.awaiting_ack || existing.rejected {
+            if !existing.is_pending() || (existing.awaiting_ack && !existing.rejected) {
+                existing.error = Some("The agent rejected this answer.".into());
+            } else if !existing.rejected {
+                existing.error = None;
+            }
+            existing.status = RequestStatus::Pending;
+            existing.rpc_id = request.rpc_id.take();
+            existing.offline = false;
+            existing.awaiting_ack = false;
+            existing.rejected = false;
+            if existing.drafts.len() != request.drafts.len() {
+                existing.kind = request.kind;
+                existing.drafts = request.drafts;
+            }
+        } else {
+            // Answered for good earlier: this is a new question with the same id.
+            self.requests.remove(ix);
+            self.requests.push(request);
         }
         cx.notify();
     }
 
+    /// The agent's connection is gone: no answer is sent for any card. Cards
+    /// with a stable identity wait offline for a re-delivery; others retire.
+    fn retire_requests(&mut self, agent_id: &str) {
+        for r in self.requests.iter_mut().filter(|r| r.agent_id == agent_id) {
+            r.awaiting_ack = false;
+            if !r.is_pending() {
+                continue;
+            }
+            r.rpc_id = None;
+            if r.stable {
+                r.offline = true;
+            } else {
+                r.status = RequestStatus::Resolved(RESOLVED_GONE.into());
+            }
+        }
+    }
+
+    /// Retire question cards of `session_id` that the agent no longer reports
+    /// as pending. Only cards that existed before recovery began (`boundary`).
+    fn reconcile_elicitations(
+        &mut self,
+        agent_id: &str,
+        session_id: &str,
+        pending: &[String],
+        boundary: &std::collections::HashSet<String>,
+    ) {
+        for r in self.requests.iter_mut().filter(|r| {
+            r.agent_id == agent_id
+                && r.session_id.as_deref() == Some(session_id)
+                && r.is_pending()
+                && boundary.contains(&r.key)
+        }) {
+            let Some(identity) = r.identity.as_deref() else {
+                continue;
+            };
+            if !pending.iter().any(|p| p == identity) {
+                r.rpc_id = None;
+                r.offline = false;
+                r.status = RequestStatus::Resolved(RESOLVED_GONE.into());
+            }
+        }
+    }
+
+    /// `querymt/elicitation/*` notifications (and ACP `elicitation/complete`).
+    fn on_elicitation_notification(&mut self, agent_id: &str, method: &str, params: &Value) {
+        let method = method.trim_start_matches('_');
+        if method == "querymt/elicitation/recoveryAuthority" {
+            if params.get("version").and_then(Value::as_u64) == Some(ELICITATION_RECOVERY_VERSION)
+                && let (Some(sid), Some(authority)) = (
+                    str_at(params, "session_id").filter(|s| !s.is_empty()),
+                    str_at(params, "resume_authority").filter(|s| !s.is_empty()),
+                )
+                && let Some(rt) = self.runtime.get_mut(agent_id)
+            {
+                rt.resume_authorities
+                    .insert(sid.to_string(), authority.to_string());
+            }
+            return;
+        }
+        let Some(eid) = str_at(params, "elicitation_id")
+            .or_else(|| str_at(params, "elicitationId"))
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+        let Some(req) = self
+            .requests
+            .iter_mut()
+            .find(|r| r.agent_id == agent_id && r.identity.as_deref() == Some(eid))
+        else {
+            return;
+        };
+        match method {
+            // The agent rejected the submitted answer and keeps the question
+            // pending; it re-delivers it, which makes the card answerable again.
+            "querymt/elicitation/validationFailed" if req.awaiting_ack => {
+                req.status = RequestStatus::Pending;
+                req.rpc_id = None;
+                req.offline = true;
+                req.awaiting_ack = false;
+                req.rejected = true;
+                req.error = Some(match str_at(params, "message").filter(|m| !m.is_empty()) {
+                    Some(m) => format!("The agent rejected this answer: {m}"),
+                    None => "The agent rejected this answer.".into(),
+                });
+            }
+            "querymt/elicitation/completed" | "elicitation/complete" => {
+                req.awaiting_ack = false;
+                if req.is_pending() {
+                    let outcome = match str_at(params, "outcome") {
+                        Some("accept") => RESOLVED_SUBMITTED,
+                        Some("decline") => "Declined",
+                        Some("cancel") => "Cancelled",
+                        _ if method == "elicitation/complete" => "Completed",
+                        _ => RESOLVED_GONE,
+                    };
+                    req.rpc_id = None;
+                    req.offline = false;
+                    req.error = None;
+                    req.status = RequestStatus::Resolved(outcome.into());
+                }
+                self.trim_resolved();
+            }
+            _ => {}
+        }
+    }
+
+    /// Replace the user's answer for one field of a pending question.
+    pub fn set_draft(
+        &mut self,
+        key: &str,
+        field: usize,
+        draft: FieldDraft,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(req) = self
+            .requests
+            .iter_mut()
+            .find(|r| r.key == key && r.is_pending())
+            && let Some(slot) = req.drafts.get_mut(field)
+        {
+            *slot = draft;
+            req.error = None;
+            cx.notify();
+        }
+    }
+
     pub fn answer_permission(&mut self, key: &str, option_id: &str, cx: &mut Context<Self>) {
-        self.respond_request(
+        let Some(resolution) =
+            self.requests
+                .iter()
+                .find(|r| r.key == key)
+                .and_then(|r| match &r.kind {
+                    RequestKind::Permission { options, .. } => options
+                        .iter()
+                        .find(|o| o.id == option_id)
+                        .map(permission_resolution),
+                    RequestKind::Elicitation { .. } => None,
+                })
+        else {
+            return;
+        };
+        self.resolve_request(
             key,
             json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
+            resolution,
+            false,
             cx,
         );
     }
 
     /// `action`: `accept` (with `content`), `decline` or `cancel`.
-    pub fn answer_elicitation(
-        &mut self,
-        key: &str,
-        action: &str,
-        content: Option<Value>,
-        cx: &mut Context<Self>,
-    ) {
-        let mut result = json!({ "action": action });
-        if let Some(content) = content {
-            result["content"] = content;
-        }
-        self.respond_request(key, result, cx);
+    pub fn answer_elicitation(&mut self, key: &str, action: &str, cx: &mut Context<Self>) {
+        let Some(req) = self
+            .requests
+            .iter_mut()
+            .find(|r| r.key == key && r.answerable())
+        else {
+            return;
+        };
+        let (result, resolution) = match action {
+            "decline" => (json!({ "action": "decline" }), "Declined"),
+            "cancel" => (json!({ "action": "cancel" }), "Cancelled"),
+            "accept" => {
+                let content = match &req.kind {
+                    RequestKind::Elicitation { url: Some(_), .. } => Ok(None),
+                    // Never submit a form whose fields cannot be represented.
+                    RequestKind::Elicitation {
+                        unsupported: true, ..
+                    }
+                    | RequestKind::Permission { .. } => return,
+                    RequestKind::Elicitation { fields, .. } => {
+                        elicitation_content(fields, &req.drafts).map(Some)
+                    }
+                };
+                match content {
+                    Ok(content) => {
+                        let mut result = json!({ "action": "accept" });
+                        if let Some(content) = content {
+                            result["content"] = content;
+                        }
+                        (result, RESOLVED_SUBMITTED)
+                    }
+                    Err(message) => {
+                        req.error = Some(message);
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            _ => return,
+        };
+        self.resolve_request(key, result, resolution.into(), action == "accept", cx);
     }
 
     pub fn session_summary(&self, agent_id: &str, session_id: &str) -> Option<&SessionSummary> {
@@ -3162,7 +3826,7 @@ impl AgentsStore {
         rt.log(format!("Error: {reason}"));
         rt.state = ConnState::Failed(reason);
         rt.busy = false;
-        self.requests.retain(|r| r.agent_id != id);
+        self.retire_requests(id);
         cx.notify();
     }
 
@@ -3183,11 +3847,7 @@ impl AgentsStore {
                     return;
                 };
                 match parse_request(id, request_id.clone(), &method, &params) {
-                    Some(request) => {
-                        self.requests.retain(|r| r.key != request.key);
-                        self.requests.push(request);
-                        cx.notify();
-                    }
+                    Some(request) => self.receive_request(request, cx),
                     None => rpc.respond(
                         request_id,
                         Err((
@@ -3293,14 +3953,12 @@ impl AgentsStore {
                         cx.notify();
                     }
                 }
-                if method.ends_with("elicitation/completed") || method == "elicitation/complete" {
-                    let eid = params
-                        .get("elicitation_id")
-                        .or_else(|| params.get("elicitationId"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    self.requests
-                        .retain(|r| r.agent_id != id || r.elicitation_id.as_deref() != Some(eid));
+                if method
+                    .trim_start_matches('_')
+                    .starts_with("querymt/elicitation/")
+                    || method == "elicitation/complete"
+                {
+                    self.on_elicitation_notification(id, &method, &params);
                     cx.notify();
                 }
                 if method.contains("runtimeChanged")
@@ -3410,6 +4068,106 @@ async fn fetch_session_pages(
     Ok(sessions)
 }
 
+/// After a (re)connect, re-attach the questions still pending for sessions
+/// whose resume authority this app holds (desktop `recoverPendingElicitations`).
+/// The agent re-delivers them, which rebinds the offline cards; cards it no
+/// longer reports are retired without sending any answer.
+async fn recover_elicitations(
+    this: &WeakEntity<AgentsStore>,
+    id: &str,
+    generation: u64,
+    rpc: &RpcClient,
+    cx: &mut AsyncApp,
+) {
+    let Ok(Some((authorities, boundary))) = this.update(cx, |s, _| {
+        let endpoint_ok = s
+            .config(id)
+            .is_some_and(|c| recovery_transport_ok(&c.endpoint));
+        let rt = s.runtime.get(id).filter(|rt| rt.generation == generation)?;
+        if !endpoint_ok || rt.resume_authorities.is_empty() {
+            return None;
+        }
+        let boundary: std::collections::HashSet<String> = s
+            .requests
+            .iter()
+            .filter(|r| r.agent_id == id)
+            .map(|r| r.key.clone())
+            .collect();
+        Some((rt.resume_authorities.clone(), boundary))
+    }) else {
+        return;
+    };
+    let version = ELICITATION_RECOVERY_VERSION;
+    for (session_id, authority) in authorities {
+        let listed = rpc
+            .request_detailed(
+                "_querymt/elicitation/listPendingSessions",
+                json!({ "version": version, "resume_authority": authority }),
+            )
+            .await;
+        let session_ids: Vec<String> = match listed {
+            Ok(v) => v
+                .get("session_ids")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.as_str().map(str::to_owned))
+                .collect(),
+            Err(err) => {
+                let denied = err
+                    .raw()
+                    .and_then(|r| r.get("code"))
+                    .and_then(Value::as_i64)
+                    == Some(ELICITATION_RECOVERY_DENIED);
+                if denied {
+                    // Expired or revoked: forget it; its questions are gone.
+                    let _ = this.update(cx, |s, cx| {
+                        if let Some(rt) = s.live(id, generation) {
+                            rt.resume_authorities.remove(&session_id);
+                        }
+                        s.reconcile_elicitations(id, &session_id, &[], &boundary);
+                        cx.notify();
+                    });
+                }
+                continue;
+            }
+        };
+        for attached in &session_ids {
+            let Ok(v) = rpc
+                .request(
+                    "_querymt/elicitation/attachSession",
+                    json!({
+                        "version": version,
+                        "session_id": attached,
+                        "resume_authority": authority,
+                    }),
+                )
+                .await
+            else {
+                // Keep offline cards for a later reconnect.
+                continue;
+            };
+            let pending: Vec<String> = v
+                .get("elicitation_ids")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.as_str().map(str::to_owned))
+                .collect();
+            let _ = this.update(cx, |s, cx| {
+                s.reconcile_elicitations(id, attached, &pending, &boundary);
+                cx.notify();
+            });
+        }
+        if !session_ids.contains(&session_id) {
+            let _ = this.update(cx, |s, cx| {
+                s.reconcile_elicitations(id, &session_id, &[], &boundary);
+                cx.notify();
+            });
+        }
+    }
+}
+
 /// Capabilities, models, sessions, mesh — each applied as soon as it arrives.
 async fn load_details(
     this: WeakEntity<AgentsStore>,
@@ -3446,10 +4204,14 @@ async fn load_details(
         .and_then(|c| c.pointer("/features/mesh"))
         .and_then(Value::as_bool)
         == Some(true);
+    let recovery = caps.as_ref().is_ok_and(supports_elicitation_recovery);
     apply!(|rt: &mut AgentRuntime| match caps {
         Ok(caps) => rt.capabilities = Some(caps),
         Err(err) => rt.log(format!("Capabilities unavailable: {err}")),
     });
+    if recovery {
+        recover_elicitations(&this, &id, generation, &rpc, cx).await;
+    }
 
     let models = rpc.request("_querymt/models", json!({})).await;
     let parsed = match &models {
@@ -3984,5 +4746,179 @@ mod tests {
         })
         .unwrap();
         assert!(json.contains(r#""image_send_mode":"resource""#));
+    }
+
+    fn question(multiple: bool) -> Value {
+        let choices = json!([
+            { "const": "A", "title": "A", "_meta": { "querymt": { "description": "first" } } },
+            { "const": "B", "title": "B", "_meta": { "querymt": { "description": "B" } } },
+        ]);
+        let selection = if multiple {
+            json!({ "type": "array", "title": "Checks", "description": "Which?", "items": { "anyOf": choices } })
+        } else {
+            json!({ "type": "string", "title": "Pick", "description": "Which?", "oneOf": choices })
+        };
+        json!({
+            "sessionId": "s1", "mode": "form", "message": "Which?",
+            "requestedSchema": { "type": "object", "properties": { "selection": selection }, "required": ["selection"] },
+            "_meta": { "querymt": { "elicitation_id": "q1", "source": "builtin:question" } }
+        })
+    }
+
+    #[test]
+    fn question_parses_options_descriptions_and_custom() {
+        for multiple in [false, true] {
+            let r =
+                parse_request("a", json!(7), "elicitation/create", &question(multiple)).unwrap();
+            assert_eq!(r.key, "a:q1");
+            assert!(r.answerable() && r.stable);
+            let f = &r.fields()[0];
+            assert_eq!(
+                f.kind,
+                if multiple {
+                    FieldKind::Array
+                } else {
+                    FieldKind::String
+                }
+            );
+            assert!(f.required && f.allow_custom);
+            assert_eq!(f.options.len(), 2);
+            assert_eq!(f.options[0].description.as_deref(), Some("first"));
+            // A description equal to the label adds nothing.
+            assert_eq!(f.options[1].description, None);
+            assert_eq!(
+                r.drafts[0].value,
+                if multiple { json!([]) } else { json!("") }
+            );
+            let labels: Vec<_> = r.actions().into_iter().map(|a| a.label).collect();
+            assert_eq!(labels, ["Submit", "Decline", "Cancel"]);
+        }
+    }
+
+    #[test]
+    fn multi_select_answers_are_arrays_and_custom_is_wrapped() {
+        let r = parse_request("a", json!(1), "elicitation/create", &question(true)).unwrap();
+        let fields = r.fields();
+        let empty = [FieldDraft {
+            value: json!([]),
+            custom: None,
+        }];
+        assert_eq!(
+            elicitation_content(fields, &empty).unwrap_err(),
+            "Please complete Checks."
+        );
+        let picked = [FieldDraft {
+            value: json!(["A", "B"]),
+            custom: None,
+        }];
+        assert_eq!(
+            elicitation_content(fields, &picked).unwrap(),
+            json!({ "selection": ["A", "B"] })
+        );
+        let custom = [FieldDraft {
+            value: json!([]),
+            custom: Some(" mine ".into()),
+        }];
+        assert_eq!(
+            elicitation_content(fields, &custom).unwrap(),
+            json!({ "selection": ["mine"] })
+        );
+        let blank = [FieldDraft {
+            value: json!([]),
+            custom: Some("  ".into()),
+        }];
+        assert_eq!(
+            elicitation_content(fields, &blank).unwrap_err(),
+            "Please enter a custom response."
+        );
+
+        let single = parse_request("a", json!(1), "elicitation/create", &question(false)).unwrap();
+        let custom = [FieldDraft {
+            value: json!(""),
+            custom: Some("other".into()),
+        }];
+        assert_eq!(
+            elicitation_content(single.fields(), &custom).unwrap(),
+            json!({ "selection": "other" })
+        );
+    }
+
+    #[test]
+    fn form_fields_keep_types_and_reject_unknown_ones() {
+        let params = json!({
+            "mode": "form", "message": "m",
+            "requestedSchema": { "title": "Setup", "properties": {
+                "name": { "type": "string" }, "n": { "type": "integer" },
+                "ok": { "type": "boolean", "default": true }
+            }, "required": ["name"] }
+        });
+        let r = parse_request("a", json!(1), "elicitation/create", &params).unwrap();
+        assert_eq!(r.title, "Setup");
+        assert!(!r.stable && r.key == "a:rpc:1");
+        let kinds: Vec<_> = r.fields().iter().map(|f| f.kind).collect();
+        assert_eq!(
+            kinds,
+            [FieldKind::String, FieldKind::Integer, FieldKind::Boolean]
+        );
+        let drafts = [
+            FieldDraft {
+                value: json!("x"),
+                custom: None,
+            },
+            FieldDraft {
+                value: json!("4.5"),
+                custom: None,
+            },
+            FieldDraft {
+                value: json!(true),
+                custom: None,
+            },
+        ];
+        assert_eq!(
+            elicitation_content(r.fields(), &drafts).unwrap_err(),
+            "n must be a whole number."
+        );
+
+        let odd = json!({ "mode": "form", "message": "m",
+            "requestedSchema": { "properties": { "x": { "type": "object" } } } });
+        let r = parse_request("a", json!(2), "elicitation/create", &odd).unwrap();
+        assert!(matches!(
+            r.kind,
+            RequestKind::Elicitation {
+                unsupported: true,
+                ..
+            }
+        ));
+        let labels: Vec<_> = r.actions().into_iter().map(|a| a.label).collect();
+        assert_eq!(labels, ["Decline", "Cancel"]);
+    }
+
+    #[test]
+    fn permission_keys_use_interaction_id_and_primary_allow() {
+        let params = json!({
+            "sessionId": "s", "toolCall": { "toolCallId": "t1", "title": "Run ls", "kind": "execute" },
+            "options": [
+                { "optionId": "r", "name": "Reject", "kind": "reject_once" },
+                { "optionId": "o", "name": "Allow", "kind": "allow_once" }
+            ],
+            "_meta": { "querymt": { "interaction_id": "i9" } }
+        });
+        let r = parse_request("a", json!(3), "session/request_permission", &params).unwrap();
+        assert_eq!(r.key, "a:i9");
+        assert!(r.detail.contains("(execute)"));
+        let primary: Vec<_> = r.actions().into_iter().map(|a| a.primary).collect();
+        assert_eq!(primary, [false, true]);
+    }
+
+    #[test]
+    fn recovery_only_over_secure_or_loopback() {
+        let ws = |address: &str, secure| Endpoint::WebSocket {
+            address: address.into(),
+            secure,
+        };
+        assert!(recovery_transport_ok(&ws("127.0.0.1:3030", false)));
+        assert!(recovery_transport_ok(&ws("[::1]:3030", false)));
+        assert!(recovery_transport_ok(&ws("example.com:443", true)));
+        assert!(!recovery_transport_ok(&ws("10.0.0.2:3030", false)));
     }
 }
