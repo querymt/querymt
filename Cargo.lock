@@ -964,7 +964,7 @@ dependencies = [
  "regex",
  "rustc-hash 2.1.3",
  "shlex 2.0.1",
- "syn 3.0.9",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1333,7 +1333,7 @@ dependencies = [
  "rayon",
  "safetensors 0.7.0",
  "thiserror 2.0.21",
- "yoke 0.8.3",
+ "yoke 0.8.4",
  "zip 7.4.0",
 ]
 
@@ -1365,7 +1365,7 @@ dependencies = [
  "safetensors 0.8.0",
  "thiserror 2.0.21",
  "tokenizers 0.23.2",
- "yoke 0.8.3",
+ "yoke 0.8.4",
  "zerocopy",
  "zip 8.6.0",
 ]
@@ -6391,7 +6391,7 @@ dependencies = [
  "displaydoc",
  "potential_utf",
  "utf8_iter",
- "yoke 0.8.3",
+ "yoke 0.8.4",
  "zerofrom",
  "zerovec",
 ]
@@ -6482,7 +6482,7 @@ dependencies = [
  "serde",
  "stable_deref_trait",
  "writeable",
- "yoke 0.8.3",
+ "yoke 0.8.4",
  "zerofrom",
  "zerotrie",
  "zerovec",
@@ -8827,7 +8827,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
- "yoke 0.8.3",
+ "yoke 0.8.4",
 ]
 
 [[package]]
@@ -12633,7 +12633,7 @@ dependencies = [
  "wasmtime-internal-core",
  "winnow 1.0.4",
  "writeable",
- "yoke 0.8.3",
+ "yoke 0.8.4",
  "zerocopy",
  "zerofrom",
  "zeroize",
@@ -19098,9 +19098,9 @@ dependencies = [
 
 [[package]]
 name = "yoke"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "709fe23a0424b6a435d82152b1bd3fdfb0833487d5fa90d05d42762a9891fef5"
+checksum = "417ef3fcf6c300b7dbd25c85531a746931c02ad536f3cf4786ed1e88223340b3"
 dependencies = [
  "stable_deref_trait",
  "yoke-derive 0.8.4",
@@ -19269,7 +19269,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ea269c3bd32f0a32c321907a2ae912ba6f4649bb0fc764a15627e99a7095a3f"
 dependencies = [
  "displaydoc",
- "yoke 0.8.3",
+ "yoke 0.8.4",
  "zerofrom",
  "zerovec",
 ]
@@ -19281,7 +19281,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bb0464e17806c1d976d5cba29399c7f08e516e279e2ba493f63123b5fca67dd8"
 dependencies = [
  "serde",
- "yoke 0.8.3",
+ "yoke 0.8.4",
  "zerofrom",
  "zerovec-derive",
 ]
