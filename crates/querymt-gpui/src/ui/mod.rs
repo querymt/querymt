@@ -139,9 +139,10 @@ pub struct QmtApp {
     /// Expanded tool calls / thoughts (by id).
     expanded_items: HashSet<String>,
     plan_open: bool,
-    form_inputs: HashMap<String, Entity<InputState>>,
-    form_values: HashMap<String, serde_json::Value>,
-    form_errors: HashMap<String, String>,
+    /// Text inputs of request forms, by (request key, field, custom answer).
+    form_inputs: HashMap<(String, usize, bool), (Entity<InputState>, Subscription)>,
+    /// Inbox cards the user expanded / collapsed (others use the default).
+    request_collapsed: HashMap<String, bool>,
     /// Session id to open once its agent has listed it (deep link).
     pending_open: Option<String>,
     /// Focus of the app shell: keeps global shortcuts working when no
@@ -201,7 +202,13 @@ impl QmtApp {
         });
 
         let mut subs = vec![
-            cx.observe(&store, |this, _, cx| {
+            cx.observe(&store, |this, store, cx| {
+                // Drop inputs of requests that left the inbox.
+                let s = store.read(cx);
+                this.form_inputs
+                    .retain(|(k, _, _), _| s.requests.iter().any(|r| &r.key == k));
+                this.request_collapsed
+                    .retain(|k, _| s.requests.iter().any(|r| &r.key == k));
                 this.open_pending_session(cx);
                 cx.notify();
             }),
@@ -334,8 +341,7 @@ impl QmtApp {
             expanded_items: HashSet::new(),
             plan_open: false,
             form_inputs: HashMap::new(),
-            form_values: HashMap::new(),
-            form_errors: HashMap::new(),
+            request_collapsed: HashMap::new(),
             pending_open: deep_link_session(),
             app_focus,
             palette,
@@ -472,7 +478,7 @@ impl QmtApp {
         let store = self.store.read(cx);
         if store.prefs.sidebar_collapsed {
             let badge = match page {
-                Page::Inbox => Some((store.requests.len(), p.accent)),
+                Page::Inbox => Some((store.pending_request_count(), p.accent)),
                 Page::Agents => Some((store.connected_ids().len(), p.success)),
                 _ => None,
             }
@@ -597,7 +603,7 @@ impl QmtApp {
                         Page::Inbox,
                         IconName::Inbox,
                         "Inbox",
-                        inbox_badge(self.store.read(cx).requests.len(), &p),
+                        inbox_badge(self.store.read(cx).pending_request_count(), &p),
                         &p,
                         cx,
                     ))
@@ -896,7 +902,7 @@ impl QmtApp {
                         Page::Inbox,
                         IconName::Inbox,
                         "Inbox",
-                        inbox_badge(self.store.read(cx).requests.len(), &p),
+                        inbox_badge(self.store.read(cx).pending_request_count(), &p),
                         &p,
                         cx,
                     ))

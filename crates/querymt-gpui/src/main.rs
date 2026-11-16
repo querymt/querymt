@@ -291,6 +291,8 @@ mod web {
             MessageSquarePlus,
             SearchX,
             PlugZap,
+            CircleDot,
+            CircleCheckBig,
             // model picker
             Gauge,
             Type,

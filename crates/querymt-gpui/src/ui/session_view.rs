@@ -4024,7 +4024,9 @@ impl QmtApp {
             .requests
             .iter()
             .filter(|r| {
-                r.agent_id == agent_id && r.session_id.as_deref() == Some(session_id.as_str())
+                r.is_pending()
+                    && r.agent_id == agent_id
+                    && r.session_id.as_deref() == Some(session_id.as_str())
             })
             .map(|r| r.key.clone())
             .collect();
@@ -4565,7 +4567,7 @@ impl QmtApp {
         // ---- requests + composer
         let request_cards: Vec<AnyElement> = requests
             .iter()
-            .filter_map(|k| self.request_card(k, false, window, cx))
+            .filter_map(|k| self.request_card(k, false, false, window, cx))
             .collect();
         let composer = self.session_composer(&view_snapshot, control, &p, cx);
         // A soft halo in the page background color around the composer: text
