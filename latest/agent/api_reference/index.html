@@ -1677,10 +1677,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#multi-agent-quorum" class="md-nav__link">
+  <a href="#agent-with-delegates" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        Multi-Agent (Quorum)
+        Agent with Delegates
       </span>
     </span>
   </a>
@@ -1796,6 +1796,17 @@
         
       </ul>
     </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#changing-subagents-while-running" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Changing subagents while running
+      </span>
+    </span>
+  </a>
   
 </li>
         
@@ -2530,7 +2541,7 @@
 <span class="normal"><a href="#__codelineno-2-8">8</a></span>
 <span class="normal"><a href="#__codelineno-2-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
 <a id="__codelineno-2-2" name="__codelineno-2-2"></a>
-<a id="__codelineno-2-3" name="__codelineno-2-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">builder</span><span class="p">()</span>
 <a id="__codelineno-2-4" name="__codelineno-2-4"></a><span class="w">    </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
 <a id="__codelineno-2-5" name="__codelineno-2-5"></a><span class="w">    </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">"."</span><span class="p">)</span>
 <a id="__codelineno-2-6" name="__codelineno-2-6"></a><span class="w">    </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s">"edit"</span><span class="p">])</span>
@@ -2539,7 +2550,8 @@
 <a id="__codelineno-2-9" name="__codelineno-2-9"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
 <p>Use <code>Mesh::hybrid()</code> when you want one process-shared runtime that supports both LAN discovery and later iroh invite joins.</p>
-<h3 id="multi-agent-quorum">Multi-Agent (Quorum)</h3>
+<h3 id="agent-with-delegates">Agent with Delegates</h3>
+<p>Every agent is a root with a roster of members it can delegate to. A plain agent has an empty roster; <code>.delegate(..)</code> adds members.</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-3-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-3-3"> 3</a></span>
@@ -2550,21 +2562,17 @@
 <span class="normal"><a href="#__codelineno-3-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-3-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-3-10">10</a></span>
-<span class="normal"><a href="#__codelineno-3-11">11</a></span>
-<span class="normal"><a href="#__codelineno-3-12">12</a></span>
-<span class="normal"><a href="#__codelineno-3-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">multi</span><span class="p">()</span>
+<span class="normal"><a href="#__codelineno-3-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">builder</span><span class="p">()</span>
 <a id="__codelineno-3-2" name="__codelineno-3-2"></a><span class="w">    </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">"."</span><span class="p">)</span>
-<a id="__codelineno-3-3" name="__codelineno-3-3"></a><span class="w">    </span><span class="p">.</span><span class="n">planner</span><span class="p">(</span><span class="o">|</span><span class="n">p</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="w">        </span><span class="n">p</span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
-<a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="w">            </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"delegate"</span><span class="p">])</span>
-<a id="__codelineno-3-6" name="__codelineno-3-6"></a><span class="w">    </span><span class="p">})</span>
-<a id="__codelineno-3-7" name="__codelineno-3-7"></a><span class="w">    </span><span class="p">.</span><span class="n">delegate</span><span class="p">(</span><span class="s">"coder"</span><span class="p">,</span><span class="w"> </span><span class="o">|</span><span class="n">d</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-3-8" name="__codelineno-3-8"></a><span class="w">        </span><span class="n">d</span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
-<a id="__codelineno-3-9" name="__codelineno-3-9"></a><span class="w">            </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s">"edit"</span><span class="p">])</span>
-<a id="__codelineno-3-10" name="__codelineno-3-10"></a><span class="w">            </span><span class="p">.</span><span class="n">capabilities</span><span class="p">([</span><span class="s">"coding"</span><span class="p">])</span>
-<a id="__codelineno-3-11" name="__codelineno-3-11"></a><span class="w">    </span><span class="p">})</span>
-<a id="__codelineno-3-12" name="__codelineno-3-12"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
-<a id="__codelineno-3-13" name="__codelineno-3-13"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3"></a><span class="w">    </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="w">    </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"delegate"</span><span class="p">])</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="w">    </span><span class="p">.</span><span class="n">delegate</span><span class="p">(</span><span class="s">"coder"</span><span class="p">,</span><span class="w"> </span><span class="o">|</span><span class="n">d</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6"></a><span class="w">        </span><span class="n">d</span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
+<a id="__codelineno-3-7" name="__codelineno-3-7"></a><span class="w">            </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s">"edit"</span><span class="p">])</span>
+<a id="__codelineno-3-8" name="__codelineno-3-8"></a><span class="w">            </span><span class="p">.</span><span class="n">capabilities</span><span class="p">([</span><span class="s">"coding"</span><span class="p">])</span>
+<a id="__codelineno-3-9" name="__codelineno-3-9"></a><span class="w">    </span><span class="p">})</span>
+<a id="__codelineno-3-10" name="__codelineno-3-10"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
+<a id="__codelineno-3-11" name="__codelineno-3-11"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="from-config">From Config</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-4-1">1</a></span>
@@ -2587,15 +2595,8 @@
 </code></pre></div></td></tr></table></div>
 <h2 id="agent-types">Agent Types</h2>
 <h3 id="agent">Agent</h3>
-<p>The main agent runtime, supporting both single and multi-agent modes.</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1">1</a></span>
-<span class="normal"><a href="#__codelineno-5-2">2</a></span>
-<span class="normal"><a href="#__codelineno-5-3">3</a></span>
-<span class="normal"><a href="#__codelineno-5-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">enum</span><span class="w"> </span><span class="nc">Agent</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="w">    </span><span class="n">Single</span><span class="p">(</span><span class="n">LocalAgentHandle</span><span class="p">),</span>
-<a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="w">    </span><span class="n">Multi</span><span class="p">(</span><span class="n">QuorumHandle</span><span class="p">),</span>
-<a id="__codelineno-5-4" name="__codelineno-5-4"></a><span class="p">}</span>
-</code></pre></div></td></tr></table></div>
+<p>The main agent runtime: one root agent plus the members it can delegate to. The delegation service runs in every runtime whose root may call <code>delegate</code>.</p>
+<p><code>Agent::builder()</code> returns an <code>AgentBuilder</code>; <code>.subagent(id, |s| ..)</code> (alias <code>.delegate</code>), <code>.delegation(bool)</code> and <code>.delegation_settings(..)</code> configure delegation. <code>Agent::has_subagents()</code> reports whether the root has subagents it can delegate to, and <code>Agent::delegate(id)</code> returns a member's handle by ID. <code>Agent::single()</code> and <code>is_multi()</code> are deprecated aliases of <code>builder()</code> and <code>has_subagents()</code>.</p>
 <h4 id="methods">Methods</h4>
 <table>
 <thead>
@@ -2633,9 +2634,9 @@
 </table>
 <h3 id="agentmesh">AgentMesh</h3>
 <p>Mesh-aware facade returned by <code>agent.mesh()</code>.</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1">1</a></span>
-<span class="normal"><a href="#__codelineno-6-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">outcome</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">mesh</span><span class="p">().</span><span class="n">unwrap</span><span class="p">().</span><span class="n">join</span><span class="p">(</span><span class="n">invite_code</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-6-2" name="__codelineno-6-2"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"joined {}"</span><span class="p">,</span><span class="w"> </span><span class="n">outcome</span><span class="p">.</span><span class="n">mesh_id</span><span class="p">);</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1">1</a></span>
+<span class="normal"><a href="#__codelineno-5-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">outcome</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">mesh</span><span class="p">().</span><span class="n">unwrap</span><span class="p">().</span><span class="n">join</span><span class="p">(</span><span class="n">invite_code</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"joined {}"</span><span class="p">,</span><span class="w"> </span><span class="n">outcome</span><span class="p">.</span><span class="n">mesh_id</span><span class="p">);</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="methods_1">Methods</h4>
 <table>
@@ -2662,11 +2663,11 @@
 </table>
 <h3 id="agentsession">AgentSession</h3>
 <p>Per-session interface for agent interaction.</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1">1</a></span>
-<span class="normal"><a href="#__codelineno-7-2">2</a></span>
-<span class="normal"><a href="#__codelineno-7-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">AgentSession</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-7-2" name="__codelineno-7-2"></a><span class="w">    </span><span class="c1">// Session-specific operations</span>
-<a id="__codelineno-7-3" name="__codelineno-7-3"></a><span class="p">}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1">1</a></span>
+<span class="normal"><a href="#__codelineno-6-2">2</a></span>
+<span class="normal"><a href="#__codelineno-6-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">AgentSession</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2"></a><span class="w">    </span><span class="c1">// Session-specific operations</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="methods_2">Methods</h4>
 <table>
@@ -2707,6 +2708,30 @@
 </tr>
 </tbody>
 </table>
+<h3 id="changing-subagents-while-running">Changing subagents while running</h3>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-7-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-7-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-7-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-7-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-7-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-7-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-7-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-7-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-7-10">10</a></span>
+<span class="normal"><a href="#__codelineno-7-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">builder</span><span class="p">()</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2"></a><span class="w">    </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5"</span><span class="p">)</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3"></a><span class="w">    </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"delegate"</span><span class="p">,</span><span class="w"> </span><span class="s">"read_tool"</span><span class="p">])</span><span class="w">   </span><span class="c1">// `delegate` is required</span>
+<a id="__codelineno-7-4" name="__codelineno-7-4"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">().</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-7-5" name="__codelineno-7-5"></a>
+<a id="__codelineno-7-6" name="__codelineno-7-6"></a><span class="n">agent</span><span class="p">.</span><span class="n">on_subagents_changed</span><span class="p">(</span><span class="o">|</span><span class="n">c</span><span class="o">|</span><span class="w"> </span><span class="fm">println!</span><span class="p">(</span><span class="s">"{} {} (generation {})"</span><span class="p">,</span><span class="w"> </span><span class="n">c</span><span class="p">.</span><span class="n">kind</span><span class="p">.</span><span class="n">label</span><span class="p">(),</span><span class="w"> </span><span class="n">c</span><span class="p">.</span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">c</span><span class="p">.</span><span class="n">generation</span><span class="p">.</span><span class="n">get</span><span class="p">()));</span>
+<a id="__codelineno-7-7" name="__codelineno-7-7"></a>
+<a id="__codelineno-7-8" name="__codelineno-7-8"></a><span class="n">agent</span><span class="p">.</span><span class="n">add_subagent</span><span class="p">(</span><span class="s">"reviewer"</span><span class="p">,</span><span class="w"> </span><span class="o">|</span><span class="n">s</span><span class="o">|</span><span class="w"> </span><span class="n">s</span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-haiku-4-5"</span><span class="p">)</span>
+<a id="__codelineno-7-9" name="__codelineno-7-9"></a><span class="w">    </span><span class="p">.</span><span class="n">description</span><span class="p">(</span><span class="s">"Reviews code"</span><span class="p">).</span><span class="n">tools</span><span class="p">([</span><span class="s">"read_tool"</span><span class="p">])).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-7-10" name="__codelineno-7-10"></a><span class="n">agent</span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">"..."</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span><span class="w">                 </span><span class="c1">// the root can now delegate to `reviewer`</span>
+<a id="__codelineno-7-11" name="__codelineno-7-11"></a><span class="n">agent</span><span class="p">.</span><span class="n">remove_subagent</span><span class="p">(</span><span class="s">"reviewer"</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</code></pre></div></td></tr></table></div>
+<p><code>subagents()</code> lists the current subagents and <code>roster_generation()</code> counts changes. <code>on_subagents_changed</code> and <code>subscribe_subagent_changes()</code> report every successful add or remove from any path (Rust, ACP, profiles). Shell hooks <code>subagent_added</code> / <code>subagent_removed</code> are described in <a href="../hooks/">Hooks</a>. See <code>crates/agent/examples/dynamic_subagents.rs</code>.</p>
 <h2 id="agent-modes">Agent Modes</h2>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1">1</a></span>
 <span class="normal"><a href="#__codelineno-8-2">2</a></span>

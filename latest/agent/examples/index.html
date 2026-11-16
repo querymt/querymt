@@ -1858,10 +1858,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#multi_agenttoml-planner-delegates" class="md-nav__link">
+  <a href="#multi_agenttoml-agent-delegates" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        <code>multi_agent.toml</code> — Planner + delegates
+        <code>multi_agent.toml</code> — Agent + delegates
       </span>
     </span>
   </a>
@@ -1919,10 +1919,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#example-multi-agent-quorum-multi_agenttoml" class="md-nav__link">
+  <a href="#example-agent-with-delegates-multi_agenttoml" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        Example: Multi-Agent Quorum (<code>multi_agent.toml</code>)
+        Example: Agent with delegates (<code>multi_agent.toml</code>)
       </span>
     </span>
   </a>
@@ -2553,8 +2553,8 @@ The <code>dashboard</code> feature automatically resolves and builds the pinned 
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>auto_delegation_example
 </code></pre></div></td></tr></table></div>
 <p><strong>What it demonstrates:</strong>
-- Configuring a planner + delegate quorum
-- The planner automatically delegating to the coder
+- Giving one agent a delegate with <code>.delegate(..)</code>
+- The root agent automatically delegating to the coder
 - Delegation lifecycle events</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-4-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-4-2"> 2</a></span>
@@ -2576,31 +2576,27 @@ The <code>dashboard</code> feature automatically resolves and builds the pinned 
 <span class="normal"><a href="#__codelineno-4-18">18</a></span>
 <span class="normal"><a href="#__codelineno-4-19">19</a></span>
 <span class="normal"><a href="#__codelineno-4-20">20</a></span>
-<span class="normal"><a href="#__codelineno-4-21">21</a></span>
-<span class="normal"><a href="#__codelineno-4-22">22</a></span>
-<span class="normal"><a href="#__codelineno-4-23">23</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+<span class="normal"><a href="#__codelineno-4-21">21</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
 <a id="__codelineno-4-2" name="__codelineno-4-2"></a>
 <a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="cp">#[tokio::main]</span>
 <a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">anyhow</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-4-5" name="__codelineno-4-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">multi</span><span class="p">()</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">builder</span><span class="p">()</span>
 <a id="__codelineno-4-6" name="__codelineno-4-6"></a><span class="w">        </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">"."</span><span class="p">)</span>
-<a id="__codelineno-4-7" name="__codelineno-4-7"></a><span class="w">        </span><span class="p">.</span><span class="n">planner</span><span class="p">(</span><span class="o">|</span><span class="n">p</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-4-8" name="__codelineno-4-8"></a><span class="w">            </span><span class="n">p</span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
-<a id="__codelineno-4-9" name="__codelineno-4-9"></a><span class="w">                </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"delegate"</span><span class="p">,</span><span class="w"> </span><span class="s">"read_tool"</span><span class="p">])</span>
-<a id="__codelineno-4-10" name="__codelineno-4-10"></a><span class="w">                </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">"You are a planner. Delegate coding tasks to the coder."</span><span class="p">)</span>
-<a id="__codelineno-4-11" name="__codelineno-4-11"></a><span class="w">        </span><span class="p">})</span>
-<a id="__codelineno-4-12" name="__codelineno-4-12"></a><span class="w">        </span><span class="p">.</span><span class="n">delegate</span><span class="p">(</span><span class="s">"coder"</span><span class="p">,</span><span class="w"> </span><span class="o">|</span><span class="n">d</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-4-13" name="__codelineno-4-13"></a><span class="w">            </span><span class="n">d</span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
-<a id="__codelineno-4-14" name="__codelineno-4-14"></a><span class="w">                </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s">"read_tool"</span><span class="p">])</span>
-<a id="__codelineno-4-15" name="__codelineno-4-15"></a><span class="w">                </span><span class="p">.</span><span class="n">capabilities</span><span class="p">([</span><span class="s">"coding"</span><span class="p">])</span>
-<a id="__codelineno-4-16" name="__codelineno-4-16"></a><span class="w">                </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">"You are a coder. Implement the requested changes."</span><span class="p">)</span>
-<a id="__codelineno-4-17" name="__codelineno-4-17"></a><span class="w">        </span><span class="p">})</span>
-<a id="__codelineno-4-18" name="__codelineno-4-18"></a><span class="w">        </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
-<a id="__codelineno-4-19" name="__codelineno-4-19"></a><span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-4-20" name="__codelineno-4-20"></a>
-<a id="__codelineno-4-21" name="__codelineno-4-21"></a><span class="w">    </span><span class="n">agent</span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">"Add a hello world function to src/lib.rs"</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-4-22" name="__codelineno-4-22"></a><span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
-<a id="__codelineno-4-23" name="__codelineno-4-23"></a><span class="p">}</span>
+<a id="__codelineno-4-7" name="__codelineno-4-7"></a><span class="w">        </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
+<a id="__codelineno-4-8" name="__codelineno-4-8"></a><span class="w">        </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"delegate"</span><span class="p">,</span><span class="w"> </span><span class="s">"read_tool"</span><span class="p">])</span>
+<a id="__codelineno-4-9" name="__codelineno-4-9"></a><span class="w">        </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">"You are a planner. Delegate coding tasks to the coder."</span><span class="p">)</span>
+<a id="__codelineno-4-10" name="__codelineno-4-10"></a><span class="w">        </span><span class="p">.</span><span class="n">delegate</span><span class="p">(</span><span class="s">"coder"</span><span class="p">,</span><span class="w"> </span><span class="o">|</span><span class="n">d</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-4-11" name="__codelineno-4-11"></a><span class="w">            </span><span class="n">d</span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
+<a id="__codelineno-4-12" name="__codelineno-4-12"></a><span class="w">                </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s">"read_tool"</span><span class="p">])</span>
+<a id="__codelineno-4-13" name="__codelineno-4-13"></a><span class="w">                </span><span class="p">.</span><span class="n">capabilities</span><span class="p">([</span><span class="s">"coding"</span><span class="p">])</span>
+<a id="__codelineno-4-14" name="__codelineno-4-14"></a><span class="w">                </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">"You are a coder. Implement the requested changes."</span><span class="p">)</span>
+<a id="__codelineno-4-15" name="__codelineno-4-15"></a><span class="w">        </span><span class="p">})</span>
+<a id="__codelineno-4-16" name="__codelineno-4-16"></a><span class="w">        </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
+<a id="__codelineno-4-17" name="__codelineno-4-17"></a><span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-4-18" name="__codelineno-4-18"></a>
+<a id="__codelineno-4-19" name="__codelineno-4-19"></a><span class="w">    </span><span class="n">agent</span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">"Add a hello world function to src/lib.rs"</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-4-20" name="__codelineno-4-20"></a><span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<a id="__codelineno-4-21" name="__codelineno-4-21"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <hr />
 <h2 id="from_config">from_config</h2>
@@ -2641,7 +2637,7 @@ The <code>dashboard</code> feature automatically resolves and builds the pinned 
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>closure_builder
 </code></pre></div></td></tr></table></div>
 <p><strong>What it demonstrates:</strong>
-- <code>Agent::single()</code> and <code>Agent::multi()</code> builder patterns
+- <code>Agent::builder()</code> with <code>.delegate(..)</code> builder patterns
 - Inline system prompts
 - Inline middleware configuration
 - Callback hooks</p>
@@ -2673,7 +2669,7 @@ The <code>dashboard</code> feature automatically resolves and builds the pinned 
 <a id="__codelineno-8-2" name="__codelineno-8-2"></a>
 <a id="__codelineno-8-3" name="__codelineno-8-3"></a><span class="cp">#[tokio::main]</span>
 <a id="__codelineno-8-4" name="__codelineno-8-4"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">anyhow</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-8-5" name="__codelineno-8-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">builder</span><span class="p">()</span>
 <a id="__codelineno-8-6" name="__codelineno-8-6"></a><span class="w">        </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
 <a id="__codelineno-8-7" name="__codelineno-8-7"></a><span class="w">        </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">"."</span><span class="p">)</span>
 <a id="__codelineno-8-8" name="__codelineno-8-8"></a><span class="w">        </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s">"search_text"</span><span class="p">])</span>
@@ -2725,7 +2721,7 @@ The <code>dashboard</code> feature automatically resolves and builds the pinned 
 <a id="__codelineno-10-2" name="__codelineno-10-2"></a>
 <a id="__codelineno-10-3" name="__codelineno-10-3"></a><span class="cp">#[tokio::main]</span>
 <a id="__codelineno-10-4" name="__codelineno-10-4"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">anyhow</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-10-5" name="__codelineno-10-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
+<a id="__codelineno-10-5" name="__codelineno-10-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">builder</span><span class="p">()</span>
 <a id="__codelineno-10-6" name="__codelineno-10-6"></a><span class="w">        </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
 <a id="__codelineno-10-7" name="__codelineno-10-7"></a><span class="w">        </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s">"glob"</span><span class="p">])</span>
 <a id="__codelineno-10-8" name="__codelineno-10-8"></a><span class="w">        </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">"You are an assistant that creates concise daily briefings."</span><span class="p">)</span>
@@ -2794,7 +2790,7 @@ The <code>dashboard</code> feature automatically resolves and builds the pinned 
 <a id="__codelineno-14-2" name="__codelineno-14-2"></a>
 <a id="__codelineno-14-3" name="__codelineno-14-3"></a><span class="cp">#[tokio::main]</span>
 <a id="__codelineno-14-4" name="__codelineno-14-4"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">anyhow</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-14-5" name="__codelineno-14-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
+<a id="__codelineno-14-5" name="__codelineno-14-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">builder</span><span class="p">()</span>
 <a id="__codelineno-14-6" name="__codelineno-14-6"></a><span class="w">        </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
 <a id="__codelineno-14-7" name="__codelineno-14-7"></a><span class="w">        </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"read_tool"</span><span class="p">])</span>
 <a id="__codelineno-14-8" name="__codelineno-14-8"></a><span class="w">        </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
@@ -2966,7 +2962,7 @@ The <code>dashboard</code> feature automatically resolves and builds the pinned 
 <p>Use this profile when you want config-level hook commands to inspect shell calls, automate approval decisions, or request one extra step at turn completion.</p>
 <h3 id="trading_analysttoml-trading_desktoml-guarded-stock-trading"><code>trading_analyst.toml</code> / <code>trading_desk.toml</code> — Guarded stock trading</h3>
 <p>Two profiles for Interactive Brokers' hosted MCP server. The analyst logs in with only the <code>mcp.read</code> scope, researches and writes small scripts and order tickets. The desk has the order scope but no shell, file-write or web tools, starts in <code>plan</code> mode, and runs <code>examples/hooks/trading/order_guard.py</code> before every order (risk limits, kill switch, build-mode-only, limit orders only) and asks you to confirm each order. Use a paper account first; see the header comments in both files for setup.</p>
-<h3 id="multi_agenttoml-planner-delegates"><code>multi_agent.toml</code> — Planner + delegates</h3>
+<h3 id="multi_agenttoml-agent-delegates"><code>multi_agent.toml</code> — Agent + delegates</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-19-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-19-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-19-3"> 3</a></span>
@@ -2985,27 +2981,25 @@ The <code>dashboard</code> feature automatically resolves and builds the pinned 
 <span class="normal"><a href="#__codelineno-19-16">16</a></span>
 <span class="normal"><a href="#__codelineno-19-17">17</a></span>
 <span class="normal"><a href="#__codelineno-19-18">18</a></span>
-<span class="normal"><a href="#__codelineno-19-19">19</a></span>
-<span class="normal"><a href="#__codelineno-19-20">20</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1"></a><span class="k">[quorum]</span>
+<span class="normal"><a href="#__codelineno-19-19">19</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1"></a><span class="k">[agent]</span>
 <a id="__codelineno-19-2" name="__codelineno-19-2"></a><span class="n">cwd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"."</span>
-<a id="__codelineno-19-3" name="__codelineno-19-3"></a><span class="n">delegation</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-19-4" name="__codelineno-19-4"></a><span class="n">verification</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-19-5" name="__codelineno-19-5"></a><span class="n">max_parallel_delegations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
-<a id="__codelineno-19-6" name="__codelineno-19-6"></a>
-<a id="__codelineno-19-7" name="__codelineno-19-7"></a><span class="k">[planner]</span>
-<a id="__codelineno-19-8" name="__codelineno-19-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
-<a id="__codelineno-19-9" name="__codelineno-19-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
-<a id="__codelineno-19-10" name="__codelineno-19-10"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"delegate"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">]</span>
-<a id="__codelineno-19-11" name="__codelineno-19-11"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/planner.md"</span><span class="w"> </span><span class="p">}]</span>
-<a id="__codelineno-19-12" name="__codelineno-19-12"></a>
-<a id="__codelineno-19-13" name="__codelineno-19-13"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-19-14" name="__codelineno-19-14"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
-<a id="__codelineno-19-15" name="__codelineno-19-15"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
-<a id="__codelineno-19-16" name="__codelineno-19-16"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
-<a id="__codelineno-19-17" name="__codelineno-19-17"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Implements code changes"</span>
-<a id="__codelineno-19-18" name="__codelineno-19-18"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"coding"</span><span class="p">,</span><span class="w"> </span><span class="s2">"filesystem"</span><span class="p">]</span>
-<a id="__codelineno-19-19" name="__codelineno-19-19"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">]</span>
-<a id="__codelineno-19-20" name="__codelineno-19-20"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/coder.md"</span><span class="w"> </span><span class="p">}]</span>
+<a id="__codelineno-19-3" name="__codelineno-19-3"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-19-4" name="__codelineno-19-4"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-19-5" name="__codelineno-19-5"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"delegate"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">]</span>
+<a id="__codelineno-19-6" name="__codelineno-19-6"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/planner.md"</span><span class="w"> </span><span class="p">}]</span>
+<a id="__codelineno-19-7" name="__codelineno-19-7"></a>
+<a id="__codelineno-19-8" name="__codelineno-19-8"></a><span class="k">[agent.delegation]</span>
+<a id="__codelineno-19-9" name="__codelineno-19-9"></a><span class="n">verification</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+<a id="__codelineno-19-10" name="__codelineno-19-10"></a><span class="n">max_parallel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
+<a id="__codelineno-19-11" name="__codelineno-19-11"></a>
+<a id="__codelineno-19-12" name="__codelineno-19-12"></a><span class="k">[[delegates]]</span>
+<a id="__codelineno-19-13" name="__codelineno-19-13"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-19-14" name="__codelineno-19-14"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-19-15" name="__codelineno-19-15"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-19-16" name="__codelineno-19-16"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Implements code changes"</span>
+<a id="__codelineno-19-17" name="__codelineno-19-17"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"coding"</span><span class="p">,</span><span class="w"> </span><span class="s2">"filesystem"</span><span class="p">]</span>
+<a id="__codelineno-19-18" name="__codelineno-19-18"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">]</span>
+<a id="__codelineno-19-19" name="__codelineno-19-19"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/coder.md"</span><span class="w"> </span><span class="p">}]</span>
 </code></pre></div></td></tr></table></div>
 <hr />
 <h2 id="running-all-examples">Running All Examples</h2>
@@ -3139,7 +3133,7 @@ The <code>dashboard</code> feature automatically resolves and builds the pinned 
 <a id="__codelineno-22-34" name="__codelineno-22-34"></a><span class="n">warn_at_percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">80</span>
 <a id="__codelineno-22-35" name="__codelineno-22-35"></a><span class="n">compact_at_percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">90</span>
 </code></pre></div></td></tr></table></div>
-<h3 id="example-multi-agent-quorum-multi_agenttoml">Example: Multi-Agent Quorum (<code>multi_agent.toml</code>)</h3>
+<h3 id="example-agent-with-delegates-multi_agenttoml">Example: Agent with delegates (<code>multi_agent.toml</code>)</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-23-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-23-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-23-3"> 3</a></span>
@@ -3158,27 +3152,25 @@ The <code>dashboard</code> feature automatically resolves and builds the pinned 
 <span class="normal"><a href="#__codelineno-23-16">16</a></span>
 <span class="normal"><a href="#__codelineno-23-17">17</a></span>
 <span class="normal"><a href="#__codelineno-23-18">18</a></span>
-<span class="normal"><a href="#__codelineno-23-19">19</a></span>
-<span class="normal"><a href="#__codelineno-23-20">20</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-23-1" name="__codelineno-23-1"></a><span class="k">[quorum]</span>
+<span class="normal"><a href="#__codelineno-23-19">19</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-23-1" name="__codelineno-23-1"></a><span class="k">[agent]</span>
 <a id="__codelineno-23-2" name="__codelineno-23-2"></a><span class="n">cwd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"."</span>
-<a id="__codelineno-23-3" name="__codelineno-23-3"></a><span class="n">delegation</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-23-4" name="__codelineno-23-4"></a><span class="n">verification</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-23-5" name="__codelineno-23-5"></a><span class="n">max_parallel_delegations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
-<a id="__codelineno-23-6" name="__codelineno-23-6"></a>
-<a id="__codelineno-23-7" name="__codelineno-23-7"></a><span class="k">[planner]</span>
-<a id="__codelineno-23-8" name="__codelineno-23-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
-<a id="__codelineno-23-9" name="__codelineno-23-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
-<a id="__codelineno-23-10" name="__codelineno-23-10"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"delegate"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">]</span>
-<a id="__codelineno-23-11" name="__codelineno-23-11"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/planner.md"</span><span class="w"> </span><span class="p">}]</span>
-<a id="__codelineno-23-12" name="__codelineno-23-12"></a>
-<a id="__codelineno-23-13" name="__codelineno-23-13"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-23-14" name="__codelineno-23-14"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
-<a id="__codelineno-23-15" name="__codelineno-23-15"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
-<a id="__codelineno-23-16" name="__codelineno-23-16"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
-<a id="__codelineno-23-17" name="__codelineno-23-17"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Implements code changes"</span>
-<a id="__codelineno-23-18" name="__codelineno-23-18"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"coding"</span><span class="p">,</span><span class="w"> </span><span class="s2">"filesystem"</span><span class="p">]</span>
-<a id="__codelineno-23-19" name="__codelineno-23-19"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">]</span>
-<a id="__codelineno-23-20" name="__codelineno-23-20"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/coder.md"</span><span class="w"> </span><span class="p">}]</span>
+<a id="__codelineno-23-3" name="__codelineno-23-3"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-23-4" name="__codelineno-23-4"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-23-5" name="__codelineno-23-5"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"delegate"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">]</span>
+<a id="__codelineno-23-6" name="__codelineno-23-6"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/planner.md"</span><span class="w"> </span><span class="p">}]</span>
+<a id="__codelineno-23-7" name="__codelineno-23-7"></a>
+<a id="__codelineno-23-8" name="__codelineno-23-8"></a><span class="k">[agent.delegation]</span>
+<a id="__codelineno-23-9" name="__codelineno-23-9"></a><span class="n">verification</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+<a id="__codelineno-23-10" name="__codelineno-23-10"></a><span class="n">max_parallel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
+<a id="__codelineno-23-11" name="__codelineno-23-11"></a>
+<a id="__codelineno-23-12" name="__codelineno-23-12"></a><span class="k">[[delegates]]</span>
+<a id="__codelineno-23-13" name="__codelineno-23-13"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-23-14" name="__codelineno-23-14"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-23-15" name="__codelineno-23-15"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-23-16" name="__codelineno-23-16"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Implements code changes"</span>
+<a id="__codelineno-23-17" name="__codelineno-23-17"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"coding"</span><span class="p">,</span><span class="w"> </span><span class="s2">"filesystem"</span><span class="p">]</span>
+<a id="__codelineno-23-18" name="__codelineno-23-18"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">]</span>
+<a id="__codelineno-23-19" name="__codelineno-23-19"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/coder.md"</span><span class="w"> </span><span class="p">}]</span>
 </code></pre></div></td></tr></table></div>
 <hr />
 <h2 id="mesh-networking-examples">Mesh Networking Examples</h2>

@@ -1426,6 +1426,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Events">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#subagent-change-hooks" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Subagent change hooks
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -2293,6 +2310,16 @@
 <td>none</td>
 <td>Observe explicit session close or deletion</td>
 </tr>
+<tr>
+<td><code>subagent_added</code></td>
+<td>subagent ID regex</td>
+<td>Observe a subagent joining the roster (not tied to a session)</td>
+</tr>
+<tr>
+<td><code>subagent_removed</code></td>
+<td>subagent ID regex</td>
+<td>Observe a subagent leaving the roster (not tied to a session)</td>
+</tr>
 </tbody>
 </table>
 <p>Handlers run in configuration order. Transform-capable events rebuild each handler's input from the last accepted value. A pre-operation block is sticky. Invalid JSON and invalid replacements emit a durable <code>hook_notice</code> and retain the last valid value.</p>
@@ -2304,58 +2331,73 @@
 <li><code>system_message</code>: emitted as a non-error durable notice and never inserted into model context</li>
 </ul>
 <p><code>additional_context</code> defaults to an approximate 2500-token limit, configurable per handler with <code>additional_context_limit</code>. Prompt and tool contributions are persisted as typed, provenance-labeled message parts. Tool contributions are placed after every <code>tool_result</code> block in the combined result message. <code>context</code> contributions exist only in the prepared request and never mutate stored history.</p>
+<h3 id="subagent-change-hooks">Subagent change hooks</h3>
+<p><code>subagent_added</code> and <code>subagent_removed</code> run after a subagent is added to or removed from a running agent, by any path (the Rust or Python API, <code>querymt/agents/add</code>, <code>querymt/agents/remove</code>). A profile's own <code>[agent.hooks]</code> run for changes to that profile's runtime. They are observe-only and are not tied to a session: there is no <code>session_id</code>, and a failure, timeout, block request or invalid reply is logged and never undoes the change. <code>mcp_tool</code> handlers are rejected for these events. The only accepted output field is <code>system_message</code>.</p>
+<p>Input fields: <code>hook_event_name</code>, <code>subagent_id</code>, <code>name</code>, <code>description</code>, <code>capabilities</code>, <code>origin</code> (<code>config</code>, <code>protocol</code> or <code>runtime</code>), <code>location</code> (<code>local</code> or <code>remote</code>), <code>generation</code>, <code>profile_id</code> (or <code>null</code>) and <code>cwd</code>.</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1">1</a></span>
+<span class="normal"><a href="#__codelineno-3-2">2</a></span>
+<span class="normal"><a href="#__codelineno-3-3">3</a></span>
+<span class="normal"><a href="#__codelineno-3-4">4</a></span>
+<span class="normal"><a href="#__codelineno-3-5">5</a></span>
+<span class="normal"><a href="#__codelineno-3-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="k">[[agent.hooks.subagent_added]]</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2"></a><span class="n">matcher</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"^review"</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3"></a>
+<a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="k">[[agent.hooks.subagent_added.hooks]]</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"command"</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6"></a><span class="n">command</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"sh ./hooks/audit-subagent.sh"</span>
+</code></pre></div></td></tr></table></div>
 <h2 id="examples">Examples</h2>
 <h3 id="pre_tool_use-block">pre_tool_use block</h3>
 <p>Example script for <code>crates/agent/examples/hooks/check-shell.sh</code>:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-3-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-3-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-3-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-3-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-3-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-3-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-3-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-3-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-3-10">10</a></span>
-<span class="normal"><a href="#__codelineno-3-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="ch">#!/bin/sh</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2"></a><span class="nv">input</span><span class="o">=</span><span class="s2">"</span><span class="k">$(</span>cat<span class="k">)</span><span class="s2">"</span>
-<a id="__codelineno-3-3" name="__codelineno-3-3"></a>
-<a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="k">case</span><span class="w"> </span><span class="s2">"</span><span class="nv">$input</span><span class="s2">"</span><span class="w"> </span><span class="k">in</span>
-<a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="w">  </span>*<span class="s2">"rm -rf"</span>*<span class="p">|</span>*<span class="s2">"git reset --hard"</span>*<span class="o">)</span>
-<a id="__codelineno-3-6" name="__codelineno-3-6"></a><span class="w">    </span><span class="nb">printf</span><span class="w"> </span><span class="s1">'{"decision":"block","reason":"Dangerous shell command blocked by local policy"}'</span>
-<a id="__codelineno-3-7" name="__codelineno-3-7"></a><span class="w">    </span><span class="p">;;</span>
-<a id="__codelineno-3-8" name="__codelineno-3-8"></a><span class="w">  </span>*<span class="o">)</span>
-<a id="__codelineno-3-9" name="__codelineno-3-9"></a><span class="w">    </span><span class="nb">printf</span><span class="w"> </span><span class="s1">'{}'</span>
-<a id="__codelineno-3-10" name="__codelineno-3-10"></a><span class="w">    </span><span class="p">;;</span>
-<a id="__codelineno-3-11" name="__codelineno-3-11"></a><span class="k">esac</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-4-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-4-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-4-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-4-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-4-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-4-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-4-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-4-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-4-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-4-10">10</a></span>
+<span class="normal"><a href="#__codelineno-4-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="ch">#!/bin/sh</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2"></a><span class="nv">input</span><span class="o">=</span><span class="s2">"</span><span class="k">$(</span>cat<span class="k">)</span><span class="s2">"</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3"></a>
+<a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="k">case</span><span class="w"> </span><span class="s2">"</span><span class="nv">$input</span><span class="s2">"</span><span class="w"> </span><span class="k">in</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5"></a><span class="w">  </span>*<span class="s2">"rm -rf"</span>*<span class="p">|</span>*<span class="s2">"git reset --hard"</span>*<span class="o">)</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6"></a><span class="w">    </span><span class="nb">printf</span><span class="w"> </span><span class="s1">'{"decision":"block","reason":"Dangerous shell command blocked by local policy"}'</span>
+<a id="__codelineno-4-7" name="__codelineno-4-7"></a><span class="w">    </span><span class="p">;;</span>
+<a id="__codelineno-4-8" name="__codelineno-4-8"></a><span class="w">  </span>*<span class="o">)</span>
+<a id="__codelineno-4-9" name="__codelineno-4-9"></a><span class="w">    </span><span class="nb">printf</span><span class="w"> </span><span class="s1">'{}'</span>
+<a id="__codelineno-4-10" name="__codelineno-4-10"></a><span class="w">    </span><span class="p">;;</span>
+<a id="__codelineno-4-11" name="__codelineno-4-11"></a><span class="k">esac</span>
 </code></pre></div></td></tr></table></div>
 <p>Expected hook output:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-4-1">1</a></span>
-<span class="normal"><a href="#__codelineno-4-2">2</a></span>
-<span class="normal"><a href="#__codelineno-4-3">3</a></span>
-<span class="normal"><a href="#__codelineno-4-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="p">{</span>
-<a id="__codelineno-4-2" name="__codelineno-4-2"></a><span class="w">  </span><span class="nt">"decision"</span><span class="p">:</span><span class="w"> </span><span class="s2">"block"</span><span class="p">,</span>
-<a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="w">  </span><span class="nt">"reason"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Shell command touches a protected path"</span>
-<a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="p">}</span>
-</code></pre></div></td></tr></table></div>
-<h3 id="pre_tool_use-rewrite">pre_tool_use rewrite</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1">1</a></span>
 <span class="normal"><a href="#__codelineno-5-2">2</a></span>
 <span class="normal"><a href="#__codelineno-5-3">3</a></span>
-<span class="normal"><a href="#__codelineno-5-4">4</a></span>
-<span class="normal"><a href="#__codelineno-5-5">5</a></span>
-<span class="normal"><a href="#__codelineno-5-6">6</a></span>
-<span class="normal"><a href="#__codelineno-5-7">7</a></span>
-<span class="normal"><a href="#__codelineno-5-8">8</a></span>
-<span class="normal"><a href="#__codelineno-5-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="p">{</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"pre_tool_use"</span><span class="p">,</span>
-<a id="__codelineno-5-4" name="__codelineno-5-4"></a><span class="w">    </span><span class="nt">"permission_decision"</span><span class="p">:</span><span class="w"> </span><span class="s2">"allow"</span><span class="p">,</span>
-<a id="__codelineno-5-5" name="__codelineno-5-5"></a><span class="w">    </span><span class="nt">"updated_input"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-5-6" name="__codelineno-5-6"></a><span class="w">      </span><span class="nt">"command"</span><span class="p">:</span><span class="w"> </span><span class="s2">"cargo test -p querymt-agent --lib"</span>
-<a id="__codelineno-5-7" name="__codelineno-5-7"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-5-8" name="__codelineno-5-8"></a><span class="w">  </span><span class="p">}</span>
-<a id="__codelineno-5-9" name="__codelineno-5-9"></a><span class="p">}</span>
+<span class="normal"><a href="#__codelineno-5-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="p">{</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="w">  </span><span class="nt">"decision"</span><span class="p">:</span><span class="w"> </span><span class="s2">"block"</span><span class="p">,</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="w">  </span><span class="nt">"reason"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Shell command touches a protected path"</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4"></a><span class="p">}</span>
+</code></pre></div></td></tr></table></div>
+<h3 id="pre_tool_use-rewrite">pre_tool_use rewrite</h3>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1">1</a></span>
+<span class="normal"><a href="#__codelineno-6-2">2</a></span>
+<span class="normal"><a href="#__codelineno-6-3">3</a></span>
+<span class="normal"><a href="#__codelineno-6-4">4</a></span>
+<span class="normal"><a href="#__codelineno-6-5">5</a></span>
+<span class="normal"><a href="#__codelineno-6-6">6</a></span>
+<span class="normal"><a href="#__codelineno-6-7">7</a></span>
+<span class="normal"><a href="#__codelineno-6-8">8</a></span>
+<span class="normal"><a href="#__codelineno-6-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="p">{</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"pre_tool_use"</span><span class="p">,</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4"></a><span class="w">    </span><span class="nt">"permission_decision"</span><span class="p">:</span><span class="w"> </span><span class="s2">"allow"</span><span class="p">,</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5"></a><span class="w">    </span><span class="nt">"updated_input"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6"></a><span class="w">      </span><span class="nt">"command"</span><span class="p">:</span><span class="w"> </span><span class="s2">"cargo test -p querymt-agent --lib"</span>
+<a id="__codelineno-6-7" name="__codelineno-6-7"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-6-8" name="__codelineno-6-8"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-6-9" name="__codelineno-6-9"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <p>Multiple matching <code>pre_tool_use</code> handlers see this rewritten object in order. A rewrite is accepted only with <code>permission_decision: \"allow\"</code>; <code>ask</code> follows the approval prompt described above.</p>
 <h4 id="tool-input-uses-canonical-parameter-names">Tool input uses canonical parameter names</h4>
@@ -2370,207 +2412,207 @@ stateful tool (such as a task update) are prepared after it completed, so their 
 its effects. See <a href="../configuration/#tool-argument-handling">Tool Argument Handling</a> for
 the raw versus effective argument rules.</p>
 <h3 id="post_tool_use-patch">post_tool_use patch</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-6-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-6-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-6-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-6-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-6-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-6-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-6-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-6-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-6-10">10</a></span>
-<span class="normal"><a href="#__codelineno-6-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="p">{</span>
-<a id="__codelineno-6-2" name="__codelineno-6-2"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-6-3" name="__codelineno-6-3"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"post_tool_use"</span><span class="p">,</span>
-<a id="__codelineno-6-4" name="__codelineno-6-4"></a><span class="w">    </span><span class="nt">"updated_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-6-5" name="__codelineno-6-5"></a><span class="w">      </span><span class="nt">"content"</span><span class="p">:</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"text"</span><span class="p">,</span><span class="w"> </span><span class="nt">"text"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Redacted result"</span><span class="w"> </span><span class="p">}],</span>
-<a id="__codelineno-6-6" name="__codelineno-6-6"></a><span class="w">      </span><span class="nt">"is_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
-<a id="__codelineno-6-7" name="__codelineno-6-7"></a><span class="w">    </span><span class="p">},</span>
-<a id="__codelineno-6-8" name="__codelineno-6-8"></a><span class="w">    </span><span class="nt">"additional_context"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Sensitive values were removed."</span>
-<a id="__codelineno-6-9" name="__codelineno-6-9"></a><span class="w">  </span><span class="p">},</span>
-<a id="__codelineno-6-10" name="__codelineno-6-10"></a><span class="w">  </span><span class="nt">"system_message"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Tool output was sanitized."</span>
-<a id="__codelineno-6-11" name="__codelineno-6-11"></a><span class="p">}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-7-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-7-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-7-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-7-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-7-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-7-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-7-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-7-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-7-10">10</a></span>
+<span class="normal"><a href="#__codelineno-7-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="p">{</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"post_tool_use"</span><span class="p">,</span>
+<a id="__codelineno-7-4" name="__codelineno-7-4"></a><span class="w">    </span><span class="nt">"updated_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-7-5" name="__codelineno-7-5"></a><span class="w">      </span><span class="nt">"content"</span><span class="p">:</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"text"</span><span class="p">,</span><span class="w"> </span><span class="nt">"text"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Redacted result"</span><span class="w"> </span><span class="p">}],</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6"></a><span class="w">      </span><span class="nt">"is_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<a id="__codelineno-7-7" name="__codelineno-7-7"></a><span class="w">    </span><span class="p">},</span>
+<a id="__codelineno-7-8" name="__codelineno-7-8"></a><span class="w">    </span><span class="nt">"additional_context"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Sensitive values were removed."</span>
+<a id="__codelineno-7-9" name="__codelineno-7-9"></a><span class="w">  </span><span class="p">},</span>
+<a id="__codelineno-7-10" name="__codelineno-7-10"></a><span class="w">  </span><span class="nt">"system_message"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Tool output was sanitized."</span>
+<a id="__codelineno-7-11" name="__codelineno-7-11"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <p>The <code>tool_response</code> input remains available as flattened text. The new <code>tool_result</code> input contains structured <code>content</code>, model-facing <code>is_error</code>, immutable <code>execution_is_error</code>, and <code>tool_source</code>. Post hooks run before final output truncation.</p>
 <h3 id="context-projection">context projection</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1">1</a></span>
-<span class="normal"><a href="#__codelineno-7-2">2</a></span>
-<span class="normal"><a href="#__codelineno-7-3">3</a></span>
-<span class="normal"><a href="#__codelineno-7-4">4</a></span>
-<span class="normal"><a href="#__codelineno-7-5">5</a></span>
-<span class="normal"><a href="#__codelineno-7-6">6</a></span>
-<span class="normal"><a href="#__codelineno-7-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="p">{</span>
-<a id="__codelineno-7-2" name="__codelineno-7-2"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-7-3" name="__codelineno-7-3"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"context"</span><span class="p">,</span>
-<a id="__codelineno-7-4" name="__codelineno-7-4"></a><span class="w">    </span><span class="nt">"messages"</span><span class="p">:</span><span class="w"> </span><span class="p">[],</span>
-<a id="__codelineno-7-5" name="__codelineno-7-5"></a><span class="w">    </span><span class="nt">"additional_context"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Request-only retrieved memory"</span>
-<a id="__codelineno-7-6" name="__codelineno-7-6"></a><span class="w">  </span><span class="p">}</span>
-<a id="__codelineno-7-7" name="__codelineno-7-7"></a><span class="p">}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1">1</a></span>
+<span class="normal"><a href="#__codelineno-8-2">2</a></span>
+<span class="normal"><a href="#__codelineno-8-3">3</a></span>
+<span class="normal"><a href="#__codelineno-8-4">4</a></span>
+<span class="normal"><a href="#__codelineno-8-5">5</a></span>
+<span class="normal"><a href="#__codelineno-8-6">6</a></span>
+<span class="normal"><a href="#__codelineno-8-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="p">{</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"context"</span><span class="p">,</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4"></a><span class="w">    </span><span class="nt">"messages"</span><span class="p">:</span><span class="w"> </span><span class="p">[],</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5"></a><span class="w">    </span><span class="nt">"additional_context"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Request-only retrieved memory"</span>
+<a id="__codelineno-8-6" name="__codelineno-8-6"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-8-7" name="__codelineno-8-7"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <p>A <code>context</code> replacement affects one logical request only. QueryMT rejects malformed projections, unmatched tool calls/results, or changes to existing tool-call identities, then recomputes cache hints after transformation. Provider retries reuse the prepared projection and do not rerun the hook.</p>
 <h3 id="permission_request-allow">permission_request allow</h3>
 <p>Example script for <code>crates/agent/examples/hooks/approve-safe-shell.sh</code>:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-8-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-8-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-8-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-8-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-8-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-8-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-8-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-8-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-8-10">10</a></span>
-<span class="normal"><a href="#__codelineno-8-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="ch">#!/bin/sh</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2"></a><span class="nv">input</span><span class="o">=</span><span class="s2">"</span><span class="k">$(</span>cat<span class="k">)</span><span class="s2">"</span>
-<a id="__codelineno-8-3" name="__codelineno-8-3"></a>
-<a id="__codelineno-8-4" name="__codelineno-8-4"></a><span class="k">case</span><span class="w"> </span><span class="s2">"</span><span class="nv">$input</span><span class="s2">"</span><span class="w"> </span><span class="k">in</span>
-<a id="__codelineno-8-5" name="__codelineno-8-5"></a><span class="w">  </span>*<span class="s2">"cargo test"</span>*<span class="p">|</span>*<span class="s2">"cargo check"</span>*<span class="o">)</span>
-<a id="__codelineno-8-6" name="__codelineno-8-6"></a><span class="w">    </span><span class="nb">printf</span><span class="w"> </span><span class="s1">'{"hook_specific_output":{"hook_event_name":"permission_request","decision":{"behavior":"allow"}}}'</span>
-<a id="__codelineno-8-7" name="__codelineno-8-7"></a><span class="w">    </span><span class="p">;;</span>
-<a id="__codelineno-8-8" name="__codelineno-8-8"></a><span class="w">  </span>*<span class="o">)</span>
-<a id="__codelineno-8-9" name="__codelineno-8-9"></a><span class="w">    </span><span class="nb">printf</span><span class="w"> </span><span class="s1">'{}'</span>
-<a id="__codelineno-8-10" name="__codelineno-8-10"></a><span class="w">    </span><span class="p">;;</span>
-<a id="__codelineno-8-11" name="__codelineno-8-11"></a><span class="k">esac</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-9-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-9-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-9-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-9-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-9-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-9-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-9-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-9-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-9-10">10</a></span>
+<span class="normal"><a href="#__codelineno-9-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a><span class="ch">#!/bin/sh</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2"></a><span class="nv">input</span><span class="o">=</span><span class="s2">"</span><span class="k">$(</span>cat<span class="k">)</span><span class="s2">"</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3"></a>
+<a id="__codelineno-9-4" name="__codelineno-9-4"></a><span class="k">case</span><span class="w"> </span><span class="s2">"</span><span class="nv">$input</span><span class="s2">"</span><span class="w"> </span><span class="k">in</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5"></a><span class="w">  </span>*<span class="s2">"cargo test"</span>*<span class="p">|</span>*<span class="s2">"cargo check"</span>*<span class="o">)</span>
+<a id="__codelineno-9-6" name="__codelineno-9-6"></a><span class="w">    </span><span class="nb">printf</span><span class="w"> </span><span class="s1">'{"hook_specific_output":{"hook_event_name":"permission_request","decision":{"behavior":"allow"}}}'</span>
+<a id="__codelineno-9-7" name="__codelineno-9-7"></a><span class="w">    </span><span class="p">;;</span>
+<a id="__codelineno-9-8" name="__codelineno-9-8"></a><span class="w">  </span>*<span class="o">)</span>
+<a id="__codelineno-9-9" name="__codelineno-9-9"></a><span class="w">    </span><span class="nb">printf</span><span class="w"> </span><span class="s1">'{}'</span>
+<a id="__codelineno-9-10" name="__codelineno-9-10"></a><span class="w">    </span><span class="p">;;</span>
+<a id="__codelineno-9-11" name="__codelineno-9-11"></a><span class="k">esac</span>
 </code></pre></div></td></tr></table></div>
 <p>Expected hook output:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1">1</a></span>
-<span class="normal"><a href="#__codelineno-9-2">2</a></span>
-<span class="normal"><a href="#__codelineno-9-3">3</a></span>
-<span class="normal"><a href="#__codelineno-9-4">4</a></span>
-<span class="normal"><a href="#__codelineno-9-5">5</a></span>
-<span class="normal"><a href="#__codelineno-9-6">6</a></span>
-<span class="normal"><a href="#__codelineno-9-7">7</a></span>
-<span class="normal"><a href="#__codelineno-9-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a><span class="p">{</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-9-3" name="__codelineno-9-3"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"permission_request"</span><span class="p">,</span>
-<a id="__codelineno-9-4" name="__codelineno-9-4"></a><span class="w">    </span><span class="nt">"decision"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-9-5" name="__codelineno-9-5"></a><span class="w">      </span><span class="nt">"behavior"</span><span class="p">:</span><span class="w"> </span><span class="s2">"allow"</span>
-<a id="__codelineno-9-6" name="__codelineno-9-6"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-9-7" name="__codelineno-9-7"></a><span class="w">  </span><span class="p">}</span>
-<a id="__codelineno-9-8" name="__codelineno-9-8"></a><span class="p">}</span>
-</code></pre></div></td></tr></table></div>
-<h3 id="custom-compaction">custom compaction</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-10-1">1</a></span>
 <span class="normal"><a href="#__codelineno-10-2">2</a></span>
 <span class="normal"><a href="#__codelineno-10-3">3</a></span>
 <span class="normal"><a href="#__codelineno-10-4">4</a></span>
 <span class="normal"><a href="#__codelineno-10-5">5</a></span>
-<span class="normal"><a href="#__codelineno-10-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="p">{</span>
+<span class="normal"><a href="#__codelineno-10-6">6</a></span>
+<span class="normal"><a href="#__codelineno-10-7">7</a></span>
+<span class="normal"><a href="#__codelineno-10-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="p">{</span>
 <a id="__codelineno-10-2" name="__codelineno-10-2"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-10-3" name="__codelineno-10-3"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"pre_compaction"</span><span class="p">,</span>
-<a id="__codelineno-10-4" name="__codelineno-10-4"></a><span class="w">    </span><span class="nt">"compaction"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">"summary"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Externally generated summary"</span><span class="w"> </span><span class="p">}</span>
-<a id="__codelineno-10-5" name="__codelineno-10-5"></a><span class="w">  </span><span class="p">}</span>
-<a id="__codelineno-10-6" name="__codelineno-10-6"></a><span class="p">}</span>
+<a id="__codelineno-10-3" name="__codelineno-10-3"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"permission_request"</span><span class="p">,</span>
+<a id="__codelineno-10-4" name="__codelineno-10-4"></a><span class="w">    </span><span class="nt">"decision"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-10-5" name="__codelineno-10-5"></a><span class="w">      </span><span class="nt">"behavior"</span><span class="p">:</span><span class="w"> </span><span class="s2">"allow"</span>
+<a id="__codelineno-10-6" name="__codelineno-10-6"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-10-7" name="__codelineno-10-7"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-10-8" name="__codelineno-10-8"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
-<p>A non-blank custom summary skips the compaction model call. Each later handler receives the current candidate in <code>candidate_summary</code>; the last valid candidate wins. <code>pre_compaction.messages</code> contains the effective typed history used for compaction. QueryMT still owns token counts, message IDs, persistence, boundaries, and effective-history reload.</p>
-<p>Command hooks are the portable lifecycle mechanism. MCP-backed handlers are intended for automatic retrieval, sanitation, and policy calls against connected services; ordinary MCP tools remain separately registered and model-visible. Compiled middleware remains the right choice for in-process state-machine behavior.</p>
-<h3 id="pre_compaction-block">pre_compaction block</h3>
+<h3 id="custom-compaction">custom compaction</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-11-1">1</a></span>
 <span class="normal"><a href="#__codelineno-11-2">2</a></span>
 <span class="normal"><a href="#__codelineno-11-3">3</a></span>
 <span class="normal"><a href="#__codelineno-11-4">4</a></span>
 <span class="normal"><a href="#__codelineno-11-5">5</a></span>
-<span class="normal"><a href="#__codelineno-11-6">6</a></span>
-<span class="normal"><a href="#__codelineno-11-7">7</a></span>
-<span class="normal"><a href="#__codelineno-11-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1"></a><span class="p">{</span>
-<a id="__codelineno-11-2" name="__codelineno-11-2"></a><span class="w">  </span><span class="nt">"decision"</span><span class="p">:</span><span class="w"> </span><span class="s2">"block"</span><span class="p">,</span>
-<a id="__codelineno-11-3" name="__codelineno-11-3"></a><span class="w">  </span><span class="nt">"reason"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Compaction requires manual review before context is collapsed."</span><span class="p">,</span>
-<a id="__codelineno-11-4" name="__codelineno-11-4"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-11-5" name="__codelineno-11-5"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"pre_compaction"</span><span class="p">,</span>
-<a id="__codelineno-11-6" name="__codelineno-11-6"></a><span class="w">    </span><span class="nt">"additional_context"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Tell the user which transcript region needs review."</span>
-<a id="__codelineno-11-7" name="__codelineno-11-7"></a><span class="w">  </span><span class="p">}</span>
-<a id="__codelineno-11-8" name="__codelineno-11-8"></a><span class="p">}</span>
+<span class="normal"><a href="#__codelineno-11-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1"></a><span class="p">{</span>
+<a id="__codelineno-11-2" name="__codelineno-11-2"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-11-3" name="__codelineno-11-3"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"pre_compaction"</span><span class="p">,</span>
+<a id="__codelineno-11-4" name="__codelineno-11-4"></a><span class="w">    </span><span class="nt">"compaction"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">"summary"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Externally generated summary"</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-11-5" name="__codelineno-11-5"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-11-6" name="__codelineno-11-6"></a><span class="p">}</span>
+</code></pre></div></td></tr></table></div>
+<p>A non-blank custom summary skips the compaction model call. Each later handler receives the current candidate in <code>candidate_summary</code>; the last valid candidate wins. <code>pre_compaction.messages</code> contains the effective typed history used for compaction. QueryMT still owns token counts, message IDs, persistence, boundaries, and effective-history reload.</p>
+<p>Command hooks are the portable lifecycle mechanism. MCP-backed handlers are intended for automatic retrieval, sanitation, and policy calls against connected services; ordinary MCP tools remain separately registered and model-visible. Compiled middleware remains the right choice for in-process state-machine behavior.</p>
+<h3 id="pre_compaction-block">pre_compaction block</h3>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-12-1">1</a></span>
+<span class="normal"><a href="#__codelineno-12-2">2</a></span>
+<span class="normal"><a href="#__codelineno-12-3">3</a></span>
+<span class="normal"><a href="#__codelineno-12-4">4</a></span>
+<span class="normal"><a href="#__codelineno-12-5">5</a></span>
+<span class="normal"><a href="#__codelineno-12-6">6</a></span>
+<span class="normal"><a href="#__codelineno-12-7">7</a></span>
+<span class="normal"><a href="#__codelineno-12-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a><span class="p">{</span>
+<a id="__codelineno-12-2" name="__codelineno-12-2"></a><span class="w">  </span><span class="nt">"decision"</span><span class="p">:</span><span class="w"> </span><span class="s2">"block"</span><span class="p">,</span>
+<a id="__codelineno-12-3" name="__codelineno-12-3"></a><span class="w">  </span><span class="nt">"reason"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Compaction requires manual review before context is collapsed."</span><span class="p">,</span>
+<a id="__codelineno-12-4" name="__codelineno-12-4"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-12-5" name="__codelineno-12-5"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"pre_compaction"</span><span class="p">,</span>
+<a id="__codelineno-12-6" name="__codelineno-12-6"></a><span class="w">    </span><span class="nt">"additional_context"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Tell the user which transcript region needs review."</span>
+<a id="__codelineno-12-7" name="__codelineno-12-7"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-12-8" name="__codelineno-12-8"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <p>When <code>pre_compaction</code> blocks, QueryMT does not start compaction. The hook reason becomes the final stop message shown to the user for that context-threshold stop.</p>
 <h3 id="pre_delegation-rewrite-and-block">pre_delegation rewrite and block</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-12-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-12-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-12-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-12-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-12-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-12-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-12-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-12-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-12-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-12-10">10</a></span>
-<span class="normal"><a href="#__codelineno-12-11">11</a></span>
-<span class="normal"><a href="#__codelineno-12-12">12</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a><span class="p">{</span>
-<a id="__codelineno-12-2" name="__codelineno-12-2"></a><span class="w">  </span><span class="nt">"decision"</span><span class="p">:</span><span class="w"> </span><span class="s2">"block"</span><span class="p">,</span>
-<a id="__codelineno-12-3" name="__codelineno-12-3"></a><span class="w">  </span><span class="nt">"reason"</span><span class="p">:</span><span class="w"> </span><span class="s2">"This task must stay in the planner session."</span><span class="p">,</span>
-<a id="__codelineno-12-4" name="__codelineno-12-4"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-12-5" name="__codelineno-12-5"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"pre_delegation"</span><span class="p">,</span>
-<a id="__codelineno-12-6" name="__codelineno-12-6"></a><span class="w">    </span><span class="nt">"updated_delegation"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-12-7" name="__codelineno-12-7"></a><span class="w">      </span><span class="nt">"target_agent_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"coder"</span><span class="p">,</span>
-<a id="__codelineno-12-8" name="__codelineno-12-8"></a><span class="w">      </span><span class="nt">"objective"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Narrow the task to implementation only"</span>
-<a id="__codelineno-12-9" name="__codelineno-12-9"></a><span class="w">    </span><span class="p">},</span>
-<a id="__codelineno-12-10" name="__codelineno-12-10"></a><span class="w">    </span><span class="nt">"additional_context"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Keep verification requirements explicit."</span>
-<a id="__codelineno-12-11" name="__codelineno-12-11"></a><span class="w">  </span><span class="p">}</span>
-<a id="__codelineno-12-12" name="__codelineno-12-12"></a><span class="p">}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-13-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-13-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-13-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-13-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-13-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-13-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-13-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-13-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-13-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-13-10">10</a></span>
+<span class="normal"><a href="#__codelineno-13-11">11</a></span>
+<span class="normal"><a href="#__codelineno-13-12">12</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1"></a><span class="p">{</span>
+<a id="__codelineno-13-2" name="__codelineno-13-2"></a><span class="w">  </span><span class="nt">"decision"</span><span class="p">:</span><span class="w"> </span><span class="s2">"block"</span><span class="p">,</span>
+<a id="__codelineno-13-3" name="__codelineno-13-3"></a><span class="w">  </span><span class="nt">"reason"</span><span class="p">:</span><span class="w"> </span><span class="s2">"This task must stay in the planner session."</span><span class="p">,</span>
+<a id="__codelineno-13-4" name="__codelineno-13-4"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-13-5" name="__codelineno-13-5"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"pre_delegation"</span><span class="p">,</span>
+<a id="__codelineno-13-6" name="__codelineno-13-6"></a><span class="w">    </span><span class="nt">"updated_delegation"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-13-7" name="__codelineno-13-7"></a><span class="w">      </span><span class="nt">"target_agent_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"coder"</span><span class="p">,</span>
+<a id="__codelineno-13-8" name="__codelineno-13-8"></a><span class="w">      </span><span class="nt">"objective"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Narrow the task to implementation only"</span>
+<a id="__codelineno-13-9" name="__codelineno-13-9"></a><span class="w">    </span><span class="p">},</span>
+<a id="__codelineno-13-10" name="__codelineno-13-10"></a><span class="w">    </span><span class="nt">"additional_context"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Keep verification requirements explicit."</span>
+<a id="__codelineno-13-11" name="__codelineno-13-11"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-13-12" name="__codelineno-13-12"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <p><code>pre_delegation</code> is the only delegation hook that can change behavior. If it blocks, QueryMT rewrites the delegate tool result so the model sees <code>Delegation blocked by hook: ...</code> instead of the original queued message.</p>
 <h3 id="delegation_start-planning-context">delegation_start planning context</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-13-1">1</a></span>
-<span class="normal"><a href="#__codelineno-13-2">2</a></span>
-<span class="normal"><a href="#__codelineno-13-3">3</a></span>
-<span class="normal"><a href="#__codelineno-13-4">4</a></span>
-<span class="normal"><a href="#__codelineno-13-5">5</a></span>
-<span class="normal"><a href="#__codelineno-13-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1"></a><span class="p">{</span>
-<a id="__codelineno-13-2" name="__codelineno-13-2"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-13-3" name="__codelineno-13-3"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"delegation_start"</span><span class="p">,</span>
-<a id="__codelineno-13-4" name="__codelineno-13-4"></a><span class="w">    </span><span class="nt">"additional_context"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Focus the delegate on minimal diffs and call out validation gaps."</span>
-<a id="__codelineno-13-5" name="__codelineno-13-5"></a><span class="w">  </span><span class="p">}</span>
-<a id="__codelineno-13-6" name="__codelineno-13-6"></a><span class="p">}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span>
+<span class="normal"><a href="#__codelineno-14-2">2</a></span>
+<span class="normal"><a href="#__codelineno-14-3">3</a></span>
+<span class="normal"><a href="#__codelineno-14-4">4</a></span>
+<span class="normal"><a href="#__codelineno-14-5">5</a></span>
+<span class="normal"><a href="#__codelineno-14-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a><span class="p">{</span>
+<a id="__codelineno-14-2" name="__codelineno-14-2"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-14-3" name="__codelineno-14-3"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"delegation_start"</span><span class="p">,</span>
+<a id="__codelineno-14-4" name="__codelineno-14-4"></a><span class="w">    </span><span class="nt">"additional_context"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Focus the delegate on minimal diffs and call out validation gaps."</span>
+<a id="__codelineno-14-5" name="__codelineno-14-5"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-14-6" name="__codelineno-14-6"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <p><code>delegation_start</code> is observe-only. Its <code>additional_context</code> is appended to the child session planning context, not used as a control signal.</p>
 <h3 id="stop-continuation">stop continuation</h3>
 <p>Example script for <code>crates/agent/examples/hooks/stop-verify.sh</code>:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-14-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-14-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-14-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-14-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-14-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-14-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-14-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-14-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-14-10">10</a></span>
-<span class="normal"><a href="#__codelineno-14-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a><span class="ch">#!/bin/sh</span>
-<a id="__codelineno-14-2" name="__codelineno-14-2"></a><span class="nv">input</span><span class="o">=</span><span class="s2">"</span><span class="k">$(</span>cat<span class="k">)</span><span class="s2">"</span>
-<a id="__codelineno-14-3" name="__codelineno-14-3"></a>
-<a id="__codelineno-14-4" name="__codelineno-14-4"></a><span class="k">case</span><span class="w"> </span><span class="s2">"</span><span class="nv">$input</span><span class="s2">"</span><span class="w"> </span><span class="k">in</span>
-<a id="__codelineno-14-5" name="__codelineno-14-5"></a><span class="w">  </span>*<span class="s2">"validation"</span>*<span class="p">|</span>*<span class="s2">"tests"</span>*<span class="o">)</span>
-<a id="__codelineno-14-6" name="__codelineno-14-6"></a><span class="w">    </span><span class="nb">printf</span><span class="w"> </span><span class="s1">'{}'</span>
-<a id="__codelineno-14-7" name="__codelineno-14-7"></a><span class="w">    </span><span class="p">;;</span>
-<a id="__codelineno-14-8" name="__codelineno-14-8"></a><span class="w">  </span>*<span class="o">)</span>
-<a id="__codelineno-14-9" name="__codelineno-14-9"></a><span class="w">    </span><span class="nb">printf</span><span class="w"> </span><span class="s1">'{"continue":false,"reason":"The turn ended without describing validation.","hook_specific_output":{"hook_event_name":"stop","additional_context":"Ask the agent to summarize what validation was run or why it was skipped."}}'</span>
-<a id="__codelineno-14-10" name="__codelineno-14-10"></a><span class="w">    </span><span class="p">;;</span>
-<a id="__codelineno-14-11" name="__codelineno-14-11"></a><span class="k">esac</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-15-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-15-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-15-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-15-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-15-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-15-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-15-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-15-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-15-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-15-10">10</a></span>
+<span class="normal"><a href="#__codelineno-15-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a><span class="ch">#!/bin/sh</span>
+<a id="__codelineno-15-2" name="__codelineno-15-2"></a><span class="nv">input</span><span class="o">=</span><span class="s2">"</span><span class="k">$(</span>cat<span class="k">)</span><span class="s2">"</span>
+<a id="__codelineno-15-3" name="__codelineno-15-3"></a>
+<a id="__codelineno-15-4" name="__codelineno-15-4"></a><span class="k">case</span><span class="w"> </span><span class="s2">"</span><span class="nv">$input</span><span class="s2">"</span><span class="w"> </span><span class="k">in</span>
+<a id="__codelineno-15-5" name="__codelineno-15-5"></a><span class="w">  </span>*<span class="s2">"validation"</span>*<span class="p">|</span>*<span class="s2">"tests"</span>*<span class="o">)</span>
+<a id="__codelineno-15-6" name="__codelineno-15-6"></a><span class="w">    </span><span class="nb">printf</span><span class="w"> </span><span class="s1">'{}'</span>
+<a id="__codelineno-15-7" name="__codelineno-15-7"></a><span class="w">    </span><span class="p">;;</span>
+<a id="__codelineno-15-8" name="__codelineno-15-8"></a><span class="w">  </span>*<span class="o">)</span>
+<a id="__codelineno-15-9" name="__codelineno-15-9"></a><span class="w">    </span><span class="nb">printf</span><span class="w"> </span><span class="s1">'{"continue":false,"reason":"The turn ended without describing validation.","hook_specific_output":{"hook_event_name":"stop","additional_context":"Ask the agent to summarize what validation was run or why it was skipped."}}'</span>
+<a id="__codelineno-15-10" name="__codelineno-15-10"></a><span class="w">    </span><span class="p">;;</span>
+<a id="__codelineno-15-11" name="__codelineno-15-11"></a><span class="k">esac</span>
 </code></pre></div></td></tr></table></div>
 <p>Expected hook output:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-15-1">1</a></span>
-<span class="normal"><a href="#__codelineno-15-2">2</a></span>
-<span class="normal"><a href="#__codelineno-15-3">3</a></span>
-<span class="normal"><a href="#__codelineno-15-4">4</a></span>
-<span class="normal"><a href="#__codelineno-15-5">5</a></span>
-<span class="normal"><a href="#__codelineno-15-6">6</a></span>
-<span class="normal"><a href="#__codelineno-15-7">7</a></span>
-<span class="normal"><a href="#__codelineno-15-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a><span class="p">{</span>
-<a id="__codelineno-15-2" name="__codelineno-15-2"></a><span class="w">  </span><span class="nt">"continue"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
-<a id="__codelineno-15-3" name="__codelineno-15-3"></a><span class="w">  </span><span class="nt">"reason"</span><span class="p">:</span><span class="w"> </span><span class="s2">"The turn ended without describing validation."</span><span class="p">,</span>
-<a id="__codelineno-15-4" name="__codelineno-15-4"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-15-5" name="__codelineno-15-5"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"stop"</span><span class="p">,</span>
-<a id="__codelineno-15-6" name="__codelineno-15-6"></a><span class="w">    </span><span class="nt">"additional_context"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Ask the agent to summarize what validation was run or why it was skipped."</span>
-<a id="__codelineno-15-7" name="__codelineno-15-7"></a><span class="w">  </span><span class="p">}</span>
-<a id="__codelineno-15-8" name="__codelineno-15-8"></a><span class="p">}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-16-1">1</a></span>
+<span class="normal"><a href="#__codelineno-16-2">2</a></span>
+<span class="normal"><a href="#__codelineno-16-3">3</a></span>
+<span class="normal"><a href="#__codelineno-16-4">4</a></span>
+<span class="normal"><a href="#__codelineno-16-5">5</a></span>
+<span class="normal"><a href="#__codelineno-16-6">6</a></span>
+<span class="normal"><a href="#__codelineno-16-7">7</a></span>
+<span class="normal"><a href="#__codelineno-16-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a><span class="p">{</span>
+<a id="__codelineno-16-2" name="__codelineno-16-2"></a><span class="w">  </span><span class="nt">"continue"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<a id="__codelineno-16-3" name="__codelineno-16-3"></a><span class="w">  </span><span class="nt">"reason"</span><span class="p">:</span><span class="w"> </span><span class="s2">"The turn ended without describing validation."</span><span class="p">,</span>
+<a id="__codelineno-16-4" name="__codelineno-16-4"></a><span class="w">  </span><span class="nt">"hook_specific_output"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-16-5" name="__codelineno-16-5"></a><span class="w">    </span><span class="nt">"hook_event_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"stop"</span><span class="p">,</span>
+<a id="__codelineno-16-6" name="__codelineno-16-6"></a><span class="w">    </span><span class="nt">"additional_context"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Ask the agent to summarize what validation was run or why it was skipped."</span>
+<a id="__codelineno-16-7" name="__codelineno-16-7"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-16-8" name="__codelineno-16-8"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="stop-hook-behavior">Stop Hook Behavior</h2>
 <p><code>stop</code> runs when a turn would normally complete (<code>stop_reason: "EndTurn"</code>). It also runs when a reply was cut off by the output-token limit and middleware recovery could not continue it (<code>stop_reason: "ModelTokenLimit"</code>), so hooks can keep unattended runs going after a cut-off. Each case has its own continuation counter against the same cap, so token-limit cut-offs do not use up the continuations available for normal end-of-turn stops. Hooks can read <code>stop_reason</code> from their input to tell the two apart.</p>
 <p>If a <code>stop</code> hook returns <code>"continue": false</code> (or <code>"decision": "block"</code>), QueryMT runs another LLM step for that turn, up to the configured cap (see below). QueryMT injects a clearly labeled runtime control message into the next LLM call, wrapped as a <code>&lt;system-reminder&gt;</code> block and marked as generated by the hook runtime rather than by the user.</p>
 <p>To avoid runaway loops, QueryMT allows at most <code>max_stop_hook_continuations</code> stop-hook continuations per turn (default <code>1</code>). When a hook asks to continue after the cap is reached, the request is ignored, the turn ends, and QueryMT publishes an error-level <code>hook_notice</code> (event <code>stop</code>) so the early end is visible. Raise the cap for long iterative runs, or set it to <code>0</code> to make stop hooks advisory only:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-16-1">1</a></span>
-<span class="normal"><a href="#__codelineno-16-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a><span class="k">[agent.execution]</span>
-<a id="__codelineno-16-2" name="__codelineno-16-2"></a><span class="n">max_stop_hook_continuations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">50</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-17-1">1</a></span>
+<span class="normal"><a href="#__codelineno-17-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1"></a><span class="k">[agent.execution]</span>
+<a id="__codelineno-17-2" name="__codelineno-17-2"></a><span class="n">max_stop_hook_continuations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">50</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="json-schemas">JSON Schemas</h2>
 <p>Generated schemas are committed in the repository and define the stdin/stdout contract for hook authors. QueryMT's snake_case schemas are the source of truth for this feature.</p>

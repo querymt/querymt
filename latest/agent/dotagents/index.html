@@ -2001,7 +2001,7 @@
 <p>Protocol support is <strong>opt-in</strong>. When it is disabled, or when no protocol directory exists, QueryMT behaves exactly as before and never creates a <code>.agents</code> directory.</p>
 <h2 id="enabling">Enabling</h2>
 <h3 id="via-toml">Via TOML</h3>
-<p>Add a <code>[dotagents]</code> section to a single-agent or quorum configuration:</p>
+<p>Add a <code>[dotagents]</code> section to an <code>[agent]</code> configuration (or the deprecated <code>[quorum]</code> form):</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-0-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-0-3"> 3</a></span>
@@ -2058,7 +2058,7 @@
 <a id="__codelineno-1-6" name="__codelineno-1-6"></a><span class="w">    </span><span class="p">.</span><span class="n">with_selected_model_preset</span><span class="p">(</span><span class="s">"fast"</span><span class="p">)</span>
 <a id="__codelineno-1-7" name="__codelineno-1-7"></a><span class="w">    </span><span class="p">.</span><span class="n">with_workspace_task_trust</span><span class="p">(</span><span class="n">DotagentsTaskTrustPolicy</span><span class="p">::</span><span class="n">Prompt</span><span class="p">);</span>
 <a id="__codelineno-1-8" name="__codelineno-1-8"></a>
-<a id="__codelineno-1-9" name="__codelineno-1-9"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">builder</span><span class="p">()</span>
 <a id="__codelineno-1-10" name="__codelineno-1-10"></a><span class="w">    </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
 <a id="__codelineno-1-11" name="__codelineno-1-11"></a><span class="w">    </span><span class="p">.</span><span class="n">dotagents_options</span><span class="p">(</span><span class="n">options</span><span class="p">)</span>
 <a id="__codelineno-1-12" name="__codelineno-1-12"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
@@ -2069,7 +2069,7 @@
 <span class="normal"><a href="#__codelineno-2-2">2</a></span>
 <span class="normal"><a href="#__codelineno-2-3">3</a></span>
 <span class="normal"><a href="#__codelineno-2-4">4</a></span>
-<span class="normal"><a href="#__codelineno-2-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
+<span class="normal"><a href="#__codelineno-2-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">builder</span><span class="p">()</span>
 <a id="__codelineno-2-2" name="__codelineno-2-2"></a><span class="w">    </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
 <a id="__codelineno-2-3" name="__codelineno-2-3"></a><span class="w">    </span><span class="p">.</span><span class="n">dotagents_manifest</span><span class="p">(</span><span class="n">manifest</span><span class="p">)</span>
 <a id="__codelineno-2-4" name="__codelineno-2-4"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
@@ -2190,12 +2190,12 @@
 <p>Protocol <code>agents/&lt;id&gt;/agent.md</code> profiles with role <code>delegation-target</code> and a supported internal connection become delegation targets:</p>
 <ul>
 <li>a <strong>standalone</strong> agent with delegation enabled gains registry targets;</li>
-<li>a <strong>quorum</strong> profile with delegation enabled gains additional delegates.</li>
+<li>an agent with delegation enabled gains additional delegates.</li>
 </ul>
-<p>The configured planner and configured delegates are never replaced.</p>
+<p>The configured root agent and configured delegates are never replaced.</p>
 <h3 id="skills-and-mcp-in-targets">Skills and MCP in targets</h3>
 <ul>
-<li><strong>Skills.</strong> A target gets the <code>skill</code> tool when the registering runtime has skills enabled and the profile's <code>tools</code> list is absent or contains <code>skill</code>. A quorum target uses the planner's skills configuration, including its permissions.</li>
+<li><strong>Skills.</strong> A target gets the <code>skill</code> tool when the registering runtime has skills enabled and the profile's <code>tools</code> list is absent or contains <code>skill</code>. A protocol target uses the root agent's skills configuration, including its permissions.</li>
 <li><strong>MCP scope.</strong> A profile's <code>mcpServers</code> selects the servers its sessions attach, so a target sees only the skills published by those servers (as <code>&lt;server&gt;.&lt;name&gt;</code>). The parent's other servers are not visible to it.</li>
 <li><strong>No prompts.</strong> A target's sessions have their own event sink and cannot reach the user, so a target never prompts. A skill whose permission resolves to <code>ask</code> fails immediately with an error naming the pattern to configure. Allow server skills for targets with <code>"&lt;server&gt;.*" = "allow"</code> under <code>[agent.skills.permissions]</code>; see <a href="../configuration/#skills-configuration">Skills Configuration</a>.</li>
 <li><strong>Restricted <code>tools</code>.</strong> With a <code>tools</code> list, built-in tools are limited to that list. MCP tools stay available when servers are attached, or when an entry contains a <code>.</code> (<code>docs.*</code>) or names an attached server; otherwise the target runs with built-in tools only. For example <code>tools: ["read_tool", "docs.*"]</code> with server <code>docs</code> offers <code>read_tool</code> and the <code>docs</code> tools only.</li>
@@ -2205,7 +2205,7 @@
 <p>Protocol profile IDs merge across layers first (workspace wins). The merged protocol targets are then combined with explicit QueryMT targets, where <strong>explicit configuration wins</strong>:</p>
 <ol>
 <li>global/workspace protocol precedence is applied;</li>
-<li>explicit standalone registry targets and quorum delegates take precedence over matching protocol IDs;</li>
+<li>explicit standalone registry targets and configured delegates take precedence over matching protocol IDs;</li>
 <li>the colliding protocol target is skipped and a diagnostic naming both sources is emitted.</li>
 </ol>
 <p><code>stdio</code>/executable and unknown connection types are never launched: they retain their metadata and emit an unsupported-connection diagnostic.</p>

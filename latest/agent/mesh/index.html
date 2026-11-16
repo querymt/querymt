@@ -3450,7 +3450,7 @@
 <span class="normal"><a href="#__codelineno-0-11">11</a></span>
 <span class="normal"><a href="#__codelineno-0-12">12</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2"></a>
-<a id="__codelineno-0-3" name="__codelineno-0-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">builder</span><span class="p">()</span>
 <a id="__codelineno-0-4" name="__codelineno-0-4"></a><span class="w">    </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
 <a id="__codelineno-0-5" name="__codelineno-0-5"></a><span class="w">    </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">"."</span><span class="p">)</span>
 <a id="__codelineno-0-6" name="__codelineno-0-6"></a><span class="w">    </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s">"edit"</span><span class="p">])</span>
@@ -4545,6 +4545,12 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <a id="__codelineno-38-11" name="__codelineno-38-11"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
 <a id="__codelineno-38-12" name="__codelineno-38-12"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"gpu"</span><span class="p">,</span><span class="w"> </span><span class="s2">"fast-model"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
+<p>A remote agent is a member of the root's agent list, like any local delegate. The root delegates to it with the same <code>delegate</code> tool.</p>
+<p><strong>Resolved on first delegation, no startup wait:</strong>
+- Startup does not contact the peer. The agent is listed in the <code>delegate</code> tool whether or not its peer is reachable, and a peer that is down or slow to join never delays the root.
+- The peer is looked up when the root first delegates to the agent. If it cannot be reached, the delegation fails with an error that names the peer.
+- Once the peer appears on the mesh, the next delegation succeeds. No restart is needed.
+- The session a delegation opens on the peer is attached to the root, so the peer's activity and permission or elicitation requests reach the client that owns the parent session. It is recorded on the peer with fork origin <code>delegation</code> and is not listed as a user session, on either node.</p>
 <h3 id="remote-delegate">Remote Delegate</h3>
 <p>Delegates can run on remote nodes:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-39-1">1</a></span>

@@ -1435,6 +1435,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Architecture">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#where-the-agent-list-appears" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Where the agent list appears
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -1472,10 +1489,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#planner-configuration" class="md-nav__link">
+  <a href="#root-agent-configuration" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        Planner Configuration
+        Root Agent Configuration
       </span>
     </span>
   </a>
@@ -1537,6 +1554,67 @@
     <span class="md-ellipsis">
       <span class="md-typeset">
         Testing and database isolation
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#changing-agents-while-running" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Changing agents while running
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Changing agents while running">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#list" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        List
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#add" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Add
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#remove" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Remove
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#notification" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Notification
       </span>
     </span>
   </a>
@@ -1778,6 +1856,23 @@
       </span>
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Remote Delegation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#remote-agents" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Remote Agents
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -2364,7 +2459,8 @@
 
 
 <h1 id="querymt-agent-delegation-system">QueryMT Agent - Delegation System</h1>
-<p>The delegation system enables multi-agent workflows where a planner agent can delegate tasks to specialized delegate agents. This allows for division of labor and specialized expertise.</p>
+<p>The delegation system enables multi-agent workflows where a root agent can delegate tasks to specialized member agents. This allows for division of labor and specialized expertise.</p>
+<p>Every runtime has one <strong>root agent</strong> and a <strong>roster</strong> of members it can delegate to. A plain agent is a runtime with an empty roster. The delegation service runs in every runtime whose root may call the <code>delegate</code> tool, whichever way the runtime was configured (<code>[agent]</code> with <code>[[delegates]]</code>, the deprecated <code>[quorum]</code>, or the Rust builder).</p>
 <h2 id="overview">Overview</h2>
 <p>Delegation allows agents to:
 - <strong>Delegate tasks</strong> to specialized agents
@@ -2374,21 +2470,40 @@
 - <strong>Route to remote agents</strong> via mesh networking</p>
 <h2 id="architecture">Architecture</h2>
 <pre class="mermaid"><code>flowchart TD
-    P["Planner Agent&lt;br/&gt;(Analyzes task, decides which delegate to use)"]
-    O["Delegation Orchestrator&lt;br/&gt;(Manages delegation lifecycle)"]
-    D1["Delegate 1&lt;br/&gt;(Coder)"]
-    D2["Delegate 2&lt;br/&gt;(Tester)"]
+    R["Root agent&lt;br/&gt;(Analyzes task, decides which member to use)"]
+    S["Delegation service&lt;br/&gt;(Manages delegation lifecycle, owned by the root)"]
+    RO["Roster&lt;br/&gt;(Members, listed in the delegate tool)"]
+    D1["Member 1&lt;br/&gt;(Coder)"]
+    D2["Member 2&lt;br/&gt;(Tester)"]
 
-    P --&gt;|"Delegation Request"| O
-    O --&gt; D1 &amp; D2</code></pre>
+    R --&gt;|"Delegation Request"| S
+    S --&gt; RO
+    RO --&gt; D1 &amp; D2</code></pre>
+<p>All members are built on the runtime's event stream, so a member's activity reaches the client that owns the parent session.</p>
+<h3 id="where-the-agent-list-appears">Where the agent list appears</h3>
+<p>The list of agents the root can delegate to lives in the <code>delegate</code> tool, not in a middleware or in the conversation. The tool holds the roster and renders it in its definition on every turn:</p>
+<ul>
+<li>each member's ID, name, description, capabilities and default isolation, in ID order;</li>
+<li><code>target_agent_id</code> as an <code>enum</code> of the member IDs when the roster is not empty.</li>
+</ul>
+<p>The tool validates <code>target_agent_id</code> against the same roster when it is called. The order is stable, so the definition (and the provider's prompt cache) changes only when the roster changes.</p>
+<p>Only a root with delegation enabled is offered <code>delegate</code>. Member agents are not: a member's tool list never contains <code>delegate</code>, so members cannot delegate further. A root whose <code>tools</code> selection excludes <code>delegate</code> has no delegation service and no <code>delegate</code> tool.</p>
 <h2 id="configuration">Configuration</h2>
 <h3 id="enabling-delegation">Enabling Delegation</h3>
-<p>Delegation is enabled in the quorum configuration:</p>
+<p>Delegation is on whenever the root agent's <code>tools</code> select <code>delegate</code> (or are empty). Its settings are under <code>[agent.delegation]</code>:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-1">1</a></span>
 <span class="normal"><a href="#__codelineno-0-2">2</a></span>
-<span class="normal"><a href="#__codelineno-0-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="k">[quorum]</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2"></a><span class="n">delegation</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3"></a><span class="n">verification</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span><span class="w">  </span><span class="c1"># Optional: enable verification</span>
+<span class="normal"><a href="#__codelineno-0-3">3</a></span>
+<span class="normal"><a href="#__codelineno-0-4">4</a></span>
+<span class="normal"><a href="#__codelineno-0-5">5</a></span>
+<span class="normal"><a href="#__codelineno-0-6">6</a></span>
+<span class="normal"><a href="#__codelineno-0-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="k">[agent]</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"delegate"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5"></a>
+<a id="__codelineno-0-6" name="__codelineno-0-6"></a><span class="k">[agent.delegation]</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7"></a><span class="n">verification</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span><span class="w">  </span><span class="c1"># Optional: enable verification</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="defining-delegates">Defining Delegates</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-1-1"> 1</a></span>
@@ -2417,7 +2532,7 @@
 <a id="__codelineno-1-12" name="__codelineno-1-12"></a><span class="k">[delegates.execution]</span>
 <a id="__codelineno-1-13" name="__codelineno-1-13"></a><span class="n">max_steps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">200</span>
 </code></pre></div></td></tr></table></div>
-<h3 id="planner-configuration">Planner Configuration</h3>
+<h3 id="root-agent-configuration">Root Agent Configuration</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-2-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-2-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-2-3"> 3</a></span>
@@ -2428,7 +2543,7 @@
 <span class="normal"><a href="#__codelineno-2-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-2-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-2-10">10</a></span>
-<span class="normal"><a href="#__codelineno-2-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a><span class="k">[planner]</span>
+<span class="normal"><a href="#__codelineno-2-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a><span class="k">[agent]</span>
 <a id="__codelineno-2-2" name="__codelineno-2-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
 <a id="__codelineno-2-3" name="__codelineno-2-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
 <a id="__codelineno-2-4" name="__codelineno-2-4"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"delegate"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">]</span>
@@ -2600,59 +2715,214 @@ means <strong>use the normal user database</strong>, not an in-memory test datab
 Never launch development builds against a live sessions database to test migrations.
 The delegate-assignment migration is <code>0017_delegate_assignments</code>, after the event
 source identity and remote sync progress migrations already present on <code>main</code>.</p>
+<h2 id="changing-agents-while-running">Changing agents while running</h2>
+<p>The members the root agent can delegate to (its <em>roster</em>) can change while the
+runtime is running, from Rust (<code>Agent::add_member</code>, <code>Agent::remove_member</code>) and over
+ACP. The <code>delegate</code> tool lists the current roster, so the next turn of every session
+sees the change.</p>
+<p><strong>Changes are not persisted.</strong> The roster is rebuilt from configuration and the
+<code>.agents</code> directory on every start, and when a profile's runtime is rebuilt. A member
+added while running is gone after a restart, and a configured member that was removed
+is back, with <code>generation</code> 0.</p>
+<p>Check <code>querymt/capabilities</code> for the three methods and the notification. All of them
+accept an optional <code>profileId</code> (or <code>profile_id</code>). With it, the request applies to that
+profile's runtime only; an unknown profile fails. Without it, the request applies to
+the connected runtime.</p>
+<h3 id="list">List</h3>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="p">{</span><span class="nt">"method"</span><span class="p">:</span><span class="s2">"querymt/agents/list"</span><span class="p">,</span><span class="nt">"params"</span><span class="p">:{}}</span>
+</code></pre></div></td></tr></table></div>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-9-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-9-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-9-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-9-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-9-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-9-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-9-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-9-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-9-10">10</a></span>
+<span class="normal"><a href="#__codelineno-9-11">11</a></span>
+<span class="normal"><a href="#__codelineno-9-12">12</a></span>
+<span class="normal"><a href="#__codelineno-9-13">13</a></span>
+<span class="normal"><a href="#__codelineno-9-14">14</a></span>
+<span class="normal"><a href="#__codelineno-9-15">15</a></span>
+<span class="normal"><a href="#__codelineno-9-16">16</a></span>
+<span class="normal"><a href="#__codelineno-9-17">17</a></span>
+<span class="normal"><a href="#__codelineno-9-18">18</a></span>
+<span class="normal"><a href="#__codelineno-9-19">19</a></span>
+<span class="normal"><a href="#__codelineno-9-20">20</a></span>
+<span class="normal"><a href="#__codelineno-9-21">21</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a><span class="p">{</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2"></a><span class="w">  </span><span class="nt">"generation"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3"></a><span class="w">  </span><span class="nt">"agents"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<a id="__codelineno-9-4" name="__codelineno-9-4"></a><span class="w">    </span><span class="p">{</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5"></a><span class="w">      </span><span class="nt">"id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"coder"</span><span class="p">,</span>
+<a id="__codelineno-9-6" name="__codelineno-9-6"></a><span class="w">      </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"coder"</span><span class="p">,</span>
+<a id="__codelineno-9-7" name="__codelineno-9-7"></a><span class="w">      </span><span class="nt">"description"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Writes code"</span><span class="p">,</span>
+<a id="__codelineno-9-8" name="__codelineno-9-8"></a><span class="w">      </span><span class="nt">"capabilities"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"coding"</span><span class="p">],</span>
+<a id="__codelineno-9-9" name="__codelineno-9-9"></a><span class="w">      </span><span class="nt">"origin"</span><span class="p">:</span><span class="w"> </span><span class="s2">"config"</span><span class="p">,</span>
+<a id="__codelineno-9-10" name="__codelineno-9-10"></a><span class="w">      </span><span class="nt">"location"</span><span class="p">:</span><span class="w"> </span><span class="s2">"local"</span>
+<a id="__codelineno-9-11" name="__codelineno-9-11"></a><span class="w">    </span><span class="p">},</span>
+<a id="__codelineno-9-12" name="__codelineno-9-12"></a><span class="w">    </span><span class="p">{</span>
+<a id="__codelineno-9-13" name="__codelineno-9-13"></a><span class="w">      </span><span class="nt">"id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"gpu"</span><span class="p">,</span>
+<a id="__codelineno-9-14" name="__codelineno-9-14"></a><span class="w">      </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"GPU"</span><span class="p">,</span>
+<a id="__codelineno-9-15" name="__codelineno-9-15"></a><span class="w">      </span><span class="nt">"description"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Remote GPU agent"</span><span class="p">,</span>
+<a id="__codelineno-9-16" name="__codelineno-9-16"></a><span class="w">      </span><span class="nt">"capabilities"</span><span class="p">:</span><span class="w"> </span><span class="p">[],</span>
+<a id="__codelineno-9-17" name="__codelineno-9-17"></a><span class="w">      </span><span class="nt">"origin"</span><span class="p">:</span><span class="w"> </span><span class="s2">"runtime"</span><span class="p">,</span>
+<a id="__codelineno-9-18" name="__codelineno-9-18"></a><span class="w">      </span><span class="nt">"location"</span><span class="p">:</span><span class="w"> </span><span class="s2">"remote"</span>
+<a id="__codelineno-9-19" name="__codelineno-9-19"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-9-20" name="__codelineno-9-20"></a><span class="w">  </span><span class="p">]</span>
+<a id="__codelineno-9-21" name="__codelineno-9-21"></a><span class="p">}</span>
+</code></pre></div></td></tr></table></div>
+<p><code>agents</code> is ordered by ID. <code>origin</code> is <code>config</code> (a <code>[[delegates]]</code>, <code>[[remote_agents]]</code>
+or builder entry), <code>protocol</code> (a <code>.agents</code> target) or <code>runtime</code> (added while running).
+<code>location</code> is <code>local</code> or <code>remote</code>. Listing never builds or starts a member. <code>generation</code>
+starts at 0 and increases by one for every successful add or remove.</p>
+<h3 id="add">Add</h3>
+<p><code>agent</code> is an object tagged by <code>kind</code>. A local member takes the keys of a
+<code>[[delegates]]</code> entry, except <code>peer</code>:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-10-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-10-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-10-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-10-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-10-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-10-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-10-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-10-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-10-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-10-10">10</a></span>
+<span class="normal"><a href="#__codelineno-10-11">11</a></span>
+<span class="normal"><a href="#__codelineno-10-12">12</a></span>
+<span class="normal"><a href="#__codelineno-10-13">13</a></span>
+<span class="normal"><a href="#__codelineno-10-14">14</a></span>
+<span class="normal"><a href="#__codelineno-10-15">15</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="p">{</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2"></a><span class="w">  </span><span class="nt">"method"</span><span class="p">:</span><span class="w"> </span><span class="s2">"querymt/agents/add"</span><span class="p">,</span>
+<a id="__codelineno-10-3" name="__codelineno-10-3"></a><span class="w">  </span><span class="nt">"params"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-10-4" name="__codelineno-10-4"></a><span class="w">    </span><span class="nt">"agent"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-10-5" name="__codelineno-10-5"></a><span class="w">      </span><span class="nt">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"local"</span><span class="p">,</span>
+<a id="__codelineno-10-6" name="__codelineno-10-6"></a><span class="w">      </span><span class="nt">"id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"reviewer"</span><span class="p">,</span>
+<a id="__codelineno-10-7" name="__codelineno-10-7"></a><span class="w">      </span><span class="nt">"provider"</span><span class="p">:</span><span class="w"> </span><span class="s2">"anthropic"</span><span class="p">,</span>
+<a id="__codelineno-10-8" name="__codelineno-10-8"></a><span class="w">      </span><span class="nt">"model"</span><span class="p">:</span><span class="w"> </span><span class="s2">"claude-sonnet-4-20250514"</span><span class="p">,</span>
+<a id="__codelineno-10-9" name="__codelineno-10-9"></a><span class="w">      </span><span class="nt">"description"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Reviews changes"</span><span class="p">,</span>
+<a id="__codelineno-10-10" name="__codelineno-10-10"></a><span class="w">      </span><span class="nt">"capabilities"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"review"</span><span class="p">],</span>
+<a id="__codelineno-10-11" name="__codelineno-10-11"></a><span class="w">      </span><span class="nt">"system"</span><span class="p">:</span><span class="w"> </span><span class="s2">"You review code. Be brief."</span><span class="p">,</span>
+<a id="__codelineno-10-12" name="__codelineno-10-12"></a><span class="w">      </span><span class="nt">"tools"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">]</span>
+<a id="__codelineno-10-13" name="__codelineno-10-13"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-10-14" name="__codelineno-10-14"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-10-15" name="__codelineno-10-15"></a><span class="p">}</span>
+</code></pre></div></td></tr></table></div>
+<p>A remote member takes the keys of a <code>[[remote_agents]]</code> entry and needs a running
+mesh. The peer is not contacted when the member is added:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-11-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-11-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-11-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-11-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-11-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-11-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-11-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-11-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-11-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-11-10">10</a></span>
+<span class="normal"><a href="#__codelineno-11-11">11</a></span>
+<span class="normal"><a href="#__codelineno-11-12">12</a></span>
+<span class="normal"><a href="#__codelineno-11-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1"></a><span class="p">{</span>
+<a id="__codelineno-11-2" name="__codelineno-11-2"></a><span class="w">  </span><span class="nt">"method"</span><span class="p">:</span><span class="w"> </span><span class="s2">"querymt/agents/add"</span><span class="p">,</span>
+<a id="__codelineno-11-3" name="__codelineno-11-3"></a><span class="w">  </span><span class="nt">"params"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-11-4" name="__codelineno-11-4"></a><span class="w">    </span><span class="nt">"profileId"</span><span class="p">:</span><span class="w"> </span><span class="s2">"quorum"</span><span class="p">,</span>
+<a id="__codelineno-11-5" name="__codelineno-11-5"></a><span class="w">    </span><span class="nt">"agent"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-11-6" name="__codelineno-11-6"></a><span class="w">      </span><span class="nt">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"remote"</span><span class="p">,</span>
+<a id="__codelineno-11-7" name="__codelineno-11-7"></a><span class="w">      </span><span class="nt">"id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"gpu"</span><span class="p">,</span>
+<a id="__codelineno-11-8" name="__codelineno-11-8"></a><span class="w">      </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"GPU"</span><span class="p">,</span>
+<a id="__codelineno-11-9" name="__codelineno-11-9"></a><span class="w">      </span><span class="nt">"description"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Remote GPU agent"</span><span class="p">,</span>
+<a id="__codelineno-11-10" name="__codelineno-11-10"></a><span class="w">      </span><span class="nt">"peer"</span><span class="p">:</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-11-11" name="__codelineno-11-11"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-11-12" name="__codelineno-11-12"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-11-13" name="__codelineno-11-13"></a><span class="p">}</span>
+</code></pre></div></td></tr></table></div>
+<p>The response is the new generation, with <code>profileId</code> when the request had one:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-12-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a><span class="p">{</span><span class="nt">"generation"</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="nt">"profileId"</span><span class="p">:</span><span class="w"> </span><span class="s2">"quorum"</span><span class="p">}</span>
+</code></pre></div></td></tr></table></div>
+<p>The request fails, naming the cause and leaving the roster unchanged, when:</p>
+<ul>
+<li>delegation is disabled (the root agent's <code>tools</code> do not select <code>delegate</code>);</li>
+<li><code>id</code> is blank, or already used (the error names the existing member's origin);</li>
+<li>the description has an unknown key, an unknown <code>kind</code> or an unknown middleware type;</li>
+<li>a local member sets <code>peer</code> (only configured delegates can use peer routing);</li>
+<li>a remote member is added to a runtime without a running mesh;</li>
+<li>a local member is <code>isolated</code> and the runtime has no workspace service;</li>
+<li>a <code>system</code> part names a file. The runtime does not read files on a client's behalf;
+  send the prompt text instead.</li>
+</ul>
+<p><code>${VAR}</code> in <code>api_key</code> is <strong>not</strong> expanded for members added this way, so a client
+cannot send an environment secret to an endpoint it chose.</p>
+<h3 id="remove">Remove</h3>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-13-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1"></a><span class="p">{</span><span class="nt">"method"</span><span class="p">:</span><span class="s2">"querymt/agents/remove"</span><span class="p">,</span><span class="nt">"params"</span><span class="p">:{</span><span class="nt">"id"</span><span class="p">:</span><span class="s2">"coder"</span><span class="p">}}</span>
+</code></pre></div></td></tr></table></div>
+<p>Any member can be removed, whatever its origin. A delegation already running on it
+finishes. New delegations to that ID fail as an unknown agent. Removing an ID that is
+not in the roster fails. The response is <code>{"generation": n}</code>.</p>
+<h3 id="notification">Notification</h3>
+<p>Every successful add or remove sends one notification to every connected client; a
+failed request sends nothing:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a><span class="p">{</span><span class="nt">"method"</span><span class="p">:</span><span class="s2">"querymt/agents/changed"</span><span class="p">,</span><span class="nt">"params"</span><span class="p">:{</span><span class="nt">"generation"</span><span class="p">:</span><span class="mi">3</span><span class="p">,</span><span class="nt">"removed"</span><span class="p">:</span><span class="s2">"coder"</span><span class="p">,</span><span class="nt">"profileId"</span><span class="p">:</span><span class="s2">"quorum"</span><span class="p">}}</span>
+</code></pre></div></td></tr></table></div>
+<p><code>added</code> or <code>removed</code> names the member the change concerned, so a client does not need to
+list again to learn what happened. The replies to <code>querymt/agents/add</code> and
+<code>querymt/agents/remove</code> carry the same fields.</p>
+<p><code>profileId</code> is present when the change was made to a profile's runtime. Treat the
+notification as an invalidation hint and call <code>querymt/agents/list</code> for the state.</p>
 <h2 id="delegation-lifecycle">Delegation Lifecycle</h2>
 <h3 id="1-delegation-request">1. Delegation Request</h3>
 <p>The planner decides to delegate and creates a delegation request.</p>
 <p>If hooks are enabled, <code>pre_delegation</code> runs before the delegation is recorded. It can block the delegation entirely or rewrite fields such as <code>target_agent_id</code>, <code>objective</code>, <code>context</code>, <code>constraints</code>, <code>expected_output</code>, and <code>isolation</code>.</p>
 <p>The planner-side tool result is updated when a delegation is blocked, so the model sees <code>Delegation blocked by hook: ...</code> instead of a misleading queued message.</p>
 <p>The delegation request shape is:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-8-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-8-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-8-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-8-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-8-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-8-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-8-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-8-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-8-10">10</a></span>
-<span class="normal"><a href="#__codelineno-8-11">11</a></span>
-<span class="normal"><a href="#__codelineno-8-12">12</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">Delegation</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">public_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w">              </span><span class="c1">// Unique delegation ID</span>
-<a id="__codelineno-8-3" name="__codelineno-8-3"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">target_agent_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w">        </span><span class="c1">// Which delegate to use</span>
-<a id="__codelineno-8-4" name="__codelineno-8-4"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">objective</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w">              </span><span class="c1">// What needs to be done</span>
-<a id="__codelineno-8-5" name="__codelineno-8-5"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">context</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span><span class="w">        </span><span class="c1">// Additional context</span>
-<a id="__codelineno-8-6" name="__codelineno-8-6"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">constraints</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span><span class="w">    </span><span class="c1">// Constraints to follow</span>
-<a id="__codelineno-8-7" name="__codelineno-8-7"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">expected_output</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span><span class="c1">// Expected result format</span>
-<a id="__codelineno-8-8" name="__codelineno-8-8"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">task_id</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span><span class="w">        </span><span class="c1">// Associated task ID</span>
-<a id="__codelineno-8-9" name="__codelineno-8-9"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">planning_summary</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span><span class="c1">// Summary of planning conversation</span>
-<a id="__codelineno-8-10" name="__codelineno-8-10"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">verification_spec</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">VerificationSpec</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="c1">// Optional verification</span>
-<a id="__codelineno-8-11" name="__codelineno-8-11"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">isolation</span><span class="p">:</span><span class="w"> </span><span class="nc">DelegationIsolation</span><span class="p">,</span><span class="w"> </span><span class="c1">// Resolved execution workspace policy</span>
-<a id="__codelineno-8-12" name="__codelineno-8-12"></a><span class="p">}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-15-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-15-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-15-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-15-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-15-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-15-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-15-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-15-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-15-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-15-10">10</a></span>
+<span class="normal"><a href="#__codelineno-15-11">11</a></span>
+<span class="normal"><a href="#__codelineno-15-12">12</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">Delegation</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-15-2" name="__codelineno-15-2"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">public_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w">              </span><span class="c1">// Unique delegation ID</span>
+<a id="__codelineno-15-3" name="__codelineno-15-3"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">target_agent_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w">        </span><span class="c1">// Which delegate to use</span>
+<a id="__codelineno-15-4" name="__codelineno-15-4"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">objective</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w">              </span><span class="c1">// What needs to be done</span>
+<a id="__codelineno-15-5" name="__codelineno-15-5"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">context</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span><span class="w">        </span><span class="c1">// Additional context</span>
+<a id="__codelineno-15-6" name="__codelineno-15-6"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">constraints</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span><span class="w">    </span><span class="c1">// Constraints to follow</span>
+<a id="__codelineno-15-7" name="__codelineno-15-7"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">expected_output</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span><span class="c1">// Expected result format</span>
+<a id="__codelineno-15-8" name="__codelineno-15-8"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">task_id</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span><span class="w">        </span><span class="c1">// Associated task ID</span>
+<a id="__codelineno-15-9" name="__codelineno-15-9"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">planning_summary</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span><span class="c1">// Summary of planning conversation</span>
+<a id="__codelineno-15-10" name="__codelineno-15-10"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">verification_spec</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">VerificationSpec</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="c1">// Optional verification</span>
+<a id="__codelineno-15-11" name="__codelineno-15-11"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">isolation</span><span class="p">:</span><span class="w"> </span><span class="nc">DelegationIsolation</span><span class="p">,</span><span class="w"> </span><span class="c1">// Resolved execution workspace policy</span>
+<a id="__codelineno-15-12" name="__codelineno-15-12"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <p><code>isolation</code> is the resolved execution-workspace policy: <code>shared</code> (legacy behavior — the delegate runs in the parent's checkout) or <code>isolated</code> (a private managed Git worktree seeded from the parent's current code state; see <a href="../worktrees/">Git Worktree Workspaces</a>). The <code>delegate</code> tool accepts an optional <code>isolation</code> argument (<code>inherit</code> | <code>isolated</code> | <code>shared</code>); <code>inherit</code> resolves from the parent session — isolated parents isolate every delegate by default, local parents keep shared execution. Explicit <code>shared</code> overrides on isolated parents are disclosed as shared execution, and a requested isolation that cannot be satisfied fails the delegation instead of falling back to sharing.</p>
-<p>In a quorum, each <code>[[delegates]]</code> entry may also set <code>isolation = "inherit" | "isolated" | "shared"</code> (default <code>inherit</code>) — the configured analogue of the tool argument. Precedence is: an explicit non-<code>inherit</code> value on the <code>delegate</code> tool call, then the target delegate's configured value, then inheritance from the parent session's execution mode. The resolved policy and where it came from (<code>request</code>, <code>delegate_config</code> or <code>inherited</code>) are persisted with the delegation and disclosed in the tool result. <code>isolated</code> requires <code>[quorum.workspace] enabled = true</code> and is rejected at load/build time otherwise. See <a href="../worktrees/">Git Worktree Workspaces</a>.</p>
+<p>Each <code>[[delegates]]</code> entry may also set <code>isolation = "inherit" | "isolated" | "shared"</code> (default <code>inherit</code>) — the configured analogue of the tool argument. Precedence is: an explicit non-<code>inherit</code> value on the <code>delegate</code> tool call, then the target delegate's configured value, then inheritance from the parent session's execution mode. The resolved policy and where it came from (<code>request</code>, <code>delegate_config</code> or <code>inherited</code>) are persisted with the delegation and disclosed in the tool result. <code>isolated</code> requires <code>[agent.workspace] enabled = true</code> and is rejected at load/build time otherwise. See <a href="../worktrees/">Git Worktree Workspaces</a>.</p>
 <h3 id="2-session-creation">2. Session Creation</h3>
 <p>The orchestrator creates a new session for the delegate:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1">1</a></span>
-<span class="normal"><a href="#__codelineno-9-2">2</a></span>
-<span class="normal"><a href="#__codelineno-9-3">3</a></span>
-<span class="normal"><a href="#__codelineno-9-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a><span class="c1">// Planner creates delegation session</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2"></a><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">session_id</span><span class="p">,</span><span class="w"> </span><span class="n">session_ref</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">target_agent</span>
-<a id="__codelineno-9-3" name="__codelineno-9-3"></a><span class="w">    </span><span class="p">.</span><span class="n">create_delegation_session</span><span class="p">(</span><span class="n">cwd</span><span class="p">)</span>
-<a id="__codelineno-9-4" name="__codelineno-9-4"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-16-1">1</a></span>
+<span class="normal"><a href="#__codelineno-16-2">2</a></span>
+<span class="normal"><a href="#__codelineno-16-3">3</a></span>
+<span class="normal"><a href="#__codelineno-16-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a><span class="c1">// Planner creates delegation session</span>
+<a id="__codelineno-16-2" name="__codelineno-16-2"></a><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">session_id</span><span class="p">,</span><span class="w"> </span><span class="n">session_ref</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">target_agent</span>
+<a id="__codelineno-16-3" name="__codelineno-16-3"></a><span class="w">    </span><span class="p">.</span><span class="n">create_delegation_session</span><span class="p">(</span><span class="n">cwd</span><span class="p">)</span>
+<a id="__codelineno-16-4" name="__codelineno-16-4"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="3-context-injection">3. Context Injection</h3>
 <p>The planner's context is injected into the delegate session.</p>
 <p>If hooks are enabled, <code>delegation_start</code> runs just before the delegate begins work. This hook is observe-only: it cannot block execution, but its <code>additional_context</code> is appended to the child session planning context.</p>
 <p>The planner's context is injected into the delegate session:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-10-1">1</a></span>
-<span class="normal"><a href="#__codelineno-10-2">2</a></span>
-<span class="normal"><a href="#__codelineno-10-3">3</a></span>
-<span class="normal"><a href="#__codelineno-10-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="c1">// Planning summary is injected via kameo message</span>
-<a id="__codelineno-10-2" name="__codelineno-10-2"></a><span class="n">session_ref</span>
-<a id="__codelineno-10-3" name="__codelineno-10-3"></a><span class="w">    </span><span class="p">.</span><span class="n">set_planning_context</span><span class="p">(</span><span class="n">planning_summary</span><span class="p">)</span>
-<a id="__codelineno-10-4" name="__codelineno-10-4"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-17-1">1</a></span>
+<span class="normal"><a href="#__codelineno-17-2">2</a></span>
+<span class="normal"><a href="#__codelineno-17-3">3</a></span>
+<span class="normal"><a href="#__codelineno-17-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1"></a><span class="c1">// Planning summary is injected via kameo message</span>
+<a id="__codelineno-17-2" name="__codelineno-17-2"></a><span class="n">session_ref</span>
+<a id="__codelineno-17-3" name="__codelineno-17-3"></a><span class="w">    </span><span class="p">.</span><span class="n">set_planning_context</span><span class="p">(</span><span class="n">planning_summary</span><span class="p">)</span>
+<a id="__codelineno-17-4" name="__codelineno-17-4"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="cost-of-the-planning-summary">Cost of the planning summary</h4>
 <p>Generating the planning summary is a paid request made by the <strong>parent</strong>. It is recorded in the parent session's cost accounting with the <code>delegation_summary</code> purpose and charged to the <strong>parent cycle that requested the delegation</strong>, even when the summary finishes after the parent has started a newer cycle. The delegated child's own generation is recorded under the child session and is never charged to the parent a second time.</p>
@@ -2665,79 +2935,79 @@ source identity and remote sync progress migrations already present on <code>mai
 </ul>
 <h3 id="4-task-execution">4. Task Execution</h3>
 <p>The delegate receives the task and begins execution:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-11-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-11-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-11-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-11-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-11-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-11-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-11-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-11-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-11-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-11-10">10</a></span>
-<span class="normal"><a href="#__codelineno-11-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1"></a>Delegate receives:
-<a id="__codelineno-11-2" name="__codelineno-11-2"></a>  - Objective: "Add user authentication"
-<a id="__codelineno-11-3" name="__codelineno-11-3"></a>  - Context: [Planning summary]
-<a id="__codelineno-11-4" name="__codelineno-11-4"></a>  - Constraints: "Use JWT, follow security best practices"
-<a id="__codelineno-11-5" name="__codelineno-11-5"></a>  - Expected Output: "Working authentication with tests"
-<a id="__codelineno-11-6" name="__codelineno-11-6"></a>
-<a id="__codelineno-11-7" name="__codelineno-11-7"></a>Delegate:
-<a id="__codelineno-11-8" name="__codelineno-11-8"></a>  - Analyzes requirements
-<a id="__codelineno-11-9" name="__codelineno-11-9"></a>  - Reads existing code
-<a id="__codelineno-11-10" name="__codelineno-11-10"></a>  - Implements changes
-<a id="__codelineno-11-11" name="__codelineno-11-11"></a>  - Writes tests
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-18-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-18-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-18-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-18-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-18-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-18-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-18-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-18-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-18-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-18-10">10</a></span>
+<span class="normal"><a href="#__codelineno-18-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1"></a>Delegate receives:
+<a id="__codelineno-18-2" name="__codelineno-18-2"></a>  - Objective: "Add user authentication"
+<a id="__codelineno-18-3" name="__codelineno-18-3"></a>  - Context: [Planning summary]
+<a id="__codelineno-18-4" name="__codelineno-18-4"></a>  - Constraints: "Use JWT, follow security best practices"
+<a id="__codelineno-18-5" name="__codelineno-18-5"></a>  - Expected Output: "Working authentication with tests"
+<a id="__codelineno-18-6" name="__codelineno-18-6"></a>
+<a id="__codelineno-18-7" name="__codelineno-18-7"></a>Delegate:
+<a id="__codelineno-18-8" name="__codelineno-18-8"></a>  - Analyzes requirements
+<a id="__codelineno-18-9" name="__codelineno-18-9"></a>  - Reads existing code
+<a id="__codelineno-18-10" name="__codelineno-18-10"></a>  - Implements changes
+<a id="__codelineno-18-11" name="__codelineno-18-11"></a>  - Writes tests
 </code></pre></div></td></tr></table></div>
 <h3 id="5-result-collection">5. Result Collection</h3>
 <p>The delegate's work is collected.</p>
 <p>If hooks are enabled, <code>post_delegation</code> runs after the delegate summary is extracted. This hook is observe-only and can append context to the summary that gets injected back into the planner session.</p>
 <p>The delegate's work is collected:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-12-1">1</a></span>
-<span class="normal"><a href="#__codelineno-12-2">2</a></span>
-<span class="normal"><a href="#__codelineno-12-3">3</a></span>
-<span class="normal"><a href="#__codelineno-12-4">4</a></span>
-<span class="normal"><a href="#__codelineno-12-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a><span class="c1">// Get delegate's history</span>
-<a id="__codelineno-12-2" name="__codelineno-12-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">history</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">session_ref</span><span class="p">.</span><span class="n">get_history</span><span class="p">().</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-12-3" name="__codelineno-12-3"></a>
-<a id="__codelineno-12-4" name="__codelineno-12-4"></a><span class="c1">// Extract summary</span>
-<a id="__codelineno-12-5" name="__codelineno-12-5"></a><span class="kd">let</span><span class="w"> </span><span class="n">summary</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">extract_session_summary_from_history</span><span class="p">(</span><span class="o">&amp;</span><span class="n">history</span><span class="p">);</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-19-1">1</a></span>
+<span class="normal"><a href="#__codelineno-19-2">2</a></span>
+<span class="normal"><a href="#__codelineno-19-3">3</a></span>
+<span class="normal"><a href="#__codelineno-19-4">4</a></span>
+<span class="normal"><a href="#__codelineno-19-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1"></a><span class="c1">// Get delegate's history</span>
+<a id="__codelineno-19-2" name="__codelineno-19-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">history</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">session_ref</span><span class="p">.</span><span class="n">get_history</span><span class="p">().</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-19-3" name="__codelineno-19-3"></a>
+<a id="__codelineno-19-4" name="__codelineno-19-4"></a><span class="c1">// Extract summary</span>
+<a id="__codelineno-19-5" name="__codelineno-19-5"></a><span class="kd">let</span><span class="w"> </span><span class="n">summary</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">extract_session_summary_from_history</span><span class="p">(</span><span class="o">&amp;</span><span class="n">history</span><span class="p">);</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="6-verification-optional">6. Verification (Optional)</h3>
 <p>If verification is enabled, the result is verified:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-13-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-13-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-13-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-13-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-13-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-13-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-13-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-13-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-13-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-13-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1"></a><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">verification_spec</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">delegation</span><span class="p">.</span><span class="n">verification_spec</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-13-2" name="__codelineno-13-2"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">passed</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">verification_service</span>
-<a id="__codelineno-13-3" name="__codelineno-13-3"></a><span class="w">        </span><span class="p">.</span><span class="n">verify</span><span class="p">(</span><span class="n">verification_spec</span><span class="p">,</span><span class="w"> </span><span class="n">context</span><span class="p">)</span>
-<a id="__codelineno-13-4" name="__codelineno-13-4"></a><span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-13-5" name="__codelineno-13-5"></a>
-<a id="__codelineno-13-6" name="__codelineno-13-6"></a><span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="o">!</span><span class="n">passed</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-13-7" name="__codelineno-13-7"></a><span class="w">        </span><span class="c1">// Delegation failed verification</span>
-<a id="__codelineno-13-8" name="__codelineno-13-8"></a><span class="w">        </span><span class="c1">// Error is reported to planner</span>
-<a id="__codelineno-13-9" name="__codelineno-13-9"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-13-10" name="__codelineno-13-10"></a><span class="p">}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-20-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-20-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-20-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-20-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-20-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-20-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-20-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-20-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-20-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-20-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-20-1" name="__codelineno-20-1"></a><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">verification_spec</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">delegation</span><span class="p">.</span><span class="n">verification_spec</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-20-2" name="__codelineno-20-2"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">passed</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">verification_service</span>
+<a id="__codelineno-20-3" name="__codelineno-20-3"></a><span class="w">        </span><span class="p">.</span><span class="n">verify</span><span class="p">(</span><span class="n">verification_spec</span><span class="p">,</span><span class="w"> </span><span class="n">context</span><span class="p">)</span>
+<a id="__codelineno-20-4" name="__codelineno-20-4"></a><span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-20-5" name="__codelineno-20-5"></a>
+<a id="__codelineno-20-6" name="__codelineno-20-6"></a><span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="o">!</span><span class="n">passed</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-20-7" name="__codelineno-20-7"></a><span class="w">        </span><span class="c1">// Delegation failed verification</span>
+<a id="__codelineno-20-8" name="__codelineno-20-8"></a><span class="w">        </span><span class="c1">// Error is reported to planner</span>
+<a id="__codelineno-20-9" name="__codelineno-20-9"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-20-10" name="__codelineno-20-10"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="7-result-injection">7. Result Injection</h3>
 <p>The result is injected back into the planner session.</p>
 <p>If a delegation fails, <code>delegation_failure</code> runs before the failure message is injected back into the planner. This hook is also observe-only and can append remediation context to the planner-visible failure message.</p>
 <p>The result is injected back into the planner session:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span>
-<span class="normal"><a href="#__codelineno-14-2">2</a></span>
-<span class="normal"><a href="#__codelineno-14-3">3</a></span>
-<span class="normal"><a href="#__codelineno-14-4">4</a></span>
-<span class="normal"><a href="#__codelineno-14-5">5</a></span>
-<span class="normal"><a href="#__codelineno-14-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">message</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">format_delegation_completion_message</span><span class="p">(</span>
-<a id="__codelineno-14-2" name="__codelineno-14-2"></a><span class="w">    </span><span class="o">&amp;</span><span class="n">delegation</span><span class="p">.</span><span class="n">public_id</span><span class="p">,</span>
-<a id="__codelineno-14-3" name="__codelineno-14-3"></a><span class="w">    </span><span class="o">&amp;</span><span class="n">summary</span>
-<a id="__codelineno-14-4" name="__codelineno-14-4"></a><span class="p">);</span>
-<a id="__codelineno-14-5" name="__codelineno-14-5"></a>
-<a id="__codelineno-14-6" name="__codelineno-14-6"></a><span class="n">planner_session</span><span class="p">.</span><span class="n">prompt</span><span class="p">(</span><span class="n">message</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-21-1">1</a></span>
+<span class="normal"><a href="#__codelineno-21-2">2</a></span>
+<span class="normal"><a href="#__codelineno-21-3">3</a></span>
+<span class="normal"><a href="#__codelineno-21-4">4</a></span>
+<span class="normal"><a href="#__codelineno-21-5">5</a></span>
+<span class="normal"><a href="#__codelineno-21-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-21-1" name="__codelineno-21-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">message</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">format_delegation_completion_message</span><span class="p">(</span>
+<a id="__codelineno-21-2" name="__codelineno-21-2"></a><span class="w">    </span><span class="o">&amp;</span><span class="n">delegation</span><span class="p">.</span><span class="n">public_id</span><span class="p">,</span>
+<a id="__codelineno-21-3" name="__codelineno-21-3"></a><span class="w">    </span><span class="o">&amp;</span><span class="n">summary</span>
+<a id="__codelineno-21-4" name="__codelineno-21-4"></a><span class="p">);</span>
+<a id="__codelineno-21-5" name="__codelineno-21-5"></a>
+<a id="__codelineno-21-6" name="__codelineno-21-6"></a><span class="n">planner_session</span><span class="p">.</span><span class="n">prompt</span><span class="p">(</span><span class="n">message</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="delegation-hooks-summary">Delegation Hooks Summary</h2>
 <table>
@@ -2805,170 +3075,6 @@ source identity and remote sync progress migrations already present on <code>mai
 </table>
 <h2 id="verification">Verification</h2>
 <h3 id="verification-types">Verification Types</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-15-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-15-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-15-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-15-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-15-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-15-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-15-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-15-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-15-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-15-10">10</a></span>
-<span class="normal"><a href="#__codelineno-15-11">11</a></span>
-<span class="normal"><a href="#__codelineno-15-12">12</a></span>
-<span class="normal"><a href="#__codelineno-15-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">enum</span><span class="w"> </span><span class="nc">VerificationType</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-15-2" name="__codelineno-15-2"></a><span class="w">    </span><span class="c1">// Run a shell command and check exit code</span>
-<a id="__codelineno-15-3" name="__codelineno-15-3"></a><span class="w">    </span><span class="n">ShellCommand</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">command</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-15-4" name="__codelineno-15-4"></a>
-<a id="__codelineno-15-5" name="__codelineno-15-5"></a><span class="w">    </span><span class="c1">// Check if a file exists</span>
-<a id="__codelineno-15-6" name="__codelineno-15-6"></a><span class="w">    </span><span class="n">FileExists</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">path</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-15-7" name="__codelineno-15-7"></a>
-<a id="__codelineno-15-8" name="__codelineno-15-8"></a><span class="w">    </span><span class="c1">// Check if file contains specific content</span>
-<a id="__codelineno-15-9" name="__codelineno-15-9"></a><span class="w">    </span><span class="n">FileContains</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">path</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w"> </span><span class="n">content</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-15-10" name="__codelineno-15-10"></a>
-<a id="__codelineno-15-11" name="__codelineno-15-11"></a><span class="w">    </span><span class="c1">// Custom verification logic</span>
-<a id="__codelineno-15-12" name="__codelineno-15-12"></a><span class="w">    </span><span class="n">Custom</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">spec</span><span class="p">:</span><span class="w"> </span><span class="nc">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-15-13" name="__codelineno-15-13"></a><span class="p">}</span>
-</code></pre></div></td></tr></table></div>
-<h3 id="example-verification">Example Verification</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-16-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-16-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-16-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-16-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-16-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-16-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-16-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-16-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-16-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-16-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a><span class="c1"># In delegate configuration</span>
-<a id="__codelineno-16-2" name="__codelineno-16-2"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-16-3" name="__codelineno-16-3"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
-<a id="__codelineno-16-4" name="__codelineno-16-4"></a><span class="c1"># ... other config</span>
-<a id="__codelineno-16-5" name="__codelineno-16-5"></a>
-<a id="__codelineno-16-6" name="__codelineno-16-6"></a><span class="c1"># Verification spec in delegation request</span>
-<a id="__codelineno-16-7" name="__codelineno-16-7"></a><span class="n">verification_spec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-16-8" name="__codelineno-16-8"></a><span class="w">    </span><span class="n">verification_type</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"shell_command"</span><span class="p">,</span>
-<a id="__codelineno-16-9" name="__codelineno-16-9"></a><span class="w">    </span><span class="n">command</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"cargo check &amp;&amp; cargo test"</span>
-<a id="__codelineno-16-10" name="__codelineno-16-10"></a><span class="p">}</span>
-</code></pre></div></td></tr></table></div>
-<h2 id="delegation-parameters">Delegation Parameters</h2>
-<h3 id="wait-policy">Wait Policy</h3>
-<p>Controls how the planner waits for delegate results:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-17-1">1</a></span>
-<span class="normal"><a href="#__codelineno-17-2">2</a></span>
-<span class="normal"><a href="#__codelineno-17-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1"></a><span class="k">[quorum]</span>
-<a id="__codelineno-17-2" name="__codelineno-17-2"></a><span class="n">delegation_wait_policy</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"any"</span><span class="w">  </span><span class="c1"># "all" | "any"</span>
-<a id="__codelineno-17-3" name="__codelineno-17-3"></a><span class="n">delegation_wait_timeout_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">120</span>
-</code></pre></div></td></tr></table></div>
-<ul>
-<li><strong>any</strong>: Continue when first delegate completes</li>
-<li><strong>all</strong>: Wait for all delegates to complete</li>
-</ul>
-<h3 id="parallel-delegations">Parallel Delegations</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-18-1">1</a></span>
-<span class="normal"><a href="#__codelineno-18-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1"></a><span class="k">[quorum]</span>
-<a id="__codelineno-18-2" name="__codelineno-18-2"></a><span class="n">max_parallel_delegations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span>
-</code></pre></div></td></tr></table></div>
-<p>Maximum concurrent delegations.</p>
-<h3 id="grace-period">Grace Period</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-19-1">1</a></span>
-<span class="normal"><a href="#__codelineno-19-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1"></a><span class="k">[quorum]</span>
-<a id="__codelineno-19-2" name="__codelineno-19-2"></a><span class="n">delegation_cancel_grace_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span>
-</code></pre></div></td></tr></table></div>
-<p>Time to wait for graceful cancellation before force abort.</p>
-<h2 id="remote-delegation">Remote Delegation</h2>
-<p>Delegates can run on remote mesh nodes:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-20-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-20-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-20-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-20-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-20-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-20-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-20-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-20-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-20-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-20-10">10</a></span>
-<span class="normal"><a href="#__codelineno-20-11">11</a></span>
-<span class="normal"><a href="#__codelineno-20-12">12</a></span>
-<span class="normal"><a href="#__codelineno-20-13">13</a></span>
-<span class="normal"><a href="#__codelineno-20-14">14</a></span>
-<span class="normal"><a href="#__codelineno-20-15">15</a></span>
-<span class="normal"><a href="#__codelineno-20-16">16</a></span>
-<span class="normal"><a href="#__codelineno-20-17">17</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-20-1" name="__codelineno-20-1"></a><span class="c1"># Mesh configuration</span>
-<a id="__codelineno-20-2" name="__codelineno-20-2"></a><span class="k">[mesh]</span>
-<a id="__codelineno-20-3" name="__codelineno-20-3"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-20-4" name="__codelineno-20-4"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/0.0.0.0/tcp/9000"</span>
-<a id="__codelineno-20-5" name="__codelineno-20-5"></a>
-<a id="__codelineno-20-6" name="__codelineno-20-6"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-20-7" name="__codelineno-20-7"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
-<a id="__codelineno-20-8" name="__codelineno-20-8"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.100/tcp/9000"</span>
-<a id="__codelineno-20-9" name="__codelineno-20-9"></a>
-<a id="__codelineno-20-10" name="__codelineno-20-10"></a><span class="c1"># Remote delegate</span>
-<a id="__codelineno-20-11" name="__codelineno-20-11"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-20-12" name="__codelineno-20-12"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"remote-coder"</span>
-<a id="__codelineno-20-13" name="__codelineno-20-13"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
-<a id="__codelineno-20-14" name="__codelineno-20-14"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
-<a id="__codelineno-20-15" name="__codelineno-20-15"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Coder on GPU server"</span>
-<a id="__codelineno-20-16" name="__codelineno-20-16"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span><span class="w">  </span><span class="c1"># Routes LLM calls to remote node</span>
-<a id="__codelineno-20-17" name="__codelineno-20-17"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
-</code></pre></div></td></tr></table></div>
-<p>When <code>peer</code> is specified:
-- LLM calls are routed to the remote node
-- Tool execution happens locally
-- Enables "remote model, local session" pattern</p>
-<h2 id="delegation-events">Delegation Events</h2>
-<p>Agents emit events during delegation:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-21-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-21-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-21-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-21-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-21-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-21-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-21-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-21-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-21-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-21-10">10</a></span>
-<span class="normal"><a href="#__codelineno-21-11">11</a></span>
-<span class="normal"><a href="#__codelineno-21-12">12</a></span>
-<span class="normal"><a href="#__codelineno-21-13">13</a></span>
-<span class="normal"><a href="#__codelineno-21-14">14</a></span>
-<span class="normal"><a href="#__codelineno-21-15">15</a></span>
-<span class="normal"><a href="#__codelineno-21-16">16</a></span>
-<span class="normal"><a href="#__codelineno-21-17">17</a></span>
-<span class="normal"><a href="#__codelineno-21-18">18</a></span>
-<span class="normal"><a href="#__codelineno-21-19">19</a></span>
-<span class="normal"><a href="#__codelineno-21-20">20</a></span>
-<span class="normal"><a href="#__codelineno-21-21">21</a></span>
-<span class="normal"><a href="#__codelineno-21-22">22</a></span>
-<span class="normal"><a href="#__codelineno-21-23">23</a></span>
-<span class="normal"><a href="#__codelineno-21-24">24</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-21-1" name="__codelineno-21-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">enum</span><span class="w"> </span><span class="nc">AgentEventKind</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-21-2" name="__codelineno-21-2"></a><span class="w">    </span><span class="c1">// Delegation lifecycle</span>
-<a id="__codelineno-21-3" name="__codelineno-21-3"></a><span class="w">    </span><span class="n">DelegationRequested</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">delegation</span><span class="p">:</span><span class="w"> </span><span class="nc">Delegation</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-21-4" name="__codelineno-21-4"></a><span class="w">    </span><span class="n">SessionForked</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-21-5" name="__codelineno-21-5"></a><span class="w">        </span><span class="n">parent_session_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
-<a id="__codelineno-21-6" name="__codelineno-21-6"></a><span class="w">        </span><span class="n">child_session_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
-<a id="__codelineno-21-7" name="__codelineno-21-7"></a><span class="w">        </span><span class="n">target_agent_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
-<a id="__codelineno-21-8" name="__codelineno-21-8"></a><span class="w">        </span><span class="n">origin</span><span class="p">:</span><span class="w"> </span><span class="nc">ForkOrigin</span><span class="p">,</span>
-<a id="__codelineno-21-9" name="__codelineno-21-9"></a><span class="w">        </span><span class="n">fork_point_type</span><span class="p">:</span><span class="w"> </span><span class="nc">ForkPointType</span><span class="p">,</span>
-<a id="__codelineno-21-10" name="__codelineno-21-10"></a><span class="w">        </span><span class="n">fork_point_ref</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
-<a id="__codelineno-21-11" name="__codelineno-21-11"></a><span class="w">        </span><span class="n">instructions</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
-<a id="__codelineno-21-12" name="__codelineno-21-12"></a><span class="w">    </span><span class="p">},</span>
-<a id="__codelineno-21-13" name="__codelineno-21-13"></a><span class="w">    </span><span class="n">DelegationCompleted</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-21-14" name="__codelineno-21-14"></a><span class="w">        </span><span class="n">delegation_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
-<a id="__codelineno-21-15" name="__codelineno-21-15"></a><span class="w">        </span><span class="n">result</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span>
-<a id="__codelineno-21-16" name="__codelineno-21-16"></a><span class="w">    </span><span class="p">},</span>
-<a id="__codelineno-21-17" name="__codelineno-21-17"></a><span class="w">    </span><span class="n">DelegationFailed</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-21-18" name="__codelineno-21-18"></a><span class="w">        </span><span class="n">delegation_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
-<a id="__codelineno-21-19" name="__codelineno-21-19"></a><span class="w">        </span><span class="n">error</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
-<a id="__codelineno-21-20" name="__codelineno-21-20"></a><span class="w">    </span><span class="p">},</span>
-<a id="__codelineno-21-21" name="__codelineno-21-21"></a><span class="w">    </span><span class="n">DelegationCancelled</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-21-22" name="__codelineno-21-22"></a><span class="w">        </span><span class="n">delegation_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
-<a id="__codelineno-21-23" name="__codelineno-21-23"></a><span class="w">    </span><span class="p">},</span>
-<a id="__codelineno-21-24" name="__codelineno-21-24"></a><span class="p">}</span>
-</code></pre></div></td></tr></table></div>
-<h2 id="programmatic-delegation">Programmatic Delegation</h2>
-<h3 id="creating-a-delegation">Creating a Delegation</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-22-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-22-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-22-3"> 3</a></span>
@@ -2981,35 +3087,21 @@ source identity and remote sync progress migrations already present on <code>mai
 <span class="normal"><a href="#__codelineno-22-10">10</a></span>
 <span class="normal"><a href="#__codelineno-22-11">11</a></span>
 <span class="normal"><a href="#__codelineno-22-12">12</a></span>
-<span class="normal"><a href="#__codelineno-22-13">13</a></span>
-<span class="normal"><a href="#__codelineno-22-14">14</a></span>
-<span class="normal"><a href="#__codelineno-22-15">15</a></span>
-<span class="normal"><a href="#__codelineno-22-16">16</a></span>
-<span class="normal"><a href="#__codelineno-22-17">17</a></span>
-<span class="normal"><a href="#__codelineno-22-18">18</a></span>
-<span class="normal"><a href="#__codelineno-22-19">19</a></span>
-<span class="normal"><a href="#__codelineno-22-20">20</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-22-1" name="__codelineno-22-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
-<a id="__codelineno-22-2" name="__codelineno-22-2"></a><span class="k">use</span><span class="w"> </span><span class="n">agent_client_protocol</span><span class="p">::</span><span class="n">Delegation</span><span class="p">;</span>
-<a id="__codelineno-22-3" name="__codelineno-22-3"></a>
-<a id="__codelineno-22-4" name="__codelineno-22-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">delegation</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Delegation</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-22-5" name="__codelineno-22-5"></a><span class="w">    </span><span class="n">public_id</span><span class="p">:</span><span class="w"> </span><span class="nc">uuid</span><span class="p">::</span><span class="n">Uuid</span><span class="p">::</span><span class="n">new_v4</span><span class="p">().</span><span class="n">to_string</span><span class="p">(),</span>
-<a id="__codelineno-22-6" name="__codelineno-22-6"></a><span class="w">    </span><span class="n">target_agent_id</span><span class="p">:</span><span class="w"> </span><span class="s">"coder"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
-<a id="__codelineno-22-7" name="__codelineno-22-7"></a><span class="w">    </span><span class="n">objective</span><span class="p">:</span><span class="w"> </span><span class="s">"Implement user authentication"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
-<a id="__codelineno-22-8" name="__codelineno-22-8"></a><span class="w">    </span><span class="n">context</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="s">"Project uses JWT for authentication"</span><span class="p">.</span><span class="n">to_string</span><span class="p">()),</span>
-<a id="__codelineno-22-9" name="__codelineno-22-9"></a><span class="w">    </span><span class="n">constraints</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="s">"Follow security best practices"</span><span class="p">.</span><span class="n">to_string</span><span class="p">()),</span>
-<a id="__codelineno-22-10" name="__codelineno-22-10"></a><span class="w">    </span><span class="n">expected_output</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="s">"Working auth with tests"</span><span class="p">.</span><span class="n">to_string</span><span class="p">()),</span>
-<a id="__codelineno-22-11" name="__codelineno-22-11"></a><span class="w">    </span><span class="n">task_id</span><span class="p">:</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span>
-<a id="__codelineno-22-12" name="__codelineno-22-12"></a><span class="w">    </span><span class="n">planning_summary</span><span class="p">:</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span>
-<a id="__codelineno-22-13" name="__codelineno-22-13"></a><span class="w">    </span><span class="n">verification_spec</span><span class="p">:</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span>
-<a id="__codelineno-22-14" name="__codelineno-22-14"></a><span class="w">    </span><span class="c1">// `Inherit` (default): isolated parents isolate delegates, local parents</span>
-<a id="__codelineno-22-15" name="__codelineno-22-15"></a><span class="w">    </span><span class="c1">// share. Use `Shared` or `Isolated` to force a mode.</span>
-<a id="__codelineno-22-16" name="__codelineno-22-16"></a><span class="w">    </span><span class="n">isolation</span><span class="p">:</span><span class="w"> </span><span class="nc">DelegationIsolation</span><span class="p">::</span><span class="n">Inherit</span><span class="p">,</span>
-<a id="__codelineno-22-17" name="__codelineno-22-17"></a><span class="p">};</span>
-<a id="__codelineno-22-18" name="__codelineno-22-18"></a>
-<a id="__codelineno-22-19" name="__codelineno-22-19"></a><span class="c1">// Request delegation</span>
-<a id="__codelineno-22-20" name="__codelineno-22-20"></a><span class="n">agent</span><span class="p">.</span><span class="n">delegate</span><span class="p">(</span><span class="n">delegation</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<span class="normal"><a href="#__codelineno-22-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-22-1" name="__codelineno-22-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">enum</span><span class="w"> </span><span class="nc">VerificationType</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-22-2" name="__codelineno-22-2"></a><span class="w">    </span><span class="c1">// Run a shell command and check exit code</span>
+<a id="__codelineno-22-3" name="__codelineno-22-3"></a><span class="w">    </span><span class="n">ShellCommand</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">command</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-22-4" name="__codelineno-22-4"></a>
+<a id="__codelineno-22-5" name="__codelineno-22-5"></a><span class="w">    </span><span class="c1">// Check if a file exists</span>
+<a id="__codelineno-22-6" name="__codelineno-22-6"></a><span class="w">    </span><span class="n">FileExists</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">path</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-22-7" name="__codelineno-22-7"></a>
+<a id="__codelineno-22-8" name="__codelineno-22-8"></a><span class="w">    </span><span class="c1">// Check if file contains specific content</span>
+<a id="__codelineno-22-9" name="__codelineno-22-9"></a><span class="w">    </span><span class="n">FileContains</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">path</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w"> </span><span class="n">content</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-22-10" name="__codelineno-22-10"></a>
+<a id="__codelineno-22-11" name="__codelineno-22-11"></a><span class="w">    </span><span class="c1">// Custom verification logic</span>
+<a id="__codelineno-22-12" name="__codelineno-22-12"></a><span class="w">    </span><span class="n">Custom</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">spec</span><span class="p">:</span><span class="w"> </span><span class="nc">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-22-13" name="__codelineno-22-13"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
-<h3 id="subscribing-to-delegation-events">Subscribing to Delegation Events</h3>
+<h3 id="example-verification">Example Verification</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-23-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-23-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-23-3"> 3</a></span>
@@ -3019,28 +3111,229 @@ source identity and remote sync progress migrations already present on <code>mai
 <span class="normal"><a href="#__codelineno-23-7"> 7</a></span>
 <span class="normal"><a href="#__codelineno-23-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-23-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-23-10">10</a></span>
-<span class="normal"><a href="#__codelineno-23-11">11</a></span>
-<span class="normal"><a href="#__codelineno-23-12">12</a></span>
-<span class="normal"><a href="#__codelineno-23-13">13</a></span>
-<span class="normal"><a href="#__codelineno-23-14">14</a></span>
-<span class="normal"><a href="#__codelineno-23-15">15</a></span>
-<span class="normal"><a href="#__codelineno-23-16">16</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-23-1" name="__codelineno-23-1"></a><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">events</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">subscribe_events</span><span class="p">();</span>
-<a id="__codelineno-23-2" name="__codelineno-23-2"></a>
-<a id="__codelineno-23-3" name="__codelineno-23-3"></a><span class="k">while</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="n">event</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">events</span><span class="p">.</span><span class="n">recv</span><span class="p">().</span><span class="k">await</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-23-4" name="__codelineno-23-4"></a><span class="w">    </span><span class="k">match</span><span class="w"> </span><span class="n">event</span><span class="p">.</span><span class="n">kind</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-23-5" name="__codelineno-23-5"></a><span class="w">        </span><span class="n">AgentEventKind</span><span class="p">::</span><span class="n">DelegationRequested</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">delegation</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-23-6" name="__codelineno-23-6"></a><span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">"Delegation requested: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">delegation</span><span class="p">.</span><span class="n">objective</span><span class="p">);</span>
-<a id="__codelineno-23-7" name="__codelineno-23-7"></a><span class="w">        </span><span class="p">}</span>
-<a id="__codelineno-23-8" name="__codelineno-23-8"></a><span class="w">        </span><span class="n">AgentEventKind</span><span class="p">::</span><span class="n">DelegationCompleted</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">,</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-23-9" name="__codelineno-23-9"></a><span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">"Delegation {} completed: {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">,</span><span class="w"> </span><span class="n">result</span><span class="p">);</span>
-<a id="__codelineno-23-10" name="__codelineno-23-10"></a><span class="w">        </span><span class="p">}</span>
-<a id="__codelineno-23-11" name="__codelineno-23-11"></a><span class="w">        </span><span class="n">AgentEventKind</span><span class="p">::</span><span class="n">DelegationFailed</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">,</span><span class="w"> </span><span class="n">error</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-23-12" name="__codelineno-23-12"></a><span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">"Delegation {} failed: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">,</span><span class="w"> </span><span class="n">error</span><span class="p">);</span>
-<a id="__codelineno-23-13" name="__codelineno-23-13"></a><span class="w">        </span><span class="p">}</span>
-<a id="__codelineno-23-14" name="__codelineno-23-14"></a><span class="w">        </span><span class="n">_</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{}</span>
-<a id="__codelineno-23-15" name="__codelineno-23-15"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-23-16" name="__codelineno-23-16"></a><span class="p">}</span>
+<span class="normal"><a href="#__codelineno-23-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-23-1" name="__codelineno-23-1"></a><span class="c1"># In delegate configuration</span>
+<a id="__codelineno-23-2" name="__codelineno-23-2"></a><span class="k">[[delegates]]</span>
+<a id="__codelineno-23-3" name="__codelineno-23-3"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-23-4" name="__codelineno-23-4"></a><span class="c1"># ... other config</span>
+<a id="__codelineno-23-5" name="__codelineno-23-5"></a>
+<a id="__codelineno-23-6" name="__codelineno-23-6"></a><span class="c1"># Verification spec in delegation request</span>
+<a id="__codelineno-23-7" name="__codelineno-23-7"></a><span class="n">verification_spec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-23-8" name="__codelineno-23-8"></a><span class="w">    </span><span class="n">verification_type</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"shell_command"</span><span class="p">,</span>
+<a id="__codelineno-23-9" name="__codelineno-23-9"></a><span class="w">    </span><span class="n">command</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"cargo check &amp;&amp; cargo test"</span>
+<a id="__codelineno-23-10" name="__codelineno-23-10"></a><span class="p">}</span>
+</code></pre></div></td></tr></table></div>
+<h2 id="delegation-parameters">Delegation Parameters</h2>
+<h3 id="wait-policy">Wait Policy</h3>
+<p>Controls how the root agent waits for delegate results:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-24-1">1</a></span>
+<span class="normal"><a href="#__codelineno-24-2">2</a></span>
+<span class="normal"><a href="#__codelineno-24-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-24-1" name="__codelineno-24-1"></a><span class="k">[agent.delegation]</span>
+<a id="__codelineno-24-2" name="__codelineno-24-2"></a><span class="n">wait_policy</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"any"</span><span class="w">  </span><span class="c1"># "all" | "any"</span>
+<a id="__codelineno-24-3" name="__codelineno-24-3"></a><span class="n">wait_timeout_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">120</span>
+</code></pre></div></td></tr></table></div>
+<ul>
+<li><strong>any</strong>: Continue when first delegate completes</li>
+<li><strong>all</strong>: Wait for all delegates to complete</li>
+</ul>
+<h3 id="parallel-delegations">Parallel Delegations</h3>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-25-1">1</a></span>
+<span class="normal"><a href="#__codelineno-25-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-25-1" name="__codelineno-25-1"></a><span class="k">[agent.delegation]</span>
+<a id="__codelineno-25-2" name="__codelineno-25-2"></a><span class="n">max_parallel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span>
+</code></pre></div></td></tr></table></div>
+<p>Maximum concurrent delegations.</p>
+<h3 id="grace-period">Grace Period</h3>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-26-1">1</a></span>
+<span class="normal"><a href="#__codelineno-26-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-26-1" name="__codelineno-26-1"></a><span class="k">[agent.delegation]</span>
+<a id="__codelineno-26-2" name="__codelineno-26-2"></a><span class="n">cancel_grace_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span>
+</code></pre></div></td></tr></table></div>
+<p>Time to wait for graceful cancellation before force abort.</p>
+<h2 id="remote-delegation">Remote Delegation</h2>
+<p>Delegates can run on remote mesh nodes:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-27-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-27-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-27-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-27-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-27-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-27-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-27-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-27-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-27-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-27-10">10</a></span>
+<span class="normal"><a href="#__codelineno-27-11">11</a></span>
+<span class="normal"><a href="#__codelineno-27-12">12</a></span>
+<span class="normal"><a href="#__codelineno-27-13">13</a></span>
+<span class="normal"><a href="#__codelineno-27-14">14</a></span>
+<span class="normal"><a href="#__codelineno-27-15">15</a></span>
+<span class="normal"><a href="#__codelineno-27-16">16</a></span>
+<span class="normal"><a href="#__codelineno-27-17">17</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-27-1" name="__codelineno-27-1"></a><span class="c1"># Mesh configuration</span>
+<a id="__codelineno-27-2" name="__codelineno-27-2"></a><span class="k">[mesh]</span>
+<a id="__codelineno-27-3" name="__codelineno-27-3"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+<a id="__codelineno-27-4" name="__codelineno-27-4"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/0.0.0.0/tcp/9000"</span>
+<a id="__codelineno-27-5" name="__codelineno-27-5"></a>
+<a id="__codelineno-27-6" name="__codelineno-27-6"></a><span class="k">[[mesh.peers]]</span>
+<a id="__codelineno-27-7" name="__codelineno-27-7"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-27-8" name="__codelineno-27-8"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.100/tcp/9000"</span>
+<a id="__codelineno-27-9" name="__codelineno-27-9"></a>
+<a id="__codelineno-27-10" name="__codelineno-27-10"></a><span class="c1"># Remote delegate</span>
+<a id="__codelineno-27-11" name="__codelineno-27-11"></a><span class="k">[[delegates]]</span>
+<a id="__codelineno-27-12" name="__codelineno-27-12"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"remote-coder"</span>
+<a id="__codelineno-27-13" name="__codelineno-27-13"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-27-14" name="__codelineno-27-14"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-27-15" name="__codelineno-27-15"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Coder on GPU server"</span>
+<a id="__codelineno-27-16" name="__codelineno-27-16"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span><span class="w">  </span><span class="c1"># Routes LLM calls to remote node</span>
+<a id="__codelineno-27-17" name="__codelineno-27-17"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
+</code></pre></div></td></tr></table></div>
+<p>When <code>peer</code> is specified:
+- LLM calls are routed to the remote node
+- Tool execution happens locally
+- Enables "remote model, local session" pattern</p>
+<h3 id="remote-agents">Remote Agents</h3>
+<p>An agent that runs on a mesh peer is declared with <code>[[remote_agents]]</code> and joins the same agent list as local delegates:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-28-1">1</a></span>
+<span class="normal"><a href="#__codelineno-28-2">2</a></span>
+<span class="normal"><a href="#__codelineno-28-3">3</a></span>
+<span class="normal"><a href="#__codelineno-28-4">4</a></span>
+<span class="normal"><a href="#__codelineno-28-5">5</a></span>
+<span class="normal"><a href="#__codelineno-28-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-28-1" name="__codelineno-28-1"></a><span class="k">[[remote_agents]]</span>
+<a id="__codelineno-28-2" name="__codelineno-28-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-coder"</span>
+<a id="__codelineno-28-3" name="__codelineno-28-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"GPU Coder"</span>
+<a id="__codelineno-28-4" name="__codelineno-28-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Coder running on GPU server with fast model"</span>
+<a id="__codelineno-28-5" name="__codelineno-28-5"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-28-6" name="__codelineno-28-6"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"gpu"</span><span class="p">,</span><span class="w"> </span><span class="s2">"fast-model"</span><span class="p">]</span>
+</code></pre></div></td></tr></table></div>
+<p>The peer is resolved on the first delegation, not at startup:</p>
+<ul>
+<li>The agent is listed whether or not its peer is reachable.</li>
+<li>Delegating to an unreachable peer fails with an error naming the peer.</li>
+<li>The delegation succeeds once the peer appears, without a restart.</li>
+<li>Activity and interaction requests from the remote session reach the client that owns the parent session, and answers go back through the root.</li>
+<li>The remote session is a delegation child: it is not listed as a user session.</li>
+</ul>
+<p>See <a href="../mesh/#remote-agents">Mesh Networking</a> for the mesh side.</p>
+<h2 id="delegation-events">Delegation Events</h2>
+<p>Agents emit events during delegation:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-29-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-29-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-29-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-29-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-29-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-29-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-29-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-29-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-29-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-29-10">10</a></span>
+<span class="normal"><a href="#__codelineno-29-11">11</a></span>
+<span class="normal"><a href="#__codelineno-29-12">12</a></span>
+<span class="normal"><a href="#__codelineno-29-13">13</a></span>
+<span class="normal"><a href="#__codelineno-29-14">14</a></span>
+<span class="normal"><a href="#__codelineno-29-15">15</a></span>
+<span class="normal"><a href="#__codelineno-29-16">16</a></span>
+<span class="normal"><a href="#__codelineno-29-17">17</a></span>
+<span class="normal"><a href="#__codelineno-29-18">18</a></span>
+<span class="normal"><a href="#__codelineno-29-19">19</a></span>
+<span class="normal"><a href="#__codelineno-29-20">20</a></span>
+<span class="normal"><a href="#__codelineno-29-21">21</a></span>
+<span class="normal"><a href="#__codelineno-29-22">22</a></span>
+<span class="normal"><a href="#__codelineno-29-23">23</a></span>
+<span class="normal"><a href="#__codelineno-29-24">24</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-29-1" name="__codelineno-29-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">enum</span><span class="w"> </span><span class="nc">AgentEventKind</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-29-2" name="__codelineno-29-2"></a><span class="w">    </span><span class="c1">// Delegation lifecycle</span>
+<a id="__codelineno-29-3" name="__codelineno-29-3"></a><span class="w">    </span><span class="n">DelegationRequested</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">delegation</span><span class="p">:</span><span class="w"> </span><span class="nc">Delegation</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-29-4" name="__codelineno-29-4"></a><span class="w">    </span><span class="n">SessionForked</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-29-5" name="__codelineno-29-5"></a><span class="w">        </span><span class="n">parent_session_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-29-6" name="__codelineno-29-6"></a><span class="w">        </span><span class="n">child_session_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-29-7" name="__codelineno-29-7"></a><span class="w">        </span><span class="n">target_agent_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-29-8" name="__codelineno-29-8"></a><span class="w">        </span><span class="n">origin</span><span class="p">:</span><span class="w"> </span><span class="nc">ForkOrigin</span><span class="p">,</span>
+<a id="__codelineno-29-9" name="__codelineno-29-9"></a><span class="w">        </span><span class="n">fork_point_type</span><span class="p">:</span><span class="w"> </span><span class="nc">ForkPointType</span><span class="p">,</span>
+<a id="__codelineno-29-10" name="__codelineno-29-10"></a><span class="w">        </span><span class="n">fork_point_ref</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-29-11" name="__codelineno-29-11"></a><span class="w">        </span><span class="n">instructions</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-29-12" name="__codelineno-29-12"></a><span class="w">    </span><span class="p">},</span>
+<a id="__codelineno-29-13" name="__codelineno-29-13"></a><span class="w">    </span><span class="n">DelegationCompleted</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-29-14" name="__codelineno-29-14"></a><span class="w">        </span><span class="n">delegation_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-29-15" name="__codelineno-29-15"></a><span class="w">        </span><span class="n">result</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span>
+<a id="__codelineno-29-16" name="__codelineno-29-16"></a><span class="w">    </span><span class="p">},</span>
+<a id="__codelineno-29-17" name="__codelineno-29-17"></a><span class="w">    </span><span class="n">DelegationFailed</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-29-18" name="__codelineno-29-18"></a><span class="w">        </span><span class="n">delegation_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-29-19" name="__codelineno-29-19"></a><span class="w">        </span><span class="n">error</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-29-20" name="__codelineno-29-20"></a><span class="w">    </span><span class="p">},</span>
+<a id="__codelineno-29-21" name="__codelineno-29-21"></a><span class="w">    </span><span class="n">DelegationCancelled</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-29-22" name="__codelineno-29-22"></a><span class="w">        </span><span class="n">delegation_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-29-23" name="__codelineno-29-23"></a><span class="w">    </span><span class="p">},</span>
+<a id="__codelineno-29-24" name="__codelineno-29-24"></a><span class="p">}</span>
+</code></pre></div></td></tr></table></div>
+<h2 id="programmatic-delegation">Programmatic Delegation</h2>
+<h3 id="creating-a-delegation">Creating a Delegation</h3>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-30-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-30-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-30-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-30-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-30-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-30-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-30-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-30-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-30-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-30-10">10</a></span>
+<span class="normal"><a href="#__codelineno-30-11">11</a></span>
+<span class="normal"><a href="#__codelineno-30-12">12</a></span>
+<span class="normal"><a href="#__codelineno-30-13">13</a></span>
+<span class="normal"><a href="#__codelineno-30-14">14</a></span>
+<span class="normal"><a href="#__codelineno-30-15">15</a></span>
+<span class="normal"><a href="#__codelineno-30-16">16</a></span>
+<span class="normal"><a href="#__codelineno-30-17">17</a></span>
+<span class="normal"><a href="#__codelineno-30-18">18</a></span>
+<span class="normal"><a href="#__codelineno-30-19">19</a></span>
+<span class="normal"><a href="#__codelineno-30-20">20</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-30-1" name="__codelineno-30-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+<a id="__codelineno-30-2" name="__codelineno-30-2"></a><span class="k">use</span><span class="w"> </span><span class="n">agent_client_protocol</span><span class="p">::</span><span class="n">Delegation</span><span class="p">;</span>
+<a id="__codelineno-30-3" name="__codelineno-30-3"></a>
+<a id="__codelineno-30-4" name="__codelineno-30-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">delegation</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Delegation</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-30-5" name="__codelineno-30-5"></a><span class="w">    </span><span class="n">public_id</span><span class="p">:</span><span class="w"> </span><span class="nc">uuid</span><span class="p">::</span><span class="n">Uuid</span><span class="p">::</span><span class="n">new_v4</span><span class="p">().</span><span class="n">to_string</span><span class="p">(),</span>
+<a id="__codelineno-30-6" name="__codelineno-30-6"></a><span class="w">    </span><span class="n">target_agent_id</span><span class="p">:</span><span class="w"> </span><span class="s">"coder"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
+<a id="__codelineno-30-7" name="__codelineno-30-7"></a><span class="w">    </span><span class="n">objective</span><span class="p">:</span><span class="w"> </span><span class="s">"Implement user authentication"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
+<a id="__codelineno-30-8" name="__codelineno-30-8"></a><span class="w">    </span><span class="n">context</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="s">"Project uses JWT for authentication"</span><span class="p">.</span><span class="n">to_string</span><span class="p">()),</span>
+<a id="__codelineno-30-9" name="__codelineno-30-9"></a><span class="w">    </span><span class="n">constraints</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="s">"Follow security best practices"</span><span class="p">.</span><span class="n">to_string</span><span class="p">()),</span>
+<a id="__codelineno-30-10" name="__codelineno-30-10"></a><span class="w">    </span><span class="n">expected_output</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="s">"Working auth with tests"</span><span class="p">.</span><span class="n">to_string</span><span class="p">()),</span>
+<a id="__codelineno-30-11" name="__codelineno-30-11"></a><span class="w">    </span><span class="n">task_id</span><span class="p">:</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span>
+<a id="__codelineno-30-12" name="__codelineno-30-12"></a><span class="w">    </span><span class="n">planning_summary</span><span class="p">:</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span>
+<a id="__codelineno-30-13" name="__codelineno-30-13"></a><span class="w">    </span><span class="n">verification_spec</span><span class="p">:</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span>
+<a id="__codelineno-30-14" name="__codelineno-30-14"></a><span class="w">    </span><span class="c1">// `Inherit` (default): isolated parents isolate delegates, local parents</span>
+<a id="__codelineno-30-15" name="__codelineno-30-15"></a><span class="w">    </span><span class="c1">// share. Use `Shared` or `Isolated` to force a mode.</span>
+<a id="__codelineno-30-16" name="__codelineno-30-16"></a><span class="w">    </span><span class="n">isolation</span><span class="p">:</span><span class="w"> </span><span class="nc">DelegationIsolation</span><span class="p">::</span><span class="n">Inherit</span><span class="p">,</span>
+<a id="__codelineno-30-17" name="__codelineno-30-17"></a><span class="p">};</span>
+<a id="__codelineno-30-18" name="__codelineno-30-18"></a>
+<a id="__codelineno-30-19" name="__codelineno-30-19"></a><span class="c1">// Request delegation</span>
+<a id="__codelineno-30-20" name="__codelineno-30-20"></a><span class="n">agent</span><span class="p">.</span><span class="n">delegate</span><span class="p">(</span><span class="n">delegation</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</code></pre></div></td></tr></table></div>
+<h3 id="subscribing-to-delegation-events">Subscribing to Delegation Events</h3>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-31-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-31-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-31-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-31-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-31-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-31-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-31-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-31-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-31-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-31-10">10</a></span>
+<span class="normal"><a href="#__codelineno-31-11">11</a></span>
+<span class="normal"><a href="#__codelineno-31-12">12</a></span>
+<span class="normal"><a href="#__codelineno-31-13">13</a></span>
+<span class="normal"><a href="#__codelineno-31-14">14</a></span>
+<span class="normal"><a href="#__codelineno-31-15">15</a></span>
+<span class="normal"><a href="#__codelineno-31-16">16</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-31-1" name="__codelineno-31-1"></a><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">events</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">subscribe_events</span><span class="p">();</span>
+<a id="__codelineno-31-2" name="__codelineno-31-2"></a>
+<a id="__codelineno-31-3" name="__codelineno-31-3"></a><span class="k">while</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="n">event</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">events</span><span class="p">.</span><span class="n">recv</span><span class="p">().</span><span class="k">await</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-31-4" name="__codelineno-31-4"></a><span class="w">    </span><span class="k">match</span><span class="w"> </span><span class="n">event</span><span class="p">.</span><span class="n">kind</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-31-5" name="__codelineno-31-5"></a><span class="w">        </span><span class="n">AgentEventKind</span><span class="p">::</span><span class="n">DelegationRequested</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">delegation</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-31-6" name="__codelineno-31-6"></a><span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">"Delegation requested: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">delegation</span><span class="p">.</span><span class="n">objective</span><span class="p">);</span>
+<a id="__codelineno-31-7" name="__codelineno-31-7"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-31-8" name="__codelineno-31-8"></a><span class="w">        </span><span class="n">AgentEventKind</span><span class="p">::</span><span class="n">DelegationCompleted</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">,</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-31-9" name="__codelineno-31-9"></a><span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">"Delegation {} completed: {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">,</span><span class="w"> </span><span class="n">result</span><span class="p">);</span>
+<a id="__codelineno-31-10" name="__codelineno-31-10"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-31-11" name="__codelineno-31-11"></a><span class="w">        </span><span class="n">AgentEventKind</span><span class="p">::</span><span class="n">DelegationFailed</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">,</span><span class="w"> </span><span class="n">error</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-31-12" name="__codelineno-31-12"></a><span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">"Delegation {} failed: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">,</span><span class="w"> </span><span class="n">error</span><span class="p">);</span>
+<a id="__codelineno-31-13" name="__codelineno-31-13"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-31-14" name="__codelineno-31-14"></a><span class="w">        </span><span class="n">_</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{}</span>
+<a id="__codelineno-31-15" name="__codelineno-31-15"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-31-16" name="__codelineno-31-16"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="error-handling">Error Handling</h2>
 <h3 id="common-errors">Common Errors</h3>
@@ -3082,35 +3375,35 @@ source identity and remote sync progress migrations already present on <code>mai
 </table>
 <h3 id="error-classification">Error Classification</h3>
 <p>The system classifies delegation errors:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-24-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-24-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-24-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-24-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-24-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-24-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-24-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-24-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-24-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-24-10">10</a></span>
-<span class="normal"><a href="#__codelineno-24-11">11</a></span>
-<span class="normal"><a href="#__codelineno-24-12">12</a></span>
-<span class="normal"><a href="#__codelineno-24-13">13</a></span>
-<span class="normal"><a href="#__codelineno-24-14">14</a></span>
-<span class="normal"><a href="#__codelineno-24-15">15</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-24-1" name="__codelineno-24-1"></a><span class="c1">// Patch Application Failure</span>
-<a id="__codelineno-24-2" name="__codelineno-24-2"></a><span class="c1">// → Use read_tool to see current file state</span>
-<a id="__codelineno-24-3" name="__codelineno-24-3"></a><span class="c1">// → Verify context lines match actual file</span>
-<a id="__codelineno-24-4" name="__codelineno-24-4"></a>
-<a id="__codelineno-24-5" name="__codelineno-24-5"></a><span class="c1">// Verification Failure  </span>
-<a id="__codelineno-24-6" name="__codelineno-24-6"></a><span class="c1">// → Read verification error output</span>
-<a id="__codelineno-24-7" name="__codelineno-24-7"></a><span class="c1">// → Fix compilation/test errors</span>
-<a id="__codelineno-24-8" name="__codelineno-24-8"></a>
-<a id="__codelineno-24-9" name="__codelineno-24-9"></a><span class="c1">// Invalid Working Directory</span>
-<a id="__codelineno-24-10" name="__codelineno-24-10"></a><span class="c1">// → Do NOT specify workdir in patches</span>
-<a id="__codelineno-24-11" name="__codelineno-24-11"></a><span class="c1">// → Verify file paths are correct</span>
-<a id="__codelineno-24-12" name="__codelineno-24-12"></a>
-<a id="__codelineno-24-13" name="__codelineno-24-13"></a><span class="c1">// Too Many Retries</span>
-<a id="__codelineno-24-14" name="__codelineno-24-14"></a><span class="c1">// → Current approach not working</span>
-<a id="__codelineno-24-15" name="__codelineno-24-15"></a><span class="c1">// → Try different strategy</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-32-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-32-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-32-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-32-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-32-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-32-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-32-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-32-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-32-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-32-10">10</a></span>
+<span class="normal"><a href="#__codelineno-32-11">11</a></span>
+<span class="normal"><a href="#__codelineno-32-12">12</a></span>
+<span class="normal"><a href="#__codelineno-32-13">13</a></span>
+<span class="normal"><a href="#__codelineno-32-14">14</a></span>
+<span class="normal"><a href="#__codelineno-32-15">15</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-32-1" name="__codelineno-32-1"></a><span class="c1">// Patch Application Failure</span>
+<a id="__codelineno-32-2" name="__codelineno-32-2"></a><span class="c1">// → Use read_tool to see current file state</span>
+<a id="__codelineno-32-3" name="__codelineno-32-3"></a><span class="c1">// → Verify context lines match actual file</span>
+<a id="__codelineno-32-4" name="__codelineno-32-4"></a>
+<a id="__codelineno-32-5" name="__codelineno-32-5"></a><span class="c1">// Verification Failure  </span>
+<a id="__codelineno-32-6" name="__codelineno-32-6"></a><span class="c1">// → Read verification error output</span>
+<a id="__codelineno-32-7" name="__codelineno-32-7"></a><span class="c1">// → Fix compilation/test errors</span>
+<a id="__codelineno-32-8" name="__codelineno-32-8"></a>
+<a id="__codelineno-32-9" name="__codelineno-32-9"></a><span class="c1">// Invalid Working Directory</span>
+<a id="__codelineno-32-10" name="__codelineno-32-10"></a><span class="c1">// → Do NOT specify workdir in patches</span>
+<a id="__codelineno-32-11" name="__codelineno-32-11"></a><span class="c1">// → Verify file paths are correct</span>
+<a id="__codelineno-32-12" name="__codelineno-32-12"></a>
+<a id="__codelineno-32-13" name="__codelineno-32-13"></a><span class="c1">// Too Many Retries</span>
+<a id="__codelineno-32-14" name="__codelineno-32-14"></a><span class="c1">// → Current approach not working</span>
+<a id="__codelineno-32-15" name="__codelineno-32-15"></a><span class="c1">// → Try different strategy</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="best-practices">Best Practices</h2>
 <h3 id="when-to-delegate">When to Delegate</h3>
@@ -3141,66 +3434,66 @@ source identity and remote sync progress migrations already present on <code>mai
 </ol>
 <h2 id="examples">Examples</h2>
 <h3 id="simple-delegation">Simple Delegation</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-25-1">1</a></span>
-<span class="normal"><a href="#__codelineno-25-2">2</a></span>
-<span class="normal"><a href="#__codelineno-25-3">3</a></span>
-<span class="normal"><a href="#__codelineno-25-4">4</a></span>
-<span class="normal"><a href="#__codelineno-25-5">5</a></span>
-<span class="normal"><a href="#__codelineno-25-6">6</a></span>
-<span class="normal"><a href="#__codelineno-25-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-25-1" name="__codelineno-25-1"></a><span class="c1"># Planner delegates coding task to coder</span>
-<a id="__codelineno-25-2" name="__codelineno-25-2"></a><span class="k">[planner]</span>
-<a id="__codelineno-25-3" name="__codelineno-25-3"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"delegate"</span><span class="p">]</span>
-<a id="__codelineno-25-4" name="__codelineno-25-4"></a>
-<a id="__codelineno-25-5" name="__codelineno-25-5"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-25-6" name="__codelineno-25-6"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
-<a id="__codelineno-25-7" name="__codelineno-25-7"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-33-1">1</a></span>
+<span class="normal"><a href="#__codelineno-33-2">2</a></span>
+<span class="normal"><a href="#__codelineno-33-3">3</a></span>
+<span class="normal"><a href="#__codelineno-33-4">4</a></span>
+<span class="normal"><a href="#__codelineno-33-5">5</a></span>
+<span class="normal"><a href="#__codelineno-33-6">6</a></span>
+<span class="normal"><a href="#__codelineno-33-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-33-1" name="__codelineno-33-1"></a><span class="c1"># The agent delegates coding tasks to coder</span>
+<a id="__codelineno-33-2" name="__codelineno-33-2"></a><span class="k">[agent]</span>
+<a id="__codelineno-33-3" name="__codelineno-33-3"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"delegate"</span><span class="p">]</span>
+<a id="__codelineno-33-4" name="__codelineno-33-4"></a>
+<a id="__codelineno-33-5" name="__codelineno-33-5"></a><span class="k">[[delegates]]</span>
+<a id="__codelineno-33-6" name="__codelineno-33-6"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-33-7" name="__codelineno-33-7"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <p>User: "Add a new API endpoint"
 Planner: Delegates to coder with task details
 Coder: Implements the endpoint
 Planner: Reviews and integrates the changes</p>
 <h3 id="parallel-delegation">Parallel Delegation</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-26-1">1</a></span>
-<span class="normal"><a href="#__codelineno-26-2">2</a></span>
-<span class="normal"><a href="#__codelineno-26-3">3</a></span>
-<span class="normal"><a href="#__codelineno-26-4">4</a></span>
-<span class="normal"><a href="#__codelineno-26-5">5</a></span>
-<span class="normal"><a href="#__codelineno-26-6">6</a></span>
-<span class="normal"><a href="#__codelineno-26-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-26-1" name="__codelineno-26-1"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-26-2" name="__codelineno-26-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"frontend-coder"</span>
-<a id="__codelineno-26-3" name="__codelineno-26-3"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">]</span>
-<a id="__codelineno-26-4" name="__codelineno-26-4"></a>
-<a id="__codelineno-26-5" name="__codelineno-26-5"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-26-6" name="__codelineno-26-6"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"backend-coder"</span>
-<a id="__codelineno-26-7" name="__codelineno-26-7"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-34-1">1</a></span>
+<span class="normal"><a href="#__codelineno-34-2">2</a></span>
+<span class="normal"><a href="#__codelineno-34-3">3</a></span>
+<span class="normal"><a href="#__codelineno-34-4">4</a></span>
+<span class="normal"><a href="#__codelineno-34-5">5</a></span>
+<span class="normal"><a href="#__codelineno-34-6">6</a></span>
+<span class="normal"><a href="#__codelineno-34-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-34-1" name="__codelineno-34-1"></a><span class="k">[[delegates]]</span>
+<a id="__codelineno-34-2" name="__codelineno-34-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"frontend-coder"</span>
+<a id="__codelineno-34-3" name="__codelineno-34-3"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">]</span>
+<a id="__codelineno-34-4" name="__codelineno-34-4"></a>
+<a id="__codelineno-34-5" name="__codelineno-34-5"></a><span class="k">[[delegates]]</span>
+<a id="__codelineno-34-6" name="__codelineno-34-6"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"backend-coder"</span>
+<a id="__codelineno-34-7" name="__codelineno-34-7"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <p>User: "Implement feature X"
 Planner: Delegates frontend to frontend-coder, backend to backend-coder
 Both delegates work in parallel
 Planner: Integrates both results</p>
 <h3 id="verification-example">Verification Example</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-27-1">1</a></span>
-<span class="normal"><a href="#__codelineno-27-2">2</a></span>
-<span class="normal"><a href="#__codelineno-27-3">3</a></span>
-<span class="normal"><a href="#__codelineno-27-4">4</a></span>
-<span class="normal"><a href="#__codelineno-27-5">5</a></span>
-<span class="normal"><a href="#__codelineno-27-6">6</a></span>
-<span class="normal"><a href="#__codelineno-27-7">7</a></span>
-<span class="normal"><a href="#__codelineno-27-8">8</a></span>
-<span class="normal"><a href="#__codelineno-27-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-27-1" name="__codelineno-27-1"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-27-2" name="__codelineno-27-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
-<a id="__codelineno-27-3" name="__codelineno-27-3"></a><span class="c1"># ...</span>
-<a id="__codelineno-27-4" name="__codelineno-27-4"></a>
-<a id="__codelineno-27-5" name="__codelineno-27-5"></a><span class="c1"># Verification in delegation request</span>
-<a id="__codelineno-27-6" name="__codelineno-27-6"></a><span class="n">verification_spec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-27-7" name="__codelineno-27-7"></a><span class="w">    </span><span class="n">verification_type</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"shell_command"</span><span class="p">,</span>
-<a id="__codelineno-27-8" name="__codelineno-27-8"></a><span class="w">    </span><span class="n">command</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"cargo test --lib"</span>
-<a id="__codelineno-27-9" name="__codelineno-27-9"></a><span class="p">}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-35-1">1</a></span>
+<span class="normal"><a href="#__codelineno-35-2">2</a></span>
+<span class="normal"><a href="#__codelineno-35-3">3</a></span>
+<span class="normal"><a href="#__codelineno-35-4">4</a></span>
+<span class="normal"><a href="#__codelineno-35-5">5</a></span>
+<span class="normal"><a href="#__codelineno-35-6">6</a></span>
+<span class="normal"><a href="#__codelineno-35-7">7</a></span>
+<span class="normal"><a href="#__codelineno-35-8">8</a></span>
+<span class="normal"><a href="#__codelineno-35-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-35-1" name="__codelineno-35-1"></a><span class="k">[[delegates]]</span>
+<a id="__codelineno-35-2" name="__codelineno-35-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-35-3" name="__codelineno-35-3"></a><span class="c1"># ...</span>
+<a id="__codelineno-35-4" name="__codelineno-35-4"></a>
+<a id="__codelineno-35-5" name="__codelineno-35-5"></a><span class="c1"># Verification in delegation request</span>
+<a id="__codelineno-35-6" name="__codelineno-35-6"></a><span class="n">verification_spec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-35-7" name="__codelineno-35-7"></a><span class="w">    </span><span class="n">verification_type</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"shell_command"</span><span class="p">,</span>
+<a id="__codelineno-35-8" name="__codelineno-35-8"></a><span class="w">    </span><span class="n">command</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"cargo test --lib"</span>
+<a id="__codelineno-35-9" name="__codelineno-35-9"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="troubleshooting">Troubleshooting</h2>
 <h3 id="delegation-not-starting">Delegation Not Starting</h3>
 <ol>
-<li>Check delegate is registered: <code>agent.agent_registry().list_agents()</code></li>
+<li>Check the delegate is in the roster: <code>Agent::has_subagents()</code> is true when the root has members, and <code>Agent::delegate(id)</code> returns a member by ID</li>
 <li>Verify delegate configuration is valid</li>
 <li>Check for middleware errors</li>
 <li>Review logs for delegation events</li>
