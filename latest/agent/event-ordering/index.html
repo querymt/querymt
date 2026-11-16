@@ -1465,6 +1465,33 @@
   
   
     <li class="md-nav__item">
+      <a href="../repository_knowledge/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Repository Knowledge
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+                
+              
+                
+                  
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../mesh/" class="md-nav__link">
         
   
@@ -1856,7 +1883,7 @@
 <li>Because file databases use <code>synchronous=NORMAL</code>, the most recent commits can be lost after a power loss. Accounting is a supported token-cost estimate, not an invoice, and cannot promise exact billing after an unobservable crash.</li>
 <li>Do not run an older binary against a journal containing these event kinds. Roll back by restoring a preserved pre-upgrade database copy with the matching binary.</li>
 </ul>
-<p>See the module documentation of <code>crates/agent/src/accounting.rs</code> for identity, retry, pricing-snapshot and uncertainty semantics.</p>
+<p>See the module documentation of <code>crates/agent-services/src/accounting.rs</code> for identity, retry, pricing-snapshot and uncertainty semantics.</p>
 <h3 id="retention-forks-and-historical-coverage">Retention, forks and historical coverage</h3>
 <ul>
 <li><strong>Rewind and pruning keep spend.</strong> Removing the tail of a conversation (undo followed by a new prompt) deletes conversation events but never <code>llm_attempt_started</code> / <code>llm_attempt_settled</code> records, so a session keeps the cost of turns that no longer appear in its history. Retained records keep their sequence numbers; the gaps are valid. Deleting the whole session is the only operation that removes its accounting.</li>

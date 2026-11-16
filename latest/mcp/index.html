@@ -1221,6 +1221,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#skills" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Skills
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#benefits-of-mcp-integration" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1521,6 +1532,33 @@
     
   
   Protocol Support Matrix
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+                
+              
+                
+                  
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agent/repository_knowledge/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Repository Knowledge
 
     
   </span>
@@ -1901,6 +1939,14 @@ This adapter converts the MCP tool's schema and handles the call forwarding.</li
 </ul>
 </li>
 </ol>
+<h2 id="skills">Skills</h2>
+<p>When an MCP server declares the MCP Skills extension (<code>io.modelcontextprotocol/skills</code>), QueryMT lists its skills with <code>skills/list</code> when the server connects and again on <code>resources/list_changed</code>. They appear in the agent's <code>skill</code> tool as <code>&lt;server&gt;.&lt;skill-name&gt;</code>, scoped to the sessions that attach the server.</p>
+<ul>
+<li>Loading a skill fetches its entry with <code>skills/get</code>, reads <code>SKILL.md</code> through <code>resources/read</code>, and verifies the size and <code>sha256</code> digest from the manifest. Content over 256 KiB, or that does not match, is rejected.</li>
+<li>Server skills ask for approval by default; allow them with <code>"&lt;server&gt;.*" = "allow"</code> under <code>[agent.skills.permissions]</code>.</li>
+<li>Servers whose name contains a <code>.</code> offer no skills. <code>skills.mcp = false</code> turns the feature off.</li>
+</ul>
+<p>See <a href="../agent/configuration/#skills-configuration">Skills Configuration</a> for permissions, visibility rules and the <code>file</code> argument.</p>
 <h2 id="benefits-of-mcp-integration">Benefits of MCP Integration</h2>
 <ul>
 <li><strong>Decoupling:</strong> Keep complex tool logic or integrations with external systems separate from your main LLM application code, managed within dedicated MCP servers.</li>

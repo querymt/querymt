@@ -1428,6 +1428,34 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Skills Configuration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#skills-from-mcp-servers" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Skills from MCP servers
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#skill-permissions" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Skill permissions
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
         
           <li class="md-nav__item">
@@ -2261,6 +2289,33 @@
   
   
     <li class="md-nav__item">
+      <a href="../repository_knowledge/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Repository Knowledge
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+                
+              
+                
+                  
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../mesh/" class="md-nav__link">
         
   
@@ -2753,18 +2808,52 @@ each turn:</p>
 <li><code>0</code> is rejected at load time. In JSON, <code>null</code> leaves the key unset.</li>
 </ul>
 <h3 id="skills-configuration">Skills Configuration</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1">1</a></span>
-<span class="normal"><a href="#__codelineno-6-2">2</a></span>
-<span class="normal"><a href="#__codelineno-6-3">3</a></span>
-<span class="normal"><a href="#__codelineno-6-4">4</a></span>
-<span class="normal"><a href="#__codelineno-6-5">5</a></span>
-<span class="normal"><a href="#__codelineno-6-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="k">[agent.skills]</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-6-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-6-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-6-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-6-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-6-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-6-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-6-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-6-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-6-10">10</a></span>
+<span class="normal"><a href="#__codelineno-6-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="k">[agent.skills]</span>
 <a id="__codelineno-6-2" name="__codelineno-6-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
 <a id="__codelineno-6-3" name="__codelineno-6-3"></a><span class="n">include_external</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="w">   </span><span class="c1"># Check Claude Code, agents conventions paths</span>
 <a id="__codelineno-6-4" name="__codelineno-6-4"></a><span class="n">paths</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"./skills"</span><span class="p">]</span><span class="w">      </span><span class="c1"># Custom skill search paths</span>
 <a id="__codelineno-6-5" name="__codelineno-6-5"></a><span class="n">urls</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[]</span><span class="w">                 </span><span class="c1"># Remote skill URLs (future)</span>
-<a id="__codelineno-6-6" name="__codelineno-6-6"></a><span class="n">agent_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"querymt"</span><span class="w">      </span><span class="c1"># Agent identifier for skills</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6"></a><span class="n">mcp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="w">                </span><span class="c1"># Offer skills published by connected MCP servers</span>
+<a id="__codelineno-6-7" name="__codelineno-6-7"></a>
+<a id="__codelineno-6-8" name="__codelineno-6-8"></a><span class="k">[agent.skills.permissions]</span>
+<a id="__codelineno-6-9" name="__codelineno-6-9"></a><span class="s2">"internal-*"</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"deny"</span><span class="w">     </span><span class="c1"># local skills: exact name or prefix wildcard</span>
+<a id="__codelineno-6-10" name="__codelineno-6-10"></a><span class="s2">"docs.*"</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"allow"</span><span class="w">        </span><span class="c1"># skills of the MCP server "docs"</span>
+<a id="__codelineno-6-11" name="__codelineno-6-11"></a><span class="s2">"ops.runbook"</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"ask"</span>
 </code></pre></div></td></tr></table></div>
+<h4 id="skills-from-mcp-servers">Skills from MCP servers</h4>
+<p>An MCP server that declares the MCP Skills extension (<code>io.modelcontextprotocol/skills</code>) publishes skills that appear in the <code>skill</code> tool next to local skills. Set <code>mcp = false</code> to hide and refuse all of them.</p>
+<ul>
+<li><strong>IDs.</strong> A server skill is listed and loaded as <code>&lt;server&gt;.&lt;name&gt;</code>, for example <code>docs.release-notes</code>. A local skill with the same ID wins and the server skill is dropped (one warning is logged).</li>
+<li><strong>Server names.</strong> A server whose name contains a <code>.</code> offers no skills (a warning is logged); its tools are unaffected. Skill names containing a <code>.</code> are ignored.</li>
+<li><strong>Visibility.</strong> Server skills follow the tool configuration: they are hidden when the agent runs built-in tools only (a restricted <code>tools</code> list with no MCP selectors and no attached servers), when <code>skill</code> is not admitted by <code>tools</code>, when the allowlist lacks <code>server.*</code>, or when the denylist contains <code>server.*</code> or the bare server name.</li>
+<li><strong>Listing text.</strong> Descriptions from servers are reduced to one line of at most 1024 characters.</li>
+<li><strong>Refresh.</strong> The list follows <code>resources/list_changed</code> notifications. If a skill is requested that is not listed, the server's list is fetched once more before failing.</li>
+<li><strong>Verification.</strong> Loading re-fetches the skill entry, checks the <code>SKILL.md</code> size and <code>sha256</code> digest against its manifest, and requires the frontmatter name to match. <code>SKILL.md</code> and each supporting file are limited to 256 KiB. Skills declared <code>"dynamic"</code> have no digests and are only bounded by the size limit.</li>
+<li><strong>Output.</strong> Skill output is wrapped in <code>&lt;skill_content&gt;</code>; skill text cannot close the wrapper (the literal tags are escaped). Server skills report <code>&lt;source&gt;mcp:&lt;server&gt;&lt;/source&gt;</code> and list the relative file names the <code>file</code> argument accepts.</li>
+</ul>
+<p>The <code>skill</code> tool takes an optional <code>file</code> argument, a path relative to the skill root, to read a supporting file instead of the skill. Paths that are empty, absolute, scheme-qualified, contain <code>?</code>, <code>#</code>, a backslash, a <code>.</code> or <code>..</code> segment (also percent-encoded) or an encoded separator are rejected. Local files must stay inside the skill directory (symlink escapes are rejected). For an MCP skill with a manifest only listed files can be read, and each is verified; <code>file</code> uses the same permission as the skill.</p>
+<h4 id="skill-permissions">Skill permissions</h4>
+<p>Permissions apply when a skill is loaded, not when it is listed. A pattern is an exact ID or a prefix ending in <code>*</code>. The longest matching prefix wins, so <code>"team-secret-*" = "deny"</code> overrides <code>"team-*" = "allow"</code>. For local skills, an unmatched name falls back to <code>"*"</code>, then <code>allow</code>.</p>
+<p>Server skills are untrusted content, so they default to <strong>ask</strong>:</p>
+<ul>
+<li><code>"docs.*" = "allow"</code> (or an exact <code>"docs.release-notes"</code>) admits them without a prompt; <code>"docs.*" = "deny"</code> blocks them.</li>
+<li><code>"*" = "allow"</code> or <code>"*" = "ask"</code> does <strong>not</strong> admit server skills; they still prompt. Only <code>"*" = "deny"</code> applies to them, so locking down all skills also locks down server skills.</li>
+<li>The prompt names the server and the skill. Each tool call has its own prompt, so parallel loads of the same skill do not collide.</li>
+<li>The prompt offers <strong>Allow</strong>, <strong>Allow for this session</strong> and <strong>Deny</strong>. "Allow for this session" is remembered per skill ID and per session: later loads of that skill, and reads of its supporting files, run without a prompt. It does not cover other skills of the same server, other sessions or delegate sessions, and it ends with the session. "Allow" and "Deny" apply to one load only. Use <code>"docs.*" = "allow"</code> to admit a whole server.</li>
+<li><code>deny</code> always wins, even over a session allow.</li>
+<li>A <code>file</code> path that can never be valid (for example <code>../secrets.env</code>) fails without a prompt. A well-formed file that the MCP skill does not list still prompts first and fails after approval.</li>
+<li>An agent that cannot prompt (such as an <code>.agents</code> delegation target, see <a href="../dotagents/">dotagents</a>) fails an <code>ask</code> result immediately with an error naming the pattern to configure.</li>
+</ul>
 <h3 id="hooks-configuration">Hooks Configuration</h3>
 <p>Hooks run configured local commands at specific agent lifecycle points. They are configured directly in <code>[agent.hooks]</code>, which makes them a natural fit for profiles.</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1"> 1</a></span>

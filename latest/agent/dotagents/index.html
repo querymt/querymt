@@ -1598,6 +1598,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#skills-and-mcp-in-targets" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Skills and MCP in targets
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#collision-rules" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1731,6 +1742,33 @@
     
   
   Protocol Support Matrix
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+                
+              
+                
+                  
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../repository_knowledge/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Repository Knowledge
 
     
   </span>
@@ -2155,6 +2193,13 @@
 <li>a <strong>quorum</strong> profile with delegation enabled gains additional delegates.</li>
 </ul>
 <p>The configured planner and configured delegates are never replaced.</p>
+<h3 id="skills-and-mcp-in-targets">Skills and MCP in targets</h3>
+<ul>
+<li><strong>Skills.</strong> A target gets the <code>skill</code> tool when the registering runtime has skills enabled and the profile's <code>tools</code> list is absent or contains <code>skill</code>. A quorum target uses the planner's skills configuration, including its permissions.</li>
+<li><strong>MCP scope.</strong> A profile's <code>mcpServers</code> selects the servers its sessions attach, so a target sees only the skills published by those servers (as <code>&lt;server&gt;.&lt;name&gt;</code>). The parent's other servers are not visible to it.</li>
+<li><strong>No prompts.</strong> A target's sessions have their own event sink and cannot reach the user, so a target never prompts. A skill whose permission resolves to <code>ask</code> fails immediately with an error naming the pattern to configure. Allow server skills for targets with <code>"&lt;server&gt;.*" = "allow"</code> under <code>[agent.skills.permissions]</code>; see <a href="../configuration/#skills-configuration">Skills Configuration</a>.</li>
+<li><strong>Restricted <code>tools</code>.</strong> With a <code>tools</code> list, built-in tools are limited to that list. MCP tools stay available when servers are attached, or when an entry contains a <code>.</code> (<code>docs.*</code>) or names an attached server; otherwise the target runs with built-in tools only. For example <code>tools: ["read_tool", "docs.*"]</code> with server <code>docs</code> offers <code>read_tool</code> and the <code>docs</code> tools only.</li>
+</ul>
 <p>Protocol loading <strong>never enables delegation</strong>. When delegation is disabled, protocol targets remain inspectable in the manifest but are not registered.</p>
 <h3 id="collision-rules">Collision Rules</h3>
 <p>Protocol profile IDs merge across layers first (workspace wins). The merged protocol targets are then combined with explicit QueryMT targets, where <strong>explicit configuration wins</strong>:</p>

@@ -12,7 +12,7 @@
       
       
       
-        <link rel="prev" href="../dotagents_support_matrix/">
+        <link rel="prev" href="../repository_knowledge/">
       
       
         <link rel="next" href="../event-ordering/">
@@ -1446,6 +1446,33 @@
     
   
   Protocol Support Matrix
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+                
+              
+                
+                  
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../repository_knowledge/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Repository Knowledge
 
     
   </span>
@@ -4687,6 +4714,7 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <li><strong>Resolution.</strong> The client's answer is submitted to the owning session. Only the first valid answer for an interaction is accepted; later answers get a not-pending or stale result. An invalid form answer is rejected, the tool keeps waiting and the question is re-delivered for correction.</li>
 <li><strong>Retirement.</strong> Cancelling the run, or the tool exiting, retires the interaction. A late answer is rejected as not pending and a reconnect cannot revive it.</li>
 </ol>
+<p>Every form question that was announced with <code>ElicitationRequested</code> ends with exactly one durable <code>ElicitationResolved</code> event carrying the same <code>elicitation_id</code> and an outcome of <code>accepted</code>, <code>declined</code> or <code>cancelled</code>. Built-in questions and skill approvals also record the selected option labels. The content of MCP server elicitations is never recorded. ACP clients receive no notification for it; it is a journal record.</p>
 <p>Sessions and prompts carry no per-connection client bridge. <code>session/prompt</code> works the same for remote sessions as for local ones.</p>
 <p><strong>Unanswered permission waits.</strong> A permission-required tool call that is not decided by a session allow, tool policy or hook waits for an explicit user answer. It is not granted because no client is attached, delivery failed, the client disconnected, the response timed out or the answer was malformed. The request stays pending and is delivered again to the next authorized client that attaches.</p>
 <blockquote>
@@ -5034,11 +5062,17 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <span class="normal"><a href="#__codelineno-59-2">2</a></span>
 <span class="normal"><a href="#__codelineno-59-3">3</a></span>
 <span class="normal"><a href="#__codelineno-59-4">4</a></span>
-<span class="normal"><a href="#__codelineno-59-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-59-1" name="__codelineno-59-1"></a><span class="c1"># Enable mesh stream logging</span>
-<a id="__codelineno-59-2" name="__codelineno-59-2"></a><span class="nv">RUST_LOG</span><span class="o">=</span>querymt_agent::agent::remote<span class="o">=</span>debug<span class="w"> </span>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
+<span class="normal"><a href="#__codelineno-59-5">5</a></span>
+<span class="normal"><a href="#__codelineno-59-6">6</a></span>
+<span class="normal"><a href="#__codelineno-59-7">7</a></span>
+<span class="normal"><a href="#__codelineno-59-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-59-1" name="__codelineno-59-1"></a><span class="c1"># Enable mesh stream logging</span>
+<a id="__codelineno-59-2" name="__codelineno-59-2"></a><span class="nv">RUST_LOG</span><span class="o">=</span>querymt_agent_runtime::agent::remote<span class="o">=</span>debug<span class="w"> </span>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
 <a id="__codelineno-59-3" name="__codelineno-59-3"></a>
-<a id="__codelineno-59-4" name="__codelineno-59-4"></a><span class="c1"># Enable all libp2p logging</span>
-<a id="__codelineno-59-5" name="__codelineno-59-5"></a><span class="nv">RUST_LOG</span><span class="o">=</span><span class="nv">libp2p</span><span class="o">=</span>info,querymt<span class="o">=</span>debug<span class="w"> </span>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
+<a id="__codelineno-59-4" name="__codelineno-59-4"></a><span class="c1"># Enable debug logging for every querymt-agent crate (prefix match)</span>
+<a id="__codelineno-59-5" name="__codelineno-59-5"></a><span class="nv">RUST_LOG</span><span class="o">=</span><span class="nv">querymt_agent</span><span class="o">=</span>debug<span class="w"> </span>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
+<a id="__codelineno-59-6" name="__codelineno-59-6"></a>
+<a id="__codelineno-59-7" name="__codelineno-59-7"></a><span class="c1"># Enable all libp2p logging</span>
+<a id="__codelineno-59-8" name="__codelineno-59-8"></a><span class="nv">RUST_LOG</span><span class="o">=</span><span class="nv">libp2p</span><span class="o">=</span>info,querymt<span class="o">=</span>debug<span class="w"> </span>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
 </code></pre></div></td></tr></table></div>
 <p><strong>Key log messages:</strong>
 - <code>Stream reconnected successfully</code> - Good

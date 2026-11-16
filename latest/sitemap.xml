@@ -46,6 +46,9 @@
         <loc>https://docs.query.mt/latest/agent/profiles/</loc>
       </url>
       <url>
+        <loc>https://docs.query.mt/latest/agent/repository_knowledge/</loc>
+      </url>
+      <url>
         <loc>https://docs.query.mt/latest/agent/slash-commands/</loc>
       </url>
       <url>
