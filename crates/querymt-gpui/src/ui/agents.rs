@@ -623,6 +623,58 @@ impl QmtApp {
             return Some(self.centered(scrim("scrim-undo"), card, cx));
         }
 
+        if let Some(s) = self.confirm_session_delete.clone() {
+            let agent = self
+                .store
+                .read(cx)
+                .config(&s.agent_id)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "the agent".into());
+            let card = self
+                .modal_card(&p)
+                .w(px(440.))
+                .child(
+                    div()
+                        .text_lg()
+                        .font_semibold()
+                        .child(format!("Delete {}?", s.display_title())),
+                )
+                .child(div().text_sm().text_color(p.muted).child(format!(
+                    "The session and its history will be permanently removed from {agent}. This cannot be undone."
+                )))
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            kit::button("session-del-cancel")
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_session_delete = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            kit::button("session-del-ok")
+                                .danger()
+                                .label("Delete")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.confirm_session_delete = None;
+                                    if this.store.read(cx).session.as_ref().is_some_and(|v| {
+                                        v.agent_id == s.agent_id && v.session_id == s.id
+                                    }) && this.page == Page::Session
+                                    {
+                                        this.page = Page::Sessions;
+                                    }
+                                    this.store.update(cx, |st, cx| {
+                                        st.delete_session(&s.agent_id, &s.id, cx)
+                                    });
+                                })),
+                        ),
+                );
+            return Some(self.centered(scrim("scrim-session-delete"), card, cx));
+        }
+
         if let Some(id) = self.confirm_delete.clone() {
             let name = self
                 .store

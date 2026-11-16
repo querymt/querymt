@@ -73,8 +73,13 @@ pub struct QmtApp {
     attach_error: Option<String>,
     session_query: Entity<InputState>,
     session_tab: SessionTab,
-    collapsed: HashSet<String>,
+    /// Which Sessions-page groups are open.
+    session_groups: sessions::GroupOpenState,
     expanded: HashSet<String>,
+    /// `agent:session` keys of Sessions-page rows showing their child sessions.
+    session_children: HashSet<String>,
+    /// Session awaiting delete confirmation.
+    confirm_session_delete: Option<SessionSummary>,
     dialog: Option<AgentDialog>,
     details: Option<String>,
     confirm_delete: Option<String>,
@@ -282,8 +287,10 @@ impl QmtApp {
             attach_error: None,
             session_query,
             session_tab: SessionTab::Open,
-            collapsed: HashSet::new(),
+            session_groups: Default::default(),
             expanded: HashSet::new(),
+            session_children: HashSet::new(),
+            confirm_session_delete: None,
             dialog: None,
             details,
             confirm_delete: None,
@@ -415,6 +422,7 @@ impl QmtApp {
         if std::mem::take(&mut self.confirm_reset)
             || self.confirm_undo.take().is_some()
             || self.confirm_delete.take().is_some()
+            || self.confirm_session_delete.take().is_some()
             || self.dialog.take().is_some()
             || self.details.take().is_some()
         {

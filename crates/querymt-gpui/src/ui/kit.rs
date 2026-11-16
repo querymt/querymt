@@ -300,6 +300,37 @@ pub fn tone_chip(text: impl Into<SharedString>, fg: Hsla) -> Div {
         .child(text.into())
 }
 
+/// [`chip`] with a leading icon: neutral metadata (fork, branch, machine).
+pub fn icon_chip(name: IconName, text: impl Into<SharedString>, p: &Palette) -> Div {
+    h_flex()
+        .flex_none()
+        .gap_1()
+        .px_2()
+        .py(px(1.))
+        .rounded_full()
+        .bg(p.chip)
+        .text_xs()
+        .text_color(p.muted)
+        .child(icon(name, 11., p.muted))
+        .child(text.into())
+}
+
+/// [`tone_chip`] with a leading icon: state that needs a colour (warnings, resolved).
+pub fn icon_tone_chip(name: IconName, text: impl Into<SharedString>, fg: Hsla) -> Div {
+    h_flex()
+        .flex_none()
+        .gap_1()
+        .px_2()
+        .py(px(1.))
+        .rounded_full()
+        .bg(fg.opacity(0.14))
+        .text_xs()
+        .font_medium()
+        .text_color(fg)
+        .child(icon(name, 11., fg))
+        .child(text.into())
+}
+
 pub fn icon_button(
     id: impl Into<ElementId>,
     name: IconName,

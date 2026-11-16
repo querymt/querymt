@@ -282,6 +282,15 @@ mod web {
             Diff,
             ArrowDown,
             ArrowUpRight,
+            // sessions page
+            GitFork,
+            GitBranch,
+            CircleQuestionMark,
+            Folder,
+            ArchiveRestore,
+            MessageSquarePlus,
+            SearchX,
+            PlugZap,
             // model picker
             Gauge,
             Type,
