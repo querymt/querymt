@@ -43,6 +43,9 @@ pub struct DotagentsTargetFactory {
     /// Skills configuration of the registering runtime and its project root.
     /// Targets get a non-interactive skill catalog built from it.
     skills: Option<(crate::config::SkillsConfig, std::path::PathBuf)>,
+    /// The runtime's event stream. Targets are built on it, so their activity
+    /// reaches the same subscribers as the root's.
+    event_fanout: Option<Arc<querymt_agent_services::event_fanout::EventFanout>>,
 }
 
 impl DotagentsTargetFactory {
@@ -51,7 +54,17 @@ impl DotagentsTargetFactory {
             plugin_registry,
             storage,
             skills: None,
+            event_fanout: None,
         }
+    }
+
+    /// Build targets on this event stream.
+    pub fn with_event_fanout(
+        mut self,
+        event_fanout: Arc<querymt_agent_services::event_fanout::EventFanout>,
+    ) -> Self {
+        self.event_fanout = Some(event_fanout);
+        self
     }
 
     /// Give targets skills from the registering runtime's configuration.
@@ -139,6 +152,9 @@ impl ProtocolTargetFactory for DotagentsTargetFactory {
                 // DelegationMiddleware auto-registration means this target cannot
                 // delegate onward or re-register the protocol collection.
                 .with_agent_registry_only(Arc::new(ChildRegistry));
+        if let Some(fanout) = &self.event_fanout {
+            builder = builder.with_event_fanout(fanout.clone());
+        }
 
         if let Some(tools) = &plan.tools
             && !tools.is_empty()

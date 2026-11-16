@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+mod delegates;
 mod extensions;
 mod hooks;
 mod loader;
@@ -28,6 +29,7 @@ pub use crate::knowledge::repository::settings::{
     RepositoryKnowledgeDeliverySettings, RepositoryKnowledgeSettings,
 };
 pub use crate::worktree::storage_root::resolved_storage_root;
+pub use delegates::*;
 pub use extensions::*;
 pub use hooks::*;
 pub use loader::{ConfigSource, interpolate_env_vars, load_config};

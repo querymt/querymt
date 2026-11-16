@@ -718,6 +718,16 @@ impl AgentConfigBuilder {
         &self.provider
     }
 
+    /// The event stream this config will be built on.
+    pub fn event_fanout(&self) -> Arc<EventFanout> {
+        self.event_fanout.clone()
+    }
+
+    /// The tool selection built so far.
+    pub fn tool_config(&self) -> &ToolConfig {
+        &self.tool_config
+    }
+
     /// Borrow the `StorageBackend` used to build this config.
     pub fn storage(&self) -> &Arc<dyn StorageBackend> {
         &self.storage

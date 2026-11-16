@@ -137,6 +137,14 @@ pub struct AgentBuilder {
     session_mcp_attachment_source: Option<Arc<dyn SessionMcpAttachmentSource>>,
     /// Optional pre-built agent registry (Phase 7: injected by `from_single_config_with_registry`).
     pub(super) agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+    /// Members the root can delegate to, built when the agent is.
+    delegates: Vec<crate::delegation::member::MemberBuildSpec>,
+    /// Whether delegation is on (default). It also needs the root's `tools`
+    /// to admit `delegate`.
+    delegation_enabled: bool,
+    delegation_settings: crate::config::DelegationSettings,
+    /// Set for profile runtimes so each delegation service claims only its own sessions.
+    profile_id: Option<String>,
     /// Optional pre-built infrastructure (plugin registry + storage).
     infra: Option<AgentInfra>,
     #[cfg(feature = "remote")]
@@ -182,6 +190,10 @@ impl AgentBuilder {
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: None,
             agent_registry: None,
+            delegates: Vec::new(),
+            delegation_enabled: true,
+            delegation_settings: crate::config::DelegationSettings::default(),
+            profile_id: None,
             infra: None,
             #[cfg(feature = "remote")]
             mesh: None,
@@ -215,6 +227,35 @@ impl AgentBuilder {
 
     pub fn parameter<K: Into<String>>(self, key: K, value: impl Into<serde_json::Value>) -> Self {
         self.with_llm(|c| c.parameter(key, value.into()))
+    }
+
+    /// Add a member the root agent can delegate to.
+    pub fn delegate<F>(mut self, id: impl Into<String>, configure: F) -> Self
+    where
+        F: FnOnce(super::config::DelegateConfigBuilder) -> super::config::DelegateConfigBuilder,
+    {
+        let builder = super::config::DelegateConfigBuilder::new(id);
+        self.delegates.push(configure(builder).build());
+        self
+    }
+
+    /// Turn delegation on or off (on by default). It also requires the root's
+    /// `tools` to admit `delegate`.
+    pub fn delegation(mut self, enabled: bool) -> Self {
+        self.delegation_enabled = enabled;
+        self
+    }
+
+    /// How the delegation service of this runtime behaves.
+    pub fn delegation_settings(mut self, settings: crate::config::DelegationSettings) -> Self {
+        self.delegation_settings = settings;
+        self
+    }
+
+    /// Mark this runtime as the one of profile `profile_id`.
+    pub fn with_profile_id(mut self, profile_id: impl Into<String>) -> Self {
+        self.profile_id = Some(profile_id.into());
+        self
     }
 
     pub fn db(mut self, path: impl Into<PathBuf>) -> Self {
@@ -616,38 +657,11 @@ impl AgentBuilder {
             .await?;
             self.agent_registry = Some(registry);
         }
-        let explicit_registry = self.agent_registry.take();
-        // Delegation is considered enabled only when the host actually wired a
-        // delegation path: the `delegate` tool, or a non-empty registry of
-        // pre-registered targets. Protocol loading never changes this.
-        let delegation_enabled = self.tools.iter().any(|tool| tool.is_builtin("delegate"))
-            || explicit_registry
-                .as_ref()
-                .is_some_and(|registry| !registry.list_agents().is_empty());
-
-        // Task 3.2: extend a delegation-enabled standalone runtime's registry
-        // with lazy protocol targets. Delegation-disabled runtimes never
-        // register targets, and protocol loading never enables delegation.
-        if delegation_enabled && let Some(manifest) = &dotagents_manifest {
-            let plans = crate::dotagents::DotagentsSubAgentPlans::from_manifest(manifest);
-            let registry = crate::dotagents::DotagentsTargetRegistry::new(
-                &plans,
-                explicit_registry,
-                Arc::new(
-                    super::DotagentsTargetFactory::new(plugin_registry.clone(), backend.clone())
-                        .with_skills(
-                            self.skills_config.clone(),
-                            cwd.clone().unwrap_or_else(|| std::path::PathBuf::from(".")),
-                        ),
-                ),
-            );
-            for diagnostic in registry.diagnostics() {
-                log::warn!("dotagents: {diagnostic}");
-            }
-            builder = builder.with_agent_registry(Arc::new(registry));
-        } else if let Some(registry) = explicit_registry {
-            builder = builder.with_agent_registry(registry);
-        }
+        let preregistered = self.agent_registry.take();
+        let protocol_plans = dotagents_manifest
+            .as_ref()
+            .map(crate::dotagents::DotagentsSubAgentPlans::from_manifest);
+        let skills_for_members = self.skills_config.clone();
 
         // Workspace service: an injected instance wins; otherwise build one from
         // the settings. Invalid settings fail here, not at the first session.
@@ -661,7 +675,7 @@ impl AgentBuilder {
                 None => None,
             },
         };
-        if let Some(service) = workspace_service {
+        if let Some(service) = workspace_service.clone() {
             builder = builder.with_workspace_service(service);
         }
 
@@ -672,7 +686,7 @@ impl AgentBuilder {
                 .as_ref()
                 .and_then(crate::knowledge::host::registry_from_settings)
         });
-        builder = builder.with_repository_knowledge(repository_knowledge);
+        builder = builder.with_repository_knowledge(repository_knowledge.clone());
 
         // Wire schedule repository and knowledge store from the storage backend.
         // These are optional — backends that don't support them return None.
@@ -807,35 +821,57 @@ impl AgentBuilder {
             builder = builder.with_slash_commands_config(Some(slash_config));
         }
 
-        // Build initial config for middleware factories (temporary handle)
-        let initial_config = Arc::new(builder.build());
-        let temp_handle = Arc::new(AgentHandle::from_config(initial_config.clone()));
-
-        // Apply middleware factories - each factory receives the handle
-        let mut middleware_drivers: Vec<Arc<dyn MiddlewareDriver>> = Vec::new();
-        for factory in self.middleware_factories {
-            let middleware = factory(&temp_handle);
-            middleware_drivers.push(middleware);
+        // Members, the delegate tool, middleware and the delegation service are
+        // all assembled by the runtime's one root builder.
+        let members = std::mem::take(&mut self.delegates);
+        for member in &members {
+            if let Some(error) = &member.tool_error {
+                return Err(anyhow!(
+                    "delegate '{}': invalid `tools` selector: {error}",
+                    member.id
+                ));
+            }
         }
-
-        // Config-based entries plus the auto-added defaults share one assembly
-        // path with quorum members; any real error fails the build.
-        let assembled = crate::middleware::build_from_entries(
-            &self.middleware_entries,
-            &middleware_drivers,
-            &initial_config,
-        )?;
-        middleware_drivers.extend(assembled);
-
-        // Drop the temporary handle so Arc::try_unwrap can succeed
-        // (avoids a full clone of AgentConfig).
-        drop(temp_handle);
-
-        // Build final AgentConfig with middleware swapped in
-        let initial = Arc::try_unwrap(initial_config).unwrap_or_else(|arc| (*arc).clone());
-        let final_config = Arc::new(initial.with_middleware(middleware_drivers));
-
-        let handle = Arc::new(AgentHandle::from_config(final_config));
+        if workspace_service.is_none()
+            && let Some(member) = members
+                .iter()
+                .find(|m| m.isolation == crate::worktree::DelegationIsolation::Isolated)
+        {
+            return Err(anyhow!(
+                "delegate '{}' is configured `isolated` but the workspace service is not enabled",
+                member.id
+            ));
+        }
+        let handle = crate::delegation::build_root(
+            builder,
+            crate::delegation::RootDelegation {
+                enabled: self.delegation_enabled,
+                settings: self.delegation_settings.clone(),
+                profile_id: self.profile_id.clone(),
+                cwd: cwd.clone(),
+                members,
+                member_params: crate::delegation::member::DelegateBuildParams {
+                    plugin_registry: plugin_registry.clone(),
+                    snapshot_policy,
+                    skills_project_root: cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+                    wait_policy: self.delegation_settings.wait_policy.clone(),
+                    wait_timeout_secs: self.delegation_settings.wait_timeout_secs,
+                    cancel_grace_secs: self.delegation_settings.cancel_grace_secs,
+                    workspace_service,
+                    repository_knowledge,
+                },
+                preregistered,
+                protocol_plans,
+                skills: skills_for_members,
+                middleware_factories: std::mem::take(&mut self.middleware_factories),
+                middleware_entries: std::mem::take(&mut self.middleware_entries),
+                #[cfg(feature = "remote")]
+                peer_delegates: Vec::new(),
+                #[cfg(feature = "remote")]
+                mesh: None,
+            },
+        )
+        .await?;
 
         #[cfg(feature = "remote")]
         let mesh_node_name = self.mesh.as_ref().and_then(|mesh| mesh.node_name());

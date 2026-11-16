@@ -3598,6 +3598,8 @@ fn scripted_text_registry() -> Result<(
     let mut mock = MockLlmProvider::new();
     mock.expect_chat()
         .returning(|_| Ok(MockChatResponse::text_only("Task complete").into()));
+    mock.expect_chat_with_tools()
+        .returning(|_, _| Ok(MockChatResponse::text_only("Task complete").into()));
     mock.expect_tools().return_const(None).times(0..);
     let factory = Arc::new(TestProviderFactory::new(SharedLlmProvider::new(
         mock,
@@ -3609,14 +3611,26 @@ fn scripted_text_registry() -> Result<(
 }
 
 /// Records a delegation request from `agent`'s root session to `target`, as the
-/// `delegate` tool does, and waits for the delegation to leave `Requested`.
+/// `delegate` tool does, and waits for the delegation to reach a terminal status.
 /// Returns its final status after at most five seconds.
 async fn request_delegation(agent: &Agent, target: &str) -> crate::session::domain::Delegation {
+    request_delegation_for(agent, target, None).await
+}
+
+/// Like [`request_delegation`]; the root session is bound to `profile` when given.
+async fn request_delegation_for(
+    agent: &Agent,
+    target: &str,
+    profile: Option<&str>,
+) -> crate::session::domain::Delegation {
     use crate::events::AgentEventKind;
     use crate::session::domain::{Delegation, DelegationStatus};
 
     let parent = agent.create_session().await.expect("root session");
     let store = agent.storage_backend().session_store();
+    if let Some(profile) = profile {
+        store.set_profile_binding(&parent, profile).await.unwrap();
+    }
     let parent_row = store
         .get_session(&parent)
         .await
@@ -3667,7 +3681,11 @@ async fn request_delegation(agent: &Agent, target: &str) -> crate::session::doma
             .await
             .unwrap()
             .expect("row");
-        if current.status != DelegationStatus::Requested || std::time::Instant::now() > deadline {
+        if !matches!(
+            current.status,
+            DelegationStatus::Requested | DelegationStatus::Running
+        ) || std::time::Instant::now() > deadline
+        {
             return current;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -3826,5 +3844,59 @@ global_enabled = false
     ids.sort();
     assert_eq!(ids, ["coder", "writer"]);
     agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_profiles_delegate_at_the_same_time() -> Result<()> {
+    use crate::session::domain::DelegationStatus;
+    use crate::test_utils::delegation::{DelegateBehavior, agent_info, build_delegate_handle};
+
+    // Profile runtimes share one storage and one event stream.
+    let (registry, _dir) = scripted_text_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let fanout = Arc::new(crate::event_fanout::EventFanout::new());
+    let store: Arc<dyn crate::session::store::SessionStore> = storage.clone();
+
+    let mut agents = Vec::new();
+    for (profile, member) in [("a", "coder"), ("b", "writer")] {
+        let mut members = crate::delegation::DefaultAgentRegistry::new();
+        members.register_handle(
+            agent_info(member),
+            build_delegate_handle(DelegateBehavior::AlwaysOk, store.clone(), None).await
+                as Arc<dyn crate::agent::handle::AgentHandle>,
+        );
+        let mut builder = Agent::single()
+            .provider("mock", "mock-model")
+            .tools(["delegate"])
+            .with_profile_id(profile);
+        builder.agent_registry = Some(Arc::new(members));
+        agents.push(
+            builder
+                .infra(AgentInfra {
+                    plugin_registry: registry.clone(),
+                    storage: Some(storage.clone()),
+                    session_mcp_attachment_source: None,
+                    event_fanout: Some(fanout.clone()),
+                })
+                .build()
+                .await?,
+        );
+    }
+
+    let (first, second) = tokio::join!(
+        request_delegation_for(&agents[0], "coder", Some("a")),
+        request_delegation_for(&agents[1], "writer", Some("b")),
+    );
+    assert_eq!(first.status, DelegationStatus::Complete, "profile a: coder");
+    assert_eq!(
+        second.status,
+        DelegationStatus::Complete,
+        "profile b: writer"
+    );
+    for agent in &agents {
+        agent.shutdown().await;
+    }
     Ok(())
 }
