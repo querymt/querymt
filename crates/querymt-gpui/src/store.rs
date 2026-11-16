@@ -156,25 +156,174 @@ impl Model {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct SessionSummary {
     pub agent_id: String,
     pub id: String,
     pub cwd: String,
     pub title: String,
     pub updated_at: String,
+    /// `runtimeStatus.phase`; `unknown` when the agent could not observe it.
     pub phase: String,
     pub root: bool,
+    /// Neither resolved nor archived (also when the agent reports no lifecycle).
     pub open: bool,
     pub resolved: bool,
     pub archived: bool,
+    /// The agent reported resolved/archived state; without it the session
+    /// belongs to no lifecycle view but All.
+    pub lifecycle_known: bool,
     pub pinned: bool,
     pub messages: u64,
+    /// The last turn finished with an error.
+    pub has_errors: bool,
+    pub parent: Option<String>,
+    /// `user`, `delegation`, `worktree`, …
+    pub fork_origin: Option<String>,
+    pub fork_count: u64,
+    pub has_children: bool,
+    pub worktree: Option<Worktree>,
+    pub remote: Option<RemoteOwner>,
 }
+
+/// Managed Git worktree a session runs in (`_meta.querymt.workspace`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Worktree {
+    pub branch: Option<String>,
+    pub checkout_path: Option<String>,
+    /// The project the worktree was created from; sessions group under it.
+    pub source_cwd: Option<String>,
+    pub baseline_mode: Option<String>,
+    /// `ready` when usable; otherwise e.g. `failed`, `archived`.
+    pub lifecycle: Option<String>,
+    pub handed_off_to: Option<String>,
+}
+
+impl Worktree {
+    pub fn usable(&self) -> bool {
+        self.lifecycle.as_deref().is_none_or(|l| l == "ready")
+    }
+}
+
+/// A session owned by another mesh node.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RemoteOwner {
+    pub node_id: String,
+    pub label: Option<String>,
+    pub connected: bool,
+}
+
+impl RemoteOwner {
+    pub fn name(&self) -> String {
+        self.label
+            .clone()
+            .filter(|l| !l.trim().is_empty())
+            .unwrap_or_else(|| self.node_id.chars().take(8).collect())
+    }
+}
+
+/// Runtime phases in which the session is doing work.
+const ACTIVE_PHASES: [&str; 7] = [
+    "starting",
+    "model",
+    "tools",
+    "waiting",
+    "closing",
+    "cancel_requested",
+    // Optimistic placeholder for a session this app just launched.
+    "running",
+];
 
 impl SessionSummary {
     pub fn running(&self) -> bool {
-        !self.phase.is_empty() && self.phase != "idle"
+        ACTIVE_PHASES.contains(&self.phase.as_str())
+    }
+
+    /// The agent could not report whether the session is running.
+    pub fn status_unknown(&self) -> bool {
+        matches!(self.phase.as_str(), "" | "unknown")
+    }
+
+    /// Workspace the session is listed under: a worktree session belongs to
+    /// the project it was created from, not its checkout.
+    pub fn group_cwd(&self) -> &str {
+        self.worktree
+            .as_ref()
+            .and_then(|w| w.source_cwd.as_deref())
+            .filter(|c| !c.is_empty())
+            .unwrap_or(&self.cwd)
+    }
+
+    /// Parse one `session/list` entry.
+    pub fn from_list_entry(agent_id: &str, s: &Value) -> Self {
+        let text = |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or_default().to_string();
+        let opt = |v: Option<&Value>| {
+            v.and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        let meta = s.get("_meta");
+        let m = |k: &str| meta.and_then(|m| m.get(k));
+        let p = |k: &str| meta.and_then(|m| m.pointer(k));
+        let lifecycle = p("/querymt/lifecycle").filter(|l| {
+            l.get("resolved").is_some_and(Value::is_boolean)
+                && l.get("archived").is_some_and(Value::is_boolean)
+        });
+        let flag = |k: &str| {
+            lifecycle
+                .and_then(|l| l.get(k))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        let (resolved, archived) = (flag("resolved"), flag("archived"));
+        let phase = if p("/runtimeStatus/observation/availability").and_then(Value::as_str)
+            == Some("unavailable")
+        {
+            "unknown".to_string()
+        } else {
+            text(p("/runtimeStatus/phase"))
+        };
+        let parent = opt(m("parentSessionId"));
+        let worktree = p("/querymt/workspace")
+            .filter(|w| w.get("workspaceId").is_some_and(|v| v.as_str().is_some()))
+            .map(|w| Worktree {
+                branch: opt(w.get("branch")),
+                checkout_path: opt(w.get("checkoutPath")),
+                source_cwd: opt(w.get("sourceCwd")),
+                baseline_mode: opt(w.get("baselineMode")),
+                lifecycle: opt(w.get("lifecycle")),
+                handed_off_to: opt(w.get("handedOffTo")),
+            });
+        let remote = (text(m("location")) == "remote")
+            .then(|| opt(m("nodeId")))
+            .flatten()
+            .map(|node_id| RemoteOwner {
+                node_id,
+                label: opt(m("nodeLabel")),
+                connected: text(m("connectionState")) != "disconnected",
+            });
+        Self {
+            agent_id: agent_id.to_string(),
+            id: text(s.get("sessionId")),
+            cwd: text(s.get("cwd")),
+            title: text(s.get("title")),
+            updated_at: text(s.get("updatedAt")),
+            phase,
+            root: parent.is_none(),
+            open: !resolved && !archived,
+            resolved,
+            archived,
+            lifecycle_known: lifecycle.is_some(),
+            pinned: p("/querymt/pin/pinned").and_then(Value::as_bool) == Some(true),
+            messages: m("messageCount").and_then(Value::as_u64).unwrap_or(0),
+            has_errors: m("hasErrors").and_then(Value::as_bool) == Some(true),
+            parent,
+            fork_origin: opt(m("forkOrigin")),
+            fork_count: m("forkCount").and_then(Value::as_u64).unwrap_or(0),
+            has_children: m("hasChildren").and_then(Value::as_bool) == Some(true),
+            worktree,
+            remote,
+        }
     }
 
     pub fn display_title(&self) -> String {
@@ -541,6 +690,16 @@ pub struct AgentRuntime {
     pub models: Vec<Model>,
     pub sessions: Vec<SessionSummary>,
     pub sessions_loaded: bool,
+    /// Why the last `session/list` failed; cleared by the next success.
+    pub sessions_error: Option<String>,
+    /// Session ids with a pin / lifecycle / delete request in flight.
+    pub session_pending: std::collections::HashSet<String>,
+    /// Session id -> error of its last failed action.
+    pub session_errors: HashMap<String, String>,
+    /// `initialize` advertised `sessionCapabilities.delete`.
+    pub can_delete_sessions: bool,
+    /// Parent session id -> its loaded direct children.
+    pub children: HashMap<String, ChildList>,
     pub mesh: Option<MeshStatus>,
     pub mesh_nodes: Vec<MeshNode>,
     pub mesh_invites: Vec<MeshInvite>,
@@ -567,7 +726,44 @@ pub struct AgentRuntime {
     refresh_scheduled: bool,
 }
 
+/// Direct children of one session, loaded on demand.
+#[derive(Clone, Debug, Default)]
+pub struct ChildList {
+    pub sessions: Vec<SessionSummary>,
+    pub loading: bool,
+    pub loaded: bool,
+    pub error: Option<String>,
+}
+
 impl AgentRuntime {
+    /// Every loaded copy of a session: the catalog row and nested child rows.
+    fn sessions_mut<'a>(
+        &'a mut self,
+        session_id: &'a str,
+    ) -> impl Iterator<Item = &'a mut SessionSummary> + 'a {
+        self.sessions
+            .iter_mut()
+            .chain(
+                self.children
+                    .values_mut()
+                    .flat_map(|c| c.sessions.iter_mut()),
+            )
+            .filter(move |s| s.id == session_id)
+    }
+
+    fn begin_session_action(&mut self, session_id: &str) {
+        self.session_pending.insert(session_id.to_string());
+        self.session_errors.remove(session_id);
+    }
+
+    fn end_session_action(&mut self, session_id: &str, error: Option<String>) {
+        self.session_pending.remove(session_id);
+        if let Some(error) = error {
+            self.log(error.clone());
+            self.session_errors.insert(session_id.to_string(), error);
+        }
+    }
+
     fn log(&mut self, line: impl Into<String>) {
         let line = line.into();
         #[cfg(not(target_family = "wasm"))]
@@ -620,6 +816,18 @@ impl AgentRuntime {
             == Some(true)
     }
 
+    /// Resolve / archive are available (desktop `supportsSessionLifecycle`).
+    pub fn can_set_lifecycle(&self) -> bool {
+        self.is_connected()
+            && self.feature("session_lifecycle")
+            && self.supports_method("querymt/session/setLifecycle")
+    }
+
+    /// Pinning is available (desktop `supportsSessionPins`).
+    pub fn can_pin(&self) -> bool {
+        self.is_connected() && self.supports_method("querymt/session/setPinned")
+    }
+
     /// The agent can take input mid-turn (steer / queue), like the desktop app checks.
     pub fn can_control_run(&self) -> bool {
         self.feature("steering")
@@ -668,6 +876,9 @@ pub struct Prefs {
     /// Agent id -> most recently picked model ids (newest first).
     #[serde(default)]
     pub recent_models: HashMap<String, Vec<String>>,
+    /// Recently opened root sessions as (agent id, session id), newest first.
+    #[serde(default)]
+    pub recent_sessions: Vec<(String, String)>,
     /// Mouse-wheel smoothing preset (`off`, `snappy`, `normal`, `smooth`, `glide`).
     #[serde(default)]
     pub scroll_smoothing: String,
@@ -1126,9 +1337,10 @@ impl AgentsStore {
             return;
         };
         let Some(rpc) = rt.rpc.clone() else { return };
-        if let Some(s) = rt.sessions.iter_mut().find(|s| s.id == session_id) {
+        for s in rt.sessions_mut(session_id) {
             s.pinned = pinned;
         }
+        rt.begin_session_action(session_id);
         cx.notify();
         let (agent_id, session_id) = (agent_id.to_string(), session_id.to_string());
         cx.spawn(async move |this, cx| {
@@ -1138,22 +1350,143 @@ impl AgentsStore {
                     json!({ "session_id": session_id, "pinned": pinned }),
                 )
                 .await;
-            if let Err(err) = result {
-                let _ = this.update(cx, |s, cx| {
-                    if let Some(rt) = s.runtime.get_mut(&agent_id) {
-                        if let Some(sess) = rt.sessions.iter_mut().find(|x| x.id == session_id) {
-                            sess.pinned = !pinned;
-                        }
-                        rt.log(format!(
-                            "Could not {} session: {err}",
-                            if pinned { "pin" } else { "unpin" }
-                        ));
+            let _ = this.update(cx, |s, cx| {
+                let Some(rt) = s.runtime.get_mut(&agent_id) else {
+                    return;
+                };
+                let error = result.err().map(|err| {
+                    for sess in rt.sessions_mut(&session_id) {
+                        sess.pinned = !pinned;
                     }
-                    cx.notify();
+                    let verb = if pinned { "pin" } else { "unpin" };
+                    format!("Could not {verb} the session: {err}")
                 });
-            }
+                rt.end_session_action(&session_id, error);
+                cx.notify();
+            });
         })
         .detach();
+    }
+
+    /// Record an opened root session for the Sessions page's Recent group
+    /// (desktop `rememberRecentSession`): forks, delegates and other children
+    /// are never recorded.
+    fn remember_recent_session(&mut self, agent_id: &str, session_id: &str) {
+        const LIMIT: usize = 50;
+        let root = self
+            .session_summary(agent_id, session_id)
+            .is_some_and(|s| s.root && s.fork_origin.is_none());
+        let entry = (agent_id.to_string(), session_id.to_string());
+        if !root || self.prefs.recent_sessions.first() == Some(&entry) {
+            return;
+        }
+        let recent = &mut self.prefs.recent_sessions;
+        recent.retain(|e| e != &entry);
+        recent.insert(0, entry);
+        recent.truncate(LIMIT);
+        self.save();
+    }
+
+    /// Delete a session and its history (`session/delete`). Only offered when
+    /// `initialize` advertised `sessionCapabilities.delete`.
+    pub fn delete_session(&mut self, agent_id: &str, session_id: &str, cx: &mut Context<Self>) {
+        let Some(rt) = self.runtime.get_mut(agent_id) else {
+            return;
+        };
+        let Some(rpc) = rt.rpc.clone().filter(|_| rt.can_delete_sessions) else {
+            return;
+        };
+        rt.begin_session_action(session_id);
+        cx.notify();
+        let (agent_id, session_id) = (agent_id.to_string(), session_id.to_string());
+        cx.spawn(async move |this, cx| {
+            let result = rpc
+                .request("session/delete", json!({ "sessionId": session_id }))
+                .await;
+            let _ = this.update(cx, |s, cx| {
+                if result.is_ok() {
+                    let before = s.prefs.recent_sessions.len();
+                    s.prefs
+                        .recent_sessions
+                        .retain(|(a, id)| a != &agent_id || id != &session_id);
+                    if s.prefs.recent_sessions.len() != before {
+                        s.save();
+                    }
+                }
+                let Some(rt) = s.runtime.get_mut(&agent_id) else {
+                    return;
+                };
+                match result {
+                    Ok(_) => {
+                        rt.end_session_action(&session_id, None);
+                        rt.sessions.retain(|x| x.id != session_id);
+                        rt.children.remove(&session_id);
+                        for list in rt.children.values_mut() {
+                            list.sessions.retain(|x| x.id != session_id);
+                        }
+                        if s.session
+                            .as_ref()
+                            .is_some_and(|v| v.agent_id == agent_id && v.session_id == session_id)
+                        {
+                            s.session = None;
+                        }
+                    }
+                    Err(err) => rt.end_session_action(
+                        &session_id,
+                        Some(format!("Could not delete the session: {err}")),
+                    ),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Direct children of a session (forks and worktree children; the agent
+    /// leaves delegates out), via `session/list` with the `children` scope.
+    pub fn load_children(&mut self, agent_id: &str, parent_id: &str, cx: &mut Context<Self>) {
+        let Some(rt) = self.runtime.get_mut(agent_id) else {
+            return;
+        };
+        let Some(rpc) = rt.rpc.clone().filter(|_| rt.is_connected()) else {
+            return;
+        };
+        let list = rt.children.entry(parent_id.to_string()).or_default();
+        if list.loading {
+            return;
+        }
+        list.loading = true;
+        list.error = None;
+        cx.notify();
+        let (generation, agent_id, parent_id) =
+            (rt.generation, agent_id.to_string(), parent_id.to_string());
+        let task = cx.spawn(async move |this, cx| {
+            let meta =
+                json!({ "session_scope": "children", "querymt": { "parentSessionId": parent_id } });
+            let result = fetch_session_pages(&rpc, &agent_id, Some(meta), CHILD_PAGES).await;
+            let _ = this.update(cx, |s, cx| {
+                let Some(rt) = s.live(&agent_id, generation) else {
+                    return;
+                };
+                let list = rt.children.entry(parent_id.clone()).or_default();
+                list.loading = false;
+                match result {
+                    Ok(mut children) => {
+                        children.retain(|c| {
+                            c.parent.as_deref() == Some(parent_id.as_str())
+                                && c.fork_origin.as_deref() != Some("delegation")
+                        });
+                        children.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                        list.sessions = children;
+                        list.loaded = true;
+                    }
+                    Err(err) => list.error = Some(format!("Could not load child sessions: {err}")),
+                }
+                cx.notify();
+            });
+        });
+        rt.tasks.push(task);
+        rt.tasks.retain(|t| !t.is_ready());
     }
 
     pub fn set_launch_model(&mut self, agent_id: &str, model_id: String, cx: &mut Context<Self>) {
@@ -1687,6 +2020,9 @@ impl AgentsStore {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 rt.agent_version = info.and_then(|i| i.get("version")).and_then(Value::as_str).map(str::to_owned);
+                rt.can_delete_sessions = init
+                    .pointer("/agentCapabilities/sessionCapabilities/delete")
+                    .is_some_and(|d| !d.is_null() && d.as_bool() != Some(false));
                 rt.state = ConnState::Connected;
                 rt.connected_at = Some(now_ms());
                 rt.log(format!(
@@ -1873,14 +2209,12 @@ impl AgentsStore {
                                 id: session_id.clone(),
                                 cwd: cwd.clone(),
                                 title: prompt.chars().take(80).collect(),
-                                updated_at: String::new(),
                                 phase: "running".into(),
                                 root: true,
                                 open: true,
-                                resolved: false,
-                                archived: false,
-                                pinned: false,
+                                lifecycle_known: true,
                                 messages: 1,
+                                ..Default::default()
                             },
                         );
                     }
@@ -1916,6 +2250,7 @@ impl AgentsStore {
         }) {
             return;
         }
+        self.remember_recent_session(agent_id, session_id);
         let mut view = SessionView::new(agent_id, session_id, cwd, title);
         let Some(rt) = self.runtime.get(agent_id) else {
             return;
@@ -2642,7 +2977,10 @@ impl AgentsStore {
             return;
         };
         let Some(rpc) = rt.rpc.clone() else { return };
-        if let Some(s) = rt.sessions.iter_mut().find(|s| s.id == session_id) {
+        // Previous state of every loaded copy, restored if the agent refuses.
+        let mut previous = None;
+        for s in rt.sessions_mut(session_id) {
+            previous.get_or_insert((s.resolved, s.archived, s.lifecycle_known));
             if let Some(r) = resolved {
                 s.resolved = r;
             }
@@ -2650,7 +2988,9 @@ impl AgentsStore {
                 s.archived = a;
             }
             s.open = !s.resolved && !s.archived;
+            s.lifecycle_known = true;
         }
+        rt.begin_session_action(session_id);
         cx.notify();
         let mut params = json!({ "session_id": session_id });
         if let Some(r) = resolved {
@@ -2659,17 +2999,31 @@ impl AgentsStore {
         if let Some(a) = archived {
             params["archived"] = json!(a);
         }
-        let agent_id = agent_id.to_string();
+        let (agent_id, session_id) = (agent_id.to_string(), session_id.to_string());
         cx.spawn(async move |this, cx| {
             let result = rpc.request("_querymt/session/setLifecycle", params).await;
             let _ = this.update(cx, |s, cx| {
+                let Some(rt) = s.runtime.get_mut(&agent_id) else {
+                    return;
+                };
                 match result {
                     Err(err) => {
-                        if let Some(rt) = s.runtime.get_mut(&agent_id) {
-                            rt.log(format!("Could not update the session: {err}"));
+                        if let Some((r, a, known)) = previous {
+                            for sess in rt.sessions_mut(&session_id) {
+                                (sess.resolved, sess.archived, sess.lifecycle_known) =
+                                    (r, a, known);
+                                sess.open = !r && !a;
+                            }
                         }
+                        rt.end_session_action(
+                            &session_id,
+                            Some(format!("Could not update the session: {err}")),
+                        );
                     }
-                    Ok(_) => s.schedule_sessions_refresh(&agent_id, Duration::from_millis(200), cx),
+                    Ok(_) => {
+                        rt.end_session_action(&session_id, None);
+                        s.schedule_sessions_refresh(&agent_id, Duration::from_millis(200), cx);
+                    }
                 }
                 cx.notify();
             });
@@ -2981,14 +3335,18 @@ impl AgentsStore {
                     return;
                 };
                 rt.refresh_scheduled = false;
-                if let Ok(fresh) = sessions {
-                    let ids: std::collections::HashSet<String> =
-                        fresh.iter().map(|s| s.id.clone()).collect();
-                    let mut merged = fresh;
-                    merged.extend(rt.sessions.drain(..).filter(|s| !ids.contains(&s.id)));
-                    merged.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-                    rt.sessions = merged;
-                    rt.sessions_loaded = true;
+                match sessions {
+                    Ok(fresh) => {
+                        let ids: std::collections::HashSet<String> =
+                            fresh.iter().map(|s| s.id.clone()).collect();
+                        let mut merged = fresh;
+                        merged.extend(rt.sessions.drain(..).filter(|s| !ids.contains(&s.id)));
+                        merged.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                        rt.sessions = merged;
+                        rt.sessions_loaded = true;
+                        rt.sessions_error = None;
+                    }
+                    Err(err) => rt.sessions_error = Some(err),
                 }
                 cx.notify();
             });
@@ -2998,66 +3356,56 @@ impl AgentsStore {
     }
 }
 
+/// Safety cap on `session/list` pages for the full catalog (250 per page):
+/// the whole history is loaded so tab counts and search are complete.
+const CATALOG_PAGES: usize = 200;
+/// Children pages of one parent (10 per page).
+const CHILD_PAGES: usize = 50;
+
 async fn fetch_sessions(
     rpc: &RpcClient,
     agent_id: &str,
     max_pages: usize,
 ) -> Result<Vec<SessionSummary>, String> {
+    fetch_session_pages(rpc, agent_id, None, max_pages).await
+}
+
+/// Follow `session/list` cursors up to `max_pages`, with optional `_meta`.
+async fn fetch_session_pages(
+    rpc: &RpcClient,
+    agent_id: &str,
+    meta: Option<Value>,
+    max_pages: usize,
+) -> Result<Vec<SessionSummary>, String> {
     let mut sessions = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..max_pages {
-        let params = match &cursor {
+        let mut params = match &cursor {
             Some(c) => json!({ "cursor": c }),
             None => json!({}),
         };
-        let page = rpc.request("session/list", params).await?;
-        for s in page
-            .get("sessions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let text =
-                |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or_default().to_string();
-            let meta = s.get("_meta");
-            let lifecycle = meta.and_then(|m| m.pointer("/querymt/lifecycle"));
-            let flag = |k: &str| {
-                lifecycle
-                    .and_then(|l| l.get(k))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-            };
-            let pinned = meta
-                .and_then(|m| m.pointer("/querymt/pin/pinned"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            sessions.push(SessionSummary {
-                agent_id: agent_id.to_string(),
-                id: text(s.get("sessionId")),
-                cwd: text(s.get("cwd")),
-                title: text(s.get("title")),
-                updated_at: text(s.get("updatedAt")),
-                phase: text(meta.and_then(|m| m.pointer("/runtimeStatus/phase"))),
-                root: meta
-                    .and_then(|m| m.get("parentSessionId"))
-                    .is_none_or(Value::is_null),
-                open: !flag("resolved") && !flag("archived"),
-                resolved: flag("resolved"),
-                archived: flag("archived"),
-                pinned,
-                messages: meta
-                    .and_then(|m| m.get("messageCount"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            });
+        if let Some(meta) = &meta {
+            params["_meta"] = meta.clone();
         }
-        cursor = page
+        let page = rpc.request("session/list", params).await?;
+        sessions.extend(
+            page.get("sessions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|s| SessionSummary::from_list_entry(agent_id, s))
+                .filter(|s| !s.id.is_empty()),
+        );
+        let next = page
             .get("nextCursor")
             .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
             .map(str::to_owned);
-        if cursor.is_none() {
+        // A repeated cursor would loop forever; stop instead.
+        if next.is_none() || next == cursor {
             break;
         }
+        cursor = next;
     }
     Ok(sessions)
 }
@@ -3120,14 +3468,21 @@ async fn load_details(
         apply!(|rt: &mut AgentRuntime| rt.models = models);
     }
 
-    // Up to 1000 sessions: enough for the Sessions page, including resolved/archived.
-    let sessions = fetch_sessions(&rpc, &id, 4).await;
+    // The whole catalog, so lifecycle tab counts and search cover every session.
+    let sessions = fetch_sessions(&rpc, &id, CATALOG_PAGES).await;
     apply!(|rt: &mut AgentRuntime| match sessions {
         Ok(sessions) => {
             rt.sessions = sessions;
             rt.sessions_loaded = true;
+            rt.sessions_error = None;
+            // Expanded children reload on next expansion.
+            rt.children.clear();
         }
-        Err(err) => rt.log(format!("Sessions unavailable: {err}")),
+        Err(err) => {
+            rt.log(format!("Sessions unavailable: {err}"));
+            rt.sessions_loaded = true;
+            rt.sessions_error = Some(err);
+        }
     });
 
     load_extras(
@@ -3532,6 +3887,41 @@ async fn load_extras(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_list_entry_reads_relations_worktree_remote_and_status() {
+        let entry = json!({
+            "sessionId": "s1", "cwd": "/w/checkout", "title": "T", "updatedAt": "2026-11-07T23:26:14Z",
+            "_meta": {
+                "parentSessionId": "p1", "forkOrigin": "user", "forkCount": 2, "hasChildren": true,
+                "messageCount": 5, "hasErrors": true,
+                "location": "remote", "nodeId": "node-123456789", "nodeLabel": "", "connectionState": "disconnected",
+                "runtimeStatus": { "phase": "idle", "observation": { "availability": "unavailable" } },
+                "querymt": {
+                    "lifecycle": { "session_id": "s1", "resolved": true, "archived": false },
+                    "pin": { "pinned": true, "pinned_at": "x" },
+                    "workspace": { "workspaceId": "w", "branch": "feat", "sourceCwd": "/w/repo", "lifecycle": "failed" }
+                }
+            }
+        });
+        let s = SessionSummary::from_list_entry("a", &entry);
+        assert!(!s.root && s.parent.as_deref() == Some("p1"));
+        assert_eq!((s.fork_count, s.has_children, s.messages), (2, true, 5));
+        assert!(s.has_errors && s.pinned && s.resolved && !s.open && s.lifecycle_known);
+        // Unobservable runtime is unknown, never running.
+        assert!(s.status_unknown() && !s.running());
+        assert_eq!(s.group_cwd(), "/w/repo");
+        assert!(!s.worktree.as_ref().unwrap().usable());
+        let remote = s.remote.unwrap();
+        assert!(!remote.connected);
+        assert_eq!(remote.name(), "node-123");
+
+        let bare = SessionSummary::from_list_entry("a", &json!({ "sessionId": "s2", "cwd": "/w" }));
+        assert!(bare.root && !bare.lifecycle_known && bare.status_unknown());
+        assert_eq!(bare.group_cwd(), "/w");
+        let live = json!({ "sessionId": "s3", "_meta": { "runtimeStatus": { "phase": "tools" } } });
+        assert!(SessionSummary::from_list_entry("a", &live).running());
+    }
 
     #[test]
     fn new_session_params_send_only_non_default_profiles() {

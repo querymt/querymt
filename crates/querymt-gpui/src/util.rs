@@ -62,6 +62,23 @@ pub fn workspace_name(cwd: &str) -> String {
         .to_string()
 }
 
+/// Full timestamp for tooltips: `Nov 7, 2026, 23:26 UTC` (the zone is named
+/// only when the timestamp is in UTC; offsets are not converted).
+pub fn absolute_time(timestamp: &str) -> Option<String> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let num = |range: std::ops::Range<usize>| timestamp.get(range)?.parse::<u32>().ok();
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hour, minute) = (num(11..13)?, num(14..16)?);
+    let name = MONTHS.get(month.checked_sub(1)? as usize)?;
+    let utc = timestamp.ends_with('Z') || timestamp.ends_with("+00:00");
+    Some(format!(
+        "{name} {day}, {year}, {hour:02}:{minute:02}{}",
+        if utc { " UTC" } else { "" }
+    ))
+}
+
 /// Compact age like the Svelte app: `now`, `5m`, `2h`, `3d`, then `Oct 31`.
 pub fn short_time(timestamp: &str) -> String {
     let Some(ms) = parse_rfc3339_ms(timestamp) else {

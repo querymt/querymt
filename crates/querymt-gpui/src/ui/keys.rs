@@ -76,7 +76,7 @@ enum PaletteTarget {
     NewSession,
     ToggleSidebar,
     Page(Page),
-    Session(SessionSummary),
+    Session(Box<SessionSummary>),
 }
 
 const PAGES: [(Page, IconName, &str); 6] = [
@@ -150,7 +150,7 @@ impl QmtApp {
     }
 
     /// Start page with the prompt focused.
-    fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = false;
         self.go(Page::Start, cx);
         self.prompt.update(cx, |s, cx| s.focus(window, cx));
@@ -305,8 +305,7 @@ impl QmtApp {
                 .collect(),
             sessions
                 .iter()
-                .cloned()
-                .map(PaletteTarget::Session)
+                .map(|s| PaletteTarget::Session(Box::new(s.clone())))
                 .collect(),
         ]);
         let actions = CommandGroup::new()
