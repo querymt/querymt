@@ -75,7 +75,9 @@ Conventions used below. They are reference text, not tracked tasks.
   - `delegation_from_a_plain_agent_runs` (agent-delegation / Delegation from a plain agent runs, with a pre-registered member);
   - `internal_sub_agent_extends_a_standalone_agent` (dotagents-protocol / Internal sub-agent extends a standalone agent, with a `.agents` target);
   - `runtime_with_configured_delegates_and_a_protocol_target_starts` (dotagents-protocol / Runtime with configured delegates and a protocol target starts).
-- [ ] 3.2 Move service ownership to the root handle. Runtime `LocalAgentHandle` owns the `DelegationOrchestrator` and its listener and stops them in `shutdown` (`agent/handle/core.rs`). Top `AgentQuorum` calls it. Verify: Run-R `delegation_loop` and Run-T `quorum_parent_clock`; both pass unchanged.
+- [x] 3.2 Move service ownership to the root handle. Runtime `LocalAgentHandle` owns the `DelegationOrchestrator` and its listener and stops them in `shutdown` (`agent/handle/core.rs`). Top `AgentQuorum` calls it. Verify: Run-R `delegation_loop` and Run-T `quorum_parent_clock`; both pass unchanged.
+  - Done: `LocalAgentHandle` has a `delegation_service` slot (`install_delegation_service`, `delegation_orchestrator`, `stop_delegation_service` called first in `shutdown`; `Drop` aborts an unstopped listener). `AgentQuorumBuilder::build` installs the orchestrator and listener on a local planner; `AgentQuorum` lost its `Drop` and only stops the service itself for a non-local planner (the remote-planner acceptance test keeps working until 4.3/6.1 remove that case).
+  - Run-R `delegation_loop`: 28 passed. Run-T `quorum_parent_clock` + `shutdown_with_profiles_and_quorum` + `quorum_preserves_nonlocal`: 3 passed.
 - [ ] 3.3 Add runtime `delegation::build_root` and `RootDelegation` (design D5):
   - The delegation-enabled rule lives in one function.
   - The delegation summarizer and the peer routing (`RoutingActor`) setup move from top `api/quorum.rs:737-1000`.

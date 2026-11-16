@@ -176,8 +176,25 @@ pub struct LocalAgentHandle {
     /// `None` if scheduling is not enabled or lease was not acquired.
     pub scheduler_handle: SchedulerHandleSlot,
 
+    /// The delegation service this handle owns when it is a runtime's root:
+    /// the orchestrator and its listener task. Stopped by `shutdown()`.
+    delegation_service: ParkingMutex<Option<DelegationService>>,
+
     /// Guard to ensure `shutdown()` only runs its body once.
     shutdown_done: AtomicBool,
+}
+
+/// A running delegation service: the orchestrator and the task that feeds it.
+struct DelegationService {
+    orchestrator: Arc<crate::delegation::DelegationOrchestrator>,
+    listener: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DelegationService {
+    fn drop(&mut self) {
+        // A handle dropped without `shutdown()` must not leave the listener running.
+        self.listener.abort();
+    }
 }
 
 #[doc(hidden)]

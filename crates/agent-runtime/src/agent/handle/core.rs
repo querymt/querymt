@@ -122,6 +122,7 @@ impl LocalAgentHandle {
             oauth_service,
             profiles,
             scheduler_handle: Arc::new(parking_lot::Mutex::new(None)),
+            delegation_service: parking_lot::Mutex::new(None),
             shutdown_done: AtomicBool::new(false),
         }
     }
@@ -643,6 +644,53 @@ impl LocalAgentHandle {
     #[doc(hidden)]
     pub fn is_shutdown(&self) -> bool {
         self.shutdown_done.load(Ordering::SeqCst)
+    }
+
+    /// Make this handle the owner of a running delegation service. Replaces
+    /// (and aborts) a previously installed listener.
+    #[doc(hidden)]
+    pub fn install_delegation_service(
+        &self,
+        orchestrator: Arc<crate::delegation::DelegationOrchestrator>,
+        listener: tokio::task::JoinHandle<()>,
+    ) {
+        let previous = self
+            .delegation_service
+            .lock()
+            .replace(super::DelegationService {
+                orchestrator,
+                listener,
+            });
+        drop(previous);
+    }
+
+    /// The delegation service owned by this handle, if it is a root.
+    pub fn delegation_orchestrator(
+        &self,
+    ) -> Option<Arc<crate::delegation::DelegationOrchestrator>> {
+        self.delegation_service
+            .lock()
+            .as_ref()
+            .map(|service| service.orchestrator.clone())
+    }
+
+    /// Stops the owned delegation service: no new claims, listener drained
+    /// (aborted after one second), active delegations cancelled.
+    async fn stop_delegation_service(&self) {
+        let Some(service) = self.delegation_service.lock().take() else {
+            return;
+        };
+        service.orchestrator.begin_shutdown();
+        let mut service = service;
+        let listener = &mut service.listener;
+        tokio::select! {
+            _ = &mut *listener => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                listener.abort();
+                let _ = (&mut *listener).await;
+            }
+        }
+        service.orchestrator.cancel_active_delegations().await;
     }
 
     #[doc(hidden)]
@@ -1207,6 +1255,8 @@ impl LocalAgentHandle {
             return;
         }
         log::info!("LocalAgentHandle: Requesting shutdown");
+
+        self.stop_delegation_service().await;
 
         if let Some(scheduler) = self.scheduler() {
             scheduler.request_shutdown();

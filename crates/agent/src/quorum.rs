@@ -61,19 +61,6 @@ pub struct AgentQuorum {
     cwd: Option<PathBuf>,
 }
 
-impl Drop for AgentQuorum {
-    fn drop(&mut self) {
-        // Recover the mutex guard even if poisoned to avoid panicking in Drop
-        let mut guard = match self.listener_handle.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(handle) = guard.take() {
-            handle.abort();
-        }
-    }
-}
-
 impl AgentQuorum {
     pub async fn builder(db_path: Option<PathBuf>) -> Result<AgentQuorumBuilder, AgentQuorumError> {
         let path = match db_path {
@@ -132,25 +119,34 @@ impl AgentQuorum {
     }
 
     pub async fn shutdown(&self) {
-        if let Some(orchestrator) = &self.orchestrator {
-            orchestrator.begin_shutdown();
-        }
-        let listener = self
-            .listener_handle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(mut handle) = listener {
-            tokio::select! {
-                _ = &mut handle => {}
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                    handle.abort();
-                    let _ = handle.await;
+        // A local planner owns the delegation service and stops it itself.
+        // A non-local planner leaves it to the quorum.
+        if self
+            .planner
+            .as_any()
+            .downcast_ref::<crate::agent::LocalAgentHandle>()
+            .is_none()
+        {
+            if let Some(orchestrator) = &self.orchestrator {
+                orchestrator.begin_shutdown();
+            }
+            let listener = self
+                .listener_handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(mut handle) = listener {
+                tokio::select! {
+                    _ = &mut handle => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
                 }
             }
-        }
-        if let Some(orchestrator) = &self.orchestrator {
-            orchestrator.cancel_active_delegations().await;
+            if let Some(orchestrator) = &self.orchestrator {
+                orchestrator.cancel_active_delegations().await;
+            }
         }
         self.planner.shutdown().await;
         for delegate in &self.delegates {
@@ -477,9 +473,18 @@ impl AgentQuorumBuilder {
             None
         };
 
-        let listener_handle = orchestrator
+        let mut listener_handle = orchestrator
             .as_ref()
             .map(|orchestrator| orchestrator.start_listening(&self.event_fanout));
+        if let (Some(orchestrator), Some(local)) = (
+            orchestrator.as_ref(),
+            planner
+                .as_any()
+                .downcast_ref::<crate::agent::LocalAgentHandle>(),
+        ) && let Some(listener) = listener_handle.take()
+        {
+            local.install_delegation_service(orchestrator.clone(), listener);
+        }
         Ok(AgentQuorum {
             storage: self.storage,
             event_fanout: self.event_fanout,
