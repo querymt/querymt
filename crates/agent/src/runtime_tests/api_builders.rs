@@ -1,9 +1,9 @@
 use crate::config::*;
-use crate::dotagents::{DotagentsLoadOptions, DotagentsManifest};
+use crate::dotagents::DotagentsManifest;
 
 #[test]
 fn repository_knowledge_builders_carry_settings_only_when_enabled() {
-    use crate::api::{Agent, QuorumBuilder};
+    use crate::api::Agent;
 
     // Disabled single-agent config: builder holds no settings at all.
     let disabled: SingleAgentConfig =
@@ -26,10 +26,8 @@ fn repository_knowledge_builders_carry_settings_only_when_enabled() {
     let b = crate::api::AgentBuilder::new()
         .repository_knowledge(RepositoryKnowledgeSettings::enabled());
     assert!(b.configured_repository_knowledge().unwrap().enabled);
-    let q = QuorumBuilder::new().repository_knowledge(RepositoryKnowledgeSettings::enabled());
-    assert!(q.configured_repository_knowledge().unwrap().enabled);
     assert!(
-        QuorumBuilder::new()
+        crate::api::AgentBuilder::new()
             .configured_repository_knowledge()
             .is_none()
     );
@@ -90,14 +88,4 @@ fn programmatic_builders_default_disabled_and_accept_protocol_inputs() {
         .dotagents_manifest(DotagentsManifest::empty());
     assert!(single.configured_dotagents_options().unwrap().is_enabled());
     assert!(single.configured_dotagents_manifest().is_some());
-
-    let quorum = crate::api::QuorumBuilder::new();
-    assert!(quorum.configured_dotagents_options().is_none());
-    assert!(quorum.configured_dotagents_manifest().is_none());
-
-    let quorum = quorum
-        .dotagents_options(DotagentsLoadOptions::enabled())
-        .dotagents_manifest(DotagentsManifest::empty());
-    assert!(quorum.configured_dotagents_options().unwrap().is_enabled());
-    assert!(quorum.configured_dotagents_manifest().is_some());
 }

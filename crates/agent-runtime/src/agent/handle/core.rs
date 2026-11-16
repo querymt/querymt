@@ -123,6 +123,7 @@ impl LocalAgentHandle {
             profiles,
             scheduler_handle: Arc::new(parking_lot::Mutex::new(None)),
             delegation_service: parking_lot::Mutex::new(None),
+            members: parking_lot::Mutex::new(Vec::new()),
             shutdown_done: AtomicBool::new(false),
         }
     }
@@ -662,6 +663,17 @@ impl LocalAgentHandle {
                 listener,
             });
         drop(previous);
+    }
+
+    /// Make this handle the owner of the local members built for it.
+    #[doc(hidden)]
+    pub fn install_members(&self, members: Vec<(String, Arc<LocalAgentHandle>)>) {
+        *self.members.lock() = members;
+    }
+
+    /// The local members this root built, in configuration order.
+    pub fn local_members(&self) -> Vec<(String, Arc<LocalAgentHandle>)> {
+        self.members.lock().clone()
     }
 
     /// The delegation service owned by this handle, if it is a root.
@@ -1257,6 +1269,11 @@ impl LocalAgentHandle {
         log::info!("LocalAgentHandle: Requesting shutdown");
 
         self.stop_delegation_service().await;
+        let members = std::mem::take(&mut *self.members.lock());
+        for (_, member) in members {
+            // Members own no members, so this recursion is one level deep.
+            Box::pin(member.shutdown()).await;
+        }
 
         if let Some(scheduler) = self.scheduler() {
             scheduler.request_shutdown();

@@ -74,21 +74,10 @@ pub struct ProfileRuntime {
 impl ProfileRuntime {
     /// Runtime-side view of this profile runtime (root handle plus delegates).
     pub fn view(&self) -> Arc<ProfileRuntimeView> {
-        let delegates = self
-            .agent
-            .quorum()
-            .map(|quorum| {
-                quorum
-                    .delegates()
-                    .iter()
-                    .map(|entry| (entry.info.id.clone(), entry.agent.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
         Arc::new(ProfileRuntimeView {
             metadata: self.metadata.clone(),
             handle: self.agent.handle(),
-            delegates,
+            registry: self.agent.handle().config.agent_registry(),
             provider_lock: self.provider_lock.clone(),
         })
     }
@@ -843,9 +832,6 @@ where
         self.building_runtimes.lock().await.clear();
         drop(lifecycle);
         for runtime in stale_runtimes {
-            if let Some(quorum) = runtime.agent.quorum() {
-                quorum.shutdown().await;
-            }
             runtime.agent.handle().shutdown().await;
         }
         Ok(profiles)
@@ -918,17 +904,11 @@ where
             let lifecycle = self.lifecycle.lock().await;
             if self.shutdown.load(Ordering::Acquire) {
                 drop(lifecycle);
-                if let Some(quorum) = runtime.agent.quorum() {
-                    quorum.shutdown().await;
-                }
                 runtime.agent.handle().shutdown().await;
                 return Err(anyhow!("profile runtime manager is shut down"));
             }
             if self.generation.load(Ordering::Acquire) != generation {
                 drop(lifecycle);
-                if let Some(quorum) = runtime.agent.quorum() {
-                    quorum.shutdown().await;
-                }
                 runtime.agent.handle().shutdown().await;
                 continue;
             }
@@ -1288,9 +1268,6 @@ where
         let runtimes = std::mem::take(&mut *self.runtimes.lock().await);
         drop(lifecycle);
         for runtime in runtimes.into_values() {
-            if let Some(quorum) = runtime.agent.quorum() {
-                quorum.shutdown().await;
-            }
             runtime.agent.handle().shutdown().await;
         }
     }
@@ -1456,60 +1433,16 @@ async fn build_profile_runtime(
         shared_infra.plugin_registry = registry;
         lock
     };
-    let agent = match document.config {
-        Config::Single(config) => {
-            let attachment_source = shared_infra.session_mcp_attachment_source.clone();
-            #[cfg(feature = "remote")]
-            let mesh_setup = config.mesh.enabled.then(|| {
-                (
-                    config.mesh.clone(),
-                    config.remote_agents.clone(),
-                    config.mesh.auto_fallback,
-                )
-            });
-
-            // Thread the protocol workspace through the normal builder so the
-            // runtime picks up `<workspace>/.agents/` without the TOML profile
-            // catalog needing to understand protocol profiles.
-            let mut builder = Agent::builder_from_config_with_dotagents(
-                *config,
-                None,
-                dotagents_workspace.as_deref(),
-            )?;
-            if let Some(source) = attachment_source {
-                builder = builder.with_session_mcp_attachment_source(source);
-            }
-            #[cfg(feature = "remote")]
-            if let Some((mesh_config, remote_agents, _)) = &mesh_setup {
-                builder = builder.mesh(
-                    crate::api::Mesh::from_toml(mesh_config.clone())
-                        .with_remote_agents(remote_agents.clone()),
-                );
-            }
-            let agent = builder.infra(shared_infra).build().await?;
-            #[cfg(feature = "remote")]
-            if let Some((_, _, auto_fallback)) = mesh_setup {
-                agent.handle().set_mesh_fallback(auto_fallback);
-            }
-            agent
-        }
-        Config::Multi(config) => {
-            #[cfg(feature = "remote")]
-            let infra = shared_infra.clone();
-            #[cfg(not(feature = "remote"))]
-            let infra = shared_infra;
-
-            let mut builder = Agent::builder_from_quorum_config(*config, None)?;
-            if let Some(workspace) = dotagents_workspace {
-                builder = builder.with_dotagents_workspace(workspace);
-            }
-            builder
-                .with_profile_id(metadata.id.clone())
-                .infra(infra)
-                .build()
-                .await?
-        }
-    };
+    // Thread the protocol workspace through the normal builder so the runtime
+    // picks up `<workspace>/.agents/` without the TOML profile catalog needing
+    // to understand protocol profiles.
+    let builder =
+        Agent::builder_from_config_value(document.config, dotagents_workspace.as_deref())?;
+    let agent = builder
+        .with_profile_id(metadata.id.clone())
+        .infra(shared_infra)
+        .build()
+        .await?;
 
     Ok(ProfileRuntime {
         metadata,
@@ -2631,7 +2564,7 @@ capabilities = ["coding"]
         .await
         .expect("initial quorum runtime build hung")
         .expect("initial quorum runtime");
-        assert!(first.agent().quorum().is_some());
+        assert!(first.agent().is_multi());
         assert!(
             first
                 .agent()

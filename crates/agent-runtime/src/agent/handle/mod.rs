@@ -180,6 +180,10 @@ pub struct LocalAgentHandle {
     /// the orchestrator and its listener task. Stopped by `shutdown()`.
     delegation_service: ParkingMutex<Option<DelegationService>>,
 
+    /// Local members built for this root, stopped by `shutdown()` after the
+    /// delegation service.
+    members: ParkingMutex<Vec<(String, Arc<LocalAgentHandle>)>>,
+
     /// Guard to ensure `shutdown()` only runs its body once.
     shutdown_done: AtomicBool,
 }

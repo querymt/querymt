@@ -10,7 +10,6 @@ pub mod acp;
 pub mod api;
 pub mod prelude;
 pub mod profiles;
-pub mod quorum;
 pub mod runner;
 #[cfg(feature = "api")]
 pub mod server;
@@ -104,4 +103,3 @@ pub use agent::{
     AgentConfig, AgentHandle, DelegationContextConfig, DelegationContextTiming, LocalAgentHandle,
     SessionActor, SessionRegistry,
 };
-pub use quorum::{AgentQuorum, AgentQuorumBuilder, AgentQuorumError, DelegateAgent};

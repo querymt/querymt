@@ -137,42 +137,25 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
         })?
         .metadata;
 
-    let agent = match config {
-        Config::Single(single) => {
-            querymt_agent::api::Agent::from_single_config_with_infra(*single, infra.clone())
-                .await
-                .map_err(|e| {
-                    set_last_error(
-                        FfiErrorCode::RuntimeError,
-                        format!("Agent construction failed: {:#}", e),
-                    );
-                    FfiErrorCode::RuntimeError
-                })?
-        }
-        Config::Multi(quorum) => {
-            log::info!("Initializing multi-agent/quorum config");
-            let builder = querymt_agent::api::Agent::builder_from_quorum_config(*quorum, None)
-                .map_err(|e| {
-                    set_last_error(
-                        FfiErrorCode::RuntimeError,
-                        format!("Quorum configuration failed: {:#}", e),
-                    );
-                    FfiErrorCode::RuntimeError
-                })?;
-            builder
-                .with_profile_id(DEFAULT_EMBEDDED_PROFILE_KEY)
-                .infra(infra.clone())
-                .build()
-                .await
-                .map_err(|e| {
-                    set_last_error(
-                        FfiErrorCode::RuntimeError,
-                        format!("Quorum construction failed: {:#}", e),
-                    );
-                    FfiErrorCode::RuntimeError
-                })?
-        }
-    };
+    let agent = querymt_agent::api::Agent::builder_from_config_value(config, None)
+        .map_err(|e| {
+            set_last_error(
+                FfiErrorCode::RuntimeError,
+                format!("Agent configuration failed: {:#}", e),
+            );
+            FfiErrorCode::RuntimeError
+        })?
+        .with_profile_id(DEFAULT_EMBEDDED_PROFILE_KEY)
+        .infra(infra.clone())
+        .build()
+        .await
+        .map_err(|e| {
+            set_last_error(
+                FfiErrorCode::RuntimeError,
+                format!("Agent construction failed: {:#}", e),
+            );
+            FfiErrorCode::RuntimeError
+        })?;
     let profile_manager = Arc::new(ProfileRuntimeManager::with_runtime(
         profile_catalog,
         infra,

@@ -18,7 +18,7 @@ use crate::dotagents::{DotagentsSubAgentPlans, DotagentsTargetFactory, Dotagents
 use crate::middleware::MiddlewareDriver;
 use crate::session::provider::SessionProvider;
 use crate::session::store::SessionStore;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use querymt::plugin::host::PluginRegistry;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -77,6 +77,7 @@ pub async fn build_root(
 
     // Members: pre-registered first, then configured delegates, which win.
     let mut base = DefaultAgentRegistry::new();
+    let mut member_handles: Vec<(String, Arc<LocalAgentHandle>)> = Vec::new();
     if let Some(preregistered) = &delegation.preregistered {
         for info in preregistered.list_agents() {
             if let Some(handle) = preregistered.get_handle(&info.id) {
@@ -91,7 +92,8 @@ pub async fn build_root(
                 &delegation.member_params,
                 storage.clone(),
                 fanout.clone(),
-            )?
+            )
+            .with_context(|| format!("delegate '{}'", spec.id))?
             .build(),
         )));
         base.register_handle(
@@ -104,8 +106,9 @@ pub async fn build_root(
                 required_capabilities: spec.required_capabilities.clone(),
                 meta: None,
             },
-            handle,
+            handle.clone(),
         );
+        member_handles.push((spec.id.clone(), handle));
     }
 
     // Protocol targets are built on first use, on this runtime's event stream.
@@ -157,7 +160,10 @@ pub async fn build_root(
     // built so far; config entries and the defaults share one assembly path.
     let initial_config = Arc::new(builder.build());
     let temp_handle = Arc::new(LocalAgentHandle::from_config(initial_config.clone()));
-    let mut middleware_drivers: Vec<Arc<dyn MiddlewareDriver>> = Vec::new();
+    // Drivers the builder already holds (the delegation context driver) come
+    // first; `with_middleware` replaces the list, so they are carried over.
+    let mut middleware_drivers: Vec<Arc<dyn MiddlewareDriver>> =
+        initial_config.middleware_drivers.clone();
     for factory in delegation.middleware_factories {
         middleware_drivers.push(factory(&temp_handle));
     }
@@ -172,6 +178,7 @@ pub async fn build_root(
     let initial = Arc::try_unwrap(initial_config).unwrap_or_else(|arc| (*arc).clone());
     let config = Arc::new(initial.with_middleware(middleware_drivers));
     let handle = Arc::new(LocalAgentHandle::from_config(config.clone()));
+    handle.install_members(member_handles);
 
     if enabled {
         let settings = &delegation.settings;

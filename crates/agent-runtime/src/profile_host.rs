@@ -184,7 +184,8 @@ where
 pub struct ProfileRuntimeView {
     pub metadata: ProfileMetadata,
     pub handle: Arc<LocalAgentHandle>,
-    pub delegates: Vec<(String, Arc<dyn crate::agent::handle::AgentHandle>)>,
+    /// The root's agent registry; members are read from it by ID.
+    pub registry: Arc<dyn crate::delegation::AgentRegistry + Send + Sync>,
     pub provider_lock: Option<ResolvedProfileProviderLock>,
 }
 
@@ -197,12 +198,9 @@ impl ProfileRuntimeView {
         self.handle.clone()
     }
 
-    /// Delegate handle by id (`None` for single agents or unknown ids).
+    /// Member handle by id (`None` for unknown ids).
     pub fn delegate(&self, id: &str) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
-        self.delegates
-            .iter()
-            .find(|(delegate_id, _)| delegate_id == id)
-            .map(|(_, handle)| handle.clone())
+        self.registry.get_handle(id)
     }
 
     pub fn session_binding(&self) -> SessionProfileBinding {

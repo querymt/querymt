@@ -11,9 +11,9 @@
 //!     .build()
 //!     .await?;
 //!
-//! // Multi-agent (same Agent type back)
-//! let agent = Agent::multi()
-//!     .planner(|p| p.provider("openai", "gpt-4"))
+//! // With members it can delegate to (same Agent type back)
+//! let agent = Agent::single()
+//!     .provider("openai", "gpt-4")
 //!     .delegate("coder", |d| d.provider("anthropic", "claude-sonnet-4-20250514"))
 //!     .build()
 //!     .await?;
@@ -27,8 +27,7 @@ pub use crate::error::AgentError;
 // High-level APIs
 pub use crate::api::{
     Agent, AgentBuilder, AgentInfra, AgentMesh, AgentProfiles, AgentSession, DelegateConfigBuilder,
-    Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec, PlannerConfigBuilder, ProfileRuntimeHandle,
-    QuorumBuilder,
+    Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec, ProfileRuntimeHandle,
 };
 // Config and runner APIs
 pub use crate::config::{
@@ -42,7 +41,6 @@ pub use crate::runner::{
 
 // Core agent types
 pub use crate::agent::{AgentHandle, LocalAgentHandle, SnapshotPolicy, ToolPolicy};
-pub use crate::quorum::{AgentQuorum, DelegateAgent};
 
 // Events
 pub use crate::events::{AgentEvent, AgentEventKind};

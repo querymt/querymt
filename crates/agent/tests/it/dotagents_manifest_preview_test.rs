@@ -5,7 +5,7 @@
 //! server is started, no task is persisted or scheduled, no memory is
 //! imported, and no protocol directory is created.
 
-use querymt_agent::api::{AgentBuilder, QuorumBuilder};
+use querymt_agent::api::AgentBuilder;
 use querymt_agent::dotagents::{
     DotagentsAgentConnectionType, DotagentsAgentRole, DotagentsLoadError, DotagentsLoadOptions,
     DotagentsMcpTransport, DotagentsStrictness, DotagentsTaskKind,
@@ -325,7 +325,7 @@ fn strict_preview_preserves_typed_load_error_manifest() {
         .expect("single-agent preview preserves DotagentsLoadError");
     assert!(load_error.manifest.has_errors());
 
-    let error = QuorumBuilder::new()
+    let error = AgentBuilder::new()
         .cwd(workspace.path())
         .dotagents_options(options)
         .preview_dotagents_manifest()
@@ -344,7 +344,7 @@ fn quorum_builder_preview_resolves_manifest() {
 
     let before = snapshot(workspace.path());
 
-    let builder = QuorumBuilder::new()
+    let builder = AgentBuilder::new()
         .cwd(workspace.path())
         .dotagents_options(workspace_options(workspace.path(), global.path()));
     let manifest = builder.preview_dotagents_manifest().unwrap().unwrap();

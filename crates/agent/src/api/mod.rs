@@ -1,8 +1,7 @@
 //! Primary public API for agent creation and interaction.
 //!
-//! `Agent` is the single runtime type for both single agents and multi-agent
-//! quorums. `Agent::single()` and `Agent::multi()` return different builders
-//! that both produce `Agent`.
+//! `Agent` is the single runtime type. `Agent::single()` returns the builder and
+//! `.delegate(..)` adds members the agent can delegate to.
 //!
 //! # Single Agent
 //!
@@ -23,16 +22,17 @@
 //! # }
 //! ```
 //!
-//! # Multi-Agent (quorum)
+//! # With delegates
 //!
 //! ```no_run
 //! use querymt_agent::prelude::*;
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let agent = Agent::multi()
+//! let agent = Agent::single()
 //!     .cwd(".")
-//!     .planner(|p| p.provider("openai", "gpt-4").tools(["delegate"]))
+//!     .provider("openai", "gpt-4")
+//!     .tools(["delegate"])
 //!     .delegate("coder", |d| {
 //!         d.provider("anthropic", "claude-sonnet-4-20250514")
 //!             .tools(["shell", "edit"])
@@ -61,7 +61,6 @@ mod agent;
 mod config;
 mod dotagents_runtime;
 mod profiles;
-mod quorum;
 mod utils;
 mod worktrees;
 
@@ -70,7 +69,7 @@ pub use querymt_agent_runtime::api::{mesh, sessions};
 
 // Re-export public API types
 pub use agent::{Agent, AgentBuilder, AgentInfra};
-pub use config::{DelegateConfigBuilder, PlannerConfigBuilder};
+pub use config::DelegateConfigBuilder;
 pub use profiles::{AgentProfiles, ProfileRuntimeHandle};
 pub use querymt_agent_runtime::api::AgentSession;
 pub use querymt_agent_runtime::api::sessions::AcpSessionListError;
@@ -83,7 +82,6 @@ pub use querymt_agent_runtime::api::sessions::{
 };
 pub use querymt_agent_runtime::api::{AgentMesh, Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec};
 pub use querymt_agent_runtime::dotagents::DotagentsTargetFactory;
-pub use quorum::QuorumBuilder;
 pub use worktrees::{AgentWorktrees, SessionOptions};
 
 #[cfg(test)]

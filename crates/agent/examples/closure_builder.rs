@@ -1,24 +1,21 @@
-/// Example demonstrating the closure-based multi-agent builder API
+/// Example demonstrating the closure-based delegate builder API
 ///
-/// This shows how to configure a multi-agent quorum using closures for
+/// This shows how to give one agent several delegates using closures for
 /// a clean, self-documenting configuration style.
 use querymt_agent::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Build a multi-agent quorum with closure-based configuration
-    let runner = Agent::multi()
+    // Build an agent with delegates, using closure-based configuration
+    let runner = Agent::single()
         .cwd(".")
         .db("./quorum.db")
-        // Configure the planner agent
-        .planner(|p| {
-            p.provider("openai", "gpt-4")
-                .system(
-                    "You are a principal engineer coordinating specialist agents. \
-                Delegate implementation to the coder and research to the researcher.",
-                )
-                .tools(["delegate", "create_task", "read_tool", "search_text"])
-        })
+        .provider("openai", "gpt-4")
+        .system(
+            "You are a principal engineer coordinating specialist agents. \
+            Delegate implementation to the coder and research to the researcher.",
+        )
+        .tools(["delegate", "create_task", "read_tool", "search_text"])
         // Add a coder delegate
         .delegate("coder", |d| {
             d.provider("ollama", "qwen2.5-coder:latest")
@@ -48,12 +45,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .tools(["web_fetch", "read_tool"])
         })
-        // Enable delegation and verification
-        .with_defaults()
+        .delegation(true)
+        .delegation_settings(querymt_agent::config::DelegationSettings {
+            verification: true,
+            ..Default::default()
+        })
         .build()
         .await?;
 
-    println!("Multi-agent quorum ready!");
+    println!("Agent with delegates ready!");
     println!("- Planner: OpenAI GPT-4");
     println!("- Coder: Ollama Qwen 2.5 Coder");
     println!("- Researcher: Anthropic Claude 3 Sonnet\n");

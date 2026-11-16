@@ -10,7 +10,7 @@
 //! wiring between protocol resolution and runtime construction stays covered.
 
 use querymt::plugin::host::PluginRegistry;
-use querymt_agent::api::{AgentBuilder, QuorumBuilder};
+use querymt_agent::api::AgentBuilder;
 use querymt_agent::dotagents::{
     DotagentsAgentRole, DotagentsLoadOptions, DotagentsTaskApprovalDecision,
     DotagentsTaskApprovalRequest, DotagentsTaskKind, DotagentsTaskTrustPolicy,
@@ -646,7 +646,7 @@ fn direct_collision_filter_skips_the_protocol_target() {
         "the protocol target resolves before collision handling"
     );
 
-    // Exercise the direct collision filter. QuorumBuilder integration is
+    // Exercise the direct collision filter. delegate integration is
     // covered separately because this fixture does not construct a runnable
     // explicit delegate handle.
     let explicit_ids: std::collections::HashSet<String> = ["helper".to_string()].into();
@@ -914,7 +914,7 @@ fn quorum_builder_resolves_the_same_two_layer_manifest() {
     write_workspace_layer(workspace.path());
     write_global_layer(global.path());
 
-    let builder = QuorumBuilder::new()
+    let builder = AgentBuilder::new()
         .cwd(workspace.path())
         .dotagents_options(both_layer_options(workspace.path(), global.path()));
     let manifest = builder

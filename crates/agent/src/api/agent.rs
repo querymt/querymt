@@ -3,7 +3,6 @@
 #[cfg(feature = "remote")]
 use super::mesh::{AgentMesh, Mesh, MeshSpec};
 use super::profiles::{AgentProfiles, ProfileRuntimeHandle};
-use super::quorum::QuorumBuilder;
 use super::sessions::{AgentSessions, ListSessionsOptions, SessionListPage};
 use super::utils::{default_registry, latest_assistant_message, to_absolute_path};
 use super::worktrees::{AgentWorktrees, SessionOptions};
@@ -132,23 +131,33 @@ pub struct AgentBuilder {
     repository_knowledge_registry:
         Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
     /// MCP servers from TOML `[[mcp]]` config, attached to every new session.
-    mcp_servers: Vec<McpServerConfig>,
+    pub(super) mcp_servers: Vec<McpServerConfig>,
     /// Runtime MCP attachment source (e.g., mobile in-process MCP peers).
     session_mcp_attachment_source: Option<Arc<dyn SessionMcpAttachmentSource>>,
     /// Optional pre-built agent registry (Phase 7: injected by `from_single_config_with_registry`).
     pub(super) agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
     /// Members the root can delegate to, built when the agent is.
-    delegates: Vec<crate::delegation::member::MemberBuildSpec>,
+    pub(super) delegates: Vec<crate::delegation::member::MemberBuildSpec>,
     /// Whether delegation is on (default). It also needs the root's `tools`
     /// to admit `delegate`.
     delegation_enabled: bool,
-    delegation_settings: crate::config::DelegationSettings,
+    pub(super) delegation_settings: crate::config::DelegationSettings,
     /// Set for profile runtimes so each delegation service claims only its own sessions.
     profile_id: Option<String>,
+    /// Set by `[quorum]` configs, which keep their old root behaviour: the root
+    /// is named `planner`, gets a git snapshot backend whenever the snapshot
+    /// policy is not `none`, and a `skill` tool without configured skills is
+    /// an error.
+    quorum_shape: bool,
     /// Optional pre-built infrastructure (plugin registry + storage).
     infra: Option<AgentInfra>,
     #[cfg(feature = "remote")]
     mesh: Option<Mesh>,
+    #[cfg(feature = "remote")]
+    mesh_auto_fallback: bool,
+    /// Delegates with a `peer`: `(delegate_id, peer_name)`.
+    #[cfg(feature = "remote")]
+    pub(super) peer_delegates: Vec<(String, String)>,
     /// Override: maximum execution steps (forwarded to AgentConfigBuilder).
     max_steps_override: Option<usize>,
     /// Override: maximum prompt bytes (forwarded to AgentConfigBuilder).
@@ -194,9 +203,14 @@ impl AgentBuilder {
             delegation_enabled: true,
             delegation_settings: crate::config::DelegationSettings::default(),
             profile_id: None,
+            quorum_shape: false,
             infra: None,
             #[cfg(feature = "remote")]
             mesh: None,
+            #[cfg(feature = "remote")]
+            mesh_auto_fallback: false,
+            #[cfg(feature = "remote")]
+            peer_delegates: Vec::new(),
             max_steps_override: None,
             max_prompt_bytes_override: None,
             execution_timeout_secs_override: None,
@@ -410,6 +424,17 @@ impl AgentBuilder {
     }
 
     /// Configure `.agents` loading explicitly.
+    /// Supply the workspace used to derive `<workspace>/.agents/`. An explicit
+    /// `workspace` or `workspace_root` in the load options always wins.
+    pub fn with_dotagents_workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
+        let options = self
+            .dotagents_options
+            .take()
+            .unwrap_or_else(crate::dotagents::DotagentsLoadOptions::disabled);
+        self.dotagents_options = Some(options.with_workspace_fallback(workspace));
+        self
+    }
+
     pub fn dotagents_options(mut self, options: crate::dotagents::DotagentsLoadOptions) -> Self {
         self.dotagents_options = Some(options);
         self
@@ -538,12 +563,43 @@ impl AgentBuilder {
         if let Some(error) = self.tool_error.take() {
             return Err(anyhow!("invalid `tools` selector: {error}"));
         }
+        if let Some(member) = self.delegates.iter().find(|m| m.tool_error.is_some())
+            && let Some(error) = &member.tool_error
+        {
+            return Err(anyhow!(
+                "delegate '{}': invalid `tools` selector: {error}",
+                member.id
+            ));
+        }
+        if self.quorum_shape {
+            check_skill_tool(&self.tools, self.skills_config.as_ref(), "planner")?;
+        }
+        for member in &self.delegates {
+            check_skill_tool(
+                &member.tools,
+                member.skills.as_ref(),
+                &format!("delegate '{}'", member.id),
+            )?;
+        }
         let snapshot_policy = self.snapshot_policy;
         let cwd = if let Some(path) = self.cwd {
             Some(to_absolute_path(path)?)
         } else {
             None
         };
+
+        if !self.delegates.is_empty() {
+            let mut required = crate::delegation::member::infer_required_capabilities(&self.tools);
+            for member in &self.delegates {
+                required.extend(member.required_capabilities.iter().copied());
+            }
+            if required.contains(&crate::tools::CapabilityRequirement::Filesystem) && cwd.is_none()
+            {
+                return Err(anyhow!(
+                    "Working directory required: one or more agents require filesystem access. Use .cwd() to set one."
+                ));
+            }
+        }
 
         let mut llm_config = self
             .llm_config
@@ -563,6 +619,11 @@ impl AgentBuilder {
             // Protocol prompts are additive to explicit system parts, in the
             // order: explicit, `system-prompt.md`, `agents.md`.
             crate::dotagents::compose_prompt(&mut llm_config, manifest);
+            for member in &mut self.delegates {
+                if let Some(params) = member.llm_config.as_mut() {
+                    crate::dotagents::compose_prompt(params, manifest);
+                }
+            }
             // The selected preset is recorded here and applied after the plugin
             // registry exists, so an unavailable provider is reported instead of
             // leaving a half-applied overlay behind.
@@ -591,6 +652,10 @@ impl AgentBuilder {
                         Arc::new(SqliteStorage::connect(db_path).await?)
                     }
                 };
+                if self.session_mcp_attachment_source.is_none() {
+                    self.session_mcp_attachment_source =
+                        infra.session_mcp_attachment_source.clone();
+                }
                 (infra.plugin_registry, storage, infra.event_fanout)
             }
             None => {
@@ -636,21 +701,34 @@ impl AgentBuilder {
 
         let mut builder =
             AgentConfigBuilder::new(plugin_registry.clone(), backend.clone(), llm_config)
-                .with_agent_id("agent")
+                .with_agent_id(if self.quorum_shape {
+                    "planner"
+                } else {
+                    "agent"
+                })
                 .with_snapshot_policy(snapshot_policy);
+        if self.quorum_shape && snapshot_policy != SnapshotPolicy::None {
+            builder =
+                builder.with_snapshot_backend(Arc::new(crate::snapshot::GitSnapshotBackend::new()));
+        }
         if let Some(event_fanout) = event_fanout {
             builder = builder.with_event_fanout(event_fanout);
         }
 
         // Phase 7: inject pre-populated agent registry (remote agents from config).
         #[cfg(feature = "remote")]
+        let mesh_handle = match &self.mesh {
+            Some(mesh) => Some(mesh.start().await?.handle().as_mesh_handle().clone()),
+            None => None,
+        };
+        #[cfg(feature = "remote")]
         if let Some(mesh) = &self.mesh
+            && let Some(mesh_handle) = &mesh_handle
             && !mesh.remote_agents().is_empty()
             && let MeshSpec::Toml(cfg) = mesh.spec_for_internal_use()
         {
-            let runtime = mesh.start().await?;
             let registry = crate::agent::remote::register_remote_agents_from_config(
-                runtime.handle().as_mesh_handle(),
+                mesh_handle,
                 mesh.remote_agents(),
                 &cfg.peers,
             )
@@ -751,6 +829,9 @@ impl AgentBuilder {
                 log::warn!("dotagents: {diagnostic}");
             }
             passive_diagnostics.extend(mcp_plan.diagnostics.iter().cloned());
+            for member in &mut self.delegates {
+                passive_diagnostics.extend(merge_dotagents_mcp_servers(member, &mcp_plan.servers));
+            }
             if !mcp_plan.servers.is_empty() {
                 let mut servers = self.mcp_servers.clone();
                 for server in mcp_plan.servers {
@@ -866,9 +947,9 @@ impl AgentBuilder {
                 middleware_factories: std::mem::take(&mut self.middleware_factories),
                 middleware_entries: std::mem::take(&mut self.middleware_entries),
                 #[cfg(feature = "remote")]
-                peer_delegates: Vec::new(),
+                peer_delegates: self.peer_delegates.clone(),
                 #[cfg(feature = "remote")]
-                mesh: None,
+                mesh: mesh_handle.clone(),
             },
         )
         .await?;
@@ -877,9 +958,9 @@ impl AgentBuilder {
         let mesh_node_name = self.mesh.as_ref().and_then(|mesh| mesh.node_name());
 
         #[cfg(feature = "remote")]
-        if let Some(mesh) = &self.mesh {
-            let runtime = mesh.start().await?;
-            handle.set_mesh(runtime.handle().as_mesh_handle().clone());
+        if let Some(mesh_handle) = mesh_handle {
+            handle.set_mesh_fallback(self.mesh_auto_fallback);
+            handle.set_mesh(mesh_handle);
         }
 
         // Protocol state is retained for post-construction activation. Task and
@@ -904,7 +985,6 @@ impl AgentBuilder {
             cwd,
             callbacks: Arc::new(EventCallbacksState::new(None)),
             profiles: None,
-            quorum: None,
             dotagents: dotagents_state.map(Arc::new),
         };
 
@@ -926,9 +1006,6 @@ pub struct Agent {
     pub(super) cwd: Option<PathBuf>,
     pub(super) callbacks: Arc<EventCallbacksState>,
     pub(super) profiles: Option<Arc<AgentProfiles>>,
-    /// Present when this agent was built with `Agent::multi()`.
-    /// Holds the quorum orchestrator for delegate access.
-    pub(super) quorum: Option<Arc<crate::quorum::AgentQuorum>>,
     /// Passive protocol state. Durable task and memory reconciliation is
     /// deliberately *not* performed during `build()`; it runs from
     /// [`Agent::activate_dotagents`] once the runtime topology is complete.
@@ -983,10 +1060,6 @@ impl AgentDotagentsState {
 impl Agent {
     pub fn single() -> AgentBuilder {
         AgentBuilder::new()
-    }
-
-    pub fn multi() -> QuorumBuilder {
-        QuorumBuilder::new()
     }
 
     /// Access the underlying `AgentHandle` for advanced configuration.
@@ -1120,11 +1193,7 @@ impl Agent {
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
-        if let Some(quorum) = &self.quorum {
-            quorum.subscribe_events()
-        } else {
-            self.inner.subscribe_events()
-        }
+        self.inner.subscribe_events()
     }
 
     pub fn on_tool_call<F>(&self, callback: F) -> &Self
@@ -1356,9 +1425,6 @@ impl Agent {
         if let Some(profiles) = self.profiles() {
             profiles.shutdown().await;
         }
-        if let Some(quorum) = self.quorum() {
-            quorum.shutdown().await;
-        }
         self.inner.shutdown().await;
     }
 
@@ -1421,43 +1487,24 @@ impl Agent {
         self.inner.clone()
     }
 
-    /// Returns `true` if this agent was built with `Agent::multi()`.
+    /// Returns `true` when the root's registry lists members it can delegate to.
     pub fn is_multi(&self) -> bool {
-        self.quorum.is_some()
-    }
-
-    /// Access the quorum orchestrator (returns `None` for single agents).
-    pub fn quorum(&self) -> Option<&crate::quorum::AgentQuorum> {
-        self.quorum.as_deref()
-    }
-
-    /// Access the planner handle (returns `None` for single agents).
-    ///
-    /// For single agents, use `.handle()` instead.
-    pub fn planner(&self) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
-        self.quorum.as_ref().map(|q| q.planner())
+        !self.inner.config.agent_registry().list_agents().is_empty()
     }
 
     /// MCP servers this agent's runtimes were built with, including those
-    /// merged in from `.agents/`: the agent's own, or for a quorum the
-    /// planner's and every local delegate's.
+    /// merged in from `.agents/`: the root's and every local member's.
     pub fn mcp_server_configs(&self) -> Vec<crate::config::McpServerConfig> {
         let mut servers = self.inner.config.mcp_servers.clone();
-        if let Some(quorum) = &self.quorum {
-            let handles = std::iter::once(quorum.planner())
-                .chain(quorum.delegates().iter().map(|d| d.agent.clone()));
-            for handle in handles {
-                if let Some(local) = handle.as_any().downcast_ref::<AgentHandle>() {
-                    servers.extend(local.config.mcp_servers.iter().cloned());
-                }
-            }
+        for (_, member) in self.inner.local_members() {
+            servers.extend(member.config.mcp_servers.iter().cloned());
         }
         servers
     }
 
-    /// Access a delegate handle by ID (returns `None` for single agents or if not found).
+    /// A member handle by ID (`None` when the root has no such member).
     pub fn delegate(&self, id: &str) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
-        self.quorum.as_ref().and_then(|q| q.delegate(id))
+        self.inner.config.agent_registry().get_handle(id)
     }
 
     async fn ensure_default_session(&self) -> Result<String> {
@@ -1548,40 +1595,31 @@ impl Agent {
         config: SingleAgentConfig,
         infra: Option<AgentInfra>,
     ) -> Result<Self> {
-        let attachment_source = infra
-            .as_ref()
-            .and_then(|i| i.session_mcp_attachment_source.clone());
-
-        #[cfg(feature = "remote")]
-        {
-            if config.mesh.enabled {
-                let auto_fallback = config.mesh.auto_fallback;
-                let mesh_cfg = config.mesh.clone();
-                let remote_agents = config.remote_agents.clone();
-                let mut builder = Self::builder_from_config(config, None)?;
-                if let Some(infra) = infra {
-                    builder = builder.infra(infra);
-                }
-                if let Some(source) = attachment_source {
-                    builder = builder.with_session_mcp_attachment_source(source);
-                }
-                let agent = builder
-                    .mesh(Mesh::from_toml(mesh_cfg).with_remote_agents(remote_agents))
-                    .build()
-                    .await?;
-                agent.inner.set_mesh_fallback(auto_fallback);
-                return Ok(agent);
-            }
-        }
-
         let mut builder = Self::builder_from_config(config, None)?;
         if let Some(infra) = infra {
             builder = builder.infra(infra);
         }
-        if let Some(source) = attachment_source {
-            builder = builder.with_session_mcp_attachment_source(source);
-        }
         builder.build().await
+    }
+
+    /// The builder for either config shape. `dotagents_workspace` is the
+    /// protocol workspace fallback (see `builder_from_config_with_dotagents`).
+    pub fn builder_from_config_value(
+        config: crate::config::Config,
+        dotagents_workspace: Option<&std::path::Path>,
+    ) -> Result<AgentBuilder> {
+        match config {
+            crate::config::Config::Single(config) => {
+                Self::builder_from_config_with_dotagents(*config, None, dotagents_workspace)
+            }
+            crate::config::Config::Multi(config) => {
+                let builder = Self::builder_from_quorum_config(*config, None)?;
+                Ok(match dotagents_workspace {
+                    Some(workspace) => builder.with_dotagents_workspace(workspace),
+                    None => builder,
+                })
+            }
+        }
     }
 
     /// Configure an `AgentBuilder` from a `SingleAgentConfig`.
@@ -1663,7 +1701,189 @@ impl Agent {
             builder.mcp_servers = config.mcp;
         }
 
+        #[cfg(feature = "remote")]
+        if config.mesh.enabled {
+            builder.mesh_auto_fallback = config.mesh.auto_fallback;
+            builder.mesh =
+                Some(Mesh::from_toml(config.mesh).with_remote_agents(config.remote_agents));
+        }
+
         Ok(builder)
+    }
+}
+
+/// Construction from the deprecated `[quorum]` config shape. It lowers to the
+/// same `AgentBuilder` as everything else: the planner is the root and the
+/// delegates are its members.
+impl Agent {
+    /// Create an agent from a serializable quorum config + custom infrastructure.
+    pub async fn from_quorum_config_with_infra(
+        config: crate::config::QuorumConfig,
+        infra: AgentInfra,
+    ) -> Result<Self> {
+        Self::builder_from_quorum_config(config, None)?
+            .infra(infra)
+            .build()
+            .await
+    }
+
+    /// Build an Agent from a quorum config (default infrastructure).
+    pub async fn from_quorum_config(config: crate::config::QuorumConfig) -> Result<Self> {
+        Self::builder_from_quorum_config(config, None)?
+            .build()
+            .await
+    }
+
+    /// Configure an `AgentBuilder` from a `QuorumConfig`.
+    ///
+    /// Returns the builder before `build()` is called, allowing further
+    /// customization (e.g., `.infra()`).
+    pub fn builder_from_quorum_config(
+        config: crate::config::QuorumConfig,
+        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+    ) -> Result<AgentBuilder> {
+        use crate::delegation::member::{MemberBuildSpec, infer_required_capabilities};
+
+        let snapshot_policy = parse_snapshot_policy(config.quorum.snapshot_policy)?;
+        let mut builder = AgentBuilder::new()
+            .provider(config.planner.provider, config.planner.model)
+            .dotagents_options(config.dotagents.load_options());
+        builder.quorum_shape = true;
+        builder.snapshot_policy = snapshot_policy;
+        if let Some(cwd) = config.quorum.cwd {
+            builder.cwd = Some(cwd);
+        }
+        builder.delegation_enabled = config.quorum.delegation;
+        builder.delegation_settings = crate::config::DelegationSettings {
+            wait_policy: config.quorum.delegation_wait_policy,
+            wait_timeout_secs: config.quorum.delegation_wait_timeout_secs,
+            cancel_grace_secs: config.quorum.delegation_cancel_grace_secs,
+            max_parallel: config.quorum.max_parallel_delegations,
+            verification: config.quorum.verification,
+            summary: config.quorum.delegation_summary,
+        };
+
+        let mut available_local_tool_names: std::collections::HashSet<String> =
+            crate::agent::builtin_tools::all_builtin_tools()
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect();
+        available_local_tool_names.insert(crate::skills::SkillTool::NAME.to_string());
+
+        for part in config.planner.system {
+            if let Some(system) = part.resolved() {
+                builder = builder.system(system);
+            }
+        }
+        if let Some(api_key) = config.planner.api_key {
+            builder = builder.api_key(api_key);
+        }
+        for (key, value) in config.planner.parameters.into_iter().flatten() {
+            builder = builder.parameter(key, value);
+        }
+
+        // Resolve planner tools (validates local tools and prepares for MCP).
+        // The runtime tool list keeps the normalized resolved MCP selectors so
+        // build() can construct allowlists the runtime filter understands and
+        // widen the tool policy for MCP tool advertisement.
+        let planner_resolved = crate::config::resolve_tools(
+            &config.planner.tools,
+            &config.mcp,
+            &[],
+            &available_local_tool_names,
+        )?;
+        builder.tools = planner_resolved.runtime_tool_selectors();
+        builder.mcp_servers = planner_resolved
+            .mcp_servers
+            .values()
+            .map(|(config, _)| config.clone())
+            .collect();
+        builder.mode = config.planner.mode;
+        builder.permissions = config.planner.permissions.to_permissions();
+        builder.middleware_entries = config.planner.middleware;
+        builder.execution = Some(config.planner.execution);
+        builder.skills_config = Some(config.planner.skills);
+
+        for delegate in config.delegates {
+            #[cfg(feature = "remote")]
+            if let Some(peer_name) = delegate.peer.clone() {
+                builder
+                    .peer_delegates
+                    .push((delegate.id.clone(), peer_name));
+            }
+
+            let mut spec = MemberBuildSpec::new(delegate.id.clone());
+            let mut llm = querymt::LLMParams::new()
+                .provider(delegate.provider)
+                .model(delegate.model);
+            for part in delegate.system {
+                if let Some(system) = part.resolved() {
+                    llm = llm.system(system);
+                }
+            }
+            if let Some(api_key) = delegate.api_key {
+                llm = llm.api_key(api_key);
+            }
+            for (key, value) in delegate.parameters.into_iter().flatten() {
+                llm = llm.parameter(key, value);
+            }
+            spec.llm_config = Some(llm);
+            spec.description = delegate.description;
+            spec.capabilities = delegate.capabilities;
+
+            let resolved = crate::config::resolve_tools(
+                &delegate.tools,
+                &config.mcp,
+                &delegate.mcp,
+                &available_local_tool_names,
+            )?;
+            spec.tools = resolved.runtime_tool_selectors();
+            spec.mcp_servers = resolved
+                .mcp_servers
+                .values()
+                .map(|(config, _)| config.clone())
+                .collect();
+            spec.required_capabilities = infer_required_capabilities(&spec.tools)
+                .into_iter()
+                .collect();
+            spec.mode = delegate.mode;
+            spec.middleware = delegate.middleware;
+            spec.execution = delegate.execution;
+            spec.skills = Some(delegate.skills);
+            spec.permissions = delegate.permissions.to_permissions();
+            spec.isolation = delegate.isolation;
+            builder.delegates.push(spec);
+        }
+
+        if config.quorum.workspace.enabled {
+            builder.workspace = Some(config.quorum.workspace);
+        }
+        if config.quorum.repository_knowledge.enabled {
+            builder.repository_knowledge = Some(config.quorum.repository_knowledge);
+        }
+        builder.agent_registry = initial_registry;
+        #[cfg(feature = "remote")]
+        {
+            builder.mesh_auto_fallback = config.mesh.auto_fallback;
+            if config.mesh.enabled {
+                builder.mesh =
+                    Some(Mesh::from_toml(config.mesh).with_remote_agents(config.remote_agents));
+            }
+        }
+
+        Ok(builder)
+    }
+}
+
+fn parse_snapshot_policy(policy: Option<String>) -> Result<SnapshotPolicy> {
+    match policy.as_deref() {
+        None | Some("none") => Ok(SnapshotPolicy::None),
+        Some("metadata") => Ok(SnapshotPolicy::Metadata),
+        Some("diff") => Ok(SnapshotPolicy::Diff),
+        Some(other) => Err(anyhow!(
+            "Invalid snapshot_policy '{}'. Valid options: 'none', 'metadata', 'diff'",
+            other
+        )),
     }
 }
 
@@ -1674,20 +1894,8 @@ impl ChatRunner for Agent {
     }
 
     async fn chat_session(&self) -> Result<Box<dyn ChatSession>> {
-        if let Some(quorum) = &self.quorum {
-            let session_id = self.create_session().await?;
-            let session = super::quorum::QuorumSession::new(
-                quorum.planner(),
-                quorum.event_fanout(),
-                quorum.store(),
-                session_id,
-                self.cwd.clone(),
-            );
-            Ok(Box::new(session))
-        } else {
-            let session = Agent::chat_session(self).await?;
-            Ok(Box::new(session))
-        }
+        let session = Agent::chat_session(self).await?;
+        Ok(Box::new(session))
     }
 
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
@@ -1723,4 +1931,53 @@ impl ChatRunner for Agent {
     fn server(&self) -> AgentServer {
         AgentServer::new(self.inner.clone(), self.storage.clone())
     }
+}
+
+/// A `skill` tool needs skills to be configured and enabled for its agent.
+fn check_skill_tool(tools: &[ToolSpec], skills: Option<&SkillsConfig>, who: &str) -> Result<()> {
+    if !tools
+        .iter()
+        .any(|tool| tool.is_builtin(crate::skills::SkillTool::NAME))
+    {
+        return Ok(());
+    }
+    match skills {
+        Some(skills) if skills.enabled => Ok(()),
+        Some(_) => Err(anyhow!(
+            "Tool '{}' requested for {who}, but skills are disabled",
+            crate::skills::SkillTool::NAME
+        )),
+        None => Err(anyhow!(
+            "Tool '{}' requested for {who}, but skills are not configured",
+            crate::skills::SkillTool::NAME
+        )),
+    }
+}
+
+/// Adds the protocol MCP servers a member does not already configure.
+fn merge_dotagents_mcp_servers(
+    member: &mut crate::delegation::member::MemberBuildSpec,
+    manifest_servers: &[McpServerConfig],
+) -> Vec<crate::dotagents::DotagentsDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for server in manifest_servers {
+        if !member
+            .mcp_servers
+            .iter()
+            .any(|existing| existing.name() == server.name())
+        {
+            member.mcp_servers.push(server.clone());
+        } else {
+            let message = format!(
+                "protocol MCP server `{}` collides with an explicit configuration; keeping the explicit server",
+                server.name()
+            );
+            log::warn!("dotagents: {message}");
+            diagnostics.push(crate::dotagents::DotagentsDiagnostic::warning(
+                crate::dotagents::DotagentsDiagnosticCode::Collision,
+                message,
+            ));
+        }
+    }
+    diagnostics
 }
