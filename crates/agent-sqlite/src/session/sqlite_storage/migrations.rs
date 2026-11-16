@@ -181,7 +181,33 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0036_revert_restore_failed",
         apply: migration_0036_revert_restore_failed,
     },
+    Migration {
+        version: "0037_session_message_read_indexes",
+        apply: migration_0037_session_message_read_indexes,
+    },
 ];
+
+/// Indexes for session message reads.
+///
+/// `idx_messages_session_order` returns a session's messages in history order
+/// (`created_at`, then rowid) without a sort and makes the `session_id`-only
+/// index redundant. `idx_message_parts_prompt` holds only prompt and steering
+/// parts so prompt records are found without reading other part rows. The
+/// `part_type IN (...)` predicate must stay textually identical to the one in
+/// the prompt query. The DDL is an intentionally inlined, frozen copy of
+/// `init_schema`; the schema drift test keeps the two in agreement.
+fn migration_0037_session_message_read_indexes(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_messages_session_order
+             ON messages(session_id, created_at);
+         CREATE INDEX IF NOT EXISTS idx_message_parts_prompt
+             ON message_parts(message_id, sort_order)
+             WHERE part_type IN ('prompt', 'steering');
+         DROP INDEX IF EXISTS idx_messages_session;",
+    )
+}
 
 /// Mark revert frames recorded by an undo whose restore failed part-way.
 ///

@@ -160,6 +160,7 @@ tower = { version = "0.5", default-features = false, features = ["balance", "buf
 tracing = { version = "0.1", features = ["log", "release_max_level_debug"] }
 tracing-core = { version = "0.1" }
 tracing-log = { version = "0.2" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 unicode-normalization = { version = "0.1" }
 ureq = { version = "3" }

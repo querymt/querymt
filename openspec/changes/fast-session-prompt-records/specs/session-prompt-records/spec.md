@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Defines the structured user prompt records that accompany session loads, older-history pages and peer prompt requests: what each record contains, which prompts are included, how they are ordered, and that producing them costs only the prompt content read.
+Defines the structured user prompt records that accompany session loads, older-history pages and peer prompt requests: what each record contains, which prompts are included, and how they are ordered. Also covers the session database reads behind those records: producing them costs only the prompt content read, and the indexes and read cache serve them.
 
 ## ADDED Requirements
 
@@ -55,6 +55,17 @@ A full session load SHALL include every prompt record of the session. A windowed
 - **WHEN** the first run of a returned window starts in the same second as an older prompt outside the window
 - **THEN** the snapshot includes the window's first prompt record and excludes the older prompt's record
 
+### Requirement: Forked sessions reference their own messages
+When a session is forked, each conversation event copied into the fork (prompt and assistant message events) SHALL carry the message id of the fork's own copy of that message, so a prompt event of the fork is always resolvable to a prompt record of the fork.
+
+#### Scenario: Copied events point at the fork's messages
+- **WHEN** a session with prompt and assistant events is forked at a message
+- **THEN** every copied event's message id is the id of a message in the fork, in the same order, and the source session's events are unchanged
+
+#### Scenario: Windowed load of a fork includes inherited prompt records
+- **WHEN** a client loads a fork that inherits 30 turns using a window of 20 turns
+- **THEN** the snapshot reports older history and its prompt records are exactly those of the 20 prompts in the window, with their structured blocks
+
 ### Requirement: Prompt records read only prompt content
 Producing prompt records or prompt blocks for history replay SHALL read only the prompt and steering content of the session's messages, so its cost does not grow with other message content. Other message content that cannot be decoded SHALL NOT cause a prompt record request, a session load, a history replay or a peer's prompt request to fail.
 
@@ -73,6 +84,29 @@ Producing prompt records or prompt blocks for history replay SHALL read only the
 #### Scenario: Corrupt tool result does not fail session update replay
 - **WHEN** a client that receives history as session updates loads a session that holds a tool result whose content cannot be decoded
 - **THEN** the replay succeeds and each replayed user message carries its structured prompt blocks
+
+### Requirement: Session message index migration
+The session database SHALL hold an index of a session's messages in message history order and an index of prompt and steering parts only. A database created by an earlier version SHALL gain the same indexes when this version opens it, without changing stored data.
+
+#### Scenario: Upgraded database matches a fresh database
+- **WHEN** a database at the oldest supported schema is opened and migrated by this version
+- **THEN** its tables and indexes match those of a newly created database
+- **AND** both hold the message history order index and the prompt part index, and neither holds an index on the session id of messages alone
+
+### Requirement: Session message reads use indexes
+Reading a session's full message history SHALL NOT sort the session's messages or parts in a temporary table. Reading prompt records SHALL find prompt and steering parts without reading the rows of other parts.
+
+#### Scenario: History and prompt reads use the indexes
+- **WHEN** the query plans of the full message history read and the prompt record read are taken on a migrated database
+- **THEN** the history read takes messages from the message history order index and parts from the per-message part index, with no temporary sort
+- **AND** the prompt record read takes messages from the message history order index and finds prompt parts through the prompt part index
+
+### Requirement: Session database read cache
+A connection to a session database file SHALL use a page cache of 64 MiB and SHALL memory-map up to 256 MiB of the database file. This applies whether or not the connection runs migrations.
+
+#### Scenario: Database file uses the read cache
+- **WHEN** a session store is opened on a database file, once with migrations and once without
+- **THEN** each connection reports a page cache size of 64 MiB (`cache_size` -65536) and a memory map limit of 256 MiB (`mmap_size` 268435456)
 
 ### Requirement: Prompt record reads are traced
 Reading prompt records and reading a session's full message history SHALL each be recorded as a tracing span named `session_store.get_user_prompts` and `session_store.get_history` respectively, carrying the session id and the number of rows and content bytes read.

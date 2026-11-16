@@ -37,6 +37,34 @@ use std::collections::{HashMap, HashSet};
 use super::SqliteStorage;
 use super::row_parsers::{parse_llm_config_row, parse_llm_params};
 use querymt_agent_core::events::AgentEventKind;
+use querymt_agent_core::session::prompt_records::UserPromptRecord;
+use tracing::Instrument;
+
+/// Messages of a session in history order. `id` is insertion order, so it
+/// breaks ties between messages stored in the same second.
+pub(super) const HISTORY_MESSAGES_SQL: &str = "SELECT id, public_id, role, created_at, parent_message_id, source_provider, source_model FROM messages WHERE session_id = ? ORDER BY created_at, id";
+
+/// All parts of a session, walked per message through `idx_message_parts_message`.
+pub(super) const HISTORY_PARTS_SQL: &str = "SELECT message_id, content_json FROM message_parts WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?) ORDER BY message_id, sort_order";
+
+/// Prompt and steering records with their position in history order.
+///
+/// The `part_type IN ('prompt', 'steering')` term must stay textually identical
+/// to the predicate of `idx_message_parts_prompt` for SQLite to use that index.
+/// `?1` is the internal session id, `?2` is NULL (all) or a JSON array of
+/// message public ids.
+pub(super) const USER_PROMPTS_SQL: &str = "WITH ordered AS (
+  SELECT id, ROW_NUMBER() OVER (ORDER BY created_at, id) - 1 AS ord
+  FROM messages WHERE session_id = ?1)
+SELECT m.public_id, o.ord, m.created_at, p.content_json
+FROM ordered o
+JOIN messages m ON m.id = o.id
+JOIN message_parts p ON p.id = (
+  SELECT id FROM message_parts
+  WHERE message_id = m.id AND part_type IN ('prompt', 'steering')
+  ORDER BY sort_order LIMIT 1)
+WHERE ?2 IS NULL OR m.public_id IN (SELECT value FROM json_each(?2))
+ORDER BY o.ord";
 
 fn read_delegate_assignments(
     conn: &rusqlite::Connection,
@@ -527,119 +555,222 @@ impl SessionStore for SqliteStorage {
 
     async fn get_history(&self, session_id: &str) -> SessionResult<Vec<AgentMessage>> {
         // Resolve session public_id → internal i64
-        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
-        let session_id_str = session_id.to_string();
+        // `debug`: the full history is read several times per turn by middleware
+        // and execution; load and replay paths are covered by the info-level
+        // `session_store.get_user_prompts` span and their own callers' spans.
+        let span = tracing::debug_span!(
+            "session_store.get_history",
+            session.id = %session_id,
+            rows = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+        );
+        let record_span = span.clone();
+        async move {
+            let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+            let session_id_str = session_id.to_string();
 
-        self.run_blocking(move |conn| {
-            // 1. Fetch Messages with public_id and internal parent_message_id
-            let mut stmt = conn.prepare(
-                "SELECT id, public_id, role, created_at, parent_message_id, source_provider, source_model FROM messages WHERE session_id = ? ORDER BY created_at ASC"
-            )?;
+            let (messages, rows, bytes) = self
+                .run_blocking(move |conn| {
+                    // 1. Fetch Messages with public_id and internal parent_message_id
+                    let mut stmt = conn.prepare(HISTORY_MESSAGES_SQL)?;
 
-            // Build a map: internal_id → public_id for parent resolution
-            let mut id_map: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
-            let messages_data: Vec<(
-                i64,
-                String,
-                String,
-                i64,
-                Option<i64>,
-                Option<String>,
-                Option<String>,
-            )> = stmt
-                .query_map(params![session_internal_id], |row| {
-                    let internal_id: i64 = row.get(0)?;
-                    let public_id: String = row.get(1)?;
-                    let role_str: String = row.get(2)?;
-                    let created_at: i64 = row.get(3)?;
-                    let parent_internal_id: Option<i64> = row.get(4)?;
-                    let source_provider: Option<String> = row.get(5)?;
-                    let source_model: Option<String> = row.get(6)?;
-                    Ok((
-                        internal_id,
-                        public_id,
-                        role_str,
-                        created_at,
-                        parent_internal_id,
-                        source_provider,
-                        source_model,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
+                    // Build a map: internal_id → public_id for parent resolution
+                    let mut id_map: std::collections::HashMap<i64, String> =
+                        std::collections::HashMap::new();
+                    let messages_data: Vec<(
+                        i64,
+                        String,
+                        String,
+                        i64,
+                        Option<i64>,
+                        Option<String>,
+                        Option<String>,
+                    )> = stmt
+                        .query_map(params![session_internal_id], |row| {
+                            let internal_id: i64 = row.get(0)?;
+                            let public_id: String = row.get(1)?;
+                            let role_str: String = row.get(2)?;
+                            let created_at: i64 = row.get(3)?;
+                            let parent_internal_id: Option<i64> = row.get(4)?;
+                            let source_provider: Option<String> = row.get(5)?;
+                            let source_model: Option<String> = row.get(6)?;
+                            Ok((
+                                internal_id,
+                                public_id,
+                                role_str,
+                                created_at,
+                                parent_internal_id,
+                                source_provider,
+                                source_model,
+                            ))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?;
 
-            // Build id_map
-            for (internal_id, public_id, _, _, _, _, _) in &messages_data {
-                id_map.insert(*internal_id, public_id.clone());
-            }
+                    // Build id_map
+                    for (internal_id, public_id, _, _, _, _, _) in &messages_data {
+                        id_map.insert(*internal_id, public_id.clone());
+                    }
 
-            // Convert to AgentMessage, resolving parent_message_id
-            let mut messages: Vec<AgentMessage> = messages_data
-                .into_iter()
-                .map(
-                    |(
-                        _internal_id,
-                        public_id,
-                        role_str,
-                        created_at,
-                        parent_internal_id,
-                        source_provider,
-                        source_model,
-                    )| {
-                        let role = match role_str.as_str() {
-                            "User" => ChatRole::User,
-                            "Assistant" => ChatRole::Assistant,
-                            _ => ChatRole::User, // Default fallback
-                        };
+                    // Convert to AgentMessage, resolving parent_message_id
+                    let mut messages: Vec<AgentMessage> = messages_data
+                        .into_iter()
+                        .map(
+                            |(
+                                _internal_id,
+                                public_id,
+                                role_str,
+                                created_at,
+                                parent_internal_id,
+                                source_provider,
+                                source_model,
+                            )| {
+                                let role = match role_str.as_str() {
+                                    "User" => ChatRole::User,
+                                    "Assistant" => ChatRole::Assistant,
+                                    _ => ChatRole::User, // Default fallback
+                                };
 
-                        let parent_message_id =
-                            parent_internal_id.and_then(|pid| id_map.get(&pid).cloned());
+                                let parent_message_id =
+                                    parent_internal_id.and_then(|pid| id_map.get(&pid).cloned());
 
-                        AgentMessage {
-                            id: public_id.clone(),
-                            session_id: session_id_str.clone(),
-                            role,
-                            parts: Vec::new(), // Will populate next
-                            created_at,
-                            parent_message_id,
-                            source_provider,
-                            source_model,
+                                AgentMessage {
+                                    id: public_id.clone(),
+                                    session_id: session_id_str.clone(),
+                                    role,
+                                    parts: Vec::new(), // Will populate next
+                                    created_at,
+                                    parent_message_id,
+                                    source_provider,
+                                    source_model,
+                                }
+                            },
+                        )
+                        .collect();
+
+                    // 2. Fetch Parts for all messages in this session (by internal message_id)
+                    let mut part_stmt = conn.prepare(HISTORY_PARTS_SQL)?;
+
+                    let parts_iter = part_stmt.query_map(params![session_internal_id], |row| {
+                        let message_internal_id: i64 = row.get(0)?;
+                        let content: String = row.get(1)?;
+                        let part: MessagePart = serde_json::from_str(&content).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                        Ok((message_internal_id, part, content.len()))
+                    })?;
+
+                    // Group parts by message internal_id, then convert to public_id
+                    let mut parts_map: std::collections::HashMap<String, Vec<MessagePart>> =
+                        std::collections::HashMap::new();
+                    let mut rows = 0usize;
+                    let mut bytes = 0usize;
+                    for res in parts_iter {
+                        let (message_internal_id, part, len) = res?;
+                        rows += 1;
+                        bytes += len;
+                        if let Some(public_id) = id_map.get(&message_internal_id) {
+                            parts_map.entry(public_id.clone()).or_default().push(part);
                         }
-                    },
-                )
-                .collect();
+                    }
 
-            // 2. Fetch Parts for all messages in this session (by internal message_id)
-            let mut part_stmt = conn.prepare(
-                "SELECT message_id, content_json FROM message_parts WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?) ORDER BY sort_order ASC"
-            )?;
+                    // Attach parts to messages
+                    for msg in &mut messages {
+                        if let Some(parts) = parts_map.remove(&msg.id) {
+                            msg.parts = parts;
+                        }
+                    }
 
-            let parts_iter = part_stmt.query_map(params![session_internal_id], |row| {
-                let message_internal_id: i64 = row.get(0)?;
-                let content: String = row.get(1)?;
-                let part: MessagePart = serde_json::from_str(&content).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-                })?;
-                Ok((message_internal_id, part))
-            })?;
-
-            // Group parts by message internal_id, then convert to public_id
-            let mut parts_map: std::collections::HashMap<String, Vec<MessagePart>> = std::collections::HashMap::new();
-            for res in parts_iter {
-                let (message_internal_id, part) = res?;
-                if let Some(public_id) = id_map.get(&message_internal_id) {
-                    parts_map.entry(public_id.clone()).or_default().push(part);
-                }
-            }
-
-            // Attach parts to messages
-            for msg in &mut messages {
-                if let Some(parts) = parts_map.remove(&msg.id) {
-                    msg.parts = parts;
-                }
-            }
-
+                    Ok((messages, rows, bytes))
+                })
+                .await?;
+            record_span.record("rows", rows as u64);
+            record_span.record("bytes", bytes as u64);
             Ok(messages)
-        })
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn get_user_prompts(
+        &self,
+        session_id: &str,
+        message_ids: Option<&[String]>,
+    ) -> SessionResult<Vec<UserPromptRecord>> {
+        let span = tracing::info_span!(
+            "session_store.get_user_prompts",
+            session.id = %session_id,
+            rows = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+        );
+        let record_span = span.clone();
+        async move {
+            let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+            // One JSON-array parameter: no host-parameter limit, no dynamic SQL.
+            let ids_json = match message_ids {
+                Some(ids) => Some(
+                    serde_json::to_string(ids)
+                        .map_err(|e| SessionError::Other(format!("encode message ids: {e}")))?,
+                ),
+                None => None,
+            };
+
+            let (records, rows_read, bytes) = self
+                .run_blocking(move |conn| {
+                    let mut stmt = conn.prepare(USER_PROMPTS_SQL)?;
+                    let rows = stmt.query_map(params![session_internal_id, ids_json], |row| {
+                        let message_id: String = row.get(0)?;
+                        let order: i64 = row.get(1)?;
+                        let timestamp: i64 = row.get(2)?;
+                        let content: String = row.get(3)?;
+                        let part: MessagePart = serde_json::from_str(&content).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                        let blocks = match part {
+                            MessagePart::Prompt { blocks }
+                            | MessagePart::Steering { blocks, .. } => Some(blocks),
+                            _ => None,
+                        };
+                        Ok((message_id, order, timestamp, blocks, content.len()))
+                    })?;
+                    let mut records = Vec::new();
+                    let mut rows_read = 0usize;
+                    let mut bytes = 0usize;
+                    for row in rows {
+                        let (message_id, order, timestamp, blocks, len) = row?;
+                        // `rows` and `bytes` describe the same set: every row read.
+                        rows_read += 1;
+                        bytes += len;
+                        match blocks {
+                            Some(blocks) => records.push(UserPromptRecord {
+                                message_id,
+                                message_order: order as u64,
+                                timestamp,
+                                blocks,
+                            }),
+                            // The row's `part_type` says prompt/steering but its JSON
+                            // decodes to another part: corrupt data, not a record.
+                            None => tracing::warn!(
+                                message_id = %message_id,
+                                "prompt part row does not decode to a prompt or steering part; skipped"
+                            ),
+                        }
+                    }
+                    Ok((records, rows_read, bytes))
+                })
+                .await?;
+            record_span.record("rows", rows_read as u64);
+            record_span.record("bytes", bytes as u64);
+            Ok(records)
+        }
+        .instrument(span)
         .await
     }
 
@@ -883,7 +1014,7 @@ impl SessionStore for SqliteStorage {
                 .map(|(_, public_id, _, _, _, _)| public_id.clone())
                 .collect();
 
-            let conversational_events_to_copy: Vec<JournalRow> = {
+            let conversational_events_to_copy: Vec<(JournalRow, AgentEventKind)> = {
                 let mut stmt = tx.prepare(
                     "SELECT timestamp, origin, source_node, kind, payload_json \
                      FROM event_journal \
@@ -905,30 +1036,37 @@ impl SessionStore for SqliteStorage {
 
                 // Allowlist: only prompts and assistant messages that belong
                 // to the copied message range. Rows that do not decode are
-                // dropped.
+                // dropped. The decoded kind is kept so the copy can point at
+                // the fork's own message ids.
                 rows.into_iter()
-                    .filter(|row| {
-                        match serde_json::from_str::<AgentEventKind>(&row.payload_json) {
-                            Ok(
-                                AgentEventKind::PromptReceived {
-                                    message_id: Some(message_id),
-                                    ..
-                                }
-                                | AgentEventKind::AssistantMessageStored {
-                                    message_id: Some(message_id),
-                                    ..
-                                },
-                            ) => copied_message_ids.contains(&message_id),
-                            _ => false,
+                    .filter_map(|row| {
+                        let kind = serde_json::from_str::<AgentEventKind>(&row.payload_json).ok()?;
+                        match &kind {
+                            AgentEventKind::PromptReceived {
+                                message_id: Some(message_id),
+                                ..
+                            }
+                            | AgentEventKind::AssistantMessageStored {
+                                message_id: Some(message_id),
+                                ..
+                            } if copied_message_ids.contains(message_id) => Some((row, kind)),
+                            _ => None,
                         }
                     })
                     .collect()
             };
 
+            // Old public id -> the copy's public id, filled while copying
+            // messages below. Copied events must reference the fork's own
+            // messages: prompt records, replay and undo all resolve a prompt
+            // event through its `message_id`.
+            let mut copied_message_id_map: std::collections::HashMap<String, String> =
+                std::collections::HashMap::with_capacity(messages_to_copy.len());
+
             // 3. Copy messages and their parts with new UUID v7 public_ids
             for (
                 old_internal_id,
-                _old_public_id,
+                old_public_id,
                 role,
                 created_at,
                 source_provider,
@@ -936,6 +1074,7 @@ impl SessionStore for SqliteStorage {
             ) in messages_to_copy
             {
                 let new_msg_public_id = Uuid::now_v7().to_string();
+                copied_message_id_map.insert(old_public_id, new_msg_public_id.clone());
 
                 // Insert Message with new public_id and internal session_id
                 tx.execute(
@@ -995,7 +1134,9 @@ impl SessionStore for SqliteStorage {
             // delegation telemetry) are intentionally excluded because replaying them in a fork can
             // create contradictory state and duplicate execution traces. The downside is inherited
             // UI telemetry before the fork point is intentionally partial.
-            for (index, row) in conversational_events_to_copy.into_iter().enumerate() {
+            for (index, (row, mut event_kind)) in
+                conversational_events_to_copy.into_iter().enumerate()
+            {
                 let JournalRow {
                     timestamp,
                     origin,
@@ -1003,6 +1144,27 @@ impl SessionStore for SqliteStorage {
                     kind,
                     payload_json,
                 } = row;
+                // Re-point the event at the fork's copy of its message. The
+                // allowlist guarantees the old id is in the map.
+                let payload_json = match &mut event_kind {
+                    AgentEventKind::PromptReceived {
+                        message_id: Some(message_id),
+                        ..
+                    }
+                    | AgentEventKind::AssistantMessageStored {
+                        message_id: Some(message_id),
+                        ..
+                    } => match copied_message_id_map.get(message_id.as_str()) {
+                        Some(new_id) => {
+                            *message_id = new_id.clone();
+                            serde_json::to_string(&event_kind).map_err(|err| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+                            })?
+                        }
+                        None => payload_json,
+                    },
+                    _ => payload_json,
+                };
                 // Copied events are numbered 1..n so the fork's own sequencer
                 // continues after them.
                 let session_seq = index as i64 + 1;

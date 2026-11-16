@@ -167,7 +167,7 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         );
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_public_id ON messages(public_id);
-        CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_session_order ON messages(session_id, created_at);
 
         -- ========================================================================
         -- TIER 2: INTERNAL TABLES (no public_id)
@@ -356,6 +356,8 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_message_parts_message ON message_parts(message_id, sort_order);
+        CREATE INDEX IF NOT EXISTS idx_message_parts_prompt ON message_parts(message_id, sort_order)
+            WHERE part_type IN ('prompt', 'steering');
 
         -- User-managed custom local models per provider
         CREATE TABLE IF NOT EXISTS custom_models (

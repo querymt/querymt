@@ -5750,6 +5750,27 @@ fn legacy_baseline_upgrade_matches_fresh_install() {
 
     let upgraded = schema_snapshot(&legacy);
     let fresh = schema_snapshot(&fresh);
+    // Both hold the session message read indexes and not the old
+    // session_id-only index (migration 0037).
+    for (label, snapshot) in [("upgraded", &upgraded), ("fresh", &fresh)] {
+        let has = |name: &str| {
+            snapshot
+                .iter()
+                .any(|l| l.starts_with(&format!("index {name} on ")))
+        };
+        assert!(
+            has("idx_messages_session_order"),
+            "{label}: missing order index"
+        );
+        assert!(
+            has("idx_message_parts_prompt"),
+            "{label}: missing prompt index"
+        );
+        assert!(
+            !has("idx_messages_session"),
+            "{label}: old index still present"
+        );
+    }
     let benign: std::collections::BTreeSet<String> =
         KNOWN_BENIGN_DRIFT.iter().map(|s| s.to_string()).collect();
 
@@ -6089,4 +6110,709 @@ async fn existing_database_opens_after_crate_split() {
         .await
         .unwrap();
     assert_eq!(after.len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// Session prompt records, message read indexes, read cache and spans
+// ---------------------------------------------------------------------------
+
+use super::session_store::{HISTORY_MESSAGES_SQL, HISTORY_PARTS_SQL, USER_PROMPTS_SQL};
+use querymt_agent_core::session::prompt_records::user_prompt_records;
+
+fn text_blocks(text: &str) -> Vec<ContentBlock> {
+    vec![ContentBlock::Text(TextContent::new(text))]
+}
+
+fn stored_message(
+    session_id: &str,
+    id: &str,
+    role: ChatRole,
+    parts: Vec<MessagePart>,
+    created_at: i64,
+) -> AgentMessage {
+    AgentMessage {
+        id: id.to_string(),
+        session_id: session_id.to_string(),
+        role,
+        parts,
+        created_at,
+        parent_message_id: None,
+        source_provider: None,
+        source_model: None,
+    }
+}
+
+fn prompt_message(session_id: &str, id: &str, text: &str, created_at: i64) -> AgentMessage {
+    stored_message(
+        session_id,
+        id,
+        ChatRole::User,
+        vec![MessagePart::Prompt {
+            blocks: text_blocks(text),
+        }],
+        created_at,
+    )
+}
+
+fn assistant_message(session_id: &str, id: &str, created_at: i64) -> AgentMessage {
+    stored_message(
+        session_id,
+        id,
+        ChatRole::Assistant,
+        vec![MessagePart::Text {
+            content: format!("reply {id}"),
+        }],
+        created_at,
+    )
+}
+
+fn tool_result_message(
+    session_id: &str,
+    id: &str,
+    payload: String,
+    created_at: i64,
+) -> AgentMessage {
+    stored_message(
+        session_id,
+        id,
+        ChatRole::User,
+        vec![MessagePart::ToolResult {
+            call_id: format!("call-{id}"),
+            content: vec![querymt::chat::ToolResultPart::text(payload)],
+            is_error: false,
+            tool_name: Some("read".to_string()),
+            tool_arguments: None,
+            compacted_at: None,
+        }],
+        created_at,
+    )
+}
+
+async fn store_all(storage: &SqliteStorage, session_id: &str, messages: Vec<AgentMessage>) {
+    for message in messages {
+        storage.add_message(session_id, message).await.unwrap();
+    }
+}
+
+async fn new_session_id(storage: &SqliteStorage) -> String {
+    storage
+        .create_session(None, None, None, None)
+        .await
+        .unwrap()
+        .public_id
+}
+
+#[tokio::test]
+async fn same_second_messages_keep_insertion_order() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let sid = new_session_id(&storage).await;
+    // Ids are not alphabetical, so only insertion order can explain the result.
+    store_all(
+        &storage,
+        &sid,
+        vec![
+            prompt_message(&sid, "zz-first", "one", 100),
+            prompt_message(&sid, "aa-second", "two", 100),
+            prompt_message(&sid, "mm-third", "three", 100),
+        ],
+    )
+    .await;
+
+    let history = storage.get_history(&sid).await.unwrap();
+    let ids: Vec<&str> = history.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["zz-first", "aa-second", "mm-third"]);
+
+    let records = storage.get_user_prompts(&sid, None).await.unwrap();
+    for (index, record) in records.iter().enumerate() {
+        assert_eq!(record.message_order, index as u64);
+        assert_eq!(record.message_id, history[index].id);
+    }
+    assert_eq!(records.len(), 3);
+}
+
+#[tokio::test]
+async fn prompt_and_steering_messages_produce_records() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let sid = new_session_id(&storage).await;
+    store_all(
+        &storage,
+        &sid,
+        vec![
+            stored_message(
+                &sid,
+                "prompt-1",
+                ChatRole::User,
+                vec![MessagePart::Prompt {
+                    blocks: vec![
+                        ContentBlock::Text(TextContent::new("look")),
+                        ContentBlock::Image(ImageContent::new("AQID", "image/png")),
+                    ],
+                }],
+                10,
+            ),
+            stored_message(
+                &sid,
+                "assistant-1",
+                ChatRole::Assistant,
+                vec![MessagePart::ToolUse(querymt::ToolCall {
+                    id: "call-1".to_string(),
+                    call_type: "function".to_string(),
+                    function: querymt::FunctionCall {
+                        name: "read".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                })],
+                11,
+            ),
+            stored_message(
+                &sid,
+                "steer-1",
+                ChatRole::User,
+                vec![MessagePart::Steering {
+                    run_id: "run-1".to_string(),
+                    client_input_id: Some("cid".to_string()),
+                    blocks: text_blocks("steer"),
+                }],
+                12,
+            ),
+        ],
+    )
+    .await;
+
+    let records = storage.get_user_prompts(&sid, None).await.unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].message_id, "prompt-1");
+    assert_eq!(records[0].timestamp, 10);
+    assert_eq!(records[0].blocks.len(), 2);
+    assert!(matches!(records[0].blocks[1], ContentBlock::Image(_)));
+    assert_eq!(records[1].message_id, "steer-1");
+    assert_eq!(records[1].timestamp, 12);
+    assert_eq!(records[1].message_order, 2);
+
+    let history = storage.get_history(&sid).await.unwrap();
+    assert_eq!(records, user_prompt_records(&history));
+}
+
+#[tokio::test]
+async fn record_position_counts_every_message() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let sid = new_session_id(&storage).await;
+    store_all(
+        &storage,
+        &sid,
+        vec![
+            prompt_message(&sid, "p1", "first", 1),
+            assistant_message(&sid, "a1", 2),
+            assistant_message(&sid, "a2", 3),
+            assistant_message(&sid, "a3", 4),
+            prompt_message(&sid, "p2", "second", 5),
+        ],
+    )
+    .await;
+
+    let records = storage.get_user_prompts(&sid, None).await.unwrap();
+    let positions: Vec<(&str, u64)> = records
+        .iter()
+        .map(|r| (r.message_id.as_str(), r.message_order))
+        .collect();
+    assert_eq!(positions, [("p1", 0), ("p2", 4)]);
+    let history = storage.get_history(&sid).await.unwrap();
+    assert_eq!(records, user_prompt_records(&history));
+}
+
+#[tokio::test]
+async fn requested_ids_select_their_records() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let sid = new_session_id(&storage).await;
+    store_all(
+        &storage,
+        &sid,
+        vec![
+            prompt_message(&sid, "p1", "one", 1),
+            assistant_message(&sid, "a1", 2),
+            prompt_message(&sid, "p2", "two", 3),
+            prompt_message(&sid, "p3", "three", 4),
+        ],
+    )
+    .await;
+
+    // Requested out of order, with an assistant id and an unknown id.
+    let ids = vec![
+        "p2".to_string(),
+        "a1".to_string(),
+        "missing".to_string(),
+        "p1".to_string(),
+    ];
+    let records = storage.get_user_prompts(&sid, Some(&ids)).await.unwrap();
+    let got: Vec<(&str, u64)> = records
+        .iter()
+        .map(|r| (r.message_id.as_str(), r.message_order))
+        .collect();
+    assert_eq!(got, [("p1", 0), ("p2", 2)]);
+}
+
+#[tokio::test]
+async fn request_without_ids_returns_every_prompt() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let sid = new_session_id(&storage).await;
+    let mut messages = Vec::new();
+    for i in 0..5 {
+        messages.push(prompt_message(&sid, &format!("p{i}"), "prompt", i * 2 + 1));
+        messages.push(assistant_message(&sid, &format!("a{i}"), i * 2 + 2));
+    }
+    messages.push(stored_message(
+        &sid,
+        "steer",
+        ChatRole::User,
+        vec![MessagePart::Steering {
+            run_id: "run".to_string(),
+            client_input_id: None,
+            blocks: text_blocks("steer"),
+        }],
+        100,
+    ));
+    store_all(&storage, &sid, messages).await;
+
+    let records = storage.get_user_prompts(&sid, None).await.unwrap();
+    assert_eq!(records.len(), 6);
+    assert!(
+        records
+            .windows(2)
+            .all(|w| w[0].message_order < w[1].message_order)
+    );
+    assert_eq!(records[5].message_id, "steer");
+}
+
+#[tokio::test]
+async fn user_prompts_for_unknown_session_is_not_found() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let err = storage.get_user_prompts("nope", None).await.unwrap_err();
+    assert!(matches!(
+        err,
+        querymt_agent_core::session::error::SessionError::SessionNotFound(_)
+    ));
+}
+
+fn query_plan(conn: &Connection, sql: &str, param_count: usize) -> Vec<String> {
+    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    let params: Vec<rusqlite::types::Value> = match param_count {
+        1 => vec![rusqlite::types::Value::Integer(1)],
+        _ => vec![
+            rusqlite::types::Value::Integer(1),
+            rusqlite::types::Value::Null,
+        ],
+    };
+    stmt.query_map(rusqlite::params_from_iter(params), |row| {
+        row.get::<_, String>(3)
+    })
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+#[tokio::test]
+async fn session_message_reads_use_indexes() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let conn = storage.conn_for_test();
+    let conn = conn.lock();
+
+    let prompt_plan = query_plan(&conn, USER_PROMPTS_SQL, 2);
+    assert!(
+        prompt_plan
+            .iter()
+            .any(|s| s.contains("idx_messages_session_order")),
+        "prompt query must use the order index, plan: {prompt_plan:?}"
+    );
+    assert!(
+        prompt_plan
+            .iter()
+            .any(|s| s.contains("idx_message_parts_prompt")),
+        "prompt query must use the prompt part index, plan: {prompt_plan:?}"
+    );
+
+    let messages_plan = query_plan(&conn, HISTORY_MESSAGES_SQL, 1);
+    assert!(
+        messages_plan
+            .iter()
+            .any(|s| s.contains("idx_messages_session_order")),
+        "history messages must use the order index, plan: {messages_plan:?}"
+    );
+    assert!(
+        !messages_plan.iter().any(|s| s.contains("USE TEMP B-TREE")),
+        "history messages must not sort, plan: {messages_plan:?}"
+    );
+
+    let parts_plan = query_plan(&conn, HISTORY_PARTS_SQL, 1);
+    assert!(
+        parts_plan
+            .iter()
+            .any(|s| s.contains("idx_message_parts_message")),
+        "history parts must use the per-message index, plan: {parts_plan:?}"
+    );
+    assert!(
+        !parts_plan.iter().any(|s| s.contains("USE TEMP B-TREE")),
+        "history parts must not sort, plan: {parts_plan:?}"
+    );
+}
+
+#[tokio::test]
+async fn large_tool_output_does_not_slow_prompt_records() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let sid = new_session_id(&storage).await;
+    // 980 tool results of about 51 KB (50 MB) and 20 prompts.
+    let payload = "x".repeat(51_000);
+    let mut prompt_ids = Vec::new();
+    let mut messages = Vec::new();
+    for i in 0..1000i64 {
+        if i % 50 == 0 {
+            let id = format!("prompt-{i}");
+            messages.push(prompt_message(&sid, &id, "do the thing", i));
+            prompt_ids.push(id);
+        } else {
+            messages.push(tool_result_message(
+                &sid,
+                &format!("tool-{i}"),
+                payload.clone(),
+                i,
+            ));
+        }
+    }
+    assert_eq!(prompt_ids.len(), 20);
+    store_all(&storage, &sid, messages).await;
+
+    let started = std::time::Instant::now();
+    let records = storage
+        .get_user_prompts(&sid, Some(&prompt_ids))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(records.len(), 20);
+    assert!(
+        elapsed < std::time::Duration::from_millis(250),
+        "prompt records took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn corrupt_tool_result_does_not_fail_prompt_records() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let sid = new_session_id(&storage).await;
+    store_all(
+        &storage,
+        &sid,
+        vec![
+            prompt_message(&sid, "p1", "one", 1),
+            tool_result_message(&sid, "t1", "output".to_string(), 2),
+            prompt_message(&sid, "p2", "two", 3),
+        ],
+    )
+    .await;
+    {
+        let conn = storage.conn_for_test();
+        let conn = conn.lock();
+        let changed = conn
+            .execute(
+                "UPDATE message_parts SET content_json = '{not json' WHERE part_type = 'tool_result'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+
+    // The full history cannot decode the row, the prompt read does not touch it.
+    assert!(storage.get_history(&sid).await.is_err());
+    let records = storage.get_user_prompts(&sid, None).await.unwrap();
+    let ids: Vec<&str> = records.iter().map(|r| r.message_id.as_str()).collect();
+    assert_eq!(ids, ["p1", "p2"]);
+    assert_eq!(records[1].message_order, 2);
+}
+
+#[tokio::test]
+async fn database_file_uses_read_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sessions.db");
+    let migrated = SqliteStorage::connect(path.clone()).await.unwrap();
+    let reopened = SqliteStorage::connect_with_options(path, false)
+        .await
+        .unwrap();
+    for (label, storage) in [("migrating", &migrated), ("without migrations", &reopened)] {
+        let conn = storage.conn_for_test();
+        let conn = conn.lock();
+        let cache: i64 = conn
+            .query_row("PRAGMA cache_size", [], |r| r.get(0))
+            .unwrap();
+        let mmap: i64 = conn
+            .query_row("PRAGMA mmap_size", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cache, -65536, "{label}: cache_size");
+        assert_eq!(mmap, 268_435_456, "{label}: mmap_size");
+    }
+}
+
+type SpanRecord = (String, HashMap<String, String>);
+
+/// Captures span names and recorded fields for the telemetry tests.
+#[derive(Default, Clone)]
+struct CapturedSpans {
+    spans: std::sync::Arc<std::sync::Mutex<Vec<SpanRecord>>>,
+    ids: std::sync::Arc<std::sync::Mutex<HashMap<u64, usize>>>,
+}
+
+struct FieldCapture<'a>(&'a mut HashMap<String, String>);
+
+impl tracing::field::Visit for FieldCapture<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedSpans {
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = HashMap::new();
+        attrs.record(&mut FieldCapture(&mut fields));
+        let mut spans = self.spans.lock().unwrap();
+        spans.push((attrs.metadata().name().to_string(), fields));
+        self.ids
+            .lock()
+            .unwrap()
+            .insert(id.into_u64(), spans.len() - 1);
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if let Some(index) = self.ids.lock().unwrap().get(&id.into_u64()).copied() {
+            let mut spans = self.spans.lock().unwrap();
+            values.record(&mut FieldCapture(&mut spans[index].1));
+        }
+    }
+}
+
+fn capture_spans() -> (CapturedSpans, tracing::subscriber::DefaultGuard) {
+    use tracing_subscriber::layer::SubscriberExt;
+    let captured = CapturedSpans::default();
+    let subscriber = tracing_subscriber::registry().with(captured.clone());
+    (captured, tracing::subscriber::set_default(subscriber))
+}
+
+fn span_fields(captured: &CapturedSpans, name: &str) -> HashMap<String, String> {
+    let spans = captured.spans.lock().unwrap();
+    let matching: Vec<_> = spans.iter().filter(|(n, _)| n == name).collect();
+    assert_eq!(matching.len(), 1, "expected one {name} span: {spans:?}");
+    matching[0].1.clone()
+}
+
+#[tokio::test]
+async fn prompt_record_read_emits_a_span() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let sid = new_session_id(&storage).await;
+    let prompts: Vec<AgentMessage> = (0..3)
+        .map(|i| prompt_message(&sid, &format!("p{i}"), &format!("prompt number {i}"), i))
+        .collect();
+    let expected_bytes: usize = prompts
+        .iter()
+        .map(|m| serde_json::to_string(&m.parts[0]).unwrap().len())
+        .sum();
+    store_all(&storage, &sid, prompts).await;
+
+    let (captured, _guard) = capture_spans();
+    storage.get_user_prompts(&sid, None).await.unwrap();
+
+    let fields = span_fields(&captured, "session_store.get_user_prompts");
+    assert_eq!(fields["session.id"], sid);
+    assert_eq!(fields["rows"], "3");
+    assert_eq!(fields["bytes"], expected_bytes.to_string());
+}
+
+#[tokio::test]
+async fn full_history_read_emits_a_span() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let sid = new_session_id(&storage).await;
+    let mut messages = Vec::new();
+    for i in 0..5i64 {
+        messages.push(stored_message(
+            &sid,
+            &format!("m{i}"),
+            ChatRole::Assistant,
+            vec![
+                MessagePart::Text {
+                    content: format!("first {i}"),
+                },
+                MessagePart::Text {
+                    content: format!("second part {i}"),
+                },
+            ],
+            i,
+        ));
+    }
+    let expected_bytes: usize = messages
+        .iter()
+        .flat_map(|m| m.parts.iter())
+        .map(|p| serde_json::to_string(p).unwrap().len())
+        .sum();
+    store_all(&storage, &sid, messages).await;
+
+    let (captured, _guard) = capture_spans();
+    storage.get_history(&sid).await.unwrap();
+
+    let fields = span_fields(&captured, "session_store.get_history");
+    assert_eq!(fields["session.id"], sid);
+    assert_eq!(fields["rows"], "10");
+    assert_eq!(fields["bytes"], expected_bytes.to_string());
+}
+
+#[tokio::test]
+async fn fork_copies_events_that_point_at_the_forks_own_messages() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let sid = new_session_id(&storage).await;
+    store_all(
+        &storage,
+        &sid,
+        vec![
+            prompt_message(&sid, "p1", "one", 1),
+            assistant_message(&sid, "a1", 2),
+            prompt_message(&sid, "p2", "two", 3),
+        ],
+    )
+    .await;
+    let prompt_event = |id: &str, text: &str| {
+        new_durable(
+            &sid,
+            AgentEventKind::PromptReceived {
+                content: text.to_string(),
+                message_id: Some(id.to_string()),
+            },
+        )
+    };
+    for event in [
+        prompt_event("p1", "one"),
+        new_durable(
+            &sid,
+            AgentEventKind::AssistantMessageStored {
+                content: "reply a1".to_string(),
+                thinking: None,
+                reasoning_parts: Vec::new(),
+                message_id: Some("a1".to_string()),
+            },
+        ),
+        // After the fork point: must not be copied.
+        prompt_event("p2", "two"),
+    ] {
+        storage.append_durable(&event).await.unwrap();
+    }
+
+    let fork_id = storage
+        .fork_session(&sid, "a1", ForkOrigin::User)
+        .await
+        .unwrap();
+
+    let fork_history = storage.get_history(&fork_id).await.unwrap();
+    let fork_ids: Vec<String> = fork_history.iter().map(|m| m.id.clone()).collect();
+    assert_eq!(fork_ids.len(), 2);
+    assert!(!fork_ids.contains(&"p1".to_string()), "copies get new ids");
+
+    let events = storage
+        .load_session_stream(&fork_id, None, None)
+        .await
+        .unwrap();
+    let event_message_ids: Vec<(&str, String)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AgentEventKind::PromptReceived {
+                message_id: Some(id),
+                ..
+            } => Some(("prompt", id.clone())),
+            AgentEventKind::AssistantMessageStored {
+                message_id: Some(id),
+                ..
+            } => Some(("assistant", id.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        event_message_ids,
+        [
+            ("prompt", fork_ids[0].clone()),
+            ("assistant", fork_ids[1].clone())
+        ],
+        "copied events reference the fork's own messages, in order"
+    );
+
+    // The prompt record is selectable through the copied event's id.
+    let prompt_event_id = event_message_ids[0].1.clone();
+    let records = storage
+        .get_user_prompts(&fork_id, Some(std::slice::from_ref(&prompt_event_id)))
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].message_id, prompt_event_id);
+    assert_eq!(records[0].blocks.len(), 1);
+
+    // The source session's events are untouched.
+    let source_events = storage.load_session_stream(&sid, None, None).await.unwrap();
+    assert!(source_events.iter().any(|e| matches!(
+        &e.kind,
+        AgentEventKind::PromptReceived { message_id: Some(id), .. } if id == "p1"
+    )));
+}
+
+#[tokio::test]
+async fn prompt_row_decoding_to_another_part_is_skipped_but_counted() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let sid = new_session_id(&storage).await;
+    store_all(
+        &storage,
+        &sid,
+        vec![
+            prompt_message(&sid, "p1", "one", 1),
+            prompt_message(&sid, "p2", "two", 2),
+        ],
+    )
+    .await;
+    // `part_type` still says prompt, but the JSON is a text part.
+    let mismatched = serde_json::to_string(&MessagePart::Text {
+        content: "not a prompt".to_string(),
+    })
+    .unwrap();
+    {
+        let conn = storage.conn_for_test();
+        let conn = conn.lock();
+        let changed = conn
+            .execute(
+                "UPDATE message_parts SET content_json = ?1
+                 WHERE message_id = (SELECT id FROM messages WHERE public_id = 'p2')",
+                [&mismatched],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    let intact = serde_json::to_string(&MessagePart::Prompt {
+        blocks: text_blocks("one"),
+    })
+    .unwrap();
+
+    let (captured, _guard) = capture_spans();
+    let records = storage.get_user_prompts(&sid, None).await.unwrap();
+
+    let ids: Vec<&str> = records.iter().map(|r| r.message_id.as_str()).collect();
+    assert_eq!(ids, ["p1"]);
+    // rows and bytes both cover every row read, including the skipped one.
+    let fields = span_fields(&captured, "session_store.get_user_prompts");
+    assert_eq!(fields["rows"], "2");
+    assert_eq!(
+        fields["bytes"],
+        (intact.len() + mismatched.len()).to_string()
+    );
 }
