@@ -1,4 +1,3 @@
-use crate::acp::protocol::ContentBlock;
 use crate::agent::LocalAgentHandle;
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::history_window::{
@@ -6,26 +5,15 @@ use crate::session::history_window::{
 };
 use crate::session::projection::{AuditView, ViewStore};
 use querymt_agent_core::events::AgentEvent;
-use querymt_agent_core::model::MessagePart;
+pub use querymt_agent_core::session::prompt_records::UserPromptRecord;
+pub(crate) use querymt_agent_core::session::prompt_records::{
+    filter_prompt_records, user_prompt_records,
+};
 pub use querymt_agent_core::stream_cursor::{StreamCursor, observe_cursor};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use time::OffsetDateTime;
 use typeshare::typeshare;
-
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct UserPromptRecord {
-    pub message_id: String,
-    /// Zero-based position in persisted message history; this is not an event sequence.
-    #[typeshare(serialized_as = "number")]
-    pub message_order: u64,
-    #[typeshare(serialized_as = "number")]
-    pub timestamp: i64,
-    #[typeshare(serialized_as = "any")]
-    pub blocks: Vec<ContentBlock>,
-}
 
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,20 +55,6 @@ pub fn cursor_from_events(events: &[AgentEvent]) -> StreamCursor {
     cursor
 }
 
-/// Restrict prompt records to `ids` (`None` keeps all).
-pub(crate) fn filter_prompt_records(
-    records: Vec<UserPromptRecord>,
-    ids: Option<&[String]>,
-) -> Vec<UserPromptRecord> {
-    match ids {
-        None => records,
-        Some(ids) => records
-            .into_iter()
-            .filter(|record| ids.contains(&record.message_id))
-            .collect(),
-    }
-}
-
 /// Message ids of the prompts (`PromptReceived` with an id) among `events`,
 /// in event order, without duplicates.
 pub(crate) fn prompt_message_ids(events: &[AgentEvent]) -> Vec<String> {
@@ -113,29 +87,6 @@ pub(crate) fn merge_prompt_records(into: &mut Vec<UserPromptRecord>, more: Vec<U
     if added {
         into.sort_by_key(|record| record.message_order);
     }
-}
-
-pub(crate) fn user_prompt_records(
-    messages: &[querymt_agent_core::model::AgentMessage],
-) -> Vec<UserPromptRecord> {
-    messages
-        .iter()
-        .enumerate()
-        .filter_map(|(message_order, message)| {
-            let blocks = message.parts.iter().find_map(|part| match part {
-                MessagePart::Prompt { blocks } | MessagePart::Steering { blocks, .. } => {
-                    Some(blocks.clone())
-                }
-                _ => None,
-            })?;
-            Some(UserPromptRecord {
-                message_id: message.id.clone(),
-                message_order: message_order as u64,
-                timestamp: message.created_at,
-                blocks,
-            })
-        })
-        .collect()
 }
 
 pub async fn load_session_snapshot(
@@ -211,16 +162,16 @@ pub async fn load_session_snapshot_windowed(
     }
     // Journal-backed sessions (remote attached, or merely bookmarked while
     // offline) live on their peer and have no local history rows, so
-    // `get_history` reports `SessionNotFound`. Treat that as an empty history
-    // (no user prompt records) instead of failing the whole snapshot.
-    let messages = match agent
+    // the prompt read reports `SessionNotFound`. Treat that as no user prompt
+    // records instead of failing the whole snapshot.
+    let prompts = match agent
         .config
         .provider
         .history_store()
-        .get_history(session_id)
+        .get_user_prompts(session_id, None)
         .await
     {
-        Ok(messages) => messages,
+        Ok(prompts) => prompts,
         Err(SessionError::SessionNotFound(_)) if journal_backed => {
             tracing::debug!(
                 session_id,
@@ -230,14 +181,13 @@ pub async fn load_session_snapshot_windowed(
         }
         Err(e) => return Err(e),
     };
-    let user_prompts = Some(user_prompt_records(&messages));
     Ok(SessionLoadSnapshot {
         runtime_status,
         audit,
         cursor,
         accounting,
         delegation_updates,
-        user_prompts,
+        user_prompts: Some(prompts),
         history: None,
         summary: None,
         truncated: None,
@@ -331,20 +281,18 @@ async fn windowed_snapshot(
             delegation_updates.push(live.clone());
         }
     }
-    let messages = match history_store.get_history(session_id).await {
-        Ok(messages) => messages,
+    // A window that covers the whole session carries every prompt; otherwise
+    // only the prompts of the window's own prompt events (older ones arrive
+    // with their events).
+    let window_prompt_ids = (!read.history.complete).then(|| prompt_message_ids(&audit.events));
+    let prompts = match history_store
+        .get_user_prompts(session_id, window_prompt_ids.as_deref())
+        .await
+    {
+        Ok(prompts) => prompts,
         Err(SessionError::SessionNotFound(_)) if journal_backed => Vec::new(),
         Err(e) => return Err(e),
     };
-    let mut prompts = user_prompt_records(&messages);
-    if !read.history.complete
-        && let Some(first) = audit.events.first()
-    {
-        // Only prompts at or after the window's first event are returned;
-        // older ones arrive with their events.
-        let from = first.timestamp;
-        prompts.retain(|record| record.timestamp >= from);
-    }
     Ok(SessionLoadSnapshot {
         runtime_status,
         audit,
@@ -399,10 +347,9 @@ async fn journal_backed_audit_view(
 mod tests {
     use std::sync::Arc;
 
-    use querymt::{LLMParams, chat::ChatRole};
+    use querymt::LLMParams;
 
-    use super::{SessionLoadSnapshot, load_session_snapshot, user_prompt_records};
-    use crate::acp::protocol::{ContentBlock, ImageContent, TextContent};
+    use super::{SessionLoadSnapshot, load_session_snapshot};
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::session::backend::StorageBackend;
     use crate::session::error::{SessionError, SessionResult};
@@ -414,103 +361,6 @@ mod tests {
     use crate::session::provider::SessionProvider;
     use crate::session::store::{RemoteSessionBookmark, SessionStore};
     use crate::test_utils::{MockSessionStore, empty_plugin_registry};
-    use querymt_agent_core::model::{AgentMessage, MessagePart};
-
-    #[test]
-    fn user_prompt_projection_preserves_message_identity_order_and_blocks() {
-        let messages = vec![
-            AgentMessage {
-                id: "assistant".to_string(),
-                session_id: "s1".to_string(),
-                role: ChatRole::Assistant,
-                parts: vec![MessagePart::Text {
-                    content: "response".to_string(),
-                }],
-                created_at: 10,
-                parent_message_id: None,
-                source_provider: None,
-                source_model: None,
-            },
-            AgentMessage {
-                id: "user-1".to_string(),
-                session_id: "s1".to_string(),
-                role: ChatRole::User,
-                parts: vec![MessagePart::Prompt {
-                    blocks: vec![
-                        ContentBlock::Text(TextContent::new("look")),
-                        ContentBlock::Image(ImageContent::new("AQID", "image/png")),
-                    ],
-                }],
-                created_at: 11,
-                parent_message_id: None,
-                source_provider: None,
-                source_model: None,
-            },
-        ];
-
-        let records = user_prompt_records(&messages);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].message_id, "user-1");
-        // messageOrder is the zero-based persisted history position, not the
-        // PromptReceived event's stream sequence.
-        assert_eq!(records[0].message_order, 1);
-        assert_eq!(records[0].timestamp, 11);
-        assert!(matches!(records[0].blocks[1], ContentBlock::Image(_)));
-        let value = serde_json::to_value(&records[0]).unwrap();
-        assert_eq!(value["messageId"], "user-1");
-        assert_eq!(value["messageOrder"], 1);
-        assert_eq!(value["blocks"][1]["type"], "image");
-    }
-
-    #[test]
-    fn user_prompt_projection_includes_steering_parts() {
-        let messages = vec![
-            AgentMessage {
-                id: "assistant".to_string(),
-                session_id: "s1".to_string(),
-                role: ChatRole::Assistant,
-                parts: vec![MessagePart::Text {
-                    content: "response".to_string(),
-                }],
-                created_at: 10,
-                parent_message_id: None,
-                source_provider: None,
-                source_model: None,
-            },
-            AgentMessage {
-                id: "steer-1".to_string(),
-                session_id: "s1".to_string(),
-                role: ChatRole::User,
-                parts: vec![MessagePart::Steering {
-                    run_id: "run-1".to_string(),
-                    client_input_id: Some("cid-1".to_string()),
-                    blocks: vec![
-                        ContentBlock::Text(TextContent::new("steer")),
-                        ContentBlock::Image(ImageContent::new("AQID", "image/png")),
-                    ],
-                }],
-                created_at: 12,
-                parent_message_id: None,
-                source_provider: None,
-                source_model: None,
-            },
-        ];
-
-        let records = user_prompt_records(&messages);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].message_id, "steer-1");
-        // messageOrder counts all persisted messages: the text-only assistant
-        // message is skipped as a projection source but still occupies index 0.
-        assert_eq!(records[0].message_order, 1);
-        assert_eq!(records[0].timestamp, 12);
-        assert!(matches!(records[0].blocks[0], ContentBlock::Text(_)));
-        assert!(matches!(records[0].blocks[1], ContentBlock::Image(_)));
-        let value = serde_json::to_value(&records[0]).unwrap();
-        assert_eq!(value["messageId"], "steer-1");
-        assert_eq!(value["messageOrder"], 1);
-        assert_eq!(value["timestamp"], 12);
-        assert_eq!(value["blocks"][1]["type"], "image");
-    }
 
     #[tokio::test]
     async fn snapshot_history_failure_is_propagated() {
@@ -883,5 +733,212 @@ mod tests {
             .unwrap();
         let seqs: Vec<i64> = snapshot.audit.events.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, (1..=10).collect::<Vec<_>>(), "owner order, no gaps");
+    }
+
+    /// A local session with `runs` runs. Each run journals RunStarted,
+    /// PromptReceived (with the prompt's message id) and RunCompleted, and
+    /// stores the prompt message `prompt-{i}`. All journal events and messages
+    /// share `timestamp` when given.
+    async fn session_with_runs(
+        f: &crate::session::run_reconcile::tests::Fixture,
+        runs: usize,
+        timestamp: Option<i64>,
+    ) -> String {
+        use crate::session::run_reconcile::tests::seed;
+        use querymt::chat::ChatRole;
+        use querymt_agent_core::events::AgentEventKind;
+        use querymt_agent_core::model::{AgentMessage, MessagePart};
+
+        let sid = f
+            .storage
+            .create_session(None, None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        for i in 0..runs {
+            let run_id = format!("run-{i}");
+            let message_id = format!("prompt-{i}");
+            seed(
+                &f.storage,
+                &sid,
+                AgentEventKind::RunStarted {
+                    run_id: run_id.clone(),
+                    origin: "interactive".into(),
+                },
+            )
+            .await;
+            seed(
+                &f.storage,
+                &sid,
+                AgentEventKind::PromptReceived {
+                    content: format!("prompt {i}"),
+                    message_id: Some(message_id.clone()),
+                },
+            )
+            .await;
+            seed(
+                &f.storage,
+                &sid,
+                AgentEventKind::RunCompleted {
+                    run_id,
+                    outcome: "completed".into(),
+                    stop_type: None,
+                    reason: None,
+                },
+            )
+            .await;
+            f.storage
+                .add_message(
+                    &sid,
+                    AgentMessage {
+                        id: message_id,
+                        session_id: sid.clone(),
+                        role: ChatRole::User,
+                        parts: vec![MessagePart::Prompt {
+                            blocks: vec![crate::acp::protocol::ContentBlock::Text(
+                                crate::acp::protocol::TextContent::new(format!("prompt {i}")),
+                            )],
+                        }],
+                        created_at: timestamp.unwrap_or(1_000 + i as i64),
+                        parent_message_id: None,
+                        source_provider: None,
+                        source_model: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        if let Some(timestamp) = timestamp {
+            f.storage
+                .conn_for_test()
+                .lock()
+                .execute(
+                    "UPDATE event_journal SET timestamp = ?1 WHERE session_id = ?2",
+                    rusqlite::params![timestamp, sid],
+                )
+                .unwrap();
+        }
+        sid
+    }
+
+    fn prompt_ids(snapshot: &SessionLoadSnapshot) -> Vec<String> {
+        snapshot
+            .user_prompts
+            .as_ref()
+            .expect("user prompts present")
+            .iter()
+            .map(|record| record.message_id.clone())
+            .collect()
+    }
+
+    async fn windowed(
+        f: &crate::session::run_reconcile::tests::Fixture,
+        sid: &str,
+        max_turns: usize,
+    ) -> SessionLoadSnapshot {
+        let agent = crate::agent::LocalAgentHandle::from_config(f.config.clone());
+        super::load_session_snapshot_windowed(
+            &agent,
+            f.storage.view_store().unwrap(),
+            sid,
+            Some(crate::session::history_window::LoadWindow {
+                max_turns,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn full_load_includes_every_prompt() {
+        let f = crate::session::run_reconcile::tests::fixture().await;
+        let sid = session_with_runs(&f, 30, None).await;
+        let agent = crate::agent::LocalAgentHandle::from_config(f.config.clone());
+        let snapshot = load_session_snapshot(&agent, f.storage.view_store().unwrap(), &sid)
+            .await
+            .unwrap();
+        let expected: Vec<String> = (0..30).map(|i| format!("prompt-{i}")).collect();
+        assert_eq!(prompt_ids(&snapshot), expected);
+    }
+
+    #[tokio::test]
+    async fn windowed_load_includes_only_window_prompts() {
+        let f = crate::session::run_reconcile::tests::fixture().await;
+        let sid = session_with_runs(&f, 30, None).await;
+        let snapshot = windowed(&f, &sid, 20).await;
+        assert!(!snapshot.history.as_ref().unwrap().complete);
+        let expected: Vec<String> = (10..30).map(|i| format!("prompt-{i}")).collect();
+        assert_eq!(prompt_ids(&snapshot), expected);
+    }
+
+    #[tokio::test]
+    async fn windowed_load_of_a_short_session_includes_every_prompt() {
+        let f = crate::session::run_reconcile::tests::fixture().await;
+        let sid = session_with_runs(&f, 5, None).await;
+        let snapshot = windowed(&f, &sid, 20).await;
+        assert!(snapshot.history.as_ref().unwrap().complete);
+        let expected: Vec<String> = (0..5).map(|i| format!("prompt-{i}")).collect();
+        assert_eq!(prompt_ids(&snapshot), expected);
+    }
+
+    #[tokio::test]
+    async fn window_first_prompt_shares_a_second_with_an_older_prompt() {
+        let f = crate::session::run_reconcile::tests::fixture().await;
+        // Every event and prompt is stored in the same second; a one-turn
+        // window holds only the last run.
+        let sid = session_with_runs(&f, 3, Some(5_000)).await;
+        let snapshot = windowed(&f, &sid, 1).await;
+        assert!(!snapshot.history.as_ref().unwrap().complete);
+        assert_eq!(prompt_ids(&snapshot), vec!["prompt-2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn corrupt_tool_result_does_not_fail_a_load() {
+        use querymt::chat::ChatRole;
+        use querymt_agent_core::model::{AgentMessage, MessagePart};
+
+        let f = crate::session::run_reconcile::tests::fixture().await;
+        let sid = session_with_runs(&f, 3, None).await;
+        f.storage
+            .add_message(
+                &sid,
+                AgentMessage {
+                    id: "tool-1".into(),
+                    session_id: sid.clone(),
+                    role: ChatRole::User,
+                    parts: vec![MessagePart::ToolResult {
+                        call_id: "call-1".into(),
+                        content: vec![querymt::chat::ToolResultPart::text("output")],
+                        is_error: false,
+                        tool_name: Some("read".into()),
+                        tool_arguments: None,
+                        compacted_at: None,
+                    }],
+                    created_at: 2_000,
+                    parent_message_id: None,
+                    source_provider: None,
+                    source_model: None,
+                },
+            )
+            .await
+            .unwrap();
+        let changed = f
+            .storage
+            .conn_for_test()
+            .lock()
+            .execute(
+                "UPDATE message_parts SET content_json = '{not json' WHERE part_type = 'tool_result'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert!(f.storage.get_history(&sid).await.is_err());
+
+        let agent = crate::agent::LocalAgentHandle::from_config(f.config.clone());
+        let snapshot = load_session_snapshot(&agent, f.storage.view_store().unwrap(), &sid)
+            .await
+            .unwrap();
+        assert_eq!(prompt_ids(&snapshot).len(), 3);
     }
 }

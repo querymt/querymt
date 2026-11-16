@@ -47,6 +47,22 @@ mod session_actor_ref_remote_tests {
         remote_session_ref_for_config(label, f.config.clone(), "mock").await
     }
 
+    /// Like [`remote_session_ref_with_host`], also returning the host's SQLite
+    /// store so a test can write rows directly.
+    async fn remote_session_ref_with_storage(
+        label: &str,
+    ) -> (
+        SessionActorRef,
+        kameo::actor::ActorRef<SessionActor>,
+        std::sync::Arc<crate::session::sqlite_storage::SqliteStorage>,
+        String,
+    ) {
+        let f = AgentConfigFixture::new().await;
+        let (session_ref, local_ref, _config, session_id) =
+            remote_session_ref_for_config(label, f.config.clone(), "mock").await;
+        (session_ref, local_ref, f.storage.clone(), session_id)
+    }
+
     /// Host a session on `config` (model `model` of provider `mock`) and
     /// return a remote ref to it.
     async fn remote_session_ref_for_config(
@@ -1416,6 +1432,131 @@ mod session_actor_ref_remote_tests {
             .insert(session_id.clone(), session_ref);
         let remote_names = names(&alpha.handle.slash_command_catalog(&session_id).await);
         assert_eq!(remote_names, vec!["/compact".to_string()]);
+    }
+
+    fn prompt_record_message(
+        session_id: &str,
+        id: &str,
+        role: querymt::chat::ChatRole,
+        part: querymt_agent_core::model::MessagePart,
+        created_at: i64,
+    ) -> querymt_agent_core::model::AgentMessage {
+        querymt_agent_core::model::AgentMessage {
+            id: id.to_string(),
+            session_id: session_id.to_string(),
+            role,
+            parts: vec![part],
+            created_at,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        }
+    }
+
+    fn prompt_part(text: &str) -> querymt_agent_core::model::MessagePart {
+        querymt_agent_core::model::MessagePart::Prompt {
+            blocks: vec![crate::acp::protocol::ContentBlock::Text(
+                crate::acp::protocol::TextContent::new(text),
+            )],
+        }
+    }
+
+    fn tool_result_part() -> querymt_agent_core::model::MessagePart {
+        querymt_agent_core::model::MessagePart::ToolResult {
+            call_id: "call-1".to_string(),
+            content: vec![querymt::chat::ToolResultPart::text("output")],
+            is_error: false,
+            tool_name: Some("read".to_string()),
+            tool_arguments: None,
+            compacted_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_prompt_request_selects_requested_ids() {
+        use querymt::chat::ChatRole;
+        use querymt_agent_core::session::store::SessionStore;
+
+        let (session_ref, _local, storage, session_id) =
+            remote_session_ref_with_storage("prompts-select").await;
+        for message in [
+            prompt_record_message(&session_id, "p1", ChatRole::User, prompt_part("one"), 1),
+            prompt_record_message(
+                &session_id,
+                "a1",
+                ChatRole::Assistant,
+                querymt_agent_core::model::MessagePart::Text {
+                    content: "reply".to_string(),
+                },
+                2,
+            ),
+            prompt_record_message(&session_id, "p2", ChatRole::User, prompt_part("two"), 3),
+            prompt_record_message(&session_id, "p3", ChatRole::User, prompt_part("three"), 4),
+        ] {
+            storage
+                .add_message(&session_id, message)
+                .await
+                .expect("store message");
+        }
+
+        let ids = vec![
+            "p2".to_string(),
+            "a1".to_string(),
+            "unknown".to_string(),
+            "p1".to_string(),
+        ];
+        let records = session_ref
+            .get_user_prompts(Some(ids))
+            .await
+            .expect("peer prompt request");
+        let got: Vec<(&str, u64)> = records
+            .iter()
+            .map(|r| (r.message_id.as_str(), r.message_order))
+            .collect();
+        assert_eq!(got, [("p1", 0), ("p2", 2)]);
+    }
+
+    #[tokio::test]
+    async fn corrupt_tool_result_does_not_fail_a_peer_prompt_request() {
+        use querymt::chat::ChatRole;
+        use querymt_agent_core::session::store::SessionStore;
+
+        let (session_ref, _local, storage, session_id) =
+            remote_session_ref_with_storage("prompts-corrupt").await;
+        for message in [
+            prompt_record_message(&session_id, "p1", ChatRole::User, prompt_part("one"), 1),
+            prompt_record_message(&session_id, "t1", ChatRole::User, tool_result_part(), 2),
+            prompt_record_message(&session_id, "p2", ChatRole::User, prompt_part("two"), 3),
+        ] {
+            storage
+                .add_message(&session_id, message)
+                .await
+                .expect("store message");
+        }
+        let changed = storage
+            .conn_for_test()
+            .lock()
+            .execute(
+                "UPDATE message_parts SET content_json = '{not json' WHERE part_type = 'tool_result'",
+                [],
+            )
+            .expect("corrupt tool result");
+        assert_eq!(changed, 1);
+        assert!(
+            storage.get_history(&session_id).await.is_err(),
+            "full history must be undecodable for this test to mean anything"
+        );
+
+        let ids = vec!["p1".to_string(), "p2".to_string()];
+        let records = session_ref
+            .get_user_prompts(Some(ids))
+            .await
+            .expect("peer prompt request survives the corrupt row");
+        let got: Vec<(&str, u64)> = records
+            .iter()
+            .map(|r| (r.message_id.as_str(), r.message_order))
+            .collect();
+        assert_eq!(got, [("p1", 0), ("p2", 2)]);
     }
 
     // ── E.12 ─────────────────────────────────────────────────────────────────

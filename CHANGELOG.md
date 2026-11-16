@@ -198,9 +198,28 @@
     `DurableEvent`, `EphemeralEvent` and `AgentEvent`. querymt-desktop should
     regenerate its types (not done here).
   - See `docs/docs/agent/event-ordering.md`.
+- **Session database: read indexes and read cache.** Migration
+  `0037_session_message_read_indexes` runs on start. It adds
+  `idx_messages_session_order` (`messages(session_id, created_at)`) and a partial
+  `idx_message_parts_prompt` (prompt and steering parts only), and drops
+  `idx_messages_session`, which the first makes redundant (about 0.2 s on a
+  3.6 GB database; no data changes). File-backed session database connections now
+  use a 64 MiB page cache (`cache_size = -65536`) and memory-map up to 256 MiB of
+  the file (`mmap_size = 268435456`), with or without migrations. Older binaries
+  can still open a migrated database.
 
 ### Fixed
 
+- **Faster prompt records, and corrupt non-prompt parts no longer fail loads.**
+  Structured user prompt records (remote and local session loads, older-history
+  pages, peer prompt requests and history replay for clients without snapshot
+  support) now come from a targeted read of prompt and steering parts instead of
+  decoding the whole message history. A message part that cannot be decoded
+  outside a prompt (for example a corrupt tool result) no longer fails the
+  request, the load or the replay. Windowed loads include exactly the prompts of
+  the window's prompt events, no longer older prompts stored in the same second.
+  Messages stored in the same second are now ordered by insertion. The remote
+  speed-up applies once the session's owner runs this version.
 - **llama.cpp Qwen3 (JSON tool-call format) calls were dropped.** The tool
   grammar forced the tool name without JSON quotes (`"name": glob`), which the
   parser cannot read. The name is now a JSON string.

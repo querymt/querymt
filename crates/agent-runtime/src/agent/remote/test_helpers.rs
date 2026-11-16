@@ -162,6 +162,8 @@ pub mod fixtures {
     /// ```
     pub struct AgentConfigFixture {
         pub config: Arc<AgentConfig>,
+        /// The SQLite store behind `config`, for tests that write rows directly.
+        pub storage: Arc<SqliteStorage>,
         /// Keep the `TempDir` alive for the duration of the test.
         pub _tempdir: TempDir,
     }
@@ -186,6 +188,7 @@ pub mod fixtures {
 
             Self {
                 config,
+                storage,
                 _tempdir: temp_dir,
             }
         }

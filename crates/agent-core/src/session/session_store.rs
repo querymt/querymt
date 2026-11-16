@@ -221,6 +221,24 @@ pub trait SessionStore: Send + Sync {
         Ok(crate::history::filter_to_effective_history(messages))
     }
 
+    /// Structured user prompt records (prompt and steering messages) of a
+    /// session, in message history order. `message_ids` restricts the result to
+    /// those message ids (`None` returns every record).
+    ///
+    /// The default projects the full history; stores should override it with a
+    /// read that touches only prompt content.
+    async fn get_user_prompts(
+        &self,
+        session_id: &str,
+        message_ids: Option<&[String]>,
+    ) -> SessionResult<Vec<crate::session::prompt_records::UserPromptRecord>> {
+        let history = self.get_history(session_id).await?;
+        Ok(crate::session::prompt_records::filter_prompt_records(
+            crate::session::prompt_records::user_prompt_records(&history),
+            message_ids,
+        ))
+    }
+
     /// Appends a rich agent message to the session.
     async fn add_message(&self, session_id: &str, message: AgentMessage) -> SessionResult<()>;
 

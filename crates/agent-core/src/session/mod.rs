@@ -8,6 +8,7 @@ mod event_journal;
 pub mod lifecycle;
 pub mod location;
 pub mod projection;
+pub mod prompt_records;
 pub mod ranges;
 pub mod repository;
 mod schedule_repository;

@@ -55,18 +55,11 @@ pub struct AcpSessionLoadOutcome {
 }
 
 fn stored_user_prompt_blocks(
-    history: Vec<querymt_agent_core::model::AgentMessage>,
+    records: Vec<crate::session::load_snapshot::UserPromptRecord>,
 ) -> HashMap<String, Vec<crate::acp::protocol::ContentBlock>> {
-    history
+    records
         .into_iter()
-        .filter_map(|message| {
-            let blocks = message.parts.into_iter().find_map(|part| match part {
-                querymt_agent_core::model::MessagePart::Prompt { blocks }
-                | querymt_agent_core::model::MessagePart::Steering { blocks, .. } => Some(blocks),
-                _ => None,
-            })?;
-            Some((message.id, blocks))
-        })
+        .map(|record| (record.message_id, record.blocks))
         .collect()
 }
 
@@ -136,7 +129,7 @@ async fn actorless_replay_sources(
     let history = config
         .provider
         .history_store()
-        .get_history(session_id)
+        .get_user_prompts(session_id, None)
         .instrument(info_span!("session.history.load", session.id = %session_id))
         .await
         .map_err(|err| internal("history", &err))?;
@@ -162,7 +155,7 @@ pub async fn replay_loaded_session(
             {
                 Ok(events) => {
                     let history = session_ref
-                    .get_history()
+                    .get_user_prompts(None)
                     .instrument(info_span!("session.history.load", session.id = %session_id))
                     .await
                     .map_err(|err| {
@@ -1450,7 +1443,9 @@ mod stdio_tests {
             source_provider: None,
             source_model: None,
         };
-        let prompt_blocks = stored_user_prompt_blocks(vec![message]);
+        let prompt_blocks = stored_user_prompt_blocks(
+            querymt_agent_core::session::prompt_records::user_prompt_records(&[message]),
+        );
 
         let notifications =
             replay_agent_events_with_user_prompts("s-1", vec![event], &prompt_blocks);
@@ -1504,6 +1499,117 @@ mod stdio_tests {
             client_input_id: Some("input-1".to_string()),
             blocks: structured_blocks(),
         });
+    }
+
+    #[tokio::test]
+    async fn corrupt_tool_result_does_not_fail_session_update_replay() {
+        use crate::session::backend::StorageBackend;
+        use kameo::actor::Spawn;
+        use querymt_agent_core::model::{AgentMessage, MessagePart};
+
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = fixture.create_session().await;
+        let store = fixture.storage.session_store();
+        let message = |id: &str, part: MessagePart, created_at: i64| AgentMessage {
+            id: id.to_string(),
+            session_id: session_id.clone(),
+            role: querymt::chat::ChatRole::User,
+            parts: vec![part],
+            created_at,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        store
+            .add_message(
+                &session_id,
+                message(
+                    "stored-message-id",
+                    MessagePart::Prompt {
+                        blocks: structured_blocks(),
+                    },
+                    1,
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .add_message(
+                &session_id,
+                message(
+                    "tool-message",
+                    MessagePart::ToolResult {
+                        call_id: "call-1".to_string(),
+                        content: vec![querymt::chat::ToolResultPart::text("output")],
+                        is_error: false,
+                        tool_name: Some("read".to_string()),
+                        tool_arguments: None,
+                        compacted_at: None,
+                    },
+                    2,
+                ),
+            )
+            .await
+            .unwrap();
+        let changed = fixture
+            .storage
+            .conn_for_test()
+            .lock()
+            .execute(
+                "UPDATE message_parts SET content_json = '{not json' WHERE part_type = 'tool_result'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert!(store.get_history(&session_id).await.is_err());
+
+        // Journal the prompt event that the replay pairs with the stored blocks.
+        fixture
+            .config
+            .emit_event_persisted(
+                &session_id,
+                querymt_agent_core::events::AgentEventKind::PromptReceived {
+                    content: "flattened summary".to_string(),
+                    message_id: Some("stored-message-id".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let runtime = crate::agent::core::SessionRuntime::new(
+            None,
+            std::collections::HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let actor = crate::agent::session_actor::SessionActor::new(
+            fixture.config.clone(),
+            session_id.clone(),
+            runtime,
+        );
+        let actor_ref = crate::agent::session_actor::SessionActor::spawn(actor);
+        fixture
+            .handle
+            .registry
+            .lock()
+            .await
+            .insert(session_id.clone(), actor_ref);
+
+        let (notifications, _count) = super::replay_loaded_session(
+            &fixture.handle,
+            &session_id,
+            &crate::acp::shared::AcpSessionUpdateCapabilities::default(),
+        )
+        .await
+        .expect("replay survives the corrupt tool result");
+        let chunks: Vec<&ContentBlock> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::UserMessageChunk(chunk) => Some(&chunk.content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chunks.len(), 3, "structured blocks replayed");
+        assert!(matches!(chunks[1], ContentBlock::Image(image) if image.data == "AQID"));
     }
 
     #[tokio::test]

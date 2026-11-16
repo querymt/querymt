@@ -62,6 +62,23 @@ fn configure_journal_durability(
     Ok(())
 }
 
+/// 64 MiB page cache (negative = KiB) and up to 256 MiB memory-mapped reads.
+const SESSION_DB_CACHE_KIB: i64 = 65_536;
+const SESSION_DB_MMAP_BYTES: i64 = 268_435_456;
+
+/// Enlarge the page cache and enable memory-mapped reads for file databases,
+/// so cold session reads do not go to disk page by page. In-memory databases
+/// are left unchanged. `mmap_size` is capped silently by the SQLite build; if
+/// mmap is unavailable it stays 0 and SQLite uses normal reads.
+fn configure_read_cache(conn: &Connection, path: &std::path::Path) -> Result<(), rusqlite::Error> {
+    if path.as_os_str() == ":memory:" || path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "PRAGMA cache_size = -{SESSION_DB_CACHE_KIB};\nPRAGMA mmap_size = {SESSION_DB_MMAP_BYTES};"
+    ))
+}
+
 /// A unified SQLite storage implementation.
 ///
 /// This implementation provides all storage functionality in a single struct:
@@ -136,6 +153,7 @@ impl SqliteStorage {
         let conn = tokio::task::spawn_blocking(move || -> Result<Connection, rusqlite::Error> {
             let mut conn = Connection::open(&db_path)?;
             conn.execute("PRAGMA foreign_keys = ON;", [])?;
+            configure_read_cache(&conn, &db_path)?;
             if migrate {
                 configure_journal_durability(&conn, &db_path)?;
                 apply_migrations(&mut conn)?;

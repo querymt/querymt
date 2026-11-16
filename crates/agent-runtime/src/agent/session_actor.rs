@@ -1752,17 +1752,12 @@ impl Message<crate::agent::messages::GetUserPrompts> for SessionActor {
         msg: crate::agent::messages::GetUserPrompts,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let history = self
-            .config
+        self.config
             .provider
             .history_store()
-            .get_history(&self.session_id)
+            .get_user_prompts(&self.session_id, msg.message_ids.as_deref())
             .await
-            .map_err(|e| AgentError::Internal(e.to_string()))?;
-        Ok(crate::session::load_snapshot::filter_prompt_records(
-            crate::session::load_snapshot::user_prompt_records(&history),
-            msg.message_ids.as_deref(),
-        ))
+            .map_err(|e| AgentError::Internal(e.to_string()))
     }
 }
 
