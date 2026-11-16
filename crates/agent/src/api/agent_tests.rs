@@ -3584,3 +3584,247 @@ async fn quorum_profiles_keep_their_runtime_shape() -> Result<()> {
     }
     Ok(())
 }
+
+// ── Delegation in every runtime (unify-agent-runtime group 3) ──────────────
+
+/// A plugin registry whose `mock` provider answers every chat with a fixed text.
+fn scripted_text_registry() -> Result<(
+    Arc<querymt::plugin::host::PluginRegistry>,
+    tempfile::TempDir,
+)> {
+    use crate::test_utils::{
+        MockChatResponse, MockLlmProvider, SharedLlmProvider, TestProviderFactory,
+    };
+    let mut mock = MockLlmProvider::new();
+    mock.expect_chat()
+        .returning(|_| Ok(MockChatResponse::text_only("Task complete").into()));
+    mock.expect_tools().return_const(None).times(0..);
+    let factory = Arc::new(TestProviderFactory::new(SharedLlmProvider::new(
+        mock,
+        vec![],
+    )));
+    let dir = tempfile::tempdir()?;
+    let registry = crate::test_utils::mock_plugin_registry_in(dir.path(), factory)?;
+    Ok((Arc::new(registry), dir))
+}
+
+/// Records a delegation request from `agent`'s root session to `target`, as the
+/// `delegate` tool does, and waits for the delegation to leave `Requested`.
+/// Returns its final status after at most five seconds.
+async fn request_delegation(agent: &Agent, target: &str) -> crate::session::domain::Delegation {
+    use crate::events::AgentEventKind;
+    use crate::session::domain::{Delegation, DelegationStatus};
+
+    let parent = agent.create_session().await.expect("root session");
+    let store = agent.storage_backend().session_store();
+    let parent_row = store
+        .get_session(&parent)
+        .await
+        .unwrap()
+        .expect("session row");
+    let delegation = store
+        .create_delegation(Delegation {
+            id: 0,
+            public_id: String::new(),
+            session_id: parent_row.id,
+            task_id: None,
+            target_agent_id: target.into(),
+            objective: format!("fixture task for {target}"),
+            objective_hash: Default::default(),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: None,
+            planning_summary: None,
+            status: DelegationStatus::Requested,
+            retry_count: 0,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+            isolation: Default::default(),
+        })
+        .await
+        .unwrap();
+    let public_id = delegation.public_id.clone();
+    agent
+        .inner
+        .config
+        .emit_event_persisted(
+            &parent,
+            AgentEventKind::DelegationRequested {
+                delegation,
+                tool_call_id: Some("call-1".into()),
+                batch_id: None,
+                cycle_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let current = store
+            .get_delegation(&public_id)
+            .await
+            .unwrap()
+            .expect("row");
+        if current.status != DelegationStatus::Requested || std::time::Instant::now() > deadline {
+            return current;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// `.agents` tree with one enabled `delegation-target` profile named `writer`.
+fn writer_dotagents_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dotagents_subdir(dir.path());
+    std::fs::create_dir_all(agents.join("agents/writer")).unwrap();
+    std::fs::write(
+        agents.join("agents/writer/agent.md"),
+        "---\nid: writer\ndescription: Writes docs\nrole: delegation-target\n---\nYou write docs.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        agents.join("agents/writer/config.json"),
+        r#"{"model":"fast"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        agents.join("models.json"),
+        r#"{"models":{"fast":{"provider":"mock","model":"mock-model"}}}"#,
+    )
+    .unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn delegation_from_a_plain_agent_runs() -> Result<()> {
+    use crate::session::domain::DelegationStatus;
+    use crate::test_utils::delegation::{DelegateBehavior, agent_info, build_delegate_handle};
+
+    let (registry, _dir) = scripted_text_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let store: Arc<dyn crate::session::store::SessionStore> = storage.clone();
+
+    let mut members = crate::delegation::DefaultAgentRegistry::new();
+    members.register_handle(
+        agent_info("helper"),
+        build_delegate_handle(DelegateBehavior::AlwaysOk, store, None).await
+            as Arc<dyn crate::agent::handle::AgentHandle>,
+    );
+    let mut builder = Agent::single()
+        .provider("mock", "mock-model")
+        .tools(["delegate"]);
+    builder.agent_registry = Some(Arc::new(members));
+    let agent = builder
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+
+    let delegation = request_delegation(&agent, "helper").await;
+    assert_eq!(
+        delegation.status,
+        DelegationStatus::Complete,
+        "a plain agent's delegation was never executed"
+    );
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn internal_sub_agent_extends_a_standalone_agent() -> Result<()> {
+    use crate::session::domain::DelegationStatus;
+
+    let dir = writer_dotagents_workspace();
+    let (registry, _reg_dir) = scripted_text_registry()?;
+    let agent = Agent::single()
+        .provider("mock", "mock-model")
+        .cwd(dir.path())
+        .tools(["delegate"])
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .dotagents_options(
+            crate::dotagents::DotagentsLoadOptions::enabled()
+                .with_workspace(dir.path())
+                .with_global_enabled(false),
+        )
+        .build()
+        .await?;
+
+    let delegation = request_delegation(&agent, "writer").await;
+    assert_eq!(
+        delegation.status,
+        DelegationStatus::Complete,
+        "delegation to the `.agents` target was never executed"
+    );
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_with_configured_delegates_and_a_protocol_target_starts() -> Result<()> {
+    let dir = writer_dotagents_workspace();
+    let toml = format!(
+        r#"
+[quorum]
+cwd = "{cwd}"
+delegation = true
+snapshot_policy = "none"
+
+[planner]
+provider = "mock"
+model = "mock-model"
+tools = ["delegate"]
+
+[[delegates]]
+id = "coder"
+provider = "mock"
+model = "mock-model"
+tools = []
+
+[dotagents]
+enabled = true
+workspace_root = "{cwd}/.agents"
+global_enabled = false
+"#,
+        cwd = dir.path().display()
+    );
+    let config: crate::config::QuorumConfig = toml::from_str(&toml)?;
+    let (registry, _reg_dir) = scripted_text_registry()?;
+    let agent = Agent::builder_from_quorum_config(config, None)?
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+
+    let mut ids: Vec<String> = agent
+        .quorum()
+        .expect("quorum")
+        .registry()
+        .list_agents()
+        .into_iter()
+        .map(|info| info.id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["coder", "writer"]);
+    agent.shutdown().await;
+    Ok(())
+}

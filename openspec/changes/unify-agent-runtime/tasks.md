@@ -70,7 +70,8 @@ Conventions used below. They are reference text, not tracked tasks.
 
 ## 3. One builder, delegation service in every runtime
 
-- [ ] 3.1 Add three failing tests in top `api/agent_tests.rs`. Verify: the first two fail on their timeout with the delegation still `requested`; the third fails with `did not use the quorum event fanout`.
+- [x] 3.1 Add three failing tests in top `api/agent_tests.rs`. Verify: the first two fail on their timeout with the delegation still `requested`; the third fails with `did not use the quorum event fanout`.
+  - Done (Run-T, `$F`): `delegation_from_a_plain_agent_runs` and `internal_sub_agent_extends_a_standalone_agent` fail after the 5 s wait with status still `Requested` (`left != Complete`); `runtime_with_configured_delegates_and_a_protocol_target_starts` fails with `Error: writer agent did not use the quorum event fanout`. They are expected to fail until 3.3/3.4. The tests record a `DelegationRequested` event the way the `delegate` tool does, because no provider script is needed to prove the service runs it.
   - `delegation_from_a_plain_agent_runs` (agent-delegation / Delegation from a plain agent runs, with a pre-registered member);
   - `internal_sub_agent_extends_a_standalone_agent` (dotagents-protocol / Internal sub-agent extends a standalone agent, with a `.agents` target);
   - `runtime_with_configured_delegates_and_a_protocol_target_starts` (dotagents-protocol / Runtime with configured delegates and a protocol target starts).
