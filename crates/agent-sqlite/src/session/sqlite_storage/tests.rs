@@ -6672,3 +6672,52 @@ async fn full_history_read_emits_a_span() {
     assert_eq!(fields["rows"], "10");
     assert_eq!(fields["bytes"], expected_bytes.to_string());
 }
+
+#[tokio::test]
+async fn prompt_row_decoding_to_another_part_is_skipped_but_counted() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let sid = new_session_id(&storage).await;
+    store_all(
+        &storage,
+        &sid,
+        vec![
+            prompt_message(&sid, "p1", "one", 1),
+            prompt_message(&sid, "p2", "two", 2),
+        ],
+    )
+    .await;
+    // `part_type` still says prompt, but the JSON is a text part.
+    let mismatched = serde_json::to_string(&MessagePart::Text {
+        content: "not a prompt".to_string(),
+    })
+    .unwrap();
+    {
+        let conn = storage.conn_for_test();
+        let conn = conn.lock();
+        let changed = conn
+            .execute(
+                "UPDATE message_parts SET content_json = ?1
+                 WHERE message_id = (SELECT id FROM messages WHERE public_id = 'p2')",
+                [&mismatched],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    let intact = serde_json::to_string(&MessagePart::Prompt {
+        blocks: text_blocks("one"),
+    })
+    .unwrap();
+
+    let (captured, _guard) = capture_spans();
+    let records = storage.get_user_prompts(&sid, None).await.unwrap();
+
+    let ids: Vec<&str> = records.iter().map(|r| r.message_id.as_str()).collect();
+    assert_eq!(ids, ["p1"]);
+    // rows and bytes both cover every row read, including the skipped one.
+    let fields = span_fields(&captured, "session_store.get_user_prompts");
+    assert_eq!(fields["rows"], "2");
+    assert_eq!(
+        fields["bytes"],
+        (intact.len() + mismatched.len()).to_string()
+    );
+}

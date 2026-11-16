@@ -555,7 +555,10 @@ impl SessionStore for SqliteStorage {
 
     async fn get_history(&self, session_id: &str) -> SessionResult<Vec<AgentMessage>> {
         // Resolve session public_id → internal i64
-        let span = tracing::info_span!(
+        // `debug`: the full history is read several times per turn by middleware
+        // and execution; load and replay paths are covered by the info-level
+        // `session_store.get_user_prompts` span and their own callers' spans.
+        let span = tracing::debug_span!(
             "session_store.get_history",
             session.id = %session_id,
             rows = tracing::field::Empty,
@@ -715,7 +718,7 @@ impl SessionStore for SqliteStorage {
                 None => None,
             };
 
-            let (records, bytes) = self
+            let (records, rows_read, bytes) = self
                 .run_blocking(move |conn| {
                     let mut stmt = conn.prepare(USER_PROMPTS_SQL)?;
                     let rows = stmt.query_map(params![session_internal_id, ids_json], |row| {
@@ -738,23 +741,32 @@ impl SessionStore for SqliteStorage {
                         Ok((message_id, order, timestamp, blocks, content.len()))
                     })?;
                     let mut records = Vec::new();
+                    let mut rows_read = 0usize;
                     let mut bytes = 0usize;
                     for row in rows {
                         let (message_id, order, timestamp, blocks, len) = row?;
+                        // `rows` and `bytes` describe the same set: every row read.
+                        rows_read += 1;
                         bytes += len;
-                        if let Some(blocks) = blocks {
-                            records.push(UserPromptRecord {
+                        match blocks {
+                            Some(blocks) => records.push(UserPromptRecord {
                                 message_id,
                                 message_order: order as u64,
                                 timestamp,
                                 blocks,
-                            });
+                            }),
+                            // The row's `part_type` says prompt/steering but its JSON
+                            // decodes to another part: corrupt data, not a record.
+                            None => tracing::warn!(
+                                message_id = %message_id,
+                                "prompt part row does not decode to a prompt or steering part; skipped"
+                            ),
                         }
                     }
-                    Ok((records, bytes))
+                    Ok((records, rows_read, bytes))
                 })
                 .await?;
-            record_span.record("rows", records.len() as u64);
+            record_span.record("rows", rows_read as u64);
             record_span.record("bytes", bytes as u64);
             Ok(records)
         }

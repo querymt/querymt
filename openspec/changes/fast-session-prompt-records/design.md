@@ -169,7 +169,11 @@ CREATE INDEX IF NOT EXISTS idx_message_parts_prompt
 DROP INDEX IF EXISTS idx_messages_session;
 ```
 
-- **`idx_messages_session_order`** serves history order for both reads. Its `session_id` prefix also serves every query that used `idx_messages_session`; for example `delete_messages_after` (`session_id = ? AND id >= ?`) and per-session counts plan onto it. That index is therefore dropped rather than kept as a redundant write cost.
+- **`idx_messages_session_order`** serves history order for both reads. Its `session_id` prefix still serves every query that used `idx_messages_session`, but two of them lose a little, because the old index was ordered by rowid after `session_id` and the new one is ordered by `created_at` (checked with `EXPLAIN QUERY PLAN` on both schemas):
+  - the fork copy read (`WHERE session_id = ? ORDER BY id`) now needs a `USE TEMP B-TREE FOR ORDER BY` over the session's messages instead of reading them in order;
+  - `delete_messages_after` (`session_id = ? AND id >= ?`) now scans all of the session's index entries and filters `id` per entry, instead of a `rowid>?` range seek. Per-session counts and other `session_id`-only lookups are unaffected.
+
+  Both run rarely (a fork, an undo) and over one session's messages, so the cost is accepted and the index is dropped rather than kept as a second write cost on every message insert. If either shows up in a trace, restore `idx_messages_session` or add `messages(session_id, id)`.
 - **`idx_message_parts_prompt`** holds about 9.6k entries locally (2% of parts). It lets the correlated subquery find a message's first prompt or steering part from the index alone, instead of opening each of the message's part rows to test `part_type`. On a cold NAS those row reads are random reads in the 1.26 GB table.
 - **Fresh and upgraded databases agree:**
   - `init_schema` gets the same two `CREATE INDEX` statements and no longer creates `idx_messages_session`. A fresh install runs `init_schema` (through 0001) and then 0037, whose `IF NOT EXISTS` / `IF EXISTS` statements are then no-ops.
@@ -177,7 +181,7 @@ DROP INDEX IF EXISTS idx_messages_session;
   - `legacy_baseline_upgrade_matches_fresh_install` checks that the two agree, with `KNOWN_BENIGN_DRIFT` left empty.
 - **Released migrations stay frozen.** The migration inlines its DDL instead of sharing a constant with `init_schema`, as `0035_knowledge_junction_tables` does.
 - **Cost:** 0.22 s and about 4.4 MB on the 3.6 GB local database, run once on start. Each message insert writes one index entry, the same count as before because one index replaces another; each prompt or steering part writes one more.
-- **Older binaries:** `apply_migrations` iterates its own migration list, so an older binary ignores the unknown `0037` row. Its queries plan onto the new `messages` index. Nothing recreates `idx_messages_session`, which is harmless.
+- **Older binaries:** `apply_migrations` iterates its own migration list, so an older binary ignores the unknown `0037` row. Its queries plan onto the new `messages` index (with the two small losses noted in decision 4). Nothing recreates `idx_messages_session`, which is harmless.
 - **Alternatives considered:**
   - `messages(session_id, created_at, id)`: the same as the chosen index, because `id` is the rowid.
   - Keeping `idx_messages_session`: a redundant index with write cost and no read benefit.
@@ -234,10 +238,11 @@ flowchart LR
 
 ### 7. Telemetry
 
-- **Spans:** the SQLite `get_history` and `get_user_prompts` each run inside an `info_span!` (`session_store.get_history` / `session_store.get_user_prompts`) with `session.id`, `rows = Empty` and `bytes = Empty`. agent-sqlite already depends on `tracing` and uses `#[tracing::instrument]` in `view_store.rs`.
-- **Counts:** the blocking closure returns them, and the async side records them on the span after `run_blocking` completes. Recording from the async side avoids depending on span propagation into `spawn_blocking` threads.
+- **Spans:** the SQLite `get_history` and `get_user_prompts` each run inside a span (`session_store.get_history` at `debug`, `session_store.get_user_prompts` at `info`; see Level below) with `session.id`, `rows = Empty` and `bytes = Empty`. agent-sqlite already depends on `tracing` and uses `#[tracing::instrument]` in `view_store.rs`.
+- **Level:** `session_store.get_user_prompts` is an `info` span. `session_store.get_history` is a `debug` span, because the full history is read several times per turn (middleware, execution, maintenance) and an `info` span would add that many exported spans per turn.
+- **Counts:** the blocking closure returns them, and the async side records them on the span after `run_blocking` completes. `rows` and `bytes` always describe the same rows: every row read, including a prompt-indexed row whose JSON decodes to a non-prompt part. Such a row produces no record and logs a `warn`. Recording from the async side avoids depending on span propagation into `spawn_blocking` threads.
   - for history: parts read and the summed `content_json` length;
-  - for prompts: rows returned and the summed prompt `content_json` length.
+  - for prompts: rows read from the prompt query (including any skipped corrupt row) and the summed prompt `content_json` length.
 - **Default implementation:** only the SQLite override records `session_store.get_user_prompts`; the default implementation is covered by the `get_history` span.
 - **Tests:** a small test `tracing_subscriber::Layer` captures span names and recorded fields, using `tracing::subscriber::set_default` on a current-thread runtime. agent-sqlite gains `tracing-subscriber = "0.3"` as a dev-dependency (runtime already has it); run `cargo hakari generate` / `verify` afterwards.
 
@@ -258,6 +263,7 @@ flowchart LR
 
 - **[Remote speed-up depends on the owner's version]** → Peers send the same `GetUserPrompts` message, so the owner answers fast only once it runs this version. Mixed versions keep working, and the rollout note is in the proposal.
 - **[The NAS's 12 s is not yet explained]** → The proposal's evidence shows the time was spent inside the full-history read. The targeted query reads only index entries plus prompt rows, and the cache settings target cold reads. A remaining slow load would show up in the new spans. Re-measuring after deploy is in Workflow follow-up.
+- **[Fork copy and undo plan slightly worse]** → Dropping `idx_messages_session` adds a temp sort to the fork copy read and turns the `delete_messages_after` range seek into a per-session index scan. Both are rare and bounded by one session's message count. Mitigation if it matters: add `messages(session_id, id)`.
 - **[Partial index silently unused]** → If the query's `part_type` predicate drifts from the index predicate, SQLite falls back to `idx_message_parts_message` and reads each part row; results stay correct, only slower. `session_message_reads_use_indexes` plans the production `const`s against the migrated schema.
 - **[Memory mapping and I/O errors]** → With mmap, an I/O error on the database file (for example a failing disk, or a database on a network share) raises a signal instead of an error return. This is SQLite's documented trade-off. The session database lives on local storage by default (`~/.qmt/sessions.db`); deployments that put it on a network filesystem should not, regardless of this change (WAL already requires shared memory). The limit is 256 MiB, not the whole file.
 - **[Memory use]** → Up to 64 MiB of page cache per file-backed store, allocated only as pages are read. A node usually opens one store; quorum and tests may open more, mostly `:memory:` (skipped).
@@ -273,5 +279,5 @@ flowchart LR
 - **Release:** ship as part of a normal agent release; CHANGELOG notes the migration and the cache settings under `### Behavior changes`.
 - **Rollback:**
   - Reverting the commit restores the old reads and connection settings.
-  - A database already migrated keeps the new indexes and lacks `idx_messages_session`. Older binaries work with that: their `session_id` lookups use the new index, and nothing requires the dropped one.
+  - A database already migrated keeps the new indexes and lacks `idx_messages_session`. Older binaries work with that: their `session_id` lookups use the new index (fork copy and `delete_messages_after` are slightly slower, see decision 4), and nothing requires the dropped one.
   - To restore the old index set exactly, run the inverse DDL by hand (`CREATE INDEX idx_messages_session ON messages(session_id)`, drop the two new indexes, delete the `0037` row from `schema_migrations`).
