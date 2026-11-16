@@ -1,11 +1,6 @@
-//! AgentHandle trait and LocalAgentHandle concrete implementation.
-//!
-//! `AgentHandle` is the trait that all agent handles implement — both local
-//! and remote. `LocalAgentHandle` is the concrete implementation for local
-//! agents, bundling shared config, the kameo session registry, and
+//! `LocalAgentHandle`: the handle of a local agent, bundling shared config, the kameo session registry, and
 //! connection-level mutable state.
 
-mod agent_handle;
 pub(crate) mod agent_handle_impl;
 pub(crate) mod core;
 pub(crate) mod ext;
@@ -15,6 +10,7 @@ pub(crate) mod ext_models;
 pub(crate) mod ext_plugins;
 pub(crate) mod ext_profiles;
 pub(crate) mod ext_remote;
+pub(crate) mod ext_roster;
 pub(crate) mod ext_schedules;
 pub(crate) mod ext_session_history;
 pub(crate) mod ext_session_ops;
@@ -25,6 +21,9 @@ pub(crate) mod remote_connect;
 pub(crate) mod remote_mesh;
 pub(crate) mod remote_nodes;
 pub(crate) mod remote_sessions;
+pub(crate) mod roster_changes;
+#[cfg(test)]
+mod roster_ext_tests;
 #[doc(hidden)]
 pub mod runtime_observation;
 pub(crate) mod scheduler;
@@ -50,11 +49,9 @@ use crate::acp::protocol::{
 };
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, ClientState};
-pub use crate::agent::handle::agent_handle::AgentHandle;
 use crate::agent::remote::SessionActorRef;
 use crate::agent::session_materializer::{PreparedSessionResult, SessionMaterializer};
 use crate::agent::session_registry::SessionRegistry;
-use crate::delegation::AgentRegistry;
 use crate::middleware::CompositeDriver;
 use crate::profile_host::ProfileRuntimeHost;
 use crate::send_agent::SendAgent;
@@ -67,7 +64,7 @@ use kameo::actor::ActorRef;
 use parking_lot::Mutex as ParkingMutex;
 use querymt::LLMParams;
 use querymt::chat::ReasoningEffort;
-use querymt_agent_core::events::{AgentEventKind, EventEnvelope};
+use querymt_agent_core::events::AgentEventKind;
 use querymt_agent_index::WorkspaceIndexManagerActor;
 use querymt_agent_services::event_fanout::EventFanout;
 use std::any::Any;
@@ -176,8 +173,25 @@ pub struct LocalAgentHandle {
     /// `None` if scheduling is not enabled or lease was not acquired.
     pub scheduler_handle: SchedulerHandleSlot,
 
+    /// The delegation service this handle owns when it is a runtime's root:
+    /// the orchestrator and its listener task. Stopped by `shutdown()`.
+    delegation_service: ParkingMutex<Option<DelegationService>>,
+
     /// Guard to ensure `shutdown()` only runs its body once.
     shutdown_done: AtomicBool,
+}
+
+/// A running delegation service: the orchestrator and the task that feeds it.
+struct DelegationService {
+    orchestrator: Arc<crate::delegation::DelegationOrchestrator>,
+    listener: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DelegationService {
+    fn drop(&mut self) {
+        // A handle dropped without `shutdown()` must not leave the listener running.
+        self.listener.abort();
+    }
 }
 
 #[doc(hidden)]

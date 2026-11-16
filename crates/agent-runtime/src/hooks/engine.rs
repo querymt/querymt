@@ -15,7 +15,8 @@ use crate::hooks::schema::{
     PostDelegationCommandInput, PostToolUseCommandInput, PreCompactionCommandInput,
     PreDelegationCommandInput, PreToolUseCommandInput, SessionEndCommandInput,
     SessionEndCommandOutputWire, SessionStartCommandInput, StopCommandInput,
-    StructuredToolResultWire, UserPromptSubmitCommandInput,
+    StructuredToolResultWire, SubagentChangeCommandInput, SubagentChangeCommandOutputWire,
+    UserPromptSubmitCommandInput,
 };
 use crate::session::pruning::estimate_chat_tokens;
 use log::warn;
@@ -118,6 +119,28 @@ pub struct SessionEndRequest {
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionEndResult {
+    pub notices: Vec<HookNotice>,
+}
+
+/// A subagent joined or left the roster. Not tied to a session.
+#[derive(Debug, Clone)]
+pub struct SubagentChangeRequest {
+    /// `SubagentAdded` or `SubagentRemoved`.
+    pub event: HookEventConfig,
+    pub subagent_id: String,
+    pub name: String,
+    pub description: String,
+    pub capabilities: Vec<String>,
+    pub origin: String,
+    pub location: String,
+    pub generation: u64,
+    pub profile_id: Option<String>,
+    /// Working directory the hook runs in; the root's, when it has one.
+    pub cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SubagentChangeResult {
     pub notices: Vec<HookNotice>,
 }
 
@@ -486,6 +509,57 @@ impl Hooks {
                 result
                     .notices
                     .push(invalid_notice(HookEventConfig::SessionEnd, error.into()));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Runs the `subagent_added` / `subagent_removed` hooks. They observe a
+    /// change that has already happened: a block request or an invalid reply
+    /// becomes a notice, and nothing here can undo the change.
+    pub async fn run_subagent_change(
+        &self,
+        request: SubagentChangeRequest,
+    ) -> anyhow::Result<SubagentChangeResult> {
+        let event = request.event;
+        debug_assert!(matches!(
+            event,
+            HookEventConfig::SubagentAdded | HookEventConfig::SubagentRemoved
+        ));
+        if !self.is_enabled() {
+            return Ok(SubagentChangeResult::default());
+        }
+        let input = SubagentChangeCommandInput {
+            hook_event_name: event.label().to_string(),
+            subagent_id: request.subagent_id.clone(),
+            name: request.name,
+            description: request.description,
+            capabilities: request.capabilities,
+            origin: request.origin,
+            location: request.location,
+            generation: request.generation,
+            profile_id: request.profile_id,
+            cwd: NullableString::from_path(request.cwd.clone()),
+        };
+        let outcomes = self
+            .run_event(
+                event,
+                Some(&request.subagent_id),
+                input,
+                request.cwd.as_deref(),
+            )
+            .await?;
+        let mut result = SubagentChangeResult::default();
+        for outcome in outcomes {
+            result.notices.extend(outcome.notices);
+            if outcome.hard_block_reason.is_some() {
+                result.notices.push(ignored_control_notice(event));
+            }
+            if !outcome.stdout.trim().is_empty()
+                && let Err(error) =
+                    serde_json::from_str::<SubagentChangeCommandOutputWire>(&outcome.stdout)
+            {
+                result.notices.push(invalid_notice(event, error.into()));
             }
         }
         Ok(result)

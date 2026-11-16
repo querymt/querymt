@@ -20,8 +20,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Loading agent from: {}", config_path);
 
-    // Load agent/quorum from config file
-    // This automatically detects whether it's a single agent or multi-agent config
+    // Load an agent (with optional `[[delegates]]`) from a config file.
+    // The deprecated `[quorum]` form is detected and loads too.
     let runner = from_config(&config_path).await?;
 
     println!("Agent loaded successfully!\n");

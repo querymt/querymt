@@ -74,21 +74,9 @@ pub struct ProfileRuntime {
 impl ProfileRuntime {
     /// Runtime-side view of this profile runtime (root handle plus delegates).
     pub fn view(&self) -> Arc<ProfileRuntimeView> {
-        let delegates = self
-            .agent
-            .quorum()
-            .map(|quorum| {
-                quorum
-                    .delegates()
-                    .iter()
-                    .map(|entry| (entry.info.id.clone(), entry.agent.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
         Arc::new(ProfileRuntimeView {
             metadata: self.metadata.clone(),
             handle: self.agent.handle(),
-            delegates,
             provider_lock: self.provider_lock.clone(),
         })
     }
@@ -113,7 +101,7 @@ impl ProfileRuntime {
     pub fn session_handle(
         &self,
         agent_id: Option<&str>,
-    ) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
+    ) -> Option<Arc<crate::agent::LocalAgentHandle>> {
         match agent_id {
             Some(agent_id) => self.agent.delegate(agent_id),
             None => Some(self.agent.handle()),
@@ -843,9 +831,6 @@ where
         self.building_runtimes.lock().await.clear();
         drop(lifecycle);
         for runtime in stale_runtimes {
-            if let Some(quorum) = runtime.agent.quorum() {
-                quorum.shutdown().await;
-            }
             runtime.agent.handle().shutdown().await;
         }
         Ok(profiles)
@@ -918,17 +903,11 @@ where
             let lifecycle = self.lifecycle.lock().await;
             if self.shutdown.load(Ordering::Acquire) {
                 drop(lifecycle);
-                if let Some(quorum) = runtime.agent.quorum() {
-                    quorum.shutdown().await;
-                }
                 runtime.agent.handle().shutdown().await;
                 return Err(anyhow!("profile runtime manager is shut down"));
             }
             if self.generation.load(Ordering::Acquire) != generation {
                 drop(lifecycle);
-                if let Some(quorum) = runtime.agent.quorum() {
-                    quorum.shutdown().await;
-                }
                 runtime.agent.handle().shutdown().await;
                 continue;
             }
@@ -1288,9 +1267,6 @@ where
         let runtimes = std::mem::take(&mut *self.runtimes.lock().await);
         drop(lifecycle);
         for runtime in runtimes.into_values() {
-            if let Some(quorum) = runtime.agent.quorum() {
-                quorum.shutdown().await;
-            }
             runtime.agent.handle().shutdown().await;
         }
     }
@@ -1456,60 +1432,16 @@ async fn build_profile_runtime(
         shared_infra.plugin_registry = registry;
         lock
     };
-    let agent = match document.config {
-        Config::Single(config) => {
-            let attachment_source = shared_infra.session_mcp_attachment_source.clone();
-            #[cfg(feature = "remote")]
-            let mesh_setup = config.mesh.enabled.then(|| {
-                (
-                    config.mesh.clone(),
-                    config.remote_agents.clone(),
-                    config.mesh.auto_fallback,
-                )
-            });
-
-            // Thread the protocol workspace through the normal builder so the
-            // runtime picks up `<workspace>/.agents/` without the TOML profile
-            // catalog needing to understand protocol profiles.
-            let mut builder = Agent::builder_from_config_with_dotagents(
-                *config,
-                None,
-                dotagents_workspace.as_deref(),
-            )?;
-            if let Some(source) = attachment_source {
-                builder = builder.with_session_mcp_attachment_source(source);
-            }
-            #[cfg(feature = "remote")]
-            if let Some((mesh_config, remote_agents, _)) = &mesh_setup {
-                builder = builder.mesh(
-                    crate::api::Mesh::from_toml(mesh_config.clone())
-                        .with_remote_agents(remote_agents.clone()),
-                );
-            }
-            let agent = builder.infra(shared_infra).build().await?;
-            #[cfg(feature = "remote")]
-            if let Some((_, _, auto_fallback)) = mesh_setup {
-                agent.handle().set_mesh_fallback(auto_fallback);
-            }
-            agent
-        }
-        Config::Multi(config) => {
-            #[cfg(feature = "remote")]
-            let infra = shared_infra.clone();
-            #[cfg(not(feature = "remote"))]
-            let infra = shared_infra;
-
-            let mut builder = Agent::builder_from_quorum_config(*config, None)?;
-            if let Some(workspace) = dotagents_workspace {
-                builder = builder.with_dotagents_workspace(workspace);
-            }
-            builder
-                .with_profile_id(metadata.id.clone())
-                .infra(infra)
-                .build()
-                .await?
-        }
-    };
+    // Thread the protocol workspace through the normal builder so the runtime
+    // picks up `<workspace>/.agents/` without the TOML profile catalog needing
+    // to understand protocol profiles.
+    let builder =
+        Agent::builder_from_config_value(document.config, dotagents_workspace.as_deref())?;
+    let agent = builder
+        .with_profile_id(metadata.id.clone())
+        .infra(shared_infra)
+        .build()
+        .await?;
 
     Ok(ProfileRuntime {
         metadata,
@@ -1918,7 +1850,7 @@ model = "model.gguf"
             .find(|profile| profile.id == "coder-delegate")
             .expect("coder delegate profile should be listed");
         assert_eq!(coder_delegate.name, "Coder Delegate");
-        assert_eq!(coder_delegate.config_kind, Some(ProfileConfigKind::Quorum));
+        assert_eq!(coder_delegate.config_kind, Some(ProfileConfigKind::Single));
         assert!(matches!(
             coder_delegate.source,
             ProfileSource::EmbeddedToml { .. }
@@ -1935,10 +1867,11 @@ model = "model.gguf"
             .await
             .expect("coder delegate profile should load");
         let delegate_config = match delegate_document.config {
-            Config::Multi(config) => config,
-            Config::Single(_) => panic!("expected coder delegate quorum config"),
+            Config::Single(config) => config,
+            Config::Multi(_) => panic!("expected coder delegate agent config"),
         };
-        crate::api::Agent::builder_from_quorum_config(*delegate_config, None)
+        assert_eq!(delegate_config.delegates.len(), 2);
+        crate::api::Agent::builder_from_config(*delegate_config)
             .expect("embedded coder delegate tools should validate");
     }
 
@@ -2631,15 +2564,8 @@ capabilities = ["coding"]
         .await
         .expect("initial quorum runtime build hung")
         .expect("initial quorum runtime");
-        assert!(first.agent().quorum().is_some());
-        assert!(
-            first
-                .agent()
-                .handle()
-                .agent_registry()
-                .get_handle("coder")
-                .is_some()
-        );
+        assert!(first.agent().has_subagents());
+        assert!(first.agent().delegate("coder").is_some());
         let subscriber_count = fanout.subscriber_count();
         for _ in 0..3 {
             let document = manager
@@ -3407,7 +3333,7 @@ system = "inline"
             .await
             .expect("single runtime builds");
         assert_eq!(runtime.profile_id(), "single");
-        assert!(!runtime.agent().is_multi());
+        assert!(!runtime.agent().has_subagents());
         assert!(Arc::ptr_eq(&shared, &runtime.agent().storage_backend()));
 
         manager.shutdown().await;
@@ -3487,7 +3413,7 @@ capabilities = ["coding"]
             .await
             .expect("quorum runtime builds");
         assert_eq!(runtime.profile_id(), "team");
-        assert!(runtime.agent().is_multi());
+        assert!(runtime.agent().has_subagents());
         assert!(Arc::ptr_eq(&shared, &runtime.agent().storage_backend()));
 
         manager.shutdown().await;

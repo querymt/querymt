@@ -942,10 +942,13 @@ fn spawn_event_bridge_forwarder(
                         break;
                     }
                     let ids = delivery.observed_sessions();
-                    let sources = crate::acp::shared::collect_event_sources(&agent);
                     let (mut notifications, updates) =
-                        crate::acp::shared::current_session_observations(&agent, &ids, &sources)
-                            .await;
+                        crate::acp::shared::current_session_observations(
+                            &agent,
+                            &ids,
+                            agent.config.event_sink.fanout(),
+                        )
+                        .await;
                     translator
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -999,7 +1002,7 @@ fn spawn_event_bridge_forwarder(
 ///
 /// #[tokio::main]
 /// async fn main() -> anyhow::Result<()> {
-///     let agent = Agent::single()
+///     let agent = Agent::builder()
 ///         .provider("anthropic", "claude-sonnet-4-20250514")
 ///         .cwd("/tmp")
 ///         .build()
@@ -1025,18 +1028,14 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
     agent.set_bridge(bridge_sender.clone()).await;
     log::debug!("Set bridge on agent");
 
-    // 3. Collect EventFanouts from agent and delegates
-    let event_sources = crate::acp::shared::collect_event_sources(&agent);
-    log::debug!(
-        "Collected {} event source(s) for forwarding",
-        event_sources.len()
-    );
+    // 3. Every member is built on the root's event stream, so the root's
+    // fanout is the only source to forward.
+    let event_fanout = agent.config.event_sink.fanout().clone();
 
     // 4. Create shutdown coordination channel
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(event_sources.len());
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
-    // 5. Spawn event bridge forwarders (one per EventFanout)
-    let mut forwarder_handles = Vec::new();
+    // 5. Spawn the event bridge forwarder
     let forwarded_elicitations = Arc::new(Mutex::new(HashSet::new()));
     let translator = Arc::new(Mutex::new(AcpLiveEventTranslator::new()));
     // One session-load preference per connection: parsed from the client's
@@ -1051,22 +1050,16 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         Some(agent.config.event_sink.journal().clone()),
         tokio_util::sync::CancellationToken::new(),
     );
-    for (idx, event_fanout) in event_sources.into_iter().enumerate() {
-        let handle = spawn_event_bridge_forwarder(
-            event_fanout,
-            bridge_sender.clone(),
-            agent.clone(),
-            forwarded_elicitations.clone(),
-            translator.clone(),
-            delivery.clone(),
-            shutdown_tx.clone(),
-        );
-        forwarder_handles.push(handle);
-        log::debug!("Spawned event forwarder #{}", idx);
-    }
-    log::info!("Spawned {} event forwarder(s)", forwarder_handles.len());
-
-    drop(shutdown_tx);
+    let forwarder_handle = spawn_event_bridge_forwarder(
+        event_fanout,
+        bridge_sender.clone(),
+        agent.clone(),
+        forwarded_elicitations.clone(),
+        translator.clone(),
+        delivery.clone(),
+        shutdown_tx,
+    );
+    log::info!("Spawned event forwarder");
 
     // 6. Set up stdio streams and connect ACP agent role.
     let stdin = tokio::io::stdin().compat();
@@ -1374,7 +1367,7 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         agent.shutdown().await;
         log::info!("Agent shutdown complete");
 
-        log::info!("Waiting for event forwarders to stop...");
+        log::info!("Waiting for the event forwarder to stop...");
         let forwarder_wait = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while shutdown_rx.recv().await.is_some() {
                 log::debug!("Event forwarder stopped");
@@ -1382,13 +1375,10 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         });
 
         match forwarder_wait.await {
-            Ok(_) => log::info!("All event forwarders stopped gracefully"),
+            Ok(_) => log::info!("Event forwarder stopped gracefully"),
             Err(_) => {
-                log::warn!("Event forwarders did not stop within 5s, aborting...");
-                for (idx, handle) in forwarder_handles.iter().enumerate() {
-                    handle.abort();
-                    log::debug!("Aborted event forwarder #{}", idx);
-                }
+                log::warn!("Event forwarder did not stop within 5s, aborting...");
+                forwarder_handle.abort();
             }
         }
     }

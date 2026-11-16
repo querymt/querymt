@@ -42,7 +42,7 @@ use querymt_agent::prelude::*;
 ```rust
 use querymt_agent::prelude::*;
 
-let agent = Agent::single()
+let agent = Agent::builder()
     .provider("anthropic", "claude-sonnet-4-5-20250929")
     .cwd(".")
     .tools(["read_tool", "shell", "edit"])
@@ -53,15 +53,15 @@ let agent = Agent::single()
 
 Use `Mesh::hybrid()` when you want one process-shared runtime that supports both LAN discovery and later iroh invite joins.
 
-### Multi-Agent (Quorum)
+### Agent with Delegates
+
+Every agent is a root with a roster of members it can delegate to. A plain agent has an empty roster; `.delegate(..)` adds members.
 
 ```rust
-let agent = Agent::multi()
+let agent = Agent::builder()
     .cwd(".")
-    .planner(|p| {
-        p.provider("anthropic", "claude-sonnet-4-5-20250929")
-            .tools(["delegate"])
-    })
+    .provider("anthropic", "claude-sonnet-4-5-20250929")
+    .tools(["delegate"])
     .delegate("coder", |d| {
         d.provider("anthropic", "claude-sonnet-4-5-20250929")
             .tools(["shell", "edit"])
@@ -89,14 +89,9 @@ let agent = Agent::from_config(config, infra).await?;
 
 ### Agent
 
-The main agent runtime, supporting both single and multi-agent modes.
+The main agent runtime: one root agent plus the members it can delegate to. The delegation service runs in every runtime whose root may call `delegate`.
 
-```rust
-pub enum Agent {
-    Single(LocalAgentHandle),
-    Multi(QuorumHandle),
-}
-```
+`Agent::builder()` returns an `AgentBuilder`; `.subagent(id, |s| ..)` (alias `.delegate`), `.delegation(bool)` and `.delegation_settings(..)` configure delegation. `Agent::has_subagents()` reports whether the root has subagents it can delegate to, and `Agent::delegate(id)` returns a member's handle by ID. `Agent::single()` and `is_multi()` are deprecated aliases of `builder()` and `has_subagents()`.
 
 #### Methods
 
@@ -147,6 +142,24 @@ pub struct AgentSession {
 | `set_denied_tools(&self, tools: &[String]) -> Result<()>` | Set denied tools |
 | `get_history(&self) -> Result<Vec<AgentMessage>>` | Get conversation history |
 | `fork(&self, instructions: &str) -> Result<AgentSession>` | Fork to new session |
+
+### Changing subagents while running
+
+```rust
+let agent = Agent::builder()
+    .provider("anthropic", "claude-sonnet-4-5")
+    .tools(["delegate", "read_tool"])   // `delegate` is required
+    .build().await?;
+
+agent.on_subagents_changed(|c| println!("{} {} (generation {})", c.kind.label(), c.id, c.generation.get()));
+
+agent.add_subagent("reviewer", |s| s.provider("anthropic", "claude-haiku-4-5")
+    .description("Reviews code").tools(["read_tool"])).await?;
+agent.chat("...").await?;                 // the root can now delegate to `reviewer`
+agent.remove_subagent("reviewer").await?;
+```
+
+`subagents()` lists the current subagents and `roster_generation()` counts changes. `on_subagents_changed` and `subscribe_subagent_changes()` report every successful add or remove from any path (Rust, ACP, profiles). Shell hooks `subagent_added` / `subagent_removed` are described in [Hooks](hooks.md). See `crates/agent/examples/dynamic_subagents.rs`.
 
 ## Agent Modes
 

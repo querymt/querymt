@@ -41,7 +41,7 @@ async fn test_agent_with_storage(
 
 async fn test_agent_with_backend(storage: Arc<dyn StorageBackend>) -> Result<Agent> {
     let (registry, _temp_dir) = empty_plugin_registry()?;
-    Agent::single()
+    Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
@@ -198,7 +198,7 @@ async fn agent_with_slash_config(config: SlashCommandsConfig) -> Result<Agent> {
     let (registry, _temp_dir) = empty_plugin_registry()?;
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
-    Agent::single()
+    Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
@@ -283,7 +283,7 @@ async fn agent_with_middleware_entries(
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
     let (registry, _temp_dir) = empty_plugin_registry()?;
-    Agent::single()
+    Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
@@ -1011,6 +1011,7 @@ async fn acp_list_sessions_source_splits_local_and_remote_listings() -> Result<(
                 cwd: Some("/remote/work".into()),
                 created_at: index,
                 title: Some(format!("Remote {index}")),
+                fork_origin: None,
             })
             .await?;
     }
@@ -1385,6 +1386,7 @@ async fn acp_list_sessions_opt_in_selected_peer_pages_offline_bookmarks() -> Res
                 cwd: Some("/remote/work".into()),
                 created_at: index,
                 title: Some(format!("Remote {index}")),
+                fork_origin: None,
             })
             .await?;
     }
@@ -1396,6 +1398,7 @@ async fn acp_list_sessions_opt_in_selected_peer_pages_offline_bookmarks() -> Res
             cwd: Some("/remote/work".into()),
             created_at: 0,
             title: None,
+            fork_origin: None,
         })
         .await?;
 
@@ -1470,6 +1473,7 @@ async fn acp_remote_pages_advance_empty_peers_and_exclude_local_conflicts() -> R
                 cwd: Some("/remote/work".into()),
                 created_at: 0,
                 title: None,
+                fork_origin: None,
             })
             .await?;
     }
@@ -1557,6 +1561,7 @@ async fn list_sessions_remote_bookmarks_mode_includes_detached_bookmarks() -> Re
             cwd: Some("/remote/worktree".to_string()),
             created_at: 1,
             title: Some("Remote Bookmark".to_string()),
+            fork_origin: None,
         })
         .await?;
 
@@ -1609,21 +1614,12 @@ tools = []
 
     // Verify both profiles and quorum are present
     assert!(agent.profiles().is_some());
-    assert!(agent.quorum().is_some());
-    assert!(agent.is_multi());
+    assert!(agent.has_subagents());
 
     // Get references before shutdown
-    let planner = agent.planner().expect("planner present");
+    let planner = agent.handle();
     let delegate = agent.delegate("coder").expect("delegate present");
 
-    let planner = planner
-        .as_any()
-        .downcast_ref::<crate::agent::LocalAgentHandle>()
-        .expect("local planner");
-    let delegate = delegate
-        .as_any()
-        .downcast_ref::<crate::agent::LocalAgentHandle>()
-        .expect("local delegate");
     assert!(!planner.is_shutdown());
     assert!(!delegate.is_shutdown());
 
@@ -1662,7 +1658,7 @@ async fn protocol_prompt_overlay_appends_after_explicit_system_parts() -> Result
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
 
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .system("Explicit system prompt")
         .infra(AgentInfra {
@@ -1708,7 +1704,7 @@ async fn partial_protocol_overlay_preserves_explicit_settings() -> Result<()> {
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
 
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .system("Explicit system prompt")
         .infra(AgentInfra {
@@ -1761,7 +1757,7 @@ async fn selected_model_preset_overlays_only_llm_fields() -> Result<()> {
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
 
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .system("Explicit system prompt")
         .infra(AgentInfra {
@@ -1805,7 +1801,7 @@ async fn unknown_selected_preset_keeps_explicit_llm_configuration() -> Result<()
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
 
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
@@ -1861,7 +1857,7 @@ global_enabled = false
     );
     let config: crate::config::SingleAgentConfig = toml::from_str(&toml).unwrap();
 
-    let builder = Agent::builder_from_config(config, None)?;
+    let builder = Agent::builder_from_config(config)?;
     let agent = builder
         .infra(AgentInfra {
             plugin_registry: Arc::new(empty_plugin_registry()?.0),
@@ -2420,6 +2416,7 @@ async fn lifecycle_query_offline_bookmark_metadata_is_unknown_and_filters_reject
             cwd: Some("/remote".into()),
             created_at: 1,
             title: None,
+            fork_origin: None,
         })
         .await?;
     let all = agent
@@ -2551,7 +2548,7 @@ mod repository_knowledge_binding {
                 .await
                 .unwrap(),
         );
-        let mut builder = Agent::single()
+        let mut builder = Agent::builder()
             .provider("openai", "gpt-4o-mini")
             .cwd(cwd)
             .infra(AgentInfra {
@@ -2669,7 +2666,7 @@ mod repository_knowledge_binding {
         )
         .unwrap();
         let warm = registry.clone();
-        let agent = Agent::single()
+        let agent = Agent::builder()
             .provider("mock", "mock-model")
             .cwd(&repo)
             .repository_knowledge(settings)
@@ -2769,7 +2766,7 @@ mod workspace_api {
                 .await
                 .unwrap(),
         );
-        let mut builder = Agent::single()
+        let mut builder = Agent::builder()
             .provider("openai", "gpt-4o-mini")
             .cwd(repo.path())
             .infra(AgentInfra {
@@ -2954,7 +2951,7 @@ mod workspace_api {
                 .await
                 .unwrap(),
         );
-        let err = Agent::single()
+        let err = Agent::builder()
             .provider("openai", "gpt-4o-mini")
             .workspace(WorkspaceSettings {
                 storage_root: Some(file.path().join("nested")),
@@ -3018,7 +3015,7 @@ mod workspace_api {
 async fn build_single_from_toml(toml: &str) -> Result<Agent> {
     let config: crate::config::SingleAgentConfig = toml::from_str(toml)?;
     let (registry, _dir) = empty_plugin_registry()?;
-    Agent::builder_from_config(config, None)?
+    Agent::builder_from_config(config)?
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
             storage: Some(Arc::new(
@@ -3085,7 +3082,7 @@ async fn invalid_middleware_fails_single_and_quorum_with_the_same_error() {
     let quorum_toml = "[quorum]\ncwd = \"/tmp\"\n\n[planner]\nprovider = \"openai\"\nmodel = \"gpt-4\"\ntools = [\"delegate\"]\n\n[[planner.middleware]]\ntype = \"limits\"\ncache_write_cost_per_million = -2.0\n";
     let config: crate::config::QuorumConfig = toml::from_str(quorum_toml).unwrap();
     let (registry, _dir) = empty_plugin_registry().unwrap();
-    let quorum = Agent::builder_from_quorum_config(config, None)
+    let quorum = Agent::lower_quorum_config(config)
         .unwrap()
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
@@ -3145,7 +3142,7 @@ async fn built_trading_desk_agent_has_a_120s_approval_timeout() -> Result<()> {
 #[tokio::test]
 async fn build_reports_a_malformed_tool_selector() {
     let (registry, _temp_dir) = empty_plugin_registry().unwrap();
-    let err = Agent::single()
+    let err = Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .tools(["github."])
         .infra(AgentInfra {
@@ -3168,7 +3165,7 @@ async fn agent_with_skills(enabled: bool, tools: &[&str]) -> Result<Agent> {
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
     let (registry, _temp_dir) = empty_plugin_registry()?;
-    let mut builder = Agent::single()
+    let mut builder = Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
@@ -3304,13 +3301,21 @@ async fn target_sees_only_its_server_skills_and_parent_sees_both() -> Result<()>
     let (registry, _tmp) = empty_plugin_registry()?;
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
-    let factory = super::DotagentsTargetFactory::new(Arc::new(registry), storage)
-        .with_skills(Some(skills.clone()), dir.path());
-    let handle = crate::dotagents::ProtocolTargetFactory::create(&factory, plan).expect("target");
-    let target = handle
-        .as_any()
-        .downcast_ref::<crate::agent::LocalAgentHandle>()
-        .expect("local target");
+    let spec = crate::delegation::member::MemberBuildSpec::from_protocol_plan(plan, Some(&skills))
+        .expect("lowers");
+    let target = crate::delegation::member::build_member_for_tests(
+        &spec,
+        crate::delegation::member::DelegateBuildParams {
+            plugin_registry: Arc::new(registry),
+            snapshot_policy: crate::agent::SnapshotPolicy::None,
+            skills_project_root: dir.path().to_path_buf(),
+            workspace_service: None,
+            repository_knowledge: None,
+        },
+        storage,
+    )
+    .expect("target");
+    let target = &*target;
     let req = crate::acp::protocol::NewSessionRequest::new(dir.path().to_path_buf());
     let prepared = target
         .session_materializer
@@ -3345,7 +3350,7 @@ async fn target_sees_only_its_server_skills_and_parent_sees_both() -> Result<()>
     let (registry, _tmp2) = empty_plugin_registry()?;
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("openai", "gpt-4o-mini")
         .cwd(dir.path())
         .skills(skills)
@@ -3375,5 +3380,1982 @@ async fn target_sees_only_its_server_skills_and_parent_sees_both() -> Result<()>
     assert_eq!(skill_enum(&tool), vec!["docs.guide", "ops.runbook"]);
 
     agent.shutdown().await;
+    Ok(())
+}
+
+// ── Characterization of the `[quorum]` example profiles ─────────────────────
+
+/// Runtime shape of one built agent handle, for comparison across refactors.
+#[derive(Debug, PartialEq, Eq)]
+struct AgentShape {
+    tools: Vec<String>,
+    middleware: Vec<String>,
+    snapshot_policy: String,
+    has_snapshot_backend: bool,
+}
+
+fn agent_shape(handle: &crate::agent::LocalAgentHandle) -> AgentShape {
+    let mut tools = handle.tool_registry().names();
+    tools.sort();
+    AgentShape {
+        tools,
+        middleware: handle
+            .config
+            .middleware_drivers
+            .iter()
+            .map(|d| d.name().to_string())
+            .collect(),
+        snapshot_policy: handle.config.snapshot_policy.to_string(),
+        has_snapshot_backend: handle.config.snapshot_backend.is_some(),
+    }
+}
+
+fn planner_mw<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+    let mut m = vec!["ContextMiddleware"];
+    m.extend_from_slice(extra);
+    m.extend(["OutputLimitRecoveryMiddleware", "ParallelEditGuard"]);
+    m
+}
+
+fn with_tail<'a>(head: &[&'a str]) -> Vec<&'a str> {
+    let mut m = head.to_vec();
+    m.extend(["OutputLimitRecoveryMiddleware", "ParallelEditGuard"]);
+    m
+}
+
+/// (profile, planner shape, delegate shapes, delegation settings)
+type ExpectedProfile<'a> = (&'a str, AgentShape, Vec<(&'a str, AgentShape)>, &'a str);
+
+const QUORUM_BASELINE_TOOLS: &[&str] = &[
+    "accept_delegation_result",
+    "browse",
+    "complete_task",
+    "create_task",
+    "delegate",
+    "delete_file",
+    "edit",
+    "find_symbol_references",
+    "get_function",
+    "get_symbol",
+    "glob",
+    "index",
+    "knowledge_consolidate",
+    "knowledge_ingest",
+    "knowledge_list_unconsolidated",
+    "knowledge_query",
+    "knowledge_stats",
+    "language_query",
+    "ls",
+    "mdq",
+    "multiedit",
+    "question",
+    "read_task",
+    "read_tool",
+    "replace_symbol",
+    "search_text",
+    "session_history",
+    "shell",
+    "todoread",
+    "todowrite",
+    "update_task",
+    "web_fetch",
+    "write_file",
+];
+
+#[tokio::test]
+async fn quorum_profiles_keep_their_runtime_shape() -> Result<()> {
+    // `multi_agent.toml` interpolates `${GITHUB_TOKEN}`. nextest runs each test
+    // in its own process, so setting it here cannot race another test.
+    unsafe { std::env::set_var("GITHUB_TOKEN", "test-token") };
+    let confs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/confs");
+
+    let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let shape = |middleware: &[&str], policy: &str, backend: bool| AgentShape {
+        tools: owned(QUORUM_BASELINE_TOOLS),
+        middleware: owned(middleware),
+        snapshot_policy: policy.to_string(),
+        has_snapshot_backend: backend,
+    };
+    // (profile, planner, delegates, "policy timeout grace max_parallel verification")
+    let coder_mw = with_tail(&[
+        "LimitsMiddleware",
+        "ContextMiddleware",
+        "DedupCheckMiddleware",
+    ]);
+    let expected: Vec<ExpectedProfile> = vec![
+        (
+            "coder_agent",
+            shape(&planner_mw(&["AgentModeMiddleware"]), "diff", true),
+            vec![("coder", shape(&coder_mw, "diff", true))],
+            "All 120 5 5 false",
+        ),
+        (
+            "coder_delegate",
+            shape(&planner_mw(&["AgentModeMiddleware"]), "diff", true),
+            vec![
+                ("coder", shape(&coder_mw, "diff", true)),
+                (
+                    "explorer",
+                    shape(
+                        &with_tail(&["ContextMiddleware", "LimitsMiddleware"]),
+                        "diff",
+                        true,
+                    ),
+                ),
+            ],
+            "All 2400 5 5 true",
+        ),
+        (
+            "learning_pair",
+            shape(&planner_mw(&["AgentModeMiddleware"]), "diff", true),
+            vec![("coder", shape(&coder_mw, "diff", true))],
+            "All 300 5 1 false",
+        ),
+        (
+            "multi_agent",
+            shape(&planner_mw(&[]), "none", false),
+            vec![
+                (
+                    "coder",
+                    shape(&with_tail(&["ContextMiddleware"]), "none", false),
+                ),
+                (
+                    "researcher",
+                    shape(&with_tail(&["ContextMiddleware"]), "none", false),
+                ),
+            ],
+            "Any 120 5 5 true",
+        ),
+    ];
+
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/fixtures/quorum");
+    let infra = || async {
+        let (registry, dir) = empty_plugin_registry()?;
+        Ok::<_, anyhow::Error>((
+            AgentInfra {
+                plugin_registry: Arc::new(registry),
+                storage: Some(Arc::new(
+                    crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                        .await?,
+                )),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            },
+            dir,
+        ))
+    };
+
+    for (name, planner_shape, delegates, settings) in expected {
+        // The deprecated `[quorum]` form (kept as a fixture) and the `[agent]`
+        // form shipped in `examples/confs` must build the same runtime.
+        for form in ["quorum", "agent"] {
+            let (infra, _dir) = infra().await?;
+            let agent = if form == "quorum" {
+                let config =
+                    crate::config::load_config(fixtures.join(format!("{name}.toml"))).await?;
+                let crate::config::Config::Multi(config) = config else {
+                    panic!("{name}: expected a quorum config");
+                };
+                Agent::lower_quorum_config(*config)?
+                    .infra(infra)
+                    .build()
+                    .await?
+            } else {
+                let config = crate::config::load_config(confs.join(format!("{name}.toml"))).await?;
+                let crate::config::Config::Single(config) = config else {
+                    panic!("{name}: expected an agent config");
+                };
+                Agent::builder_from_config(*config)?
+                    .infra(infra)
+                    .build()
+                    .await?
+            };
+            let name = format!("{name} ({form})");
+            let local = |h: &Arc<crate::agent::LocalAgentHandle>| agent_shape(h);
+
+            assert_eq!(
+                agent_shape(&agent.handle()),
+                planner_shape,
+                "{name}: planner"
+            );
+            let mut ids: Vec<String> = roster_ids(&agent);
+            ids.sort();
+            let mut expected_ids: Vec<String> =
+                delegates.iter().map(|(id, _)| id.to_string()).collect();
+            expected_ids.sort();
+            assert_eq!(ids, expected_ids, "{name}: member ids");
+            for (id, expected_shape) in &delegates {
+                let handle = agent.delegate(id).expect("delegate");
+                // Members are not offered the `delegate` tool (agent-delegation spec).
+                let member_shape = AgentShape {
+                    tools: expected_shape
+                        .tools
+                        .iter()
+                        .filter(|tool| *tool != "delegate")
+                        .cloned()
+                        .collect(),
+                    middleware: expected_shape.middleware.clone(),
+                    snapshot_policy: expected_shape.snapshot_policy.clone(),
+                    has_snapshot_backend: expected_shape.has_snapshot_backend,
+                };
+                assert_eq!(local(&handle), member_shape, "{name}: delegate {id}");
+            }
+            let c = agent
+                .handle()
+                .delegation_orchestrator()
+                .expect("orchestrator")
+                .config()
+                .clone();
+            assert_eq!(
+                format!(
+                    "{:?} {} {} {} {}",
+                    c.wait_policy,
+                    c.wait_timeout_secs,
+                    c.cancel_grace_secs,
+                    c.max_parallel_delegations,
+                    c.run_verification
+                ),
+                settings,
+                "{name}: delegation settings"
+            );
+            agent.shutdown().await;
+        }
+    }
+    Ok(())
+}
+
+// ── Delegation in every runtime (unify-agent-runtime group 3) ──────────────
+
+/// A plugin registry whose `mock` provider answers every chat with a fixed text.
+fn scripted_text_registry() -> Result<(
+    Arc<querymt::plugin::host::PluginRegistry>,
+    tempfile::TempDir,
+)> {
+    use crate::test_utils::{
+        MockChatResponse, MockLlmProvider, SharedLlmProvider, TestProviderFactory,
+    };
+    let mut mock = MockLlmProvider::new();
+    mock.expect_chat()
+        .returning(|_| Ok(MockChatResponse::text_only("Task complete").into()));
+    mock.expect_chat_with_tools()
+        .returning(|_, _| Ok(MockChatResponse::text_only("Task complete").into()));
+    mock.expect_tools().return_const(None).times(0..);
+    let factory = Arc::new(TestProviderFactory::new(SharedLlmProvider::new(
+        mock,
+        vec![],
+    )));
+    let dir = tempfile::tempdir()?;
+    let registry = crate::test_utils::mock_plugin_registry_in(dir.path(), factory)?;
+    Ok((Arc::new(registry), dir))
+}
+
+/// Records a delegation request from `agent`'s root session to `target`, as the
+/// `delegate` tool does, and waits for the delegation to reach a terminal status.
+/// Returns its final status after at most five seconds.
+async fn request_delegation(agent: &Agent, target: &str) -> crate::session::domain::Delegation {
+    request_delegation_for(agent, target, None).await
+}
+
+/// Like [`request_delegation`]; the root session is bound to `profile` when given.
+async fn request_delegation_for(
+    agent: &Agent,
+    target: &str,
+    profile: Option<&str>,
+) -> crate::session::domain::Delegation {
+    use crate::events::AgentEventKind;
+    use crate::session::domain::{Delegation, DelegationStatus};
+
+    let parent = agent.create_session().await.expect("root session");
+    let store = agent.storage_backend().session_store();
+    if let Some(profile) = profile {
+        store.set_profile_binding(&parent, profile).await.unwrap();
+    }
+    let parent_row = store
+        .get_session(&parent)
+        .await
+        .unwrap()
+        .expect("session row");
+    let delegation = store
+        .create_delegation(Delegation {
+            id: 0,
+            public_id: String::new(),
+            session_id: parent_row.id,
+            task_id: None,
+            target_agent_id: target.into(),
+            objective: format!("fixture task for {target}"),
+            objective_hash: Default::default(),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: None,
+            planning_summary: None,
+            status: DelegationStatus::Requested,
+            retry_count: 0,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+            isolation: Default::default(),
+        })
+        .await
+        .unwrap();
+    let public_id = delegation.public_id.clone();
+    agent
+        .inner
+        .config
+        .emit_event_persisted(
+            &parent,
+            AgentEventKind::DelegationRequested {
+                delegation,
+                tool_call_id: Some("call-1".into()),
+                batch_id: None,
+                cycle_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let current = store
+            .get_delegation(&public_id)
+            .await
+            .unwrap()
+            .expect("row");
+        if !matches!(
+            current.status,
+            DelegationStatus::Requested | DelegationStatus::Running
+        ) || std::time::Instant::now() > deadline
+        {
+            return current;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// `.agents` tree with one enabled `delegation-target` profile named `writer`.
+fn writer_dotagents_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dotagents_subdir(dir.path());
+    std::fs::create_dir_all(agents.join("agents/writer")).unwrap();
+    std::fs::write(
+        agents.join("agents/writer/agent.md"),
+        "---\nid: writer\ndescription: Writes docs\nrole: delegation-target\n---\nYou write docs.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        agents.join("agents/writer/config.json"),
+        r#"{"model":"fast"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        agents.join("models.json"),
+        r#"{"models":{"fast":{"provider":"mock","model":"mock-model"}}}"#,
+    )
+    .unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn delegation_from_a_plain_agent_runs() -> Result<()> {
+    use crate::session::domain::DelegationStatus;
+    use crate::test_utils::delegation::{DelegateBehavior, agent_info, build_delegate_handle};
+
+    let (registry, _dir) = scripted_text_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let store: Arc<dyn crate::session::store::SessionStore> = storage.clone();
+
+    let members = vec![local_member(
+        agent_info("helper"),
+        build_delegate_handle(DelegateBehavior::AlwaysOk, store, None).await,
+    )];
+    let mut builder = Agent::builder()
+        .provider("mock", "mock-model")
+        .tools(["delegate"]);
+    builder.preregistered = members;
+    let agent = builder
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+
+    let delegation = request_delegation(&agent, "helper").await;
+    assert_eq!(
+        delegation.status,
+        DelegationStatus::Complete,
+        "a plain agent's delegation was never executed"
+    );
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn internal_sub_agent_extends_a_standalone_agent() -> Result<()> {
+    use crate::session::domain::DelegationStatus;
+
+    let dir = writer_dotagents_workspace();
+    let (registry, _reg_dir) = scripted_text_registry()?;
+    let agent = Agent::builder()
+        .provider("mock", "mock-model")
+        .cwd(dir.path())
+        .tools(["delegate"])
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .dotagents_options(
+            crate::dotagents::DotagentsLoadOptions::enabled()
+                .with_workspace(dir.path())
+                .with_global_enabled(false),
+        )
+        .build()
+        .await?;
+
+    let delegation = request_delegation(&agent, "writer").await;
+    assert_eq!(
+        delegation.status,
+        DelegationStatus::Complete,
+        "delegation to the `.agents` target was never executed"
+    );
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_with_configured_delegates_and_a_protocol_target_starts() -> Result<()> {
+    let dir = writer_dotagents_workspace();
+    let toml = format!(
+        r#"
+[quorum]
+cwd = "{cwd}"
+delegation = true
+snapshot_policy = "none"
+
+[planner]
+provider = "mock"
+model = "mock-model"
+tools = ["delegate"]
+
+[[delegates]]
+id = "coder"
+provider = "mock"
+model = "mock-model"
+tools = []
+
+[dotagents]
+enabled = true
+workspace_root = "{cwd}/.agents"
+global_enabled = false
+"#,
+        cwd = dir.path().display()
+    );
+    let config: crate::config::QuorumConfig = toml::from_str(&toml)?;
+    let (registry, _reg_dir) = scripted_text_registry()?;
+    let agent = Agent::lower_quorum_config(config)?
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+
+    let mut ids: Vec<String> = roster_ids(&agent);
+    ids.sort();
+    assert_eq!(ids, ["coder", "writer"]);
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn internal_sub_agent_extends_a_quorum_profile() -> Result<()> {
+    use crate::session::domain::DelegationStatus;
+
+    let dir = writer_dotagents_workspace();
+    let toml = format!(
+        r#"
+[quorum]
+cwd = "{cwd}"
+delegation = true
+snapshot_policy = "none"
+
+[planner]
+provider = "mock"
+model = "mock-model"
+tools = ["delegate"]
+
+[[delegates]]
+id = "coder"
+description = "Writes code"
+provider = "mock"
+model = "mock-model"
+tools = []
+
+[dotagents]
+enabled = true
+workspace_root = "{cwd}/.agents"
+global_enabled = false
+"#,
+        cwd = dir.path().display()
+    );
+    let config: crate::config::QuorumConfig = toml::from_str(&toml)?;
+    let (registry, _reg_dir) = scripted_text_registry()?;
+    let agent = Agent::lower_quorum_config(config)?
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+
+    // The protocol target is an additional member; the configured delegate is unchanged.
+    let mut ids: Vec<String> = roster_ids(&agent);
+    ids.sort();
+    assert_eq!(ids, ["coder", "writer"]);
+    assert_eq!(
+        agent
+            .handle()
+            .config
+            .roster()
+            .unwrap()
+            .snapshot()
+            .get("coder")
+            .unwrap()
+            .info()
+            .description,
+        "Writes code"
+    );
+
+    let delegation = request_delegation(&agent, "writer").await;
+    assert_eq!(
+        delegation.status,
+        DelegationStatus::Complete,
+        "delegation to the `.agents` target of a quorum profile was never executed"
+    );
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_bound_to_a_protocol_member_loads_after_restart() -> Result<()> {
+    use crate::profile_host::{ProfileMetadata, ProfileRuntimeView, ProfileSource};
+
+    let dir = writer_dotagents_workspace();
+    // Two builds of the same configuration stand for a restart: the protocol
+    // member is never built in either until a session needs it.
+    for _ in 0..2 {
+        let (registry, _reg_dir) = scripted_text_registry()?;
+        let agent = Agent::builder()
+            .provider("mock", "mock-model")
+            .cwd(dir.path())
+            .tools(["delegate"])
+            .infra(AgentInfra {
+                plugin_registry: registry,
+                storage: Some(Arc::new(
+                    crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                        .await?,
+                )),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            })
+            .dotagents_options(
+                crate::dotagents::DotagentsLoadOptions::enabled()
+                    .with_workspace(dir.path())
+                    .with_global_enabled(false),
+            )
+            .build()
+            .await?;
+        assert_eq!(
+            agent.handle().local_members().len(),
+            0,
+            "the protocol member is not built at startup"
+        );
+
+        let view = ProfileRuntimeView {
+            metadata: ProfileMetadata {
+                id: "p".into(),
+                name: "p".into(),
+                description: None,
+                tags: vec![],
+                source: ProfileSource::Embedded { key: "p".into() },
+                config_kind: None,
+                fingerprint: None,
+            },
+            handle: agent.handle(),
+            provider_lock: None,
+        };
+        let member = view
+            .session_handle(Some("writer"))
+            .expect("a session bound to the protocol member resolves");
+        assert!(view.session_handle(Some("nobody")).is_none());
+        assert_eq!(agent.handle().local_members().len(), 1);
+        drop(member);
+        agent.shutdown().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_profiles_delegate_at_the_same_time() -> Result<()> {
+    use crate::session::domain::DelegationStatus;
+    use crate::test_utils::delegation::{DelegateBehavior, agent_info, build_delegate_handle};
+
+    // Profile runtimes share one storage and one event stream.
+    let (registry, _dir) = scripted_text_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let fanout = Arc::new(crate::event_fanout::EventFanout::new());
+    let store: Arc<dyn crate::session::store::SessionStore> = storage.clone();
+
+    let mut agents = Vec::new();
+    for (profile, member) in [("a", "coder"), ("b", "writer")] {
+        let members = vec![local_member(
+            agent_info(member),
+            build_delegate_handle(DelegateBehavior::AlwaysOk, store.clone(), None).await,
+        )];
+        let mut builder = Agent::builder()
+            .provider("mock", "mock-model")
+            .tools(["delegate"])
+            .with_profile_id(profile);
+        builder.preregistered = members;
+        agents.push(
+            builder
+                .infra(AgentInfra {
+                    plugin_registry: registry.clone(),
+                    storage: Some(storage.clone()),
+                    session_mcp_attachment_source: None,
+                    event_fanout: Some(fanout.clone()),
+                })
+                .build()
+                .await?,
+        );
+    }
+
+    let (first, second) = tokio::join!(
+        request_delegation_for(&agents[0], "coder", Some("a")),
+        request_delegation_for(&agents[1], "writer", Some("b")),
+    );
+    assert_eq!(first.status, DelegationStatus::Complete, "profile a: coder");
+    assert_eq!(
+        second.status,
+        DelegationStatus::Complete,
+        "profile b: writer"
+    );
+    for agent in &agents {
+        agent.shutdown().await;
+    }
+    Ok(())
+}
+
+// ── Parent clock through the one runtime (ported from the quorum) ─────────
+
+#[tokio::test]
+async fn parent_clock_keeps_three_shell_delegations_terminal_on_wire() {
+    use crate::acp::protocol::NewSessionRequest;
+    use crate::control::delegation_notifications::{DelegationStage, DelegationUpdateState};
+    use crate::events::AgentEventKind;
+    use crate::session::domain::{Delegation, DelegationStatus};
+    use crate::test_utils::{
+        MockChatResponse, MockLlmProvider, SharedLlmProvider, TestProviderFactory,
+    };
+    use crate::tools::{Tool, ToolRegistry, builtins::ShellTool};
+    use querymt::LLMParams;
+    use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(
+        crate::session::sqlite_storage::SqliteStorage::connect(dir.path().join("quorum.db"))
+            .await
+            .unwrap(),
+    );
+    let release = dir.path().join("release");
+    let mut summary_mock = MockLlmProvider::new();
+    summary_mock
+        .expect_chat()
+        .times(3)
+        .returning(|_| Ok(MockChatResponse::text_only("fixture summary").into()));
+    let summary_factory = Arc::new(TestProviderFactory::new(SharedLlmProvider::new(
+        summary_mock,
+        vec![],
+    )));
+    let summary_root = dir.path().join("summary");
+    std::fs::create_dir(&summary_root).unwrap();
+    let summary_registry =
+        crate::test_utils::mock_plugin_registry_in(&summary_root, summary_factory).unwrap();
+    let fanout = Arc::new(crate::event_fanout::EventFanout::new());
+    let mut members = Vec::new();
+    for target in ["coder", "explorer", "linus"] {
+        let root = dir.path().to_path_buf();
+        let release = release.clone();
+        let mut mock = MockLlmProvider::new();
+        let command = serde_json::json!({"command":"sh", "args":["-c", ": > \"$2\"; i=0; while test ! -f \"$1\" && test $i -lt 2000; do i=$((i+1)); sleep 0.01; done; test -f \"$1\" && sleep 0.02 && printf done > \"$3\"", "qmt-quorum", release, root.join(format!("entered-{target}")), root.join(format!("done-{target}"))],"workdir":root});
+        let respond = Arc::new(move |messages: &[querymt::chat::ChatMessage]| {
+            if messages.last().is_some_and(|message| {
+                message
+                    .portable_input_parts()
+                    .iter()
+                    .any(|part| part.is_tool_result())
+            }) {
+                MockChatResponse::text_only("fixture child completed")
+            } else {
+                MockChatResponse::with_tools(
+                    "fixture shell",
+                    vec![crate::test_utils::mock_querymt_tool_call(
+                        &format!("shell-{target}"),
+                        "shell",
+                        &command.to_string(),
+                    )],
+                )
+            }
+        });
+        let tools_response = respond.clone();
+        mock.expect_chat_with_tools()
+            .returning(move |messages, _| Ok(tools_response(messages).into()));
+        mock.expect_chat()
+            .returning(move |messages| Ok(respond(messages).into()));
+        let factory = Arc::new(TestProviderFactory::new(SharedLlmProvider::new(
+            mock,
+            vec![ShellTool::new().definition()],
+        )));
+        let registry_root = dir.path().join(target);
+        std::fs::create_dir(&registry_root).unwrap();
+        let registry = crate::test_utils::mock_plugin_registry_in(&registry_root, factory).unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.add(Arc::new(ShellTool::new()));
+        let config = crate::agent::AgentConfigBuilder::new(
+            Arc::new(registry),
+            storage.clone(),
+            LLMParams::new()
+                .provider("mock")
+                .model(format!("model-{target}")),
+        )
+        .with_agent_id(target)
+        .with_event_fanout(fanout.clone())
+        .with_tool_registry(tools)
+        .build();
+        members.push(local_member(
+            crate::delegation::AgentInfo {
+                id: crate::delegation::roster::AgentId::try_from(target).unwrap(),
+                name: target.into(),
+                description: String::new(),
+                capabilities: vec![],
+                required_capabilities: vec![],
+                meta: None,
+                isolation: Default::default(),
+            },
+            Arc::new(crate::agent::LocalAgentHandle::from_config(Arc::new(
+                config,
+            ))),
+        ));
+    }
+    // The root's plugin registry also serves the delegation summarizer.
+    let mut builder = Agent::builder()
+        .cwd(dir.path())
+        .provider("mock", "summary")
+        .tools(["delegate"])
+        .delegation_settings(crate::config::DelegationSettings {
+            verification: true,
+            max_parallel: std::num::NonZeroUsize::new(3).unwrap(),
+            summary: Some(crate::config::DelegationSummaryConfig {
+                provider: "mock".into(),
+                model: "summary".into(),
+                min_history_tokens: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    builder.preregistered = members;
+    // Do not construct an orchestrator here: exercise the production builder's wiring.
+    let agent = builder
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(summary_registry),
+            storage: Some(storage.clone()),
+            session_mcp_attachment_source: None,
+            event_fanout: Some(fanout.clone()),
+        })
+        .build()
+        .await
+        .unwrap();
+    let local = agent.handle();
+    let parent = crate::send_agent::SendAgent::new_session(
+        &*local,
+        NewSessionRequest::new(dir.path().to_path_buf()),
+    )
+    .await
+    .unwrap()
+    .session_id
+    .to_string();
+    let store = agent.storage_backend().session_store();
+    let parent_row = store.get_session(&parent).await.unwrap().unwrap();
+    // Hold the planner's existing projection before the orchestrator records summaries.
+    let parent_accounting = local
+        .config
+        .event_sink
+        .session_accounting(&parent)
+        .await
+        .unwrap();
+    let mut rx = agent.subscribe();
+    // A real planner stream already exists before the first delegation, as in a prompt.
+    for _ in 0..20 {
+        local.emit_event(
+            &parent,
+            AgentEventKind::HookNotice {
+                event_name: "fixture".into(),
+                message: "planner progress".into(),
+                is_error: false,
+            },
+        );
+    }
+    let mut ids = HashMap::new();
+    for target in ["coder", "explorer", "linus"] {
+        let delegation = store
+            .create_delegation(Delegation {
+                id: 0,
+                public_id: String::new(),
+                session_id: parent_row.id,
+                task_id: None,
+                target_agent_id: target.into(),
+                objective: format!("bounded fixture {target}"),
+                objective_hash: Default::default(),
+                context: None,
+                constraints: None,
+                expected_output: None,
+                verification_spec: Some(crate::verification::VerificationSpec {
+                    description: "actual shell result exists".into(),
+                    strategy: Default::default(),
+                    steps: vec![crate::verification::VerificationStep::FileAssertion {
+                        path: dir.path().join(format!("done-{target}")),
+                        exists: true,
+                        contains: Some("done".into()),
+                        matches_regex: None,
+                    }],
+                }),
+                planning_summary: None,
+                status: DelegationStatus::Requested,
+                retry_count: 0,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+                isolation: Default::default(),
+            })
+            .await
+            .unwrap();
+        ids.insert(delegation.public_id.clone(), target);
+        local
+            .config
+            .emit_event_persisted(
+                &parent,
+                AgentEventKind::DelegationRequested {
+                    delegation,
+                    tool_call_id: Some(format!("dispatch-{target}")),
+                    batch_id: None,
+                    cycle_id: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let entered = tokio::time::timeout(Duration::from_secs(20), async {
+        while !["coder", "explorer", "linus"]
+            .iter()
+            .all(|id| dir.path().join(format!("entered-{id}")).exists())
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    if entered.is_err() {
+        let mut diagnostic = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            diagnostic.push(serde_json::to_value(event).unwrap());
+        }
+        panic!("all three actual builtin shell tools must start: {diagnostic:?}");
+    }
+    tokio::fs::write(&release, "go").await.unwrap();
+    let (events, wire) = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut translator = crate::acp::shared::AcpLiveEventTranslator::new();
+        let mut events = Vec::new();
+        let mut wire = Vec::new();
+        let mut cleaned = HashSet::new();
+        while cleaned.len() < 3 {
+            let event = rx.recv().await.unwrap();
+            if event.session_id() != parent {
+                continue;
+            }
+            wire.extend(translator.translate_notifications(&event));
+            if let AgentEventKind::DelegationStageChanged {
+                delegation_id,
+                stage: None,
+                ..
+            } = event.kind()
+            {
+                cleaned.insert(delegation_id.clone());
+            }
+            events.push(event);
+        }
+        (events, wire)
+    })
+    .await
+    .unwrap();
+    for delegation in store.clone().list_delegations(&parent).await.unwrap() {
+        assert_eq!(
+            delegation.status,
+            DelegationStatus::Complete,
+            "actual durable execution must succeed before wire assertion"
+        );
+    }
+    let completed: Vec<_> = wire
+        .iter()
+        .filter(|message| message["params"]["state"] == "completed")
+        .collect();
+    assert_eq!(
+        completed
+            .iter()
+            .filter_map(|message| message["params"]["delegationId"].as_str())
+            .collect::<HashSet<_>>()
+            .len(),
+        3,
+        "real quorum composition dropped durable completions from the actual translator: {wire:?}"
+    );
+    for (id, target) in ids {
+        let observations: Vec<_> = wire
+            .iter()
+            .filter(|message| message["params"]["delegationId"] == id)
+            .map(|message| &message["params"])
+            .collect();
+        for stage in ["queued", "executing", "verifying", "finalizing"] {
+            assert!(
+                observations.iter().any(|row| row["stage"] == stage),
+                "missing {target} {stage}"
+            );
+        }
+        assert!(observations.iter().any(|row| row["state"] == "forked"));
+        let last = observations.last().unwrap();
+        assert_eq!(last["state"], "completed");
+        assert_eq!(last["activity"], "historical");
+        assert!(last["stage"].is_null());
+        assert!(last["childSessionId"].as_str().is_some());
+        assert_eq!(last["selectedModelId"], format!("mock/model-{target}"));
+        assert_eq!(last["toolCallId"], format!("dispatch-{target}"));
+        let cached = fanout
+            .delegation_snapshots(std::slice::from_ref(&parent))
+            .into_iter()
+            .find(|row| row.delegation_id == id)
+            .unwrap();
+        assert_eq!(cached.state, DelegationUpdateState::Completed);
+        assert_eq!(cached.stage, None);
+        assert!(events.iter().any(|event| matches!(event.kind(), AgentEventKind::DelegationStageChanged { delegation_id, stage: Some(DelegationStage::Verifying), .. } if delegation_id == &id)));
+    }
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0].session_seq() < pair[1].session_seq()),
+        "parent stages/durable events must use one increasing clock: {:?}",
+        events
+            .iter()
+            .map(|event| event.session_seq())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(events.iter().filter(|event| matches!(event.kind(), AgentEventKind::LlmAttemptSettled { settlement } if settlement.attempt.purpose == crate::accounting::AttemptPurpose::DelegationSummary)).count(), 3);
+    parent_accounting.read(|reducer| {
+        assert_eq!(reducer.attempt_count(), 3, "summary attempts must update the already-held planner projection without catch_up or rehydration");
+        assert!(reducer.unresolved().is_empty());
+    });
+    agent.shutdown().await;
+}
+
+/// A pre-built local member for `AgentBuilder::preregistered`.
+fn local_member(
+    info: crate::delegation::AgentInfo,
+    handle: Arc<crate::agent::LocalAgentHandle>,
+) -> crate::delegation::roster::Member {
+    crate::delegation::roster::Member::built(
+        info,
+        crate::delegation::roster::MemberOrigin::Config,
+        crate::delegation::roster::MemberAgent::Local(handle),
+    )
+}
+
+/// Ids of the root's roster, in roster order.
+fn roster_ids(agent: &Agent) -> Vec<String> {
+    agent
+        .handle()
+        .config
+        .roster()
+        .map(|roster| {
+            roster
+                .snapshot()
+                .iter()
+                .map(|m| m.id().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ── Quorum-config lowering and validation (ported from the removed quorum builder tests) ──
+
+mod lowering {
+    use super::*;
+    use crate::agent::LocalAgentHandle;
+    use crate::agent::core::{AgentMode, ToolPolicy};
+    use crate::config::{McpServerConfig, QuorumConfig, ToolSpec};
+
+    fn local(handle: Arc<LocalAgentHandle>) -> Arc<LocalAgentHandle> {
+        handle
+    }
+
+    async fn test_infra() -> (AgentInfra, tempfile::TempDir) {
+        let (registry, dir) = empty_plugin_registry().expect("empty registry");
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("storage"),
+        );
+        (
+            AgentInfra {
+                plugin_registry: Arc::new(registry),
+                storage: Some(storage),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            },
+            dir,
+        )
+    }
+
+    fn quorum(toml: &str) -> QuorumConfig {
+        toml::from_str(toml).expect("parse quorum config")
+    }
+
+    fn skill_config(enabled: bool) -> QuorumConfig {
+        quorum(&format!(
+            r#"
+[quorum]
+cwd = "."
+
+[planner]
+provider = "test"
+model = "planner-model"
+tools = ["delegate", "skill"]
+
+[planner.skills]
+enabled = {enabled}
+include_external = false
+
+[[delegates]]
+id = "coder"
+provider = "test"
+model = "coder-model"
+tools = ["skill"]
+
+[delegates.skills]
+enabled = {enabled}
+include_external = false
+"#
+        ))
+    }
+
+    const MCP: &str = r#"
+[quorum]
+cwd = "/tmp"
+
+[planner]
+provider = "openai"
+model = "gpt-4"
+tools = ["shell", "stdio-tool.*", "http-tool.lookup"]
+
+[[mcp]]
+name = "stdio-tool"
+command = "stdio-cmd"
+transport = "stdio"
+
+[[mcp]]
+name = "http-tool"
+url = "https://example.test/mcp"
+transport = "http"
+
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+tools = ["read_tool", "stdio-tool.fetch"]
+"#;
+
+    #[tokio::test]
+    async fn build_reports_a_malformed_tool_selector_of_the_root_or_a_delegate() {
+        let err = Agent::builder()
+            .provider("openai", "gpt-4")
+            .tools(["github."])
+            .build()
+            .await
+            .err()
+            .expect("malformed selector must fail the build");
+        assert!(
+            err.to_string().contains("invalid `tools` selector"),
+            "{err}"
+        );
+
+        let err = Agent::builder()
+            .provider("openai", "gpt-4")
+            .tools(["delegate"])
+            .delegate("coder", |d| {
+                d.provider("ollama", "model").tools(["github."])
+            })
+            .build()
+            .await
+            .err()
+            .expect("malformed selector must fail the build");
+        assert!(err.to_string().contains("delegate 'coder'"), "{err}");
+    }
+
+    #[test]
+    fn delegates_are_stored_with_their_system_prompt_and_no_skills_by_default() {
+        let builder = Agent::builder()
+            .provider("test", "planner")
+            .delegate("coder", |d| {
+                d.provider("ollama", "model")
+                    .system("Coder system prompt")
+                    .tools(["shell"])
+            });
+        assert_eq!(builder.delegates.len(), 1);
+        assert_eq!(
+            builder.delegates[0]
+                .llm_config
+                .as_ref()
+                .map(|c| c.system.clone()),
+            Some(vec!["Coder system prompt".into()])
+        );
+        assert!(builder.delegates[0].skills.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_skill_tool_is_rejected_for_a_quorum_root_only() {
+        let (infra, _dir) = test_infra().await;
+        // A `[quorum]` root names `skill` without configuring skills: rejected.
+        let mut config = skill_config(true);
+        config.planner.skills = Default::default();
+        config.planner.skills.enabled = false;
+        let error = Agent::lower_quorum_config(config)
+            .unwrap()
+            .infra(infra)
+            .build()
+            .await
+            .err()
+            .expect("disabled skill should fail validation");
+        assert_eq!(
+            error.to_string(),
+            "Tool 'skill' requested for planner, but skills are disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delegate_with_skills_disabled_rejects_its_skill_tool() {
+        let (infra, _dir) = test_infra().await;
+        let mut config = skill_config(true);
+        config.delegates[0].skills.enabled = false;
+        let error = Agent::lower_quorum_config(config)
+            .unwrap()
+            .infra(infra)
+            .build()
+            .await
+            .err()
+            .expect("disabled delegate skill should fail validation");
+        assert_eq!(
+            error.to_string(),
+            "Tool 'skill' requested for delegate 'coder', but skills are disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_tool_is_registered_for_root_and_delegate_when_enabled() {
+        let (infra, _dir) = test_infra().await;
+        let agent = Agent::lower_quorum_config(skill_config(true))
+            .unwrap()
+            .infra(infra)
+            .build()
+            .await
+            .expect("skill quorum should build");
+        for config in [
+            agent.handle().config.clone(),
+            local(agent.delegate("coder").expect("coder"))
+                .config
+                .clone(),
+        ] {
+            assert!(config.skill_catalog.is_some());
+            assert!(
+                config
+                    .tool_registry
+                    .find(crate::skills::SkillTool::NAME)
+                    .is_none()
+            );
+            assert!(config.is_tool_allowed(crate::config::ToolRef::builtin(
+                crate::skills::SkillTool::NAME
+            )));
+        }
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn skill_tool_is_skipped_when_not_selected() {
+        let (infra, _dir) = test_infra().await;
+        let agent = Agent::builder()
+            .infra(infra)
+            .provider("test", "planner-model")
+            .tools(["delegate"])
+            .skills(crate::config::SkillsConfig::default())
+            .delegate("coder", |d| {
+                d.provider("test", "coder-model")
+                    .tools(["question"])
+                    .skills(crate::config::SkillsConfig::default())
+            })
+            .build()
+            .await
+            .expect("builds");
+        assert!(
+            agent
+                .handle()
+                .config
+                .tool_registry
+                .find(crate::skills::SkillTool::NAME)
+                .is_none()
+        );
+        let coder = local(agent.delegate("coder").unwrap());
+        assert!(
+            coder
+                .config
+                .tool_registry
+                .find(crate::skills::SkillTool::NAME)
+                .is_none()
+        );
+        agent.shutdown().await;
+    }
+
+    #[test]
+    fn peer_delegates_are_recorded_only_for_delegates_with_a_peer() {
+        #[cfg(feature = "remote")]
+        {
+            let config = quorum(
+                r#"
+[quorum]
+cwd = "/tmp"
+[planner]
+provider = "openai"
+model = "gpt-4"
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+peer = "gpu-node"
+[[delegates]]
+id = "writer"
+provider = "openai"
+model = "gpt-4"
+"#,
+            );
+            let builder = Agent::lower_quorum_config(config).unwrap();
+            assert_eq!(
+                builder.peer_delegates,
+                vec![crate::delegation::PeerRoute {
+                    delegate: crate::delegation::roster::AgentId::try_from("coder").unwrap(),
+                    peer: "gpu-node".to_string(),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_mcp_servers_and_selectors_are_kept_for_root_and_delegates() {
+        let builder = Agent::lower_quorum_config(quorum(MCP)).unwrap();
+        let names: Vec<&str> = builder.mcp_servers.iter().map(|s| s.name()).collect();
+        assert!(
+            names.contains(&"stdio-tool") && names.contains(&"http-tool"),
+            "{names:?}"
+        );
+        assert!(builder.tools.contains(&"stdio-tool.*".parse().unwrap()));
+        assert!(builder.tools.contains(&"http-tool.lookup".parse().unwrap()));
+        assert!(!builder.tools.contains(&"lookup".parse().unwrap()));
+        assert!(builder.tools.contains(&"shell".parse().unwrap()));
+        let coder = builder
+            .delegates
+            .iter()
+            .find(|d| d.id.as_str() == "coder")
+            .unwrap();
+        assert_eq!(
+            coder.tools,
+            vec![
+                "read_tool".parse::<ToolSpec>().unwrap(),
+                "stdio-tool.fetch".parse().unwrap()
+            ]
+        );
+        assert_eq!(coder.mcp_servers.len(), 1);
+        assert!(matches!(
+            coder.mcp_servers[0],
+            McpServerConfig::Stdio { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_config_admits_only_the_resolved_mcp_tools() {
+        let (infra, _dir) = test_infra().await;
+        let agent = Agent::lower_quorum_config(quorum(MCP))
+            .unwrap()
+            .infra(infra)
+            .build()
+            .await
+            .expect("builds");
+        let root = agent.handle().config.clone();
+        assert_eq!(root.tool_config.policy, ToolPolicy::BuiltInAndProvider);
+        let allow = root.tool_config.allow.as_ref().expect("allowlist");
+        assert!(allow.covers(&"stdio-tool.*".parse().unwrap()));
+        assert!(allow.covers(&"http-tool.lookup".parse().unwrap()));
+        assert!(!allow.covers(&"lookup".parse().unwrap()));
+        assert!(
+            root.tool_config
+                .allows(crate::config::ToolRef::mcp("stdio-tool", "any"))
+        );
+        assert!(
+            root.tool_config
+                .allows(crate::config::ToolRef::mcp("http-tool", "lookup"))
+        );
+        assert!(
+            !root
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("unattached", "lookup"))
+        );
+        assert!(
+            !root
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("http-tool", "other"))
+        );
+        let coder = local(agent.delegate("coder").unwrap()).config.clone();
+        assert!(
+            coder
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("stdio-tool", "fetch"))
+        );
+        assert!(
+            !coder
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("stdio-tool", "read_tool"))
+        );
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_mcp_tool_names_authorize_per_server() {
+        let (infra, _dir) = test_infra().await;
+        let config = quorum(
+            r#"
+[quorum]
+cwd = "/tmp"
+[planner]
+provider = "openai"
+model = "gpt-4"
+tools = ["alpha.lookup"]
+[[mcp]]
+name = "alpha"
+url = "https://alpha.test/mcp"
+transport = "http"
+[[mcp]]
+name = "beta"
+url = "https://beta.test/mcp"
+transport = "http"
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+tools = ["beta.lookup"]
+"#,
+        );
+        let agent = Agent::lower_quorum_config(config)
+            .unwrap()
+            .infra(infra)
+            .build()
+            .await
+            .expect("builds");
+        let root = agent.handle().config.clone();
+        assert!(
+            root.tool_config
+                .allows(crate::config::ToolRef::mcp("alpha", "lookup"))
+        );
+        assert!(
+            !root
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("beta", "lookup"))
+        );
+        assert!(
+            !root
+                .tool_config
+                .allows(crate::config::ToolRef::builtin("lookup"))
+        );
+        let coder = local(agent.delegate("coder").unwrap()).config.clone();
+        assert!(
+            coder
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("beta", "lookup"))
+        );
+        assert!(
+            !coder
+                .tool_config
+                .allows(crate::config::ToolRef::mcp("alpha", "lookup"))
+        );
+        agent.shutdown().await;
+    }
+
+    fn mode_config(root_extra: &str, delegate_extra: &str) -> QuorumConfig {
+        quorum(&format!(
+            r#"
+[quorum]
+cwd = "/tmp"
+[planner]
+provider = "openai"
+model = "gpt-4"
+tools = ["delegate"]
+{root_extra}
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+{delegate_extra}
+"#
+        ))
+    }
+
+    #[tokio::test]
+    async fn agents_start_in_their_configured_mode() {
+        let (infra, _dir) = test_infra().await;
+        let agent = Agent::lower_quorum_config(mode_config("mode = \"plan\"", "mode = \"review\""))
+            .unwrap()
+            .infra(infra)
+            .build()
+            .await
+            .expect("builds");
+        let mode = |config: &crate::agent::AgentConfig| *config.default_mode.lock().unwrap();
+        assert_eq!(mode(&agent.handle().config), AgentMode::Plan);
+        assert_eq!(
+            mode(&local(agent.delegate("coder").unwrap()).config),
+            AgentMode::Review
+        );
+        agent.shutdown().await;
+    }
+
+    #[test]
+    fn a_mode_typo_fails_loading_naming_the_mode() {
+        for (root, delegate) in [("mode = \"plna\"", ""), ("", "mode = \"plna\"")] {
+            let toml = format!(
+                "[quorum]\n[planner]\nprovider=\"o\"\nmodel=\"m\"\n{root}\n[[delegates]]\nid=\"d\"\nprovider=\"o\"\nmodel=\"m\"\n{delegate}\n"
+            );
+            let err = toml::from_str::<QuorumConfig>(&toml)
+                .expect_err("typo must fail")
+                .to_string();
+            assert!(err.contains("plna") && err.contains("build"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_delegate_middleware_fails_the_build_naming_the_delegate() {
+        let (infra, _dir) = test_infra().await;
+        let delegate =
+            "[[delegates.middleware]]\ntype = \"limits\"\ncache_write_cost_per_million = -2.0\n";
+        let err = Agent::lower_quorum_config(mode_config("", delegate))
+            .unwrap()
+            .infra(infra)
+            .build()
+            .await
+            .err()
+            .expect("invalid middleware must fail the build");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("coder") && text.contains("middleware 'limits'"),
+            "{text}"
+        );
+    }
+
+    fn workspace_config(root: &std::path::Path, isolation: &str) -> QuorumConfig {
+        quorum(&format!(
+            r#"
+[quorum]
+cwd = "/tmp"
+[quorum.workspace]
+enabled = true
+storage_root = {root:?}
+[planner]
+provider = "openai"
+model = "gpt-4"
+tools = ["delegate"]
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+{isolation}
+[[delegates]]
+id = "reviewer"
+provider = "openai"
+model = "gpt-4"
+"#
+        ))
+    }
+
+    #[tokio::test]
+    async fn members_share_one_workspace_service_and_carry_their_isolation() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (infra, _dir) = test_infra().await;
+        let agent =
+            Agent::lower_quorum_config(workspace_config(root.path(), "isolation = \"isolated\""))
+                .unwrap()
+                .infra(infra)
+                .build()
+                .await
+                .expect("builds");
+        let service =
+            |config: &crate::agent::AgentConfig| config.workspace_service().expect("service");
+        let root_service = service(&agent.handle().config);
+        let coder = service(&local(agent.delegate("coder").unwrap()).config);
+        let reviewer = service(&local(agent.delegate("reviewer").unwrap()).config);
+        assert!(Arc::ptr_eq(&root_service, &coder) && Arc::ptr_eq(&root_service, &reviewer));
+        assert_eq!(root_service.storage_root(), root.path());
+        let snapshot = agent.handle().config.roster().unwrap().snapshot();
+        let isolation = |id: &str| snapshot.get(id).expect("registered").info().isolation;
+        assert_eq!(
+            isolation("coder"),
+            crate::worktree::DelegationIsolation::Isolated
+        );
+        assert_eq!(
+            isolation("reviewer"),
+            crate::worktree::DelegationIsolation::Inherit
+        );
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn members_share_one_lazy_repository_registry_only_when_enabled() {
+        let root = tempfile::TempDir::new().unwrap();
+        for enabled in [true, false] {
+            let (infra, _dir) = test_infra().await;
+            let mut builder = Agent::lower_quorum_config(workspace_config(root.path(), ""))
+                .unwrap()
+                .infra(infra);
+            if enabled {
+                builder = builder
+                    .repository_knowledge(crate::config::RepositoryKnowledgeSettings::enabled());
+            }
+            let agent = builder.build().await.expect("builds");
+            let registry_of = |config: &crate::agent::AgentConfig| config.repository_knowledge();
+            let root_registry = registry_of(&agent.handle().config);
+            let coder = registry_of(&local(agent.delegate("coder").unwrap()).config);
+            let reviewer = registry_of(&local(agent.delegate("reviewer").unwrap()).config);
+            if enabled {
+                let (r, c, v) = (root_registry.unwrap(), coder.unwrap(), reviewer.unwrap());
+                assert!(Arc::ptr_eq(&r, &c) && Arc::ptr_eq(&r, &v));
+                assert_eq!(r.open_services(), 0, "no builder-time discovery");
+            } else {
+                assert!(root_registry.is_none() && coder.is_none() && reviewer.is_none());
+            }
+            // The root's explicit `tools = ["delegate"]` stays authoritative; unrestricted
+            // delegates follow the host setting.
+            assert!(!crate::agent::repository_delivery::policy_applies(
+                &agent.handle().config
+            ));
+            assert_eq!(
+                crate::agent::repository_delivery::policy_applies(
+                    &local(agent.delegate("coder").unwrap()).config
+                ),
+                enabled
+            );
+            agent.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn without_workspace_settings_there_is_no_service_and_isolated_delegates_fail() {
+        let (infra, _dir) = test_infra().await;
+        let mut config = workspace_config(std::path::Path::new("/unused"), "");
+        config.quorum.workspace = crate::config::WorkspaceSettings::default();
+        let agent = Agent::lower_quorum_config(config)
+            .unwrap()
+            .infra(infra)
+            .build()
+            .await
+            .expect("builds without a service");
+        assert!(agent.handle().config.workspace_service().is_none());
+        agent.shutdown().await;
+
+        let (infra, _dir) = test_infra().await;
+        let err = Agent::builder()
+            .cwd("/tmp")
+            .provider("openai", "gpt-4")
+            .tools(["delegate"])
+            .delegate("coder", |d| {
+                d.provider("openai", "gpt-4")
+                    .isolation(crate::worktree::DelegationIsolation::Isolated)
+            })
+            .infra(infra)
+            .build()
+            .await
+            .err()
+            .expect("isolated delegate needs the service");
+        assert!(err.to_string().contains("coder"), "{err}");
+    }
+
+    #[test]
+    fn snapshot_policy_strings_parse() {
+        let parse = |p: Option<&str>| {
+            let mut config = mode_config("", "");
+            config.quorum.snapshot_policy = p.map(str::to_string);
+            Agent::lower_quorum_config(config).map(|b| b.snapshot_policy)
+        };
+        use crate::agent::core::SnapshotPolicy;
+        assert_eq!(parse(None).unwrap(), SnapshotPolicy::None);
+        assert_eq!(parse(Some("metadata")).unwrap(), SnapshotPolicy::Metadata);
+        assert_eq!(parse(Some("diff")).unwrap(), SnapshotPolicy::Diff);
+        assert!(parse(Some("invalid")).is_err());
+    }
+
+    #[tokio::test]
+    async fn dotagents_prompts_apply_to_root_and_delegates_in_order() {
+        use crate::dotagents::*;
+        let source = DotagentsSource::singleton(DotagentsLayer::Workspace, "system-prompt.md");
+        let mut manifest = DotagentsManifest::empty();
+        manifest.system_prompt = Some(DotagentsPrompt {
+            metadata: Default::default(),
+            body: "protocol system".into(),
+            source: source.clone(),
+            fingerprint: "system".into(),
+        });
+        manifest.agents_md = Some(DotagentsPrompt {
+            metadata: Default::default(),
+            body: "protocol instructions".into(),
+            source,
+            fingerprint: "agents".into(),
+        });
+        let (infra, _dir) = test_infra().await;
+        let agent = Agent::builder()
+            .infra(infra)
+            .provider("test", "root")
+            .system("root explicit")
+            .tools(["delegate"])
+            .dotagents_manifest(manifest)
+            .delegate("coder", |d| {
+                d.provider("test", "coder").system("delegate explicit")
+            })
+            .build()
+            .await
+            .expect("builds");
+        let expected = |who: &str| {
+            vec![
+                format!("{who} explicit"),
+                "protocol system".to_string(),
+                "protocol instructions".to_string(),
+            ]
+        };
+        let system = |config: &crate::agent::AgentConfig| {
+            config
+                .provider
+                .initial_config()
+                .system
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(system(&agent.handle().config), expected("root"));
+        assert_eq!(
+            system(&local(agent.delegate("coder").unwrap()).config),
+            expected("delegate")
+        );
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn agent_roster_methods_forward_to_the_root() -> Result<()> {
+    use crate::delegation::member::MemberSpec;
+    use crate::delegation::roster::{MemberOrigin, RosterError};
+
+    let (registry, _reg_dir) = scripted_text_registry()?;
+    let agent = Agent::builder()
+        .provider("mock", "mock-model")
+        .tools(["delegate"])
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+    assert!(agent.roster().snapshot().is_empty());
+    let mut notifications = agent.inner().subscribe_ext_notifications();
+
+    let spec: MemberSpec = serde_json::from_value(serde_json::json!({
+        "kind": "local", "id": "reviewer", "provider": "mock", "model": "mock-model"
+    }))?;
+    let generation = agent.add_member(spec).await?;
+    assert_eq!(generation.get(), 1);
+    let snapshot = agent.roster().snapshot();
+    assert_eq!(
+        snapshot.get("reviewer").map(|member| member.origin()),
+        Some(MemberOrigin::Runtime)
+    );
+    assert!(agent.has_subagents());
+    let notification = notifications.try_recv().expect("clients are told");
+    assert_eq!(notification.method.as_ref(), "querymt/agents/changed");
+
+    let generation = agent.remove_member("reviewer").await?;
+    assert_eq!(generation.get(), 2);
+    assert!(agent.roster().snapshot().is_empty());
+    assert!(matches!(
+        agent.remove_member("reviewer").await,
+        Err(RosterError::UnknownAgent(_))
+    ));
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_subagent_aliases_add_list_and_remove_between_turns() -> Result<()> {
+    use crate::delegation::roster::{MemberOrigin, RosterError};
+
+    let (registry, _reg_dir) = scripted_text_registry()?;
+    let agent = Agent::builder()
+        .provider("mock", "mock-model")
+        .tools(["delegate"])
+        .subagent("coder", |s| {
+            s.provider("mock", "mock-model").description("writes code")
+        })
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+    assert_eq!(agent.roster_generation(), 0);
+    assert_eq!(agent.subagents().len(), 1);
+    let mut notifications = agent.inner().subscribe_ext_notifications();
+
+    let generation = agent
+        .add_subagent("reviewer", |s| {
+            s.provider("mock", "mock-model")
+                .description("reviews code")
+                .capabilities(["review"])
+        })
+        .await?;
+    assert_eq!(generation.get(), 1);
+    assert_eq!(agent.roster_generation(), 1);
+    let listed = agent.subagents();
+    assert_eq!(
+        listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["coder", "reviewer"]
+    );
+    assert_eq!(listed[0].origin, MemberOrigin::Config);
+    assert_eq!(listed[1].origin, MemberOrigin::Runtime);
+    assert_eq!(listed[1].capabilities, ["review"]);
+    let notification = notifications.try_recv().expect("clients are told");
+    assert_eq!(notification.method.as_ref(), "querymt/agents/changed");
+
+    assert!(matches!(
+        agent
+            .add_subagent("reviewer", |s| s.provider("mock", "m"))
+            .await,
+        Err(RosterError::DuplicateId { .. })
+    ));
+    assert_eq!(agent.roster_generation(), 1);
+
+    assert_eq!(agent.remove_subagent("coder").await?.get(), 2);
+    assert_eq!(agent.subagents().len(), 1);
+    assert!(matches!(
+        agent.remove_subagent("coder").await,
+        Err(RosterError::UnknownAgent(_))
+    ));
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_reports_subagent_changes_to_callbacks_and_subscribers() -> Result<()> {
+    use crate::delegation::roster::{MemberOrigin, RosterChangeKind};
+
+    let (registry, _reg_dir) = scripted_text_registry()?;
+    let agent = Agent::builder()
+        .provider("mock", "mock-model")
+        .tools(["delegate"])
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+    assert!(!agent.has_subagents());
+
+    let (tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    agent.on_subagents_changed(move |change| {
+        let _ = tx.send((change.kind, change.id.to_string(), change.origin));
+    });
+    let mut subscription = agent.subscribe_subagent_changes();
+
+    agent
+        .add_subagent("reviewer", |s| s.provider("mock", "mock-model"))
+        .await?;
+    // A refused change is not reported.
+    assert!(
+        agent
+            .add_subagent("reviewer", |s| s.provider("mock", "mock-model"))
+            .await
+            .is_err()
+    );
+    agent.remove_subagent("reviewer").await?;
+
+    let timeout = std::time::Duration::from_secs(5);
+    let first = tokio::time::timeout(timeout, seen.recv()).await?.unwrap();
+    let second = tokio::time::timeout(timeout, seen.recv()).await?.unwrap();
+    assert_eq!(
+        first,
+        (
+            RosterChangeKind::Added,
+            "reviewer".to_string(),
+            MemberOrigin::Runtime
+        )
+    );
+    assert_eq!(second.0, RosterChangeKind::Removed);
+    assert!(seen.try_recv().is_err(), "exactly two changes");
+
+    let added = subscription.try_recv()?;
+    assert_eq!(
+        (added.kind, added.generation.get()),
+        (RosterChangeKind::Added, 1)
+    );
+    let removed = subscription.try_recv()?;
+    assert_eq!(removed.generation.get(), 2);
+    assert!(subscription.try_recv().is_err());
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_configuration_delegates_and_settings_reach_the_runtime() -> Result<()> {
+    use crate::config::{Config, ConfigSource, DelegationWaitPolicy, load_config};
+    use crate::delegation::roster::MemberOrigin;
+
+    let toml = r#"
+[agent]
+provider = "mock"
+model = "mock-model"
+
+[agent.delegation]
+wait_policy = "all"
+max_parallel = 2
+
+[[delegates]]
+id = "reviewer"
+provider = "mock"
+model = "mock-model"
+
+[[delegates]]
+id = "coder"
+provider = "mock"
+model = "mock-model"
+capabilities = ["coding"]
+"#;
+    let Config::Single(single) = load_config(ConfigSource::Toml(toml.into())).await? else {
+        panic!("expected a single-agent config");
+    };
+    assert_eq!(
+        single.agent.delegation.wait_policy,
+        DelegationWaitPolicy::All
+    );
+    let builder = Agent::builder_from_config(*single)?;
+    assert_eq!(builder.delegation_settings.max_parallel.get(), 2);
+
+    let (registry, _reg_dir) = scripted_text_registry()?;
+    let agent = builder
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+    let snapshot = agent.roster().snapshot();
+    let members: Vec<_> = snapshot
+        .iter()
+        .map(|member| (member.id().to_string(), member.origin()))
+        .collect();
+    assert_eq!(
+        members,
+        [
+            ("coder".to_string(), MemberOrigin::Config),
+            ("reviewer".to_string(), MemberOrigin::Config)
+        ]
+    );
+    assert_eq!(snapshot.generation().get(), 0);
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_policy_can_be_turned_off() -> Result<()> {
+    use crate::config::{Config, ConfigSource, load_config};
+
+    let toml = |policy: &str| {
+        format!(
+            "[agent]\nprovider = \"mock\"\nmodel = \"mock-model\"\n{policy}\n\
+             [[delegates]]\nid = \"coder\"\nprovider = \"mock\"\nmodel = \"mock-model\"\n"
+        )
+    };
+    for (line, expected) in [
+        ("snapshot_policy = \"none\"", "none"),
+        ("snapshot_policy = \"metadata\"", "metadata"),
+        ("", "diff"),
+    ] {
+        let Config::Single(single) = load_config(ConfigSource::Toml(toml(line))).await? else {
+            panic!("expected a single-agent config");
+        };
+        let (registry, _dir) = scripted_text_registry()?;
+        let agent = Agent::builder_from_config(*single)?
+            .infra(AgentInfra {
+                plugin_registry: registry,
+                storage: Some(Arc::new(
+                    crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                        .await?,
+                )),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            })
+            .build()
+            .await?;
+        assert_eq!(agent.handle().config.snapshot_policy.to_string(), expected);
+        let member = agent.delegate("coder").expect("delegate");
+        assert_eq!(
+            member.config.snapshot_policy.to_string(),
+            expected,
+            "delegate"
+        );
+        agent.shutdown().await;
+    }
     Ok(())
 }

@@ -1,6 +1,6 @@
 # QueryMT Agent - Overview
 
-The `querymt-agent` crate is a high-level agent runtime for QueryMaTe, providing a flexible framework for building AI agents with support for single-agent and multi-agent (quorum) configurations.
+The `querymt-agent` crate is a high-level agent runtime for QueryMaTe, providing a flexible framework for building AI agents with support for single-agent and multi-agent configurations.
 
 ## What is QueryMT Agent?
 
@@ -53,7 +53,6 @@ A pluggable processing pipeline that intercepts and modifies agent behavior:
 - **ContextMiddleware**: Token management and compaction
 - **AgentModeMiddleware**: Mode-aware restrictions (build/plan/review)
 - **DedupCheckMiddleware**: Duplicate code detection
-- **DelegationMiddleware**: Multi-agent coordination
 
 #### 4. Tool Registry
 Unified tool system supporting:
@@ -94,13 +93,13 @@ flowchart TD
     G -->|"Next action"| B
 ```
 
-## Multi-Agent (Quorum) Architecture
+## Delegation Architecture
 
-For complex tasks, QueryMT supports a planner-delegate pattern:
+For complex tasks, the root agent can delegate to the members of its roster:
 
 ```mermaid
 flowchart TD
-    P["Planner Agent<br/>(Analyzes task, decides which delegate to use)"]
+    P["Root Agent<br/>(Analyzes task, decides which delegate to use)"]
     P -->|"Delegation Request"| D1 & D2
     D1["Delegate 1<br/>(Code Reviewer)"]
     D2["Delegate 2<br/>(Tester)"]
@@ -309,7 +308,7 @@ use querymt_agent::prelude::*;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a single agent
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("anthropic", "claude-sonnet-4-5-20250929")
         .cwd(".")
         .tools(["read_tool", "shell", "edit"])

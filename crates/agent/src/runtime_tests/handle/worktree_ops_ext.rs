@@ -637,8 +637,6 @@ async fn management_create_preserves_session_creation_error_codes() {
 
 #[tokio::test]
 async fn local_workspace_support_reflects_target_readiness() {
-    use crate::agent::handle::AgentHandle as _;
-
     // A target without its own workspace service must not claim support:
     // delegation preflight would otherwise provision a checkout that the
     // target then rejects, leaking an unowned Ready allocation.

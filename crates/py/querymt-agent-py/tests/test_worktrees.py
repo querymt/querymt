@@ -42,7 +42,7 @@ def repo(tmp_path: Path) -> Path:
 
 
 async def make_agent(repo: Path, tmp_path: Path, **kwargs) -> Agent:
-    return await Agent.single(
+    return await Agent.create(
         provider="openai",
         model="gpt-4o-mini",
         api_key="unused",
@@ -266,4 +266,4 @@ def test_invalid_arguments_raise_clear_errors(repo, tmp_path):
 )
 def test_invalid_approval_arguments_raise_value_error(kwargs, needle):
     with pytest.raises(ValueError, match=needle):
-        run(Agent.single("mock", "m", **kwargs))
+        run(Agent.create("mock", "m", **kwargs))

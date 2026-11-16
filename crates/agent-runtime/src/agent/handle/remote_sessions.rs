@@ -25,6 +25,24 @@ impl LocalAgentHandle {
         }
     }
 
+    /// Create a session for a delegation. The owner records it with fork
+    /// origin `delegation`.
+    #[cfg(feature = "remote")]
+    pub(crate) async fn create_remote_delegation_session(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        cwd: Option<String>,
+    ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, agent_client_protocol::Error>
+    {
+        querymt_remote::ask_remote_with_timeout(
+            node_manager_ref,
+            &crate::agent::remote::CreateRemoteDelegationSession { cwd },
+            Self::remote_request_timeout(),
+        )
+        .await
+        .map_err(Self::map_remote_node_manager_error)
+    }
+
     #[cfg(feature = "remote")]
     pub(crate) async fn delegate_session_owner(
         &self,
@@ -547,6 +565,7 @@ impl LocalAgentHandle {
                     },
                 ),
                 windowed: false,
+                fork_origin: None,
             },
         )
         .await
@@ -694,6 +713,109 @@ impl LocalAgentHandle {
         )
         .await
         .map_err(Self::map_remote_node_manager_error)
+    }
+
+    /// Finds the node manager of a remote member's peer. The node is resolved
+    /// now, not when the member was listed; a failure names the peer.
+    #[cfg(feature = "remote")]
+    async fn remote_member_node(
+        &self,
+        member: &crate::delegation::roster::RemoteMember,
+    ) -> Result<
+        (
+            String,
+            kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        ),
+        agent_client_protocol::Error,
+    > {
+        let peer = member.peer();
+        let mesh = self.mesh().ok_or_else(|| {
+            agent_client_protocol::Error::new(
+                -32001,
+                format!("Remote peer '{peer}' is unreachable: the mesh is not running"),
+            )
+        })?;
+        // The mesh's own resolution wins over the owner id taken from the
+        // configured address.
+        let node_id = match mesh.resolve_peer_node_id(peer).await {
+            Some(node_id) => node_id.to_string(),
+            None => member.node_id().map(str::to_owned).ok_or_else(|| {
+                agent_client_protocol::Error::new(
+                    -32001,
+                    format!("Remote peer '{peer}' could not be resolved to a live node id"),
+                )
+            })?,
+        };
+        let node_manager = self.find_node_manager(&node_id).await.map_err(|error| {
+            agent_client_protocol::Error::new(
+                -32001,
+                format!("Remote peer '{peer}' is unreachable: {}", error.message),
+            )
+        })?;
+        Ok((node_id, node_manager))
+    }
+
+    /// Opens a delegated session on a remote member and attaches it to this
+    /// runtime: the calls of `control::remote::create_remote_session` with
+    /// `attach = true`, under `RemoteConnectReason::Delegation`. The session's
+    /// events are then relayed into this runtime's event stream.
+    #[cfg(feature = "remote")]
+    pub(crate) async fn open_remote_delegation_session(
+        &self,
+        member: &crate::delegation::roster::RemoteMember,
+        cwd: Option<String>,
+    ) -> Result<(String, crate::agent::remote::SessionActorRef), agent_client_protocol::Error> {
+        use super::remote_connect::{RemoteConnectOptions, RemoteConnectReason};
+
+        let (node_id, node_manager) = self.remote_member_node(member).await?;
+        // The owner records the session with fork origin `delegation`; the
+        // bookmark records the same, so neither side lists it as a user session.
+        let response = self
+            .create_remote_delegation_session(&node_manager, cwd)
+            .await?;
+        let reason = RemoteConnectReason::Delegation;
+        let connected = self
+            .connect_remote_session(
+                &response.session_id,
+                RemoteConnectOptions {
+                    node_hint: Some(&node_id),
+                    peer_label: Some(member.peer()),
+                    preferred_scope: None,
+                    reason,
+                    replace: reason.default_replace_policy(),
+                    handoff: Some(response.handoff),
+                    windowed: false,
+                    fork_origin: Some(crate::session::domain::ForkOrigin::Delegation),
+                },
+            )
+            .await
+            .map_err(|error| error.to_acp_error())?;
+        Ok((response.session_id, connected.session_ref))
+    }
+
+    /// Sets lifecycle state of a session owned by a remote member's node.
+    #[cfg(feature = "remote")]
+    pub(crate) async fn set_remote_member_session_lifecycle(
+        &self,
+        member: &crate::delegation::roster::RemoteMember,
+        session_id: &str,
+        patch: crate::session::lifecycle::SessionLifecyclePatch,
+    ) -> crate::session::error::SessionResult<crate::session::lifecycle::SessionLifecycle> {
+        use crate::session::error::SessionError;
+
+        patch.validate()?;
+        if session_id.is_empty() {
+            return Err(SessionError::InvalidOperation(
+                "session id must not be empty".into(),
+            ));
+        }
+        let (_, node_manager) = self
+            .remote_member_node(member)
+            .await
+            .map_err(|error| SessionError::InvalidOperation(error.message))?;
+        self.patch_remote_session_lifecycle(&node_manager, session_id.to_owned(), patch)
+            .await
+            .map_err(|error| SessionError::InvalidOperation(error.message))
     }
 }
 

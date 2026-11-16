@@ -1,5 +1,5 @@
 use crate::acp::protocol::{ContentBlock, PromptRequest, StopReason, TextContent};
-pub use crate::delegation::agent_registry::AgentRegistry;
+use crate::delegation::roster::{AgentRoster, MemberAgent};
 use crate::hooks::{
     DelegationFailureRequest, DelegationStartRequest, HookNotice, Hooks, PostDelegationRequest,
 };
@@ -39,24 +39,37 @@ struct ActiveDelegation {
     activity: WorkflowActivity,
 }
 
+/// The child session of a delegation, once it exists.
+struct DelegationChild {
+    target: MemberAgent,
+    session_id: String,
+    /// The root that owns the delegation. Weak: a running delegation must not
+    /// keep an abandoned runtime alive.
+    root: std::sync::Weak<crate::agent::LocalAgentHandle>,
+}
+
 #[derive(Default)]
 struct DelegationCancellation {
-    child: OnceLock<(Arc<dyn crate::agent::handle::AgentHandle>, String)>,
+    child: OnceLock<DelegationChild>,
     finalized: AtomicBool,
 }
 
 impl DelegationCancellation {
     async fn resolve(&self, delegation_id: &str) {
-        if let Some((target, child_session_id)) = self.child.get()
+        if let Some(child) = self.child.get()
             && !self.finalized.swap(true, Ordering::AcqRel)
         {
-            let target = target.clone();
-            let child_session_id = child_session_id.clone();
+            let Some(root) = child.root.upgrade() else {
+                return;
+            };
+            let target = child.target.clone();
+            let child_session_id = child.session_id.clone();
             let delegation_id = delegation_id.to_owned();
             // A grace-period abort of the execution task must not drop the owner patch.
             let _ = tokio::spawn(async move {
                 resolve_terminal_delegate_attempt(
-                    target.as_ref(),
+                    &root,
+                    &target,
                     &child_session_id,
                     &delegation_id,
                 )
@@ -88,7 +101,7 @@ impl DelegationCancellation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
-    pub id: String,
+    pub id: super::roster::AgentId,
     pub name: String,
     pub description: String,
     pub capabilities: Vec<String>,
@@ -116,7 +129,6 @@ impl VerificationSpecBuilder {
 #[derive(Clone)]
 pub struct DelegationOrchestratorConfig {
     pub cwd: Option<PathBuf>,
-    pub inject_results: bool,
     pub run_verification: bool,
     pub wait_policy: crate::config::DelegationWaitPolicy,
     pub wait_timeout_secs: u64,
@@ -125,25 +137,26 @@ pub struct DelegationOrchestratorConfig {
 }
 
 impl DelegationOrchestratorConfig {
-    pub fn new(cwd: Option<PathBuf>) -> Self {
+    /// The behaviour `settings` describe, working in `cwd`.
+    pub fn new(cwd: Option<PathBuf>, settings: &crate::config::DelegationSettings) -> Self {
         Self {
             cwd,
-            inject_results: false,
-            run_verification: false,
-            wait_policy: crate::config::DelegationWaitPolicy::default(),
-            wait_timeout_secs: 120,
-            cancel_grace_secs: 5,
-            max_parallel_delegations: NonZeroUsize::new(5).expect("non-zero default"),
+            run_verification: settings.verification,
+            wait_policy: settings.wait_policy.clone(),
+            wait_timeout_secs: settings.wait_timeout_secs,
+            cancel_grace_secs: settings.cancel_grace_secs,
+            max_parallel_delegations: settings.max_parallel,
         }
     }
 }
 
 pub struct DelegationOrchestrator {
-    delegator: Arc<dyn crate::agent::handle::AgentHandle>,
+    /// The root that owns this service. Weak: the root owns the service.
+    root: std::sync::Weak<crate::agent::LocalAgentHandle>,
     event_sink: Arc<EventSink>,
     store: Arc<dyn SessionStore>,
-    agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
-    tool_registry: Arc<ToolRegistry>,
+    roster: Arc<AgentRoster>,
+    pub(crate) tool_registry: Arc<ToolRegistry>,
     hooks: Hooks,
     config: DelegationOrchestratorConfig,
     max_parallel: Arc<tokio::sync::Semaphore>,
@@ -167,24 +180,25 @@ pub struct DelegationOrchestrator {
 }
 
 impl DelegationOrchestrator {
+    /// A service for `root`, delegating to the members of `roster` as
+    /// `settings` describe. Event sink, store, tool registry and hooks are
+    /// those of the root's config.
     pub fn new(
-        delegator: Arc<dyn crate::agent::handle::AgentHandle>,
-        event_sink: Arc<EventSink>,
-        store: Arc<dyn SessionStore>,
-        agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
-        tool_registry: Arc<ToolRegistry>,
-        hooks: Hooks,
+        root: &Arc<crate::agent::LocalAgentHandle>,
+        roster: Arc<AgentRoster>,
+        settings: &crate::config::DelegationSettings,
         cwd: Option<PathBuf>,
     ) -> Self {
+        let config = &root.config;
         Self {
-            delegator,
-            event_sink,
-            store,
-            agent_registry,
-            tool_registry,
-            hooks,
-            config: DelegationOrchestratorConfig::new(cwd),
-            max_parallel: Arc::new(tokio::sync::Semaphore::new(5)),
+            root: Arc::downgrade(root),
+            event_sink: config.event_sink.clone(),
+            store: config.provider.history_store(),
+            roster,
+            tool_registry: config.tool_registry_arc(),
+            hooks: config.hooks.clone(),
+            config: DelegationOrchestratorConfig::new(cwd, settings),
+            max_parallel: Arc::new(tokio::sync::Semaphore::new(settings.max_parallel.get())),
             active_delegations: Arc::new(Mutex::new(HashMap::new())),
             shutting_down: AtomicBool::new(false),
             delegation_summarizer: None,
@@ -198,12 +212,14 @@ impl DelegationOrchestrator {
     }
 
     /// Apply this per-cycle price cap before each delegation-summary dispatch.
+    #[must_use]
     pub fn with_budget_cap(mut self, cap_usd: Option<f64>) -> Self {
         self.budget_cap_usd = cap_usd;
         self
     }
 
     /// Snapshot this manual budget pricing onto delegation-summary attempts.
+    #[must_use]
     pub fn with_budget_pricing(
         mut self,
         pricing: Option<querymt::providers::ModelPricing>,
@@ -212,38 +228,7 @@ impl DelegationOrchestrator {
         self
     }
 
-    /// Legacy constructor for backward compatibility with QueryMTAgent.
-    pub fn with_result_injection(mut self, enabled: bool) -> Self {
-        self.config.inject_results = enabled;
-        self
-    }
-
-    pub fn with_verification(mut self, enabled: bool) -> Self {
-        self.config.run_verification = enabled;
-        self
-    }
-
-    pub fn with_wait_policy(mut self, policy: crate::config::DelegationWaitPolicy) -> Self {
-        self.config.wait_policy = policy;
-        self
-    }
-
-    pub fn with_wait_timeout_secs(mut self, timeout_secs: u64) -> Self {
-        self.config.wait_timeout_secs = timeout_secs;
-        self
-    }
-
-    pub fn with_cancel_grace_secs(mut self, grace_secs: u64) -> Self {
-        self.config.cancel_grace_secs = grace_secs;
-        self
-    }
-
-    pub fn with_max_parallel_delegations(mut self, max_parallel: NonZeroUsize) -> Self {
-        self.config.max_parallel_delegations = max_parallel;
-        self.max_parallel = Arc::new(tokio::sync::Semaphore::new(max_parallel.get()));
-        self
-    }
-
+    #[must_use]
     pub fn with_summarizer(
         mut self,
         summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
@@ -252,6 +237,7 @@ impl DelegationOrchestrator {
         self
     }
 
+    #[must_use]
     pub fn with_delegate_model_overrides(
         mut self,
         overrides: super::DelegateModelOverrideStore,
@@ -260,6 +246,7 @@ impl DelegationOrchestrator {
         self
     }
 
+    #[must_use]
     pub fn with_profile_id(mut self, profile_id: impl Into<String>) -> Self {
         self.profile_id = Some(profile_id.into());
         self
@@ -270,6 +257,7 @@ impl DelegationOrchestrator {
     /// When set, the orchestrator will consult the routing table before creating
     /// delegation sessions and write `provider_node_id` from the routing policy
     /// to the session's DB row.
+    #[must_use]
     pub fn with_routing_snapshot(
         mut self,
         snapshot: crate::agent::remote::RoutingSnapshotHandle,
@@ -279,12 +267,18 @@ impl DelegationOrchestrator {
     }
 
     /// Enable isolated delegation through the given workspace service.
+    #[must_use]
     pub fn with_workspace_service(
         mut self,
         service: Arc<crate::worktree::WorkspaceService>,
     ) -> Self {
         self.workspace_service = Some(service);
         self
+    }
+
+    /// The settings this service runs with.
+    pub fn config(&self) -> &DelegationOrchestratorConfig {
+        &self.config
     }
 
     pub fn begin_shutdown(&self) {
@@ -405,24 +399,12 @@ impl DelegationOrchestrator {
             .await
         {
             Ok(true) => {
-                emit_delegation_event(
-                    &self.delegator,
-                    &self.event_sink,
-                    parent_session_id,
+                self.event_sink.session_stream(parent_session_id).emit(
                     AgentEventKind::DelegationFailed {
                         delegation_id: delegation.public_id.clone(),
                         error: error_message.to_string(),
                     },
                 );
-                if self.config.inject_results {
-                    inject_failure(
-                        &self.delegator,
-                        parent_session_id,
-                        &delegation.public_id,
-                        error_message,
-                    )
-                    .await;
-                }
             }
             Ok(false) => {}
             Err(_) => warn!("Failed to persist delegation claim failure"),
@@ -453,6 +435,9 @@ impl DelegationOrchestrator {
             return;
         }
         let session_id = envelope.session_id();
+        let Some(delegator) = self.root.upgrade() else {
+            return;
+        };
         match envelope.kind() {
             AgentEventKind::DelegationRequested {
                 delegation,
@@ -517,8 +502,7 @@ impl DelegationOrchestrator {
                     }
                     Ok(DelegationClaim::NotFound) => {
                         emit_delegation_event(
-                            &self.delegator,
-                            &self.event_sink,
+                            &delegator,
                             session_id,
                             AgentEventKind::DelegationFailed {
                                 delegation_id: delegation.public_id.clone(),
@@ -545,33 +529,40 @@ impl DelegationOrchestrator {
                     }
                 }
 
-                let Some(target_handle) =
-                    self.agent_registry.get_handle(&delegation.target_agent_id)
-                else {
-                    fail_delegation(
-                        DelegationFailureContext {
-                            event_sink: &self.event_sink,
-                            delegator: &self.delegator,
-                            store: &self.store,
-                            hooks: None,
-                            config: &self.config,
-                            parent_session_id: session_id,
-                            delegation_id: &delegation.public_id,
-                            target_agent_id: Some(&delegation.target_agent_id),
-                            objective: Some(&delegation.objective),
-                            child_session: None,
-                            execution_cwd: None,
-                        },
-                        &format!(
-                            "Agent '{}' is not registered with a handle",
-                            delegation.target_agent_id
-                        ),
-                    )
-                    .await;
-                    return;
+                let target_handle = self
+                    .roster
+                    .snapshot()
+                    .get(&delegation.target_agent_id)
+                    .cloned()
+                    .ok_or_else(|| format!("Unknown agent '{}'", delegation.target_agent_id))
+                    .and_then(|member| {
+                        self.roster
+                            .resolve(&member)
+                            .map_err(|error| format!("{:#}", anyhow::Error::from(error)))
+                    });
+                let target_handle = match target_handle {
+                    Ok(handle) => handle,
+                    Err(message) => {
+                        fail_delegation(
+                            DelegationFailureContext {
+                                delegator: &delegator,
+                                store: &self.store,
+                                hooks: None,
+                                parent_session_id: session_id,
+                                delegation_id: &delegation.public_id,
+                                target_agent_id: Some(&delegation.target_agent_id),
+                                objective: Some(&delegation.objective),
+                                child_session: None,
+                                execution_cwd: None,
+                            },
+                            &message,
+                        )
+                        .await;
+                        return;
+                    }
                 };
 
-                let delegator = self.delegator.clone();
+                let delegator_for_task = delegator.clone();
                 let event_sink = self.event_sink.clone();
                 let store = self.store.clone();
                 let tool_registry = self.tool_registry.clone();
@@ -609,6 +600,7 @@ impl DelegationOrchestrator {
                 let activity_for_entry = activity.clone();
                 let handle = tokio::spawn(
                     async move {
+                        let delegator = delegator_for_task;
                         if start_rx.await.is_err() {
                             return;
                         }
@@ -617,11 +609,9 @@ impl DelegationOrchestrator {
                             Err(_) => {
                                 fail_delegation(
                                     DelegationFailureContext {
-                                        event_sink: &event_sink,
                                         delegator: &delegator,
                                         store: &store,
                                         hooks: Some(&hooks),
-                                        config: &config,
                                         parent_session_id: &parent_session_id,
                                         delegation_id: &delegation.public_id,
                                         target_agent_id: Some(&delegation.target_agent_id),
@@ -681,11 +671,9 @@ impl DelegationOrchestrator {
                     drop(active);
                     fail_delegation(
                         DelegationFailureContext {
-                            event_sink: &self.event_sink,
-                            delegator: &self.delegator,
+                            delegator: &delegator,
                             store: &self.store,
                             hooks: None,
-                            config: &self.config,
                             parent_session_id: session_id,
                             delegation_id: &delegation_id,
                             target_agent_id: None,
@@ -882,7 +870,7 @@ impl Drop for WorkflowActivityInner {
 /// Context structure to group delegation handler parameters
 struct DelegationContext {
     activity: WorkflowActivity,
-    delegator: Arc<dyn crate::agent::handle::AgentHandle>,
+    delegator: Arc<crate::agent::LocalAgentHandle>,
     event_sink: Arc<EventSink>,
     store: Arc<dyn SessionStore>,
     tool_registry: Arc<ToolRegistry>,
@@ -906,16 +894,14 @@ struct DelegationContext {
 }
 
 struct DelegationFailureContext<'a> {
-    event_sink: &'a Arc<EventSink>,
-    delegator: &'a Arc<dyn crate::agent::handle::AgentHandle>,
+    delegator: &'a Arc<crate::agent::LocalAgentHandle>,
     store: &'a Arc<dyn SessionStore>,
     hooks: Option<&'a Hooks>,
-    config: &'a DelegationOrchestratorConfig,
     parent_session_id: &'a str,
     delegation_id: &'a str,
     target_agent_id: Option<&'a str>,
     objective: Option<&'a str>,
-    child_session: Option<(&'a Arc<dyn crate::agent::handle::AgentHandle>, &'a str)>,
+    child_session: Option<(&'a MemberAgent, &'a str)>,
     /// The delegate's effective execution cwd once its workspace/checkout
     /// has been allocated; `None` for pre-allocation failures, which keep
     /// explicit parent context only.
@@ -923,17 +909,12 @@ struct DelegationFailureContext<'a> {
 }
 
 async fn teardown_failed_delegate_session(
-    target: &Arc<dyn crate::agent::handle::AgentHandle>,
+    target: &MemberAgent,
     child_session_id: &str,
     session_ref: &crate::agent::remote::SessionActorRef,
     bridge_connection_id: Option<&Arc<str>>,
 ) {
-    if let (Some(target), Some(connection_id)) = (
-        target
-            .as_any()
-            .downcast_ref::<crate::agent::LocalAgentHandle>(),
-        bridge_connection_id,
-    ) {
+    if let (Some(target), Some(connection_id)) = (target.as_local(), bridge_connection_id) {
         target
             .clear_session_bridge(child_session_id, connection_id.clone())
             .await;
@@ -1025,7 +1006,7 @@ async fn summary_operation(
 )]
 async fn execute_delegation(
     ctx: DelegationContext,
-    target: Arc<dyn crate::agent::handle::AgentHandle>,
+    target: MemberAgent,
     parent_session_id: String,
     delegation: Delegation,
     cancel_token: CancellationToken,
@@ -1041,11 +1022,9 @@ async fn execute_delegation(
     {
         fail_delegation(
             DelegationFailureContext {
-                event_sink: &ctx.event_sink,
                 delegator: &ctx.delegator,
                 store: &ctx.store,
                 hooks: Some(&ctx.hooks),
-                config: &ctx.config,
                 parent_session_id: &parent_session_id,
                 delegation_id: &delegation.public_id,
                 target_agent_id: Some(&delegation.target_agent_id),
@@ -1072,11 +1051,9 @@ async fn execute_delegation(
                 );
                 fail_delegation(
                     DelegationFailureContext {
-                        event_sink: &ctx.event_sink,
                         delegator: &ctx.delegator,
                         store: &ctx.store,
                         hooks: Some(&ctx.hooks),
-                        config: &ctx.config,
                         parent_session_id: &parent_session_id,
                         delegation_id: &delegation.public_id,
                         target_agent_id: Some(&delegation.target_agent_id),
@@ -1098,11 +1075,9 @@ async fn execute_delegation(
             );
             fail_delegation(
                 DelegationFailureContext {
-                    event_sink: &ctx.event_sink,
                     delegator: &ctx.delegator,
                     store: &ctx.store,
                     hooks: Some(&ctx.hooks),
-                    config: &ctx.config,
                     parent_session_id: &parent_session_id,
                     delegation_id: &delegation.public_id,
                     target_agent_id: Some(&delegation.target_agent_id),
@@ -1123,11 +1098,9 @@ async fn execute_delegation(
             );
             fail_delegation(
                 DelegationFailureContext {
-                    event_sink: &ctx.event_sink,
                     delegator: &ctx.delegator,
                     store: &ctx.store,
                     hooks: Some(&ctx.hooks),
-                    config: &ctx.config,
                     parent_session_id: &parent_session_id,
                     delegation_id: &delegation.public_id,
                     target_agent_id: Some(&delegation.target_agent_id),
@@ -1171,11 +1144,9 @@ async fn execute_delegation(
                 Err(err) => {
                     fail_delegation(
                         DelegationFailureContext {
-                            event_sink: &ctx.event_sink,
                             delegator: &ctx.delegator,
                             store: &ctx.store,
                             hooks: Some(&ctx.hooks),
-                            config: &ctx.config,
                             parent_session_id: &parent_session_id,
                             delegation_id: &delegation.public_id,
                             target_agent_id: Some(&delegation.target_agent_id),
@@ -1209,11 +1180,9 @@ async fn execute_delegation(
             let Some(parent_cwd) = effective_cwd.clone() else {
                 fail_delegation(
                     DelegationFailureContext {
-                        event_sink: &ctx.event_sink,
                         delegator: &ctx.delegator,
                         store: &ctx.store,
                         hooks: Some(&ctx.hooks),
-                        config: &ctx.config,
                         parent_session_id: &parent_session_id,
                         delegation_id: &delegation.public_id,
                         target_agent_id: Some(&delegation.target_agent_id),
@@ -1236,11 +1205,9 @@ async fn execute_delegation(
                 Err(err) => {
                     fail_delegation(
                         DelegationFailureContext {
-                            event_sink: &ctx.event_sink,
                             delegator: &ctx.delegator,
                             store: &ctx.store,
                             hooks: Some(&ctx.hooks),
-                            config: &ctx.config,
                             parent_session_id: &parent_session_id,
                             delegation_id: &delegation.public_id,
                             target_agent_id: Some(&delegation.target_agent_id),
@@ -1281,11 +1248,9 @@ async fn execute_delegation(
                 Err(err) => {
                     fail_delegation(
                         DelegationFailureContext {
-                            event_sink: &ctx.event_sink,
                             delegator: &ctx.delegator,
                             store: &ctx.store,
                             hooks: Some(&ctx.hooks),
-                            config: &ctx.config,
                             parent_session_id: &parent_session_id,
                             delegation_id: &delegation.public_id,
                             target_agent_id: Some(&delegation.target_agent_id),
@@ -1357,7 +1322,11 @@ async fn execute_delegation(
             }
             None => {
                 target
-                    .create_delegation_session(cwd_string, parent_session_id.clone())
+                    .create_delegation_session(
+                        &ctx.delegator,
+                        cwd_string,
+                        parent_session_id.clone(),
+                    )
                     .await
             }
         }
@@ -1390,11 +1359,9 @@ async fn execute_delegation(
             );
             fail_delegation(
                 DelegationFailureContext {
-                    event_sink: &ctx.event_sink,
                     delegator: &ctx.delegator,
                     store: &ctx.store,
                     hooks: Some(&ctx.hooks),
-                    config: &ctx.config,
                     parent_session_id: &parent_session_id,
                     delegation_id: &delegation.public_id,
                     target_agent_id: Some(&delegation.target_agent_id),
@@ -1409,37 +1376,31 @@ async fn execute_delegation(
             return;
         }
     };
-    let _ = ctx
-        .cancellation
-        .child
-        .set((target.clone(), child_session_id.clone()));
+    let _ = ctx.cancellation.child.set(DelegationChild {
+        target: target.clone(),
+        session_id: child_session_id.clone(),
+        root: Arc::downgrade(&ctx.delegator),
+    });
     let child_session = Some((&target, child_session_id.as_str()));
 
     let mut child_bridge_connection_id = None;
     let parent_bridge = ctx
         .delegator
-        .as_any()
-        .downcast_ref::<crate::agent::LocalAgentHandle>()
-        .and_then(|handle| {
-            handle
-                .config
-                .session_bridges
-                .lock()
-                .ok()
-                .and_then(|bridges| {
-                    bridges
-                        .get(&parent_session_id)
-                        .map(|route| route.bridge.clone())
-                })
+        .config
+        .session_bridges
+        .lock()
+        .ok()
+        .and_then(|bridges| {
+            bridges
+                .get(&parent_session_id)
+                .map(|route| route.bridge.clone())
         });
     // Locally hosted children inherit the parent's connection route so the
     // workspace-query capability follows the delegation. Remote children never
     // get a route (workspace queries are unavailable for remote sessions).
     if let Some(bridge) = parent_bridge
         && !session_ref.is_remote()
-        && let Some(target) = target
-            .as_any()
-            .downcast_ref::<crate::agent::LocalAgentHandle>()
+        && let Some(target) = target.as_local()
         && let Ok(mut bridges) = target.config.session_bridges.lock()
     {
         child_bridge_connection_id = bridge.connection_id().map(Arc::from);
@@ -1468,11 +1429,9 @@ async fn execute_delegation(
         .await;
         fail_delegation(
             DelegationFailureContext {
-                event_sink: &ctx.event_sink,
                 delegator: &ctx.delegator,
                 store: &ctx.store,
                 hooks: Some(&ctx.hooks),
-                config: &ctx.config,
                 parent_session_id: &parent_session_id,
                 delegation_id: &delegation.public_id,
                 target_agent_id: Some(&delegation.target_agent_id),
@@ -1560,11 +1519,9 @@ async fn execute_delegation(
             .await;
             fail_delegation(
                 DelegationFailureContext {
-                    event_sink: &ctx.event_sink,
                     delegator: &ctx.delegator,
                     store: &ctx.store,
                     hooks: Some(&ctx.hooks),
-                    config: &ctx.config,
                     parent_session_id: &parent_session_id,
                     delegation_id: &delegation.public_id,
                     target_agent_id: Some(&delegation.target_agent_id),
@@ -1596,11 +1553,9 @@ async fn execute_delegation(
                 .await;
                 fail_delegation(
                     DelegationFailureContext {
-                        event_sink: &ctx.event_sink,
                         delegator: &ctx.delegator,
                         store: &ctx.store,
                         hooks: Some(&ctx.hooks),
-                        config: &ctx.config,
                         parent_session_id: &parent_session_id,
                         delegation_id: &delegation.public_id,
                         target_agent_id: Some(&delegation.target_agent_id),
@@ -1635,11 +1590,9 @@ async fn execute_delegation(
             .await;
             fail_delegation(
                 DelegationFailureContext {
-                    event_sink: &ctx.event_sink,
                     delegator: &ctx.delegator,
                     store: &ctx.store,
                     hooks: Some(&ctx.hooks),
-                    config: &ctx.config,
                     parent_session_id: &parent_session_id,
                     delegation_id: &delegation.public_id,
                     target_agent_id: Some(&delegation.target_agent_id),
@@ -1677,11 +1630,9 @@ async fn execute_delegation(
         .await;
         fail_delegation(
             DelegationFailureContext {
-                event_sink: &ctx.event_sink,
                 delegator: &ctx.delegator,
                 store: &ctx.store,
                 hooks: Some(&ctx.hooks),
-                config: &ctx.config,
                 parent_session_id: &parent_session_id,
                 delegation_id: &delegation.public_id,
                 target_agent_id: Some(&delegation.target_agent_id),
@@ -1718,7 +1669,6 @@ async fn execute_delegation(
 
     emit_delegation_event(
         &ctx.delegator,
-        &ctx.event_sink,
         &parent_session_id,
         AgentEventKind::SessionForked {
             parent_session_id: parent_session_id.clone(),
@@ -1885,9 +1835,7 @@ async fn execute_delegation(
                 }
             }
 
-            emit_delegation_event(
-                &ctx.delegator,
-                &ctx.event_sink,
+            emit_delegation_event(&ctx.delegator,
                 &parent_session_id,
                 AgentEventKind::DelegationCancelled {
                     delegation_id: delegation_id.clone(),
@@ -1931,11 +1879,9 @@ async fn execute_delegation(
             );
             fail_delegation(
                 DelegationFailureContext {
-                    event_sink: &ctx.event_sink,
                     delegator: &ctx.delegator,
                     store: &ctx.store,
                     hooks: Some(&ctx.hooks),
-                    config: &ctx.config,
                     parent_session_id: &parent_session_id,
                     delegation_id: &delegation_id,
                     target_agent_id: Some(&delegation.target_agent_id),
@@ -2010,11 +1956,9 @@ async fn execute_delegation(
                 );
                 fail_delegation(
                     DelegationFailureContext {
-                        event_sink: &ctx.event_sink,
                         delegator: &ctx.delegator,
                         store: &ctx.store,
                         hooks: Some(&ctx.hooks),
-                        config: &ctx.config,
                         parent_session_id: &parent_session_id,
                         delegation_id: &delegation.public_id,
                         target_agent_id: Some(&delegation.target_agent_id),
@@ -2186,7 +2130,8 @@ async fn execute_delegation(
             {
                 Ok(true) => {
                     resolve_terminal_delegate_attempt(
-                        target.as_ref(),
+                        &ctx.delegator,
+                        &target,
                         &child_session_id,
                         &delegation_id,
                     )
@@ -2207,23 +2152,12 @@ async fn execute_delegation(
 
             emit_delegation_event(
                 &ctx.delegator,
-                &ctx.event_sink,
                 &parent_session_id,
                 AgentEventKind::DelegationCompleted {
                     delegation_id: delegation.public_id.clone(),
                     result: Some(summary.clone()),
                 },
             );
-
-            if ctx.config.inject_results {
-                inject_results(
-                    &ctx.delegator,
-                    &parent_session_id,
-                    &delegation.public_id,
-                    &summary,
-                )
-                .await;
-            }
 
             let mut active = ctx.active_delegations.lock().await;
             active.remove(&delegation_id);
@@ -2236,11 +2170,9 @@ async fn execute_delegation(
             );
             fail_delegation(
                 DelegationFailureContext {
-                    event_sink: &ctx.event_sink,
                     delegator: &ctx.delegator,
                     store: &ctx.store,
                     hooks: Some(&ctx.hooks),
-                    config: &ctx.config,
                     parent_session_id: &parent_session_id,
                     delegation_id: &delegation_id,
                     target_agent_id: Some(&delegation.target_agent_id),
@@ -2301,13 +2233,15 @@ async fn persist_delegate_runtime_binding(
 }
 
 async fn resolve_terminal_delegate_attempt(
-    target: &dyn crate::agent::handle::AgentHandle,
+    root: &crate::agent::LocalAgentHandle,
+    target: &MemberAgent,
     child_session_id: &str,
     delegation_id: &str,
 ) {
     // Resolution marks the one-shot attempt as finished, not as successful execution.
     if let Err(error) = target
         .set_session_lifecycle(
+            root,
             child_session_id,
             crate::session::lifecycle::SessionLifecyclePatch {
                 resolved: Some(true),
@@ -2368,8 +2302,13 @@ async fn fail_delegation(ctx: DelegationFailureContext<'_>, error_message: &str)
     }
 
     if let Some((target, child_session_id)) = ctx.child_session {
-        resolve_terminal_delegate_attempt(target.as_ref(), child_session_id, ctx.delegation_id)
-            .await;
+        resolve_terminal_delegate_attempt(
+            ctx.delegator,
+            target,
+            child_session_id,
+            ctx.delegation_id,
+        )
+        .await;
     }
 
     let mut failure_message = error_message.to_string();
@@ -2408,37 +2347,24 @@ async fn fail_delegation(ctx: DelegationFailureContext<'_>, error_message: &str)
 
     emit_delegation_event(
         ctx.delegator,
-        ctx.event_sink,
         ctx.parent_session_id,
         AgentEventKind::DelegationFailed {
             delegation_id: ctx.delegation_id.to_string(),
             error: failure_message.clone(),
         },
     );
-
-    if ctx.config.inject_results {
-        inject_failure(
-            ctx.delegator,
-            ctx.parent_session_id,
-            ctx.delegation_id,
-            &failure_message,
-        )
-        .await;
-    }
 }
 
 fn emit_delegation_event(
-    delegator: &Arc<dyn crate::agent::handle::AgentHandle>,
-    _event_sink: &Arc<EventSink>,
+    delegator: &Arc<crate::agent::LocalAgentHandle>,
     session_id: &str,
     kind: AgentEventKind,
 ) {
-    // emit_event is now on the AgentHandle trait — no downcast needed.
     delegator.emit_event(session_id, kind);
 }
 
 fn emit_hook_notices(
-    delegator: &Arc<dyn crate::agent::handle::AgentHandle>,
+    delegator: &Arc<crate::agent::LocalAgentHandle>,
     session_id: &str,
     notices: Vec<HookNotice>,
 ) {
@@ -2491,46 +2417,6 @@ pub(crate) fn format_delegation_failure_message(delegation_id: &str, error: &str
          Analyze the error and adjust your strategy.",
         delegation_id, error_type, error, remediation
     )
-}
-
-async fn inject_results(
-    delegator: &Arc<dyn crate::agent::handle::AgentHandle>,
-    session_id: &str,
-    delegation_id: &str,
-    summary: &str,
-) {
-    let message = format_delegation_completion_message(delegation_id, summary);
-
-    if delegator
-        .prompt(PromptRequest::new(
-            session_id.to_string(),
-            vec![ContentBlock::Text(TextContent::new(message))],
-        ))
-        .await
-        .is_err()
-    {
-        warn!("Failed to inject delegation results");
-    }
-}
-
-async fn inject_failure(
-    delegator: &Arc<dyn crate::agent::handle::AgentHandle>,
-    session_id: &str,
-    delegation_id: &str,
-    error: &str,
-) {
-    let message = format_delegation_failure_message(delegation_id, error);
-
-    if delegator
-        .prompt(PromptRequest::new(
-            session_id.to_string(),
-            vec![ContentBlock::Text(TextContent::new(message))],
-        ))
-        .await
-        .is_err()
-    {
-        warn!("Failed to inject delegation failure");
-    }
 }
 
 fn classify_delegation_error(error: &str) -> (&str, &str) {
@@ -2703,59 +2589,6 @@ fn extract_tool_args_preview(tool_name: &str, args_json: &str) -> String {
     }
 }
 
-/// Internal structure to hold both metadata and agent handle.
-struct AgentEntry {
-    info: AgentInfo,
-    handle: Arc<dyn crate::agent::handle::AgentHandle>,
-}
-
-#[derive(Default)]
-pub struct DefaultAgentRegistry {
-    agents: std::collections::HashMap<String, AgentEntry>,
-}
-
-impl DefaultAgentRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Register an agent with its metadata and a unified `AgentHandle`.
-    pub fn register(
-        &mut self,
-        info: AgentInfo,
-        handle: Arc<dyn crate::agent::handle::AgentHandle>,
-    ) {
-        let id = info.id.clone();
-        self.agents.insert(id, AgentEntry { info, handle });
-    }
-
-    /// Alias for `register` — kept for backward compatibility during migration.
-    pub fn register_handle(
-        &mut self,
-        info: AgentInfo,
-        handle: Arc<dyn crate::agent::handle::AgentHandle>,
-    ) {
-        self.register(info, handle);
-    }
-}
-
-impl AgentRegistry for DefaultAgentRegistry {
-    fn list_agents(&self) -> Vec<AgentInfo> {
-        self.agents
-            .values()
-            .map(|entry| entry.info.clone())
-            .collect()
-    }
-
-    fn get_agent(&self, id: &str) -> Option<AgentInfo> {
-        self.agents.get(id).map(|entry| entry.info.clone())
-    }
-
-    fn get_handle(&self, id: &str) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
-        self.agents.get(id).map(|entry| entry.handle.clone())
-    }
-}
-
 // ══════════════════════════════════════════════════════════════════════════
 //  Tests
 // ══════════════════════════════════════════════════════════════════════════
@@ -2763,17 +2596,12 @@ impl AgentRegistry for DefaultAgentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::protocol::{
-        CancelNotification, Error, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-        NewSessionResponse, PromptRequest, PromptResponse,
-    };
-    use crate::agent::handle::AgentHandle;
-    use crate::agent::remote::SessionActorRef;
+    use crate::delegation::roster::{Member, MemberOrigin, test_roster_on};
     use crate::hooks::Hooks;
     use crate::session::backend::StorageBackend;
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::test_utils::MockSessionStore;
-    use async_trait::async_trait;
+    use crate::test_utils::delegation::{DelegateBehavior, agent_info, build_delegate_handle};
     use querymt_agent_core::events::EventEnvelope;
     use querymt_agent_services::event_fanout::EventFanout;
     use querymt_agent_services::event_sink::EventSink;
@@ -3058,73 +2886,64 @@ mod tests {
         assert_eq!(restored.provider_locks_json, None);
     }
 
-    // ── Minimal stub AgentHandle ──────────────────────────────────────────────
-
-    struct StubAgentHandle {
-        name: String,
-        event_fanout: Arc<EventFanout>,
+    /// A root handle and an empty roster over the same storage.
+    async fn root_and_roster() -> (
+        Arc<crate::agent::LocalAgentHandle>,
+        Arc<AgentRoster>,
+        crate::test_utils::TestAgent,
+        tempfile::TempDir,
+    ) {
+        let agent = crate::test_utils::TestAgent::with_mock_provider(
+            crate::test_utils::SharedLlmProvider::new(
+                crate::test_utils::MockLlmProvider::new(),
+                vec![],
+            ),
+        )
+        .await;
+        let (plugins, dir) = crate::test_utils::helpers::empty_plugin_registry().unwrap();
+        let roster = test_roster_on(Arc::new(plugins), agent.storage.clone());
+        (agent.handle.clone(), roster, agent, dir)
     }
 
-    impl StubAgentHandle {
-        fn new(name: &str) -> Arc<Self> {
-            Arc::new(Self {
-                name: name.to_string(),
-                event_fanout: Arc::new(EventFanout::new()),
-            })
-        }
+    /// An orchestrator for `root` whose store and event sink are replaced.
+    fn orchestrator_on(
+        root: &Arc<crate::agent::LocalAgentHandle>,
+        roster: Arc<AgentRoster>,
+        store: Arc<dyn SessionStore>,
+        event_sink: Arc<EventSink>,
+    ) -> DelegationOrchestrator {
+        orchestrator_with(root, roster, &Default::default(), store, event_sink)
     }
 
-    #[async_trait]
-    impl AgentHandle for StubAgentHandle {
-        async fn new_session(
-            &self,
-            _req: NewSessionRequest,
-        ) -> std::result::Result<NewSessionResponse, Error> {
-            Ok(NewSessionResponse::new(format!("{}-session", self.name)))
-        }
+    /// [`orchestrator_on`] with explicit delegation settings.
+    fn orchestrator_with(
+        root: &Arc<crate::agent::LocalAgentHandle>,
+        roster: Arc<AgentRoster>,
+        settings: &crate::config::DelegationSettings,
+        store: Arc<dyn SessionStore>,
+        event_sink: Arc<EventSink>,
+    ) -> DelegationOrchestrator {
+        let mut orchestrator = DelegationOrchestrator::new(root, roster, settings, None);
+        orchestrator.store = store;
+        orchestrator.event_sink = event_sink;
+        orchestrator.tool_registry = Arc::new(ToolRegistry::new());
+        orchestrator.hooks = Hooks::default();
+        orchestrator
+    }
 
-        async fn prompt(&self, _req: PromptRequest) -> std::result::Result<PromptResponse, Error> {
-            Ok(PromptResponse::new(
-                crate::acp::protocol::StopReason::EndTurn,
-            ))
-        }
-
-        async fn cancel(&self, _notif: CancelNotification) -> std::result::Result<(), Error> {
-            Ok(())
-        }
-
-        async fn load_session(
-            &self,
-            _req: LoadSessionRequest,
-        ) -> std::result::Result<LoadSessionResponse, Error> {
-            Ok(LoadSessionResponse::new())
-        }
-
-        async fn create_delegation_session(
-            &self,
-            _cwd: Option<String>,
-            _parent_session_id: String,
-        ) -> std::result::Result<(String, SessionActorRef), Error> {
-            Err(Error::internal_error().data("stub: not implemented"))
-        }
-
-        fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<EventEnvelope> {
-            self.event_fanout.subscribe()
-        }
-
-        fn event_fanout(&self) -> &Arc<EventFanout> {
-            &self.event_fanout
-        }
-
-        fn emit_event(&self, _session_id: &str, _kind: AgentEventKind) {}
-
-        fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
-            Arc::new(DefaultAgentRegistry::new())
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
+    async fn built_member(
+        id: &str,
+        store: Arc<dyn SessionStore>,
+    ) -> (Member, Arc<crate::agent::LocalAgentHandle>) {
+        let handle = build_delegate_handle(DelegateBehavior::AlwaysOk, store, None).await;
+        (
+            Member::built(
+                agent_info(id),
+                MemberOrigin::Config,
+                MemberAgent::Local(handle.clone()),
+            ),
+            handle,
+        )
     }
 
     #[tokio::test]
@@ -3142,7 +2961,11 @@ mod tests {
         assert!(
             cancellation
                 .child
-                .set((fixture.delegate.clone(), child.public_id.clone()))
+                .set(DelegationChild {
+                    target: MemberAgent::Local(fixture.delegate.clone()),
+                    session_id: child.public_id.clone(),
+                    root: Arc::downgrade(&fixture.delegate),
+                })
                 .is_ok()
         );
         tokio::join!(
@@ -3221,20 +3044,20 @@ mod tests {
             .expect("delegation");
         let fanout = Arc::new(EventFanout::new());
         let event_sink = Arc::new(EventSink::new(storage.event_journal(), fanout.clone()));
-        let mut registry = DefaultAgentRegistry::new();
-        registry.register(make_agent_info("coder"), StubAgentHandle::new("coder"));
-        let orchestrator = Arc::new(
-            DelegationOrchestrator::new(
-                StubAgentHandle::new("delegator"),
-                event_sink,
-                storage.session_store().clone(),
-                Arc::new(registry),
-                Arc::new(ToolRegistry::new()),
-                Hooks::default(),
-                None,
-            )
-            .with_max_parallel_delegations(NonZeroUsize::new(1).unwrap()),
-        );
+        let (root, roster, _agent, _dir) = root_and_roster().await;
+        let (member, _handle) = built_member("coder", storage.session_store().clone()).await;
+        roster.add(member).unwrap();
+        let settings = crate::config::DelegationSettings {
+            max_parallel: NonZeroUsize::new(1).unwrap(),
+            ..Default::default()
+        };
+        let orchestrator = Arc::new(orchestrator_with(
+            &root,
+            roster,
+            &settings,
+            storage.session_store().clone(),
+            event_sink,
+        ));
         let held_permit = orchestrator
             .max_parallel
             .clone()
@@ -3326,6 +3149,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protocol_target_that_cannot_be_built_fails_the_delegation() {
+        let (root, roster, agent, _dir) = root_and_roster().await;
+        let storage = agent.storage.clone();
+        let session = storage
+            .create_session(None, None, None, None)
+            .await
+            .expect("session");
+        let delegation = storage
+            .create_delegation(Delegation {
+                isolation: Default::default(),
+                id: 0,
+                public_id: String::new(),
+                session_id: session.id,
+                task_id: None,
+                target_agent_id: "writer".to_string(),
+                objective: "write".to_string(),
+                objective_hash: querymt_agent_core::hash::RapidHash::new(b"write"),
+                context: None,
+                constraints: None,
+                expected_output: None,
+                verification_spec: None,
+                planning_summary: None,
+                status: DelegationStatus::Requested,
+                retry_count: 0,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            })
+            .await
+            .expect("delegation");
+        // A protocol member whose build always fails.
+        roster
+            .add(Member::unbuildable(
+                agent_info("writer"),
+                MemberOrigin::Protocol,
+                &"model preset `fast` rejected",
+            ))
+            .unwrap();
+        let mut events = root.config.subscribe_events();
+        let orchestrator = orchestrator_on(
+            &root,
+            roster.clone(),
+            storage.session_store(),
+            root.config.event_sink.clone(),
+        );
+        let envelope = EventEnvelope::from(querymt_agent_core::events::AgentEvent {
+            seq: 0,
+            session_seq: 0,
+            timestamp: 0,
+            session_id: session.public_id.clone(),
+            origin: querymt_agent_core::events::EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::DelegationRequested {
+                delegation: delegation.clone(),
+                tool_call_id: None,
+                batch_id: None,
+                cycle_id: None,
+            },
+        });
+        orchestrator.handle_envelope(&envelope).await;
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let AgentEventKind::DelegationFailed { error, .. } =
+                    events.recv().await.unwrap().kind()
+                {
+                    break error.clone();
+                }
+            }
+        })
+        .await
+        .expect("the delegation fails instead of staying requested");
+        assert!(error.contains("writer"), "{error}");
+        assert!(error.contains("model preset `fast` rejected"), "{error}");
+        assert_eq!(
+            storage
+                .get_delegation(&delegation.public_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            DelegationStatus::Failed
+        );
+
+        // The failed build left the member unbuilt, so the next use tries again.
+        let snapshot = roster.snapshot();
+        let member = snapshot.get("writer").unwrap();
+        assert!(!member.is_built());
+        assert!(roster.resolve(member).is_err());
+    }
+
+    #[tokio::test]
     async fn claim_error_does_not_fail_running_winner() {
         let mut store = MockSessionStore::new();
         store
@@ -3345,15 +3259,8 @@ mod tests {
         );
         let fanout = Arc::new(EventFanout::new());
         let event_sink = Arc::new(EventSink::new(storage.event_journal(), fanout));
-        let orchestrator = DelegationOrchestrator::new(
-            StubAgentHandle::new("delegator"),
-            event_sink,
-            store,
-            Arc::new(DefaultAgentRegistry::new()),
-            Arc::new(ToolRegistry::new()),
-            Hooks::default(),
-            None,
-        );
+        let (root, roster, _agent, _dir) = root_and_roster().await;
+        let orchestrator = orchestrator_on(&root, roster, store, event_sink);
         let delegation = Delegation {
             isolation: Default::default(),
             id: 1,
@@ -3377,75 +3284,6 @@ mod tests {
         orchestrator
             .fail_unclaimed_delegation(&delegation, "session-1", "claim failed")
             .await;
-    }
-
-    /// A stub handle that records delegation child-session launches.
-    struct CountingStubHandle {
-        child_launches: Arc<std::sync::atomic::AtomicUsize>,
-        event_fanout: Arc<EventFanout>,
-    }
-
-    impl CountingStubHandle {
-        fn new(child_launches: Arc<std::sync::atomic::AtomicUsize>) -> Arc<Self> {
-            Arc::new(Self {
-                child_launches,
-                event_fanout: Arc::new(EventFanout::new()),
-            })
-        }
-    }
-
-    #[async_trait]
-    impl AgentHandle for CountingStubHandle {
-        async fn new_session(
-            &self,
-            _req: NewSessionRequest,
-        ) -> std::result::Result<NewSessionResponse, Error> {
-            Ok(NewSessionResponse::new("counting-session".to_string()))
-        }
-
-        async fn prompt(&self, _req: PromptRequest) -> std::result::Result<PromptResponse, Error> {
-            Ok(PromptResponse::new(
-                crate::acp::protocol::StopReason::EndTurn,
-            ))
-        }
-
-        async fn cancel(&self, _notif: CancelNotification) -> std::result::Result<(), Error> {
-            Ok(())
-        }
-
-        async fn load_session(
-            &self,
-            _req: LoadSessionRequest,
-        ) -> std::result::Result<LoadSessionResponse, Error> {
-            Ok(LoadSessionResponse::new())
-        }
-
-        async fn create_delegation_session(
-            &self,
-            _cwd: Option<String>,
-            _parent_session_id: String,
-        ) -> std::result::Result<(String, SessionActorRef), Error> {
-            self.child_launches.fetch_add(1, Ordering::SeqCst);
-            Err(Error::internal_error().data("stub: not implemented"))
-        }
-
-        fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<EventEnvelope> {
-            self.event_fanout.subscribe()
-        }
-
-        fn event_fanout(&self) -> &Arc<EventFanout> {
-            &self.event_fanout
-        }
-
-        fn emit_event(&self, _session_id: &str, _kind: AgentEventKind) {}
-
-        fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
-            Arc::new(DefaultAgentRegistry::new())
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
 
     /// Failure/cancellation outputs retain workspace references: the note
@@ -3524,7 +3362,6 @@ mod tests {
     }
 
     async fn isolation_preflight_fails_closed(configure_service: bool) {
-        let child_launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (failed_tx, failed_rx) = tokio::sync::oneshot::channel::<()>();
         let failed_tx = Arc::new(std::sync::Mutex::new(Some(failed_tx)));
         let mut store = MockSessionStore::new();
@@ -3556,20 +3393,10 @@ mod tests {
         let fanout = Arc::new(EventFanout::new());
         let event_sink = Arc::new(EventSink::new(storage.event_journal(), fanout));
 
-        let mut registry = DefaultAgentRegistry::new();
-        registry.register(
-            make_agent_info("coder"),
-            CountingStubHandle::new(child_launches.clone()),
-        );
-        let mut orchestrator = DelegationOrchestrator::new(
-            StubAgentHandle::new("delegator"),
-            event_sink,
-            store,
-            Arc::new(registry),
-            Arc::new(ToolRegistry::new()),
-            Hooks::default(),
-            None,
-        );
+        let (root, roster, _agent, _dir) = root_and_roster().await;
+        let (member, member_handle) = built_member("coder", storage.session_store()).await;
+        roster.add(member).unwrap();
+        let mut orchestrator = orchestrator_on(&root, roster, store, event_sink);
         let storage_root = tempfile::TempDir::new().unwrap();
         if configure_service {
             orchestrator = orchestrator.with_workspace_service(Arc::new(
@@ -3623,9 +3450,8 @@ mod tests {
             .expect("delegation must fail closed in time")
             .expect("failure signal sender dropped early");
 
-        assert_eq!(
-            child_launches.load(Ordering::SeqCst),
-            0,
+        assert!(
+            member_handle.registry.lock().await.is_empty(),
             "no child session may be launched without a workspace service or local execution capability"
         );
         assert!(
@@ -3638,18 +3464,6 @@ mod tests {
                 .is_empty(),
             "remote filesystem isolation fails before any allocation"
         );
-    }
-
-    fn make_agent_info(id: &str) -> AgentInfo {
-        AgentInfo {
-            isolation: Default::default(),
-            id: id.to_string(),
-            name: format!("Agent {id}"),
-            description: format!("Description for {id}"),
-            capabilities: vec!["coding".to_string()],
-            required_capabilities: vec![],
-            meta: None,
-        }
     }
 
     // ── claim_delegation retry ───────────────────────────────────────────────
@@ -3683,15 +3497,8 @@ mod tests {
             storage.event_journal(),
             Arc::new(EventFanout::new()),
         ));
-        let orchestrator = DelegationOrchestrator::new(
-            StubAgentHandle::new("delegator"),
-            event_sink,
-            store,
-            Arc::new(DefaultAgentRegistry::new()),
-            Arc::new(ToolRegistry::new()),
-            Hooks::default(),
-            None,
-        );
+        let (root, roster, _agent, _dir) = root_and_roster().await;
+        let orchestrator = orchestrator_on(&root, roster, store, event_sink);
         (orchestrator, attempts)
     }
 
@@ -3758,91 +3565,13 @@ mod tests {
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    // ── DefaultAgentRegistry tests ───────────────────────────────────────────
-
-    #[test]
-    fn test_new_registry_is_empty() {
-        let registry = DefaultAgentRegistry::new();
-        assert!(registry.list_agents().is_empty());
-        assert!(registry.get_agent("any").is_none());
-        assert!(registry.get_handle("any").is_none());
-    }
-
-    #[test]
-    fn test_register_and_list_agent() {
-        let mut registry = DefaultAgentRegistry::new();
-        let info = make_agent_info("agent-1");
-        let agent = StubAgentHandle::new("agent-1");
-        registry.register(info, agent);
-
-        let agents = registry.list_agents();
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].id, "agent-1");
-        assert_eq!(agents[0].name, "Agent agent-1");
-    }
-
-    #[test]
-    fn test_get_agent_by_id() {
-        let mut registry = DefaultAgentRegistry::new();
-        registry.register(make_agent_info("alpha"), StubAgentHandle::new("alpha"));
-        registry.register(make_agent_info("beta"), StubAgentHandle::new("beta"));
-
-        let alpha = registry.get_agent("alpha");
-        assert!(alpha.is_some());
-        assert_eq!(alpha.unwrap().id, "alpha");
-
-        let beta = registry.get_agent("beta");
-        assert!(beta.is_some());
-        assert_eq!(beta.unwrap().id, "beta");
-
-        assert!(registry.get_agent("gamma").is_none());
-    }
-
-    #[test]
-    fn test_get_handle() {
-        let mut registry = DefaultAgentRegistry::new();
-        registry.register(make_agent_info("worker"), StubAgentHandle::new("worker"));
-
-        assert!(registry.get_handle("worker").is_some());
-        assert!(registry.get_handle("missing").is_none());
-    }
-
-    #[test]
-    fn test_register_multiple_agents() {
-        let mut registry = DefaultAgentRegistry::new();
-        for i in 0..5 {
-            registry.register(
-                make_agent_info(&format!("agent-{i}")),
-                StubAgentHandle::new(&format!("agent-{i}")),
-            );
-        }
-        assert_eq!(registry.list_agents().len(), 5);
-    }
-
-    #[test]
-    fn test_register_overwrites_same_id() {
-        let mut registry = DefaultAgentRegistry::new();
-        let mut info1 = make_agent_info("x");
-        info1.description = "first".to_string();
-        let mut info2 = make_agent_info("x");
-        info2.description = "second".to_string();
-
-        registry.register(info1, StubAgentHandle::new("x"));
-        registry.register(info2, StubAgentHandle::new("x"));
-
-        // Still only one entry
-        assert_eq!(registry.list_agents().len(), 1);
-        let got = registry.get_agent("x").unwrap();
-        assert_eq!(got.description, "second");
-    }
-
     // ── AgentInfo serialization ──────────────────────────────────────────────
 
     #[test]
     fn test_agent_info_serde_round_trip() {
         let info = AgentInfo {
             isolation: Default::default(),
-            id: "coder".to_string(),
+            id: crate::delegation::roster::AgentId::try_from("coder").unwrap(),
             name: "Coder Agent".to_string(),
             description: "Writes code".to_string(),
             capabilities: vec!["rust".to_string(), "python".to_string()],
@@ -3862,7 +3591,7 @@ mod tests {
     fn test_agent_info_meta_none_omitted_in_json() {
         let info = AgentInfo {
             isolation: Default::default(),
-            id: "minimal".to_string(),
+            id: crate::delegation::roster::AgentId::try_from("minimal").unwrap(),
             name: "Minimal".to_string(),
             description: "No meta".to_string(),
             capabilities: vec![],
@@ -3882,8 +3611,7 @@ mod tests {
 
     #[test]
     fn test_orchestrator_config_defaults() {
-        let config = DelegationOrchestratorConfig::new(None);
-        assert!(!config.inject_results);
+        let config = DelegationOrchestratorConfig::new(None, &Default::default());
         assert!(!config.run_verification);
         assert_eq!(config.wait_policy, crate::config::DelegationWaitPolicy::Any);
         assert_eq!(config.wait_timeout_secs, 120);
@@ -3896,7 +3624,7 @@ mod tests {
     fn test_orchestrator_config_with_cwd() {
         use std::path::PathBuf;
         let path = PathBuf::from("/workspace");
-        let config = DelegationOrchestratorConfig::new(Some(path.clone()));
+        let config = DelegationOrchestratorConfig::new(Some(path.clone()), &Default::default());
         assert_eq!(config.cwd, Some(path));
     }
 }

@@ -9,7 +9,6 @@ pub mod state;
 // Keep existing exports during transition
 mod context;
 pub mod dedup_check;
-mod delegation;
 pub mod delegation_guard;
 mod limits;
 mod modes;
@@ -41,7 +40,6 @@ pub use context::{ContextConfig, ContextMiddleware};
 pub use dedup_check::{
     DedupCheckFactory, DedupCheckMiddleware, DuplicateWarning, FunctionLocation, SimilarMatch,
 };
-pub use delegation::{DelegationConfig, DelegationContextMiddleware, DelegationMiddleware};
 pub use delegation_guard::DelegationGuardMiddleware;
 pub use factory::{MIDDLEWARE_REGISTRY, MiddlewareFactory, MiddlewareRegistry, enabled_flag};
 pub use limits::{

@@ -1,14 +1,9 @@
 //! Shared utility functions for the simple API
 
-use crate::agent::builtin_tools::all_builtin_tools;
-use crate::tools::CapabilityRequirement;
 use anyhow::{Result, anyhow};
-use once_cell::sync::Lazy;
-use querymt::LLMParams;
 #[cfg(feature = "plugin-loaders")]
 use querymt::dynamic::PluginRegistryDynamicExt;
 use querymt::plugin::host::PluginRegistry;
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// Converts a path to an absolute path, canonicalizing if it exists
@@ -47,41 +42,3 @@ pub(super) async fn default_registry() -> Result<PluginRegistry> {
 }
 
 pub(super) use crate::agent::utils::latest_assistant_message;
-
-pub(super) fn infer_required_capabilities(
-    tools: &[crate::config::ToolSpec],
-) -> HashSet<CapabilityRequirement> {
-    let mut caps = HashSet::new();
-    for tool in tools {
-        if tool.as_builtin().is_some_and(tool_requires_filesystem) {
-            caps.insert(CapabilityRequirement::Filesystem);
-        }
-    }
-    caps
-}
-
-/// Set of builtin tool names that require filesystem access.
-/// Lazily computed from `all_builtin_tools()` to stay in sync with tool definitions.
-static FILESYSTEM_TOOLS: Lazy<HashSet<String>> = Lazy::new(|| {
-    all_builtin_tools()
-        .into_iter()
-        .filter(|tool| {
-            tool.required_capabilities()
-                .contains(&CapabilityRequirement::Filesystem)
-        })
-        .map(|tool| tool.name().to_string())
-        .collect()
-});
-
-pub(super) fn tool_requires_filesystem(tool_name: &str) -> bool {
-    FILESYSTEM_TOOLS.contains(tool_name)
-}
-
-use super::config::AgentConfig;
-
-pub(super) fn build_llm_config(config: &AgentConfig) -> Result<LLMParams> {
-    config
-        .llm_config
-        .clone()
-        .ok_or_else(|| anyhow!("LLM configuration required (call .provider() first)"))
-}

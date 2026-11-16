@@ -286,6 +286,7 @@ impl LocalAgentHandle {
                         replace: remote_connect::RemoteReplacePolicy::ReplaceIfMatches(attachment_id),
                         handoff: None,
                         windowed: false,
+                        fork_origin: None,
                     },
                 )
                 .await
@@ -409,6 +410,7 @@ mod tests {
             cwd: None,
             created_at: 1,
             title: None,
+            fork_origin: None,
         }
     }
 

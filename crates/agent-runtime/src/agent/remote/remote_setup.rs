@@ -5,12 +5,12 @@
 //!
 //! All functionality is feature-gated behind `#[cfg(feature = "remote")]`.
 
-use crate::agent::remote::mesh::MeshHandle;
 use crate::agent::remote::scope::{
     scoped_node_manager, scoped_node_manager_for_peer, scoped_provider_host,
 };
 use crate::config::RemoteAgentConfig;
-use crate::delegation::{AgentInfo, DefaultAgentRegistry};
+use crate::delegation::AgentInfo;
+use crate::delegation::roster::{AgentId, Member, MemberAgent, MemberOrigin, RemoteMember};
 use anyhow::Result;
 use querymt_remote::scoped_provider_catalog;
 use querymt_remote::{MeshRuntimeHandle, ProviderCatalogActor, ProviderHostActor};
@@ -132,170 +132,56 @@ pub async fn spawn_and_register_local_mesh_actors_with_name(
     actor_refs
 }
 
-pub async fn register_remote_agents_from_config(
-    mesh: &MeshHandle,
+/// Builds the members for `[[remote_agents]]` without contacting any peer: a
+/// member is listed whether or not its peer is reachable, and the node is
+/// resolved when a delegation needs it. The owner id in a configured peer
+/// address (`/p2p/<id>`) is kept as a fallback for that resolution.
+pub fn remote_members_from_config(
     remotes: &[RemoteAgentConfig],
     peers: &[crate::config::MeshPeerConfig],
-) -> Result<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>> {
+) -> Result<Vec<Member>> {
+    use libp2p::multiaddr::Protocol;
+
     let peer_map: std::collections::HashMap<&str, &str> = peers
         .iter()
         .map(|p| (p.name.as_str(), p.addr.as_str()))
         .collect();
 
-    let mut registry = DefaultAgentRegistry::new();
-
+    let mut members = Vec::new();
     for remote in remotes {
-        let peer_addr = match peer_map.get(remote.peer.as_str()) {
-            Some(a) => *a,
-            None => {
-                log::warn!(
-                    "remote_agent '{}' references unknown peer '{}'; skipping",
-                    remote.id,
-                    remote.peer
-                );
-                continue;
-            }
-        };
-
-        match register_remote_agent(mesh, remote, peer_addr).await {
-            Ok((agent_info, target_node_id)) => {
-                log::info!(
-                    "Registered remote agent '{}' (peer='{}')",
-                    agent_info.id,
-                    remote.peer
-                );
-                let remote_handle = Arc::new(super::remote_handle::RemoteAgentHandle::new(
-                    remote.peer.clone(),
-                    target_node_id,
-                    mesh.clone(),
-                ));
-                registry.register_handle(agent_info, remote_handle);
-            }
-            Err(e) => {
-                log::warn!(
-                    "Could not register remote agent '{}' (peer='{}'): {}; skipping",
-                    remote.id,
-                    remote.peer,
-                    e
-                );
-            }
-        }
-    }
-
-    Ok(Arc::new(registry))
-}
-
-/// Attempt to contact the peer's `RemoteNodeManager` and confirm the agent
-/// exists, then return an `AgentInfo` for registration.
-#[tracing::instrument(
-    name = "remote.setup.register_remote_agent",
-    skip(mesh, peer_addr),
-    fields(
-        peer = %remote.peer,
-        agent_id = %remote.id,
-        reachable = tracing::field::Empty,
-        peer_hostname = tracing::field::Empty,
-    )
-)]
-async fn register_remote_agent(
-    mesh: &MeshHandle,
-    remote: &RemoteAgentConfig,
-    peer_addr: &str,
-) -> Result<(AgentInfo, Option<String>)> {
-    use crate::agent::remote::{GetNodeInfo, NodeId, RemoteNodeManager};
-    use libp2p::multiaddr::Protocol;
-    use querymt_remote::ask_remote_with_timeout;
-
-    // Prefer peer-specific DHT names so multi-peer meshes do not bind to the
-    // first generic node_manager provider returned by the DHT.
-    let lookup_timeout = std::time::Duration::from_secs(5);
-    let runtime = MeshRuntimeHandle::from(mesh.clone());
-    let mut found_ref = None;
-    let mut target_node_id = mesh
-        .resolve_peer_node_id(&remote.peer)
-        .await
-        .map(|node_id| node_id.to_string())
-        .or_else(|| {
-            // A terminal /p2p address component identifies the owner without a name resolver.
-            let addr = peer_addr.parse::<libp2p::Multiaddr>().ok()?;
-            match addr.iter().last()? {
-                Protocol::P2p(peer_id) => Some(NodeId::from_peer_id(peer_id).to_string()),
-                _ => None,
-            }
-        });
-
-    if let Some(owner_node_id) = target_node_id.clone() {
-        for scope in runtime.active_scopes() {
-            let dht_name = super::scope::scoped_node_manager_for_peer(&scope, &owner_node_id);
-            match runtime
-                .lookup_actor_with_timeout::<RemoteNodeManager>(dht_name.clone(), lookup_timeout)
-                .await
-            {
-                Ok(Some(node_manager_ref)) => {
-                    found_ref = Some(node_manager_ref);
-                    break;
-                }
-                Ok(None) => {}
-                Err(querymt_remote::RemoteLookupError::Timeout { .. }) => {}
-                Err(e) => {
-                    log::debug!(
-                        "DHT lookup error for peer '{}' under '{}': {}",
-                        remote.peer,
-                        dht_name,
-                        e
-                    );
-                }
-            }
-        }
-    }
-
-    match found_ref {
-        Some(node_manager_ref) => {
-            match ask_remote_with_timeout(&node_manager_ref, &GetNodeInfo, lookup_timeout).await {
-                Ok(node_info) => {
-                    tracing::Span::current()
-                        .record("reachable", true)
-                        .record("peer_hostname", &node_info.hostname);
-                    target_node_id = Some(node_info.node_id.to_string());
-                    log::debug!(
-                        "Peer '{}' reachable (hostname='{}')",
-                        remote.peer,
-                        node_info.hostname
-                    );
-                }
-                Err(e) => {
-                    tracing::Span::current().record("reachable", false);
-                    log::debug!(
-                        "GetNodeInfo failed for peer '{}': {} (registering anyway)",
-                        remote.peer,
-                        e
-                    );
-                }
-            }
-        }
-        None => {
-            tracing::Span::current().record("reachable", false);
-            log::debug!(
-                "Peer '{}' not yet in peer-specific scoped DHT; registering remote agent '{}' speculatively",
-                remote.peer,
-                remote.id
+        let Some(peer_addr) = peer_map.get(remote.peer.as_str()) else {
+            log::warn!(
+                "remote_agent '{}' references unknown peer '{}'; skipping",
+                remote.id,
+                remote.peer
             );
-        }
+            continue;
+        };
+        // A terminal /p2p address component identifies the owner without a
+        // name resolver.
+        let node_id = peer_addr
+            .parse::<libp2p::Multiaddr>()
+            .ok()
+            .and_then(|addr| match addr.iter().last()? {
+                Protocol::P2p(peer_id) => {
+                    Some(crate::agent::remote::NodeId::from_peer_id(peer_id).to_string())
+                }
+                _ => None,
+            });
+        let info = AgentInfo {
+            isolation: Default::default(),
+            id: AgentId::try_from(remote.id.as_str())?,
+            name: remote.name.clone(),
+            description: remote.description.clone(),
+            capabilities: remote.capabilities.clone(),
+            required_capabilities: vec![],
+            meta: None,
+        };
+        members.push(Member::built(
+            info,
+            MemberOrigin::Config,
+            MemberAgent::Remote(RemoteMember::new(remote.peer.clone(), node_id)),
+        ));
     }
-
-    let info = AgentInfo {
-        isolation: Default::default(),
-        id: remote.id.clone(),
-        name: remote.name.clone(),
-        description: remote.description.clone(),
-        capabilities: remote.capabilities.clone(),
-        required_capabilities: vec![],
-        meta: Some(serde_json::json!({
-            "remote": true,
-            "peer": remote.peer,
-            "node_id": target_node_id,
-        })),
-    };
-
-    Ok((info, target_node_id))
+    Ok(members)
 }

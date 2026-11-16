@@ -10,6 +10,9 @@ impl LocalAgentHandle {
         match req.method.as_ref() {
             "querymt/models" => self.handle_ext_models().await,
             "querymt/profiles" => self.handle_ext_profiles(req).await,
+            "querymt/agents/list" => self.handle_ext_agents_list(req).await,
+            "querymt/agents/add" => self.handle_ext_agents_add(req).await,
+            "querymt/agents/remove" => self.handle_ext_agents_remove(req).await,
             "querymt/profile/agents" => self.handle_ext_profile_agents(req).await,
             "querymt/profile/setActive" => self.handle_ext_set_active_profile(req).await,
             "querymt/session/setDelegateModel" => self.handle_ext_set_delegate_model(req).await,

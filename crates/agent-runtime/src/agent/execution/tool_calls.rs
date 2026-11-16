@@ -1354,7 +1354,7 @@ fn tool_context_for_call(
     });
 
     exec_ctx
-        .tool_context(config.agent_registry.clone(), Some(elicitation_tx))
+        .tool_context(Some(elicitation_tx))
         .with_tool_call_id(call.id.clone())
         .with_workspace_service(config.workspace_service())
         .with_todo_store(config.todo_store.clone())
@@ -1854,9 +1854,13 @@ pub(super) async fn record_tool_side_effects(
             None => crate::worktree::ExecutionMode::Local,
         };
         let configured_isolation = config
-            .agent_registry
-            .get_agent(&target_agent_id)
-            .map(|info| info.isolation)
+            .roster()
+            .and_then(|roster| {
+                roster
+                    .snapshot()
+                    .get(&target_agent_id)
+                    .map(|member| member.info().isolation)
+            })
             .unwrap_or_default();
         let (resolved_isolation, isolation_source) = crate::worktree::resolve_delegation_policy(
             parent_mode,
@@ -4585,7 +4589,9 @@ mod mcp_tool_tests {
     /// shared fanout and can be answered through the planner (quorum) handle.
     #[tokio::test]
     async fn delegate_skill_approval_is_answerable_through_the_planner() {
-        use crate::delegation::{AgentInfo, DefaultAgentRegistry};
+        use crate::delegation::roster::{
+            AgentRoster, Member, MemberAgent, MemberOrigin, test_roster_on,
+        };
         use crate::elicitation::{ElicitationAction, ElicitationResponse};
         use crate::skills::{SkillCatalog, SkillPermissions};
         use crate::test_utils::mcp_harness::ScriptedSkill;
@@ -4609,24 +4615,21 @@ mod mcp_tool_tests {
         let delegate = Arc::new(crate::agent::LocalAgentHandle::from_config(Arc::new(
             config.clone(),
         )));
-        let mut registry = DefaultAgentRegistry::new();
-        registry.register(
-            AgentInfo {
-                isolation: Default::default(),
-                id: "coder".into(),
-                name: "Coder".into(),
-                description: "d".into(),
-                capabilities: vec![],
-                required_capabilities: vec![],
-                meta: None,
-            },
-            delegate.clone(),
-        );
         let planner_agent =
             TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
                 .await;
+        let (plugins, _dir) = crate::test_utils::helpers::empty_plugin_registry().unwrap();
+        let roster: Arc<AgentRoster> =
+            test_roster_on(Arc::new(plugins), planner_agent.storage.clone());
+        roster
+            .add(Member::built(
+                crate::test_utils::delegation::agent_info("coder"),
+                MemberOrigin::Config,
+                MemberAgent::Local(delegate.clone()),
+            ))
+            .unwrap();
         let mut planner_config = planner_agent.config.as_ref().clone();
-        planner_config.agent_registry = Arc::new(registry);
+        planner_config.roster = Some(roster);
         let planner = crate::agent::LocalAgentHandle::from_config(Arc::new(planner_config));
 
         let exec = agent
@@ -4673,6 +4676,223 @@ mod mcp_tool_tests {
                 .filter_map(|b| b.as_text())
                 .any(|t| t.contains("Body of a"))
         );
+    }
+
+    /// A root and a built protocol target on one event stream and one store,
+    /// as `build_root` wires them. The target is in the root's roster.
+    struct ProtocolTargetFixture {
+        agent: TestAgent,
+        root: crate::agent::LocalAgentHandle,
+        target: Arc<crate::agent::LocalAgentHandle>,
+        harness: McpHarness,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn protocol_target_fixture() -> ProtocolTargetFixture {
+        use crate::config::SkillsConfig;
+        use crate::delegation::member::{
+            DelegateBuildParams, MemberBuildSpec, MemberContext, build_local_member,
+        };
+        use crate::delegation::roster::{Member, MemberAgent, MemberOrigin, test_roster_on};
+        use crate::dotagents::{DotagentsLayer, DotagentsSource, DotagentsSubAgentPlan};
+        use crate::test_utils::mcp_harness::ScriptedSkill;
+
+        let harness = McpHarness::start(HarnessOptions {
+            skills: Some(vec![ScriptedSkill::new("a", "A")]),
+            ..HarnessOptions::default()
+        })
+        .await;
+        let agent =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let (plugins, dir) = crate::test_utils::helpers::empty_plugin_registry().unwrap();
+        let plugins = Arc::new(plugins);
+
+        let plan = DotagentsSubAgentPlan {
+            id: "writer".into(),
+            info: crate::test_utils::delegation::agent_info("writer"),
+            system_prompt: String::new(),
+            model: None,
+            tools: None,
+            mcp_servers: vec![],
+            source: DotagentsSource::entry(DotagentsLayer::Workspace, "a.md", "writer"),
+            diagnostics: vec![],
+        };
+        let spec = MemberBuildSpec::from_protocol_plan(&plan, Some(&SkillsConfig::default()))
+            .expect("lowers");
+        let ctx = MemberContext::new(
+            DelegateBuildParams {
+                plugin_registry: plugins.clone(),
+                snapshot_policy: crate::agent::core::SnapshotPolicy::None,
+                skills_project_root: dir.path().to_path_buf(),
+                workspace_service: None,
+                repository_knowledge: None,
+            },
+            Default::default(),
+            agent.storage.clone(),
+            agent.config.event_sink.fanout().clone(),
+        );
+        let target = build_local_member(&spec, &ctx).expect("target builds");
+        assert!(
+            Arc::ptr_eq(target.event_fanout(), agent.config.event_sink.fanout()),
+            "the target uses the root's event stream"
+        );
+
+        let roster = test_roster_on(plugins, agent.storage.clone());
+        roster
+            .add(Member::built(
+                plan.info.clone(),
+                MemberOrigin::Protocol,
+                MemberAgent::Local(target.clone()),
+            ))
+            .unwrap();
+        let mut root_config = agent.config.as_ref().clone();
+        root_config.roster = Some(roster);
+        let root = crate::agent::LocalAgentHandle::from_config(Arc::new(root_config));
+        ProtocolTargetFixture {
+            agent,
+            root,
+            target,
+            harness,
+            _dir: dir,
+        }
+    }
+
+    /// Covers agent-delegation / Protocol target skill approval reaches the
+    /// user.
+    #[tokio::test]
+    async fn protocol_target_skill_approval_reaches_the_user() {
+        use crate::elicitation::{ElicitationAction, ElicitationResponse};
+
+        let fx = protocol_target_fixture().await;
+        let config = fx.target.config.clone();
+        let exec = fx
+            .agent
+            .execution_context_with_mcp(fx.harness.tool_state.clone())
+            .await;
+        let mut events = fx.agent.config.event_sink.fanout().subscribe();
+        let call = mock_tool_call("call-p", "skill", r#"{"name":"harness.a"}"#);
+        let run = execute_tool_call(&config, &call, &exec);
+        let answer = async {
+            // The request reaches the stream the parent's client reads.
+            let (id, schema) = loop {
+                let envelope = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .expect("approval event within 5s")
+                    .expect("fanout open");
+                if let AgentEventKind::ElicitationRequested {
+                    elicitation_id,
+                    requested_schema,
+                    ..
+                } = envelope.kind()
+                {
+                    break (elicitation_id.clone(), requested_schema.to_string());
+                }
+            };
+            assert!(id.starts_with("skill-permission-harness.a-"), "{id}");
+            for label in ["Allow", "Allow for this session", "Deny"] {
+                assert!(schema.contains(label), "missing `{label}` in {schema}");
+            }
+            // The user's answer, given through the root, reaches the target.
+            let resolution = crate::elicitation::resolve_elicitation_from_connection(
+                &fx.root,
+                Some(&exec.session_id),
+                &id,
+                "conn",
+                ElicitationResponse {
+                    action: ElicitationAction::Accept,
+                    content: Some(json!({"selection": "Allow"})),
+                },
+            )
+            .await
+            .expect("answer accepted");
+            assert_eq!(
+                resolution,
+                crate::elicitation::ElicitationResolution::Resolved
+            );
+        };
+        let (result, ()) = tokio::join!(run, answer);
+        let result = result.unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(
+            result
+                .content
+                .iter()
+                .filter_map(|b| b.as_text())
+                .any(|t| t.contains("Body of a")),
+            "the skill loaded after the answer"
+        );
+    }
+
+    /// Covers agent-delegation / Protocol target tool permission request
+    /// reaches the user.
+    #[tokio::test]
+    async fn protocol_target_tool_permission_request_reaches_the_user() {
+        use crate::elicitation::ElicitationResponse;
+
+        let fx = protocol_target_fixture().await;
+        let mut config = fx.target.config.as_ref().clone();
+        config.permissions = crate::config::Permissions::new()
+            .always_ask(["read_tool".parse().unwrap()])
+            .timeout(Duration::from_secs(10));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let exec = fx
+            .agent
+            .execution_context_in(dir.path().to_path_buf())
+            .await;
+        let mut events = fx.agent.config.event_sink.fanout().subscribe();
+        let call = mock_tool_call(
+            "call-q",
+            "read_tool",
+            &json!({"path": file.display().to_string()}).to_string(),
+        );
+        let run = execute_tool_call(&config, &call, &exec);
+        let answer = async {
+            let id = loop {
+                let envelope = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .expect("permission event within 5s")
+                    .expect("fanout open");
+                if let AgentEventKind::PermissionRequested {
+                    permission_id,
+                    tool_name,
+                    ..
+                } = envelope.kind()
+                {
+                    assert_eq!(tool_name, "read_tool");
+                    break permission_id.clone();
+                }
+            };
+            let resolution = crate::elicitation::resolve_elicitation_from_connection(
+                &fx.root,
+                Some(&exec.session_id),
+                &id,
+                "conn",
+                ElicitationResponse::permission_selected("allow_once"),
+            )
+            .await
+            .expect("answer accepted");
+            assert_eq!(
+                resolution,
+                crate::elicitation::ElicitationResolution::Resolved
+            );
+            id
+        };
+        let (result, id) = tokio::join!(run, answer);
+        let result = result.unwrap();
+        assert!(
+            !result.is_error,
+            "the decision was applied: {:?}",
+            result.content
+        );
+        // The decision is on the stream too.
+        let granted = collect(&mut events, Duration::from_millis(200)).await;
+        assert!(granted.iter().any(|e| matches!(
+            e.kind(),
+            AgentEventKind::PermissionGranted { permission_id, granted: true } if *permission_id == id
+        )));
     }
 
     /// Run `skill harness.a` through `execute_tool_call`. When `answer` is

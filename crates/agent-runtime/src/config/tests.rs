@@ -1045,7 +1045,7 @@ fn dotagents_settings_are_present_in_generated_schemas() {
 /// know exactly which values are valid.
 #[test]
 fn test_schema_tools_description_covers_all_builtins() {
-    use crate::agent::builtin_tools::all_builtin_tools;
+    use crate::agent::builtin_tools::builtin_tool_names;
 
     let schema = schemars::schema_for!(SingleAgentConfig);
     let schema_json = serde_json::to_value(&schema).unwrap();
@@ -1056,10 +1056,7 @@ fn test_schema_tools_description_covers_all_builtins() {
         .and_then(|v| v.as_str())
         .expect("AgentSettings.tools must have a description in the schema");
 
-    let builtin_names: Vec<String> = all_builtin_tools()
-        .iter()
-        .map(|t| t.name().to_string())
-        .collect();
+    let builtin_names: Vec<String> = builtin_tool_names();
 
     let mut missing = Vec::new();
     for name in &builtin_names {
@@ -1554,18 +1551,20 @@ async fn example_profiles_keep_workspace_disabled_and_delegates_inheriting() {
     let single: SingleAgentConfig = table.try_into().unwrap();
     assert_eq!(single.agent.workspace, WorkspaceSettings::default());
 
+    // `coder_delegate.toml` is written in the `[agent]` form with `[[delegates]]`.
     for raw in quorums {
         let table: toml::Value = toml::from_str(raw).unwrap();
         assert!(
-            table["quorum"].get("workspace").is_none(),
+            table["agent"].get("workspace").is_none(),
             "block stays commented out"
         );
         let mut table = table;
         table.as_table_mut().unwrap().remove("profile");
-        let quorum: QuorumConfig = table.try_into().unwrap();
-        assert!(!quorum.quorum.workspace.enabled);
+        let config: SingleAgentConfig = table.try_into().unwrap();
+        assert!(!config.agent.workspace.enabled);
+        assert!(!config.delegates.is_empty());
         assert!(
-            quorum
+            config
                 .delegates
                 .iter()
                 .all(|d| d.isolation == crate::worktree::DelegationIsolation::Inherit)
@@ -2331,4 +2330,381 @@ fn documented_skills_configuration_parses() {
         crate::skills::PermissionLevel::Ask
     );
     assert!(!doc.contains("agent_id = \"querymt\""), "stale key removed");
+}
+
+/// The first TOML block under `## Remote Agents` in `docs/docs/agent/mesh.md`.
+fn mesh_docs_remote_agents_block() -> String {
+    let doc = include_str!("../../../../docs/docs/agent/mesh.md");
+    let section = doc
+        .split("\n## Remote Agents\n")
+        .nth(1)
+        .expect("mesh.md has a Remote Agents section");
+    section
+        .split("```toml\n")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .expect("the section has a TOML example")
+        .to_string()
+}
+
+#[tokio::test]
+async fn mesh_docs_remote_agent_example_loads() {
+    // The example is a fragment: it needs an agent and an enabled mesh around it.
+    let toml = format!(
+        "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\n\n[mesh]\nenabled = true\n\n{}",
+        mesh_docs_remote_agents_block()
+    );
+    let Config::Single(single) = load_config(ConfigSource::Toml(toml))
+        .await
+        .expect("the documented remote agent example should load")
+    else {
+        panic!("expected a single-agent config");
+    };
+    assert_eq!(single.mesh.peers.len(), 1);
+    assert_eq!(single.mesh.peers[0].name, "gpu-server");
+    assert_eq!(single.remote_agents.len(), 1);
+    let agent = &single.remote_agents[0];
+    assert_eq!(agent.id, "gpu-coder");
+    assert_eq!(agent.peer, "gpu-server");
+    assert_eq!(agent.capabilities, ["gpu", "fast-model"]);
+}
+
+// ── `[[delegates]]` and `[agent.delegation]` under `[agent]` ──────────────
+
+const AGENT_HEAD: &str = "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\n";
+
+fn delegate_toml(id: &str, extra: &str) -> String {
+    format!(
+        "\n[[delegates]]\nid = \"{id}\"\nprovider = \"test\"\nmodel = \"test-model\"\n{extra}\n"
+    )
+}
+
+async fn load_single(toml: String) -> Result<SingleAgentConfig> {
+    match load_config(ConfigSource::Toml(toml)).await? {
+        Config::Single(single) => Ok(*single),
+        Config::Multi(_) => panic!("expected a single-agent config"),
+    }
+}
+
+fn error_text(error: anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
+#[tokio::test]
+async fn agent_configuration_with_delegates_loads() {
+    let toml = format!(
+        "{AGENT_HEAD}{}{}",
+        delegate_toml("coder", "capabilities = [\"coding\"]"),
+        delegate_toml("reviewer", "description = \"Reviews\"")
+    );
+    let single = load_single(toml).await.expect("loads");
+    let ids: Vec<_> = single.delegates.iter().map(|d| d.id.as_str()).collect();
+    assert_eq!(ids, ["coder", "reviewer"]);
+    assert_eq!(single.delegates[0].capabilities, ["coding"]);
+    assert_eq!(single.delegates[1].description.as_deref(), Some("Reviews"));
+    // The delegates' MCP servers are reported with the configuration's.
+    assert_eq!(Config::Single(Box::new(single)).mcp_servers().count(), 0);
+
+    let none = load_single(AGENT_HEAD.to_string()).await.unwrap();
+    assert!(none.delegates.is_empty());
+}
+
+#[tokio::test]
+async fn unknown_delegate_key_is_rejected() {
+    let toml = format!("{AGENT_HEAD}{}", delegate_toml("coder", "colour = \"red\""));
+    let error = error_text(load_single(toml).await.unwrap_err());
+    assert!(error.contains("colour"), "{error}");
+}
+
+#[tokio::test]
+async fn duplicate_delegate_id_is_rejected() {
+    let toml = format!(
+        "{AGENT_HEAD}{}{}",
+        delegate_toml("coder", ""),
+        delegate_toml("coder", "")
+    );
+    let error = error_text(load_single(toml).await.unwrap_err());
+    assert!(error.contains("coder"), "{error}");
+}
+
+#[tokio::test]
+async fn isolated_delegate_without_the_workspace_service_is_rejected() {
+    let isolated = delegate_toml("worker", "isolation = \"isolated\"");
+    let error = error_text(
+        load_single(format!("{AGENT_HEAD}{isolated}"))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        error.contains("worker") && error.contains("[agent.workspace]"),
+        "{error}"
+    );
+
+    let enabled = format!("{AGENT_HEAD}\n[agent.workspace]\nenabled = true\n{isolated}");
+    load_single(enabled).await.expect("workspace enabled loads");
+}
+
+#[tokio::test]
+async fn delegation_settings_default_when_omitted() {
+    let single = load_single(AGENT_HEAD.to_string()).await.unwrap();
+    let settings = &single.agent.delegation;
+    assert_eq!(settings.wait_policy, DelegationWaitPolicy::Any);
+    assert_eq!(settings.wait_timeout_secs, 120);
+    assert_eq!(settings.cancel_grace_secs, 5);
+    assert_eq!(settings.max_parallel.get(), 5);
+    assert!(!settings.verification);
+    assert!(settings.summary.is_none());
+}
+
+#[tokio::test]
+async fn delegation_settings_accept_valid_values() {
+    let toml = format!(
+        "{AGENT_HEAD}\n[agent.delegation]\nwait_policy = \"all\"\nwait_timeout_secs = 0\n\
+         cancel_grace_secs = 10\nmax_parallel = 2\nverification = true\n\n\
+         [agent.delegation.summary]\nprovider = \"test\"\nmodel = \"summary-model\"\n"
+    );
+    let single = load_single(toml).await.expect("loads");
+    let settings = &single.agent.delegation;
+    assert_eq!(settings.wait_policy, DelegationWaitPolicy::All);
+    assert_eq!(settings.wait_timeout_secs, 0);
+    assert_eq!(settings.cancel_grace_secs, 10);
+    assert_eq!(settings.max_parallel.get(), 2);
+    assert!(settings.verification);
+    let summary = settings.summary.as_ref().expect("summary");
+    assert_eq!(
+        (summary.provider.as_str(), summary.model.as_str()),
+        ("test", "summary-model")
+    );
+}
+
+#[tokio::test]
+async fn invalid_delegation_settings_are_rejected() {
+    for (value, key) in [
+        ("wait_policy = \"first\"", "first"),
+        ("wait_timeout_secs = -1", "wait_timeout_secs"),
+        ("colour = \"red\"", "colour"),
+    ] {
+        let toml = format!("{AGENT_HEAD}\n[agent.delegation]\n{value}\n");
+        let error = error_text(load_single(toml).await.unwrap_err());
+        assert!(error.contains(key), "{value}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn zero_parallel_delegations_is_rejected() {
+    let toml = format!("{AGENT_HEAD}\n[agent.delegation]\nmax_parallel = 0\n");
+    let error = error_text(load_single(toml).await.unwrap_err());
+    assert!(error.contains("max_parallel"), "{error}");
+}
+
+// ── Deprecation of `[quorum]` ─────────────────────────────────────────────
+
+mod deprecation_log {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static RECORDED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Records warnings of the current thread only, so tests that load
+    /// configurations in parallel do not see each other's notices.
+    struct ThreadLogger;
+
+    impl log::Log for ThreadLogger {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                RECORDED.with(|recorded| recorded.borrow_mut().push(record.args().to_string()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static LOGGER: ThreadLogger = ThreadLogger;
+
+    pub fn start() {
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(log::LevelFilter::Warn);
+        RECORDED.with(|recorded| recorded.borrow_mut().clear());
+    }
+
+    pub fn take() -> Vec<String> {
+        RECORDED.with(|recorded| std::mem::take(&mut *recorded.borrow_mut()))
+    }
+}
+
+const QUORUM_TOML: &str = r#"
+[quorum]
+delegation = true
+
+[planner]
+provider = "test"
+model = "planner-model"
+tools = ["delegate", "read_tool"]
+system = "plan"
+
+[[delegates]]
+id = "coder"
+provider = "test"
+model = "coder-model"
+"#;
+
+#[tokio::test]
+async fn quorum_configuration_loads_with_a_deprecation_notice() {
+    deprecation_log::start();
+    let Config::Multi(quorum) = load_config(ConfigSource::Toml(QUORUM_TOML.into()))
+        .await
+        .expect("a quorum configuration still loads")
+    else {
+        panic!("expected a quorum config");
+    };
+    assert_eq!(quorum.planner.model, "planner-model");
+    assert_eq!(quorum.delegates.len(), 1);
+    assert_eq!(quorum.delegates[0].id, "coder");
+
+    let notices: Vec<_> = deprecation_log::take()
+        .into_iter()
+        .filter(|message| message.contains("deprecated"))
+        .collect();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    for name in ["[agent]", "[[delegates]]", "[agent.delegation]"] {
+        assert!(notices[0].contains(name), "{name}: {}", notices[0]);
+    }
+
+    // The notice is per load, and an `[agent]` load does not emit one.
+    load_config(ConfigSource::Toml(AGENT_HEAD.into()))
+        .await
+        .unwrap();
+    assert!(deprecation_log::take().is_empty());
+    load_config(ConfigSource::Toml(QUORUM_TOML.into()))
+        .await
+        .unwrap();
+    assert_eq!(deprecation_log::take().len(), 1);
+}
+
+#[tokio::test]
+async fn agent_and_quorum_tables_cannot_be_mixed() {
+    for (extra, table) in [
+        ("\n[quorum]\ndelegation = true\n", "quorum"),
+        (
+            "\n[planner]\nprovider = \"test\"\nmodel = \"test-model\"\n",
+            "planner",
+        ),
+    ] {
+        let toml = format!("{AGENT_HEAD}{extra}");
+        let error = error_text(load_config(ConfigSource::Toml(toml)).await.unwrap_err());
+        assert!(error.contains(&format!("[{table}]")), "{error}");
+        assert!(error.contains("[agent]"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn invalid_snapshot_policy_is_rejected() {
+    for policy in ["none", "metadata", "diff"] {
+        let single = load_single(format!("{AGENT_HEAD}snapshot_policy = \"{policy}\"\n"))
+            .await
+            .expect("valid policy loads");
+        assert_eq!(single.agent.snapshot_policy.as_deref(), Some(policy));
+    }
+    assert!(
+        load_single(AGENT_HEAD.to_string())
+            .await
+            .unwrap()
+            .agent
+            .snapshot_policy
+            .is_none()
+    );
+
+    let error = error_text(
+        load_single(format!("{AGENT_HEAD}snapshot_policy = \"sometimes\"\n"))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        error.contains("snapshot_policy") && error.contains("sometimes"),
+        "{error}"
+    );
+}
+
+/// The two migration examples of `configuration.md` ("Migrating from
+/// `[quorum]`") must load and describe the same agent.
+#[tokio::test]
+async fn documented_quorum_migration_examples_load_and_match() {
+    let docs = include_str!("../../../../docs/docs/agent/configuration.md");
+    let section = docs
+        .split("\n## Migrating from `[quorum]`\n")
+        .nth(1)
+        .expect("migration section")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    let blocks: Vec<&str> = section
+        .split("```toml\n")
+        .skip(1)
+        .map(|rest| rest.split("```").next().unwrap())
+        .collect();
+    assert_eq!(blocks.len(), 2, "old and new form");
+
+    let Config::Multi(old) = load_config(ConfigSource::Toml(blocks[0].into()))
+        .await
+        .expect("old form loads")
+    else {
+        panic!("expected the quorum form");
+    };
+    let Config::Single(new) = load_config(ConfigSource::Toml(blocks[1].into()))
+        .await
+        .expect("new form loads")
+    else {
+        panic!("expected the agent form");
+    };
+
+    assert_eq!(old.planner.model, new.agent.model);
+    assert_eq!(old.planner.tools, new.agent.tools);
+    assert_eq!(old.quorum.cwd, new.agent.cwd);
+    assert_eq!(old.quorum.verification, new.agent.delegation.verification);
+    assert_eq!(
+        old.quorum.delegation_wait_policy,
+        new.agent.delegation.wait_policy
+    );
+    assert_eq!(
+        old.quorum.delegation_wait_timeout_secs,
+        new.agent.delegation.wait_timeout_secs
+    );
+    assert_eq!(
+        old.quorum.max_parallel_delegations,
+        new.agent.delegation.max_parallel.get()
+    );
+    assert_eq!(old.delegates.len(), new.delegates.len());
+    assert_eq!(old.delegates[0].id, new.delegates[0].id);
+    assert_eq!(old.delegates[0].tools, new.delegates[0].tools);
+    assert_eq!(new.agent.execution.snapshot.backend, "git");
+    assert_eq!(new.delegates[0].execution.snapshot.backend, "git");
+}
+
+/// The delegation example of `configuration.md` ("Delegates and delegation
+/// settings") must load with the documented values.
+#[tokio::test]
+async fn documented_agent_delegation_example_loads() {
+    let docs = include_str!("../../../../docs/docs/agent/configuration.md");
+    let toml = doc_toml_after(docs, "### Delegates and delegation settings");
+    let Config::Single(single) = load_config(ConfigSource::Toml(toml)).await.expect("loads") else {
+        panic!("expected a single agent");
+    };
+    assert_eq!(single.delegates.len(), 1);
+    assert_eq!(single.agent.snapshot_policy.as_deref(), Some("diff"));
+    let settings = &single.agent.delegation;
+    assert_eq!(settings.wait_policy, DelegationWaitPolicy::Any);
+    assert_eq!(
+        (
+            settings.wait_timeout_secs,
+            settings.cancel_grace_secs,
+            settings.max_parallel.get()
+        ),
+        (120, 5, 5)
+    );
+    assert!(settings.summary.is_some());
 }

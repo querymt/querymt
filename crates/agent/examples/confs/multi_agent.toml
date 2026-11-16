@@ -3,11 +3,6 @@
 # This demonstrates configuring a multi-agent system with a planner
 # coordinating specialist agents.
 
-[quorum]
-cwd = "."
-delegation = true
-verification = true
-
 # Global MCP servers (available to all agents)
 [[mcp]]
 name = "github"
@@ -17,7 +12,9 @@ args = ["-y", "@anthropic/mcp-server-github"]
 env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }
 
 # Planner agent configuration
-[planner]
+[agent]
+cwd = "."
+snapshot_policy = "none"
 provider = "openai"
 model = "${PLANNER_MODEL:-gpt-4}"
 # api_key = "${OPENAI_API_KEY}"
@@ -31,7 +28,10 @@ tools = [
     "github.*"  # All tools from github MCP
 ]
 
-system = [{ file = "prompts/planner.md" }]
+system = [{ file = "../prompts/planner.md" }]
+
+[agent.delegation]
+verification = true
 
 # Delegate agents
 [[delegates]]
@@ -51,7 +51,7 @@ tools = [
     "search_text"
 ]
 
-system = [{ file = "prompts/coder.md" }]
+system = [{ file = "../prompts/coder.md" }]
 
 # Inline MCP for this delegate only
 # [[delegates.mcp]]

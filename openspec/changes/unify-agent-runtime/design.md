@@ -145,10 +145,12 @@ All in runtime `delegation/member.rs`.
 ```rust
 #[derive(Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "lowercase")]
-pub enum MemberSpec { Local(DelegateConfig), Remote(RemoteAgentConfig) }
+pub enum MemberSpec { Local(Box<DelegateConfig>), Remote(RemoteAgentConfig) }
 ```
 
-**Lowering.** Two functions produce `MemberBuildSpec` (D0): one from `DelegateConfig` (moved from top `Agent::builder_from_quorum_config`), one from `DotagentsSubAgentPlan` (moved from `DotagentsTargetFactory::create`). Top `DelegateConfigBuilder` produces a `MemberBuildSpec` directly. What protocol targets do not inherit today (middleware, hooks, snapshot backend, workspace service, schedules, knowledge store) stays a difference in the lowered values, not a second code path.
+`Local` is boxed (the delegate configuration is several times larger than the remote one). The type is `Deserialize` only: `DelegateConfig` holds `api_key`, and a `Serialize` impl would let `querymt/agents/list` return keys. `MemberSpec::check_external()` rejects what a client must not ask a runtime to do (see D9).
+
+**Lowering.** Two functions produce `MemberBuildSpec` (D0): `MemberBuildSpec::from_delegate_config(delegate, top_level_mcp, local_tool_names)` (moved from top `Agent::builder_from_quorum_config`; `peer` is read by the caller before lowering) and `MemberBuildSpec::from_protocol_plan` (moved from `DotagentsTargetFactory::create`). Top `DelegateConfigBuilder` produces a `MemberBuildSpec` directly. What protocol targets do not inherit today (middleware, hooks, snapshot backend, workspace service, schedules, knowledge store) stays a difference in the lowered values, not a second code path.
 
 **Build.** One function builds a local member:
 
@@ -251,7 +253,10 @@ The node is resolved when a delegation needs it, not at startup. Deleted (runtim
 
 - **Rust.** Top `Agent::roster() -> &Arc<AgentRoster>` (read), `Agent::add_member(MemberSpec) -> Result<RosterGeneration, RosterError>` and `Agent::remove_member(&str)`. They call `LocalAgentHandle` methods in runtime, which change the roster and broadcast `querymt/agents/changed` through the existing `broadcast_ext_notification`.
 - **ACP.** `querymt/agents/list|add|remove` in runtime `agent/handle/ext.rs` (a new `ext_roster.rs` next to `ext_profiles.rs`), advertised in runtime `control/capabilities.rs`. With `profileId` the handler resolves the profile runtime as `querymt/profile/agents` does (through `ProfileRuntimeHost`), applies the change there, and broadcasts from the handle that serves the connection. Requests accept `profileId` and `profile_id`, as existing extension requests do. Because D0 moved the build path into runtime, the handler builds the member itself.
-- **Runtime-added local members** are lowered by the same function as configured delegates. Tool selectors resolve against the runtime's top-level MCP servers and the entry's own `mcp`. `peer` is rejected (`PeerRoutingUnsupported`): the `RoutingActor` is created only when configured delegates use `peer`.
+- **Runtime-added local members** are lowered by the same function as configured delegates, `MemberBuildSpec::from_delegate_config`. Tool selectors resolve against the runtime's top-level MCP servers and the entry's own `mcp`; the roster keeps the top-level list in memory for this (nothing is stored). `peer` is rejected (`PeerRoutingUnsupported`): the `RoutingActor` is created only when configured delegates use `peer`.
+- **Input from a client is not trusted like a configuration file.** `MemberSpec::check_external()` rejects a system prompt part that names a file (the runtime would read it on the client's behalf, and `SystemPart::resolved()` would otherwise drop it silently); the client sends the text instead. `${VAR}` in `api_key` is not expanded for this input, so a client cannot pair an environment secret with an endpoint it chose. An `isolated` member is rejected when the runtime has no workspace service, as `validate_delegate_isolation` does at load time.
+- **One choke point for change events.** `AgentRoster::update` publishes a `RosterChange { kind, id, name, description, capabilities, origin, location, generation }` on a `tokio::sync::broadcast` channel after the new snapshot is stored, under the writer lock, so subscribers see changes in generation order and a refused change publishes nothing. Every path (Rust API, `agents/add|remove`, profile-targeted requests) goes through `add_change` / `remove_change`. The Rust API exposes it as `Agent::subscribe_subagent_changes()` and `Agent::on_subagents_changed(..)`; a lagging subscriber skips changes and logs, it never delays the change.
+- **After a change.** `LocalAgentHandle::after_roster_change` sends `querymt/agents/changed` (now with `added` or `removed`) and runs the `subagent_added` / `subagent_removed` hooks of the runtime that changed. Hooks are awaited (bounded by the handler timeout) so ordering is deterministic. They observe: a failure, block request or invalid reply is logged, never undoes the change. Their input has no `session_id`; `mcp_tool` handlers are rejected at config load because no MCP tool state exists outside a session.
 - **Removal** drops the roster's reference. A running delegation holds its own `Arc`, so it finishes.
 - **Not persisted.** The roster is rebuilt from configuration on every start.
 - **Subsets later.** A group or per-session subset is a set of `AgentId` applied as a filter to one snapshot. It needs no second registry and no change to the types above.
@@ -260,9 +265,9 @@ Limitation, unchanged from today: a session bound to a member that no longer exi
 
 ### D10. Configuration and deprecation
 
-All in runtime `config/`. `SingleAgentConfig` (`config/single.rs`) gains `delegates: Vec<DelegateConfig>` and `AgentSettings` gains `delegation: DelegationSettings`. `DelegateConfig` moves from `config/quorum.rs` to a new `config/delegates.rs`, with `DelegationSettings`; `config::*` re-exports keep both paths (`config::DelegateConfig`). `Config::{Single, Multi}` stays as the parsed form, because `config_kind` is on the wire in `querymt/profiles`. `QuorumConfig` gets `#[deprecated]`-style documentation and `load_config` (`config/loader.rs`) logs the notice once per load. The `JsonSchema` output of `QuorumConfig` stays identical; that of `SingleAgentConfig` changes only by the two additions.
+All in runtime `config/`. `SingleAgentConfig` (`config/single.rs`) gains `delegates: Vec<DelegateConfig>` and `AgentSettings` gains `delegation: DelegationSettings` and `snapshot_policy: Option<String>` (`"none"`, `"metadata"` or `"diff"`; absent keeps today's `[agent]` default, `diff`; delegates inherit it). `DelegateConfig` moves from `config/quorum.rs` to a new `config/delegates.rs`, with `DelegationSettings`; `config::*` re-exports keep both paths (`config::DelegateConfig`). `Config::{Single, Multi}` stays as the parsed form, because `config_kind` is on the wire in `querymt/profiles`. `QuorumConfig` gets `#[deprecated]`-style documentation and `load_config` (`config/loader.rs`) logs the notice once per load. The `JsonSchema` output of `QuorumConfig` stays identical; that of `SingleAgentConfig` changes only by the three additions (`delegates`, `delegation`, `snapshot_policy`).
 
-Lowering happens at the builder, not between config structs, because `[quorum] snapshot_policy` has no `[agent]` key:
+Lowering happens at the builder, not between config structs, because the quorum keys do not map one to one onto `[agent]` keys:
 
 | `[quorum]` form | `[agent]` form |
 |---|---|
@@ -272,8 +277,8 @@ Lowering happens at the builder, not between config structs, because `[quorum] s
 | `delegation_wait_policy`, `delegation_wait_timeout_secs`, `delegation_cancel_grace_secs`, `max_parallel_delegations`, `verification` | `[agent.delegation]` `wait_policy`, `wait_timeout_secs`, `cancel_grace_secs`, `max_parallel`, `verification` |
 | `[quorum.delegation_summary]` | `[agent.delegation.summary]` |
 | `delegation = false` | leave `delegate` out of `[agent] tools` |
-| `snapshot_policy = "diff"` | `[agent.execution.snapshot] backend = "git"`, and the same on each delegate |
-| `snapshot_policy = "metadata"` | no equivalent; keep `[quorum]` |
+| `snapshot_policy = "diff"` | `[agent.execution.snapshot] backend = "git"` on the agent and on each delegate (undo/redo backend); `[agent] snapshot_policy = "diff"` is the default |
+| `snapshot_policy = "metadata"` or `"none"`/absent | `[agent] snapshot_policy = "metadata"` or `"none"` (absent keeps `diff` for `[agent]`, so a quorum file without the key becomes `"none"`) |
 | `[[delegates]]`, `[[mcp]]`, `[mesh]`, `[[remote_agents]]`, `[dotagents]` | unchanged |
 
 Under `[agent]`, delegates inherit the root's snapshot policy, as quorum delegates inherit the quorum's.

@@ -13,12 +13,10 @@ use querymt::chat::ReasoningEffort;
 
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::acp::protocol::AuthMethod;
-use crate::agent::core::{
-    AgentMode, DelegationContextConfig, SnapshotPolicy, ToolConfig, ToolPolicy,
-};
+use crate::agent::core::{AgentMode, SnapshotPolicy, ToolConfig, ToolPolicy};
 use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{DelegationWaitPolicy, McpServerConfig, RuntimeExecutionPolicy, ToolRef};
-use crate::delegation::AgentRegistry;
+use crate::delegation::roster::AgentRoster;
 use crate::hooks::Hooks;
 use crate::middleware::{CompositeDriver, MiddlewareDriver};
 use crate::session::backend::StorageBackend;
@@ -66,7 +64,9 @@ pub struct AgentConfig {
     pub provider: Arc<SessionProvider>,
     pub storage: Arc<dyn StorageBackend>,
     pub event_sink: Arc<EventSink>,
-    pub agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
+    /// The members this agent can delegate to. `Some` for a runtime's root,
+    /// `None` for a member (members cannot delegate onward).
+    pub roster: Option<Arc<AgentRoster>>,
     pub delegate_model_overrides: crate::delegation::DelegateModelOverrideStore,
     pub workspace_manager_actor: ActorRef<WorkspaceIndexManagerActor>,
     pub session_bridges: Arc<StdMutex<HashMap<String, SessionBridgeRoute>>>,
@@ -108,7 +108,6 @@ pub struct AgentConfig {
     pub compaction: SessionCompaction,
     pub snapshot_backend: Option<Arc<dyn querymt_agent_services::snapshot::SnapshotBackend>>,
     pub snapshot_gc_config: querymt_agent_services::snapshot::GcConfig,
-    pub delegation_context_config: DelegationContextConfig,
     pub pending_elicitations: crate::elicitation::PendingElicitationMap,
 
     // ── Session MCP attachments ───────────────────────────────────
@@ -200,17 +199,19 @@ impl AgentConfig {
 
     /// Builds delegation metadata for ACP `AgentCapabilities._meta` field.
     pub fn build_delegation_meta(&self) -> Option<serde_json::Map<String, serde_json::Value>> {
-        let agents = self.agent_registry.list_agents();
-        if agents.is_empty() {
+        let snapshot = self.roster.as_ref()?.snapshot();
+        if snapshot.is_empty() {
             return None;
         }
+        let agents: Vec<&crate::delegation::AgentInfo> =
+            snapshot.iter().map(|member| member.info()).collect();
 
         let delegation_value = serde_json::json!({
             "version": "1",
             "available": true,
             "agents": agents.iter().map(|agent| {
                 serde_json::json!({
-                    "id": agent.id,
+                    "id": agent.id.as_str(),
                     "name": agent.name,
                     "description": agent.description,
                     "capabilities": agent.capabilities,
@@ -273,9 +274,9 @@ impl AgentConfig {
         self.event_sink.fanout().subscribe()
     }
 
-    /// Access the agent registry.
-    pub fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
-        self.agent_registry.clone()
+    /// The roster of members this agent can delegate to, if it is a root.
+    pub fn roster(&self) -> Option<&Arc<AgentRoster>> {
+        self.roster.as_ref()
     }
 
     /// Shared handle to the tool registry (cheap `Arc` clone).
@@ -542,12 +543,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_registry_returns_instance() {
+    async fn agent_without_roster_has_none() {
         let (config, _td) = make_config().await;
-        let registry = config.agent_registry();
-        let agents = registry.list_agents();
-        // Default empty registry
-        assert!(agents.is_empty());
+        assert!(config.roster().is_none());
     }
 
     #[tokio::test]

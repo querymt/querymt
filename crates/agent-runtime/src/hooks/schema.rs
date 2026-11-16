@@ -33,6 +33,8 @@ pub const DELEGATION_FAILURE_INPUT_FIXTURE: &str = "delegation-failure.command.i
 pub const DELEGATION_FAILURE_OUTPUT_FIXTURE: &str = "delegation-failure.command.output.schema.json";
 pub const SESSION_END_INPUT_FIXTURE: &str = "session-end.command.input.schema.json";
 pub const SESSION_END_OUTPUT_FIXTURE: &str = "session-end.command.output.schema.json";
+pub const SUBAGENT_CHANGE_INPUT_FIXTURE: &str = "subagent-change.command.input.schema.json";
+pub const SUBAGENT_CHANGE_OUTPUT_FIXTURE: &str = "subagent-change.command.output.schema.json";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
@@ -442,6 +444,16 @@ pub struct SessionEndCommandOutputWire {
     pub system_message: Option<String>,
 }
 
+/// Output of `subagent_added` and `subagent_removed`: observe-only, so only
+/// a message is accepted.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "subagent-change.command.output")]
+pub struct SubagentChangeCommandOutputWire {
+    #[serde(default)]
+    pub system_message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(rename = "pre-tool-use.command.input")]
@@ -693,6 +705,30 @@ pub struct PostDelegationCommandInput {
     pub verification_passed: bool,
 }
 
+/// Input of `subagent_added` and `subagent_removed`. A roster change belongs
+/// to the agent, not to a session, so there is no `session_id`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "subagent-change.command.input")]
+pub struct SubagentChangeCommandInput {
+    #[schemars(schema_with = "subagent_change_hook_event_name_schema")]
+    pub hook_event_name: String,
+    pub subagent_id: String,
+    pub name: String,
+    pub description: String,
+    pub capabilities: Vec<String>,
+    #[schemars(schema_with = "subagent_origin_schema")]
+    pub origin: String,
+    #[schemars(schema_with = "subagent_location_schema")]
+    pub location: String,
+    /// Roster generation the change produced.
+    pub generation: u64,
+    /// Profile whose runtime changed; `null` outside profiles.
+    pub profile_id: Option<String>,
+    /// Working directory of the root agent, when it has one.
+    pub cwd: NullableString,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(rename = "session-end.command.input")]
@@ -845,6 +881,14 @@ pub fn write_schema_fixtures(schema_root: &Path) -> anyhow::Result<()> {
         &generated_dir.join(SESSION_END_OUTPUT_FIXTURE),
         schema_json::<SessionEndCommandOutputWire>()?,
     )?;
+    write_schema(
+        &generated_dir.join(SUBAGENT_CHANGE_INPUT_FIXTURE),
+        schema_json::<SubagentChangeCommandInput>()?,
+    )?;
+    write_schema(
+        &generated_dir.join(SUBAGENT_CHANGE_OUTPUT_FIXTURE),
+        schema_json::<SubagentChangeCommandOutputWire>()?,
+    )?;
 
     Ok(())
 }
@@ -951,6 +995,18 @@ fn delegation_failure_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Sche
 
 fn session_end_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
     string_const_schema("session_end")
+}
+
+fn subagent_change_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
+    string_enum_schema(&["subagent_added", "subagent_removed"])
+}
+
+fn subagent_origin_schema(_gen: &mut SchemaGenerator) -> Schema {
+    string_enum_schema(&["config", "protocol", "runtime"])
+}
+
+fn subagent_location_schema(_gen: &mut SchemaGenerator) -> Schema {
+    string_enum_schema(&["local", "remote"])
 }
 
 fn delegation_lifecycle_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {

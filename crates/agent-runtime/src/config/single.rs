@@ -64,6 +64,11 @@ pub struct SingleAgentConfig {
     /// Optional `.agents` Protocol loading settings (disabled by default).
     #[serde(default)]
     pub dotagents: crate::dotagents::DotagentsSettings,
+
+    /// Member agents the root agent can delegate to. Each entry has the keys
+    /// of a `[[delegates]]` entry of a `[quorum]` configuration.
+    #[serde(default)]
+    pub delegates: Vec<DelegateConfig>,
 }
 
 /// A middleware entry in the agent's processing stack.
@@ -203,4 +208,18 @@ pub struct AgentSettings {
     /// Disabled by default; repository content can never enable it.
     #[serde(default)]
     pub repository_knowledge: RepositoryKnowledgeSettings,
+
+    /// Snapshot policy for capturing file state around tool calls, used by the
+    /// root agent and its delegates.
+    /// - `"diff"` (default when absent): capture file diffs.
+    /// - `"metadata"`: capture file metadata only.
+    /// - `"none"`: no snapshots.
+    #[serde(default)]
+    #[schemars(extend("enum" = ["none", "metadata", "diff"]))]
+    pub snapshot_policy: Option<String>,
+
+    /// How the root agent's delegations behave (`[agent.delegation]`): wait
+    /// policy, timeouts, parallelism, verification and the planning summary.
+    #[serde(default)]
+    pub delegation: DelegationSettings,
 }

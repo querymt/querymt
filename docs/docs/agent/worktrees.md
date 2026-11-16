@@ -25,7 +25,7 @@ no worktree, and is unchanged whether or not the service is enabled.
 === "TOML"
 
     ```toml
-    [agent.workspace]            # or [quorum.workspace] for a multi-agent quorum
+    [agent.workspace]
     enabled = true               # default false: no service, behavior unchanged
     # storage_root = "~/.qmt/worktrees"   # default; relative paths resolve
     #                                       # against the config file
@@ -38,7 +38,7 @@ no worktree, and is unchanged whether or not the service is enabled.
     use querymt_agent::api::Agent;
     use querymt_agent::config::WorkspaceSettings;
 
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("anthropic", "claude-sonnet-4-5-20250929")
         .cwd("/path/to/repo")
         .workspace(WorkspaceSettings::enabled())
@@ -46,8 +46,8 @@ no worktree, and is unchanged whether or not the service is enabled.
         .await?;
     ```
 
-    A prebuilt service can be injected instead with `.workspace_service(arc)`
-    (also on `Agent::multi()`); it takes precedence over the settings. Lower
+    A prebuilt service can be injected instead with `.workspace_service(arc)`;
+    it takes precedence over the settings. Lower
     level embedders can still attach one with
     `AgentConfigBuilder::with_workspace_service`.
 

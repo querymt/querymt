@@ -23,7 +23,6 @@ querymt-agent-knowledge = { path = "../agent-knowledge" }
 typeshare.workspace = true
 agent-client-protocol.workspace = true
 async-trait.workspace = true
-http.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 log.workspace = true

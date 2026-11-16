@@ -25,7 +25,7 @@
 //! # use querymt_agent::prelude::*;
 //! # async fn example() -> anyhow::Result<()> {
 //! // Tokens from `qmt auth login anthropic` are automatically used
-//! let agent = Agent::single()
+//! let agent = Agent::builder()
 //!     .provider("anthropic", "claude-sonnet-4-20250514")
 //!     .build()
 //!     .await?;

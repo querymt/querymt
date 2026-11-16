@@ -1,5 +1,5 @@
 use crate::agent::core::{McpToolState, ToolConfig, ToolPolicy};
-use crate::skills::catalog::{ApprovalMode, SkillCatalog};
+use crate::skills::catalog::SkillCatalog;
 use crate::skills::mcp::McpSkill;
 use crate::skills::permissions::PermissionLevel;
 use crate::tools::{QuestionOption, Tool, ToolContext, ToolError};
@@ -271,15 +271,13 @@ impl SkillTool {
         ToolError::InvalidRequest(message)
     }
 
-    /// Apply a permission level: deny, ask the user (or fail at once for a
-    /// non-interactive catalog) or continue.
+    /// Apply a permission level: deny, ask the user or continue.
     async fn authorize(
         &self,
         ctx: &dyn ToolContext,
         id: &str,
         level: PermissionLevel,
         subject: &str,
-        allow_pattern: &str,
     ) -> Result<(), ToolError> {
         match level {
             PermissionLevel::Allow => Ok(()),
@@ -287,12 +285,6 @@ impl SkillTool {
                 "Skill '{id}' is blocked by configuration"
             ))),
             PermissionLevel::Ask => {
-                if self.catalog.approval() == ApprovalMode::NonInteractive {
-                    return Err(ToolError::PermissionDenied(format!(
-                        "Loading {subject} needs approval, and this agent cannot prompt. \
-                         Allow it with {allow_pattern} under [agent.skills.permissions]"
-                    )));
-                }
                 if self.skill_grants.lock().contains(id) {
                     return Ok(());
                 }
@@ -337,8 +329,7 @@ impl SkillTool {
     ) -> Result<(), ToolError> {
         let level = self.catalog.permissions().check_mcp(server, skill_name);
         let subject = format!("skill '{skill_name}' of MCP server '{server}'");
-        let pattern = format!("\"{server}.*\" = \"allow\"");
-        self.authorize(ctx, id, level, &subject, &pattern).await
+        self.authorize(ctx, id, level, &subject).await
     }
 
     /// List `server`'s skills again and apply the result to the session
@@ -605,8 +596,7 @@ impl Tool for SkillTool {
         // Local skill: check permissions for the requested callable ID.
         let level = self.catalog.permissions().check(name);
         let subject = format!("skill '{name}'");
-        let pattern = format!("\"{name}\" = \"allow\"");
-        self.authorize(ctx, name, level, &subject, &pattern).await?;
+        self.authorize(ctx, name, level, &subject).await?;
 
         // Get skill from this workspace's registry; on a miss, refresh once and
         // retry so skills added after the last schema snapshot can still load.
@@ -2387,17 +2377,14 @@ Body
         }
     }
 
-    async fn perm_tool(
-        patterns: &[(&str, PermissionLevel)],
-        approval: ApprovalMode,
-    ) -> (McpHarness, SkillTool) {
+    async fn perm_tool(patterns: &[(&str, PermissionLevel)]) -> (McpHarness, SkillTool) {
         let h = McpHarness::start(HarnessOptions {
             skills: Some(vec![ScriptedSkill::new("a", "A")]),
             ..HarnessOptions::default()
         })
         .await;
         let tool = mcp_tool(
-            catalog_with_perms(patterns).with_approval(approval),
+            catalog_with_perms(patterns),
             h.tool_state.clone(),
             Default::default(),
         );
@@ -2411,7 +2398,7 @@ Body
 
     #[tokio::test]
     async fn unconfigured_mcp_skill_asks_and_names_server_and_skill() {
-        let (h, tool) = perm_tool(&[], ApprovalMode::Interactive).await;
+        let (h, tool) = perm_tool(&[]).await;
         let ctx = RecordingContext::new(Some("call-7"), "Allow");
         let out = call_named_with_context(&tool, "harness.a", &ctx)
             .await
@@ -2444,7 +2431,7 @@ Body
 
     #[tokio::test]
     async fn denied_prompt_blocks_all_server_requests() {
-        let (h, tool) = perm_tool(&[], ApprovalMode::Interactive).await;
+        let (h, tool) = perm_tool(&[]).await;
         let ctx = RecordingContext::new(Some("c"), "Deny");
         let err = call_named_with_context(&tool, "harness.a", &ctx)
             .await
@@ -2455,8 +2442,7 @@ Body
 
     #[tokio::test]
     async fn catch_all_allow_does_not_admit_server_skills() {
-        let (h, tool) =
-            perm_tool(&[("*", PermissionLevel::Allow)], ApprovalMode::Interactive).await;
+        let (h, tool) = perm_tool(&[("*", PermissionLevel::Allow)]).await;
         let ctx = RecordingContext::new(Some("c"), "Deny");
         let err = call_named_with_context(&tool, "harness.a", &ctx)
             .await
@@ -2472,7 +2458,7 @@ Body
             vec![("*", PermissionLevel::Deny)],
             vec![("harness.*", PermissionLevel::Deny)],
         ] {
-            let (h, tool) = perm_tool(&patterns, ApprovalMode::Interactive).await;
+            let (h, tool) = perm_tool(&patterns).await;
             let ctx = RecordingContext::new(Some("c"), "Allow");
             let err = call_named_with_context(&tool, "harness.a", &ctx)
                 .await
@@ -2485,13 +2471,10 @@ Body
 
     #[tokio::test]
     async fn server_wildcard_allow_loads_without_prompt() {
-        let (_h, tool) = perm_tool(
-            &[
-                ("*", PermissionLevel::Deny),
-                ("harness.*", PermissionLevel::Allow),
-            ],
-            ApprovalMode::Interactive,
-        )
+        let (_h, tool) = perm_tool(&[
+            ("*", PermissionLevel::Deny),
+            ("harness.*", PermissionLevel::Allow),
+        ])
         .await;
         let ctx = RecordingContext::new(Some("c"), "Deny");
         assert!(
@@ -2504,11 +2487,7 @@ Body
 
     #[tokio::test]
     async fn permission_applies_before_refresh_on_miss() {
-        let (h, tool) = perm_tool(
-            &[("harness.*", PermissionLevel::Deny)],
-            ApprovalMode::Interactive,
-        )
-        .await;
+        let (h, tool) = perm_tool(&[("harness.*", PermissionLevel::Deny)]).await;
         let lists = h
             .log
             .skills_list_calls
@@ -2524,7 +2503,7 @@ Body
 
     #[tokio::test]
     async fn concurrent_loads_get_distinct_elicitation_ids() {
-        let (_h, tool) = perm_tool(&[], ApprovalMode::Interactive).await;
+        let (_h, tool) = perm_tool(&[]).await;
         let one = RecordingContext::new(Some("call-1"), "Allow");
         let two = RecordingContext::new(Some("call-2"), "Allow");
         let (a, b) = tokio::join!(
@@ -2552,23 +2531,6 @@ Body
         assert_ne!(idx, idy);
     }
 
-    #[tokio::test]
-    async fn non_interactive_catalog_fails_at_once_naming_the_pattern() {
-        let (h, tool) = perm_tool(&[], ApprovalMode::NonInteractive).await;
-        let ctx = RecordingContext::new(Some("c"), "Allow");
-        let err = call_named_with_context(&tool, "harness.a", &ctx)
-            .await
-            .unwrap_err();
-        match err {
-            ToolError::PermissionDenied(m) => {
-                assert!(m.contains("\"harness.*\" = \"allow\""), "{m}");
-            }
-            other => panic!("{other:?}"),
-        }
-        assert!(ctx.asked.lock().unwrap().is_empty());
-        untouched(&h);
-    }
-
     // ── Session grants (refine-mcp-skill-approval 1.2) ───────────────────
 
     fn ask_local_tool(dir: &TempDir, patterns: &[(&str, PermissionLevel)]) -> SkillTool {
@@ -2590,7 +2552,7 @@ Body
 
     #[tokio::test]
     async fn session_allow_skips_later_prompts_for_the_same_skill() {
-        let (_h, tool) = perm_tool(&[], ApprovalMode::Interactive).await;
+        let (_h, tool) = perm_tool(&[]).await;
         let ctx = RecordingContext::new(Some("c"), "Allow for this session");
         call_named_with_context(&tool, "harness.a", &ctx)
             .await
@@ -2613,7 +2575,7 @@ Body
         })
         .await;
         let tool = mcp_tool(
-            catalog_with_perms(&[]).with_approval(ApprovalMode::Interactive),
+            catalog_with_perms(&[]),
             h.tool_state.clone(),
             Default::default(),
         );
@@ -2642,7 +2604,7 @@ Body
         })
         .await;
         let tool = mcp_tool(
-            catalog_with_perms(&[]).with_approval(ApprovalMode::Interactive),
+            catalog_with_perms(&[]),
             h.tool_state.clone(),
             Default::default(),
         );
@@ -2660,7 +2622,7 @@ Body
 
     #[tokio::test]
     async fn allow_once_is_not_remembered() {
-        let (_h, tool) = perm_tool(&[], ApprovalMode::Interactive).await;
+        let (_h, tool) = perm_tool(&[]).await;
         let ctx = RecordingContext::new(Some("c"), "Allow");
         for _ in 0..2 {
             call_named_with_context(&tool, "harness.a", &ctx)
@@ -2673,7 +2635,7 @@ Body
 
     #[tokio::test]
     async fn skill_denial_is_not_remembered() {
-        let (_h, tool) = perm_tool(&[], ApprovalMode::Interactive).await;
+        let (_h, tool) = perm_tool(&[]).await;
         let ctx = RecordingContext::new(Some("c"), "Deny");
         for _ in 0..2 {
             let err = call_named_with_context(&tool, "harness.a", &ctx)
@@ -2702,7 +2664,7 @@ Body
 
     #[tokio::test]
     async fn configured_deny_overrides_a_session_allow() {
-        let (h, tool) = perm_tool(&[], ApprovalMode::Interactive).await;
+        let (h, tool) = perm_tool(&[]).await;
         let ctx = RecordingContext::new(Some("c"), "Allow for this session");
         call_named_with_context(&tool, "harness.a", &ctx)
             .await
@@ -2721,46 +2683,6 @@ Body
             .unwrap_err();
         assert!(matches!(err, ToolError::PermissionDenied(m) if m.contains("blocked")));
         assert_eq!(ctx.asked.lock().unwrap().len(), before, "not asked");
-    }
-
-    #[tokio::test]
-    async fn non_interactive_catalog_ignores_a_non_empty_grant_set() {
-        let (h, tool) = perm_tool(&[], ApprovalMode::NonInteractive).await;
-        tool.skill_grants.lock().insert("harness.a".to_string());
-        let ctx = RecordingContext::new(Some("c"), "Allow");
-        let err = call_named_with_context(&tool, "harness.a", &ctx)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, ToolError::PermissionDenied(m) if m.contains("\"harness.*\" = \"allow\""))
-        );
-        assert!(ctx.asked.lock().unwrap().is_empty());
-        untouched(&h);
-    }
-
-    #[tokio::test]
-    async fn non_interactive_catalog_also_fails_local_ask() {
-        let dir = TempDir::new().unwrap();
-        write_skill(dir.path(), "loc", "Local");
-        let mut perms = SkillPermissions::default();
-        perms.patterns.insert("loc".into(), PermissionLevel::Ask);
-        let tool = bind_tool(
-            SkillCatalog::from_parts(
-                Arc::new(Mutex::new(SkillRegistry::new())),
-                Arc::new(perms),
-                vec![SkillSource::Project(dir.path().to_path_buf())],
-                true,
-                PathBuf::from("."),
-            )
-            .with_approval(ApprovalMode::NonInteractive),
-            PathBuf::from("."),
-        );
-        let ctx = RecordingContext::new(Some("c"), "Allow");
-        let err = call_named_with_context(&tool, "loc", &ctx)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::PermissionDenied(m) if m.contains("\"loc\" = \"allow\"")));
-        assert!(ctx.asked.lock().unwrap().is_empty());
     }
 
     // ── Supporting files (task 4.4) ───────────────────────────────────────
@@ -2954,16 +2876,12 @@ Body
 
     #[tokio::test]
     async fn denied_skill_file_is_rejected_without_a_request() {
-        let (h, tool) = perm_tool(
-            &[("harness.*", PermissionLevel::Deny)],
-            ApprovalMode::Interactive,
-        )
-        .await;
+        let (h, tool) = perm_tool(&[("harness.*", PermissionLevel::Deny)]).await;
         let err = call_file(&tool, "harness.a", "x.md").await.unwrap_err();
         assert!(matches!(err, ToolError::PermissionDenied(_)));
         untouched(&h);
 
-        let (h, tool) = perm_tool(&[], ApprovalMode::Interactive).await;
+        let (h, tool) = perm_tool(&[]).await;
         let ctx = RecordingContext::new(Some("c"), "Deny");
         let err = tool
             .call(json!({"name": "harness.a", "file": "x.md"}), &ctx)
@@ -2993,7 +2911,7 @@ Body
 
     #[tokio::test]
     async fn traversal_path_fails_without_an_approval_request() {
-        let (h, tool) = perm_tool(&[], ApprovalMode::Interactive).await;
+        let (h, tool) = perm_tool(&[]).await;
         let ctx = RecordingContext::new(Some("c"), "Allow");
         let err = call_with_file(&tool, &ctx, "harness.a", "../secrets.env")
             .await
@@ -3005,11 +2923,7 @@ Body
 
     #[tokio::test]
     async fn denied_skill_with_an_invalid_path_reports_the_denial() {
-        let (h, tool) = perm_tool(
-            &[("harness.*", PermissionLevel::Deny)],
-            ApprovalMode::Interactive,
-        )
-        .await;
+        let (h, tool) = perm_tool(&[("harness.*", PermissionLevel::Deny)]).await;
         let ctx = RecordingContext::new(Some("c"), "Allow");
         let err = call_with_file(&tool, &ctx, "harness.a", "../secrets.env")
             .await
@@ -3027,7 +2941,7 @@ Body
         })
         .await;
         let tool = mcp_tool(
-            catalog_with_perms(&[]).with_approval(ApprovalMode::Interactive),
+            catalog_with_perms(&[]),
             h.tool_state.clone(),
             Default::default(),
         );

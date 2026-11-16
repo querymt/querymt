@@ -46,17 +46,14 @@ pub mod utils;
 
 // Re-export main types for convenience
 pub use agent_config_builder::AgentConfigBuilder;
-pub use core::{
-    ClientState, DelegationContextConfig, DelegationContextTiming, SessionRuntime, SnapshotPolicy,
-    ToolConfig, ToolPolicy,
-};
+pub use core::{ClientState, SessionRuntime, SnapshotPolicy, ToolConfig, ToolPolicy};
 pub use execution::CycleOutcome;
 pub use snapshots::SnapshotState;
 pub use turn_control::{InputDelivery, SubmitInput, SubmitInputResult, TurnControlError};
 
 // Re-export kameo actor types
 pub use agent_config::AgentConfig;
-pub use handle::{AgentHandle, LocalAgentHandle};
+pub use handle::LocalAgentHandle;
 pub use remote::SessionActorRef;
 pub use session_actor::SessionActor;
 pub use session_control::{

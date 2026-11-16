@@ -1,13 +1,14 @@
 #![cfg(all(test, feature = "remote"))]
 
 use super::remote_setup::{
-    register_remote_agents_from_config, spawn_and_register_local_mesh_actors_with_name,
+    remote_members_from_config, spawn_and_register_local_mesh_actors_with_name,
 };
 use crate::agent::LocalAgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::remote::test_helpers::fixtures::{NodeManagerFixture, get_test_mesh};
 use crate::agent::remote::{MeshRuntimeHandle, MeshScopeId, NodeId};
 use crate::config::{MeshPeerConfig, RemoteAgentConfig};
+use crate::delegation::roster::MemberAgent;
 use crate::test_utils::{SharedLlmProvider, TestProviderFactory, mock_plugin_registry};
 use querymt::LLMParams;
 use std::sync::Arc;
@@ -63,7 +64,9 @@ async fn mesh_publication_triggers_local_only_model_refresh() {
 #[tokio::test]
 async fn configured_peer_address_routes_to_owner_and_creates_delegation_session() {
     let mesh = get_test_mesh().await;
-    let owner_peer_id = random_peer_id();
+    // The in-process owner is hosted by the test mesh, so its node id is the
+    // mesh's own peer id (attaching checks the actor's peer against it).
+    let owner_peer_id = *mesh.peer_id();
     let decoy_peer_id = random_peer_id();
     let owner_node_id = NodeId::from_peer_id(owner_peer_id).to_string();
     let decoy_node_id = NodeId::from_peer_id(decoy_peer_id).to_string();
@@ -105,35 +108,30 @@ async fn configured_peer_address_routes_to_owner_and_creates_delegation_session(
         },
     ];
 
-    let registry = register_remote_agents_from_config(mesh, &remotes, &peers)
-        .await
-        .expect("register configured remote agents");
-    let owner_info = registry.get_agent("owner-agent").expect("owner metadata");
+    // Listing contacts no peer: nothing is published yet.
+    let registry = remote_members_from_config(&remotes, &peers).expect("list remote members");
+    assert_eq!(registry.len(), 3);
+    let node_of = |id: &str| match member_agent(&registry, id) {
+        MemberAgent::Remote(member) => member.node_id().map(str::to_owned),
+        _ => panic!("remote member"),
+    };
     assert_eq!(
-        owner_info.meta.as_ref().expect("owner metadata fields")["node_id"],
-        serde_json::json!(owner_node_id),
+        node_of("owner-agent"),
+        Some(owner_node_id.clone()),
         "the full configured Multiaddr's terminal /p2p id identifies the owner"
     );
-    let decoy_info = registry.get_agent("decoy-agent").expect("decoy metadata");
     assert_eq!(
-        decoy_info.meta.as_ref().expect("decoy metadata fields")["node_id"],
-        serde_json::json!(decoy_node_id),
+        node_of("decoy-agent"),
+        Some(decoy_node_id.clone()),
         "the remote agent name must select its own configured peer address"
     );
-    let unresolved_info = registry
-        .get_agent("unresolved-agent")
-        .expect("unresolved metadata");
-    assert!(
-        unresolved_info
-            .meta
-            .as_ref()
-            .expect("unresolved metadata fields")["node_id"]
-            .is_null(),
+    assert_eq!(
+        node_of("unresolved-agent"),
+        None,
         "an address without terminal /p2p must not invent an owner id"
     );
 
-    // Publish after registration to exercise speculative startup: the fallback
-    // owner id must survive until its exact peer-scoped node manager appears.
+    // Publish after listing: the delegation resolves the node when it runs.
     let owner = NodeManagerFixture::new_with_mesh().await;
     let decoy = NodeManagerFixture::new_with_mesh().await;
     let wrong_scope = NodeManagerFixture::new_with_mesh().await;
@@ -165,51 +163,38 @@ async fn configured_peer_address_routes_to_owner_and_creates_delegation_session(
         )
         .await;
 
-    let remote_handle = registry
-        .get_handle("owner-agent")
-        .expect("registered owner handle");
-    let (session_id, _session_ref) = remote_handle
-        .create_delegation_session(None, "parent-session".into())
+    let root = root_handle(mesh).await;
+    let (session_id, _session_ref) = member_agent(&registry, "owner-agent")
+        .create_delegation_session(&root, None, "parent-session".into())
         .await
         .expect("delegation session should be created on configured owner");
 
-    let owner_sessions = owner
-        .actor_ref
-        .ask(crate::agent::remote::ListRemoteSessions {
-            offset: None,
-            limit: None,
-        })
-        .await
-        .expect("list owner sessions");
+    let sessions_of = |fixture: &NodeManagerFixture| {
+        let actor = fixture.actor_ref.clone();
+        async move {
+            actor
+                .ask(crate::agent::remote::ListRemoteSessions {
+                    offset: None,
+                    limit: None,
+                })
+                .await
+                .expect("list sessions")
+        }
+    };
     assert!(
-        owner_sessions
+        sessions_of(&owner)
+            .await
             .sessions
             .iter()
             .any(|session| session.session_id == session_id),
         "the exact configured owner should create the delegation session"
     );
-    let decoy_sessions = decoy
-        .actor_ref
-        .ask(crate::agent::remote::ListRemoteSessions {
-            offset: None,
-            limit: None,
-        })
-        .await
-        .expect("list decoy sessions");
     assert!(
-        decoy_sessions.sessions.is_empty(),
+        sessions_of(&decoy).await.sessions.is_empty(),
         "decoy peer was not selected"
     );
-    let wrong_scope_sessions = wrong_scope
-        .actor_ref
-        .ask(crate::agent::remote::ListRemoteSessions {
-            offset: None,
-            limit: None,
-        })
-        .await
-        .expect("list unrelated-scope sessions");
     assert!(
-        wrong_scope_sessions.sessions.is_empty(),
+        sessions_of(&wrong_scope).await.sessions.is_empty(),
         "owner lookup must remain within the mesh's active scope"
     );
 }
@@ -250,15 +235,54 @@ async fn peer_node_resolver_precedes_configured_address_fallback() {
         capabilities: vec![],
     }];
 
-    let registry = register_remote_agents_from_config(&mesh, &remotes, &peers)
+    let registry = remote_members_from_config(&remotes, &peers).expect("list remote member");
+    let root = root_handle(&mesh).await;
+    let (session_id, _) = member_agent(&registry, "resolved-agent")
+        .create_delegation_session(&root, None, "parent-session".into())
         .await
-        .expect("register remote agent");
-    let info = registry
-        .get_agent("resolved-agent")
-        .expect("resolved agent metadata");
-    assert_eq!(
-        info.meta.as_ref().expect("agent metadata fields")["node_id"],
-        serde_json::json!(resolved_node_id.to_string()),
+        .expect("the mesh resolver wins over the configured address");
+    assert!(
+        owner
+            .actor_ref
+            .ask(crate::agent::remote::ListRemoteSessions {
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap()
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id),
         "configured address fallback must not override a successful resolver"
     );
+}
+
+/// A root runtime on `mesh` that delegations are opened from.
+async fn root_handle(mesh: &crate::agent::remote::MeshHandle) -> Arc<LocalAgentHandle> {
+    let (plugins, _dir) = crate::test_utils::helpers::empty_plugin_registry().unwrap();
+    std::mem::forget(_dir);
+    let storage = Arc::new(
+        crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+            .await
+            .unwrap(),
+    );
+    let config = Arc::new(
+        AgentConfigBuilder::new(
+            Arc::new(plugins),
+            storage,
+            LLMParams::new().provider("mock").model("mock-model"),
+        )
+        .build(),
+    );
+    let handle = Arc::new(LocalAgentHandle::from_config(config));
+    handle.set_mesh(mesh.clone());
+    handle
+}
+
+fn member_agent(members: &[crate::delegation::roster::Member], id: &str) -> MemberAgent {
+    members
+        .iter()
+        .find(|member| member.id().as_str() == id)
+        .and_then(|member| member.agent().cloned())
+        .unwrap_or_else(|| panic!("member `{id}` is listed"))
 }

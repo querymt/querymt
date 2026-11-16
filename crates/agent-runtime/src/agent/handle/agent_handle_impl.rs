@@ -1,34 +1,11 @@
 use super::*;
 
 // ══════════════════════════════════════════════════════════════════════════
-//  AgentHandle trait implementation for LocalAgentHandle
+//  Delegation session creation for LocalAgentHandle
 // ══════════════════════════════════════════════════════════════════════════
 
-#[async_trait]
-impl AgentHandle for LocalAgentHandle {
-    async fn new_session(
-        &self,
-        req: NewSessionRequest,
-    ) -> std::result::Result<NewSessionResponse, Error> {
-        SendAgent::new_session(self, req).await
-    }
-
-    async fn prompt(&self, req: PromptRequest) -> std::result::Result<PromptResponse, Error> {
-        SendAgent::prompt(self, req).await
-    }
-
-    async fn cancel(&self, notif: CancelNotification) -> std::result::Result<(), Error> {
-        SendAgent::cancel(self, notif).await
-    }
-
-    async fn load_session(
-        &self,
-        req: LoadSessionRequest,
-    ) -> std::result::Result<LoadSessionResponse, Error> {
-        SendAgent::load_session(self, req).await
-    }
-
-    async fn create_delegation_session(
+impl LocalAgentHandle {
+    pub async fn create_delegation_session(
         &self,
         cwd: Option<String>,
         parent_session_id: String,
@@ -52,7 +29,7 @@ impl AgentHandle for LocalAgentHandle {
         Ok((session_id, session_ref))
     }
 
-    async fn set_session_lifecycle(
+    pub async fn set_session_lifecycle(
         &self,
         session_id: &str,
         patch: crate::session::lifecycle::SessionLifecyclePatch,
@@ -61,7 +38,7 @@ impl AgentHandle for LocalAgentHandle {
             .await
     }
 
-    fn supports_local_workspaces(&self) -> bool {
+    pub fn supports_local_workspaces(&self) -> bool {
         // Ready only when this target can actually bind and run a managed
         // workspace. A target without its own workspace service would
         // reject the preallocated checkout after the parent had already
@@ -69,7 +46,7 @@ impl AgentHandle for LocalAgentHandle {
         self.config.workspace_service().is_some()
     }
 
-    async fn create_isolated_delegation_session(
+    pub async fn create_isolated_delegation_session(
         &self,
         workspace: crate::worktree::WorkspaceBinding,
         parent_session_id: String,
@@ -93,32 +70,8 @@ impl AgentHandle for LocalAgentHandle {
         Ok((prepared.session_id, session_ref))
     }
 
-    fn subscribe_events(&self) -> broadcast::Receiver<EventEnvelope> {
-        self.config.event_sink.fanout().subscribe()
-    }
-
-    fn event_fanout(&self) -> &Arc<EventFanout> {
+    /// The runtime's event stream.
+    pub fn event_fanout(&self) -> &Arc<EventFanout> {
         self.config.event_sink.fanout()
-    }
-
-    fn emit_event(&self, session_id: &str, kind: AgentEventKind) {
-        self.config.emit_event(session_id, kind);
-    }
-
-    fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
-        self.config.agent_registry.clone()
-    }
-
-    async fn shutdown(&self) {
-        self.shutdown().await;
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    #[cfg(feature = "remote")]
-    fn set_mesh_handle(&self, mesh: crate::agent::remote::MeshHandle) {
-        self.set_mesh(mesh);
     }
 }

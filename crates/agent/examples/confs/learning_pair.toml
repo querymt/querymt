@@ -26,18 +26,9 @@
 #   #   Max steps: 15
 #   #   Max runs: 24 (one day of consolidation cycles)
 
-[quorum]
+# Agent — the knowledge-bearing orchestrator
+[agent]
 cwd = "."
-delegation = true
-verification = false
-snapshot_policy = "diff"
-delegation_wait_policy = "all"
-delegation_wait_timeout_secs = 300
-delegation_cancel_grace_secs = 5
-max_parallel_delegations = 1
-
-# Planner — the knowledge-bearing orchestrator
-[planner]
 mode = "plan"
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
@@ -66,14 +57,25 @@ system = [
   { file = "../prompts/code_meta.jinja2" }
 ]
 
-# Planner middleware
-[[planner.middleware]]
+[agent.delegation]
+wait_policy = "all"
+wait_timeout_secs = 300
+cancel_grace_secs = 5
+max_parallel = 1
+verification = false
+
+# Undo/redo through git, as `snapshot_policy = "diff"` did.
+[agent.execution.snapshot]
+backend = "git"
+
+# Agent middleware
+[[middleware]]
 type = "context"
 warn_at_percent = 80
 compact_at_percent = 90
 fallback_max_tokens = 128000
 
-[[planner.middleware]]
+[[middleware]]
 type = "agent_mode"
 reminder = """<system-reminder>
 # Plan Mode — Knowledge-Driven Orchestrator
@@ -94,7 +96,7 @@ Do NOT implement code yourself — that is the coder's job.
 </system-reminder>"""
 
 # Delegation summary model (cheap model for summarizing delegation results)
-[quorum.delegation_summary]
+[agent.delegation.summary]
 provider = "anthropic"
 model = "claude-haiku-4-5-20251001"
 
@@ -132,3 +134,6 @@ fallback_max_tokens = 128000
 type = "dedup_check"
 threshold = 0.85
 min_lines = 10
+
+[delegates.execution.snapshot]
+backend = "git"

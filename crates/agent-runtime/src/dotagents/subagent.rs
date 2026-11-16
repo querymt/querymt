@@ -182,7 +182,7 @@ pub fn plan_agent(
 
     let info = AgentInfo {
         isolation: Default::default(),
-        id: agent.id.clone(),
+        id: agent_id(agent),
         name: agent.name.clone(),
         description: agent.description.clone(),
         capabilities: agent.capabilities.clone(),
@@ -205,6 +205,12 @@ pub fn plan_agent(
     };
     plan.diagnostics.sort_by(|a, b| a.message.cmp(&b.message));
     Ok(Some(plan))
+}
+
+/// The roster ID of a profile. The parser rejects empty IDs, so this holds.
+fn agent_id(agent: &DotagentsAgent) -> crate::delegation::roster::AgentId {
+    crate::delegation::roster::AgentId::try_from(agent.id.as_str())
+        .expect("the parser rejects empty agent IDs")
 }
 
 /// Build an inactive plan for an unsupported connection type.
@@ -233,7 +239,7 @@ fn unsupported_connection_plan(agent: &DotagentsAgent, declared: &str) -> Dotage
         id: agent.id.clone(),
         info: AgentInfo {
             isolation: Default::default(),
-            id: agent.id.clone(),
+            id: agent_id(agent),
             name: agent.name.clone(),
             description: agent.description.clone(),
             capabilities: agent.capabilities.clone(),

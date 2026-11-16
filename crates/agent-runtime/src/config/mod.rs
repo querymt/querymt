@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+mod delegates;
 mod extensions;
 mod hooks;
 mod loader;
@@ -28,6 +29,7 @@ pub use crate::knowledge::repository::settings::{
     RepositoryKnowledgeDeliverySettings, RepositoryKnowledgeSettings,
 };
 pub use crate::worktree::storage_root::resolved_storage_root;
+pub use delegates::*;
 pub use extensions::*;
 pub use hooks::*;
 pub use loader::{ConfigSource, interpolate_env_vars, load_config};
@@ -57,7 +59,7 @@ impl Config {
     /// A server shared by several delegates is yielded once per declaration.
     pub fn mcp_servers(&self) -> impl Iterator<Item = &McpServerConfig> {
         let (top, delegates): (&[McpServerConfig], &[DelegateConfig]) = match self {
-            Self::Single(config) => (&config.mcp, &[]),
+            Self::Single(config) => (&config.mcp, &config.delegates),
             Self::Multi(config) => (&config.mcp, &config.delegates),
         };
         top.iter()

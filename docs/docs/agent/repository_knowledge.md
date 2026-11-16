@@ -22,7 +22,7 @@ enabled = true
 # allow_ignored = false        # include Git-ignored files matched by the manifest
 ```
 
-The same table exists under `[quorum.repository_knowledge]`. When tool allowlists are used, add the tools you want: `repo_knowledge_query`, `repo_knowledge_get`, `repo_knowledge_list`, `repo_knowledge_stats`. An allowlist is never widened for you.
+When tool allowlists are used, add the tools you want: `repo_knowledge_query`, `repo_knowledge_get`, `repo_knowledge_list`, `repo_knowledge_stats`. An allowlist is never widened for you.
 
 ## Selecting documents: `.qmt/knowledge.toml`
 

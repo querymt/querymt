@@ -184,7 +184,6 @@ where
 pub struct ProfileRuntimeView {
     pub metadata: ProfileMetadata,
     pub handle: Arc<LocalAgentHandle>,
-    pub delegates: Vec<(String, Arc<dyn crate::agent::handle::AgentHandle>)>,
     pub provider_lock: Option<ResolvedProfileProviderLock>,
 }
 
@@ -197,12 +196,10 @@ impl ProfileRuntimeView {
         self.handle.clone()
     }
 
-    /// Delegate handle by id (`None` for single agents or unknown ids).
-    pub fn delegate(&self, id: &str) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
-        self.delegates
-            .iter()
-            .find(|(delegate_id, _)| delegate_id == id)
-            .map(|(_, handle)| handle.clone())
+    /// Local member by id, built on first use (`None` for unknown ids, remote
+    /// members and members that cannot be built).
+    pub fn delegate(&self, id: &str) -> Option<Arc<LocalAgentHandle>> {
+        self.handle.config.roster()?.local_member(id)
     }
 
     pub fn session_binding(&self) -> SessionProfileBinding {
@@ -214,10 +211,7 @@ impl ProfileRuntimeView {
         binding
     }
 
-    pub fn session_handle(
-        &self,
-        agent_id: Option<&str>,
-    ) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
+    pub fn session_handle(&self, agent_id: Option<&str>) -> Option<Arc<LocalAgentHandle>> {
         match agent_id {
             Some(agent_id) => self.delegate(agent_id),
             None => Some(self.handle.clone()),

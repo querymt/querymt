@@ -1,6 +1,6 @@
 //! Unified chat runner interface for agents
 //!
-//! Provides a common trait for both single agents and multi-agent quorums.
+//! Provides a common trait for agents, with or without subagents.
 
 use crate::api::{Agent, AgentInfra, AgentProfiles, ProfileRuntimeHandle};
 use crate::config::{Config, ConfigSource, load_config};
@@ -74,9 +74,8 @@ impl<T: ChatRunner + ?Sized> ChatRunnerExt for T {}
 
 pub use crate::chat_session::{ChatSession, ChatSessionExt};
 
-/// Unified runner for both single agents and multi-agent quorums.
+/// Unified runner for agents, with or without subagents.
 ///
-/// Since `Agent` now handles both single and multi-agent configurations,
 /// `AgentRunner` is a thin wrapper around `Agent` for backward compatibility.
 ///
 /// # Examples
@@ -195,9 +194,14 @@ impl AgentRunner {
         self.0
     }
 
-    /// Returns true if this is a multi-agent (quorum) runner.
+    /// Returns true if the agent has subagents it can delegate to.
+    pub fn has_subagents(&self) -> bool {
+        self.0.has_subagents()
+    }
+
+    #[deprecated(note = "use `has_subagents()`")]
     pub fn is_multi(&self) -> bool {
-        self.0.is_multi()
+        self.has_subagents()
     }
 }
 
@@ -208,9 +212,9 @@ impl From<AgentRunner> for Box<dyn ChatRunner> {
     }
 }
 
-/// Load an agent or quorum from configuration source.
+/// Load an agent from a configuration source.
 ///
-/// Automatically detects whether the config is for a single agent or multi-agent quorum.
+/// Accepts `[agent]` (with optional `[[delegates]]`) and the deprecated `[quorum]` shape.
 /// Returns an `AgentRunner` which provides access to all agent functionality including
 /// the `.acp()` method for starting ACP servers.
 ///
@@ -237,8 +241,8 @@ impl From<AgentRunner> for Box<dyn ChatRunner> {
 /// `from_config` will automatically:
 /// 1. Bootstrap the kameo libp2p swarm.
 /// 2. Register this node as a `RemoteNodeManager` in the DHT.
-/// 3. Pre-populate the agent registry with `AgentInfo` for each `[[remote_agents]]` entry,
-///    backed by a `RemoteAgentHandle` that routes delegation calls via the mesh.
+/// 3. List each `[[remote_agents]]` entry as a roster member. The peer is resolved when a
+///    delegation needs it, not at startup.
 ///
 /// # Example
 ///
@@ -293,22 +297,9 @@ async fn build_runner_from_config(
     config: Config,
     infra: Option<AgentInfra>,
 ) -> Result<AgentRunner> {
-    match config {
-        Config::Single(single_config) => {
-            let single_config = *single_config;
-            let agent = match infra {
-                Some(infra) => Agent::from_single_config_with_infra(single_config, infra).await?,
-                None => Agent::from_single_config(single_config).await?,
-            };
-            Ok(AgentRunner::new(agent))
-        }
-        Config::Multi(quorum_config) => {
-            let quorum_config = *quorum_config;
-            let agent = match infra {
-                Some(infra) => Agent::from_quorum_config_with_infra(quorum_config, infra).await?,
-                None => Agent::from_quorum_config(quorum_config).await?,
-            };
-            Ok(AgentRunner::new(agent))
-        }
+    let mut builder = Agent::builder_from_config_value(config, None)?;
+    if let Some(infra) = infra {
+        builder = builder.infra(infra);
     }
+    Ok(AgentRunner::new(builder.build().await?))
 }

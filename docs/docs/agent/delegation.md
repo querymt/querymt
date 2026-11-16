@@ -1,6 +1,8 @@
 # QueryMT Agent - Delegation System
 
-The delegation system enables multi-agent workflows where a planner agent can delegate tasks to specialized delegate agents. This allows for division of labor and specialized expertise.
+The delegation system enables multi-agent workflows where a root agent can delegate tasks to specialized member agents. This allows for division of labor and specialized expertise.
+
+Every runtime has one **root agent** and a **roster** of members it can delegate to. A plain agent is a runtime with an empty roster. The delegation service runs in every runtime whose root may call the `delegate` tool, whichever way the runtime was configured (`[agent]` with `[[delegates]]`, the deprecated `[quorum]`, or the Rust builder).
 
 ## Overview
 
@@ -15,24 +17,43 @@ Delegation allows agents to:
 
 ```mermaid
 flowchart TD
-    P["Planner Agent<br/>(Analyzes task, decides which delegate to use)"]
-    O["Delegation Orchestrator<br/>(Manages delegation lifecycle)"]
-    D1["Delegate 1<br/>(Coder)"]
-    D2["Delegate 2<br/>(Tester)"]
+    R["Root agent<br/>(Analyzes task, decides which member to use)"]
+    S["Delegation service<br/>(Manages delegation lifecycle, owned by the root)"]
+    RO["Roster<br/>(Members, listed in the delegate tool)"]
+    D1["Member 1<br/>(Coder)"]
+    D2["Member 2<br/>(Tester)"]
 
-    P -->|"Delegation Request"| O
-    O --> D1 & D2
+    R -->|"Delegation Request"| S
+    S --> RO
+    RO --> D1 & D2
 ```
+
+All members are built on the runtime's event stream, so a member's activity reaches the client that owns the parent session.
+
+### Where the agent list appears
+
+The list of agents the root can delegate to lives in the `delegate` tool, not in a middleware or in the conversation. The tool holds the roster and renders it in its definition on every turn:
+
+- each member's ID, name, description, capabilities and default isolation, in ID order;
+- `target_agent_id` as an `enum` of the member IDs when the roster is not empty.
+
+The tool validates `target_agent_id` against the same roster when it is called. The order is stable, so the definition (and the provider's prompt cache) changes only when the roster changes.
+
+Only a root with delegation enabled is offered `delegate`. Member agents are not: a member's tool list never contains `delegate`, so members cannot delegate further. A root whose `tools` selection excludes `delegate` has no delegation service and no `delegate` tool.
 
 ## Configuration
 
 ### Enabling Delegation
 
-Delegation is enabled in the quorum configuration:
+Delegation is on whenever the root agent's `tools` select `delegate` (or are empty). Its settings are under `[agent.delegation]`:
 
 ```toml
-[quorum]
-delegation = true
+[agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+tools = ["delegate", "read_tool", "shell"]
+
+[agent.delegation]
 verification = false  # Optional: enable verification
 ```
 
@@ -54,10 +75,10 @@ efficiently and correctly. Focus on writing clean, maintainable code."""
 max_steps = 200
 ```
 
-### Planner Configuration
+### Root Agent Configuration
 
 ```toml
-[planner]
+[agent]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
 tools = ["delegate", "read_tool", "shell", "glob"]
@@ -223,6 +244,146 @@ Never launch development builds against a live sessions database to test migrati
 The delegate-assignment migration is `0017_delegate_assignments`, after the event
 source identity and remote sync progress migrations already present on `main`.
 
+## Changing agents while running
+
+The members the root agent can delegate to (its *roster*) can change while the
+runtime is running, from Rust (`Agent::add_member`, `Agent::remove_member`) and over
+ACP. The `delegate` tool lists the current roster, so the next turn of every session
+sees the change.
+
+**Changes are not persisted.** The roster is rebuilt from configuration and the
+`.agents` directory on every start, and when a profile's runtime is rebuilt. A member
+added while running is gone after a restart, and a configured member that was removed
+is back, with `generation` 0.
+
+Check `querymt/capabilities` for the three methods and the notification. All of them
+accept an optional `profileId` (or `profile_id`). With it, the request applies to that
+profile's runtime only; an unknown profile fails. Without it, the request applies to
+the connected runtime.
+
+### List
+
+```json
+{"method":"querymt/agents/list","params":{}}
+```
+
+```json
+{
+  "generation": 2,
+  "agents": [
+    {
+      "id": "coder",
+      "name": "coder",
+      "description": "Writes code",
+      "capabilities": ["coding"],
+      "origin": "config",
+      "location": "local"
+    },
+    {
+      "id": "gpu",
+      "name": "GPU",
+      "description": "Remote GPU agent",
+      "capabilities": [],
+      "origin": "runtime",
+      "location": "remote"
+    }
+  ]
+}
+```
+
+`agents` is ordered by ID. `origin` is `config` (a `[[delegates]]`, `[[remote_agents]]`
+or builder entry), `protocol` (a `.agents` target) or `runtime` (added while running).
+`location` is `local` or `remote`. Listing never builds or starts a member. `generation`
+starts at 0 and increases by one for every successful add or remove.
+
+### Add
+
+`agent` is an object tagged by `kind`. A local member takes the keys of a
+`[[delegates]]` entry, except `peer`:
+
+```json
+{
+  "method": "querymt/agents/add",
+  "params": {
+    "agent": {
+      "kind": "local",
+      "id": "reviewer",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-20250514",
+      "description": "Reviews changes",
+      "capabilities": ["review"],
+      "system": "You review code. Be brief.",
+      "tools": ["read_tool", "search_text"]
+    }
+  }
+}
+```
+
+A remote member takes the keys of a `[[remote_agents]]` entry and needs a running
+mesh. The peer is not contacted when the member is added:
+
+```json
+{
+  "method": "querymt/agents/add",
+  "params": {
+    "profileId": "quorum",
+    "agent": {
+      "kind": "remote",
+      "id": "gpu",
+      "name": "GPU",
+      "description": "Remote GPU agent",
+      "peer": "gpu-server"
+    }
+  }
+}
+```
+
+The response is the new generation, with `profileId` when the request had one:
+
+```json
+{"generation": 3, "profileId": "quorum"}
+```
+
+The request fails, naming the cause and leaving the roster unchanged, when:
+
+- delegation is disabled (the root agent's `tools` do not select `delegate`);
+- `id` is blank, or already used (the error names the existing member's origin);
+- the description has an unknown key, an unknown `kind` or an unknown middleware type;
+- a local member sets `peer` (only configured delegates can use peer routing);
+- a remote member is added to a runtime without a running mesh;
+- a local member is `isolated` and the runtime has no workspace service;
+- a `system` part names a file. The runtime does not read files on a client's behalf;
+  send the prompt text instead.
+
+`${VAR}` in `api_key` is **not** expanded for members added this way, so a client
+cannot send an environment secret to an endpoint it chose.
+
+### Remove
+
+```json
+{"method":"querymt/agents/remove","params":{"id":"coder"}}
+```
+
+Any member can be removed, whatever its origin. A delegation already running on it
+finishes. New delegations to that ID fail as an unknown agent. Removing an ID that is
+not in the roster fails. The response is `{"generation": n}`.
+
+### Notification
+
+Every successful add or remove sends one notification to every connected client; a
+failed request sends nothing:
+
+```json
+{"method":"querymt/agents/changed","params":{"generation":3,"removed":"coder","profileId":"quorum"}}
+```
+
+`added` or `removed` names the member the change concerned, so a client does not need to
+list again to learn what happened. The replies to `querymt/agents/add` and
+`querymt/agents/remove` carry the same fields.
+
+`profileId` is present when the change was made to a profile's runtime. Treat the
+notification as an invalidation hint and call `querymt/agents/list` for the state.
+
 ## Delegation Lifecycle
 
 ### 1. Delegation Request
@@ -252,7 +413,7 @@ pub struct Delegation {
 
 `isolation` is the resolved execution-workspace policy: `shared` (legacy behavior — the delegate runs in the parent's checkout) or `isolated` (a private managed Git worktree seeded from the parent's current code state; see [Git Worktree Workspaces](worktrees.md)). The `delegate` tool accepts an optional `isolation` argument (`inherit` | `isolated` | `shared`); `inherit` resolves from the parent session — isolated parents isolate every delegate by default, local parents keep shared execution. Explicit `shared` overrides on isolated parents are disclosed as shared execution, and a requested isolation that cannot be satisfied fails the delegation instead of falling back to sharing.
 
-In a quorum, each `[[delegates]]` entry may also set `isolation = "inherit" | "isolated" | "shared"` (default `inherit`) — the configured analogue of the tool argument. Precedence is: an explicit non-`inherit` value on the `delegate` tool call, then the target delegate's configured value, then inheritance from the parent session's execution mode. The resolved policy and where it came from (`request`, `delegate_config` or `inherited`) are persisted with the delegation and disclosed in the tool result. `isolated` requires `[quorum.workspace] enabled = true` and is rejected at load/build time otherwise. See [Git Worktree Workspaces](worktrees.md).
+Each `[[delegates]]` entry may also set `isolation = "inherit" | "isolated" | "shared"` (default `inherit`) — the configured analogue of the tool argument. Precedence is: an explicit non-`inherit` value on the `delegate` tool call, then the target delegate's configured value, then inheritance from the parent session's execution mode. The resolved policy and where it came from (`request`, `delegate_config` or `inherited`) are persisted with the delegation and disclosed in the tool result. `isolated` requires `[agent.workspace] enabled = true` and is rejected at load/build time otherwise. See [Git Worktree Workspaces](worktrees.md).
 
 ### 2. Session Creation
 
@@ -418,12 +579,12 @@ verification_spec = {
 
 ### Wait Policy
 
-Controls how the planner waits for delegate results:
+Controls how the root agent waits for delegate results:
 
 ```toml
-[quorum]
-delegation_wait_policy = "any"  # "all" | "any"
-delegation_wait_timeout_secs = 120
+[agent.delegation]
+wait_policy = "any"  # "all" | "any"
+wait_timeout_secs = 120
 ```
 
 - **any**: Continue when first delegate completes
@@ -432,8 +593,8 @@ delegation_wait_timeout_secs = 120
 ### Parallel Delegations
 
 ```toml
-[quorum]
-max_parallel_delegations = 5
+[agent.delegation]
+max_parallel = 5
 ```
 
 Maximum concurrent delegations.
@@ -441,8 +602,8 @@ Maximum concurrent delegations.
 ### Grace Period
 
 ```toml
-[quorum]
-delegation_cancel_grace_secs = 5
+[agent.delegation]
+cancel_grace_secs = 5
 ```
 
 Time to wait for graceful cancellation before force abort.
@@ -475,6 +636,29 @@ When `peer` is specified:
 - LLM calls are routed to the remote node
 - Tool execution happens locally
 - Enables "remote model, local session" pattern
+
+### Remote Agents
+
+An agent that runs on a mesh peer is declared with `[[remote_agents]]` and joins the same agent list as local delegates:
+
+```toml
+[[remote_agents]]
+id = "gpu-coder"
+name = "GPU Coder"
+description = "Coder running on GPU server with fast model"
+peer = "gpu-server"
+capabilities = ["gpu", "fast-model"]
+```
+
+The peer is resolved on the first delegation, not at startup:
+
+- The agent is listed whether or not its peer is reachable.
+- Delegating to an unreachable peer fails with an error naming the peer.
+- The delegation succeeds once the peer appears, without a restart.
+- Activity and interaction requests from the remote session reach the client that owns the parent session, and answers go back through the root.
+- The remote session is a delegation child: it is not listed as a user session.
+
+See [Mesh Networking](mesh.md#remote-agents) for the mesh side.
 
 ## Delegation Events
 
@@ -625,8 +809,8 @@ The system classifies delegation errors:
 ### Simple Delegation
 
 ```toml
-# Planner delegates coding task to coder
-[planner]
+# The agent delegates coding tasks to coder
+[agent]
 tools = ["delegate"]
 
 [[delegates]]
@@ -674,7 +858,7 @@ verification_spec = {
 
 ### Delegation Not Starting
 
-1. Check delegate is registered: `agent.agent_registry().list_agents()`
+1. Check the delegate is in the roster: `Agent::has_subagents()` is true when the root has members, and `Agent::delegate(id)` returns a member by ID
 2. Verify delegate configuration is valid
 3. Check for middleware errors
 4. Review logs for delegation events

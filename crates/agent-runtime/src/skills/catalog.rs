@@ -22,17 +22,6 @@ use std::sync::{Arc, Mutex};
 pub(crate) type DiscoverFn =
     dyn Fn(&[SkillSource], bool) -> anyhow::Result<Vec<Skill>> + Send + Sync;
 
-/// How a permission result of `Ask` is handled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ApprovalMode {
-    /// Prompt the user through the tool context.
-    #[default]
-    Interactive,
-    /// Nobody can answer a prompt (for example `.agents` delegation
-    /// targets): every `Ask` fails immediately.
-    NonInteractive,
-}
-
 /// Agent-level skill state shared by every session of an agent.
 pub struct SkillCatalog {
     registries: Arc<Mutex<HashMap<PathBuf, SkillRegistry>>>,
@@ -43,7 +32,6 @@ pub struct SkillCatalog {
     project_root: PathBuf,
     include_external: bool,
     mcp: bool,
-    approval: ApprovalMode,
     /// `(local source, server)` collision pairs already warned about.
     warned_collisions: Mutex<HashSet<(String, String)>>,
     discovery_fn: Arc<DiscoverFn>,
@@ -118,18 +106,11 @@ impl SkillCatalog {
             project_root,
             include_external,
             mcp: true,
-            approval: ApprovalMode::Interactive,
             warned_collisions: Mutex::new(HashSet::new()),
             discovery_fn: Arc::new(discovery::discover_all_strict),
             refresh_tickets: AtomicU64::new(0),
             published_tickets: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Use the given approval mode.
-    pub fn with_approval(mut self, approval: ApprovalMode) -> Self {
-        self.approval = approval;
-        self
     }
 
     /// Enable or disable MCP skills.
@@ -147,10 +128,6 @@ impl SkillCatalog {
 
     pub fn permissions(&self) -> &SkillPermissions {
         &self.permissions
-    }
-
-    pub fn approval(&self) -> ApprovalMode {
-        self.approval
     }
 
     /// Whether skills published by MCP servers are offered.

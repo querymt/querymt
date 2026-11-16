@@ -153,7 +153,6 @@ use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::SnapshotPolicy;
 use crate::delegation::AgentInfo;
-use crate::delegation::DefaultAgentRegistry;
 use crate::middleware::{AgentStats, ConversationContext, ToolCall, ToolFunction};
 use crate::session::backend::StorageBackend;
 use crate::session::domain::ForkOrigin;
@@ -802,29 +801,36 @@ impl DelegateTestFixture {
         let delegate_config = Arc::new(delegate_builder.build());
         let delegate = Arc::new(crate::agent::LocalAgentHandle::from_config(delegate_config));
 
-        let mut registry = DefaultAgentRegistry::new();
-        registry.register(
-            AgentInfo {
-                isolation: Default::default(),
-                id: "coder".to_string(),
-                name: "Coder".to_string(),
-                description: "Delegate coder".to_string(),
-                capabilities: vec![],
-                required_capabilities: vec![],
-                meta: None,
-            },
-            delegate.clone(),
-        );
-
         let (planner_registry, _config_dir) = empty_plugin_registry()?;
+        let planner_registry = Arc::new(planner_registry);
         let planner_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
 
+        let roster = crate::delegation::roster::test_roster_on(
+            planner_registry.clone(),
+            planner_storage.clone(),
+        );
+        roster
+            .add(crate::delegation::roster::Member::built(
+                AgentInfo {
+                    isolation: Default::default(),
+                    id: crate::delegation::roster::AgentId::try_from("coder")?,
+                    name: "Coder".to_string(),
+                    description: "Delegate coder".to_string(),
+                    capabilities: vec![],
+                    required_capabilities: vec![],
+                    meta: None,
+                },
+                crate::delegation::roster::MemberOrigin::Config,
+                crate::delegation::roster::MemberAgent::Local(delegate.clone()),
+            ))
+            .map_err(anyhow::Error::from)?;
+
         let builder = AgentConfigBuilder::new(
-            Arc::new(planner_registry),
+            planner_registry,
             planner_storage.clone(),
             LLMParams::new().provider("mock").model("mock-model"),
         )
-        .with_agent_registry(Arc::new(registry));
+        .with_roster(roster);
         let planner = Arc::new(crate::agent::LocalAgentHandle::from_config(
             builder.build().into(),
         ));

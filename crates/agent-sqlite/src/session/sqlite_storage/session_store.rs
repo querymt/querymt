@@ -2781,13 +2781,14 @@ impl SessionStore for SqliteStorage {
             // - `node_id`/`peer_label` always reflect the latest confirmed node.
             conn.execute(
                 "INSERT INTO remote_session_bookmarks
-                     (session_id, node_id, peer_label, cwd, created_at, title)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     (session_id, node_id, peer_label, cwd, created_at, title, fork_origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(session_id) DO UPDATE SET
                      node_id = excluded.node_id,
                      peer_label = excluded.peer_label,
                      cwd = COALESCE(excluded.cwd, remote_session_bookmarks.cwd),
-                     title = COALESCE(excluded.title, remote_session_bookmarks.title)",
+                     title = COALESCE(excluded.title, remote_session_bookmarks.title),
+                     fork_origin = COALESCE(excluded.fork_origin, remote_session_bookmarks.fork_origin)",
                 params![
                     b.session_id,
                     b.node_id,
@@ -2795,6 +2796,7 @@ impl SessionStore for SqliteStorage {
                     b.cwd,
                     b.created_at,
                     b.title,
+                    b.fork_origin.as_ref().map(|origin| origin.to_string()),
                 ],
             )?;
             Ok(())
@@ -2831,7 +2833,7 @@ impl SessionStore for SqliteStorage {
                 };
                 let bookmarks = {
                     let sql = format!(
-                        "SELECT session_id, node_id, peer_label, cwd, created_at, title
+                        "SELECT session_id, node_id, peer_label, cwd, created_at, title, fork_origin
                          FROM remote_session_bookmarks WHERE session_id IN ({placeholders})"
                     );
                     let mut stmt = tx.prepare(&sql).db()?;
@@ -2844,6 +2846,9 @@ impl SessionStore for SqliteStorage {
                                 cwd: row.get(3)?,
                                 created_at: row.get(4)?,
                                 title: row.get(5)?,
+                                fork_origin: row
+                                    .get::<_, Option<String>>(6)?
+                                    .and_then(|origin| origin.parse().ok()),
                             })
                         })
                         .db()?;
@@ -2871,7 +2876,7 @@ impl SessionStore for SqliteStorage {
     async fn list_remote_session_bookmarks(&self) -> SessionResult<Vec<RemoteSessionBookmark>> {
         self.run_blocking(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT session_id, node_id, peer_label, cwd, created_at, title
+                "SELECT session_id, node_id, peer_label, cwd, created_at, title, fork_origin
                  FROM remote_session_bookmarks
                  ORDER BY created_at DESC",
             )?;
@@ -2884,6 +2889,9 @@ impl SessionStore for SqliteStorage {
                         cwd: row.get(3)?,
                         created_at: row.get(4)?,
                         title: row.get(5)?,
+                        fork_origin: row
+                            .get::<_, Option<String>>(6)?
+                            .and_then(|origin| origin.parse().ok()),
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2899,7 +2907,7 @@ impl SessionStore for SqliteStorage {
         let sid = session_id.to_string();
         self.run_blocking(move |conn| {
             conn.query_row(
-                "SELECT session_id, node_id, peer_label, cwd, created_at, title
+                "SELECT session_id, node_id, peer_label, cwd, created_at, title, fork_origin
                  FROM remote_session_bookmarks
                  WHERE session_id = ?1",
                 params![sid],
@@ -2911,6 +2919,9 @@ impl SessionStore for SqliteStorage {
                         cwd: row.get(3)?,
                         created_at: row.get(4)?,
                         title: row.get(5)?,
+                        fork_origin: row
+                            .get::<_, Option<String>>(6)?
+                            .and_then(|origin| origin.parse().ok()),
                     })
                 },
             )

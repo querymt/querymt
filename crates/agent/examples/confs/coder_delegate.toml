@@ -1,6 +1,6 @@
 # Coder Agent - Multi-agent system for code implementation
 #
-# This configuration defines a quorum with a planner agent that coordinates
+# This configuration defines an agent that coordinates
 # a specialized coder agent for implementation tasks.
 
 [profile]
@@ -9,21 +9,11 @@ name = "Coder Delegate"
 description = "Multi-agent coder profile with planner, coder, and explorer delegates"
 tags = ["coding", "delegation", "multi-agent"]
 
-[quorum]
-cwd = "."
-delegation = true
-verification = true
-snapshot_policy = "diff"
-delegation_wait_policy = "all"
-delegation_wait_timeout_secs = 2400
-delegation_cancel_grace_secs = 5
-max_parallel_delegations = 5
-
 # -----------------------------------------------------------------------------
 # Optional: managed Git worktree workspaces (disabled by default).
 # One workspace service is shared by the planner and every delegate.
 #
-# [quorum.workspace]
+# [agent.workspace]
 # enabled = true
 # storage_root = "~/.qmt/worktrees"   # relative paths resolve against this file
 # baseline = "commit"                 # or "current_working_tree"
@@ -35,7 +25,8 @@ max_parallel_delegations = 5
 # A non-"inherit" value on the `delegate` tool call overrides this setting.
 # -----------------------------------------------------------------------------
 
-[planner]
+[agent]
+cwd = "."
 mode = "plan"
 provider = "codex"
 model = "gpt-6.1-sol"
@@ -66,15 +57,26 @@ system = [
   { file = "../prompts/code_meta.jinja2" }
 ]
 
-# Middleware for planner
+[agent.delegation]
+wait_policy = "all"
+wait_timeout_secs = 2400
+cancel_grace_secs = 5
+max_parallel = 5
+verification = true
+
+# Undo/redo through git, as `snapshot_policy = "diff"` did.
+[agent.execution.snapshot]
+backend = "git"
+
+# Middleware for the agent
 # Context middleware warns when approaching token limits
-[[planner.middleware]]
+[[middleware]]
 type = "context"
 warn_at_percent = 80
 compact_at_percent = 90
 fallback_max_tokens = 128000
 
-[[planner.middleware]]
+[[middleware]]
 type = "agent_mode"
 reminder = """<system-reminder>
 # Plan Mode - System Reminder
@@ -134,16 +136,16 @@ Don't make large assumptions about user intent.
 </system-reminder>"""
 
 # Optional: Detect duplicate code patterns
-# [[planner.middleware]]
+# [[middleware]]
 # type = "dedup_check"
 # threshold = 0.8
 
-[quorum.delegation_summary]
+[agent.delegation.summary]
 provider = "codex"
 model = "gpt-6.1-sol"
 
 [[delegates]]
-# isolation = "inherit"   # "inherit" | "isolated" | "shared" (see [quorum.workspace])
+# isolation = "inherit"   # "inherit" | "isolated" | "shared" (see [agent.workspace])
 id = "coder"
 provider = "codex"
 model = "gpt-6.1-sol"
@@ -186,6 +188,9 @@ fallback_max_tokens = 128000
 type = "dedup_check"
 threshold = 0.85
 min_lines = 10
+
+[delegates.execution.snapshot]
+backend = "git"
 
 [[delegates]]
 id = "explorer"
@@ -241,3 +246,6 @@ fallback_max_tokens = 120000
 type = "limits"
 max_steps = 200
 max_turns = 50
+
+[delegates.execution.snapshot]
+backend = "git"

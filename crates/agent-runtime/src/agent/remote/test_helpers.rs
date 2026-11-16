@@ -567,43 +567,6 @@ pub mod fixtures {
         }
     }
 
-    // ── RemoteAgentHandleFixture ─────────────────────────────────────────────
-
-    /// Fixture for `RemoteAgentHandle` / `AgentHandle` tests.
-    ///
-    /// Creates a `RemoteNodeManager` and wraps it in a
-    /// `RemoteAgentHandle` via the same construction path as
-    /// `setup_mesh_from_config`.  Tests only require local actor refs —
-    /// no DHT lookup is exercised.
-    #[allow(dead_code)]
-    pub struct RemoteAgentHandleFixture {
-        pub handle: Arc<crate::agent::remote::remote_handle::RemoteAgentHandle>,
-        pub node_manager: ActorRef<RemoteNodeManager>,
-        pub mesh: &'static MeshHandle,
-        pub _tempdir: TempDir,
-    }
-
-    #[allow(dead_code)]
-    impl RemoteAgentHandleFixture {
-        pub async fn new(test_id: &str) -> Self {
-            let mesh = get_test_mesh().await;
-            let nm_fixture = MeshNodeManagerFixture::new("stub", test_id).await;
-
-            let handle = Arc::new(crate::agent::remote::remote_handle::RemoteAgentHandle::new(
-                format!("stub-{}", test_id),
-                None,
-                mesh.clone(),
-            ));
-
-            Self {
-                handle,
-                node_manager: nm_fixture.actor_ref,
-                mesh,
-                _tempdir: nm_fixture._tempdir,
-            }
-        }
-    }
-
     #[test]
     fn remote_test_config_dir_overrides_mesh_state_path() {
         let config_dir = ensure_remote_test_config_dir();

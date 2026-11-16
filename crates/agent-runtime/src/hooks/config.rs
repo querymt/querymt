@@ -24,6 +24,8 @@ pub struct HooksConfig {
     pub post_delegation: Vec<MatcherGroupConfig>,
     pub delegation_failure: Vec<MatcherGroupConfig>,
     pub session_end: Vec<MatcherGroupConfig>,
+    pub subagent_added: Vec<MatcherGroupConfig>,
+    pub subagent_removed: Vec<MatcherGroupConfig>,
     #[schemars(skip)]
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
@@ -53,6 +55,8 @@ impl Default for HooksConfig {
             post_delegation: Vec::new(),
             delegation_failure: Vec::new(),
             session_end: Vec::new(),
+            subagent_added: Vec::new(),
+            subagent_removed: Vec::new(),
             extra: BTreeMap::new(),
             base_dir: None,
         }
@@ -112,6 +116,10 @@ pub enum HookEventConfig {
     PostDelegation,
     DelegationFailure,
     SessionEnd,
+    /// A subagent joined the roster. Not tied to a session.
+    SubagentAdded,
+    /// A subagent left the roster. Not tied to a session.
+    SubagentRemoved,
 }
 
 impl HookEventConfig {
@@ -131,11 +139,13 @@ impl HookEventConfig {
             Self::PostDelegation => "post_delegation",
             Self::DelegationFailure => "delegation_failure",
             Self::SessionEnd => "session_end",
+            Self::SubagentAdded => "subagent_added",
+            Self::SubagentRemoved => "subagent_removed",
         }
     }
 }
 
-const ALL_EVENTS: [HookEventConfig; 14] = [
+const ALL_EVENTS: [HookEventConfig; 16] = [
     HookEventConfig::SessionStart,
     HookEventConfig::UserPromptSubmit,
     HookEventConfig::PreToolUse,
@@ -150,6 +160,8 @@ const ALL_EVENTS: [HookEventConfig; 14] = [
     HookEventConfig::PostDelegation,
     HookEventConfig::DelegationFailure,
     HookEventConfig::SessionEnd,
+    HookEventConfig::SubagentAdded,
+    HookEventConfig::SubagentRemoved,
 ];
 
 fn validate_handler_fields(
@@ -192,6 +204,8 @@ impl HooksConfig {
             HookEventConfig::PostDelegation => &self.post_delegation,
             HookEventConfig::DelegationFailure => &self.delegation_failure,
             HookEventConfig::SessionEnd => &self.session_end,
+            HookEventConfig::SubagentAdded => &self.subagent_added,
+            HookEventConfig::SubagentRemoved => &self.subagent_removed,
         }
     }
 

@@ -599,21 +599,23 @@ async fn remote_owner_lifecycle_updates_and_filters_before_paging() {
             .await
             .expect("resolve first unfiltered page");
     }
-    let remote_handle = crate::agent::remote::RemoteAgentHandle::new(
+    let member = crate::delegation::roster::RemoteMember::new(
         "lifecycle-owner".to_string(),
         Some(_node_id.clone()),
-        mesh.clone(),
     );
-    let state = crate::agent::handle::AgentHandle::set_session_lifecycle(
-        &remote_handle,
-        &unfiltered.sessions[10].session_id,
-        crate::session::lifecycle::SessionLifecyclePatch {
-            resolved: None,
-            archived: Some(true),
-        },
-    )
-    .await
-    .expect("patch lifecycle via remote agent handle");
+    let viewer = RealStorageHandleFixture::new().await;
+    viewer.handle.set_mesh(mesh.clone());
+    let state = crate::delegation::roster::MemberAgent::Remote(member)
+        .set_session_lifecycle(
+            &viewer.handle,
+            &unfiltered.sessions[10].session_id,
+            crate::session::lifecycle::SessionLifecyclePatch {
+                resolved: None,
+                archived: Some(true),
+            },
+        )
+        .await
+        .expect("patch lifecycle via the remote member");
     assert!(state.archived);
     let read = manager
         .ask(crate::agent::remote::GetRemoteSessionLifecycle {
@@ -825,6 +827,7 @@ async fn lifecycle_query_remote_owner_scopes_relationships_and_live_metadata() {
             cwd: Some("/remote/work".into()),
             created_at: 0,
             title: None,
+            fork_origin: None,
         })
         .await
         .expect("bookmark owner fork");
@@ -919,6 +922,7 @@ async fn lifecycle_location_conflicts_reject_get_patch_and_acp_hydration() {
             cwd: None,
             created_at: 0,
             title: None,
+            fork_origin: None,
         })
         .await
         .expect("bookmark colliding owner session");
@@ -990,6 +994,7 @@ async fn lifecycle_location_conflicts_reject_get_patch_and_acp_hydration() {
             cwd: None,
             created_at: 0,
             title: None,
+            fork_origin: None,
         })
         .await
         .expect("bookmark remote-only owner session");
@@ -1759,6 +1764,7 @@ async fn test_acp_remote_cursor_restarts_when_peer_switches_between_bookmarks_an
                 cwd: entry.cwd.clone(),
                 created_at: entry.created_at,
                 title: None,
+                fork_origin: None,
             })
             .await
             .expect("bookmark subset");
@@ -1882,6 +1888,7 @@ async fn viewer_with_synced_history(
             cwd: None,
             created_at: 1_700_000_000,
             title: None,
+            fork_origin: None,
         })
         .await
         .unwrap();
@@ -1967,6 +1974,7 @@ async fn unreachable_owner_without_local_window_fails_retryably_without_partial_
             cwd: None,
             created_at: 1_700_000_000,
             title: None,
+            fork_origin: None,
         })
         .await
         .unwrap();
@@ -2042,6 +2050,7 @@ async fn load_session_with_unreachable_owner_and_no_local_window_keeps_the_conne
             cwd: None,
             created_at: 1_700_000_000,
             title: None,
+            fork_origin: None,
         })
         .await
         .unwrap();
@@ -2106,6 +2115,7 @@ async fn owner_and_viewer_with_image_prompts(
             cwd: None,
             created_at: 1_700_000_000,
             title: None,
+            fork_origin: None,
         })
         .await
         .unwrap();

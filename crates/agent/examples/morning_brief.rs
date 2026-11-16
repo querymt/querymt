@@ -2,7 +2,7 @@ use querymt_agent::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("openai", "gpt-4")
         .api_key(std::env::var("OPENAI_API_KEY")?)
         .system("You are a concise market analyst.")

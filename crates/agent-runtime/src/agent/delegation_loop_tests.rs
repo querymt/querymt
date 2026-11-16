@@ -1,8 +1,5 @@
-use crate::agent::agent_config::AgentConfig;
-use crate::agent::core::ToolPolicy;
 use crate::agent::execution::CycleOutcome;
-use crate::agent::execution_context::ExecutionContext;
-use crate::delegation::{AgentInfo, DefaultAgentRegistry, DelegationOrchestrator};
+use crate::delegation::DelegationOrchestrator;
 use crate::middleware::{
     AgentStats, ConversationContext, DelegationGuardMiddleware, ExecutionState, LlmResponse,
     MiddlewareDriver,
@@ -10,14 +7,12 @@ use crate::middleware::{
 use querymt_agent_core::events::{AgentEventKind, StopType};
 use querymt_agent_core::model::{AgentMessage, MessagePart};
 
-use crate::session::backend::StorageBackend;
 use crate::session::domain::{Delegation, DelegationStatus};
-use crate::session::runtime::RuntimeContext;
-use crate::session::sqlite_storage::SqliteStorage;
-use crate::session::store::{SessionExecutionConfig, SessionStore};
+use crate::session::store::SessionStore;
+use crate::test_utils::delegation::{DelegateBehavior, TestHarness};
 use crate::test_utils::{
     MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory,
-    mock_plugin_registry, mock_plugin_registry_in, mock_querymt_tool_call,
+    mock_querymt_tool_call,
 };
 use kameo::actor::Spawn;
 use mockall::Sequence;
@@ -26,17 +21,54 @@ use querymt::chat::FinishReason;
 use querymt::chat::{ChatRole, ReasoningEffort};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, Notify};
 
 // Mock implementations moved to crate::test_utils::mocks
 
+/// An orchestrator over the roster of `config`, bound to a fresh root handle.
+/// The root is leaked: the orchestrator holds it weakly and tests end soon after.
+fn orchestrator_for(
+    config: &Arc<crate::agent::agent_config::AgentConfig>,
+) -> DelegationOrchestrator {
+    orchestrator_with(config, &Default::default())
+}
+
+/// [`orchestrator_for`] with explicit delegation settings.
+fn orchestrator_with(
+    config: &Arc<crate::agent::agent_config::AgentConfig>,
+    settings: &crate::config::DelegationSettings,
+) -> DelegationOrchestrator {
+    let root = Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone()));
+    let orchestrator = DelegationOrchestrator::new(
+        &root,
+        config.roster().expect("config has a roster").clone(),
+        settings,
+        None,
+    );
+    std::mem::forget(root);
+    orchestrator
+}
+
+/// The built local member `id` of `config`'s roster.
+fn delegate_of(
+    config: &crate::agent::agent_config::AgentConfig,
+    id: &str,
+) -> Arc<crate::agent::LocalAgentHandle> {
+    config
+        .roster()
+        .expect("roster")
+        .snapshot()
+        .get(id)
+        .and_then(|member| member.agent().and_then(|agent| agent.as_local().cloned()))
+        .expect("built local delegate")
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn genai_delegation_concurrent_parent_prompts_reach_child_agents_without_persisting_context()
 {
     use crate::acp::protocol::{ContentBlock, LoadSessionRequest, PromptRequest, TextContent};
-    use crate::agent::handle::AgentHandle as _;
+    use crate::send_agent::SendAgent as _;
     use opentelemetry::Value;
     use querymt_agent_services::tools::trace_support::genai_trace::{
         assert_private, attr, capture_local_tasks,
@@ -81,19 +113,8 @@ async fn genai_delegation_concurrent_parent_prompts_reach_child_agents_without_p
             .await
             .unwrap();
             let config = harness.config.clone();
-            let orchestrator = Arc::new(
-                DelegationOrchestrator::new(
-                    Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-                    config.event_sink.clone(),
-                    config.provider.history_store(),
-                    config.agent_registry.clone(),
-                    config.tool_registry_arc(),
-                    config.hooks.clone(),
-                    None,
-                )
-                .with_result_injection(false)
-                .with_summarizer(Some(Arc::new(summarizer))),
-            );
+            let orchestrator =
+                Arc::new(orchestrator_for(&config).with_summarizer(Some(Arc::new(summarizer))));
             harness.orchestrator_handle =
                 Some(orchestrator.start_listening(config.event_sink.fanout()));
             let handle = crate::agent::LocalAgentHandle::from_config(harness.config.clone());
@@ -155,11 +176,7 @@ async fn genai_delegation_concurrent_parent_prompts_reach_child_agents_without_p
                 .load_session_stream(&parent_id, None, None)
                 .await
                 .unwrap();
-            let target = harness.config.agent_registry.get_handle("agent").unwrap();
-            let child_events = target
-                .as_any()
-                .downcast_ref::<crate::agent::LocalAgentHandle>()
-                .unwrap()
+            let child_events = delegate_of(&harness.config, "agent")
                 .config
                 .event_sink
                 .journal()
@@ -396,18 +413,7 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
             tokio::task::yield_now().await;
             let config = harness.config.clone();
             let store = config.provider.history_store();
-            let orchestrator = Arc::new(
-                DelegationOrchestrator::new(
-                    Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-                    config.event_sink.clone(),
-                    store.clone(),
-                    config.agent_registry.clone(),
-                    config.tool_registry_arc(),
-                    config.hooks.clone(),
-                    None,
-                )
-                .with_result_injection(false),
-            );
+            let orchestrator = Arc::new(orchestrator_for(&config));
             let consumer = tracing::info_span!(parent: None, "unrelated-consumer");
             let listener =
                 consumer.in_scope(|| orchestrator.start_listening(config.event_sink.fanout()));
@@ -551,611 +557,6 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
     }
 }
 
-/// A middleware that immediately stops execution with `StepLimit`,
-/// simulating what happens when a delegate is stopped by middleware before
-/// completing its work. Uses `StepLimit` (maps to `StopReason::MaxTurnRequests`)
-/// rather than `ContextThreshold` to avoid triggering the auto-compaction loop
-/// in the execution state machine.
-struct AlwaysStopMiddleware;
-
-#[async_trait::async_trait]
-impl MiddlewareDriver for AlwaysStopMiddleware {
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<ExecutionState> {
-        match state {
-            ExecutionState::BeforeLlmCall { ref context } => Ok(ExecutionState::Stopped {
-                message: "Step limit reached".into(),
-                stop_type: StopType::StepLimit,
-                context: Some(context.clone()),
-            }),
-            other => Ok(other),
-        }
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "AlwaysStopMiddleware"
-    }
-}
-
-/// Hold a delegate before its first LLM call to make cancellation deterministic.
-struct CancellationGateMiddleware {
-    entered: Arc<Notify>,
-    release: Arc<Notify>,
-}
-
-#[async_trait::async_trait]
-impl MiddlewareDriver for CancellationGateMiddleware {
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<ExecutionState> {
-        match state {
-            before @ ExecutionState::BeforeLlmCall { .. } => {
-                self.entered.notify_one();
-                self.release.notified().await;
-                Ok(before)
-            }
-            other => Ok(other),
-        }
-    }
-
-    fn reset(&self) {}
-
-    fn name(&self) -> &'static str {
-        "CancellationGateMiddleware"
-    }
-}
-
-/// Fires `ContextThreshold` on the first `BeforeLlmCall`, then passes through.
-/// This simulates a full context window that triggers AI compaction.
-struct ContextThresholdOnceMiddleware {
-    fired: std::sync::atomic::AtomicBool,
-}
-
-impl ContextThresholdOnceMiddleware {
-    fn new() -> Self {
-        Self {
-            fired: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl MiddlewareDriver for ContextThresholdOnceMiddleware {
-    async fn on_step_start(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> crate::middleware::Result<ExecutionState> {
-        match state {
-            ExecutionState::BeforeLlmCall { ref context }
-                if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) =>
-            {
-                Ok(ExecutionState::Stopped {
-                    message: "Context token threshold reached, requesting compaction".into(),
-                    stop_type: StopType::ContextThreshold,
-                    context: Some(context.clone()),
-                })
-            }
-            other => Ok(other),
-        }
-    }
-
-    fn reset(&self) {
-        self.fired.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    fn name(&self) -> &'static str {
-        "ContextThresholdOnceMiddleware"
-    }
-}
-
-#[derive(Debug, Clone)]
-enum DelegateBehavior {
-    AlwaysOk,
-    AlwaysFail,
-    PauseBeforeLlmCall {
-        entered: Arc<Notify>,
-        release: Arc<Notify>,
-    },
-    /// Delegate's execution is stopped by middleware (e.g. context threshold).
-    /// This simulates a premature stop that should be treated as a delegation failure.
-    StoppedByMiddleware,
-    /// Delegate hits ContextThreshold, auto-compaction runs and succeeds, then
-    /// the delegate resumes and completes normally. Verifies that the delegation
-    /// orchestrator sees `EndTurn` (success) when compaction recovers the session.
-    ContextThresholdCompactionSucceeds,
-    /// Delegate hits ContextThreshold, auto-compaction runs but the LLM call
-    /// fails. The state machine falls through to `Stopped(MaxTokens)`, which
-    /// the delegation orchestrator must treat as a failure.
-    ContextThresholdCompactionFails,
-}
-
-struct TestHarness {
-    config: Arc<AgentConfig>,
-    exec_ctx: ExecutionContext,
-    provider: Arc<Mutex<MockLlmProvider>>,
-    orchestrator_handle: Option<tokio::task::JoinHandle<()>>,
-    _temp_dir: TempDir,
-}
-
-impl TestHarness {
-    async fn new(history: Vec<AgentMessage>, behavior: DelegateBehavior) -> Self {
-        Self::new_with_delegate_reasoning(history, behavior, None).await
-    }
-
-    async fn new_with_delegate_reasoning(
-        history: Vec<AgentMessage>,
-        behavior: DelegateBehavior,
-        delegate_reasoning_effort: Option<ReasoningEffort>,
-    ) -> Self {
-        let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
-        let shared_provider = SharedLlmProvider {
-            inner: provider.clone(),
-            tools: Vec::new().into_boxed_slice(),
-        };
-        let factory = Arc::new(TestProviderFactory::new(shared_provider));
-        let (registry, temp_dir) = mock_plugin_registry(factory).expect("plugin registry");
-        let registry = Arc::new(registry);
-
-        // Use a single shared in-memory SQLite store for orchestrator and delegates.
-        let shared_storage = Arc::new(
-            SqliteStorage::connect(":memory:".into())
-                .await
-                .expect("shared sqlite storage"),
-        );
-        let store: Arc<dyn SessionStore> = shared_storage.clone();
-
-        let provider_context = crate::session::provider::SessionProvider::new(
-            registry,
-            store.clone(),
-            LLMParams::new().provider("mock").model("mock-model"),
-        )
-        .with_agent_id(Some("parent".into()));
-        let provider_context = Arc::new(provider_context);
-
-        // Create the parent session via SessionProvider so LLM config is set up.
-        let context = provider_context
-            .create_session(None, None, &SessionExecutionConfig::default())
-            .await
-            .expect("create parent session");
-        let session_id = context.session().public_id.clone();
-
-        // Seed any initial history into the real store.
-        for msg in &history {
-            store
-                .add_message(&session_id, msg.clone())
-                .await
-                .expect("seed history message");
-        }
-
-        let mut runtime_context = RuntimeContext::new(store.clone(), session_id.clone())
-            .await
-            .expect("runtime context");
-        runtime_context
-            .load_working_context()
-            .await
-            .expect("load context");
-
-        // Create delegate agents as real LocalAgentHandles.
-        // All delegates share the same in-memory SQLite store so parent_session_id
-        // resolves correctly when creating delegation sessions.
-        let mut agent_registry = DefaultAgentRegistry::new();
-        for id in ["agent", "agent1", "agent2"] {
-            let delegate_handle =
-                build_delegate_handle(behavior.clone(), store.clone(), delegate_reasoning_effort)
-                    .await;
-            agent_registry.register_handle(
-                agent_info(id),
-                delegate_handle as Arc<dyn crate::agent::handle::AgentHandle>,
-            );
-        }
-        let agent_registry: Arc<DefaultAgentRegistry> = Arc::new(agent_registry);
-
-        let config = Arc::new(
-            crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
-                shared_storage.clone(),
-                provider_context,
-                shared_storage.event_journal(),
-            )
-            .with_tool_policy(ToolPolicy::ProviderOnly)
-            .with_agent_registry_only(agent_registry.clone())
-            .build(),
-        );
-
-        // Create a LocalAgentHandle for delegation (wraps its own SessionRegistry)
-        let delegator: Arc<dyn crate::agent::handle::AgentHandle> =
-            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone()));
-
-        let orchestrator = Arc::new(
-            DelegationOrchestrator::new(
-                delegator,
-                config.event_sink.clone(),
-                store.clone(),
-                agent_registry.clone(),
-                config.tool_registry_arc(),
-                config.hooks.clone(),
-                None,
-            )
-            .with_delegate_model_overrides(config.delegate_model_overrides.clone()),
-        );
-        let orchestrator_handle = Some(orchestrator.start_listening(config.event_sink.fanout()));
-
-        // Create a SessionRuntime for the execution context
-        let session_runtime = crate::agent::core::SessionRuntime::new(
-            None,
-            HashMap::new(),
-            crate::agent::core::McpToolState::empty(),
-        );
-
-        let exec_ctx = ExecutionContext::new(
-            session_id,
-            querymt_agent_core::model::TurnId::new(),
-            session_runtime,
-            runtime_context,
-            context,
-            crate::agent::core::ToolConfig::default(),
-        );
-
-        Self {
-            config,
-            exec_ctx,
-            provider,
-            orchestrator_handle,
-            _temp_dir: temp_dir,
-        }
-    }
-
-    fn stop_harness_orchestrator(&mut self) {
-        if let Some(handle) = self.orchestrator_handle.take() {
-            handle.abort();
-        }
-    }
-
-    async fn run(&mut self) -> CycleOutcome {
-        crate::agent::execution::execute_cycle_state_machine(
-            &self.config,
-            &mut self.exec_ctx,
-            crate::agent::core::AgentMode::Build,
-        )
-        .await
-        .expect("state machine")
-    }
-
-    async fn set_parent_reasoning_effort(&self, effort: Option<ReasoningEffort>) {
-        let store = self.config.provider.history_store();
-        let current = store
-            .get_session_llm_config(&self.exec_ctx.session_id)
-            .await
-            .expect("parent config lookup")
-            .expect("parent config");
-        let mut params = current
-            .params
-            .map(serde_json::from_value::<LLMParams>)
-            .transpose()
-            .expect("deserialize parent params")
-            .unwrap_or_default()
-            .provider(&current.provider)
-            .model(&current.model);
-        params.reasoning_effort = effort;
-        let updated = store
-            .create_or_get_llm_config(&params)
-            .await
-            .expect("create parent config");
-        store
-            .set_session_llm_config(&self.exec_ctx.session_id, updated.id)
-            .await
-            .expect("set parent config");
-    }
-
-    async fn expect_single_delegation(&mut self) {
-        let delegate_call = mock_querymt_tool_call(
-            "call-1",
-            "delegate",
-            r#"{"target_agent_id":"agent","objective":"task"}"#,
-        );
-        let mut seq = Sequence::new();
-        self.provider_mut()
-            .await
-            .expect_chat()
-            .times(1)
-            .in_sequence(&mut seq)
-            .returning(move |_| {
-                Ok(
-                    MockChatResponse::with_tools("Delegating task", vec![delegate_call.clone()])
-                        .into(),
-                )
-            });
-        self.provider_mut()
-            .await
-            .expect_chat()
-            .times(1)
-            .in_sequence(&mut seq)
-            .returning(|_| Ok(MockChatResponse::text_only("Done").into()));
-        self.provider_mut()
-            .await
-            .expect_call_tool()
-            .returning(|_, _| {
-                Ok(vec![querymt::chat::ToolResultPart::Text {
-                    text: "ok".to_string(),
-                }])
-            })
-            .times(1);
-        self.provider_mut()
-            .await
-            .expect_tools()
-            .return_const(None)
-            .times(0..);
-    }
-
-    async fn run_single_delegation(&mut self) -> CycleOutcome {
-        self.expect_single_delegation().await;
-        self.run().await
-    }
-
-    async fn run_single_delegation_without_child_tool(&mut self) -> CycleOutcome {
-        let delegate_call = mock_querymt_tool_call(
-            "call-1",
-            "delegate",
-            r#"{"target_agent_id":"agent","objective":"task"}"#,
-        );
-        let mut seq = Sequence::new();
-        self.provider_mut()
-            .await
-            .expect_chat()
-            .times(1)
-            .in_sequence(&mut seq)
-            .returning(move |_| {
-                Ok(
-                    MockChatResponse::with_tools("Delegating task", vec![delegate_call.clone()])
-                        .into(),
-                )
-            });
-        self.provider_mut()
-            .await
-            .expect_chat()
-            .times(1)
-            .in_sequence(&mut seq)
-            .returning(|_| Ok(MockChatResponse::text_only("Done").into()));
-        self.provider_mut()
-            .await
-            .expect_call_tool()
-            .returning(|_, _| {
-                Ok(vec![querymt::chat::ToolResultPart::Text {
-                    text: "ok".to_string(),
-                }])
-            })
-            .times(1);
-        self.provider_mut()
-            .await
-            .expect_tools()
-            .return_const(None)
-            .times(0..);
-
-        self.run().await
-    }
-
-    async fn child_sessions(&self) -> Vec<String> {
-        self.config
-            .provider
-            .history_store()
-            .list_child_sessions(&self.exec_ctx.session_id)
-            .await
-            .expect("child sessions")
-    }
-
-    async fn session_lifecycle(
-        &self,
-        session_id: &str,
-    ) -> crate::session::lifecycle::SessionLifecycle {
-        self.config
-            .provider
-            .history_store()
-            .get_session_lifecycle(session_id)
-            .await
-            .expect("session lifecycle")
-    }
-
-    async fn child_llm_params(&self) -> (String, LLMParams) {
-        let store = self.config.provider.history_store();
-        let child_sessions = store
-            .list_child_sessions(&self.exec_ctx.session_id)
-            .await
-            .expect("child sessions");
-        let child_session_id = child_sessions.first().expect("child session id");
-        let config = store
-            .get_session_llm_config(child_session_id)
-            .await
-            .expect("child config lookup")
-            .expect("child config");
-        let params = config
-            .params
-            .map(serde_json::from_value::<LLMParams>)
-            .transpose()
-            .expect("deserialize child params")
-            .unwrap_or_default();
-
-        (config.model, params)
-    }
-
-    async fn provider_mut(&self) -> tokio::sync::MutexGuard<'_, MockLlmProvider> {
-        self.provider.lock().await
-    }
-}
-
-/// Build a delegate `AgentHandle` that shares the given store with the
-/// orchestrator, ensuring parent_session_id resolves correctly.
-async fn build_delegate_handle(
-    behavior: DelegateBehavior,
-    shared_store: Arc<dyn SessionStore>,
-    reasoning_effort: Option<ReasoningEffort>,
-) -> Arc<crate::agent::LocalAgentHandle> {
-    let delegate_provider = Arc::new(Mutex::new(MockLlmProvider::new()));
-    {
-        let mut mock = delegate_provider.lock().await;
-        match &behavior {
-            DelegateBehavior::AlwaysOk => {
-                mock.expect_chat()
-                    .times(0..)
-                    .returning(|_| Ok(MockChatResponse::text_only("Task complete").into()));
-            }
-            DelegateBehavior::AlwaysFail => {
-                mock.expect_chat().times(0..).returning(|_| {
-                    Err(querymt::error::LLMError::ProviderError(
-                        "Invalid patch: line mismatch".to_string(),
-                    ))
-                });
-            }
-            DelegateBehavior::PauseBeforeLlmCall { .. } => {
-                mock.expect_chat()
-                    .times(0..)
-                    .returning(|_| Ok(MockChatResponse::text_only("Task complete").into()));
-            }
-            DelegateBehavior::StoppedByMiddleware => {
-                // The LLM will never be called because the middleware stops execution
-                // before the LLM call. Set up a fallback that would succeed if reached.
-                mock.expect_chat()
-                    .times(0..)
-                    .returning(|_| Ok(MockChatResponse::text_only("Task complete").into()));
-            }
-            DelegateBehavior::ContextThresholdCompactionSucceeds => {
-                // ContextThresholdOnceMiddleware fires ContextThreshold on the first
-                // BeforeLlmCall. The state machine then calls run_ai_compaction which
-                // calls provider.chat() for the compaction summary. After that succeeds,
-                // the state machine loops back and the middleware passes through, so
-                // provider.chat() is called again for the normal conversation turn.
-                let mut seq = Sequence::new();
-                // 1st chat call: compaction summary
-                mock.expect_chat()
-                    .times(1)
-                    .in_sequence(&mut seq)
-                    .returning(|_| {
-                        Ok(
-                            MockChatResponse::text_only(
-                                "Summary of previous conversation context.",
-                            )
-                            .into(),
-                        )
-                    });
-                // 2nd chat call: normal delegate completion
-                mock.expect_chat()
-                    .times(1)
-                    .in_sequence(&mut seq)
-                    .returning(|_| Ok(MockChatResponse::text_only("Task complete").into()));
-            }
-            DelegateBehavior::ContextThresholdCompactionFails => {
-                // ContextThresholdOnceMiddleware fires ContextThreshold. The state
-                // machine calls run_ai_compaction which calls provider.chat() — this
-                // fails. The state machine falls through to Stopped(MaxTokens).
-                // No retries: we set max_retries=0 in the compaction config.
-                mock.expect_chat().times(0..).returning(|_| {
-                    Err(querymt::error::LLMError::ProviderError(
-                        "Compaction LLM call failed: service unavailable".to_string(),
-                    ))
-                });
-            }
-        }
-        mock.expect_tools().return_const(None).times(0..);
-    }
-
-    let delegate_shared = SharedLlmProvider {
-        inner: delegate_provider,
-        tools: Vec::new().into_boxed_slice(),
-    };
-    let delegate_factory = Arc::new(TestProviderFactory::new(delegate_shared));
-
-    let delegate_temp_dir = TempDir::new().expect("temp dir");
-    let delegate_plugin_registry = Arc::new(
-        mock_plugin_registry_in(delegate_temp_dir.path(), delegate_factory)
-            .expect("plugin registry"),
-    );
-
-    let mut delegate_params = LLMParams::new().provider("mock").model("mock-model");
-    delegate_params.reasoning_effort = reasoning_effort;
-    let delegate_session_provider = Arc::new(
-        crate::session::provider::SessionProvider::new(
-            delegate_plugin_registry,
-            shared_store,
-            delegate_params,
-        )
-        .with_agent_id(Some("reader".into())),
-    );
-    let delegate_event_storage = Arc::new(
-        SqliteStorage::connect(":memory:".into())
-            .await
-            .expect("create delegate event journal storage"),
-    );
-
-    let mut builder = crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
-        delegate_event_storage.clone(),
-        delegate_session_provider,
-        delegate_event_storage.event_journal(),
-    )
-    .with_tool_policy(ToolPolicy::ProviderOnly)
-    .with_max_steps(1)
-    .with_execution_timeout_secs(30);
-
-    if let DelegateBehavior::PauseBeforeLlmCall { entered, release } = &behavior {
-        builder = builder.with_middleware(CancellationGateMiddleware {
-            entered: entered.clone(),
-            release: release.clone(),
-        });
-    }
-
-    if matches!(behavior, DelegateBehavior::StoppedByMiddleware) {
-        builder = builder.with_middleware(AlwaysStopMiddleware);
-    }
-
-    if matches!(
-        behavior,
-        DelegateBehavior::ContextThresholdCompactionSucceeds
-            | DelegateBehavior::ContextThresholdCompactionFails
-    ) {
-        // Install middleware that triggers ContextThreshold once, then passes through.
-        builder = builder.with_middleware(ContextThresholdOnceMiddleware::new());
-
-        // Enable auto-compaction with zero retries so the test doesn't sleep.
-        builder = builder.with_compaction_config(crate::config::CompactionConfig {
-            auto: true,
-            provider: None,
-            model: None,
-            retry: crate::config::RetryConfig {
-                max_retries: 0,
-                initial_backoff_ms: 0,
-                backoff_multiplier: 1.0,
-            },
-        });
-
-        // Allow more steps so the delegate can continue after compaction.
-        builder = builder.with_max_steps(5);
-    }
-
-    let delegate_config = Arc::new(builder.build());
-
-    // Leak the TempDir so its contents survive the test
-    std::mem::forget(delegate_temp_dir);
-
-    Arc::new(crate::agent::LocalAgentHandle::from_config(delegate_config))
-}
-
-fn agent_info(id: &str) -> AgentInfo {
-    AgentInfo {
-        isolation: Default::default(),
-        id: id.to_string(),
-        name: format!("{} name", id),
-        description: format!("{} description", id),
-        capabilities: vec![],
-        required_capabilities: vec![],
-        meta: None,
-    }
-}
-
 // Helper functions moved to crate::test_utils::helpers
 
 #[tokio::test]
@@ -1192,15 +593,7 @@ async fn delegate_session_inherits_parent_connection_bridge() {
         .into_iter()
         .next()
         .expect("child session");
-    let target = harness
-        .config
-        .agent_registry
-        .get_handle("agent")
-        .expect("delegate handle");
-    let target = target
-        .as_any()
-        .downcast_ref::<crate::agent::LocalAgentHandle>()
-        .expect("local delegate");
+    let target = delegate_of(&harness.config, "agent");
     let child = target
         .registry
         .lock()
@@ -1300,15 +693,7 @@ async fn delegate_setup_failure_removes_inherited_bridge_route() {
         .next()
         .expect("child session");
     assert!(harness.session_lifecycle(&child_session_id).await.resolved);
-    let target = harness
-        .config
-        .agent_registry
-        .get_handle("agent")
-        .expect("delegate handle");
-    let target = target
-        .as_any()
-        .downcast_ref::<crate::agent::LocalAgentHandle>()
-        .expect("local delegate");
+    let target = delegate_of(&harness.config, "agent");
     assert!(
         target
             .config
@@ -1325,18 +710,9 @@ async fn delegate_setup_failure_removes_inherited_bridge_route() {
 async fn duplicate_orchestrators_create_one_child_for_one_request() {
     let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
     let config = harness.config.clone();
-    let store = config.provider.history_store();
     let duplicate = Arc::new(
-        DelegationOrchestrator::new(
-            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-            config.event_sink.clone(),
-            store,
-            config.agent_registry.clone(),
-            config.tool_registry_arc(),
-            config.hooks.clone(),
-            None,
-        )
-        .with_delegate_model_overrides(config.delegate_model_overrides.clone()),
+        orchestrator_for(&config)
+            .with_delegate_model_overrides(config.delegate_model_overrides.clone()),
     );
     let duplicate_listener = duplicate.start_listening(config.event_sink.fanout());
     assert_eq!(config.event_sink.fanout().subscriber_count(), 2);
@@ -1353,18 +729,7 @@ async fn duplicate_orchestrators_create_one_child_for_one_request() {
 async fn profile_orchestrator_does_not_poison_unbound_session() {
     let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
     let config = harness.config.clone();
-    let spectator = Arc::new(
-        DelegationOrchestrator::new(
-            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-            config.event_sink.clone(),
-            config.provider.history_store(),
-            config.agent_registry.clone(),
-            config.tool_registry_arc(),
-            config.hooks.clone(),
-            None,
-        )
-        .with_profile_id("owner"),
-    );
+    let spectator = Arc::new(orchestrator_for(&config).with_profile_id("owner"));
     let spectator_listener = spectator.start_listening(config.event_sink.fanout());
 
     let outcome = tokio::time::timeout(
@@ -1390,30 +755,8 @@ async fn unrelated_profile_orchestrator_does_not_claim_delegation() {
         .set_profile_binding(&harness.exec_ctx.session_id, "owner")
         .await
         .expect("bind parent profile");
-    let owner = Arc::new(
-        DelegationOrchestrator::new(
-            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-            config.event_sink.clone(),
-            store.clone(),
-            config.agent_registry.clone(),
-            config.tool_registry_arc(),
-            config.hooks.clone(),
-            None,
-        )
-        .with_profile_id("owner"),
-    );
-    let unrelated = Arc::new(
-        DelegationOrchestrator::new(
-            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-            config.event_sink.clone(),
-            store,
-            config.agent_registry.clone(),
-            config.tool_registry_arc(),
-            config.hooks.clone(),
-            None,
-        )
-        .with_profile_id("other"),
-    );
+    let owner = Arc::new(orchestrator_for(&config).with_profile_id("owner"));
+    let unrelated = Arc::new(orchestrator_for(&config).with_profile_id("other"));
     let owner_listener = owner.start_listening(config.event_sink.fanout());
     let unrelated_listener = unrelated.start_listening(config.event_sink.fanout());
 
@@ -1436,13 +779,12 @@ async fn missing_target_fails_and_unblocks_parent() {
     let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
     harness.stop_harness_orchestrator();
     let config = harness.config.clone();
+    let (empty_roster, empty_dir) = crate::delegation::roster::test_roster().await;
+    std::mem::forget(empty_dir);
     let missing_target = Arc::new(DelegationOrchestrator::new(
-        Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-        config.event_sink.clone(),
-        config.provider.history_store(),
-        Arc::new(DefaultAgentRegistry::new()),
-        config.tool_registry_arc(),
-        config.hooks.clone(),
+        &harness.delegator,
+        empty_roster,
+        &Default::default(),
         None,
     ));
     let listener = missing_target.start_listening(config.event_sink.fanout());
@@ -2342,19 +1684,16 @@ async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct(
         .unwrap();
     let mut verification_tools = crate::tools::ToolRegistry::new();
     verification_tools.add(Arc::new(crate::tools::builtins::ShellTool::new()));
-    let orchestrator = Arc::new(
-        DelegationOrchestrator::new(
-            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-            config.event_sink.clone(),
-            store.clone(),
-            config.agent_registry.clone(),
-            Arc::new(verification_tools),
-            config.hooks.clone(),
-            None,
-        )
-        .with_verification(true)
-        .with_cancel_grace_secs(2),
-    );
+    let settings = crate::config::DelegationSettings {
+        verification: true,
+        cancel_grace_secs: 2,
+        ..Default::default()
+    };
+    let orchestrator = Arc::new({
+        let mut orchestrator = orchestrator_with(&config, &settings);
+        orchestrator.tool_registry = Arc::new(verification_tools);
+        orchestrator
+    });
     let listener = orchestrator.start_listening(config.event_sink.fanout());
     let mut events = config.subscribe_events();
     config.emit_event(
@@ -2391,11 +1730,7 @@ async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct(
     .expect("actual verification shell must be waiting before cancellation");
     let activity = config.event_sink.live_delegation_activity(&parent_id);
     let child_id = activity[0].child_session_id.clone().unwrap();
-    let delegate = config.agent_registry.get_handle("agent").unwrap();
-    let local = delegate
-        .as_any()
-        .downcast_ref::<crate::agent::LocalAgentHandle>()
-        .unwrap();
+    let local = delegate_of(&config, "agent");
     let child = local
         .observe_session_runtimes(std::slice::from_ref(&child_id))
         .await
@@ -2464,6 +1799,7 @@ async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct(
                 cwd: None,
                 created_at: 0,
                 title: None,
+                fork_origin: None,
             })
             .await
             .unwrap();
@@ -2648,18 +1984,11 @@ async fn verification_failure_resolves_terminal_delegate_child() {
         })
         .await
         .expect("create verification delegation");
-    let orchestrator = Arc::new(
-        DelegationOrchestrator::new(
-            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-            config.event_sink.clone(),
-            store.clone(),
-            config.agent_registry.clone(),
-            config.tool_registry_arc(),
-            config.hooks.clone(),
-            None,
-        )
-        .with_verification(true),
-    );
+    let settings = crate::config::DelegationSettings {
+        verification: true,
+        ..Default::default()
+    };
+    let orchestrator = Arc::new(orchestrator_with(&config, &settings));
     let listener = orchestrator.start_listening(config.event_sink.fanout());
     config.event_sink.emit_ephemeral(
         &parent_session_id,

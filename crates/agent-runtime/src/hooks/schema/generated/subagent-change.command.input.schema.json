@@ -1,0 +1,86 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "NullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "description": "Input of `subagent_added` and `subagent_removed`. A roster change belongs\nto the agent, not to a session, so there is no `session_id`.",
+  "properties": {
+    "capabilities": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "cwd": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/NullableString"
+        }
+      ],
+      "description": "Working directory of the root agent, when it has one."
+    },
+    "description": {
+      "type": "string"
+    },
+    "generation": {
+      "description": "Roster generation the change produced.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "hook_event_name": {
+      "enum": [
+        "subagent_added",
+        "subagent_removed"
+      ],
+      "type": "string"
+    },
+    "location": {
+      "enum": [
+        "local",
+        "remote"
+      ],
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "origin": {
+      "enum": [
+        "config",
+        "protocol",
+        "runtime"
+      ],
+      "type": "string"
+    },
+    "profile_id": {
+      "description": "Profile whose runtime changed; `null` outside profiles.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "subagent_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "hook_event_name",
+    "subagent_id",
+    "name",
+    "description",
+    "capabilities",
+    "origin",
+    "location",
+    "generation",
+    "cwd"
+  ],
+  "title": "subagent-change.command.input",
+  "type": "object"
+}

@@ -62,6 +62,8 @@ pub(crate) enum RemoteConnectReason {
     OperationRecovery,
     /// Startup reattachment of bookmarked sessions.
     StartupReattach,
+    /// Attaching the session a delegation opened on a remote member.
+    Delegation,
     /// Extension-level attach request (`remote/attach_session`).
     ExtensionAttach,
 }
@@ -73,6 +75,7 @@ impl RemoteConnectReason {
             Self::ExplicitReconnect => "explicit_reconnect",
             Self::OperationRecovery => "operation_recovery",
             Self::StartupReattach => "startup_reattach",
+            Self::Delegation => "delegation",
             Self::ExtensionAttach => "extension_attach",
         }
     }
@@ -85,7 +88,7 @@ impl RemoteConnectReason {
     /// stay generation-exact. Open-time and first-attach paths reuse.
     pub(crate) fn default_replace_policy(self) -> RemoteReplacePolicy {
         match self {
-            Self::Open | Self::StartupReattach | Self::ExtensionAttach => {
+            Self::Open | Self::StartupReattach | Self::ExtensionAttach | Self::Delegation => {
                 RemoteReplacePolicy::ReuseIfPresent
             }
             Self::ExplicitReconnect | Self::OperationRecovery => {
@@ -103,6 +106,7 @@ impl RemoteConnectReason {
             Self::ExplicitReconnect => ("QUERYMT_REMOTE_CONNECT_RECONNECT_BUDGET_MS", 15_000),
             Self::OperationRecovery => ("QUERYMT_REMOTE_CONNECT_OPERATION_BUDGET_MS", 10_000),
             Self::StartupReattach => ("QUERYMT_REMOTE_CONNECT_STARTUP_BUDGET_MS", 10_000),
+            Self::Delegation => ("QUERYMT_REMOTE_CONNECT_DELEGATION_BUDGET_MS", 10_000),
             Self::ExtensionAttach => ("QUERYMT_REMOTE_CONNECT_ATTACH_BUDGET_MS", 15_000),
         };
         let timeout_ms = std::env::var(env_var)
@@ -431,6 +435,9 @@ pub(crate) struct RemoteConnectOptions<'a> {
     /// The caller will load a recent window: a fresh attachment fetches the
     /// recent tail first and fills older history afterwards.
     pub(crate) windowed: bool,
+    /// Recorded on the bookmark when the attach is confirmed. `Delegation`
+    /// marks a session a delegation opened.
+    pub(crate) fork_origin: Option<crate::session::domain::ForkOrigin>,
 }
 
 // ── Per-session failure cooldown ────────────────────────────────────────
@@ -543,6 +550,7 @@ impl LocalAgentHandle {
                 replace: reason.default_replace_policy(),
                 handoff: None,
                 windowed: false,
+                fork_origin: None,
             },
         )
         .await
@@ -874,7 +882,16 @@ impl LocalAgentHandle {
                     }
                 })?;
             let merged = self
-                .build_connect_bookmark(session_id, &node_id, &peer_label, None, None, None)
+                .build_connect_bookmark(
+                    session_id,
+                    RemoteSessionBookmarkUpdate {
+                        node_id: Some(node_id.clone()),
+                        peer_label: Some(peer_label.clone()),
+                        fork_origin: options.fork_origin.clone(),
+                        ..Default::default()
+                    },
+                    None,
+                )
                 .await?;
             return self
                 .attach_and_verify_remote(
@@ -903,7 +920,16 @@ impl LocalAgentHandle {
 
         if let Some((remote_ref, matched_scope)) = dht_hit {
             let merged = self
-                .build_connect_bookmark(session_id, &node_id, &peer_label, None, None, None)
+                .build_connect_bookmark(
+                    session_id,
+                    RemoteSessionBookmarkUpdate {
+                        node_id: Some(node_id.clone()),
+                        peer_label: Some(peer_label.clone()),
+                        fork_origin: options.fork_origin.clone(),
+                        ..Default::default()
+                    },
+                    None,
+                )
                 .await?;
             match self
                 .attach_and_verify_remote(
@@ -1005,10 +1031,13 @@ impl LocalAgentHandle {
         let merged = self
             .build_connect_bookmark(
                 session_id,
-                &node_id,
-                &peer_label,
-                resumed.cwd,
-                resumed.title,
+                RemoteSessionBookmarkUpdate {
+                    node_id: Some(node_id.clone()),
+                    peer_label: Some(peer_label.clone()),
+                    cwd: resumed.cwd,
+                    title: resumed.title,
+                    fork_origin: options.fork_origin.clone(),
+                },
                 Some(resumed.created_at),
             )
             .await?;
@@ -1279,10 +1308,7 @@ impl LocalAgentHandle {
     async fn build_connect_bookmark(
         &self,
         session_id: &str,
-        node_id: &str,
-        peer_label: &str,
-        cwd: Option<String>,
-        title: Option<String>,
+        update: RemoteSessionBookmarkUpdate,
         fallback_created_at: Option<i64>,
     ) -> Result<RemoteSessionBookmark, RemoteSessionConnectError> {
         let store = self.config.provider.history_store();
@@ -1293,12 +1319,6 @@ impl LocalAgentHandle {
                 session_id: session_id.to_string(),
                 message: e.to_string(),
             })?;
-        let update = RemoteSessionBookmarkUpdate {
-            node_id: Some(node_id.to_string()),
-            peer_label: Some(peer_label.to_string()),
-            cwd: cwd.clone(),
-            title: title.clone(),
-        };
         let merged = match existing {
             Some(bookmark) => {
                 log::debug!(
@@ -1309,16 +1329,17 @@ impl LocalAgentHandle {
             }
             None => RemoteSessionBookmark {
                 session_id: session_id.to_string(),
-                node_id: node_id.to_string(),
-                peer_label: peer_label.to_string(),
-                cwd,
+                node_id: update.node_id.unwrap_or_default(),
+                peer_label: update.peer_label.unwrap_or_default(),
+                cwd: update.cwd,
                 created_at: fallback_created_at.unwrap_or_else(|| {
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0)
                 }),
-                title,
+                title: update.title,
+                fork_origin: update.fork_origin,
             },
         };
         Ok(merged)
@@ -1465,6 +1486,7 @@ mod tests {
             cwd: Some("/remote/work".to_string()),
             created_at: 1_700_000_000,
             title: Some("remote session".to_string()),
+            fork_origin: None,
         }
     }
 

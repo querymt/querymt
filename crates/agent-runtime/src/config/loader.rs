@@ -71,6 +71,11 @@ pub(crate) fn ensure_inline_system_parts(parts: &[SystemPart], context: &str) ->
     Ok(())
 }
 
+/// Logged once for every load of a `[quorum]` configuration.
+pub(crate) const QUORUM_DEPRECATION_NOTICE: &str = "`[quorum]` and `[planner]` configuration is deprecated: \
+     use `[agent]` for the root agent, `[[delegates]]` for its delegates and \
+     `[agent.delegation]` for the delegation settings";
+
 /// Build typed config from a parsed TOML value.
 async fn build_config_from_toml_value(
     mut value: toml::Value,
@@ -80,6 +85,20 @@ async fn build_config_from_toml_value(
     // deserialization so it cannot affect agent behavior; all other unknown fields stay rejected.
     if let Some(table) = value.as_table_mut() {
         table.remove("profile");
+    }
+
+    // `[agent]` is the one way to describe an agent. A file that also has the
+    // deprecated `[quorum]` or `[planner]` would have two roots.
+    if value.get("agent").is_some() {
+        for table in ["quorum", "planner"] {
+            if value.get(table).is_some() {
+                return Err(anyhow!(
+                    "Invalid config file: `[{table}]` cannot be combined with `[agent]`; \
+                     describe delegates with `[[delegates]]` and their settings with \
+                     `[agent.delegation]`"
+                ));
+            }
+        }
     }
 
     let config = if value.get("agent").is_some() {
@@ -96,6 +115,7 @@ async fn build_config_from_toml_value(
             &config.agent.permissions,
             &config.mcp.iter().collect::<Vec<_>>(),
         )?;
+        validate_agent_delegation(&config)?;
 
         // Step 5: Resolve system prompt file references
         match &resolution {
@@ -103,9 +123,19 @@ async fn build_config_from_toml_value(
                 let resolved =
                     resolve_system_parts(&config.agent.system, base_path, "agent").await?;
                 config.agent.system = resolved.into_iter().map(SystemPart::from).collect();
+                for delegate in &mut config.delegates {
+                    let context = format!("delegate '{}'", delegate.id);
+                    let resolved =
+                        resolve_system_parts(&delegate.system, base_path, &context).await?;
+                    delegate.system = resolved.into_iter().map(SystemPart::from).collect();
+                }
             }
             PromptResolution::RejectFileRefs => {
                 ensure_inline_system_parts(&config.agent.system, "agent.system")?;
+                for delegate in &config.delegates {
+                    let context = format!("delegate '{}'.system", delegate.id);
+                    ensure_inline_system_parts(&delegate.system, &context)?;
+                }
             }
         }
 
@@ -174,6 +204,7 @@ async fn build_config_from_toml_value(
                 std::mem::take(&mut config.quorum.repository_knowledge).anchored_at(base_path);
         }
         validate_delegate_isolation(&config)?;
+        log::warn!("{QUORUM_DEPRECATION_NOTICE}");
 
         Config::Multi(Box::new(config))
     } else {
@@ -274,6 +305,47 @@ pub(crate) fn validate_peer_delegates(
                 peer_name,
             ));
         }
+    }
+    Ok(())
+}
+
+/// The delegates and delegation settings of an `[agent]` configuration.
+///
+/// Fails at load time, naming the offender, for a duplicate delegate ID, a
+/// delegate configured `isolated` without `[agent.workspace] enabled = true`,
+/// a `peer` without an enabled mesh, an invalid MCP server or approval list,
+/// and `max_parallel = 0`.
+pub(crate) fn validate_agent_delegation(config: &SingleAgentConfig) -> Result<()> {
+    if let Some(policy) = config.agent.snapshot_policy.as_deref() {
+        policy
+            .parse::<crate::agent::core::SnapshotPolicy>()
+            .map_err(|error| anyhow!("`[agent] snapshot_policy`: {error}"))?;
+    }
+    let mut seen = HashSet::new();
+    for delegate in &config.delegates {
+        if !seen.insert(delegate.id.as_str()) {
+            return Err(anyhow!("duplicate delegate id '{}'", delegate.id));
+        }
+        validate_mcp_servers(&delegate.mcp)?;
+        validate_permissions(
+            &format!("delegate '{}'", delegate.id),
+            &delegate.tools,
+            &delegate.permissions,
+            &config.mcp.iter().chain(&delegate.mcp).collect::<Vec<_>>(),
+        )?;
+    }
+    validate_peer_delegates(&config.delegates, &config.mesh)?;
+    if !config.agent.workspace.enabled
+        && let Some(delegate) = config
+            .delegates
+            .iter()
+            .find(|d| d.isolation == crate::worktree::DelegationIsolation::Isolated)
+    {
+        return Err(anyhow!(
+            "delegate '{}' has `isolation = \"isolated\"` but `[agent.workspace] enabled` is false; \
+             enable the workspace service or use `inherit`/`shared`",
+            delegate.id
+        ));
     }
     Ok(())
 }

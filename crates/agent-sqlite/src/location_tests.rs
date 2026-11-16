@@ -31,6 +31,7 @@ impl Fixture {
             cwd: Some("/srv/work".to_string()),
             created_at: 1_700_000_000,
             title: Some("Remote session".to_string()),
+            fork_origin: None,
         }
     }
 }

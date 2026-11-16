@@ -185,6 +185,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0037_session_message_read_indexes",
         apply: migration_0037_session_message_read_indexes,
     },
+    Migration {
+        version: "0038_remote_bookmark_fork_origin",
+        apply: migration_0038_remote_bookmark_fork_origin,
+    },
 ];
 
 /// Indexes for session message reads.
@@ -207,6 +211,27 @@ fn migration_0037_session_message_read_indexes(
              WHERE part_type IN ('prompt', 'steering');
          DROP INDEX IF EXISTS idx_messages_session;",
     )
+}
+
+/// Why a bookmarked remote session exists (`delegation` for a session opened
+/// by a delegation). The owning node holds the session row, so without this a
+/// bookmark list cannot tell a delegated child from a user session. Existing
+/// rows stay NULL, which is what they were.
+fn migration_0038_remote_bookmark_fork_origin(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    let existing: HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(remote_session_bookmarks)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?
+    };
+    if !existing.contains("fork_origin") {
+        conn.execute(
+            "ALTER TABLE remote_session_bookmarks ADD COLUMN fork_origin TEXT",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 /// Mark revert frames recorded by an undo whose restore failed part-way.

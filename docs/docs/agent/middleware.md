@@ -151,7 +151,7 @@ You are in review mode. Provide feedback only.
 ```
 
 **Features:**
-- The initial session mode is not set here; use `mode` on `[agent]`, `[planner]` or `[[delegates]]`
+- The initial session mode is not set here; use `mode` on `[agent]` or `[[delegates]]`
 - `reminder`: System message for plan mode
 - `review_reminder`: System message for review mode
 
@@ -483,7 +483,7 @@ option2 = 42
 use querymt_agent::prelude::*;
 use querymt_agent::middleware::MiddlewareDriver;
 
-let agent = Agent::single()
+let agent = Agent::builder()
     .provider("anthropic", "claude-sonnet-4-5-20250929")
     .cwd(".")
     .tools(["read_tool", "shell"])

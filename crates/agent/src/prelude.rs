@@ -6,14 +6,14 @@
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Single agent
-//! let agent = Agent::single()
+//! let agent = Agent::builder()
 //!     .provider("anthropic", "claude-sonnet-4-20250514")
 //!     .build()
 //!     .await?;
 //!
-//! // Multi-agent (same Agent type back)
-//! let agent = Agent::multi()
-//!     .planner(|p| p.provider("openai", "gpt-4"))
+//! // With members it can delegate to (same Agent type back)
+//! let agent = Agent::builder()
+//!     .provider("openai", "gpt-4")
 //!     .delegate("coder", |d| d.provider("anthropic", "claude-sonnet-4-20250514"))
 //!     .build()
 //!     .await?;
@@ -27,8 +27,8 @@ pub use crate::error::AgentError;
 // High-level APIs
 pub use crate::api::{
     Agent, AgentBuilder, AgentInfra, AgentMesh, AgentProfiles, AgentSession, DelegateConfigBuilder,
-    Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec, PlannerConfigBuilder, ProfileRuntimeHandle,
-    QuorumBuilder,
+    Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec, ProfileRuntimeHandle, SubagentChange,
+    SubagentChangeKind, SubagentInfo,
 };
 // Config and runner APIs
 pub use crate::config::{
@@ -41,18 +41,18 @@ pub use crate::runner::{
 };
 
 // Core agent types
-pub use crate::agent::{AgentHandle, LocalAgentHandle, SnapshotPolicy, ToolPolicy};
-pub use crate::quorum::{AgentQuorum, DelegateAgent};
+pub use crate::agent::{LocalAgentHandle, SnapshotPolicy, ToolPolicy};
 
 // Events
 pub use crate::events::{AgentEvent, AgentEventKind};
 
 // Delegation & Multi-agent
-pub use crate::delegation::{AgentInfo, AgentRegistry};
+pub use crate::delegation::AgentInfo;
+pub use crate::delegation::member::MemberSpec;
+pub use crate::delegation::roster::{AgentId, AgentRoster, RosterError, RosterGeneration};
 
 // Configuration types
-pub use crate::agent::DelegationContextTiming;
-pub use crate::middleware::{ContextConfig, DelegationConfig, LimitsConfig, MiddlewarePresets};
+pub use crate::middleware::{ContextConfig, LimitsConfig, MiddlewarePresets};
 
 // Session & Storage
 pub use crate::session::domain::Task;

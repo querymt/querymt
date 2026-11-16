@@ -438,7 +438,7 @@ mod tests {
                 .await
                 .expect("in-memory storage"),
         );
-        let root = crate::api::Agent::single()
+        let root = crate::api::Agent::builder()
             .provider("test", "test-model")
             .infra(AgentInfra {
                 plugin_registry: Arc::new(registry),

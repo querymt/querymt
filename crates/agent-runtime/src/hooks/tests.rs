@@ -10,7 +10,7 @@ use crate::hooks::schema::{
 };
 use crate::hooks::{HookCommandConfig, HookEventConfig, HookMcpToolConfig};
 use schemars::JsonSchema;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 
@@ -150,6 +150,8 @@ fn generated_hook_schemas_match_expected_fixtures() {
         schema::DELEGATION_FAILURE_OUTPUT_FIXTURE,
         schema::SESSION_END_INPUT_FIXTURE,
         schema::SESSION_END_OUTPUT_FIXTURE,
+        schema::SUBAGENT_CHANGE_INPUT_FIXTURE,
+        schema::SUBAGENT_CHANGE_OUTPUT_FIXTURE,
     ] {
         let generated = std::fs::read(generated_dir.join(file_name)).expect("generated fixture");
         let expected = std::fs::read(expected_dir.join(file_name)).expect("expected fixture");
@@ -507,6 +509,148 @@ fn command_hook(command: String) -> HookHandlerConfig {
         additional_context_limit: None,
         env: BTreeMap::new(),
     })
+}
+
+fn subagent_request(
+    event: HookEventConfig,
+    id: &str,
+    cwd: Option<std::path::PathBuf>,
+) -> super::engine::SubagentChangeRequest {
+    super::engine::SubagentChangeRequest {
+        event,
+        subagent_id: id.into(),
+        name: id.into(),
+        description: "reviews".into(),
+        capabilities: vec!["review".into()],
+        origin: "runtime".into(),
+        location: "local".into(),
+        generation: 7,
+        profile_id: None,
+        cwd,
+    }
+}
+
+#[tokio::test]
+async fn subagent_hooks_receive_the_change_and_match_on_the_id() {
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("seen.json");
+    let command = format!("cat > '{}'", out.display());
+    let config = HooksConfig {
+        enabled: true,
+        subagent_added: vec![MatcherGroupConfig {
+            matcher: Some("^rev".into()),
+            hooks: vec![command_hook(command.clone())],
+        }],
+        subagent_removed: vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![command_hook(command)],
+        }],
+        ..HooksConfig::default()
+    };
+    let hooks = Hooks::new(config).unwrap();
+
+    // A non-matching ID runs nothing.
+    hooks
+        .run_subagent_change(subagent_request(
+            HookEventConfig::SubagentAdded,
+            "coder",
+            Some(dir.path().into()),
+        ))
+        .await
+        .unwrap();
+    assert!(!out.exists());
+
+    hooks
+        .run_subagent_change(subagent_request(
+            HookEventConfig::SubagentAdded,
+            "reviewer",
+            Some(dir.path().into()),
+        ))
+        .await
+        .unwrap();
+    let seen: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_matches_schema::<crate::hooks::schema::SubagentChangeCommandInput>(&seen);
+    assert_eq!(seen["hook_event_name"], "subagent_added");
+    assert_eq!(seen["subagent_id"], "reviewer");
+    assert_eq!(seen["origin"], "runtime");
+    assert_eq!(seen["generation"], 7);
+    assert_eq!(seen["capabilities"], json!(["review"]));
+    assert!(seen["profile_id"].is_null());
+
+    hooks
+        .run_subagent_change(subagent_request(
+            HookEventConfig::SubagentRemoved,
+            "coder",
+            Some(dir.path().into()),
+        ))
+        .await
+        .unwrap();
+    let seen: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(seen["hook_event_name"], "subagent_removed");
+    assert_eq!(seen["subagent_id"], "coder");
+}
+
+#[tokio::test]
+async fn subagent_hook_messages_become_notices_and_blocks_are_ignored() {
+    let config = HooksConfig {
+        enabled: true,
+        subagent_added: vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![
+                command_hook("printf '%s' '{\"system_message\":\"welcome\"}'".into()),
+                command_hook("echo no >&2; exit 2".into()),
+            ],
+        }],
+        ..HooksConfig::default()
+    };
+    assert_matches_schema::<crate::hooks::schema::SubagentChangeCommandOutputWire>(
+        &json!({"system_message":"welcome"}),
+    );
+    let result = Hooks::new(config)
+        .unwrap()
+        .run_subagent_change(subagent_request(HookEventConfig::SubagentAdded, "a", None))
+        .await
+        .unwrap();
+    assert!(
+        result
+            .notices
+            .iter()
+            .any(|n| n.message == "welcome" && !n.is_error)
+    );
+    assert!(
+        result
+            .notices
+            .iter()
+            .any(|n| n.message.contains("observe-only")),
+        "a block request is reported, not obeyed: {:?}",
+        result.notices
+    );
+}
+
+#[test]
+fn subagent_events_have_labels_and_reject_mcp_handlers() {
+    assert_eq!(HookEventConfig::SubagentAdded.label(), "subagent_added");
+    assert_eq!(HookEventConfig::SubagentRemoved.label(), "subagent_removed");
+    let config = HooksConfig {
+        subagent_added: vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![HookHandlerConfig::McpTool(HookMcpToolConfig {
+                server: "s".into(),
+                tool: "t".into(),
+                ..Default::default()
+            })],
+        }],
+        ..HooksConfig::default()
+    };
+    // These events run outside any session, so no MCP tool state exists.
+    assert!(matches!(
+        Hooks::new(config),
+        Err(crate::hooks::HookError::Config(
+            crate::hooks::HookConfigError::McpUnsupported {
+                event: "subagent_added"
+            }
+        ))
+    ));
 }
 
 #[tokio::test]

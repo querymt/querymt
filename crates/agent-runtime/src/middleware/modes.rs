@@ -9,7 +9,7 @@
 //! ```ignore
 //! use querymt_agent::middleware::AgentModeMiddleware;
 //!
-//! let agent = Agent::single()
+//! let agent = Agent::builder()
 //!     .provider("anthropic", "claude-sonnet")
 //!     .with_agent_mode(AgentMode::Plan)
 //!     .with_agent_mode_middleware("You are in plan mode. Only observe and plan.")

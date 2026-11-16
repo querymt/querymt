@@ -1,6 +1,7 @@
 """Type stubs for the QueryMT Agent Python bindings."""
 
-from typing import Any, Literal, Mapping, TypedDict
+from typing import Any, Callable, Literal, Mapping, TypedDict
+from typing_extensions import deprecated
 
 __all__: list[str]
 
@@ -15,6 +16,47 @@ class WorktreeError(RuntimeError):
     """
 
     code: str
+
+class SubagentError(RuntimeError):
+    """Changing the agent's subagents failed; the set is unchanged.
+
+    ``code`` is one of ``invalid_id``, ``duplicate_id``, ``unknown_agent``,
+    ``delegation_disabled`` (the root's ``tools`` must include ``delegate``),
+    ``mesh_required``, ``peer_routing_unsupported``, ``file_prompt_part``,
+    ``isolation_without_workspace`` or ``build_failed``.
+    """
+
+    code: str
+
+class SubagentSpec(TypedDict, total=False):
+    id: str  # required
+    provider: str  # required
+    model: str  # required
+    system: str
+    tools: list[str]
+    description: str
+    capabilities: list[str]
+    mode: Literal["build", "plan", "review"]
+    api_key: str
+    base_url: str
+
+class SubagentInfo(TypedDict):
+    id: str
+    name: str
+    description: str
+    capabilities: list[str]
+    origin: Literal["config", "protocol", "runtime"]
+    location: Literal["local", "remote"]
+
+class SubagentChange(TypedDict):
+    kind: Literal["added", "removed"]
+    id: str
+    name: str
+    description: str
+    capabilities: list[str]
+    origin: Literal["config", "protocol", "runtime"]
+    location: Literal["local", "remote"]
+    generation: int
 
 class WorktreeOptions(TypedDict, total=False):
     storage_root: str
@@ -75,7 +117,7 @@ class AgentSession:
 
 class Agent:
     @staticmethod
-    async def single(
+    async def create(
         provider: str,
         model: str,
         cwd: str | None = None,
@@ -92,6 +134,7 @@ class Agent:
         max_prompt_bytes: int | None = None,
         execution_timeout_secs: int | None = None,
         worktrees: bool | WorktreeOptions | None = None,
+        subagents: list[SubagentSpec] | None = None,
     ) -> Agent:
         """``worktrees=True`` (or a dict with ``storage_root``/``baseline``)
         enables the workspace service. It never isolates a session on its own:
@@ -103,6 +146,9 @@ class Agent:
         ``server.tool`` or ``server.*``. ``approval_timeout_sec`` rejects
         unanswered prompts. ``mode`` is ``"build"``, ``"plan"`` or ``"review"``.
         Invalid values raise ``ValueError``."""
+    @staticmethod
+    @deprecated("Use Agent.create(); every agent can have subagents")
+    async def single(*args: Any, **kwargs: Any) -> Agent: ...
     @staticmethod
     async def from_config(path: str) -> Agent: ...
     async def chat(self, prompt: str) -> str: ...
@@ -130,4 +176,42 @@ class Agent:
     async def load_session(self, session_id: str) -> AgentSession: ...
     async def delete_session(self, session_id: str) -> None: ...
     async def set_provider(self, provider: str, model: str) -> None: ...
-    def is_multi(self) -> bool: ...
+    async def add_subagent(
+        self,
+        id: str,
+        provider: str,
+        model: str,
+        system: str | None = None,
+        tools: list[str] | None = None,
+        description: str | None = None,
+        capabilities: list[str] | None = None,
+        mode: Literal["build", "plan", "review"] | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ) -> int:
+        """Add a subagent while the agent runs. The root's ``delegate`` tool
+        lists it from the next turn. Returns the new roster generation.
+        Raises :class:`SubagentError`. Lasts until the agent stops."""
+    async def remove_subagent(self, id: str) -> int:
+        """Remove a subagent. A delegation already running on it finishes.
+        Returns the new roster generation."""
+    @property
+    def subagents(self) -> list[SubagentInfo]:
+        """The current subagents, ordered by id."""
+    @property
+    def roster_generation(self) -> int:
+        """Number of subagent changes since the agent started."""
+    def on_delegation(self, callback: Callable[[str, str], None]) -> None:
+        """``callback(agent_id, objective)`` when the root delegates."""
+    def on_tool_call(self, callback: Callable[[str, Any], None]) -> None:
+        """``callback(tool_name, arguments)`` for every tool call."""
+    def has_subagents(self) -> bool:
+        """True when the agent has subagents it can delegate to (from
+        configuration, the ``.agents`` directory, or added while running)."""
+    def on_subagents_changed(self, callback: Callable[[SubagentChange], None]) -> None:
+        """``callback(change)`` whenever a subagent is added or removed, from
+        any path. Refused changes are not reported. An exception in the
+        callback is printed and does not affect the change."""
+    @deprecated("Use has_subagents()")
+    def is_multi(self) -> bool:
+        """Deprecated alias of :meth:`has_subagents`."""

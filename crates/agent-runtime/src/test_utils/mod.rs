@@ -3,6 +3,7 @@
 //! This module provides shared mocks, helpers, and test infrastructure
 //! to reduce code duplication across test files.
 
+pub mod delegation;
 pub mod drivers;
 pub mod fixtures;
 pub mod helpers;

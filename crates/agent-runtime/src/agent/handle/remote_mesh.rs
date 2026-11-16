@@ -25,19 +25,17 @@ impl LocalAgentHandle {
     #[cfg(feature = "remote")]
     pub fn set_mesh(&self, mesh: crate::agent::remote::MeshHandle) {
         self.set_mesh_local(mesh.clone());
-        for agent in self.config.agent_registry.list_agents() {
-            if let Some(handle) = self.config.agent_registry.get_handle(&agent.id) {
-                if let Some(local) = handle.as_any().downcast_ref::<LocalAgentHandle>() {
-                    local.set_mesh_local(mesh.clone());
-                } else {
-                    handle.set_mesh_handle(mesh.clone());
-                }
-            }
+        if let Some(roster) = self.config.roster() {
+            // Members built from now on join the mesh as they are built.
+            roster.context().set_mesh(Some(mesh.clone()));
+        }
+        for local in self.local_members() {
+            local.set_mesh_local(mesh.clone());
         }
     }
 
     #[cfg(feature = "remote")]
-    fn set_mesh_local(&self, mesh: crate::agent::remote::MeshHandle) {
+    pub(crate) fn set_mesh_local(&self, mesh: crate::agent::remote::MeshHandle) {
         *self.mesh.lock().unwrap_or_else(|e| e.into_inner()) = Some(mesh.clone());
         self.config.provider.set_mesh(Some(mesh.clone()));
 
@@ -58,12 +56,11 @@ impl LocalAgentHandle {
     #[cfg(feature = "remote")]
     pub fn clear_mesh(&self) {
         self.clear_mesh_local();
-        for agent in self.config.agent_registry.list_agents() {
-            if let Some(handle) = self.config.agent_registry.get_handle(&agent.id)
-                && let Some(local) = handle.as_any().downcast_ref::<LocalAgentHandle>()
-            {
-                local.clear_mesh_local();
-            }
+        if let Some(roster) = self.config.roster() {
+            roster.context().set_mesh(None);
+        }
+        for local in self.local_members() {
+            local.clear_mesh_local();
         }
     }
 

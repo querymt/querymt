@@ -1,100 +1,47 @@
-//! Tests for protocol delegation-target registration (tasks 3.2, 3.3, 3.4).
-//!
-//! These tests exercise the registry integration layer directly: lazy
-//! materialization, one handle per target, explicit-target precedence, and the
-//! rule that protocol loading never enables delegation and never launches
-//! unsupported connections.
+//! Tests for protocol delegation targets in the roster: collision handling,
+//! build on first use, and unsupported connections.
 
 use super::*;
-use crate::agent::handle::AgentHandle as AgentHandleTrait;
-use crate::delegation::{AgentInfo, AgentRegistry, DefaultAgentRegistry};
+use crate::delegation::member::MemberBuildSpec;
+use crate::delegation::roster::{
+    AgentRoster, Member, MemberAgent, MemberOrigin, RosterSnapshot, test_roster,
+};
 use crate::dotagents::{
     DotagentsAgent, DotagentsAgentConfig, DotagentsAgentConnection, DotagentsAgentConnectionType,
     DotagentsAgentRole, DotagentsLayer, DotagentsManifest, DotagentsSource, DotagentsSubAgentPlans,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// A factory that counts how many times each plan was created and returns a
-/// trivial handle. It proves laziness and single-materialization without
-/// needing a real provider.
-struct CountingFactory {
-    created: Arc<AtomicUsize>,
+/// Adds the plans that survive the merge to `roster` as protocol members.
+fn add_protocol_members(
+    roster: &AgentRoster,
+    plans: &DotagentsSubAgentPlans,
+) -> DotagentsTargetMerge {
+    let merge = merge_protocol_targets(plans, Some(&roster.snapshot()));
+    for plan in merge.accepted.clone() {
+        let spec = MemberBuildSpec::from_protocol_plan(&plan, None).unwrap();
+        roster
+            .add(Member::pending(
+                plan.info.clone(),
+                MemberOrigin::Protocol,
+                spec,
+            ))
+            .unwrap();
+    }
+    merge
 }
 
-impl ProtocolTargetFactory for CountingFactory {
-    fn create(
-        &self,
-        _plan: &crate::dotagents::DotagentsSubAgentPlan,
-    ) -> Option<Arc<dyn AgentHandleTrait>> {
-        self.created.fetch_add(1, Ordering::SeqCst);
-        Some(Arc::new(StubHandle))
-    }
-}
-
-/// Minimal handle used to observe materialization.
-struct StubHandle;
-
-#[async_trait::async_trait]
-impl AgentHandleTrait for StubHandle {
-    async fn new_session(
-        &self,
-        _req: crate::acp::protocol::NewSessionRequest,
-    ) -> Result<crate::acp::protocol::NewSessionResponse, crate::acp::protocol::Error> {
-        Err(crate::acp::protocol::Error::internal_error())
-    }
-
-    async fn prompt(
-        &self,
-        _req: crate::acp::protocol::PromptRequest,
-    ) -> Result<crate::acp::protocol::PromptResponse, crate::acp::protocol::Error> {
-        Err(crate::acp::protocol::Error::internal_error())
-    }
-
-    async fn cancel(
-        &self,
-        _notif: crate::acp::protocol::CancelNotification,
-    ) -> Result<(), crate::acp::protocol::Error> {
-        Ok(())
-    }
-
-    async fn load_session(
-        &self,
-        _req: crate::acp::protocol::LoadSessionRequest,
-    ) -> Result<crate::acp::protocol::LoadSessionResponse, crate::acp::protocol::Error> {
-        Err(crate::acp::protocol::Error::internal_error())
-    }
-
-    async fn create_delegation_session(
-        &self,
-        _cwd: Option<String>,
-        _parent_session_id: String,
-    ) -> Result<(String, crate::agent::remote::SessionActorRef), crate::acp::protocol::Error> {
-        Err(crate::acp::protocol::Error::internal_error())
-    }
-
-    fn subscribe_events(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope> {
-        let (tx, rx) = tokio::sync::broadcast::channel(1);
-        drop(tx);
-        rx
-    }
-
-    fn event_fanout(&self) -> &Arc<querymt_agent_services::event_fanout::EventFanout> {
-        unimplemented!("not needed for registry tests")
-    }
-
-    fn emit_event(&self, _session_id: &str, _kind: querymt_agent_core::events::AgentEventKind) {}
-
-    fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
-        Arc::new(DefaultAgentRegistry::new())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
+fn explicit_member(roster: &AgentRoster, id: &str, name: &str) {
+    let mut info = crate::test_utils::delegation::agent_info(id);
+    info.name = name.to_string();
+    roster
+        .add(Member::pending(
+            info,
+            MemberOrigin::Config,
+            MemberBuildSpec::new(crate::delegation::roster::AgentId::try_from(id).unwrap()),
+        ))
+        .unwrap();
 }
 
 fn protocol_agent(id: &str) -> DotagentsAgent {
@@ -155,20 +102,11 @@ fn plans_from(items: Vec<crate::dotagents::DotagentsSubAgentPlan>) -> DotagentsS
 
 #[test]
 fn protocol_layer_precedence_prefers_workspace_over_global() {
-    // Cross-layer precedence is applied upstream by `merge_layers`: the workspace
-    // layer replaces a matching ID from the global layer, so only the winning
-    // definition reaches a plan. Verify the plan set keeps the winner and that
-    // the losing definition is surfaced as a layer collision diagnostic when a
-    // caller merges layer-assembled plans manually.
     let global = plan_in_layer("shared", DotagentsLayer::Global);
     let workspace = plan_in_layer("shared", DotagentsLayer::Workspace);
-
-    // The winner is the workspace definition.
     assert_eq!(workspace.source.layer, DotagentsLayer::Workspace);
     assert_eq!(workspace.system_prompt, "shared body from workspace");
 
-    // Merging a two-layer plan set yields the winning entry plus a diagnostic
-    // naming both layers.
     let plans = plans_from(vec![workspace.clone()]);
     let merge = merge_protocol_targets(&plans, None);
     assert_eq!(merge.accepted.len(), 1);
@@ -189,32 +127,19 @@ fn protocol_layer_precedence_prefers_workspace_over_global() {
     assert!(diagnostic.source.is_some(), "diagnostic carries provenance");
 }
 
-#[test]
-fn explicit_config_precedence_beats_protocol_layers() {
+#[tokio::test]
+async fn explicit_config_precedence_beats_protocol_layers() {
     let plans = plans_from(vec![plan_in_layer("shared", DotagentsLayer::Workspace)]);
-    let mut explicit = DefaultAgentRegistry::new();
-    explicit.register(
-        AgentInfo {
-            isolation: Default::default(),
-            id: "shared".to_string(),
-            name: "Explicit Shared".to_string(),
-            description: String::new(),
-            capabilities: vec![],
-            required_capabilities: vec![],
-            meta: None,
-        },
-        Arc::new(StubHandle),
-    );
+    let (roster, _dir) = test_roster().await;
+    explicit_member(&roster, "shared", "Explicit Shared");
 
-    let merge = merge_protocol_targets(&plans, Some(&explicit));
+    let merge = merge_protocol_targets(&plans, Some(&roster.snapshot()));
     assert!(merge.accepted.is_empty());
-
     let diagnostic = merge
         .diagnostics
         .iter()
         .find(|d| d.code == DotagentsDiagnosticCode::Collision)
         .expect("explicit collision is diagnosed");
-    // Both sources appear: the protocol path and the explicit target.
     assert!(diagnostic.message.contains("Explicit Shared"));
     assert!(diagnostic.message.contains("agent.md"));
 }
@@ -225,87 +150,75 @@ fn distinct_protocol_ids_across_layers_both_survive() {
         plan_in_layer("global-only", DotagentsLayer::Global),
         plan_in_layer("workspace-only", DotagentsLayer::Workspace),
     ]);
-
     let merge = merge_protocol_targets(&plans, None);
     let ids: Vec<&str> = merge.accepted.iter().map(|p| p.id.as_str()).collect();
     assert_eq!(ids, vec!["global-only", "workspace-only"]);
     assert!(merge.diagnostics.is_empty());
 }
-#[test]
-fn protocol_targets_are_advertised_lazily_without_materializing() {
+
+#[tokio::test]
+async fn listing_does_not_build_members() {
     let manifest = manifest_with_agents(&["reviewer"]);
     let plans = DotagentsSubAgentPlans::from_manifest(&manifest);
-    let created = Arc::new(AtomicUsize::new(0));
-    let registry = DotagentsTargetRegistry::new(
-        &plans,
-        None,
-        Arc::new(CountingFactory {
-            created: created.clone(),
-        }),
-    );
+    let (roster, _dir) = test_roster().await;
+    add_protocol_members(&roster, &plans);
 
-    // Advertised immediately, materialized only on demand.
-    let agents = registry.list_agents();
-    assert_eq!(agents.len(), 1);
-    assert_eq!(agents[0].id, "reviewer");
-    assert_eq!(agents[0].description, "reviewer description");
-    assert_eq!(agents[0].capabilities, vec!["read".to_string()]);
-    assert_eq!(created.load(Ordering::SeqCst), 0);
-    assert!(!registry.is_materialized("reviewer"));
-
-    // First handle request materializes exactly once.
-    let handle = registry.get_handle("reviewer").expect("handle resolves");
-    assert_eq!(created.load(Ordering::SeqCst), 1);
-    assert!(registry.is_materialized("reviewer"));
-
-    // Repeated requests reuse the same handle.
-    let again = registry.get_handle("reviewer").expect("handle resolves");
-    assert!(Arc::ptr_eq(&handle, &again));
-    assert_eq!(created.load(Ordering::SeqCst), 1);
+    let snapshot = roster.snapshot();
+    assert_eq!(snapshot.len(), 1);
+    let member = snapshot.get("reviewer").expect("listed");
+    assert_eq!(member.info().description, "reviewer description");
+    assert_eq!(member.info().capabilities, vec!["read".to_string()]);
+    assert_eq!(member.origin(), MemberOrigin::Protocol);
+    assert!(!member.is_built());
+    assert_eq!(snapshot.built_local().count(), 0);
 }
 
-#[test]
-fn protocol_targets_do_not_replace_explicit_targets() {
+#[tokio::test]
+async fn protocol_target_is_built_on_first_delegation() {
+    let manifest = manifest_with_agents(&["a", "b", "c"]);
+    let plans = DotagentsSubAgentPlans::from_manifest(&manifest);
+    let (roster, _dir) = test_roster().await;
+    add_protocol_members(&roster, &plans);
+
+    let snapshot = roster.snapshot();
+    assert_eq!(snapshot.built_local().count(), 0);
+
+    let first = match roster.resolve(snapshot.get("a").unwrap()).expect("builds") {
+        MemberAgent::Local(handle) => handle,
+        _ => panic!("local member"),
+    };
+    assert_eq!(roster.snapshot().built_local().count(), 1);
+    assert!(!snapshot.get("b").unwrap().is_built());
+
+    // Later resolutions reuse the one handle.
+    for _ in 0..3 {
+        match roster.resolve(snapshot.get("a").unwrap()).unwrap() {
+            MemberAgent::Local(again) => assert!(Arc::ptr_eq(&first, &again)),
+            _ => panic!("local member"),
+        }
+    }
+    assert_eq!(roster.snapshot().built_local().count(), 1);
+}
+
+#[tokio::test]
+async fn explicit_delegate_collides_with_a_protocol_target() {
     let manifest = manifest_with_agents(&["shared", "protocol-only"]);
     let plans = DotagentsSubAgentPlans::from_manifest(&manifest);
+    let (roster, _dir) = test_roster().await;
+    explicit_member(&roster, "shared", "Explicit Shared");
 
-    // Explicit QueryMT target with a colliding ID.
-    let mut explicit = DefaultAgentRegistry::new();
-    explicit.register(
-        AgentInfo {
-            isolation: Default::default(),
-            id: "shared".to_string(),
-            name: "Explicit Shared".to_string(),
-            description: "explicit".to_string(),
-            capabilities: vec![],
-            required_capabilities: vec![],
-            meta: None,
-        },
-        Arc::new(StubHandle),
+    let merge = add_protocol_members(&roster, &plans);
+
+    let snapshot = roster.snapshot();
+    let shared = snapshot.get("shared").expect("explicit visible");
+    assert_eq!(shared.info().name, "Explicit Shared");
+    assert_eq!(shared.origin(), MemberOrigin::Config);
+    assert_eq!(
+        snapshot.get("protocol-only").unwrap().origin(),
+        MemberOrigin::Protocol
     );
-
-    let created = Arc::new(AtomicUsize::new(0));
-    let registry = DotagentsTargetRegistry::new(
-        &plans,
-        Some(Arc::new(explicit)),
-        Arc::new(CountingFactory {
-            created: created.clone(),
-        }),
-    );
-
-    // The explicit target wins and the protocol one is not registered.
-    assert!(!registry.contains("shared"));
-    assert!(registry.contains("protocol-only"));
-    let shared = registry
-        .get_agent("shared")
-        .expect("explicit target visible");
-    assert_eq!(shared.name, "Explicit Shared");
-    // Non-colliding protocol target is still advertised.
-    assert!(registry.get_agent("protocol-only").is_some());
-
-    // A collision diagnostic names both sources.
-    let diagnostic = registry
-        .diagnostics()
+    let diagnostic = merge
+        .diagnostics
         .iter()
         .find(|d| d.code == DotagentsDiagnosticCode::Collision)
         .expect("collision is diagnosed");
@@ -314,104 +227,10 @@ fn protocol_targets_do_not_replace_explicit_targets() {
     assert!(diagnostic.source.is_some(), "collision carries provenance");
 }
 
-#[test]
-fn protocol_targets_skip_unsupported_connections() {
-    let mut manifest = manifest_with_agents(&["external"]);
-    manifest.agents.get_mut("external").unwrap().connection = DotagentsAgentConnection {
-        connection_type: DotagentsAgentConnectionType::Stdio,
-        declared_type: Some("stdio".to_string()),
-        command: Some("never-launched".to_string()),
-    };
-    let plans = DotagentsSubAgentPlans::from_manifest(&manifest);
-
-    let created = Arc::new(AtomicUsize::new(0));
-    let registry = DotagentsTargetRegistry::new(
-        &plans,
-        None,
-        Arc::new(CountingFactory {
-            created: created.clone(),
-        }),
-    );
-
-    // Nothing is registered and nothing is ever created for an unsupported target.
-    assert!(registry.protocol_ids().is_empty());
-    assert!(registry.get_handle("external").is_none());
-    assert_eq!(created.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn nested_materialization_creates_one_handle_per_target_and_terminates() {
-    // Multiple targets, each resolved repeatedly. The registry must create each
-    // handle exactly once and return the same instance, which is what makes
-    // nested materialization terminate instead of rebuilding recursively.
-    let manifest = manifest_with_agents(&["a", "b", "c"]);
-    let plans = DotagentsSubAgentPlans::from_manifest(&manifest);
-    let created = Arc::new(AtomicUsize::new(0));
-    let registry = DotagentsTargetRegistry::new(
-        &plans,
-        None,
-        Arc::new(CountingFactory {
-            created: created.clone(),
-        }),
-    );
-
-    let mut first_pass = Vec::new();
-    for id in ["a", "b", "c"] {
-        first_pass.push((id, registry.get_handle(id).expect("handle resolves")));
-    }
-    assert_eq!(created.load(Ordering::SeqCst), 3);
-
-    // Repeated resolution returns the identical handles and creates nothing new.
-    for _ in 0..3 {
-        for (id, original) in &first_pass {
-            let again = registry.get_handle(id).expect("handle resolves");
-            assert!(Arc::ptr_eq(&again, original), "handle for {id} is reused");
-        }
-    }
-    assert_eq!(
-        created.load(Ordering::SeqCst),
-        3,
-        "each target is materialized exactly once"
-    );
-    assert_eq!(registry.materialization_count(), 3);
-    for id in ["a", "b", "c"] {
-        assert!(registry.is_materialized(id));
-    }
-}
-
-#[test]
-fn child_targets_expose_no_delegation_targets() {
-    // The recursion guard: a child protocol target's registry is empty, so it
-    // cannot rediscover the protocol collection or delegate onward.
-    let manifest = manifest_with_agents(&["solo"]);
-    let plans = DotagentsSubAgentPlans::from_manifest(&manifest);
-    let registry = DotagentsTargetRegistry::new(&plans, None, Arc::new(RecordingFactory));
-
-    let handle = registry.get_handle("solo").expect("handle resolves");
-    // A nested lookup through the child's own registry finds nothing.
-    assert!(
-        handle.agent_registry().list_agents().is_empty(),
-        "child protocol target must not expose delegation targets"
-    );
-}
-
-/// Factory that records the child registry it was asked to build.
-struct RecordingFactory;
-
-impl ProtocolTargetFactory for RecordingFactory {
-    fn create(
-        &self,
-        _plan: &crate::dotagents::DotagentsSubAgentPlan,
-    ) -> Option<Arc<dyn AgentHandleTrait>> {
-        Some(Arc::new(StubHandle))
-    }
-}
-
-#[test]
-fn unsupported_connections_never_launch_a_process() {
-    // Task 3.6: a stdio/executable profile points at a command that would create
-    // a marker file if it were ever launched. Nothing may execute it, so the
-    // marker must not exist after planning and after every registration path.
+#[tokio::test]
+async fn external_connection_cannot_be_represented_safely() {
+    // A stdio/executable profile points at a command that would create a
+    // marker file if it were ever launched. Nothing may execute it.
     let dir = tempfile::TempDir::new().expect("temp dir");
     let marker = dir.path().join("LAUNCHED");
 
@@ -437,14 +256,12 @@ fn unsupported_connections_never_launch_a_process() {
         manifest.agents.insert(id.to_string(), agent);
     }
 
-    // Planning must diagnose both and must not run anything.
     let plans = DotagentsSubAgentPlans::from_manifest(&manifest);
     assert_eq!(plans.plans.len(), 2);
     assert!(
         !marker.exists(),
         "planning must not launch the declared command"
     );
-
     for id in ["stdio-target", "unknown-target"] {
         let plan = plans.get(id).expect("profile is retained for inspection");
         let diagnostic = plan
@@ -452,47 +269,19 @@ fn unsupported_connections_never_launch_a_process() {
             .iter()
             .find(|d| d.code == DotagentsDiagnosticCode::UnsupportedTransport)
             .expect("unsupported connection is diagnosed");
-        // The diagnostic identifies the profile and the connection type.
         assert!(diagnostic.message.contains(id), "{}", diagnostic.message);
-        assert!(diagnostic.is_error(), "unsupported connections are errors");
+        assert!(diagnostic.is_error());
         assert!(
             diagnostic.message.contains("never launched"),
             "{}",
             diagnostic.message
         );
     }
-    assert!(
-        plans
-            .get("stdio-target")
-            .unwrap()
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("stdio"))
-    );
-    assert!(
-        plans
-            .get("unknown-target")
-            .unwrap()
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("carrier-pigeon"))
-    );
 
-    // Registration must also skip them entirely and never invoke the factory.
-    let created = Arc::new(AtomicUsize::new(0));
-    let registry = DotagentsTargetRegistry::new(
-        &plans,
-        None,
-        Arc::new(CountingFactory {
-            created: created.clone(),
-        }),
-    );
-    assert!(registry.protocol_ids().is_empty());
-    for id in ["stdio-target", "unknown-target"] {
-        assert!(registry.get_handle(id).is_none());
-        assert!(registry.get_agent(id).is_none());
-    }
-    assert_eq!(created.load(Ordering::SeqCst), 0);
+    // The roster never receives them, so nothing can be built or launched.
+    let (roster, _dir) = test_roster().await;
+    add_protocol_members(&roster, &plans);
+    assert!(roster.snapshot().is_empty());
     assert!(
         !marker.exists(),
         "no path may launch the declared command: marker {} exists",
@@ -500,26 +289,14 @@ fn unsupported_connections_never_launch_a_process() {
     );
 }
 
-#[test]
-fn collision_resolution_merges_before_explicit_precedence() {
+#[tokio::test]
+async fn collision_resolution_merges_before_explicit_precedence() {
     let manifest = manifest_with_agents(&["a", "b"]);
     let plans = DotagentsSubAgentPlans::from_manifest(&manifest);
+    let (roster, _dir) = test_roster().await;
+    explicit_member(&roster, "a", "A explicit");
 
-    let mut explicit = DefaultAgentRegistry::new();
-    explicit.register(
-        AgentInfo {
-            isolation: Default::default(),
-            id: "a".to_string(),
-            name: "A explicit".to_string(),
-            description: String::new(),
-            capabilities: vec![],
-            required_capabilities: vec![],
-            meta: None,
-        },
-        Arc::new(StubHandle),
-    );
-
-    let merge = merge_protocol_targets(&plans, Some(&explicit));
+    let merge = merge_protocol_targets(&plans, Some(&roster.snapshot()));
     assert_eq!(merge.accepted.len(), 1);
     assert_eq!(merge.accepted[0].id, "b");
     assert_eq!(merge.diagnostics.len(), 1);
@@ -527,4 +304,24 @@ fn collision_resolution_merges_before_explicit_precedence() {
         merge.diagnostics[0].code,
         DotagentsDiagnosticCode::Collision
     );
+}
+
+#[test]
+fn an_empty_snapshot_has_no_collisions() {
+    let manifest = manifest_with_agents(&["a"]);
+    let plans = DotagentsSubAgentPlans::from_manifest(&manifest);
+    let merge = merge_protocol_targets(&plans, Some(&RosterSnapshot::default()));
+    assert_eq!(merge.accepted.len(), 1);
+    let _ = BTreeMap::<String, String>::new();
+}
+
+#[test]
+fn profile_is_disabled() {
+    let mut manifest = manifest_with_agents(&["off", "on"]);
+    manifest.agents.get_mut("off").unwrap().enabled = false;
+    let plans = DotagentsSubAgentPlans::from_manifest(&manifest);
+    assert!(plans.get("off").is_none(), "a disabled profile has no plan");
+    let merge = merge_protocol_targets(&plans, None);
+    let ids: Vec<&str> = merge.accepted.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(ids, ["on"]);
 }

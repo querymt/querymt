@@ -119,6 +119,9 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/schedules/resume".to_string(),
         "querymt/schedules/trigger".to_string(),
         "querymt/schedules/delete".to_string(),
+        "querymt/agents/list".to_string(),
+        "querymt/agents/add".to_string(),
+        "querymt/agents/remove".to_string(),
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_LIST_PENDING_METHOD.to_string(),
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_ATTACH_METHOD.to_string(),
     ];
@@ -178,6 +181,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/mesh/peerExpired".to_string(),
         "querymt/models/changed".to_string(),
         "querymt/schedules/changed".to_string(),
+        crate::acp::shared::QMT_NOTIFICATION_AGENTS_CHANGED.to_string(),
         crate::acp::shared::QMT_NOTIFICATION_DELEGATION_UPDATE.to_string(),
         crate::acp::shared::QMT_NOTIFICATION_INPUT_STATE.to_string(),
         crate::acp::shared::QMT_NOTIFICATION_RUNTIME_CHANGED.to_string(),

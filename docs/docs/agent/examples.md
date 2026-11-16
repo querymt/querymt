@@ -107,8 +107,8 @@ cargo run --example auto_delegation_example
 ```
 
 **What it demonstrates:**
-- Configuring a planner + delegate quorum
-- The planner automatically delegating to the coder
+- Giving one agent a delegate with `.delegate(..)`
+- The root agent automatically delegating to the coder
 - Delegation lifecycle events
 
 ```rust
@@ -116,13 +116,11 @@ use querymt_agent::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let agent = Agent::multi()
+    let agent = Agent::builder()
         .cwd(".")
-        .planner(|p| {
-            p.provider("anthropic", "claude-sonnet-4-5-20250929")
-                .tools(["delegate", "read_tool"])
-                .system("You are a planner. Delegate coding tasks to the coder.")
-        })
+        .provider("anthropic", "claude-sonnet-4-5-20250929")
+        .tools(["delegate", "read_tool"])
+        .system("You are a planner. Delegate coding tasks to the coder.")
         .delegate("coder", |d| {
             d.provider("anthropic", "claude-sonnet-4-5-20250929")
                 .tools(["edit", "write_file", "shell", "read_tool"])
@@ -178,7 +176,7 @@ cargo run --example closure_builder
 ```
 
 **What it demonstrates:**
-- `Agent::single()` and `Agent::multi()` builder patterns
+- `Agent::builder()` with `.delegate(..)` builder patterns
 - Inline system prompts
 - Inline middleware configuration
 - Callback hooks
@@ -188,7 +186,7 @@ use querymt_agent::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("anthropic", "claude-sonnet-4-5-20250929")
         .cwd(".")
         .tools(["read_tool", "shell", "edit", "glob", "search_text"])
@@ -231,7 +229,7 @@ use querymt_agent::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("anthropic", "claude-sonnet-4-5-20250929")
         .tools(["shell", "read_tool", "glob"])
         .system("You are an assistant that creates concise daily briefings.")
@@ -296,7 +294,7 @@ use querymt_agent::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let agent = Agent::single()
+    let agent = Agent::builder()
         .provider("anthropic", "claude-sonnet-4-5-20250929")
         .tools(["read_tool"])
         .build()
@@ -437,20 +435,19 @@ Use this profile when you want config-level hook commands to inspect shell calls
 
 Two profiles for Interactive Brokers' hosted MCP server. The analyst logs in with only the `mcp.read` scope, researches and writes small scripts and order tickets. The desk has the order scope but no shell, file-write or web tools, starts in `plan` mode, and runs `examples/hooks/trading/order_guard.py` before every order (risk limits, kill switch, build-mode-only, limit orders only) and asks you to confirm each order. Use a paper account first; see the header comments in both files for setup.
 
-### `multi_agent.toml` — Planner + delegates
+### `multi_agent.toml` — Agent + delegates
 
 ```toml
-[quorum]
+[agent]
 cwd = "."
-delegation = true
-verification = true
-max_parallel_delegations = 3
-
-[planner]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
 tools = ["delegate", "read_tool", "shell", "glob"]
 system = [{ file = "../prompts/planner.md" }]
+
+[agent.delegation]
+verification = true
+max_parallel = 3
 
 [[delegates]]
 id = "coder"
@@ -546,20 +543,19 @@ warn_at_percent = 80
 compact_at_percent = 90
 ```
 
-### Example: Multi-Agent Quorum (`multi_agent.toml`)
+### Example: Agent with delegates (`multi_agent.toml`)
 
 ```toml
-[quorum]
+[agent]
 cwd = "."
-delegation = true
-verification = true
-max_parallel_delegations = 3
-
-[planner]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
 tools = ["delegate", "read_tool", "shell", "glob"]
 system = [{ file = "../prompts/planner.md" }]
+
+[agent.delegation]
+verification = true
+max_parallel = 3
 
 [[delegates]]
 id = "coder"

@@ -1,0 +1,7 @@
+agent    35580
+agent-core    18248
+agent-index    15142
+agent-knowledge    26987
+agent-runtime   177764
+agent-services    65877
+agent-sqlite    22313

@@ -264,6 +264,7 @@ pub mod tests {
                 cwd: None,
                 created_at: 0,
                 title: None,
+                fork_origin: None,
             })
             .await
             .unwrap();

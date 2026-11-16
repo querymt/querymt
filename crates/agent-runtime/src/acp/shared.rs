@@ -679,6 +679,7 @@ pub const QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED: &str = "querymt/session/dele
 pub const QMT_NOTIFICATION_MCP_AUTH_REQUIRED: &str = "querymt/session/mcpAuthRequired";
 pub const QMT_NOTIFICATION_INPUT_STATE: &str = "querymt/session/inputState";
 pub const QMT_NOTIFICATION_RUNTIME_CHANGED: &str = "querymt/session/runtimeChanged";
+pub const QMT_NOTIFICATION_AGENTS_CHANGED: &str = "querymt/agents/changed";
 pub const QMT_NOTIFICATION_SESSION_PINS_CHANGED: &str = "querymt/session/pinsChanged";
 
 fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -787,7 +788,7 @@ pub fn delegate_models_changed_notification(
 pub async fn current_session_observations(
     agent: &AgentHandle,
     session_ids: &[String],
-    sources: &[Arc<EventFanout>],
+    fanout: &Arc<EventFanout>,
 ) -> (Vec<serde_json::Value>, Vec<DelegationUpdateNotification>) {
     let runtimes = agent.observe_session_runtimes(session_ids).await;
     let mut notifications = Vec::with_capacity(runtimes.len());
@@ -798,10 +799,7 @@ pub async fn current_session_observations(
         ));
     }
     // Include historical cleanup tombstones: live-only refresh would leave a lost stage stuck busy.
-    let updates = sources
-        .iter()
-        .flat_map(|source| source.delegation_snapshots(session_ids))
-        .collect();
+    let updates = fanout.delegation_snapshots(session_ids);
     (notifications, updates)
 }
 
@@ -2854,39 +2852,6 @@ pub async fn is_event_owned(
     owners
         .get(event.session_id())
         .is_some_and(|subscribers| subscribers.contains(conn_id))
-}
-
-/// Collect EventFanout sources from agent and all delegate agents.
-///
-/// This function collects the EventFanout from the main agent and recursively
-/// collects EventFanouts from all registered delegate agents. Each EventFanout is
-/// deduplicated by pointer address to avoid subscribing multiple times.
-///
-/// # Arguments
-/// * `agent` - The main agent to collect EventFanout sources from
-///
-/// # Returns
-/// A vector of unique EventFanout instances
-pub fn collect_event_sources(agent: &Arc<AgentHandle>) -> Vec<Arc<EventFanout>> {
-    let mut sources = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    let primary = agent.config.event_sink.fanout().clone();
-    if seen.insert(Arc::as_ptr(&primary) as usize) {
-        sources.push(primary);
-    }
-
-    let registry = agent.agent_registry();
-    for info in registry.list_agents() {
-        if let Some(handle) = registry.get_handle(&info.id) {
-            let fanout = handle.event_fanout().clone();
-            if seen.insert(Arc::as_ptr(&fanout) as usize) {
-                sources.push(fanout);
-            }
-        }
-    }
-
-    sources
 }
 
 /// Re-export from session_registry — the single source of truth for config option shape.

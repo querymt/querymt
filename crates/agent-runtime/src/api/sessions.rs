@@ -5,6 +5,8 @@ use crate::acp::protocol::{
 };
 use crate::agent::LocalAgentHandle;
 use crate::agent::messages::SessionRuntimeStatus;
+#[cfg(feature = "remote")]
+use crate::session::domain::ForkOrigin;
 pub use crate::session::lifecycle::{
     ArchiveFilter, ResolutionFilter, SessionLifecycle, SessionLifecycleFilter,
     SessionLifecyclePatch,
@@ -1042,7 +1044,7 @@ impl AgentSessions {
                         peer_label: bookmark.peer_label.clone(),
                         runtime_state: None,
                         parent_session_id: None,
-                        fork_origin: None,
+                        fork_origin: bookmark.fork_origin.as_ref().map(ToString::to_string),
                     })
                     .collect();
                 let end = start.saturating_add(entries.len());
@@ -1092,7 +1094,12 @@ impl AgentSessions {
             });
             let same_scope = match scope {
                 SessionScope::All => true,
-                SessionScope::Root => entry.parent_session_id.is_none(),
+                // A session a delegation opened on the owner has no parent row
+                // there, but it is not a root user session.
+                SessionScope::Root => {
+                    entry.parent_session_id.is_none()
+                        && entry.fork_origin.as_deref() != Some("delegation")
+                }
                 SessionScope::Forks => entry
                     .fork_origin
                     .as_deref()
@@ -1533,6 +1540,15 @@ impl AgentSessions {
                     return;
                 }
             };
+            // Delegated remote sessions are bookmarked and attached, but they
+            // are not user sessions.
+            let (delegated, bookmarks): (Vec<_>, Vec<_>) = bookmarks
+                .into_iter()
+                .partition(|bookmark| bookmark.fork_origin == Some(ForkOrigin::Delegation));
+            let delegated: std::collections::HashSet<String> = delegated
+                .into_iter()
+                .map(|bookmark| bookmark.session_id)
+                .collect();
 
             let bookmark_titles: std::collections::HashMap<String, String> = bookmarks
                 .iter()
@@ -1570,6 +1586,9 @@ impl AgentSessions {
                         .collect()
                 };
                 for (session_id, peer_label, remote_node_id) in remote {
+                    if delegated.contains(&session_id) {
+                        continue;
+                    }
                     let summary = SessionSummary {
                         session_id: session_id.clone(),
                         name: bookmark_titles.get(&session_id).cloned(),
@@ -1697,7 +1716,9 @@ impl AgentSessions {
             for result in peer_results.into_iter().flatten() {
                 let (peer_label, node_id_str, sessions) = result;
                 for session_info in sessions {
-                    if attached_sessions.contains(&session_info.session_id) {
+                    if attached_sessions.contains(&session_info.session_id)
+                        || session_info.fork_origin.as_deref() == Some("delegation")
+                    {
                         continue;
                     }
                     let summary = SessionSummary {
@@ -1997,6 +2018,7 @@ mod remote_page_tests {
                 cwd: None,
                 created_at: 0,
                 title: None,
+                fork_origin: None,
             })
             .await
             .unwrap();

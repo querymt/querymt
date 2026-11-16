@@ -1,6 +1,6 @@
 //! Runtime adapters for post-construction `.agents` activation.
 //!
-//! Delegation target construction lives in `dotagents_targets`; this module is
+//! Delegation target construction lives in runtime `dotagents::target_factory`; this module is
 //! intentionally separate because activation targets and startup triggering are
 //! runtime lifecycle concerns, not delegation registry concerns.
 

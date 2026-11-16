@@ -16,6 +16,14 @@ impl LocalAgentHandle {
         &self,
         bookmark: &crate::session::store::RemoteSessionBookmark,
     ) -> Result<crate::agent::remote::SessionActorRef, crate::error::AgentError> {
+        // A delegated remote session belongs to its parent's delegation; it is
+        // not a user session to bring back at startup.
+        if bookmark.fork_origin == Some(crate::session::domain::ForkOrigin::Delegation) {
+            return Err(crate::error::AgentError::Internal(format!(
+                "session {} is a delegated remote session and is not reattached",
+                bookmark.session_id
+            )));
+        }
         self.ensure_remote_session_connected(
             &bookmark.session_id,
             Some(&bookmark.node_id),

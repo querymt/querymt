@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "description": "Output of `subagent_added` and `subagent_removed`: observe-only, so only\na message is accepted.",
+  "properties": {
+    "system_message": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "title": "subagent-change.command.output",
+  "type": "object"
+}
