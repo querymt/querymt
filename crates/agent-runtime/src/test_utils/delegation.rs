@@ -89,15 +89,14 @@ impl MiddlewareDriver for CancellationGateMiddleware {
 
 /// Fires `ContextThreshold` on the first `BeforeLlmCall`, then passes through.
 /// This simulates a full context window that triggers AI compaction.
+#[derive(Default)]
 pub struct ContextThresholdOnceMiddleware {
     pub fired: std::sync::atomic::AtomicBool,
 }
 
 impl ContextThresholdOnceMiddleware {
     pub fn new() -> Self {
-        Self {
-            fired: std::sync::atomic::AtomicBool::new(false),
-        }
+        Self::default()
     }
 }
 

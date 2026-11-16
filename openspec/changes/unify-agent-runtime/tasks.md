@@ -45,18 +45,28 @@ Conventions used below. They are reference text, not tracked tasks.
 
 - [x] 2.1 Move the scripted-provider helpers out of runtime `agent/delegation_loop_tests.rs` (`TestHarness`, `build_delegate_handle`, `agent_info`, `DelegateBehavior` and the middleware stubs they need) into a new runtime `test_utils/delegation.rs`, gated on `cfg(any(test, feature = "test-support"))`. `delegation_loop_tests.rs` keeps its tests and imports the helpers. Verify: Run-R `delegation_loop` and Run-T `delegation` pass; the test list equals the 1.3 list.
   - Done: Run-R `delegation_loop` 28 passed; Run-T `delegation` 4 passed; sorted `cargo nextest list` over runtime/top/services equals `baseline/nextest-list.txt`. `test_utils` is already gated by `cfg(any(test, feature = "test-support"))` in `lib.rs`. `TestHarness.exec_ctx` is `pub(crate)` because `ExecutionContext` is.
-- [ ] 2.2 Move the member build code (design D0). Verify:
+- [x] 2.2 Move the member build code (design D0). Verify:
   - `git show --stat` of the move commit shows renames only;
   - both packages' full nextest runs pass and the test list equals the 1.3 list except for the moved tests' paths (name them below this task);
   - `ProtocolTargetFactory` and its only implementation are both in runtime;
   - top no longer calls `AgentConfigBuilder::new` for a delegate or protocol target;
   - the schema and typeshare outputs equal the 1.3 files.
 
+  Result (commands: `$RF`/`$F` as in the conventions):
+  - Renames-only commit `refactor: move dotagents target factory into runtime (rename only)` (`git show --stat`: 1 file, 0 insertions, 0 deletions). Glue commit follows it.
+  - Full nextest: runtime 2421 passed, 6 skipped; top 519 passed, 1 skipped.
+  - Test list vs `baseline/nextest-list.txt`: the only differences are the 7 moved tests, `querymt-agent api::dotagents_targets::tests::*` -> `querymt-agent-runtime dotagents::target_factory::tests::*` (`parent_without_skills_yields_no_catalog`, `quorum_style_target_applies_the_registering_permissions`, `restricted_target_with_mcp_servers_keeps_only_listed_tools`, `restricted_target_without_servers_is_builtin_only`, `restricted_target_without_skill_gets_no_catalog`, `target_loading_an_unconfigured_mcp_skill_fails_at_once`, `unrestricted_target_offers_skills_non_interactively`).
+  - typeshare output equals `baseline/types.ts`; no file under runtime `config/` changed, so the schemas equal the baseline.
+  - `ProtocolTargetFactory` and its only production implementation (`DotagentsTargetFactory`) are both in runtime.
+  - Top `AgentConfigBuilder::new` remains only for the root agent (`api/agent.rs`) and the planner (`api/quorum.rs`); delegates and protocol targets are built by runtime `delegation::member::configure_delegate_builder` and `DotagentsTargetFactory::create_or_bare`.
+  - Public items added in runtime for the glue: `delegation::member::{MemberBuildSpec (doc-hidden), DelegateBuildParams, configure_delegate_builder, apply_middleware_from_config, parse_tool_specs, infer_required_capabilities}`, `dotagents::DotagentsTargetFactory::create_or_bare`. `api::DotagentsTargetFactory` is re-exported from runtime.
+
   Steps:
   1. In a renames-only commit, `git mv agent/src/api/dotagents_targets.rs agent-runtime/src/dotagents/target_factory.rs`.
   2. In the glue commit, add runtime `delegation/member.rs`. It holds `MemberBuildSpec` (top `api::config::AgentConfig`, renamed, `pub` with `#[doc(hidden)]`), `parse_tool_specs`, `infer_required_capabilities` and `FILESYSTEM_TOOLS` (from top `api/utils.rs`). It also holds the body of the delegate closure in top `api/quorum.rs:602-735`, as a function that returns the configured `AgentConfigBuilder`.
   3. Top `api/config.rs` builders produce `MemberBuildSpec`. Top `api/quorum.rs` and `api/agent.rs` call the runtime functions. `api::DotagentsTargetFactory` is re-exported from runtime so its path is unchanged.
-- [ ] 2.3 Group gate with filters `delegation|dotagents|quorum_profiles|config::tests`.
+- [x] 2.3 Group gate with filters `delegation|dotagents|quorum_profiles|config::tests`.
+  - Done: all six gate steps pass. check runtime (`$RF` all-targets, `--no-default-features`), top (`$F` all-targets, `--lib --no-default-features`) and `querymt-mobile-ffi`; Run-R filters 484 passed; Run-T filters 39 passed; fmt clean; clippy `-D warnings` clean for both packages (fixed `new_without_default` on the moved `ContextThresholdOnceMiddleware` and `type_complexity` in the 1.2 test).
 
 ## 3. One builder, delegation service in every runtime
 

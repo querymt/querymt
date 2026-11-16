@@ -3418,6 +3418,9 @@ fn with_tail<'a>(head: &[&'a str]) -> Vec<&'a str> {
     m
 }
 
+/// (profile, planner shape, delegate shapes, delegation settings)
+type ExpectedProfile<'a> = (&'a str, AgentShape, Vec<(&'a str, AgentShape)>, &'a str);
+
 const QUORUM_BASELINE_TOOLS: &[&str] = &[
     "accept_delegation_result",
     "browse",
@@ -3474,7 +3477,7 @@ async fn quorum_profiles_keep_their_runtime_shape() -> Result<()> {
         "ContextMiddleware",
         "DedupCheckMiddleware",
     ]);
-    let expected: Vec<(&str, AgentShape, Vec<(&str, AgentShape)>, &str)> = vec![
+    let expected: Vec<ExpectedProfile> = vec![
         (
             "coder_agent",
             shape(&planner_mw(&["AgentModeMiddleware"]), "diff", true),
