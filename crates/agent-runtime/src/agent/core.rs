@@ -9,21 +9,6 @@ use tokio::sync::OnceCell;
 
 pub use querymt_agent_core::agent_mode::AgentMode;
 
-/// Configuration for when and how delegation context is injected into conversations.
-#[derive(Debug, Clone)]
-pub struct DelegationContextConfig {
-    pub timing: DelegationContextTiming,
-    pub auto_inject: bool,
-}
-
-/// Timing options for delegation context injection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DelegationContextTiming {
-    FirstTurnOnly,
-    EveryTurn,
-    Disabled,
-}
-
 /// Client state for protocol compliance.
 #[derive(Clone)]
 pub struct ClientState {
@@ -408,6 +393,21 @@ impl std::fmt::Display for SnapshotPolicy {
             SnapshotPolicy::Diff => "diff",
         };
         write!(f, "{}", value)
+    }
+}
+
+impl std::str::FromStr for SnapshotPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::None),
+            "metadata" => Ok(Self::Metadata),
+            "diff" => Ok(Self::Diff),
+            other => Err(format!(
+                "Invalid snapshot_policy '{other}'. Valid options: 'none', 'metadata', 'diff'"
+            )),
+        }
     }
 }
 

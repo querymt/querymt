@@ -262,6 +262,9 @@ impl PyAgent {
         })
     }
 
+    /// True when the agent's roster has members it can delegate to, whether
+    /// they came from configuration, the `.agents` directory or were added
+    /// while running. A plain agent has an empty roster and returns False.
     fn is_multi(&self) -> bool {
         self.inner.is_multi()
     }

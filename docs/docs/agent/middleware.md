@@ -151,7 +151,7 @@ You are in review mode. Provide feedback only.
 ```
 
 **Features:**
-- The initial session mode is not set here; use `mode` on `[agent]`, `[planner]` or `[[delegates]]`
+- The initial session mode is not set here; use `mode` on `[agent]` or `[[delegates]]`
 - `reminder`: System message for plan mode
 - `review_reminder`: System message for review mode
 

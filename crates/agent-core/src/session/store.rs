@@ -42,6 +42,12 @@ pub struct RemoteSessionBookmark {
     pub created_at: i64,
     /// Session title/name (if known).
     pub title: Option<String>,
+    /// Why the session exists on the owner. `Delegation` marks a session a
+    /// delegation opened: the owner holds the row, so a bookmark list cannot
+    /// otherwise tell it from a user session. `None` for ordinary sessions
+    /// and for bookmarks written before this field existed.
+    #[serde(default)]
+    pub fork_origin: Option<ForkOrigin>,
 }
 
 /// Incremental metadata from a confirmed reattach or resume. Fields left as
@@ -53,6 +59,7 @@ pub struct RemoteSessionBookmarkUpdate {
     pub peer_label: Option<String>,
     pub cwd: Option<String>,
     pub title: Option<String>,
+    pub fork_origin: Option<ForkOrigin>,
 }
 
 impl RemoteSessionBookmark {
@@ -70,6 +77,7 @@ impl RemoteSessionBookmark {
             cwd: update.cwd.or(self.cwd),
             created_at: self.created_at,
             title: update.title.or(self.title),
+            fork_origin: update.fork_origin.or(self.fork_origin),
         }
     }
 }
@@ -333,6 +341,7 @@ mod tests {
             cwd: Some("/work".to_string()),
             created_at: 111,
             title: Some("Original".to_string()),
+            fork_origin: Some(ForkOrigin::Delegation),
         };
         // An update supplying no new values must not erase anything.
         let merged = original.clone().merge_confirmed(Default::default());
@@ -348,12 +357,14 @@ mod tests {
             cwd: Some("/work".to_string()),
             created_at: 111,
             title: None,
+            fork_origin: Some(ForkOrigin::Delegation),
         };
         let merged = original.merge_confirmed(RemoteSessionBookmarkUpdate {
             node_id: Some("node-b".to_string()),
             peer_label: None,
             cwd: Some("/other".to_string()),
             title: Some("Fresh title".to_string()),
+            fork_origin: None,
         });
         assert_eq!(merged.session_id, "s1");
         assert_eq!(merged.created_at, 111, "created_at is identity metadata");
@@ -361,5 +372,10 @@ mod tests {
         assert_eq!(merged.peer_label, "peer-a");
         assert_eq!(merged.cwd.as_deref(), Some("/other"));
         assert_eq!(merged.title.as_deref(), Some("Fresh title"));
+        assert_eq!(
+            merged.fork_origin,
+            Some(ForkOrigin::Delegation),
+            "an update without an origin keeps the recorded one"
+        );
     }
 }

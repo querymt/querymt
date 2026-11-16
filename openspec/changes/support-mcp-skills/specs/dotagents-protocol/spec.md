@@ -22,18 +22,6 @@ A materialized protocol delegation target SHALL use the skills configuration of 
 - **WHEN** a quorum profile with delegation enabled registers a protocol target and its planner has skills enabled with custom permissions
 - **THEN** the target offers the skill tool and applies the planner's skill permissions
 
-### Requirement: Protocol targets do not wait for skill approval
-A protocol delegation target SHALL NOT request user approval to load a skill. WHEN a skill's permission in a target would require approval, THEN the load SHALL fail immediately with a permission error that names the skill and the permission pattern that would allow it.
-
-#### Scenario: Unconfigured server skill in a target
-- **WHEN** a target attached to server `docs` loads `docs.release-notes` and no permission pattern names `docs`
-- **THEN** the load fails at once with a permission error naming `docs.release-notes` and the pattern `docs.*`
-- **AND** no approval request is sent and the delegated turn continues
-
-#### Scenario: Explicitly allowed server skill in a target
-- **WHEN** the registering runtime's skill permissions contain `"docs.*" = "allow"` and a target attached to server `docs` loads `docs.release-notes`
-- **THEN** the skill loads without an approval request
-
 ### Requirement: Protocol targets are offered only their own MCP servers' skills
 A protocol delegation target SHALL be offered MCP skills only from the MCP servers it attaches, which are the servers named by its `config.json` `mcpServers` or, when that field is absent, every enabled manifest server. Skills of the parent's other servers SHALL NOT be offered to the target.
 

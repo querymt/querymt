@@ -1,0 +1,243 @@
+# Coder Agent - Multi-agent system for code implementation
+#
+# This configuration defines a quorum with a planner agent that coordinates
+# a specialized coder agent for implementation tasks.
+
+[profile]
+id = "coder-delegate"
+name = "Coder Delegate"
+description = "Multi-agent coder profile with planner, coder, and explorer delegates"
+tags = ["coding", "delegation", "multi-agent"]
+
+[quorum]
+cwd = "."
+delegation = true
+verification = true
+snapshot_policy = "diff"
+delegation_wait_policy = "all"
+delegation_wait_timeout_secs = 2400
+delegation_cancel_grace_secs = 5
+max_parallel_delegations = 5
+
+# -----------------------------------------------------------------------------
+# Optional: managed Git worktree workspaces (disabled by default).
+# One workspace service is shared by the planner and every delegate.
+#
+# [quorum.workspace]
+# enabled = true
+# storage_root = "~/.qmt/worktrees"   # relative paths resolve against this file
+# baseline = "commit"                 # or "current_working_tree"
+#
+# Per-delegate isolation (see [[delegates]] below):
+#   isolation = "inherit"   # default: isolated parents isolate delegates
+#   isolation = "isolated"  # always a private checkout (needs the service)
+#   isolation = "shared"    # share the parent's checkout (disclosed as shared)
+# A non-"inherit" value on the `delegate` tool call overrides this setting.
+# -----------------------------------------------------------------------------
+
+[planner]
+mode = "plan"
+provider = "codex"
+model = "gpt-6.1-sol"
+tools = [
+  # File operations
+  "read_tool",
+  # Search & navigation
+  "glob", "search_text", "ls", "index", "get_symbol", "get_function", "find_symbol_references",
+  # Skill usage
+  "skill",
+  # Execution
+  "shell",
+  # Task management
+  "create_task", "read_task", "update_task", "complete_task", "todowrite", "todoread",
+  # Sub-agent delegation
+  "delegate",
+  # Deterministic integration of a reviewed isolated result (one commit on the
+  # current branch; repository hooks run). Not a free-form edit tool.
+  "accept_delegation_result",
+  # User interaction
+  "question",
+  # Web browsing
+  "browse",
+]
+
+system = [
+  { file = "../../../../examples/prompts/default_system.txt" },
+  { file = "../../../../examples/prompts/code_meta.jinja2" }
+]
+
+# Middleware for planner
+# Context middleware warns when approaching token limits
+[[planner.middleware]]
+type = "context"
+warn_at_percent = 80
+compact_at_percent = 90
+fallback_max_tokens = 128000
+
+[[planner.middleware]]
+type = "agent_mode"
+reminder = """<system-reminder>
+# Plan Mode - System Reminder
+
+## Your Role: Orchestrator
+
+You are the **planner and orchestrator**. Your hands are tied — YOU personally must
+not edit files, run mutating shell commands, or make any direct changes to the system.
+However, your PRIMARY job is to **delegate implementation work to specialized agents**.
+
+**Read-only constraint applies to YOU, not your delegates.** When you delegate to the
+`coder` agent, that agent WILL edit files, write code, and make changes — that is
+exactly what it's for, and that is expected and correct.
+
+**Remember: Delegates are ephemeral**. When you are delegating something to agent, note
+that agents are brand new, and don't contain any information about previous runs, you
+must supply all required context to agent to execute task.
+
+## What You MUST Do
+
+1. **Explore & understand** — Use read-only tools and delegate exploration tasks to
+   gather the context needed. use the `explorer` agent and the `delegate` tool to
+   explore a codebase.
+2. **Plan** — Break the work into concrete, actionable implementation tasks.
+3. **Delegate implementation** — Use the `delegate` tool to assign each implementation
+   task to the `coder` agent with a clear objective, context, and expected output.
+   Do NOT attempt to do the implementation yourself. Do NOT stop at just having a plan.
+4. **Verify & iterate** — After a delegate completes, review the results and delegate
+   follow-up work if needed. "Completed" only means the run ended: check that the
+   result actually contains the changes the objective required.
+5. **Integrate accepted work** — Isolated delegates work in a private checkout and
+   nothing reaches this checkout until you accept it. When a reviewed result is
+   correct, call `accept_delegation_result` with the delegation id and the result
+   commit from the delegation summary. QueryMT then applies exactly that change as
+   one commit on the current branch (repository hooks run). If it reports a
+   conflict or a refusal, nothing was changed: do NOT delegate "apply this patch" or
+   "merge this branch" work; report it, or delegate the underlying change again.
+
+## What You MUST NOT Do
+
+- Do NOT edit files yourself (no sed, tee, echo, cat, write_file, edit, etc.)
+- Do NOT run mutating shell commands yourself
+- Do NOT stop at exploration and planning — a plan without delegation is incomplete
+- Do NOT use explore-only delegation when implementation is needed
+
+## Anti-Pattern Warning
+
+If you find yourself only delegating exploration/search tasks and never delegating
+to the `coder` agent for actual implementation, you are doing it wrong. The user
+wants code changes, not just analysis. Your plan is only valuable when it results
+in delegated implementation work.
+
+---
+
+Ask the user clarifying questions or for their opinion when weighing tradeoffs.
+Don't make large assumptions about user intent.
+</system-reminder>"""
+
+# Optional: Detect duplicate code patterns
+# [[planner.middleware]]
+# type = "dedup_check"
+# threshold = 0.8
+
+[quorum.delegation_summary]
+provider = "codex"
+model = "gpt-6.1-sol"
+
+[[delegates]]
+# isolation = "inherit"   # "inherit" | "isolated" | "shared" (see [quorum.workspace])
+id = "coder"
+provider = "codex"
+model = "gpt-6.1-sol"
+description = "Specialized in implementation and code writing"
+capabilities = ["rust", "python"]
+tools = [
+  # File operations
+  "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
+  # Search & navigation
+  "glob", "search_text", "ls", "index", "get_symbol", "get_function", "find_symbol_references",
+  # Execution
+  "shell",
+  # Task management
+  "todowrite", "todoread",
+  # User interaction
+  "question",
+  # Web browsing
+  "browse",
+]
+
+system = [
+  { file = "../../../../examples/prompts/default_system.txt" }
+]
+
+# Middleware for coder delegate
+# Apply same limits as planner
+[[delegates.middleware]]
+type = "limits"
+max_steps = 200
+max_turns = 50
+
+[[delegates.middleware]]
+type = "context"
+warn_at_percent = 80
+compact_at_percent = 90
+fallback_max_tokens = 128000
+
+# Detect when code is similar to existing code
+[[delegates.middleware]]
+type = "dedup_check"
+threshold = 0.85
+min_lines = 10
+
+[[delegates]]
+id = "explorer"
+provider = "codex"
+model = "gpt-5.4"
+description = "Specialized in reviewing and understanding and summarizing code."
+capabilities = ["rust", "python"]
+tools = [
+  # File operations
+  "read_tool",
+  # Search & navigation
+  "glob", "search_text", "ls", "index", "get_symbol", "get_function", "find_symbol_references",
+  # Execution
+  "shell",
+  # Task management
+  "todowrite", "todoread",
+  # User interaction
+  "question",
+  # Web browsing
+  "browse",
+]
+
+system = ["""You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
+
+Your strengths:
+- Rapidly finding files using glob patterns
+- Searching code and text with powerful regex patterns
+- Reading and analyzing file contents
+
+Guidelines:
+- Use `glob` for broad file pattern matching
+- Use `search_text` for searching file contents with regex
+- Use `read_tool` when you know the specific file path you need to read
+- Use `shell` for file operations like copying, moving, or listing directory contents
+- Use `get_symbol` to get info about symbols and their metadata
+- Use `get_function` to read one or more functions
+- Use `find_symbol_references` to find definitions and references for symbols across files
+- Adapt your search approach based on the thoroughness level specified by the caller
+- Return file paths as absolute paths in your final response
+- For clear communication, avoid using emojis
+- Do not create any files, or run bash commands that modify the user's system state in any way
+
+Complete the user's search request efficiently and report your findings clearly."""
+]
+
+[[delegates.middleware]]
+type = "context"
+warn_at_percent = 80
+compact_at_percent = 90
+fallback_max_tokens = 120000
+
+[[delegates.middleware]]
+type = "limits"
+max_steps = 200
+max_turns = 50

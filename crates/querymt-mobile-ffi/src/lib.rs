@@ -552,8 +552,9 @@ unsafe fn qmt_internal_android_init(
 /// Initialize the agent runtime. Call once per agent instance.
 ///
 /// `config_toml` is an inline TOML config string, parsed by the shared
-/// `querymt_agent::config::load_config` parser. Supports both single-agent
-/// (`[agent]`) and multi-agent/quorum (`[quorum]`/`[planner]`) configs.
+/// `querymt_agent::config::load_config` parser. An `[agent]` config (with
+/// optional `[[delegates]]`) is the supported form; the deprecated
+/// `[quorum]`/`[planner]` form still loads. Both go through one builder call.
 /// On success, `*out_agent` is set to an opaque handle.
 ///
 /// Telemetry is configured explicitly via `qmt_ffi_configure_telemetry`
@@ -1569,6 +1570,7 @@ mod tests {
                 cwd: None,
                 created_at: 0,
                 title: None,
+                fork_origin: None,
             })
             .await
             .unwrap();

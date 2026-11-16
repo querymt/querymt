@@ -498,7 +498,7 @@ impl LocalAgentHandle {
     async fn hosting_handle(
         &self,
         session_id: &str,
-    ) -> Result<Option<Arc<dyn crate::agent::handle::AgentHandle>>, WorktreeOpError> {
+    ) -> Result<Option<Arc<LocalAgentHandle>>, WorktreeOpError> {
         self.bound_session_handle(session_id)
             .await
             .map(|bound| bound.map(|(handle, _)| handle))
@@ -507,14 +507,8 @@ impl LocalAgentHandle {
 
     /// The local handle to run session-layer steps on: the hosting runtime
     /// when the session is profile-bound, otherwise `self`.
-    fn runtime_of<'a>(
-        &'a self,
-        hosted: &'a Option<Arc<dyn crate::agent::handle::AgentHandle>>,
-    ) -> &'a LocalAgentHandle {
-        hosted
-            .as_ref()
-            .and_then(|handle| handle.as_any().downcast_ref::<LocalAgentHandle>())
-            .unwrap_or(self)
+    fn runtime_of<'a>(&'a self, hosted: &'a Option<Arc<LocalAgentHandle>>) -> &'a LocalAgentHandle {
+        hosted.as_deref().unwrap_or(self)
     }
 
     async fn summarize_in_runtime(

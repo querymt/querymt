@@ -541,6 +541,7 @@ async fn test_cancel_known_remote_session_routes_cancel_to_session_ref() {
             cwd: None,
             created_at: 1,
             title: None,
+            fork_origin: None,
         })
         .await
         .expect("save remote bookmark");
@@ -1252,12 +1253,9 @@ async fn register_profile_bound_delegate_session(
     f: &HandleFixture,
     runtime: &Arc<crate::profile_host::ProfileRuntimeView>,
     session_id: &str,
-) -> (Arc<dyn AgentHandle>, SessionActorRef) {
+) -> (Arc<LocalAgentHandle>, SessionActorRef) {
     let delegate_handle = runtime.delegate("coder").expect("coder delegate");
-    let local_handle = delegate_handle
-        .as_any()
-        .downcast_ref::<LocalAgentHandle>()
-        .expect("local delegate");
+    let local_handle = &*delegate_handle;
     let actor = SessionActor::new(
         local_handle.config.clone(),
         session_id.to_string(),
@@ -1544,6 +1542,7 @@ async fn test_load_session_resolves_remote_bookmark_before_local_or_profile_load
             cwd: Some("/remote/work".into()),
             title: Some("Remote task".into()),
             created_at: 1,
+            fork_origin: None,
         })
         .await
         .expect("bookmark remote session");
@@ -1585,6 +1584,7 @@ async fn test_load_and_resume_reject_conflicting_remote_and_local_identity() {
             cwd: None,
             title: None,
             created_at: 1,
+            fork_origin: None,
         })
         .await
         .expect("conflicting bookmark");

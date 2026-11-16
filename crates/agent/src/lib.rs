@@ -74,6 +74,7 @@ pub mod tools {
     pub mod builtins {
         pub use querymt_agent_runtime::agent::builtin_tools::{
             DelegateTool, RouteDelegationToPeerTool, UseRemoteProviderTool, all_builtin_tools,
+            builtin_tool_names,
         };
         pub use querymt_agent_services::tools::builtins::*;
     }
@@ -99,7 +100,4 @@ mod runtime_tests;
 pub use error::AgentError;
 
 // Re-export main agent types for backward compatibility
-pub use agent::{
-    AgentConfig, AgentHandle, DelegationContextConfig, DelegationContextTiming, LocalAgentHandle,
-    SessionActor, SessionRegistry,
-};
+pub use agent::{AgentConfig, LocalAgentHandle, SessionActor, SessionRegistry};

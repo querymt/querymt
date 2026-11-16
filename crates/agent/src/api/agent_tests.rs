@@ -1011,6 +1011,7 @@ async fn acp_list_sessions_source_splits_local_and_remote_listings() -> Result<(
                 cwd: Some("/remote/work".into()),
                 created_at: index,
                 title: Some(format!("Remote {index}")),
+                fork_origin: None,
             })
             .await?;
     }
@@ -1385,6 +1386,7 @@ async fn acp_list_sessions_opt_in_selected_peer_pages_offline_bookmarks() -> Res
                 cwd: Some("/remote/work".into()),
                 created_at: index,
                 title: Some(format!("Remote {index}")),
+                fork_origin: None,
             })
             .await?;
     }
@@ -1396,6 +1398,7 @@ async fn acp_list_sessions_opt_in_selected_peer_pages_offline_bookmarks() -> Res
             cwd: Some("/remote/work".into()),
             created_at: 0,
             title: None,
+            fork_origin: None,
         })
         .await?;
 
@@ -1470,6 +1473,7 @@ async fn acp_remote_pages_advance_empty_peers_and_exclude_local_conflicts() -> R
                 cwd: Some("/remote/work".into()),
                 created_at: 0,
                 title: None,
+                fork_origin: None,
             })
             .await?;
     }
@@ -1557,6 +1561,7 @@ async fn list_sessions_remote_bookmarks_mode_includes_detached_bookmarks() -> Re
             cwd: Some("/remote/worktree".to_string()),
             created_at: 1,
             title: Some("Remote Bookmark".to_string()),
+            fork_origin: None,
         })
         .await?;
 
@@ -1615,10 +1620,6 @@ tools = []
     let planner = agent.handle();
     let delegate = agent.delegate("coder").expect("delegate present");
 
-    let delegate = delegate
-        .as_any()
-        .downcast_ref::<crate::agent::LocalAgentHandle>()
-        .expect("local delegate");
     assert!(!planner.is_shutdown());
     assert!(!delegate.is_shutdown());
 
@@ -1856,7 +1857,7 @@ global_enabled = false
     );
     let config: crate::config::SingleAgentConfig = toml::from_str(&toml).unwrap();
 
-    let builder = Agent::builder_from_config(config, None)?;
+    let builder = Agent::builder_from_config(config)?;
     let agent = builder
         .infra(AgentInfra {
             plugin_registry: Arc::new(empty_plugin_registry()?.0),
@@ -2415,6 +2416,7 @@ async fn lifecycle_query_offline_bookmark_metadata_is_unknown_and_filters_reject
             cwd: Some("/remote".into()),
             created_at: 1,
             title: None,
+            fork_origin: None,
         })
         .await?;
     let all = agent
@@ -3013,7 +3015,7 @@ mod workspace_api {
 async fn build_single_from_toml(toml: &str) -> Result<Agent> {
     let config: crate::config::SingleAgentConfig = toml::from_str(toml)?;
     let (registry, _dir) = empty_plugin_registry()?;
-    Agent::builder_from_config(config, None)?
+    Agent::builder_from_config(config)?
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
             storage: Some(Arc::new(
@@ -3080,7 +3082,7 @@ async fn invalid_middleware_fails_single_and_quorum_with_the_same_error() {
     let quorum_toml = "[quorum]\ncwd = \"/tmp\"\n\n[planner]\nprovider = \"openai\"\nmodel = \"gpt-4\"\ntools = [\"delegate\"]\n\n[[planner.middleware]]\ntype = \"limits\"\ncache_write_cost_per_million = -2.0\n";
     let config: crate::config::QuorumConfig = toml::from_str(quorum_toml).unwrap();
     let (registry, _dir) = empty_plugin_registry().unwrap();
-    let quorum = Agent::builder_from_quorum_config(config, None)
+    let quorum = Agent::builder_from_quorum_config(config)
         .unwrap()
         .infra(AgentInfra {
             plugin_registry: Arc::new(registry),
@@ -3299,13 +3301,21 @@ async fn target_sees_only_its_server_skills_and_parent_sees_both() -> Result<()>
     let (registry, _tmp) = empty_plugin_registry()?;
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
-    let factory = super::DotagentsTargetFactory::new(Arc::new(registry), storage)
-        .with_skills(Some(skills.clone()), dir.path());
-    let handle = crate::dotagents::ProtocolTargetFactory::create(&factory, plan).expect("target");
-    let target = handle
-        .as_any()
-        .downcast_ref::<crate::agent::LocalAgentHandle>()
-        .expect("local target");
+    let spec = crate::delegation::member::MemberBuildSpec::from_protocol_plan(plan, Some(&skills))
+        .expect("lowers");
+    let target = crate::delegation::member::build_member_for_tests(
+        &spec,
+        crate::delegation::member::DelegateBuildParams {
+            plugin_registry: Arc::new(registry),
+            snapshot_policy: crate::agent::SnapshotPolicy::None,
+            skills_project_root: dir.path().to_path_buf(),
+            workspace_service: None,
+            repository_knowledge: None,
+        },
+        storage,
+    )
+    .expect("target");
+    let target = &*target;
     let req = crate::acp::protocol::NewSessionRequest::new(dir.path().to_path_buf());
     let prepared = target
         .session_materializer
@@ -3401,7 +3411,7 @@ fn agent_shape(handle: &crate::agent::LocalAgentHandle) -> AgentShape {
 }
 
 fn planner_mw<'a>(extra: &[&'a str]) -> Vec<&'a str> {
-    let mut m = vec!["DelegationMiddleware", "ContextMiddleware"];
+    let mut m = vec!["ContextMiddleware"];
     m.extend_from_slice(extra);
     m.extend(["OutputLimitRecoveryMiddleware", "ParallelEditGuard"]);
     m
@@ -3518,14 +3528,10 @@ async fn quorum_profiles_keep_their_runtime_shape() -> Result<()> {
         ),
     ];
 
-    for (name, planner_shape, delegates, settings) in expected {
-        let config = crate::config::load_config(confs.join(format!("{name}.toml"))).await?;
-        let crate::config::Config::Multi(config) = config else {
-            panic!("{name}: expected a quorum config");
-        };
-        let (registry, _dir) = empty_plugin_registry()?;
-        let agent = Agent::from_quorum_config_with_infra(
-            *config,
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/fixtures/quorum");
+    let infra = || async {
+        let (registry, dir) = empty_plugin_registry()?;
+        Ok::<_, anyhow::Error>((
             AgentInfra {
                 plugin_registry: Arc::new(registry),
                 storage: Some(Arc::new(
@@ -3535,57 +3541,82 @@ async fn quorum_profiles_keep_their_runtime_shape() -> Result<()> {
                 session_mcp_attachment_source: None,
                 event_fanout: None,
             },
-        )
-        .await?;
-        let local = |h: &Arc<dyn crate::agent::handle::AgentHandle>| {
-            agent_shape(
-                h.as_any()
-                    .downcast_ref::<crate::agent::LocalAgentHandle>()
-                    .expect("local handle"),
-            )
-        };
+            dir,
+        ))
+    };
 
-        assert_eq!(
-            agent_shape(&agent.handle()),
-            planner_shape,
-            "{name}: planner"
-        );
-        let mut ids: Vec<String> = agent
-            .handle()
-            .config
-            .agent_registry()
-            .list_agents()
-            .into_iter()
-            .map(|info| info.id)
-            .collect();
-        ids.sort();
-        let mut expected_ids: Vec<String> =
-            delegates.iter().map(|(id, _)| id.to_string()).collect();
-        expected_ids.sort();
-        assert_eq!(ids, expected_ids, "{name}: member ids");
-        for (id, expected_shape) in &delegates {
-            let handle = agent.delegate(id).expect("delegate");
-            assert_eq!(&local(&handle), expected_shape, "{name}: delegate {id}");
+    for (name, planner_shape, delegates, settings) in expected {
+        // The deprecated `[quorum]` form (kept as a fixture) and the `[agent]`
+        // form shipped in `examples/confs` must build the same runtime.
+        for form in ["quorum", "agent"] {
+            let (infra, _dir) = infra().await?;
+            let agent = if form == "quorum" {
+                let config =
+                    crate::config::load_config(fixtures.join(format!("{name}.toml"))).await?;
+                let crate::config::Config::Multi(config) = config else {
+                    panic!("{name}: expected a quorum config");
+                };
+                Agent::from_quorum_config_with_infra(*config, infra).await?
+            } else {
+                let config = crate::config::load_config(confs.join(format!("{name}.toml"))).await?;
+                let crate::config::Config::Single(config) = config else {
+                    panic!("{name}: expected an agent config");
+                };
+                Agent::builder_from_config(*config)?
+                    .infra(infra)
+                    .build()
+                    .await?
+            };
+            let name = format!("{name} ({form})");
+            let local = |h: &Arc<crate::agent::LocalAgentHandle>| agent_shape(h);
+
+            assert_eq!(
+                agent_shape(&agent.handle()),
+                planner_shape,
+                "{name}: planner"
+            );
+            let mut ids: Vec<String> = roster_ids(&agent);
+            ids.sort();
+            let mut expected_ids: Vec<String> =
+                delegates.iter().map(|(id, _)| id.to_string()).collect();
+            expected_ids.sort();
+            assert_eq!(ids, expected_ids, "{name}: member ids");
+            for (id, expected_shape) in &delegates {
+                let handle = agent.delegate(id).expect("delegate");
+                // Members are not offered the `delegate` tool (agent-delegation spec).
+                let member_shape = AgentShape {
+                    tools: expected_shape
+                        .tools
+                        .iter()
+                        .filter(|tool| *tool != "delegate")
+                        .cloned()
+                        .collect(),
+                    middleware: expected_shape.middleware.clone(),
+                    snapshot_policy: expected_shape.snapshot_policy.clone(),
+                    has_snapshot_backend: expected_shape.has_snapshot_backend,
+                };
+                assert_eq!(local(&handle), member_shape, "{name}: delegate {id}");
+            }
+            let c = agent
+                .handle()
+                .delegation_orchestrator()
+                .expect("orchestrator")
+                .config()
+                .clone();
+            assert_eq!(
+                format!(
+                    "{:?} {} {} {} {}",
+                    c.wait_policy,
+                    c.wait_timeout_secs,
+                    c.cancel_grace_secs,
+                    c.max_parallel_delegations,
+                    c.run_verification
+                ),
+                settings,
+                "{name}: delegation settings"
+            );
+            agent.shutdown().await;
         }
-        let c = agent
-            .handle()
-            .delegation_orchestrator()
-            .expect("orchestrator")
-            .config()
-            .clone();
-        assert_eq!(
-            format!(
-                "{:?} {} {} {} {}",
-                c.wait_policy,
-                c.wait_timeout_secs,
-                c.cancel_grace_secs,
-                c.max_parallel_delegations,
-                c.run_verification
-            ),
-            settings,
-            "{name}: delegation settings"
-        );
-        agent.shutdown().await;
     }
     Ok(())
 }
@@ -3730,16 +3761,14 @@ async fn delegation_from_a_plain_agent_runs() -> Result<()> {
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
     let store: Arc<dyn crate::session::store::SessionStore> = storage.clone();
 
-    let mut members = crate::delegation::DefaultAgentRegistry::new();
-    members.register_handle(
+    let members = vec![local_member(
         agent_info("helper"),
-        build_delegate_handle(DelegateBehavior::AlwaysOk, store, None).await
-            as Arc<dyn crate::agent::handle::AgentHandle>,
-    );
+        build_delegate_handle(DelegateBehavior::AlwaysOk, store, None).await,
+    )];
     let mut builder = Agent::single()
         .provider("mock", "mock-model")
         .tools(["delegate"]);
-    builder.agent_registry = Some(Arc::new(members));
+    builder.preregistered = members;
     let agent = builder
         .infra(AgentInfra {
             plugin_registry: registry,
@@ -3826,7 +3855,7 @@ global_enabled = false
     );
     let config: crate::config::QuorumConfig = toml::from_str(&toml)?;
     let (registry, _reg_dir) = scripted_text_registry()?;
-    let agent = Agent::builder_from_quorum_config(config, None)?
+    let agent = Agent::builder_from_quorum_config(config)?
         .infra(AgentInfra {
             plugin_registry: registry,
             storage: Some(Arc::new(
@@ -3838,14 +3867,7 @@ global_enabled = false
         .build()
         .await?;
 
-    let mut ids: Vec<String> = agent
-        .handle()
-        .config
-        .agent_registry()
-        .list_agents()
-        .into_iter()
-        .map(|info| info.id)
-        .collect();
+    let mut ids: Vec<String> = roster_ids(&agent);
     ids.sort();
     assert_eq!(ids, ["coder", "writer"]);
     agent.shutdown().await;
@@ -3885,7 +3907,7 @@ global_enabled = false
     );
     let config: crate::config::QuorumConfig = toml::from_str(&toml)?;
     let (registry, _reg_dir) = scripted_text_registry()?;
-    let agent = Agent::builder_from_quorum_config(config, None)?
+    let agent = Agent::builder_from_quorum_config(config)?
         .infra(AgentInfra {
             plugin_registry: registry,
             storage: Some(Arc::new(
@@ -3898,12 +3920,20 @@ global_enabled = false
         .await?;
 
     // The protocol target is an additional member; the configured delegate is unchanged.
-    let registry = agent.handle().config.agent_registry();
-    let mut ids: Vec<String> = registry.list_agents().into_iter().map(|i| i.id).collect();
+    let mut ids: Vec<String> = roster_ids(&agent);
     ids.sort();
     assert_eq!(ids, ["coder", "writer"]);
     assert_eq!(
-        registry.get_agent("coder").unwrap().description,
+        agent
+            .handle()
+            .config
+            .roster()
+            .unwrap()
+            .snapshot()
+            .get("coder")
+            .unwrap()
+            .info()
+            .description,
         "Writes code"
     );
 
@@ -3914,6 +3944,65 @@ global_enabled = false
         "delegation to the `.agents` target of a quorum profile was never executed"
     );
     agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_bound_to_a_protocol_member_loads_after_restart() -> Result<()> {
+    use crate::profile_host::{ProfileMetadata, ProfileRuntimeView, ProfileSource};
+
+    let dir = writer_dotagents_workspace();
+    // Two builds of the same configuration stand for a restart: the protocol
+    // member is never built in either until a session needs it.
+    for _ in 0..2 {
+        let (registry, _reg_dir) = scripted_text_registry()?;
+        let agent = Agent::single()
+            .provider("mock", "mock-model")
+            .cwd(dir.path())
+            .tools(["delegate"])
+            .infra(AgentInfra {
+                plugin_registry: registry,
+                storage: Some(Arc::new(
+                    crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                        .await?,
+                )),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            })
+            .dotagents_options(
+                crate::dotagents::DotagentsLoadOptions::enabled()
+                    .with_workspace(dir.path())
+                    .with_global_enabled(false),
+            )
+            .build()
+            .await?;
+        assert_eq!(
+            agent.handle().local_members().len(),
+            0,
+            "the protocol member is not built at startup"
+        );
+
+        let view = ProfileRuntimeView {
+            metadata: ProfileMetadata {
+                id: "p".into(),
+                name: "p".into(),
+                description: None,
+                tags: vec![],
+                source: ProfileSource::Embedded { key: "p".into() },
+                config_kind: None,
+                fingerprint: None,
+            },
+            handle: agent.handle(),
+            provider_lock: None,
+        };
+        let member = view
+            .session_handle(Some("writer"))
+            .expect("a session bound to the protocol member resolves");
+        assert!(view.session_handle(Some("nobody")).is_none());
+        assert_eq!(agent.handle().local_members().len(), 1);
+        drop(member);
+        agent.shutdown().await;
+    }
     Ok(())
 }
 
@@ -3931,17 +4020,15 @@ async fn two_profiles_delegate_at_the_same_time() -> Result<()> {
 
     let mut agents = Vec::new();
     for (profile, member) in [("a", "coder"), ("b", "writer")] {
-        let mut members = crate::delegation::DefaultAgentRegistry::new();
-        members.register_handle(
+        let members = vec![local_member(
             agent_info(member),
-            build_delegate_handle(DelegateBehavior::AlwaysOk, store.clone(), None).await
-                as Arc<dyn crate::agent::handle::AgentHandle>,
-        );
+            build_delegate_handle(DelegateBehavior::AlwaysOk, store.clone(), None).await,
+        )];
         let mut builder = Agent::single()
             .provider("mock", "mock-model")
             .tools(["delegate"])
             .with_profile_id(profile);
-        builder.agent_registry = Some(Arc::new(members));
+        builder.preregistered = members;
         agents.push(
             builder
                 .infra(AgentInfra {
@@ -4008,7 +4095,7 @@ async fn parent_clock_keeps_three_shell_delegations_terminal_on_wire() {
     let summary_registry =
         crate::test_utils::mock_plugin_registry_in(&summary_root, summary_factory).unwrap();
     let fanout = Arc::new(crate::event_fanout::EventFanout::new());
-    let mut members = crate::delegation::DefaultAgentRegistry::new();
+    let mut members = Vec::new();
     for target in ["coder", "explorer", "linus"] {
         let root = dir.path().to_path_buf();
         let release = release.clone();
@@ -4058,9 +4145,9 @@ async fn parent_clock_keeps_three_shell_delegations_terminal_on_wire() {
         .with_event_fanout(fanout.clone())
         .with_tool_registry(tools)
         .build();
-        members.register_handle(
+        members.push(local_member(
             crate::delegation::AgentInfo {
-                id: target.into(),
+                id: crate::delegation::roster::AgentId::try_from(target).unwrap(),
                 name: target.into(),
                 description: String::new(),
                 capabilities: vec![],
@@ -4070,8 +4157,8 @@ async fn parent_clock_keeps_three_shell_delegations_terminal_on_wire() {
             },
             Arc::new(crate::agent::LocalAgentHandle::from_config(Arc::new(
                 config,
-            ))) as Arc<dyn crate::agent::handle::AgentHandle>,
-        );
+            ))),
+        ));
     }
     // The root's plugin registry also serves the delegation summarizer.
     let mut builder = Agent::single()
@@ -4080,7 +4167,7 @@ async fn parent_clock_keeps_three_shell_delegations_terminal_on_wire() {
         .tools(["delegate"])
         .delegation_settings(crate::config::DelegationSettings {
             verification: true,
-            max_parallel: 3,
+            max_parallel: std::num::NonZeroUsize::new(3).unwrap(),
             summary: Some(crate::config::DelegationSummaryConfig {
                 provider: "mock".into(),
                 model: "summary".into(),
@@ -4089,7 +4176,7 @@ async fn parent_clock_keeps_three_shell_delegations_terminal_on_wire() {
             }),
             ..Default::default()
         });
-    builder.agent_registry = Some(Arc::new(members));
+    builder.preregistered = members;
     // Do not construct an orchestrator here: exercise the production builder's wiring.
     let agent = builder
         .infra(AgentInfra {
@@ -4288,7 +4375,35 @@ async fn parent_clock_keeps_three_shell_delegations_terminal_on_wire() {
     agent.shutdown().await;
 }
 
-// ── Quorum-config lowering and validation (ported from the deleted QuorumBuilder tests) ──
+/// A pre-built local member for `AgentBuilder::preregistered`.
+fn local_member(
+    info: crate::delegation::AgentInfo,
+    handle: Arc<crate::agent::LocalAgentHandle>,
+) -> crate::delegation::roster::Member {
+    crate::delegation::roster::Member::built(
+        info,
+        crate::delegation::roster::MemberOrigin::Config,
+        crate::delegation::roster::MemberAgent::Local(handle),
+    )
+}
+
+/// Ids of the root's roster, in roster order.
+fn roster_ids(agent: &Agent) -> Vec<String> {
+    agent
+        .handle()
+        .config
+        .roster()
+        .map(|roster| {
+            roster
+                .snapshot()
+                .iter()
+                .map(|m| m.id().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ── Quorum-config lowering and validation (ported from the removed quorum builder tests) ──
 
 mod lowering {
     use super::*;
@@ -4296,20 +4411,8 @@ mod lowering {
     use crate::agent::core::{AgentMode, ToolPolicy};
     use crate::config::{McpServerConfig, QuorumConfig, ToolSpec};
 
-    fn local(handle: Arc<dyn crate::agent::handle::AgentHandle>) -> Arc<LocalAgentHandle> {
-        // Members of a root are local handles; read the config through the agent.
-        let any = handle.as_any();
-        assert!(
-            any.downcast_ref::<LocalAgentHandle>().is_some(),
-            "local member"
-        );
-        // Re-wrap through the config so tests read `config` uniformly.
-        Arc::new(LocalAgentHandle::from_config(
-            any.downcast_ref::<LocalAgentHandle>()
-                .unwrap()
-                .config
-                .clone(),
-        ))
+    fn local(handle: Arc<LocalAgentHandle>) -> Arc<LocalAgentHandle> {
+        handle
     }
 
     async fn test_infra() -> (AgentInfra, tempfile::TempDir) {
@@ -4442,7 +4545,7 @@ tools = ["read_tool", "stdio-tool.fetch"]
         let mut config = skill_config(true);
         config.planner.skills = Default::default();
         config.planner.skills.enabled = false;
-        let error = Agent::builder_from_quorum_config(config, None)
+        let error = Agent::builder_from_quorum_config(config)
             .unwrap()
             .infra(infra)
             .build()
@@ -4460,7 +4563,7 @@ tools = ["read_tool", "stdio-tool.fetch"]
         let (infra, _dir) = test_infra().await;
         let mut config = skill_config(true);
         config.delegates[0].skills.enabled = false;
-        let error = Agent::builder_from_quorum_config(config, None)
+        let error = Agent::builder_from_quorum_config(config)
             .unwrap()
             .infra(infra)
             .build()
@@ -4556,17 +4659,20 @@ provider = "openai"
 model = "gpt-4"
 "#,
             );
-            let builder = Agent::builder_from_quorum_config(config, None).unwrap();
+            let builder = Agent::builder_from_quorum_config(config).unwrap();
             assert_eq!(
                 builder.peer_delegates,
-                vec![("coder".to_string(), "gpu-node".to_string())]
+                vec![crate::delegation::PeerRoute {
+                    delegate: crate::delegation::roster::AgentId::try_from("coder").unwrap(),
+                    peer: "gpu-node".to_string(),
+                }]
             );
         }
     }
 
     #[test]
     fn resolved_mcp_servers_and_selectors_are_kept_for_root_and_delegates() {
-        let builder = Agent::builder_from_quorum_config(quorum(MCP), None).unwrap();
+        let builder = Agent::builder_from_quorum_config(quorum(MCP)).unwrap();
         let names: Vec<&str> = builder.mcp_servers.iter().map(|s| s.name()).collect();
         assert!(
             names.contains(&"stdio-tool") && names.contains(&"http-tool"),
@@ -4576,7 +4682,11 @@ model = "gpt-4"
         assert!(builder.tools.contains(&"http-tool.lookup".parse().unwrap()));
         assert!(!builder.tools.contains(&"lookup".parse().unwrap()));
         assert!(builder.tools.contains(&"shell".parse().unwrap()));
-        let coder = builder.delegates.iter().find(|d| d.id == "coder").unwrap();
+        let coder = builder
+            .delegates
+            .iter()
+            .find(|d| d.id.as_str() == "coder")
+            .unwrap();
         assert_eq!(
             coder.tools,
             vec![
@@ -4594,7 +4704,7 @@ model = "gpt-4"
     #[tokio::test]
     async fn runtime_config_admits_only_the_resolved_mcp_tools() {
         let (infra, _dir) = test_infra().await;
-        let agent = Agent::builder_from_quorum_config(quorum(MCP), None)
+        let agent = Agent::builder_from_quorum_config(quorum(MCP))
             .unwrap()
             .infra(infra)
             .build()
@@ -4664,7 +4774,7 @@ model = "gpt-4"
 tools = ["beta.lookup"]
 "#,
         );
-        let agent = Agent::builder_from_quorum_config(config, None)
+        let agent = Agent::builder_from_quorum_config(config)
             .unwrap()
             .infra(infra)
             .build()
@@ -4721,15 +4831,13 @@ model = "gpt-4"
     #[tokio::test]
     async fn agents_start_in_their_configured_mode() {
         let (infra, _dir) = test_infra().await;
-        let agent = Agent::builder_from_quorum_config(
-            mode_config("mode = \"plan\"", "mode = \"review\""),
-            None,
-        )
-        .unwrap()
-        .infra(infra)
-        .build()
-        .await
-        .expect("builds");
+        let agent =
+            Agent::builder_from_quorum_config(mode_config("mode = \"plan\"", "mode = \"review\""))
+                .unwrap()
+                .infra(infra)
+                .build()
+                .await
+                .expect("builds");
         let mode = |config: &crate::agent::AgentConfig| *config.default_mode.lock().unwrap();
         assert_eq!(mode(&agent.handle().config), AgentMode::Plan);
         assert_eq!(
@@ -4757,7 +4865,7 @@ model = "gpt-4"
         let (infra, _dir) = test_infra().await;
         let delegate =
             "[[delegates.middleware]]\ntype = \"limits\"\ncache_write_cost_per_million = -2.0\n";
-        let err = Agent::builder_from_quorum_config(mode_config("", delegate), None)
+        let err = Agent::builder_from_quorum_config(mode_config("", delegate))
             .unwrap()
             .infra(infra)
             .build()
@@ -4800,10 +4908,10 @@ model = "gpt-4"
     async fn members_share_one_workspace_service_and_carry_their_isolation() {
         let root = tempfile::TempDir::new().unwrap();
         let (infra, _dir) = test_infra().await;
-        let agent = Agent::builder_from_quorum_config(
-            workspace_config(root.path(), "isolation = \"isolated\""),
-            None,
-        )
+        let agent = Agent::builder_from_quorum_config(workspace_config(
+            root.path(),
+            "isolation = \"isolated\"",
+        ))
         .unwrap()
         .infra(infra)
         .build()
@@ -4816,8 +4924,8 @@ model = "gpt-4"
         let reviewer = service(&local(agent.delegate("reviewer").unwrap()).config);
         assert!(Arc::ptr_eq(&root_service, &coder) && Arc::ptr_eq(&root_service, &reviewer));
         assert_eq!(root_service.storage_root(), root.path());
-        let registry = agent.handle().config.agent_registry();
-        let isolation = |id: &str| registry.get_agent(id).expect("registered").isolation;
+        let snapshot = agent.handle().config.roster().unwrap().snapshot();
+        let isolation = |id: &str| snapshot.get(id).expect("registered").info().isolation;
         assert_eq!(
             isolation("coder"),
             crate::worktree::DelegationIsolation::Isolated
@@ -4834,10 +4942,9 @@ model = "gpt-4"
         let root = tempfile::TempDir::new().unwrap();
         for enabled in [true, false] {
             let (infra, _dir) = test_infra().await;
-            let mut builder =
-                Agent::builder_from_quorum_config(workspace_config(root.path(), ""), None)
-                    .unwrap()
-                    .infra(infra);
+            let mut builder = Agent::builder_from_quorum_config(workspace_config(root.path(), ""))
+                .unwrap()
+                .infra(infra);
             if enabled {
                 builder = builder
                     .repository_knowledge(crate::config::RepositoryKnowledgeSettings::enabled());
@@ -4874,7 +4981,7 @@ model = "gpt-4"
         let (infra, _dir) = test_infra().await;
         let mut config = workspace_config(std::path::Path::new("/unused"), "");
         config.quorum.workspace = crate::config::WorkspaceSettings::default();
-        let agent = Agent::builder_from_quorum_config(config, None)
+        let agent = Agent::builder_from_quorum_config(config)
             .unwrap()
             .infra(infra)
             .build()
@@ -4905,7 +5012,7 @@ model = "gpt-4"
         let parse = |p: Option<&str>| {
             let mut config = mode_config("", "");
             config.quorum.snapshot_policy = p.map(str::to_string);
-            Agent::builder_from_quorum_config(config, None).map(|b| b.snapshot_policy)
+            Agent::builder_from_quorum_config(config).map(|b| b.snapshot_policy)
         };
         use crate::agent::core::SnapshotPolicy;
         assert_eq!(parse(None).unwrap(), SnapshotPolicy::None);
@@ -4967,4 +5074,158 @@ model = "gpt-4"
         );
         agent.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn agent_roster_methods_forward_to_the_root() -> Result<()> {
+    use crate::delegation::member::MemberSpec;
+    use crate::delegation::roster::{MemberOrigin, RosterError};
+
+    let (registry, _reg_dir) = scripted_text_registry()?;
+    let agent = Agent::single()
+        .provider("mock", "mock-model")
+        .tools(["delegate"])
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+    assert!(agent.roster().snapshot().is_empty());
+    let mut notifications = agent.inner().subscribe_ext_notifications();
+
+    let spec: MemberSpec = serde_json::from_value(serde_json::json!({
+        "kind": "local", "id": "reviewer", "provider": "mock", "model": "mock-model"
+    }))?;
+    let generation = agent.add_member(spec).await?;
+    assert_eq!(generation.get(), 1);
+    let snapshot = agent.roster().snapshot();
+    assert_eq!(
+        snapshot.get("reviewer").map(|member| member.origin()),
+        Some(MemberOrigin::Runtime)
+    );
+    assert!(agent.is_multi());
+    let notification = notifications.try_recv().expect("clients are told");
+    assert_eq!(notification.method.as_ref(), "querymt/agents/changed");
+
+    let generation = agent.remove_member("reviewer").await?;
+    assert_eq!(generation.get(), 2);
+    assert!(agent.roster().snapshot().is_empty());
+    assert!(matches!(
+        agent.remove_member("reviewer").await,
+        Err(RosterError::UnknownAgent(_))
+    ));
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_configuration_delegates_and_settings_reach_the_runtime() -> Result<()> {
+    use crate::config::{Config, ConfigSource, DelegationWaitPolicy, load_config};
+    use crate::delegation::roster::MemberOrigin;
+
+    let toml = r#"
+[agent]
+provider = "mock"
+model = "mock-model"
+
+[agent.delegation]
+wait_policy = "all"
+max_parallel = 2
+
+[[delegates]]
+id = "reviewer"
+provider = "mock"
+model = "mock-model"
+
+[[delegates]]
+id = "coder"
+provider = "mock"
+model = "mock-model"
+capabilities = ["coding"]
+"#;
+    let Config::Single(single) = load_config(ConfigSource::Toml(toml.into())).await? else {
+        panic!("expected a single-agent config");
+    };
+    assert_eq!(
+        single.agent.delegation.wait_policy,
+        DelegationWaitPolicy::All
+    );
+    let builder = Agent::builder_from_config(*single)?;
+    assert_eq!(builder.delegation_settings.max_parallel.get(), 2);
+
+    let (registry, _reg_dir) = scripted_text_registry()?;
+    let agent = builder
+        .infra(AgentInfra {
+            plugin_registry: registry,
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+    let snapshot = agent.roster().snapshot();
+    let members: Vec<_> = snapshot
+        .iter()
+        .map(|member| (member.id().to_string(), member.origin()))
+        .collect();
+    assert_eq!(
+        members,
+        [
+            ("coder".to_string(), MemberOrigin::Config),
+            ("reviewer".to_string(), MemberOrigin::Config)
+        ]
+    );
+    assert_eq!(snapshot.generation().get(), 0);
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_policy_can_be_turned_off() -> Result<()> {
+    use crate::config::{Config, ConfigSource, load_config};
+
+    let toml = |policy: &str| {
+        format!(
+            "[agent]\nprovider = \"mock\"\nmodel = \"mock-model\"\n{policy}\n\
+             [[delegates]]\nid = \"coder\"\nprovider = \"mock\"\nmodel = \"mock-model\"\n"
+        )
+    };
+    for (line, expected) in [
+        ("snapshot_policy = \"none\"", "none"),
+        ("snapshot_policy = \"metadata\"", "metadata"),
+        ("", "diff"),
+    ] {
+        let Config::Single(single) = load_config(ConfigSource::Toml(toml(line))).await? else {
+            panic!("expected a single-agent config");
+        };
+        let (registry, _dir) = scripted_text_registry()?;
+        let agent = Agent::builder_from_config(*single)?
+            .infra(AgentInfra {
+                plugin_registry: registry,
+                storage: Some(Arc::new(
+                    crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                        .await?,
+                )),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            })
+            .build()
+            .await?;
+        assert_eq!(agent.handle().config.snapshot_policy.to_string(), expected);
+        let member = agent.delegate("coder").expect("delegate");
+        assert_eq!(
+            member.config.snapshot_policy.to_string(),
+            expected,
+            "delegate"
+        );
+        agent.shutdown().await;
+    }
+    Ok(())
 }

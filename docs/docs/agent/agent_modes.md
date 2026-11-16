@@ -275,7 +275,7 @@ unsupported Preview variants are never sent.
 
 ### Via Configuration
 
-Set the initial mode with the typed `mode` key on `[agent]`, `[planner]` or a `[[delegates]]` entry:
+Set the initial mode with the typed `mode` key on `[agent]` or a `[[delegates]]` entry:
 
 ```toml
 [agent]

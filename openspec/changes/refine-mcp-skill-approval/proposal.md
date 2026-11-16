@@ -15,7 +15,6 @@ The 7.3 manual check of `support-mcp-skills` (qmtcode against mcpkit `mcpskills`
   - "Allow for this session" lets later loads of the same skill ID, and reads of its supporting files, run without a prompt in that session only.
   - It applies to MCP skills and to local skills configured as `ask`.
   - Configured `deny` still wins.
-  - Agents that cannot prompt (such as `.agents` delegation targets) are unchanged: they still fail at once.
   - Rejections are never remembered.
 - **Path check before the prompt.** An invalid `file` path is rejected before any approval prompt, for local and MCP skills. The manifest check for an unlisted file still happens after approval, because it needs the server.
 - **Log wording.** The skill registry refresh log names the count as local skills.

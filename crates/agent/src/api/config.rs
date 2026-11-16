@@ -3,19 +3,26 @@
 use crate::agent::core::AgentMode;
 use crate::config::{Permissions, SkillsConfig};
 use crate::delegation::member::{MemberBuildSpec, infer_required_capabilities, parse_tool_specs};
+use crate::delegation::roster::AgentId;
 use crate::worktree::DelegationIsolation;
 use querymt::{LLMParams, chat::ReasoningEffort};
 use serde_json::Value;
 
-/// Builder for configuring a delegate agent
+/// Builder for configuring a delegate agent.
+///
+/// A malformed tool selector is remembered and reported by
+/// [`DelegateConfigBuilder::build`], which the agent builder calls.
 pub struct DelegateConfigBuilder {
     pub(super) config: MemberBuildSpec,
+    /// The first problem found while configuring.
+    error: Option<anyhow::Error>,
 }
 
 impl DelegateConfigBuilder {
-    pub(super) fn new(id: impl Into<String>) -> Self {
+    pub(super) fn new(id: AgentId) -> Self {
         Self {
             config: MemberBuildSpec::new(id),
+            error: None,
         }
     }
 
@@ -92,7 +99,16 @@ impl DelegateConfigBuilder {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        (self.config.tools, self.config.tool_error) = parse_tool_specs(tools);
+        let (specs, error) = parse_tool_specs(tools);
+        self.config.tools = specs;
+        if let Some(error) = error {
+            self.error.get_or_insert_with(|| {
+                anyhow::anyhow!(
+                    "delegate '{}': invalid `tools` selector: {error}",
+                    self.config.id
+                )
+            });
+        }
         self
     }
 
@@ -120,12 +136,15 @@ impl DelegateConfigBuilder {
         self
     }
 
-    pub(super) fn build(mut self) -> MemberBuildSpec {
+    pub(super) fn build(mut self) -> anyhow::Result<MemberBuildSpec> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
         // Auto-infer required_capabilities from tools
         self.config.required_capabilities = infer_required_capabilities(&self.config.tools)
             .into_iter()
             .collect();
-        self.config
+        Ok(self.config)
     }
 }
 
@@ -135,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_delegate_system_prompt_stored() {
-        let mut config = MemberBuildSpec::new("test-delegate");
+        let mut config = MemberBuildSpec::new(AgentId::try_from("test-delegate").unwrap());
         config.llm_config = Some(
             LLMParams::new()
                 .provider("openai")

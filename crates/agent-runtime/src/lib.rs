@@ -43,6 +43,7 @@ pub(crate) mod tools {
         #[allow(unused_imports)]
         pub use crate::agent::builtin_tools::{
             DelegateTool, RouteDelegationToPeerTool, UseRemoteProviderTool, all_builtin_tools,
+            builtin_tool_names,
         };
         pub use querymt_agent_services::tools::builtins::*;
     }
@@ -62,9 +63,6 @@ pub(crate) mod worktree {
 #[cfg_attr(not(test), allow(dead_code, unused_imports))]
 pub mod test_utils;
 
-pub use agent::{
-    AgentConfig, AgentHandle, DelegationContextConfig, DelegationContextTiming, LocalAgentHandle,
-    SessionActor, SessionRegistry,
-};
+pub use agent::{AgentConfig, LocalAgentHandle, SessionActor, SessionRegistry};
 pub use error::AgentError;
 pub use querymt_utils::secret_store::SecretStore;

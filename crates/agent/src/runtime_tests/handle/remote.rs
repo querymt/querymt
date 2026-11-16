@@ -290,19 +290,3 @@ async fn find_node_manager_error_contains_node_id() {
     // For the no-mesh case the error is different but must not be empty.
     assert!(!err.message.is_empty(), "error message must not be empty");
 }
-
-// ── mesh handle on AgentHandle trait ────────────────────────────────────
-
-#[cfg(feature = "remote")]
-#[tokio::test]
-async fn set_mesh_handle_delegates_to_set_mesh() {
-    // set_mesh_handle on the trait dispatches to LocalAgentHandle::set_mesh.
-    // Without a real MeshHandle we only verify it compiles and is callable.
-    // The type check is the main assertion here — LocalAgentHandle must
-    // implement AgentHandle::set_mesh_handle.
-    let f = HandleFixture::new().await;
-    let handle: &dyn AgentHandle = &f.handle;
-    // Verify the method exists and accepts the correct type (no-op default).
-    // Real mesh handle testing lives in integration tests.
-    let _ = handle;
-}

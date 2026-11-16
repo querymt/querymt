@@ -54,7 +54,7 @@ impl LocalAgentHandle {
         session_id: &str,
     ) -> Result<
         Option<(
-            Arc<dyn crate::agent::handle::AgentHandle>,
+            Arc<LocalAgentHandle>,
             crate::profile_host::SessionProfileBinding,
         )>,
         Error,
@@ -97,17 +97,7 @@ impl LocalAgentHandle {
         session_id: &str,
     ) -> Result<SessionActorRef, Error> {
         if let Some((session_handle, binding)) = self.bound_session_handle(session_id).await? {
-            let local_handle = session_handle
-                .as_any()
-                .downcast_ref::<LocalAgentHandle>()
-                .ok_or_else(|| {
-                    Error::internal_error().data(serde_json::json!({
-                        "message": "bound session runtime is not local",
-                        "sessionId": session_id,
-                        "profileId": binding.profile_id,
-                        "agentId": binding.agent_id,
-                    }))
-                })?;
+            let local_handle = &*session_handle;
             let registry = local_handle.registry.lock().await;
             return registry.get(session_id).cloned().ok_or_else(|| {
                 Error::invalid_params().data(serde_json::json!({
@@ -129,18 +119,8 @@ impl LocalAgentHandle {
     }
 
     pub async fn stop_session(&self, session_id: &str) -> Result<(), Error> {
-        if let Some((session_handle, binding)) = self.bound_session_handle(session_id).await? {
-            let local_handle = session_handle
-                .as_any()
-                .downcast_ref::<LocalAgentHandle>()
-                .ok_or_else(|| {
-                    Error::internal_error().data(serde_json::json!({
-                        "message": "bound session runtime is not local",
-                        "sessionId": session_id,
-                        "profileId": binding.profile_id,
-                        "agentId": binding.agent_id,
-                    }))
-                })?;
+        if let Some((session_handle, _binding)) = self.bound_session_handle(session_id).await? {
+            let local_handle = &*session_handle;
             return local_handle.stop_session_in_runtime(session_id).await;
         }
 

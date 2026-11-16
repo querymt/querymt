@@ -85,15 +85,15 @@ pub struct NodeInfo {
 
 #[cfg(feature = "remote")]
 pub use remote_impl::{
-    AdmissionRejection, AdmissionRequest, AdmissionResponse, CreateRemoteSchedule,
-    CreateRemoteScheduleResponse, CreateRemoteSession, CreateRemoteSessionResponse,
-    CreateRemoteSessionWithProfile, DeleteRemoteSchedule, ForkRemoteSession,
-    ForkRemoteSessionResponse, GetNodeInfo, GetRemoteDelegateModels, GetRemoteSessionLifecycle,
-    GetRemoteSessionProfile, ListRemoteProfiles, ListRemoteSchedules, ListRemoteSchedulesResponse,
-    ListRemoteSessions, ListRemoteSessionsWithLifecycle, PauseRemoteSchedule, RemoteNodeManager,
-    RemoteNodeManagerState, RemoteSessionProfile, ResumeRemoteSchedule, ResumeRemoteSession,
-    SessionHandoff, SetRemoteDelegateModel, SetRemoteSessionLifecycle, StopRemoteSessionRuntime,
-    TriggerRemoteSchedule,
+    AdmissionRejection, AdmissionRequest, AdmissionResponse, CreateRemoteDelegationSession,
+    CreateRemoteSchedule, CreateRemoteScheduleResponse, CreateRemoteSession,
+    CreateRemoteSessionResponse, CreateRemoteSessionWithProfile, DeleteRemoteSchedule,
+    ForkRemoteSession, ForkRemoteSessionResponse, GetNodeInfo, GetRemoteDelegateModels,
+    GetRemoteSessionLifecycle, GetRemoteSessionProfile, ListRemoteProfiles, ListRemoteSchedules,
+    ListRemoteSchedulesResponse, ListRemoteSessions, ListRemoteSessionsWithLifecycle,
+    PauseRemoteSchedule, RemoteNodeManager, RemoteNodeManagerState, RemoteSessionProfile,
+    ResumeRemoteSchedule, ResumeRemoteSession, SessionHandoff, SetRemoteDelegateModel,
+    SetRemoteSessionLifecycle, StopRemoteSessionRuntime, TriggerRemoteSchedule,
 };
 
 #[cfg(feature = "remote")]
@@ -126,6 +126,15 @@ mod remote_impl {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct CreateRemoteSession {
         /// Working directory on the remote machine (optional; string for cross-OS)
+        pub cwd: Option<String>,
+    }
+
+    /// Create a session that a delegation opens on this node. The owner
+    /// records it with fork origin `delegation`, so it is never listed as a
+    /// user session. A separate message, because an older owner must reject
+    /// it instead of silently creating an ordinary root session.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct CreateRemoteDelegationSession {
         pub cwd: Option<String>,
     }
 
@@ -551,14 +560,7 @@ mod remote_impl {
                 .ok_or_else(|| {
                     AgentError::Internal(format!("Unknown owner runtime for session {session_id}"))
                 })?;
-            let local = handle
-                .as_any()
-                .downcast_ref::<crate::agent::LocalAgentHandle>()
-                .ok_or_else(|| {
-                    AgentError::Internal(format!(
-                        "Owner runtime is not local for session {session_id}"
-                    ))
-                })?;
+            let local = &*handle;
             if local.mesh().is_none()
                 && let Some(mesh) = &self.mesh
             {
@@ -601,9 +603,7 @@ mod remote_impl {
                     .into_iter()
                     .find(|runtime| runtime.profile_id() == binding.profile_id)?;
                 let handle = runtime.session_handle(binding.agent_id.as_deref())?;
-                let local = handle
-                    .as_any()
-                    .downcast_ref::<crate::agent::LocalAgentHandle>()?;
+                let local = &*handle;
                 return local.registry.lock().await.get(session_id).cloned();
             }
             self.registry.lock().await.get(session_id).cloned()
@@ -1019,6 +1019,7 @@ mod remote_impl {
             &self,
             cwd: Option<String>,
             profile_id: Option<String>,
+            fork_origin: Option<crate::session::domain::ForkOrigin>,
         ) -> Result<CreateRemoteSessionResponse, AgentError> {
             let cwd_path = cwd.as_ref().map(PathBuf::from);
             if let Some(ref path) = cwd_path
@@ -1053,7 +1054,13 @@ mod remote_impl {
                 .unwrap_or_else(|| self.config.clone());
             let session_context = config
                 .provider
-                .create_session(cwd_path.clone(), None, &config.execution_config_snapshot())
+                .create_session_with_isolation_intent(
+                    cwd_path.clone(),
+                    None,
+                    fork_origin,
+                    &config.execution_config_snapshot(),
+                    None,
+                )
                 .await
                 .map_err(|e| AgentError::Internal(e.to_string()))?;
 
@@ -1128,7 +1135,33 @@ mod remote_impl {
             let shared_state = self.shared_state.clone();
 
             // Spawn the work as a background task
-            ctx.spawn(async move { shared_state.create_session(msg.cwd, None).await })
+            ctx.spawn(async move { shared_state.create_session(msg.cwd, None, None).await })
+        }
+    }
+
+    impl Message<CreateRemoteDelegationSession> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<CreateRemoteSessionResponse, AgentError>>;
+
+        #[tracing::instrument(
+            name = "remote.node_manager.create_delegation_session",
+            skip(self, ctx),
+            fields(session_id = tracing::field::Empty)
+        )]
+        async fn handle(
+            &mut self,
+            msg: CreateRemoteDelegationSession,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let state = self.shared_state.clone();
+            ctx.spawn(async move {
+                state
+                    .create_session(
+                        msg.cwd,
+                        None,
+                        Some(crate::session::domain::ForkOrigin::Delegation),
+                    )
+                    .await
+            })
         }
     }
 
@@ -1178,14 +1211,7 @@ mod remote_impl {
                             .ok_or_else(|| {
                                 AgentError::Internal("Unknown source session runtime".into())
                             })?;
-                        handle
-                            .as_any()
-                            .downcast_ref::<crate::agent::LocalAgentHandle>()
-                            .ok_or_else(|| {
-                                AgentError::Internal("Source session runtime is not local".into())
-                            })?
-                            .config
-                            .clone()
+                        handle.config.clone()
                     }
                     None => shared_state.config.clone(),
                 };
@@ -1279,7 +1305,11 @@ mod remote_impl {
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             let state = self.shared_state.clone();
-            ctx.spawn(async move { state.create_session(msg.cwd, Some(msg.profile_id)).await })
+            ctx.spawn(async move {
+                state
+                    .create_session(msg.cwd, Some(msg.profile_id), None)
+                    .await
+            })
         }
     }
 
@@ -1627,7 +1657,10 @@ mod remote_impl {
                     let has_parent = session.parent_session_id.is_some();
                     let scope_matches = match msg.scope {
                         SessionScope::All => true,
-                        SessionScope::Root => !has_parent,
+                        SessionScope::Root => {
+                            !has_parent
+                                && session.fork_origin != Some(crate::session::domain::ForkOrigin::Delegation)
+                        }
                         SessionScope::Forks => session.fork_origin == Some(crate::session::domain::ForkOrigin::User),
                         SessionScope::Delegates => session.fork_origin == Some(crate::session::domain::ForkOrigin::Delegation),
                         SessionScope::Children => has_parent,
@@ -2324,6 +2357,11 @@ mod remote_impl {
         CreateRemoteSession,
         "querymt::CreateRemoteSession",
         REG_CREATE_REMOTE_SESSION
+    );
+    remote_node_msg_impl!(
+        CreateRemoteDelegationSession,
+        "querymt::CreateRemoteDelegationSession",
+        REG_CREATE_REMOTE_DELEGATION_SESSION
     );
     remote_node_msg_impl!(
         ForkRemoteSession,

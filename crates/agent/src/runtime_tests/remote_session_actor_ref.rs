@@ -222,6 +222,7 @@ mod session_actor_ref_remote_tests {
                 cwd: None,
                 created_at: 0,
                 title: None,
+                fork_origin: None,
             })
             .await
             .unwrap();
@@ -831,6 +832,7 @@ mod session_actor_ref_remote_tests {
                 cwd: None,
                 created_at: 0,
                 title: None,
+                fork_origin: None,
             })
             .await
             .expect("save remote bookmark");

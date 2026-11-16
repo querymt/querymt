@@ -123,7 +123,6 @@ impl LocalAgentHandle {
             profiles,
             scheduler_handle: Arc::new(parking_lot::Mutex::new(None)),
             delegation_service: parking_lot::Mutex::new(None),
-            members: parking_lot::Mutex::new(Vec::new()),
             shutdown_done: AtomicBool::new(false),
         }
     }
@@ -457,11 +456,6 @@ impl LocalAgentHandle {
         guard
     }
 
-    /// Access the agent registry.
-    pub fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
-        self.config.agent_registry.clone()
-    }
-
     /// Access the agent-level tool registry for built-in tool execution.
     ///
     /// This describes the agent, not a session: session-bound tools (the
@@ -518,7 +512,7 @@ impl LocalAgentHandle {
             );
         }
         if let Some((session_handle, _)) = self.bound_session_handle(session_id).await?
-            && let Some(local_handle) = session_handle.as_any().downcast_ref::<LocalAgentHandle>()
+            && let local_handle = &*session_handle
             && let Ok(mut bridges) = local_handle.config.session_bridges.lock()
         {
             bridges.insert(
@@ -561,10 +555,8 @@ impl LocalAgentHandle {
         connection_id: &Arc<str>,
     ) -> bool {
         let mut removed = Self::remove_session_bridge(&handle.config, session_id, connection_id);
-        for target in handle.config.agent_registry.list_agents() {
-            if let Some(agent_handle) = handle.config.agent_registry.get_handle(&target.id)
-                && let Some(local_handle) = agent_handle.as_any().downcast_ref::<LocalAgentHandle>()
-            {
+        if let Some(roster) = handle.config.roster() {
+            for local_handle in roster.snapshot().built_local() {
                 removed |=
                     Self::remove_session_bridge(&local_handle.config, session_id, connection_id);
             }
@@ -649,8 +641,7 @@ impl LocalAgentHandle {
 
     /// Make this handle the owner of a running delegation service. Replaces
     /// (and aborts) a previously installed listener.
-    #[doc(hidden)]
-    pub fn install_delegation_service(
+    pub(crate) fn install_delegation_service(
         &self,
         orchestrator: Arc<crate::delegation::DelegationOrchestrator>,
         listener: tokio::task::JoinHandle<()>,
@@ -665,15 +656,12 @@ impl LocalAgentHandle {
         drop(previous);
     }
 
-    /// Make this handle the owner of the local members built for it.
-    #[doc(hidden)]
-    pub fn install_members(&self, members: Vec<(String, Arc<LocalAgentHandle>)>) {
-        *self.members.lock() = members;
-    }
-
-    /// The local members this root built, in configuration order.
-    pub fn local_members(&self) -> Vec<(String, Arc<LocalAgentHandle>)> {
-        self.members.lock().clone()
+    /// The local members that have been built, in ID order.
+    pub fn local_members(&self) -> Vec<Arc<LocalAgentHandle>> {
+        self.config
+            .roster()
+            .map(|roster| roster.snapshot().built_local().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// The delegation service owned by this handle, if it is a root.
@@ -689,11 +677,10 @@ impl LocalAgentHandle {
     /// Stops the owned delegation service: no new claims, listener drained
     /// (aborted after one second), active delegations cancelled.
     async fn stop_delegation_service(&self) {
-        let Some(service) = self.delegation_service.lock().take() else {
+        let Some(mut service) = self.delegation_service.lock().take() else {
             return;
         };
         service.orchestrator.begin_shutdown();
-        let mut service = service;
         let listener = &mut service.listener;
         tokio::select! {
             _ = &mut *listener => {}
@@ -941,6 +928,7 @@ impl LocalAgentHandle {
                         replace: RemoteConnectReason::Open.default_replace_policy(),
                         handoff: None,
                         windowed: load_window.is_some(),
+                        fork_origin: None,
                     },
                 )
                 .await;
@@ -1052,7 +1040,7 @@ impl LocalAgentHandle {
                         "sessionId": session_id,
                     }))
                 })?;
-                return delegate_handle.load_session(req).await;
+                return Box::pin(delegate_handle.load_session(req)).await;
             }
 
             let profile_handle = runtime.handle();
@@ -1269,11 +1257,13 @@ impl LocalAgentHandle {
         log::info!("LocalAgentHandle: Requesting shutdown");
 
         self.stop_delegation_service().await;
-        let members = std::mem::take(&mut *self.members.lock());
-        for (_, member) in members {
-            // Members own no members, so this recursion is one level deep.
-            Box::pin(member.shutdown()).await;
-        }
+        // Members own no members, so this recursion is one level deep.
+        futures_util::future::join_all(
+            self.local_members()
+                .into_iter()
+                .map(|member| async move { Box::pin(member.shutdown()).await }),
+        )
+        .await;
 
         if let Some(scheduler) = self.scheduler() {
             scheduler.request_shutdown();

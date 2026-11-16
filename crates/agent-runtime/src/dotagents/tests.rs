@@ -1052,7 +1052,7 @@ fn subagent_plan_maps_metadata_prompt_and_supported_config() {
     let plan = plans.get("helper").expect("helper is planned");
 
     // Metadata advertised to delegation consumers.
-    assert_eq!(plan.info.id, "helper");
+    assert_eq!(plan.info.id.as_str(), "helper");
     assert_eq!(plan.info.name, "helper");
     assert_eq!(plan.info.description, "helper description");
     assert_eq!(plan.info.capabilities, vec!["read".to_string()]);

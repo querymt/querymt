@@ -1,7 +1,8 @@
 version = 1
 
-# Pilot corpus: reviewed concept notes kept next to the crate they describe, plus
-# the source files those notes explain. No exhaustive per-file inventory is
+# Reviewed concept notes kept next to the crate they describe (execution, tools,
+# sessions, repository knowledge, profiles, config, delegation), plus the source
+# files those notes explain. No exhaustive per-file inventory is
 # selected here; that is an optional comparison arm (see
 # crates/agent-knowledge/pilot/README.md).
 #
@@ -14,6 +15,7 @@ include = [
   "crates/agent-runtime/knowledge/*.md",
   "crates/agent-services/knowledge/*.md",
   "crates/agent-knowledge/knowledge/*.md",
+  "crates/agent/knowledge/*.md",
   "openspec/specs/*/spec.md",
 ]
 exclude = []
@@ -30,9 +32,19 @@ include = [
   "crates/agent-services/src/tools/builtins/*.rs",
   "crates/agent-sqlite/src/session/sqlite_storage/*.rs",
   "crates/agent-knowledge/src/*.rs",
+  "crates/agent/src/profiles.rs",
+  "crates/agent-runtime/src/profile_host.rs",
+  "crates/agent-core/src/config/*.rs",
+  "crates/agent-runtime/src/config/*.rs",
+  "crates/agent-core/src/delegation/*.rs",
+  "crates/agent-runtime/src/delegation/*.rs",
 ]
-# The evaluation harness is not part of the subject matter being documented.
-exclude = ["crates/agent-knowledge/src/evaluation.rs"]
+# The evaluation harness is not part of the subject matter being documented, and
+# the config test module is large enough to bury the config note in search results.
+exclude = [
+  "crates/agent-knowledge/src/evaluation.rs",
+  "crates/agent-runtime/src/config/tests.rs",
+]
 
 [orientation]
 entrypoints = ["crates/agent-runtime/knowledge/README.md"]

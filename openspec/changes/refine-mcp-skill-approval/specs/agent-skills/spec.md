@@ -35,7 +35,7 @@ A skill session grant SHALL apply only to the exact callable ID it was given for
 - **THEN** the user receives a new approval request
 
 ### Requirement: Configuration overrides skill session grants
-A skill whose configured permission resolves to deny SHALL be rejected with a permission error even when the session holds a grant for it. An agent that cannot prompt SHALL keep failing at once with the configuration hint.
+A skill whose configured permission resolves to deny SHALL be rejected with a permission error even when the session holds a grant for it.
 
 #### Scenario: Configured deny overrides a session allow
 - **WHEN** the session holds a grant for `docs.guide` and the permissions in effect for the next load resolve `docs.guide` to deny

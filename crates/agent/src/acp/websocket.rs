@@ -27,7 +27,7 @@ use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
 use crate::acp::protocol::{Error, ExtNotification, RequestPermissionResponse};
 use crate::acp::shared::{
     AcpLiveEventTranslator, PendingElicitationMap, RpcDispatchContext, RpcDispatchState,
-    RpcMessage, SessionOwnerMap, collect_event_sources, convert_elicitation_response_value,
+    RpcMessage, SessionOwnerMap, convert_elicitation_response_value,
     convert_permission_response_value, create_elicitation_request,
     dispatch_rpc_message_with_context, is_event_owned,
 };
@@ -58,7 +58,7 @@ use uuid::Uuid;
 pub(crate) struct WsServerState {
     pub(crate) agent: Arc<crate::agent::LocalAgentHandle>,
     pub(crate) pending_elicitations: PendingElicitationMap,
-    pub(crate) event_sources: Vec<Arc<EventFanout>>,
+    pub(crate) event_source: Arc<EventFanout>,
     pub(crate) session_owners: SessionOwnerMap,
     pub(crate) connection_bridges: Arc<Mutex<HashMap<String, ClientBridgeSender>>>,
     pub(crate) elicitation_recovery:
@@ -69,7 +69,7 @@ pub(crate) struct WsServerState {
 impl WsServerState {
     pub(crate) fn new(agent: Arc<crate::agent::LocalAgentHandle>) -> Self {
         Self {
-            event_sources: collect_event_sources(&agent),
+            event_source: agent.config.event_sink.fanout().clone(),
             pending_elicitations: agent.pending_elicitations(),
             session_owners: SessionOwnerMap::default(),
             connection_bridges: Arc::new(Mutex::new(HashMap::new())),
@@ -1673,51 +1673,44 @@ pub(crate) fn spawn_event_forwarders(
     translator: Arc<StdMutex<AcpLiveEventTranslator>>,
 ) {
     spawn_global_notification_forwarders(state.clone(), connection.clone());
-    for event_source in &state.event_sources {
-        let mut events = event_source.subscribe();
-        let state_events = state.clone();
-        let connection_events = connection.clone();
-        let translator = translator.clone();
-
-        tokio::spawn(async move {
-            let connection_cancel = connection_events.connection_cancel.clone();
-            let delivery = connection_events.delivery.clone();
-            loop {
-                let batch = tokio::select! {
-                    _ = connection_cancel.cancelled() => break,
-                    result = events.recv() => match result {
-                        Ok(event) => delivery.admit(event).await,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            // Recover the missed durable range from the journal and
-                            // keep going; a lag must never end the connection's
-                            // session updates.
-                            log::warn!(
-                                "WebSocket event forwarder lagged: conn_id={} skipped={skipped}",
-                                connection_events.conn_id
-                            );
-                            let recovered = delivery.recover_after_lag().await;
-                            let keep_going = forward_admitted(
-                                &state_events,
-                                &connection_events,
-                                &translator,
-                                recovered,
-                            )
-                            .await;
-                            delivery.finish_lag_recovery();
-                            if !keep_going || !refresh_session_observations(&state_events, &connection_events, &translator).await {
-                                break;
-                            }
-                            continue;
+    // Every member is built on the root's event stream: one subscription.
+    let mut events = state.event_source.subscribe();
+    tokio::spawn(async move {
+        let connection_cancel = connection.connection_cancel.clone();
+        let delivery = connection.delivery.clone();
+        loop {
+            let batch = tokio::select! {
+                _ = connection_cancel.cancelled() => break,
+                result = events.recv() => match result {
+                    Ok(event) => delivery.admit(event).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Recover the missed durable range from the journal and
+                        // keep going; a lag must never end the connection's
+                        // session updates.
+                        log::warn!(
+                            "WebSocket event forwarder lagged: conn_id={} skipped={skipped}",
+                            connection.conn_id
+                        );
+                        let recovered = delivery.recover_after_lag().await;
+                        let keep_going =
+                            forward_admitted(&state, &connection, &translator, recovered).await;
+                        delivery.finish_lag_recovery();
+                        if !keep_going
+                            || !refresh_session_observations(&state, &connection, &translator)
+                                .await
+                        {
+                            break;
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                };
-                if !forward_admitted(&state_events, &connection_events, &translator, batch).await {
-                    break;
-                }
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+            };
+            if !forward_admitted(&state, &connection, &translator, batch).await {
+                break;
             }
-        });
-    }
+        }
+    });
 }
 
 async fn refresh_session_observations(
@@ -1737,7 +1730,7 @@ async fn refresh_session_observations(
         let (mut notifications, updates) = crate::acp::shared::current_session_observations(
             &state.agent,
             &session_ids,
-            &state.event_sources,
+            &state.event_source,
         )
         .await;
         translator

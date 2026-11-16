@@ -53,15 +53,15 @@ let agent = Agent::single()
 
 Use `Mesh::hybrid()` when you want one process-shared runtime that supports both LAN discovery and later iroh invite joins.
 
-### Multi-Agent (Quorum)
+### Agent with Delegates
+
+Every agent is a root with a roster of members it can delegate to. A plain agent has an empty roster; `.delegate(..)` adds members.
 
 ```rust
-let agent = Agent::multi()
+let agent = Agent::single()
     .cwd(".")
-    .planner(|p| {
-        p.provider("anthropic", "claude-sonnet-4-5-20250929")
-            .tools(["delegate"])
-    })
+    .provider("anthropic", "claude-sonnet-4-5-20250929")
+    .tools(["delegate"])
     .delegate("coder", |d| {
         d.provider("anthropic", "claude-sonnet-4-5-20250929")
             .tools(["shell", "edit"])
@@ -89,14 +89,9 @@ let agent = Agent::from_config(config, infra).await?;
 
 ### Agent
 
-The main agent runtime, supporting both single and multi-agent modes.
+The main agent runtime: one root agent plus the members it can delegate to. The delegation service runs in every runtime whose root may call `delegate`.
 
-```rust
-pub enum Agent {
-    Single(LocalAgentHandle),
-    Multi(QuorumHandle),
-}
-```
+`Agent::single()` returns an `AgentBuilder`; `.delegate(id, |d| ..)`, `.delegation(bool)` and `.delegation_settings(..)` configure delegation. `Agent::is_multi()` reports whether the root has members it can delegate to, and `Agent::delegate(id)` returns a member's handle by ID.
 
 #### Methods
 

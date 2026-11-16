@@ -12191,7 +12191,6 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "hex",
- "http 1.5.0",
  "ignore",
  "imagesize",
  "imara-diff",

@@ -1,15 +1,15 @@
 ---
 id: agent-delegation
 title: Delegation lifecycle
-description: How a planner's delegation request is claimed, run in a child session (optionally in an isolated worktree), summarized, verified, completed or cancelled, and how the parent waits for it.
-tags: delegation, quorum, orchestrator, worktree, isolation, cancellation
+description: How the root agent's delegation request is claimed, run in a child session (optionally in an isolated worktree), summarized, verified, completed or cancelled, and how the parent waits for it.
+tags: delegation, roster, orchestrator, worktree, isolation, cancellation
 knowledge_paths: ["crates/agent-runtime/src/delegation/*.rs", "crates/agent-core/src/delegation/*.rs"]
 knowledge_sources: ["crates/agent-runtime/src/delegation/core.rs", "crates/agent-core/src/delegation/model_overrides.rs"]
 ---
 
 # Delegation lifecycle
 
-A planner agent hands work to a delegate through the `delegate` tool. The execution loop
+The root agent hands work to a delegate through the `delegate` tool. The execution loop
 (`crates/agent-runtime/src/agent/execution/tool_calls.rs`) resolves the delegation's
 isolation (`inherit` becomes `isolated` or `shared`, using the tool call, then the delegate's
 configured value, then the parent's execution mode), records the delegation and emits
@@ -27,9 +27,11 @@ fields are described in the agent-config note; user documentation is
 - `DelegationOrchestratorConfig`: `cwd`, `inject_results`, `run_verification`, `wait_policy`,
   `wait_timeout_secs`, `cancel_grace_secs`, `max_parallel_delegations`. Builder methods
   (`with_verification`, `with_wait_policy`, ...) set them.
-- `AgentRegistry` / `DefaultAgentRegistry` (`agent_registry.rs`, bottom of `core.rs`): maps a
-  delegate id to its `AgentInfo` (description, capabilities, configured isolation) and its
-  `AgentHandle`.
+- `AgentRoster` (`roster.rs`): the members the root can delegate to, each with its `AgentInfo`
+  (description, capabilities, configured isolation), origin (`config`, `protocol`, `runtime`)
+  and location (local handle or remote node). Members are built on first use and the roster
+  can change while the runtime runs; the `delegate` tool and the orchestrator read the same
+  snapshot.
 - `DelegationSummarizer` (`summarizer.rs`): optional LLM call that writes an implementation
   brief from the parent history.
 - `DelegateModelOverrideStore` (`agent-core/src/delegation/model_overrides.rs`): per
@@ -67,8 +69,8 @@ In order:
    The child's cwd is then its own workspace, never the parent's checkout.
 5. **`delegation_start` hook** runs against the real execution root; its additional context is
    appended to the planning context.
-6. **Child session** is created through `AgentHandle` (`create_isolated_delegation_session` or
-   `create_delegation_session`). If that fails, an allocated workspace is marked failed and
+6. **Child session** is created through the roster member (`MemberAgent::create_isolated_delegation_session`
+   or `create_delegation_session`; a remote member opens it through the owning root). If that fails, an allocated workspace is marked failed and
    retained, not left Ready. The child inherits the parent's UI bridge route when local.
 7. With a `profile_id`, the child's runtime binding is persisted; a failure tears down the
    child session and fails the delegation.

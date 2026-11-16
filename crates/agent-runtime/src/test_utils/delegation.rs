@@ -6,7 +6,8 @@ use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::ToolPolicy;
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
-use crate::delegation::{AgentInfo, DefaultAgentRegistry, DelegationOrchestrator};
+use crate::delegation::roster::{Member, MemberAgent, MemberOrigin};
+use crate::delegation::{AgentInfo, DelegationOrchestrator};
 use crate::middleware::{ExecutionState, MiddlewareDriver};
 use crate::session::backend::StorageBackend;
 use crate::session::runtime::RuntimeContext;
@@ -153,6 +154,8 @@ pub enum DelegateBehavior {
 
 pub struct TestHarness {
     pub config: Arc<AgentConfig>,
+    /// The root handle the orchestrator is weakly bound to.
+    pub delegator: Arc<crate::agent::LocalAgentHandle>,
     pub(crate) exec_ctx: ExecutionContext,
     pub provider: Arc<Mutex<MockLlmProvider>>,
     pub orchestrator_handle: Option<tokio::task::JoinHandle<()>>,
@@ -187,7 +190,7 @@ impl TestHarness {
         let store: Arc<dyn SessionStore> = shared_storage.clone();
 
         let provider_context = crate::session::provider::SessionProvider::new(
-            registry,
+            registry.clone(),
             store.clone(),
             LLMParams::new().provider("mock").model("mock-model"),
         )
@@ -220,17 +223,20 @@ impl TestHarness {
         // Create delegate agents as real LocalAgentHandles.
         // All delegates share the same in-memory SQLite store so parent_session_id
         // resolves correctly when creating delegation sessions.
-        let mut agent_registry = DefaultAgentRegistry::new();
+        let roster =
+            crate::delegation::roster::test_roster_on(registry.clone(), shared_storage.clone());
         for id in ["agent", "agent1", "agent2"] {
             let delegate_handle =
                 build_delegate_handle(behavior.clone(), store.clone(), delegate_reasoning_effort)
                     .await;
-            agent_registry.register_handle(
-                agent_info(id),
-                delegate_handle as Arc<dyn crate::agent::handle::AgentHandle>,
-            );
+            roster
+                .add(Member::built(
+                    agent_info(id),
+                    MemberOrigin::Config,
+                    MemberAgent::Local(delegate_handle),
+                ))
+                .expect("unique delegate id");
         }
-        let agent_registry: Arc<DefaultAgentRegistry> = Arc::new(agent_registry);
 
         let config = Arc::new(
             crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
@@ -239,25 +245,16 @@ impl TestHarness {
                 shared_storage.event_journal(),
             )
             .with_tool_policy(ToolPolicy::ProviderOnly)
-            .with_agent_registry_only(agent_registry.clone())
+            .with_roster(roster.clone())
             .build(),
         );
 
-        // Create a LocalAgentHandle for delegation (wraps its own SessionRegistry)
-        let delegator: Arc<dyn crate::agent::handle::AgentHandle> =
-            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone()));
+        // The root handle owns its own session registry.
+        let delegator = Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone()));
 
         let orchestrator = Arc::new(
-            DelegationOrchestrator::new(
-                delegator,
-                config.event_sink.clone(),
-                store.clone(),
-                agent_registry.clone(),
-                config.tool_registry_arc(),
-                config.hooks.clone(),
-                None,
-            )
-            .with_delegate_model_overrides(config.delegate_model_overrides.clone()),
+            DelegationOrchestrator::new(&delegator, roster, &Default::default(), None)
+                .with_delegate_model_overrides(config.delegate_model_overrides.clone()),
         );
         let orchestrator_handle = Some(orchestrator.start_listening(config.event_sink.fanout()));
 
@@ -279,6 +276,7 @@ impl TestHarness {
 
         Self {
             config,
+            delegator,
             exec_ctx,
             provider,
             orchestrator_handle,
@@ -621,7 +619,7 @@ pub async fn build_delegate_handle(
 pub fn agent_info(id: &str) -> AgentInfo {
     AgentInfo {
         isolation: Default::default(),
-        id: id.to_string(),
+        id: crate::delegation::roster::AgentId::try_from(id).expect("non-empty id"),
         name: format!("{} name", id),
         description: format!("{} description", id),
         capabilities: vec![],

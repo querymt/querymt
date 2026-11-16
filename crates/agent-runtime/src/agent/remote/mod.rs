@@ -53,9 +53,6 @@ pub(crate) mod provider_catalog_backend;
 pub(crate) mod provider_host_backend;
 
 #[cfg(feature = "remote")]
-pub mod remote_handle;
-
-#[cfg(feature = "remote")]
 pub mod remote_setup;
 
 #[cfg(feature = "remote")]
@@ -79,9 +76,6 @@ mod provider_host_tests;
 
 #[cfg(all(test, feature = "remote"))]
 mod mesh_provider_tests;
-
-#[cfg(all(test, feature = "remote"))]
-mod remote_agent_stub_tests;
 
 #[cfg(all(test, feature = "remote"))]
 mod remote_setup_tests;
@@ -116,8 +110,8 @@ pub use mesh_state::{MeshLocalRole, MeshStateEntry, MeshStateStore, MeshStatus};
 pub use node_id::NodeId;
 #[cfg(feature = "remote")]
 pub use node_manager::{
-    CreateRemoteSchedule, CreateRemoteScheduleResponse, CreateRemoteSession,
-    CreateRemoteSessionResponse, DeleteRemoteSchedule, ForkRemoteSession,
+    CreateRemoteDelegationSession, CreateRemoteSchedule, CreateRemoteScheduleResponse,
+    CreateRemoteSession, CreateRemoteSessionResponse, DeleteRemoteSchedule, ForkRemoteSession,
     ForkRemoteSessionResponse, GetNodeInfo, GetRemoteSessionLifecycle, GetRemoteSessionProfile,
     ListRemoteSchedules, ListRemoteSchedulesResponse, ListRemoteSessions,
     ListRemoteSessionsWithLifecycle, PauseRemoteSchedule, RemoteNodeManager, RemoteSessionProfile,
@@ -155,10 +149,8 @@ pub use registry_exchange::{
     GetRegistrations, NotifyRegistration, RegistrationEntry, RegistryExchangeActor,
 };
 #[cfg(feature = "remote")]
-pub use remote_handle::RemoteAgentHandle;
-#[cfg(feature = "remote")]
 pub use remote_setup::{
-    LocalMeshActorRefs, register_local_mesh_actor_scope, register_remote_agents_from_config,
+    LocalMeshActorRefs, register_local_mesh_actor_scope, remote_members_from_config,
     spawn_and_register_local_mesh_actors, spawn_and_register_local_mesh_actors_with_name,
 };
 pub use routing::{

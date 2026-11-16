@@ -4,6 +4,50 @@
 
 ### Behavior changes
 
+- **BREAKING (Rust API, delegation):** every runtime has one root agent and a
+  typed roster of members it can delegate to (`unify-agent-runtime`). A plain
+  agent is a runtime with an empty roster and now gets the delegation service
+  too. Removed: the `AgentHandle` trait and `RemoteAgentHandle`,
+  `register_remote_agent*`, `AgentRegistry` / `DefaultAgentRegistry`,
+  `ProtocolTargetFactory` and `DotagentsTargetFactory`, `DelegationMiddleware`
+  and the `DelegationContextConfig` / `DelegationContextTiming` types and
+  builder methods, `AgentQuorum*`, `QuorumBuilder`, `DelegateAgent`,
+  `Agent::multi` / `Agent::quorum` / `Agent::planner`, `collect_event_sources`
+  (every transport uses the root's single `EventFanout`), the services
+  `ToolContext::extensions()` / `with_extension` API and its `http`
+  dependency, and `skills::ApprovalMode` with `NonInteractive`. Use
+  `Agent::roster()`, `add_member`, `remove_member`, `MemberSpec` and
+  `AgentRoster` / `AgentId` (all in the prelude) instead.
+- **BREAKING (behavior):** a skill approval requested by a protocol
+  (`.agents`) target in an unattended run now waits for an answer instead of
+  being refused (`skills::ApprovalMode::NonInteractive` is removed). Unattended
+  runs that relied on the refusal need an explicit approval policy.
+- **BREAKING (profile catalog):** the embedded `coder-delegate` profile is
+  written as `[agent]` with `[[delegates]]`, so its `config_kind` is now
+  `single`, not `quorum`.
+- Configuration: `[agent]` accepts `[[delegates]]`, `[agent.delegation]`
+  (`wait_policy`, `wait_timeout_secs`, `cancel_grace_secs`, `max_parallel`,
+  `verification`, `summary`) and `snapshot_policy`. `[quorum]` / `[planner]` is
+  deprecated: it still loads and builds the same runtime, logs one notice per
+  load, and a file mixing it with `[agent]` is rejected. See "Migrating from
+  `[quorum]`" in `docs/docs/agent/configuration.md`. The shipped
+  `coder_agent`, `coder_delegate`, `learning_pair` and `multi_agent` profiles
+  use the new form.
+- ACP: new `querymt/agents/list`, `querymt/agents/add` and
+  `querymt/agents/remove` (optional `profileId`) and the
+  `querymt/agents/changed` notification change the roster of a running
+  runtime. Changes are not persisted. Members added this way reject `peer`,
+  file system-prompt parts and `isolated` without a workspace service, and do
+  not expand `${VAR}` in `api_key`. See "Changing agents while running" in
+  `docs/docs/agent/delegation.md`.
+- Remote agents are no longer contacted at startup. They are listed whether or
+  not the peer is reachable and resolved on first delegation; an unreachable
+  peer fails that delegation with an error naming the peer. Remote delegation
+  sessions are marked as delegations and are not listed as user sessions. New
+  mesh message `CreateRemoteDelegationSession`: nodes in one mesh need the same
+  version for remote delegation. New session-database migration
+  `0038_remote_bookmark_fork_origin` (nullable column); bookmarks written
+  earlier have no recorded origin.
 - **BREAKING (log filtering):** the agent is split into `querymt-agent-core`,
   `-index`, `-knowledge`, `-sqlite`, `-services` and `-runtime`, with
   `querymt-agent` as the facade. `log` and `tracing` targets come from module

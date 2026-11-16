@@ -9,24 +9,43 @@ use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
-pub struct DelegateTool;
-
-impl Default for DelegateTool {
-    fn default() -> Self {
-        Self::new()
-    }
+/// The `delegate` tool. It holds the roster of the runtime it belongs to, so
+/// its definition always lists the current members and a call validates
+/// against the same roster. Only `build_root` registers it.
+pub struct DelegateTool {
+    roster: std::sync::Arc<crate::delegation::roster::AgentRoster>,
 }
 
 impl DelegateTool {
-    pub fn new() -> Self {
-        Self
+    pub const NAME: &'static str = "delegate";
+
+    pub(crate) fn new(roster: std::sync::Arc<crate::delegation::roster::AgentRoster>) -> Self {
+        Self { roster }
+    }
+
+    /// The member list appended to the tool description, in ID order.
+    fn member_listing(snapshot: &crate::delegation::roster::RosterSnapshot) -> String {
+        use std::fmt::Write;
+
+        let mut out = String::from("\n\nAvailable agents:\n");
+        for info in snapshot.infos() {
+            let _ = write!(out, "- `{}` ({})", info.id, info.name);
+            if !info.description.is_empty() {
+                let _ = write!(out, ": {}", info.description);
+            }
+            if !info.capabilities.is_empty() {
+                let _ = write!(out, " [capabilities: {}]", info.capabilities.join(", "));
+            }
+            let _ = writeln!(out, " [default isolation: {}]", info.isolation);
+        }
+        out
     }
 }
 
 #[async_trait]
 impl ToolTrait for DelegateTool {
     fn name(&self) -> &str {
-        "delegate"
+        Self::NAME
     }
 
     fn is_read_only(&self) -> bool {
@@ -35,21 +54,31 @@ impl ToolTrait for DelegateTool {
     }
 
     fn definition(&self) -> Tool {
-        // Note: In the new architecture, we might not have access to the registry
-        // at definition time to populate the enum. For now, we'll keep it simple.
+        let snapshot = self.roster.snapshot();
+        let mut description = "Delegate a task to another specialized agent.".to_string();
+        let mut target = json!({
+            "type": "string",
+            "description": "The ID of the agent to delegate to."
+        });
+        if !snapshot.is_empty() {
+            description.push_str(&Self::member_listing(&snapshot));
+            target["enum"] = Value::Array(
+                snapshot
+                    .iter()
+                    .map(|member| Value::String(member.id().to_string()))
+                    .collect(),
+            );
+        }
         Tool {
             tool_type: "function".to_string(),
             function: FunctionTool {
-                name: "delegate".to_string(),
-                description: "Delegate a task to another specialized agent.".to_string(),
+                name: Self::NAME.to_string(),
+                description,
                 parameters: json!({
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "target_agent_id": {
-                            "type": "string",
-                            "description": "The ID of the agent to delegate to."
-                        },
+                        "target_agent_id": target,
                         "objective": {
                             "type": "string",
                             "description": "The goal of the delegation."
@@ -114,18 +143,11 @@ impl ToolTrait for DelegateTool {
             }
         }
 
-        // Get agent registry from context to validate target agent exists
-        let registry = context
-            .extensions()
-            .get::<std::sync::Arc<dyn crate::delegation::AgentRegistry>>()
-            .cloned()
-            .ok_or_else(|| {
-                ToolError::ProviderError("No agent registry available in context".into())
-            })?;
-
-        // Validate target agent exists and check capability requirements
-        let target_info = registry
-            .get_agent(target_id)
+        // Validate the target exists and check capability requirements.
+        let snapshot = self.roster.snapshot();
+        let target_info = snapshot
+            .get(target_id)
+            .map(|member| member.info())
             .ok_or_else(|| ToolError::InvalidRequest(format!("Unknown agent: '{}'.", target_id)))?;
 
         if target_info
@@ -155,121 +177,10 @@ impl ToolTrait for DelegateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delegation::{AgentInfo, DefaultAgentRegistry};
-    use async_trait::async_trait;
-    use std::any::Any;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use crate::delegation::roster::{MemberOrigin, test_member, test_roster};
+    use std::path::Path;
 
-    struct StubAgentHandle {
-        event_fanout: Arc<querymt_agent_services::event_fanout::EventFanout>,
-    }
-
-    impl StubAgentHandle {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                event_fanout: Arc::new(querymt_agent_services::event_fanout::EventFanout::new()),
-            })
-        }
-    }
-
-    #[async_trait]
-    impl crate::agent::handle::AgentHandle for StubAgentHandle {
-        async fn new_session(
-            &self,
-            _req: crate::acp::protocol::NewSessionRequest,
-        ) -> Result<crate::acp::protocol::NewSessionResponse, crate::acp::protocol::Error> {
-            Ok(crate::acp::protocol::NewSessionResponse::new(
-                "stub-session".to_string(),
-            ))
-        }
-
-        async fn prompt(
-            &self,
-            _req: crate::acp::protocol::PromptRequest,
-        ) -> Result<crate::acp::protocol::PromptResponse, crate::acp::protocol::Error> {
-            Ok(crate::acp::protocol::PromptResponse::new(
-                crate::acp::protocol::StopReason::EndTurn,
-            ))
-        }
-
-        async fn cancel(
-            &self,
-            _notif: crate::acp::protocol::CancelNotification,
-        ) -> Result<(), crate::acp::protocol::Error> {
-            Ok(())
-        }
-
-        async fn load_session(
-            &self,
-            _req: crate::acp::protocol::LoadSessionRequest,
-        ) -> Result<crate::acp::protocol::LoadSessionResponse, crate::acp::protocol::Error>
-        {
-            Ok(crate::acp::protocol::LoadSessionResponse::new())
-        }
-
-        async fn create_delegation_session(
-            &self,
-            _cwd: Option<String>,
-            _parent_session_id: String,
-        ) -> Result<(String, crate::agent::remote::SessionActorRef), crate::acp::protocol::Error>
-        {
-            Err(crate::acp::protocol::Error::internal_error())
-        }
-
-        fn subscribe_events(
-            &self,
-        ) -> tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope> {
-            self.event_fanout.subscribe()
-        }
-
-        fn event_fanout(&self) -> &Arc<querymt_agent_services::event_fanout::EventFanout> {
-            &self.event_fanout
-        }
-
-        fn emit_event(&self, _session_id: &str, _kind: querymt_agent_core::events::AgentEventKind) {
-        }
-
-        fn agent_registry(&self) -> Arc<dyn crate::delegation::AgentRegistry + Send + Sync> {
-            Arc::new(DefaultAgentRegistry::new())
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    struct TestContext {
-        extensions: http::Extensions,
-    }
-
-    impl TestContext {
-        fn without_registry() -> Self {
-            Self {
-                extensions: http::Extensions::new(),
-            }
-        }
-
-        fn with_registry() -> Self {
-            let mut registry = DefaultAgentRegistry::new();
-            registry.register(
-                AgentInfo {
-                    isolation: Default::default(),
-                    id: "coder".into(),
-                    name: "coder".into(),
-                    description: String::new(),
-                    capabilities: vec![],
-                    required_capabilities: vec![],
-                    meta: None,
-                },
-                StubAgentHandle::new(),
-            );
-            let registry: Arc<dyn crate::delegation::AgentRegistry> = Arc::new(registry);
-            let mut extensions = http::Extensions::new();
-            extensions.insert(registry);
-            Self { extensions }
-        }
-    }
+    struct TestContext;
 
     #[async_trait]
     impl ToolContext for TestContext {
@@ -281,10 +192,6 @@ mod tests {
             None
         }
 
-        fn extensions(&self) -> &http::Extensions {
-            &self.extensions
-        }
-
         async fn record_progress(
             &self,
             _kind: &str,
@@ -294,7 +201,7 @@ mod tests {
             Ok(String::new())
         }
 
-        fn as_any(&self) -> &dyn Any {
+        fn as_any(&self) -> &dyn std::any::Any {
             self
         }
     }
@@ -310,14 +217,19 @@ mod tests {
         value
     }
 
+    async fn tool_with(ids: &[&str]) -> (DelegateTool, tempfile::TempDir) {
+        let (roster, dir) = test_roster().await;
+        for id in ids {
+            roster.add(test_member(id, MemberOrigin::Config)).unwrap();
+        }
+        (DelegateTool::new(roster), dir)
+    }
+
     #[tokio::test]
     async fn unknown_isolation_value_is_rejected() {
-        let tool = DelegateTool::new();
+        let (tool, _dir) = tool_with(&[]).await;
         let err = tool
-            .call(
-                args_json(Some("sandboxed")),
-                &TestContext::without_registry(),
-            )
+            .call(args_json(Some("sandboxed")), &TestContext)
             .await
             .unwrap_err();
         assert!(
@@ -328,27 +240,75 @@ mod tests {
 
     #[tokio::test]
     async fn known_isolation_values_pass_validation() {
-        let tool = DelegateTool::new();
-        let context = TestContext::with_registry();
+        let (tool, _dir) = tool_with(&["coder"]).await;
         for isolation in ["inherit", "isolated", "shared"] {
             let result = tool
-                .call(args_json(Some(isolation)), &context)
+                .call(args_json(Some(isolation)), &TestContext)
                 .await
                 .unwrap_or_else(|err| panic!("isolation '{isolation}' should parse: {err}"));
             assert!(!result.is_empty());
         }
-        // Absent isolation stays valid (inherit default).
-        tool.call(args_json(None), &context).await.unwrap();
+        tool.call(args_json(None), &TestContext).await.unwrap();
     }
 
-    #[test]
-    fn schema_exposes_isolation_enum() {
-        let definition = DelegateTool::new().definition();
-        let parameters = definition.function.parameters;
+    #[tokio::test]
+    async fn unknown_agent_is_rejected() {
+        let (tool, _dir) = tool_with(&["writer"]).await;
+        let err = tool.call(args_json(None), &TestContext).await.unwrap_err();
+        assert!(err.to_string().contains("Unknown agent: 'coder'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn schema_exposes_isolation_enum() {
+        let (tool, _dir) = tool_with(&[]).await;
+        let parameters = tool.definition().function.parameters;
         assert_eq!(
             parameters["properties"]["isolation"]["enum"],
             serde_json::json!(["inherit", "isolated", "shared"])
         );
-        let _ = PathBuf::new();
+        assert!(parameters["properties"]["target_agent_id"]["enum"].is_null());
+    }
+
+    #[tokio::test]
+    async fn delegate_tool_lists_members_ordered_by_id() {
+        let (tool, _dir) = tool_with(&["writer", "coder"]).await;
+        let definition = tool.definition().function;
+        assert_eq!(
+            definition.parameters["properties"]["target_agent_id"]["enum"],
+            serde_json::json!(["coder", "writer"])
+        );
+        let coder = definition
+            .description
+            .find("`coder`")
+            .expect("coder listed");
+        let writer = definition
+            .description
+            .find("`writer`")
+            .expect("writer listed");
+        assert!(coder < writer, "{}", definition.description);
+        assert!(definition.description.contains("coder description"));
+        assert!(
+            definition
+                .description
+                .contains("default isolation: inherit")
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_roster_keeps_the_tool_definition_unchanged() {
+        let (roster, _dir) = test_roster().await;
+        roster
+            .add(test_member("coder", MemberOrigin::Config))
+            .unwrap();
+        let tool = DelegateTool::new(roster.clone());
+        let first = serde_json::to_string(&tool.definition()).unwrap();
+        let second = serde_json::to_string(&tool.definition()).unwrap();
+        assert_eq!(first, second);
+        roster
+            .add(test_member("reviewer", MemberOrigin::Runtime))
+            .unwrap();
+        let third = serde_json::to_string(&tool.definition()).unwrap();
+        assert_ne!(first, third);
+        assert!(third.contains("reviewer"));
     }
 }

@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use querymt_agent::acp::protocol::NewSessionRequest;
-use querymt_agent::agent::AgentHandle;
+use querymt_agent::agent::LocalAgentHandle;
 use querymt_agent::config::ConfigSource;
 use querymt_agent::runner::{AgentRunner, from_config};
 use std::sync::Arc;
@@ -81,7 +81,7 @@ fn make_bench_config(provider: &str, model: &str) -> String {
         .replace("db = \"/tmp/agent2.db\"", "db = \":memory:\"")
 }
 
-fn extract_handle(runner: &AgentRunner) -> Arc<dyn AgentHandle> {
+fn extract_handle(runner: &AgentRunner) -> Arc<LocalAgentHandle> {
     assert!(
         !runner.is_multi(),
         "expected single-agent config in benchmark"

@@ -242,7 +242,7 @@ Server skills are untrusted content, so they default to **ask**:
 - The prompt offers **Allow**, **Allow for this session** and **Deny**. "Allow for this session" is remembered per skill ID and per session: later loads of that skill, and reads of its supporting files, run without a prompt. It does not cover other skills of the same server, other sessions or delegate sessions, and it ends with the session. "Allow" and "Deny" apply to one load only. Use `"docs.*" = "allow"` to admit a whole server.
 - `deny` always wins, even over a session allow.
 - A `file` path that can never be valid (for example `../secrets.env`) fails without a prompt. A well-formed file that the MCP skill does not list still prompts first and fails after approval.
-- An agent that cannot prompt (such as an `.agents` delegation target, see [dotagents](dotagents.md)) fails an `ask` result immediately with an error naming the pattern to configure.
+- An approval raised in a delegated session, including one in an `.agents` delegation target (see [dotagents](dotagents.md)), is delivered to the client that owns the parent session, and the answer resumes the delegated turn. With no client attached it waits, so unattended runs should configure `allow` patterns.
 
 ### Hooks Configuration
 
@@ -293,7 +293,7 @@ isolation *available*; sessions still run locally unless they explicitly ask
 for a worktree.
 
 ```toml
-[agent.workspace]          # [quorum.workspace] for a quorum
+[agent.workspace]
 enabled = true             # default false
 storage_root = "~/.qmt/worktrees"   # default; relative paths resolve against this file
 baseline = "commit"        # "commit" (default) | "current_working_tree"
@@ -304,6 +304,51 @@ not choose its own baseline. Invalid settings (unusable `storage_root`, a
 backend without a workspace repository) fail when the agent is built. See
 [Git Worktree Workspaces](worktrees.md) for requesting isolation, the error
 codes, and the Rust/Python APIs.
+
+### Delegates and delegation settings
+
+An `[agent]` configuration can list the agents its root may delegate to, and tune how delegations run. See [Delegation](delegation.md) for how delegation works.
+
+```toml
+[agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+tools = ["delegate", "read_tool", "shell"]   # delegation needs `delegate` (or an empty `tools`)
+snapshot_policy = "diff"                     # "none" | "metadata" | "diff"
+
+[agent.delegation]
+wait_policy = "any"          # "any" | "all"
+wait_timeout_secs = 120
+cancel_grace_secs = 5
+max_parallel = 5
+verification = false
+
+[agent.delegation.summary]   # optional
+provider = "anthropic"
+model = "claude-haiku"
+
+[[delegates]]
+id = "coder"
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+description = "Coder agent that implements changes"
+tools = ["edit", "write_file", "shell", "read_tool"]
+```
+
+| Key | Type | Default | Limits |
+|---|---|---|---|
+| `[agent] snapshot_policy` | string | `"diff"` | `"none"`, `"metadata"` or `"diff"`; anything else fails loading. The root and every delegate use it. |
+| `[agent.delegation] wait_policy` | string | `"any"` | `"any"` continues when the first delegation completes, `"all"` waits for all. |
+| `wait_timeout_secs` | integer | `120` | Zero or more, in seconds. `0` means no timeout. The window restarts whenever a delegation finishes. |
+| `cancel_grace_secs` | integer | `5` | Zero or more, in seconds. |
+| `max_parallel` | integer | `5` | At least 1; `0` fails loading. |
+| `verification` | boolean | `false` | Run the verification pass after a delegation completes. |
+| `[agent.delegation.summary]` | table | absent (no planning summary) | Keys `provider` and `model` (required), `api_key`, `enabled` (default `true`), `max_tokens` (default 2000), `timeout_secs` (default 30), `min_history_tokens` (default 2000). |
+| `[[delegates]]` | array of tables | empty | The keys of a delegate below. Each entry becomes a roster member with origin `config`. |
+
+An unknown key in any of these tables, an invalid value, a duplicate delegate `id`, a delegate with `peer` while `[mesh]` is not enabled, and a delegate with `isolation = "isolated"` while `[agent.workspace] enabled` is false all fail loading with an error naming the key or delegate.
+
+A delegate takes `id`, `provider`, `model`, `api_key`, `description`, `capabilities`, `tools`, `mode`, `system`, `parameters`, `mcp`, `middleware`, `execution`, `skills`, `permissions`, `peer` and `isolation`. `system` file references resolve against the configuration file's directory.
 
 ## MCP Servers
 
@@ -348,7 +393,7 @@ auth = { type = "oauth", scopes = ["read"] }
 - **Login:** use the `_querymt/auth/*` extension methods (`start`, `complete`,
   `status`, `logout`) with the provider id `mcp:<server name>`, for example
   `mcp:linear`. Servers are offered from the agent configuration, every profile
-  (its `[[mcp]]` entries, quorum delegate `mcp` entries and `.agents/mcp.json`
+  (its `[[mcp]]` entries, delegate `mcp` entries and `.agents/mcp.json`
   servers) and the running profile runtimes, so a server declared only in a
   profile can be logged into before any session uses it. A name declared with
   different settings by several sources is refused with an `invalid_params`
@@ -401,7 +446,7 @@ tools = ["read_tool", "filesystem.*", "shell"]
 
 ## Middleware Configuration
 
-Middleware extends agent behavior through a pluggable stack. Building an agent (single agent, quorum planner or delegate) fails when an entry has an unknown `type` or invalid configuration; an entry turned off by its own config (for example `enabled = false`) is skipped. The initial session mode is the `mode` key on `[agent]`, `[planner]` and `[[delegates]]`, not a middleware setting:
+Middleware extends agent behavior through a pluggable stack. Building an agent (root agent or delegate) fails when an entry has an unknown `type` or invalid configuration; an entry turned off by its own config (for example `enabled = false`) is skipped. The initial session mode is the `mode` key on `[agent]` and `[[delegates]]`, not a middleware setting:
 
 ```toml
 # Agent mode middleware (build/plan/review modes)
@@ -512,82 +557,76 @@ sessions database, so a separate `--db` gets separate leases.
   disk. If the lease cannot be taken for any other I/O reason, the run proceeds without one.
 - Sessions hosted on a remote node are not reconciled locally; the host closes its own runs.
 
-## Multi-Agent (Quorum) Configuration
+## Migrating from `[quorum]`
 
-For planner-delegate workflows:
+`[quorum]` and `[planner]` are deprecated. A file written that way still loads and builds the same runtime (the planner is the root agent and the delegates are roster members), but every load logs a notice naming the replacement. A file that contains `[agent]` together with `[quorum]` or `[planner]` fails loading.
+
+Old form:
 
 ```toml
 [quorum]
 cwd = "."
-delegation = true
 verification = true
 snapshot_policy = "diff"
-
-# Optional delegation summary configuration
-[quorum.delegation_summary]
-provider = "anthropic"
-model = "claude-haiku"
-enabled = true
-max_tokens = 2000
-timeout_secs = 30
-min_history_tokens = 2000
-
-# Wait policy for delegations
-delegation_wait_policy = "any"  # "all" | "any"
+delegation_wait_policy = "any"
 delegation_wait_timeout_secs = 120
-delegation_cancel_grace_secs = 5
 max_parallel_delegations = 5
 
-# Planner configuration
 [planner]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-api_key = "${ANTHROPIC_API_KEY}"
 tools = ["delegate", "read_tool", "shell"]
 
-system = "You are a planner agent that coordinates tasks."
-
-[planner.execution]
-# Same execution policy structure as [agent.execution]
-
-# Optional planner middleware
-[[planner.middleware]]
-type = "limits"
-max_steps = 100
-
-# Delegate configurations
 [[delegates]]
 id = "coder"
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-description = "Coder agent that implements changes"
-capabilities = ["coding", "filesystem"]
 tools = ["edit", "write_file", "shell", "read_tool"]
+```
 
-system = "You are a coder agent. Implement the requested changes."
+New form:
 
-# Workspace isolation for tasks delegated to this agent (default "inherit").
-# isolation = "inherit"   # isolated parents isolate delegates; local parents share
-# isolation = "isolated"  # always a private worktree (needs [quorum.workspace])
-# isolation = "shared"    # share the parent's checkout (disclosed as shared)
-
-[delegates.execution]
-# Same execution policy structure
-
-# Optional delegate middleware
-[[delegates.middleware]]
-type = "limits"
-max_steps = 200
-
-# Remote delegate (runs on different mesh node)
-[[delegates]]
-id = "remote-coder"
+```toml
+[agent]
+cwd = "."
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-description = "Coder on remote GPU machine"
-peer = "dev-gpu"  # Routes LLM calls to remote node
-tools = ["edit", "write_file", "shell"]
+tools = ["delegate", "read_tool", "shell"]
+
+[agent.delegation]
+verification = true
+wait_policy = "any"
+wait_timeout_secs = 120
+max_parallel = 5
+
+[agent.execution.snapshot]
+backend = "git"
+
+[[delegates]]
+id = "coder"
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+tools = ["edit", "write_file", "shell", "read_tool"]
+
+[delegates.execution.snapshot]
+backend = "git"
 ```
+
+| `[quorum]` form | `[agent]` form |
+|---|---|
+| `[planner]` and `[planner.*]` | `[agent]` and `[agent.*]` |
+| `[[planner.middleware]]` | `[[middleware]]` |
+| `[quorum] cwd`, `[quorum.workspace]`, `[quorum.repository_knowledge]` | `[agent] cwd`, `[agent.workspace]`, `[agent.repository_knowledge]` |
+| `delegation_wait_policy`, `delegation_wait_timeout_secs`, `delegation_cancel_grace_secs`, `max_parallel_delegations`, `verification` | `[agent.delegation]` `wait_policy`, `wait_timeout_secs`, `cancel_grace_secs`, `max_parallel`, `verification` |
+| `[quorum.delegation_summary]` | `[agent.delegation.summary]` |
+| `delegation = false` | leave `delegate` out of `[agent] tools` |
+| `snapshot_policy = "diff"` | `[agent.execution.snapshot] backend = "git"` on the agent and on each delegate (the undo/redo backend); `[agent] snapshot_policy = "diff"` is the default |
+| `snapshot_policy = "metadata"`, or `"none"` or absent | `[agent] snapshot_policy = "metadata"` or `"none"`. Absent means `diff` under `[agent]`, so a `[quorum]` file without the key needs `snapshot_policy = "none"` to keep its behavior |
+| `[[delegates]]`, `[[mcp]]`, `[mesh]`, `[[remote_agents]]`, `[dotagents]` | unchanged |
+
+Delegates inherit the root's snapshot policy, as quorum delegates inherit the quorum's. The shipped `coder_agent`, `coder_delegate`, `learning_pair` and `multi_agent` profiles are written in the new form.
+
+A `[[delegates]]` entry may also set `isolation = "inherit" | "isolated" | "shared"` (default `inherit`) and `peer = "<mesh peer>"` (routes the delegate's LLM calls to that node). `isolated` needs `[agent.workspace] enabled = true`. A remote agent that runs on another node is a `[[remote_agents]]` entry; see [Remote Agents](#remote-agents).
 
 ## Environment Variable Interpolation
 
@@ -617,7 +656,8 @@ The configuration system validates:
 See the `examples/confs/` directory for complete examples:
 - `single_coder.toml` - Single coder agent
 - `coder_agent.toml` - Coder agent with full features
-- `multi_agent.toml` - Planner-delegate configuration
+- `multi_agent.toml` - Agent with delegates
+- `coder_delegate.toml`, `learning_pair.toml` - Agent with delegates, a delegation summary and workspace notes
 
 ## Profiles Configuration
 
@@ -974,7 +1014,7 @@ always_ask  = ["ibkr.place_order"]   # prompt on every call, never remembered
 timeout_sec = 120                    # unanswered prompts are rejected; unset waits
 ```
 
-The same `[permissions]` table is accepted under `[planner]` and each `[[delegates]]`. Entries are tool selectors: `shell` (built-in or provider tool), `server.tool` (one MCP tool) or `server.*` (every tool of an MCP server). A bare name never matches an MCP tool. Loading fails when an MCP selector names a server that is not configured, or when `tools` is set and does not select a listed tool.
+The same `[permissions]` table is accepted under `[agent]` and each `[[delegates]]`. Entries are tool selectors: `shell` (built-in or provider tool), `server.tool` (one MCP tool) or `server.*` (every tool of an MCP server). A bare name never matches an MCP tool. Loading fails when an MCP selector names a server that is not configured, or when `tools` is set and does not select a listed tool.
 
 Approval works the same for built-in, MCP and provider tools, and runs before the tool does:
 
@@ -990,7 +1030,7 @@ Approval works the same for built-in, MCP and provider tools, and runs before th
 
 `timeout_sec` applies to every prompt, including hook asks when both lists are empty. Unattended profiles (schedules, headless runs) must set it, or add `permission_request` hooks, otherwise they wait at the first prompt. A prompt that is not answered, or whose client is not attached, is never granted automatically. See [Session Interactions](mesh.md#session-interactions) for the full lifecycle and the all-nodes-upgrade requirement (`RemoteNodeUpgradeRequired`).
 
-Snapshots need no per-tool list. A call is snapshotted when a snapshot policy other than `none` is enabled (`AgentBuilder` defaults to `diff`, Quorum to `none`), the session has a working directory, and the tool does not declare itself read-only. Read-only tools are the built-ins that only read or only change session and knowledge state (for example `read_tool`, `search_text`, `delegate`, `todowrite`, `skill`) and MCP tools with `readOnlyHint = true`. Every other built-in (`edit`, `shell`, `accept_delegation_result`, ...) and every MCP tool without the hint is treated as mutating. Calls that reach no registered tool (the LLM-client provider fallback) are not snapshotted. With the `diff` policy each session reuses its last workspace tree, so a call only re-hashes files whose size or modification time changed. A delegate running in its own worktree is snapshotted in that checkout, not in the planner's.
+Snapshots need no per-tool list. A call is snapshotted when a snapshot policy other than `none` is enabled (`[agent]` and `AgentBuilder` default to `diff`; set `[agent] snapshot_policy` to change it), the session has a working directory, and the tool does not declare itself read-only. Read-only tools are the built-ins that only read or only change session and knowledge state (for example `read_tool`, `search_text`, `delegate`, `todowrite`, `skill`) and MCP tools with `readOnlyHint = true`. Every other built-in (`edit`, `shell`, `accept_delegation_result`, ...) and every MCP tool without the hint is treated as mutating. Calls that reach no registered tool (the LLM-client provider fallback) are not snapshotted. With the `diff` policy each session reuses its last workspace tree, so a call only re-hashes files whose size or modification time changed. A delegate running in its own worktree is snapshotted in that checkout, not in the root agent's.
 
 The removed keys `assume_mutating`, `mutating_tools`, `confirm_tools` and `confirm_timeout_sec` are rejected as unknown fields; see the CHANGELOG for replacements.
 
@@ -1069,7 +1109,7 @@ This requires a VS Code extension that implements the workspace query bridge.
 
 If you have old configurations, note these changes:
 - `system` now supports file references and arrays
-- `execution` section is nested under agent/planner/delegate
+- `execution` section is nested under agent/delegate
 - Middleware uses `type` field instead of direct fields
 - Mesh configuration moved to top-level `[mesh]` section
 - Profiles added with `[profile]` section

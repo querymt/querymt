@@ -1,5 +1,5 @@
 use crate::agent::execution::CycleOutcome;
-use crate::delegation::{DefaultAgentRegistry, DelegationOrchestrator};
+use crate::delegation::DelegationOrchestrator;
 use crate::middleware::{
     AgentStats, ConversationContext, DelegationGuardMiddleware, ExecutionState, LlmResponse,
     MiddlewareDriver,
@@ -26,11 +26,49 @@ use tokio::sync::{Mutex, Notify};
 
 // Mock implementations moved to crate::test_utils::mocks
 
+/// An orchestrator over the roster of `config`, bound to a fresh root handle.
+/// The root is leaked: the orchestrator holds it weakly and tests end soon after.
+fn orchestrator_for(
+    config: &Arc<crate::agent::agent_config::AgentConfig>,
+) -> DelegationOrchestrator {
+    orchestrator_with(config, &Default::default())
+}
+
+/// [`orchestrator_for`] with explicit delegation settings.
+fn orchestrator_with(
+    config: &Arc<crate::agent::agent_config::AgentConfig>,
+    settings: &crate::config::DelegationSettings,
+) -> DelegationOrchestrator {
+    let root = Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone()));
+    let orchestrator = DelegationOrchestrator::new(
+        &root,
+        config.roster().expect("config has a roster").clone(),
+        settings,
+        None,
+    );
+    std::mem::forget(root);
+    orchestrator
+}
+
+/// The built local member `id` of `config`'s roster.
+fn delegate_of(
+    config: &crate::agent::agent_config::AgentConfig,
+    id: &str,
+) -> Arc<crate::agent::LocalAgentHandle> {
+    config
+        .roster()
+        .expect("roster")
+        .snapshot()
+        .get(id)
+        .and_then(|member| member.agent().and_then(|agent| agent.as_local().cloned()))
+        .expect("built local delegate")
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn genai_delegation_concurrent_parent_prompts_reach_child_agents_without_persisting_context()
 {
     use crate::acp::protocol::{ContentBlock, LoadSessionRequest, PromptRequest, TextContent};
-    use crate::agent::handle::AgentHandle as _;
+    use crate::send_agent::SendAgent as _;
     use opentelemetry::Value;
     use querymt_agent_services::tools::trace_support::genai_trace::{
         assert_private, attr, capture_local_tasks,
@@ -75,19 +113,8 @@ async fn genai_delegation_concurrent_parent_prompts_reach_child_agents_without_p
             .await
             .unwrap();
             let config = harness.config.clone();
-            let orchestrator = Arc::new(
-                DelegationOrchestrator::new(
-                    Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-                    config.event_sink.clone(),
-                    config.provider.history_store(),
-                    config.agent_registry.clone(),
-                    config.tool_registry_arc(),
-                    config.hooks.clone(),
-                    None,
-                )
-                .with_result_injection(false)
-                .with_summarizer(Some(Arc::new(summarizer))),
-            );
+            let orchestrator =
+                Arc::new(orchestrator_for(&config).with_summarizer(Some(Arc::new(summarizer))));
             harness.orchestrator_handle =
                 Some(orchestrator.start_listening(config.event_sink.fanout()));
             let handle = crate::agent::LocalAgentHandle::from_config(harness.config.clone());
@@ -149,11 +176,7 @@ async fn genai_delegation_concurrent_parent_prompts_reach_child_agents_without_p
                 .load_session_stream(&parent_id, None, None)
                 .await
                 .unwrap();
-            let target = harness.config.agent_registry.get_handle("agent").unwrap();
-            let child_events = target
-                .as_any()
-                .downcast_ref::<crate::agent::LocalAgentHandle>()
-                .unwrap()
+            let child_events = delegate_of(&harness.config, "agent")
                 .config
                 .event_sink
                 .journal()
@@ -390,18 +413,7 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
             tokio::task::yield_now().await;
             let config = harness.config.clone();
             let store = config.provider.history_store();
-            let orchestrator = Arc::new(
-                DelegationOrchestrator::new(
-                    Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-                    config.event_sink.clone(),
-                    store.clone(),
-                    config.agent_registry.clone(),
-                    config.tool_registry_arc(),
-                    config.hooks.clone(),
-                    None,
-                )
-                .with_result_injection(false),
-            );
+            let orchestrator = Arc::new(orchestrator_for(&config));
             let consumer = tracing::info_span!(parent: None, "unrelated-consumer");
             let listener =
                 consumer.in_scope(|| orchestrator.start_listening(config.event_sink.fanout()));
@@ -581,15 +593,7 @@ async fn delegate_session_inherits_parent_connection_bridge() {
         .into_iter()
         .next()
         .expect("child session");
-    let target = harness
-        .config
-        .agent_registry
-        .get_handle("agent")
-        .expect("delegate handle");
-    let target = target
-        .as_any()
-        .downcast_ref::<crate::agent::LocalAgentHandle>()
-        .expect("local delegate");
+    let target = delegate_of(&harness.config, "agent");
     let child = target
         .registry
         .lock()
@@ -689,15 +693,7 @@ async fn delegate_setup_failure_removes_inherited_bridge_route() {
         .next()
         .expect("child session");
     assert!(harness.session_lifecycle(&child_session_id).await.resolved);
-    let target = harness
-        .config
-        .agent_registry
-        .get_handle("agent")
-        .expect("delegate handle");
-    let target = target
-        .as_any()
-        .downcast_ref::<crate::agent::LocalAgentHandle>()
-        .expect("local delegate");
+    let target = delegate_of(&harness.config, "agent");
     assert!(
         target
             .config
@@ -714,18 +710,9 @@ async fn delegate_setup_failure_removes_inherited_bridge_route() {
 async fn duplicate_orchestrators_create_one_child_for_one_request() {
     let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
     let config = harness.config.clone();
-    let store = config.provider.history_store();
     let duplicate = Arc::new(
-        DelegationOrchestrator::new(
-            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-            config.event_sink.clone(),
-            store,
-            config.agent_registry.clone(),
-            config.tool_registry_arc(),
-            config.hooks.clone(),
-            None,
-        )
-        .with_delegate_model_overrides(config.delegate_model_overrides.clone()),
+        orchestrator_for(&config)
+            .with_delegate_model_overrides(config.delegate_model_overrides.clone()),
     );
     let duplicate_listener = duplicate.start_listening(config.event_sink.fanout());
     assert_eq!(config.event_sink.fanout().subscriber_count(), 2);
@@ -742,18 +729,7 @@ async fn duplicate_orchestrators_create_one_child_for_one_request() {
 async fn profile_orchestrator_does_not_poison_unbound_session() {
     let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
     let config = harness.config.clone();
-    let spectator = Arc::new(
-        DelegationOrchestrator::new(
-            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-            config.event_sink.clone(),
-            config.provider.history_store(),
-            config.agent_registry.clone(),
-            config.tool_registry_arc(),
-            config.hooks.clone(),
-            None,
-        )
-        .with_profile_id("owner"),
-    );
+    let spectator = Arc::new(orchestrator_for(&config).with_profile_id("owner"));
     let spectator_listener = spectator.start_listening(config.event_sink.fanout());
 
     let outcome = tokio::time::timeout(
@@ -779,30 +755,8 @@ async fn unrelated_profile_orchestrator_does_not_claim_delegation() {
         .set_profile_binding(&harness.exec_ctx.session_id, "owner")
         .await
         .expect("bind parent profile");
-    let owner = Arc::new(
-        DelegationOrchestrator::new(
-            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-            config.event_sink.clone(),
-            store.clone(),
-            config.agent_registry.clone(),
-            config.tool_registry_arc(),
-            config.hooks.clone(),
-            None,
-        )
-        .with_profile_id("owner"),
-    );
-    let unrelated = Arc::new(
-        DelegationOrchestrator::new(
-            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-            config.event_sink.clone(),
-            store,
-            config.agent_registry.clone(),
-            config.tool_registry_arc(),
-            config.hooks.clone(),
-            None,
-        )
-        .with_profile_id("other"),
-    );
+    let owner = Arc::new(orchestrator_for(&config).with_profile_id("owner"));
+    let unrelated = Arc::new(orchestrator_for(&config).with_profile_id("other"));
     let owner_listener = owner.start_listening(config.event_sink.fanout());
     let unrelated_listener = unrelated.start_listening(config.event_sink.fanout());
 
@@ -825,13 +779,12 @@ async fn missing_target_fails_and_unblocks_parent() {
     let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
     harness.stop_harness_orchestrator();
     let config = harness.config.clone();
+    let (empty_roster, empty_dir) = crate::delegation::roster::test_roster().await;
+    std::mem::forget(empty_dir);
     let missing_target = Arc::new(DelegationOrchestrator::new(
-        Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-        config.event_sink.clone(),
-        config.provider.history_store(),
-        Arc::new(DefaultAgentRegistry::new()),
-        config.tool_registry_arc(),
-        config.hooks.clone(),
+        &harness.delegator,
+        empty_roster,
+        &Default::default(),
         None,
     ));
     let listener = missing_target.start_listening(config.event_sink.fanout());
@@ -1731,19 +1684,16 @@ async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct(
         .unwrap();
     let mut verification_tools = crate::tools::ToolRegistry::new();
     verification_tools.add(Arc::new(crate::tools::builtins::ShellTool::new()));
-    let orchestrator = Arc::new(
-        DelegationOrchestrator::new(
-            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-            config.event_sink.clone(),
-            store.clone(),
-            config.agent_registry.clone(),
-            Arc::new(verification_tools),
-            config.hooks.clone(),
-            None,
-        )
-        .with_verification(true)
-        .with_cancel_grace_secs(2),
-    );
+    let settings = crate::config::DelegationSettings {
+        verification: true,
+        cancel_grace_secs: 2,
+        ..Default::default()
+    };
+    let orchestrator = Arc::new({
+        let mut orchestrator = orchestrator_with(&config, &settings);
+        orchestrator.tool_registry = Arc::new(verification_tools);
+        orchestrator
+    });
     let listener = orchestrator.start_listening(config.event_sink.fanout());
     let mut events = config.subscribe_events();
     config.emit_event(
@@ -1780,11 +1730,7 @@ async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct(
     .expect("actual verification shell must be waiting before cancellation");
     let activity = config.event_sink.live_delegation_activity(&parent_id);
     let child_id = activity[0].child_session_id.clone().unwrap();
-    let delegate = config.agent_registry.get_handle("agent").unwrap();
-    let local = delegate
-        .as_any()
-        .downcast_ref::<crate::agent::LocalAgentHandle>()
-        .unwrap();
+    let local = delegate_of(&config, "agent");
     let child = local
         .observe_session_runtimes(std::slice::from_ref(&child_id))
         .await
@@ -1853,6 +1799,7 @@ async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct(
                 cwd: None,
                 created_at: 0,
                 title: None,
+                fork_origin: None,
             })
             .await
             .unwrap();
@@ -2037,18 +1984,11 @@ async fn verification_failure_resolves_terminal_delegate_child() {
         })
         .await
         .expect("create verification delegation");
-    let orchestrator = Arc::new(
-        DelegationOrchestrator::new(
-            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
-            config.event_sink.clone(),
-            store.clone(),
-            config.agent_registry.clone(),
-            config.tool_registry_arc(),
-            config.hooks.clone(),
-            None,
-        )
-        .with_verification(true),
-    );
+    let settings = crate::config::DelegationSettings {
+        verification: true,
+        ..Default::default()
+    };
+    let orchestrator = Arc::new(orchestrator_with(&config, &settings));
     let listener = orchestrator.start_listening(config.event_sink.fanout());
     config.event_sink.emit_ephemeral(
         &parent_session_id,

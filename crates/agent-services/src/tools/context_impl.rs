@@ -73,7 +73,6 @@ fn question_schema(
 pub struct AgentToolContext {
     session_id: String,
     cwd: Option<PathBuf>,
-    extensions: http::Extensions,
     elicitation_tx: Option<mpsc::Sender<ElicitationRequest>>,
     cancellation_token: CancellationToken,
     workspace_query_bridge: Option<Arc<dyn crate::workspace_query::WorkspaceQueryBridge>>,
@@ -98,7 +97,6 @@ impl AgentToolContext {
         Self {
             session_id,
             cwd,
-            extensions: http::Extensions::new(),
             elicitation_tx,
             cancellation_token: CancellationToken::new(),
             workspace_query_bridge: None,
@@ -113,15 +111,6 @@ impl AgentToolContext {
             repository_knowledge: None,
             tool_call_id: None,
         }
-    }
-
-    /// Store a typed value in this context's extensions.
-    ///
-    /// Runtime uses this to hand services to tools that the tool layer cannot
-    /// name, such as `Arc<dyn AgentRegistry>`.
-    pub fn with_extension<T: Clone + Send + Sync + 'static>(mut self, value: T) -> Self {
-        self.extensions.insert(value);
-        self
     }
 
     /// Attach the agent's per-session todo store.
@@ -230,10 +219,6 @@ impl ToolContext for AgentToolContext {
 
     fn tool_call_id(&self) -> Option<&str> {
         self.tool_call_id.as_deref()
-    }
-
-    fn extensions(&self) -> &http::Extensions {
-        &self.extensions
     }
 
     fn session_public_id(&self) -> Option<String> {

@@ -129,42 +129,36 @@ impl LocalAgentHandle {
                 .await
                 .get_many(session_ids.iter().map(String::as_str));
             let mut root = owned.clone();
-            {
-                let registry = &self.config.agent_registry;
-                for info in registry.list_agents() {
-                    if let Some(handle) = registry.get_handle(&info.id)
-                        && let Some(local) = handle.as_any().downcast_ref::<LocalAgentHandle>()
-                    {
-                        root.extend(
-                            local
-                                .registry
-                                .lock()
-                                .await
-                                .get_many(session_ids.iter().map(String::as_str)),
-                        );
-                    }
-                }
+            for local in self.local_members() {
+                root.extend(
+                    local
+                        .registry
+                        .lock()
+                        .await
+                        .get_many(session_ids.iter().map(String::as_str)),
+                );
             }
             let mut profiles = ProfileActors::new();
             if let Some(manager) = self.profiles() {
                 for runtime in manager.materialized_runtimes().await {
                     let mut ids = vec![None];
-                    if let Some(handle) = runtime.session_handle(None)
-                        && let Some(local) = handle.as_any().downcast_ref::<LocalAgentHandle>()
-                    {
+                    if let Some(local) = runtime.session_handle(None) {
                         ids.extend(
                             local
                                 .config
-                                .agent_registry
-                                .list_agents()
-                                .into_iter()
-                                .map(|info| Some(info.id)),
+                                .roster()
+                                .map(|roster| {
+                                    roster
+                                        .snapshot()
+                                        .iter()
+                                        .map(|member| Some(member.id().to_string()))
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default(),
                         );
                     }
                     for id in ids {
-                        if let Some(handle) = runtime.session_handle(id.as_deref())
-                            && let Some(local) = handle.as_any().downcast_ref::<LocalAgentHandle>()
-                        {
+                        if let Some(local) = runtime.session_handle(id.as_deref()) {
                             profiles.insert(
                                 (runtime.profile_id().to_string(), id),
                                 local

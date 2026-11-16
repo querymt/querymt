@@ -44,6 +44,17 @@ An `[agent]` configuration SHALL accept `[[delegates]]`, an array of tables with
 - **WHEN** `[agent.delegation]` sets `max_parallel = 0`
 - **THEN** loading fails with an error naming `max_parallel`
 
+### Requirement: Snapshot policy is configured under the agent
+`[agent]` SHALL accept `snapshot_policy` (`"none"`, `"metadata"` or `"diff"`). When absent, the policy SHALL be `diff`, as before. The root agent and every delegate SHALL use it. Any other value SHALL be a load error naming `snapshot_policy`.
+
+#### Scenario: Snapshot policy can be turned off
+- **WHEN** an `[agent]` configuration sets `snapshot_policy = "none"`
+- **THEN** the runtime's root agent and its delegates use snapshot policy `none`
+
+#### Scenario: Invalid snapshot policy is rejected
+- **WHEN** `[agent]` sets `snapshot_policy = "sometimes"`
+- **THEN** loading fails with an error naming `snapshot_policy`
+
 ### Requirement: Quorum configuration is deprecated
 A configuration written with `[quorum]` and `[planner]` SHALL still load and SHALL produce the same runtime as before: the planner as the root agent and the delegates as roster members. Loading it SHALL emit one deprecation notice that names `[agent]`, `[[delegates]]` and `[agent.delegation]` as the replacement. A file that contains `[agent]` together with `[quorum]` or `[planner]` SHALL be a load error.
 

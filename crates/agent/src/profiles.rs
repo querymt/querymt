@@ -77,7 +77,6 @@ impl ProfileRuntime {
         Arc::new(ProfileRuntimeView {
             metadata: self.metadata.clone(),
             handle: self.agent.handle(),
-            registry: self.agent.handle().config.agent_registry(),
             provider_lock: self.provider_lock.clone(),
         })
     }
@@ -102,7 +101,7 @@ impl ProfileRuntime {
     pub fn session_handle(
         &self,
         agent_id: Option<&str>,
-    ) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
+    ) -> Option<Arc<crate::agent::LocalAgentHandle>> {
         match agent_id {
             Some(agent_id) => self.agent.delegate(agent_id),
             None => Some(self.agent.handle()),
@@ -1851,7 +1850,7 @@ model = "model.gguf"
             .find(|profile| profile.id == "coder-delegate")
             .expect("coder delegate profile should be listed");
         assert_eq!(coder_delegate.name, "Coder Delegate");
-        assert_eq!(coder_delegate.config_kind, Some(ProfileConfigKind::Quorum));
+        assert_eq!(coder_delegate.config_kind, Some(ProfileConfigKind::Single));
         assert!(matches!(
             coder_delegate.source,
             ProfileSource::EmbeddedToml { .. }
@@ -1868,10 +1867,11 @@ model = "model.gguf"
             .await
             .expect("coder delegate profile should load");
         let delegate_config = match delegate_document.config {
-            Config::Multi(config) => config,
-            Config::Single(_) => panic!("expected coder delegate quorum config"),
+            Config::Single(config) => config,
+            Config::Multi(_) => panic!("expected coder delegate agent config"),
         };
-        crate::api::Agent::builder_from_quorum_config(*delegate_config, None)
+        assert_eq!(delegate_config.delegates.len(), 2);
+        crate::api::Agent::builder_from_config(*delegate_config)
             .expect("embedded coder delegate tools should validate");
     }
 
@@ -2565,14 +2565,7 @@ capabilities = ["coding"]
         .expect("initial quorum runtime build hung")
         .expect("initial quorum runtime");
         assert!(first.agent().is_multi());
-        assert!(
-            first
-                .agent()
-                .handle()
-                .agent_registry()
-                .get_handle("coder")
-                .is_some()
-        );
+        assert!(first.agent().delegate("coder").is_some());
         let subscriber_count = fanout.subscriber_count();
         for _ in 0..3 {
             let document = manager

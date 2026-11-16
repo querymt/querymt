@@ -81,7 +81,6 @@ pub use querymt_agent_runtime::api::sessions::{
     SessionListPageWithLifecycle, SessionMeta, SessionSummary, SessionSummaryWithLifecycle,
 };
 pub use querymt_agent_runtime::api::{AgentMesh, Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec};
-pub use querymt_agent_runtime::dotagents::DotagentsTargetFactory;
 pub use worktrees::{AgentWorktrees, SessionOptions};
 
 #[cfg(test)]

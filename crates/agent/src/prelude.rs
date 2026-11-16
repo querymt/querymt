@@ -40,17 +40,18 @@ pub use crate::runner::{
 };
 
 // Core agent types
-pub use crate::agent::{AgentHandle, LocalAgentHandle, SnapshotPolicy, ToolPolicy};
+pub use crate::agent::{LocalAgentHandle, SnapshotPolicy, ToolPolicy};
 
 // Events
 pub use crate::events::{AgentEvent, AgentEventKind};
 
 // Delegation & Multi-agent
-pub use crate::delegation::{AgentInfo, AgentRegistry};
+pub use crate::delegation::AgentInfo;
+pub use crate::delegation::member::MemberSpec;
+pub use crate::delegation::roster::{AgentId, AgentRoster, RosterError, RosterGeneration};
 
 // Configuration types
-pub use crate::agent::DelegationContextTiming;
-pub use crate::middleware::{ContextConfig, DelegationConfig, LimitsConfig, MiddlewarePresets};
+pub use crate::middleware::{ContextConfig, LimitsConfig, MiddlewarePresets};
 
 // Session & Storage
 pub use crate::session::domain::Task;

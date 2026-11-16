@@ -320,7 +320,6 @@ impl ExecutionContext {
 
     pub fn tool_context(
         &self,
-        agent_registry: Arc<dyn crate::delegation::AgentRegistry>,
         elicitation_tx: Option<tokio::sync::mpsc::Sender<crate::tools::ElicitationRequest>>,
     ) -> AgentToolContext {
         let mut ctx = AgentToolContext::new(
@@ -328,7 +327,6 @@ impl ExecutionContext {
             self.cwd().map(|p| p.to_path_buf()),
             elicitation_tx,
         )
-        .with_extension(agent_registry)
         .with_cancellation_token(self.cancellation_token.clone());
 
         if let Some(gate) = self.runtime.mutation_gate.get() {
@@ -520,8 +518,7 @@ mod tests {
         )
         .with_knowledge_store(Some(knowledge_store.clone()));
 
-        let agent_registry = Arc::new(crate::delegation::DefaultAgentRegistry::new());
-        let tool_ctx = ctx.tool_context(agent_registry, None);
+        let tool_ctx = ctx.tool_context(None);
 
         // The knowledge_store must be propagated to the tool context
         assert!(
@@ -548,10 +545,7 @@ mod tests {
             handle,
             ToolConfig::default(),
         );
-        let tools = ctx.tool_context(
-            Arc::new(crate::delegation::DefaultAgentRegistry::new()),
-            None,
-        );
+        let tools = ctx.tool_context(None);
         assert!(Arc::ptr_eq(&gate, &tools.checkout_mutation_gate().unwrap()));
     }
 
@@ -569,13 +563,7 @@ mod tests {
             handle,
             ToolConfig::default(),
         );
-        let registry = |ctx: &ExecutionContext| {
-            ctx.tool_context(
-                Arc::new(crate::delegation::DefaultAgentRegistry::new()),
-                None,
-            )
-            .repository_knowledge()
-        };
+        let registry = |ctx: &ExecutionContext| ctx.tool_context(None).repository_knowledge();
         assert!(registry(&ctx).is_none(), "absent unless host-enabled");
 
         let enabled =
@@ -601,8 +589,7 @@ mod tests {
             ToolConfig::default(),
         );
 
-        let agent_registry = Arc::new(crate::delegation::DefaultAgentRegistry::new());
-        let tool_ctx = ctx.tool_context(agent_registry, None);
+        let tool_ctx = ctx.tool_context(None);
 
         // Without knowledge_store, tool context should return None
         assert!(

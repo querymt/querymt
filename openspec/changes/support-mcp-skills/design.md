@@ -54,7 +54,6 @@ See proposal.md for motivation. Current state that shapes the approach:
 - the resolved local sources and `include_external`;
 - the permissions;
 - the `mcp` switch;
-- the approval mode (`Interactive` by default, `NonInteractive` for `.agents` targets, see §7);
 - the existing per-workspace `SkillRegistry` cache;
 - the set of collision pairs already warned about (§4);
 - the injectable discovery function used by tests.
@@ -194,8 +193,6 @@ Then:
 - Its elicitation ID is `skill-permission-<id>-<uuid>`. The pending-approval map is shared by all sessions of an agent and provider tool call IDs are not unique across sessions, so a call-ID suffix could replace another session's waiter; a fresh UUID cannot. The local-miss fallback in `call()` applies the same MCP authorization when the name is served by a visible MCP server, so a server registered while the local refresh was pending is never loaded without approval.
 - Permissions do not apply to listing, matching today's local behaviour.
 
-**Non-interactive catalogs** (§7): any `Ask` result, for a local or MCP skill, fails immediately with `PermissionDenied`. The message names the skill and the pattern that would allow it (for example `"docs.*" = "allow"` under `[agent.skills.permissions]`). No prompt is sent.
-
 ### 7. Sub-agents
 
 **Protocol targets (`.agents` delegation targets):**
@@ -203,27 +200,27 @@ Then:
   - `api/agent.rs` passes the standalone config, cloned before it is consumed, and the standalone project root;
   - `api/quorum.rs` passes `planner_config.skills` and the quorum's project root.
 - `create` attaches `SkillCatalog::from_config(skills, registering_project_root)` under three conditions: skills are enabled, the target is materialized, and the plan's `tools` is absent or contains `skill`. A target session with a cwd uses that cwd at bind time; the project root is only the fallback.
-- The catalog is `NonInteractive`. Target sessions own a separate `AgentConfig` and event sink with no fanout to the parent, so an approval prompt would never reach the user and the delegated turn would hang until cancelled. Failing fast with an error that names the pattern to configure is the predictable behaviour; forwarding prompts is a non-goal.
+- The catalog behaves like every other member's: an `Ask` result prompts. Every member is built on the runtime's event stream (`unify-agent-runtime`), so the prompt reaches the client that owns the parent session and the answer resumes the delegated turn. There is no separate approval mode for targets.
 - The target's own sessions bind the tool to their own workspace and their own MCP state, so only the target's attached servers contribute skills. Nothing needs to be copied from the parent.
 - Tool policy for targets with `tools` comes from a single shared helper `infer_restricted_tool_policy(tools, mcp_servers) -> ToolPolicy` in `agent/tools.rs`. It returns `BuiltInAndProvider` when servers are attached or any entry contains `.` or equals an attached server's name; otherwise `BuiltInOnly`. `api/agent.rs`, both quorum builders and `DotagentsTargetFactory` all call it, replacing the three existing copies. For quorum this adds the bare-server-name case, a superset that only widens the policy where an attached server is named.
 
 **Configured quorum planner and delegates:**
 - They replace `tool_registry_mut().add(build_skill_tool(..))` with `with_skill_catalog(..)` under the same gating.
 - Their sessions get MCP skills from their own servers automatically.
-- The planner and configured delegates are `Interactive`. **Outcome (task 5.4):** an approval raised by a delegate's skill tool call is emitted as `ElicitationRequested` on the shared fanout and is found by `take_pending_elicitation_sender` from the planner handle (it searches the registry's delegates), so it can be answered through the quorum session. Only protocol targets, whose sessions have a separate event sink, are `NonInteractive`.
+- **Outcome (task 5.4):** an approval raised by a delegate's skill tool call is emitted as `ElicitationRequested` on the shared fanout and is found by `take_pending_elicitation_sender` from the planner handle, so it can be answered through the quorum session. Protocol targets behave the same way since `unify-agent-runtime`.
 
 Because each sub-agent builds its own `AgentConfig`, the recursion guard in `ChildRegistry` is unaffected.
 
 ### 8. Configuration
 
-`SkillsConfig.mcp: bool`, with `#[serde(default = "default_true")]`. It is documented in `configuration.md` next to the permission examples (`"docs.*" = "allow"`), together with the `"*"` rule for MCP skills and the non-interactive behaviour of `.agents` targets.
+`SkillsConfig.mcp: bool`, with `#[serde(default = "default_true")]`. It is documented in `configuration.md` next to the permission examples (`"docs.*" = "allow"`), together with the `"*"` rule for MCP skills.
 
 ## Risks / Trade-offs
 
 - **[Breaking Rust API]** Removing `definition_for_cwd` and changing the `SkillTool` constructors breaks external `Tool` implementors that overrode it. Only the skill tool did in-tree. → Called out in the proposal; no compatibility shim, per repo policy.
 - **[Extra round trips per load]** `skills/get` plus `resources/read` on every MCP skill load, plus one `skills/list` on a miss. → Loads are rare and user-visible. Caching is a non-goal and can be added later using `ttl_ms`.
 - **[Approval fatigue]** `Ask` by default prompts once per load. → Users configure `server.*`. The default is deliberate because server content is untrusted instructions.
-- **[Sub-agents need explicit permissions]** Targets cannot prompt, so MCP skills in targets work only with an explicit `allow` pattern. → The error names the exact pattern to add.
+- **[Sub-agent approvals wait for a client]** A target's approval prompt waits until a client answers, as for any member; with no client attached the delegated turn waits. → Configure `allow` patterns for unattended runs.
 - **[Schema churn]** A server that changes skills often changes the tools hash and the prompt cache. → Refreshes happen only on server announcements or load misses, as with tools.
 - **[Turn-scoped binding]** Session tools are rebuilt per turn. → Construction is a few `Arc` clones, cached in the `ExecutionContext`.
 - **[Name/ID divergence]** A server may list a name that differs from the URI path segment. → The callable ID uses the frontmatter name, and `Skill::validate` (on list and on get) enforces the spec's consistency rules.

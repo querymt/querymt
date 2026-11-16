@@ -1,23 +1,13 @@
 # Coder Agent - Multi-agent system for code implementation
 #
-# This configuration defines a quorum with a planner agent that coordinates
+# This configuration defines an agent that coordinates
 # a specialized coder agent for implementation tasks.
-
-[quorum]
-cwd = "."
-delegation = true
-verification = false
-snapshot_policy = "diff"
-delegation_wait_policy = "all"
-delegation_wait_timeout_secs = 120
-delegation_cancel_grace_secs = 5
-max_parallel_delegations = 5
 
 # -----------------------------------------------------------------------------
 # Optional: managed Git worktree workspaces (disabled by default).
 # One workspace service is shared by the planner and every delegate.
 #
-# [quorum.workspace]
+# [agent.workspace]
 # enabled = true
 # storage_root = "~/.qmt/worktrees"   # relative paths resolve against this file
 # baseline = "commit"                 # or "current_working_tree"
@@ -29,7 +19,8 @@ max_parallel_delegations = 5
 # A non-"inherit" value on the `delegate` tool call overrides this setting.
 # -----------------------------------------------------------------------------
 
-[planner]
+[agent]
+cwd = "."
 mode = "plan"
 provider = "anthropic"
 model = "claude-opus-4-5"
@@ -40,14 +31,25 @@ system = [
   { file = "../prompts/default_system.txt" }
 ]
 
-# Middleware for planner
+[agent.delegation]
+wait_policy = "all"
+wait_timeout_secs = 120
+cancel_grace_secs = 5
+max_parallel = 5
+verification = false
+
+# Undo/redo through git, as `snapshot_policy = "diff"` did.
+[agent.execution.snapshot]
+backend = "git"
+
+# Middleware for the agent
 # Context middleware warns when approaching token limits
-[[planner.middleware]]
+[[middleware]]
 type = "context"
 warn_at_percent = 80
 fallback_max_tokens = 32000
 
-[[planner.middleware]]
+[[middleware]]
 type = "agent_mode"
 reminder = """<system-reminder>
 # Plan Mode - System Reminder
@@ -94,16 +96,16 @@ Don't make large assumptions about user intent.
 </system-reminder>"""
 
 # Optional: Detect duplicate code patterns
-# [[planner.middleware]]
+# [[middleware]]
 # type = "dedup_check"
 # threshold = 0.8
  
-[quorum.delegation_summary]
+[agent.delegation.summary]
 provider = "anthropic"
 model = "claude-3-5-haiku-20241022"
 
 [[delegates]]
-# isolation = "inherit"   # "inherit" | "isolated" | "shared" (see [quorum.workspace])
+# isolation = "inherit"   # "inherit" | "isolated" | "shared" (see [agent.workspace])
 id = "coder"
 provider = "llama_cpp"
 model = "qwen3-coder-30b"
@@ -139,3 +141,6 @@ fallback_max_tokens = 110000
 type = "dedup_check"
 threshold = 0.85
 min_lines = 10
+
+[delegates.execution.snapshot]
+backend = "git"

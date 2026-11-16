@@ -237,8 +237,8 @@ impl From<AgentRunner> for Box<dyn ChatRunner> {
 /// `from_config` will automatically:
 /// 1. Bootstrap the kameo libp2p swarm.
 /// 2. Register this node as a `RemoteNodeManager` in the DHT.
-/// 3. Pre-populate the agent registry with `AgentInfo` for each `[[remote_agents]]` entry,
-///    backed by a `RemoteAgentHandle` that routes delegation calls via the mesh.
+/// 3. List each `[[remote_agents]]` entry as a roster member. The peer is resolved when a
+///    delegation needs it, not at startup.
 ///
 /// # Example
 ///

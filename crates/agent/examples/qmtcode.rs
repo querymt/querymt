@@ -992,13 +992,13 @@ mod tests {
             coder_delegate.tags,
             vec!["coding", "delegation", "multi-agent"]
         );
-        assert_eq!(coder_delegate.config_kind, Some(ProfileConfigKind::Quorum));
+        assert_eq!(coder_delegate.config_kind, Some(ProfileConfigKind::Single));
 
         let document = catalog
             .load_profile("coder-delegate")
             .await
             .expect("inline embedded profile should load");
-        assert!(matches!(document.config, Config::Multi(_)));
+        assert!(matches!(document.config, Config::Single(_)));
     }
 
     #[tokio::test]

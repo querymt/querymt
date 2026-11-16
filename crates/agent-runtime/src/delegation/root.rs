@@ -4,32 +4,41 @@
 //! decides whether delegation is enabled, registers the delegation tool,
 //! builds the handle and, when enabled, starts the delegation service on it.
 
-use super::member::{DelegateBuildParams, MemberBuildSpec, configure_delegate_builder};
+use super::member::{DelegateBuildParams, MemberBuildSpec, MemberContext, build_local_member};
+use super::roster::{AgentId, AgentRoster, Member, MemberAgent, MemberOrigin, RosterSnapshot};
 use crate::agent::LocalAgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
+use crate::agent::builtin_tools::DelegateTool;
 use crate::agent::core::ToolConfig;
 use crate::config::{
     DelegationSettings, DelegationSummaryConfig, MiddlewareEntry, SkillsConfig, ToolRef,
 };
-use crate::delegation::{
-    AgentInfo, AgentRegistry, DefaultAgentRegistry, DelegationOrchestrator, DelegationSummarizer,
-};
-use crate::dotagents::{DotagentsSubAgentPlans, DotagentsTargetFactory, DotagentsTargetRegistry};
+use crate::delegation::{DelegationOrchestrator, DelegationSummarizer};
+use crate::dotagents::{DotagentsSubAgentPlans, merge_protocol_targets};
 use crate::middleware::MiddlewareDriver;
 use crate::session::provider::SessionProvider;
 use crate::session::store::SessionStore;
 use anyhow::{Context, Result};
 use querymt::plugin::host::PluginRegistry;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Builds a middleware driver once the root's configuration exists.
 pub type MiddlewareFactory = Box<dyn FnOnce(&LocalAgentHandle) -> Arc<dyn MiddlewareDriver> + Send>;
 
-/// Everything `build_root` needs besides the root's own builder.
+/// A delegate whose LLM calls run on a mesh peer.
+#[cfg(feature = "remote")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerRoute {
+    pub delegate: AgentId,
+    pub peer: String,
+}
+
+/// Everything `build_root` needs besides the root's own builder: the members
+/// of the roster, the settings of the delegation service and the middleware
+/// that is assembled once the root's configuration exists.
 #[doc(hidden)]
-pub struct RootDelegation {
+pub struct RootParts {
     /// The builder's delegation flag. Delegation is enabled when this is on and
     /// the root's tool selection admits `delegate` (see [`delegation_enabled`]).
     pub enabled: bool,
@@ -37,20 +46,19 @@ pub struct RootDelegation {
     /// Set for profile runtimes, so each service claims only its own sessions.
     pub profile_id: Option<String>,
     pub cwd: Option<PathBuf>,
-    /// Configured delegates, built before they enter the registry.
+    /// Configured delegates, built before they enter the roster.
     pub members: Vec<MemberBuildSpec>,
     pub member_params: DelegateBuildParams,
     /// Members that already exist (remote agents), registered first.
-    pub preregistered: Option<Arc<dyn AgentRegistry + Send + Sync>>,
+    pub preregistered: Vec<Member>,
     /// Protocol delegation targets, added lazily when delegation is enabled.
     pub protocol_plans: Option<DotagentsSubAgentPlans>,
     /// The root's skills configuration; protocol targets inherit it.
     pub skills: Option<SkillsConfig>,
     pub middleware_factories: Vec<MiddlewareFactory>,
     pub middleware_entries: Vec<MiddlewareEntry>,
-    /// Delegates with a `peer`: `(delegate_id, peer_name)`.
     #[cfg(feature = "remote")]
-    pub peer_delegates: Vec<(String, String)>,
+    pub peer_delegates: Vec<PeerRoute>,
     #[cfg(feature = "remote")]
     pub mesh: Option<crate::agent::remote::MeshHandle>,
 }
@@ -58,7 +66,49 @@ pub struct RootDelegation {
 /// The one rule for whether a runtime delegates: the flag is on and the root's
 /// tool selection admits `delegate` (an empty selection admits everything).
 pub fn delegation_enabled(flag: bool, tools: &ToolConfig) -> bool {
-    flag && tools.allows(ToolRef::builtin("delegate"))
+    flag && tools.allows(ToolRef::builtin(DelegateTool::NAME))
+}
+
+/// Builds the roster: pre-registered members first, then configured
+/// delegates, which win, then protocol targets, which yield to both.
+///
+/// Configured members are built before they enter the roster, so a bad
+/// middleware entry fails startup. Protocol targets are lowered now and
+/// built on first use, on this runtime's event stream.
+fn build_roster(
+    ctx: MemberContext,
+    parts: &mut RootParts,
+    enabled: bool,
+) -> Result<Arc<AgentRoster>> {
+    let mut members = std::mem::take(&mut parts.preregistered);
+    for spec in &parts.members {
+        let handle =
+            build_local_member(spec, &ctx).with_context(|| format!("delegate '{}'", spec.id))?;
+        members.push(Member::built(
+            spec.info(),
+            MemberOrigin::Config,
+            MemberAgent::Local(handle),
+        ));
+    }
+    let mut snapshot = RosterSnapshot::from_members(members)?;
+
+    if let (Some(plans), true) = (&parts.protocol_plans, enabled) {
+        let merge = merge_protocol_targets(plans, Some(&snapshot));
+        for diagnostic in &merge.diagnostics {
+            log::warn!("dotagents: {diagnostic}");
+        }
+        for plan in merge.accepted {
+            let info = plan.info.clone();
+            let member = match MemberBuildSpec::from_protocol_plan(&plan, parts.skills.as_ref()) {
+                Ok(spec) => Member::pending(info, MemberOrigin::Protocol, spec),
+                Err(error) => {
+                    Member::unbuildable(info, MemberOrigin::Protocol, &format!("{error:#}"))
+                }
+            };
+            snapshot.insert(member)?;
+        }
+    }
+    Ok(Arc::new(AgentRoster::new(ctx, snapshot, enabled)))
 }
 
 /// Builds the root agent of a runtime.
@@ -68,75 +118,31 @@ pub fn delegation_enabled(flag: bool, tools: &ToolConfig) -> bool {
 #[doc(hidden)]
 pub async fn build_root(
     mut builder: AgentConfigBuilder,
-    delegation: RootDelegation,
+    mut parts: RootParts,
 ) -> Result<Arc<LocalAgentHandle>> {
-    let enabled = delegation_enabled(delegation.enabled, builder.tool_config());
+    let enabled = delegation_enabled(parts.enabled, builder.tool_config());
     let storage = builder.storage().clone();
-    let fanout = builder.event_fanout();
-    let plugin_registry = delegation.member_params.plugin_registry.clone();
-
-    // Members: pre-registered first, then configured delegates, which win.
-    let mut base = DefaultAgentRegistry::new();
-    let mut member_handles: Vec<(String, Arc<LocalAgentHandle>)> = Vec::new();
-    if let Some(preregistered) = &delegation.preregistered {
-        for info in preregistered.list_agents() {
-            if let Some(handle) = preregistered.get_handle(&info.id) {
-                base.register_handle(info, handle);
-            }
-        }
-    }
-    for spec in &delegation.members {
-        let handle = Arc::new(LocalAgentHandle::from_config(Arc::new(
-            configure_delegate_builder(
-                spec,
-                &delegation.member_params,
-                storage.clone(),
-                fanout.clone(),
-            )
-            .with_context(|| format!("delegate '{}'", spec.id))?
-            .build(),
-        )));
-        base.register_handle(
-            AgentInfo {
-                isolation: spec.isolation,
-                id: spec.id.clone(),
-                name: spec.id.clone(),
-                description: spec.description.clone().unwrap_or_default(),
-                capabilities: spec.capabilities.clone(),
-                required_capabilities: spec.required_capabilities.clone(),
-                meta: None,
-            },
-            handle.clone(),
-        );
-        member_handles.push((spec.id.clone(), handle));
-    }
-
-    // Protocol targets are built on first use, on this runtime's event stream.
-    let registry: Arc<dyn AgentRegistry + Send + Sync> = match &delegation.protocol_plans {
-        Some(plans) if enabled => {
-            let factory = DotagentsTargetFactory::new(plugin_registry.clone(), storage.clone())
-                .with_skills(
-                    delegation.skills.clone(),
-                    delegation.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
-                )
-                .with_event_fanout(fanout.clone());
-            let registry =
-                DotagentsTargetRegistry::new(plans, Some(Arc::new(base)), Arc::new(factory));
-            for diagnostic in registry.diagnostics() {
-                log::warn!("dotagents: {diagnostic}");
-            }
-            Arc::new(registry)
-        }
-        _ => Arc::new(base),
-    };
+    let plugin_registry = parts.member_params.plugin_registry.clone();
+    let member_ctx = MemberContext::new(
+        parts.member_params.clone(),
+        parts.settings.clone(),
+        storage.clone(),
+        builder.event_fanout(),
+    );
+    #[cfg(feature = "remote")]
+    member_ctx.set_mesh(parts.mesh.clone());
+    let roster = build_roster(member_ctx, &mut parts, enabled)?;
+    let delegation = parts;
 
     builder = builder
-        .with_agent_registry(registry.clone())
+        .with_roster(roster.clone())
         .with_delegation_wait_policy(delegation.settings.wait_policy.clone())
         .with_delegation_wait_timeout_secs(delegation.settings.wait_timeout_secs)
         .with_delegation_cancel_grace_secs(delegation.settings.cancel_grace_secs);
-    if !enabled {
-        builder.tool_registry_mut().remove("delegate");
+    if enabled {
+        builder
+            .tool_registry_mut()
+            .add(Arc::new(DelegateTool::new(roster.clone())));
     }
 
     #[cfg(feature = "remote")]
@@ -160,8 +166,8 @@ pub async fn build_root(
     // built so far; config entries and the defaults share one assembly path.
     let initial_config = Arc::new(builder.build());
     let temp_handle = Arc::new(LocalAgentHandle::from_config(initial_config.clone()));
-    // Drivers the builder already holds (the delegation context driver) come
-    // first; `with_middleware` replaces the list, so they are carried over.
+    // Drivers the builder already holds come first; `with_middleware`
+    // replaces the list, so they are carried over.
     let mut middleware_drivers: Vec<Arc<dyn MiddlewareDriver>> =
         initial_config.middleware_drivers.clone();
     for factory in delegation.middleware_factories {
@@ -178,7 +184,6 @@ pub async fn build_root(
     let initial = Arc::try_unwrap(initial_config).unwrap_or_else(|arc| (*arc).clone());
     let config = Arc::new(initial.with_middleware(middleware_drivers));
     let handle = Arc::new(LocalAgentHandle::from_config(config.clone()));
-    handle.install_members(member_handles);
 
     if enabled {
         let settings = &delegation.settings;
@@ -188,25 +193,12 @@ pub async fn build_root(
             }
             None => None,
         };
-        let max_parallel = NonZeroUsize::new(settings.max_parallel.max(1)).expect("at least one");
-        let mut orchestrator = DelegationOrchestrator::new(
-            handle.clone() as Arc<dyn crate::agent::handle::AgentHandle>,
-            config.event_sink.clone(),
-            storage.session_store(),
-            registry,
-            config.tool_registry_arc(),
-            config.hooks.clone(),
-            delegation.cwd.clone(),
-        )
-        .with_delegate_model_overrides(config.delegate_model_overrides.clone())
-        .with_verification(settings.verification)
-        .with_wait_policy(settings.wait_policy.clone())
-        .with_wait_timeout_secs(settings.wait_timeout_secs)
-        .with_cancel_grace_secs(settings.cancel_grace_secs)
-        .with_max_parallel_delegations(max_parallel)
-        .with_summarizer(summarizer)
-        .with_budget_pricing(config.budget_pricing())
-        .with_budget_cap(config.budget_cap_usd());
+        let mut orchestrator =
+            DelegationOrchestrator::new(&handle, roster, settings, delegation.cwd.clone())
+                .with_delegate_model_overrides(config.delegate_model_overrides.clone())
+                .with_summarizer(summarizer)
+                .with_budget_pricing(config.budget_pricing())
+                .with_budget_cap(config.budget_cap_usd());
         if let Some(service) = config.workspace_service() {
             orchestrator = orchestrator.with_workspace_service(service);
         }
@@ -232,8 +224,7 @@ pub async fn build_root(
 
 /// Builds the summarizer that writes the brief handed to a delegate. A failure
 /// is logged and delegation proceeds without summaries.
-#[doc(hidden)]
-pub async fn build_summarizer(
+async fn build_summarizer(
     config: &DelegationSummaryConfig,
     plugin_registry: Arc<PluginRegistry>,
     store: Arc<dyn SessionStore>,
@@ -262,8 +253,7 @@ pub async fn build_summarizer(
 /// The routing actor for delegates that run on a peer, and the snapshot the
 /// delegation service reads at delegation time.
 #[cfg(feature = "remote")]
-#[doc(hidden)]
-pub struct PeerRouting {
+struct PeerRouting {
     pub actor: kameo::actor::ActorRef<crate::agent::remote::routing::RoutingActor>,
     pub snapshot: crate::agent::remote::RoutingSnapshotHandle,
 }
@@ -272,9 +262,8 @@ pub struct PeerRouting {
 /// routes. Peers already visible in the mesh are resolved at once; the rest are
 /// resolved by [`spawn_peer_event_resolver`] when they appear.
 #[cfg(feature = "remote")]
-#[doc(hidden)]
-pub async fn setup_peer_routing(
-    peer_delegates: &[(String, String)],
+async fn setup_peer_routing(
+    peer_delegates: &[PeerRoute],
     mesh: Option<&crate::agent::remote::MeshHandle>,
 ) -> Option<PeerRouting> {
     use crate::agent::remote::routing::{
@@ -288,10 +277,14 @@ pub async fn setup_peer_routing(
     let snapshot = new_routing_snapshot_handle();
     let actor = RoutingActor::spawn(RoutingActor::new(snapshot.clone()));
 
-    for (delegate_id, peer_name) in peer_delegates {
+    for PeerRoute {
+        delegate: delegate_id,
+        peer: peer_name,
+    } in peer_delegates
+    {
         if let Err(e) = actor
             .ask(SetProviderTarget {
-                agent_id: delegate_id.clone(),
+                agent_id: delegate_id.to_string(),
                 target: RouteTarget::Peer(peer_name.clone()),
             })
             .await
@@ -326,11 +319,10 @@ pub async fn setup_peer_routing(
 /// Keeps the routing table current: resolves peers as they are discovered and
 /// forgets them when they expire.
 #[cfg(feature = "remote")]
-#[doc(hidden)]
-pub fn spawn_peer_event_resolver(
+fn spawn_peer_event_resolver(
     actor: kameo::actor::ActorRef<crate::agent::remote::routing::RoutingActor>,
     mesh: crate::agent::remote::MeshHandle,
-    peer_delegates: Vec<(String, String)>,
+    peer_delegates: Vec<PeerRoute>,
 ) {
     tokio::spawn(async move {
         use crate::agent::remote::routing::{ResolvePeer, UnresolvePeer};
@@ -371,7 +363,10 @@ pub fn spawn_peer_event_resolver(
                             continue;
                         }
                     };
-                    for (_delegate_id, peer_name) in &peer_delegates {
+                    for PeerRoute {
+                        peer: peer_name, ..
+                    } in &peer_delegates
+                    {
                         if node_info.hostname == *peer_name
                             && let Err(e) = actor
                                 .ask(ResolvePeer {

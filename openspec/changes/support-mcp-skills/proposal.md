@@ -27,7 +27,7 @@ rmcp 3.9.0 implements the MCP Skills extension (SEP-2640, `io.modelcontextprotoc
 - Add a `skills.mcp` setting (default `true`) that turns off MCP skills while keeping local skills.
 - **Sub-agents gain skills:**
   - `.agents` protocol delegation targets inherit the parent runtime's skill configuration. They are offered local skills for their own workspace plus the skills of only their own attached MCP servers, gated by their `tools` restriction.
-  - Protocol targets cannot show approval prompts to the user, so they never ask: a load that would need approval fails at once with an error naming the pattern to configure.
+  - Protocol targets are asked like any other member: an approval raised in a target's session is delivered to the client that owns the parent session (requirement "Interactions raised in delegated sessions reach the user" of `unify-agent-runtime`).
   - Protocol targets that attach MCP servers infer their tool policy the same way standalone agents do, through one shared helper that replaces the three existing copies, so restricted targets can reach their selected servers.
   - Configured quorum delegates and the planner keep their per-agent skill configuration and automatically see their own MCP servers' skills.
 - **BREAKING (Rust API):** `Tool::definition_for_cwd`, `ToolRegistry::definitions_for_cwd`/`definition_for_cwd` and the public `SkillTool` constructors are removed or replaced. Agent-level skill setup moves to a skill catalog held by the agent configuration. TOML configuration stays compatible; the new key is additive.

@@ -42,9 +42,8 @@ The 7.3 manual check of `support-mcp-skills` (qmtcode against mcpkit `mcpskills`
 - **Order in `SkillTool::authorize`:**
   1. `Deny` returns the permission error. Config wins, and a grant is never consulted.
   2. `Allow` passes.
-  3. `Ask` on a `NonInteractive` catalog fails at once with the pattern hint (unchanged), even if a grant exists.
-  4. `Ask`, when the ID is in `skill_grants`, passes without a prompt.
-  5. Otherwise it prompts with options "Allow", "Allow for this session" and "Deny".
+  3. `Ask`, when the ID is in `skill_grants`, passes without a prompt.
+  4. Otherwise it prompts with options "Allow", "Allow for this session" and "Deny".
      - "Allow" passes.
      - "Allow for this session" inserts the ID, then passes.
      - Any other answer is the existing denial.

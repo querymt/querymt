@@ -6,20 +6,17 @@
 
 use crate::acp::protocol::AuthMethod;
 use crate::agent::agent_config::AgentConfig;
-use crate::agent::core::{
-    AgentMode, ClientState, DelegationContextConfig, DelegationContextTiming, SnapshotPolicy,
-    ToolConfig, ToolPolicy,
-};
+use crate::agent::core::{AgentMode, ClientState, SnapshotPolicy, ToolConfig, ToolPolicy};
 use crate::agent::session_mcp::{NoopSessionMcpAttachmentSource, SessionMcpAttachmentSource};
 use crate::config::{
     CompactionConfig, DelegationWaitPolicy, McpServerConfig, Permissions, PruningConfig,
     RateLimitConfig, RuntimeExecutionPolicy, ToolOutputConfig, ToolSpec,
 };
-use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
+use crate::delegation::roster::AgentRoster;
 use crate::hooks::Hooks;
 use crate::middleware::{
-    AgentModeMiddleware, ContextConfig, ContextMiddleware, DelegationConfig, DelegationMiddleware,
-    LimitsConfig, LimitsMiddleware, MiddlewareDriver,
+    AgentModeMiddleware, ContextConfig, ContextMiddleware, LimitsConfig, LimitsMiddleware,
+    MiddlewareDriver,
 };
 use crate::session::backend::StorageBackend;
 use crate::session::compaction::SessionCompaction;
@@ -56,9 +53,8 @@ pub struct AgentConfigBuilder {
     skill_catalog: Option<Arc<crate::skills::SkillCatalog>>,
     middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,
     auth_methods: Vec<AuthMethod>,
-    agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
+    roster: Option<Arc<AgentRoster>>,
     delegate_model_overrides: crate::delegation::DelegateModelOverrideStore,
-    delegation_context_config: DelegationContextConfig,
     workspace_manager_actor: kameo::actor::ActorRef<WorkspaceIndexManagerActor>,
     execution_timeout_secs: u64,
     delegation_wait_policy: DelegationWaitPolicy,
@@ -113,12 +109,8 @@ impl AgentConfigBuilder {
             skill_catalog: None,
             middleware_drivers: Vec::new(),
             auth_methods: Vec::new(),
-            agent_registry: Arc::new(DefaultAgentRegistry::new()),
+            roster: None,
             delegate_model_overrides: crate::delegation::DelegateModelOverrideStore::default(),
-            delegation_context_config: DelegationContextConfig {
-                timing: DelegationContextTiming::FirstTurnOnly,
-                auto_inject: true,
-            },
             workspace_manager_actor: WorkspaceIndexManagerActor::new(
                 WorkspaceIndexManagerConfig::default(),
             ),
@@ -169,12 +161,8 @@ impl AgentConfigBuilder {
             skill_catalog: None,
             middleware_drivers: Vec::new(),
             auth_methods: Vec::new(),
-            agent_registry: Arc::new(DefaultAgentRegistry::new()),
+            roster: None,
             delegate_model_overrides: crate::delegation::DelegateModelOverrideStore::default(),
-            delegation_context_config: DelegationContextConfig {
-                timing: DelegationContextTiming::FirstTurnOnly,
-                auto_inject: true,
-            },
             workspace_manager_actor: WorkspaceIndexManagerActor::new(
                 WorkspaceIndexManagerConfig::default(),
             ),
@@ -213,7 +201,7 @@ impl AgentConfigBuilder {
             provider: self.provider,
             storage: self.storage,
             event_sink,
-            agent_registry: self.agent_registry,
+            roster: self.roster,
             delegate_model_overrides: self.delegate_model_overrides,
             workspace_manager_actor: self.workspace_manager_actor,
             session_bridges: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -236,7 +224,6 @@ impl AgentConfigBuilder {
             compaction: self.compaction,
             snapshot_backend: self.snapshot_backend,
             snapshot_gc_config: self.snapshot_gc_config,
-            delegation_context_config: self.delegation_context_config,
             pending_elicitations: self.pending_elicitations,
             mcp_servers: self.mcp_servers,
             session_mcp_attachment_source: self.session_mcp_attachment_source,
@@ -271,42 +258,10 @@ impl AgentConfigBuilder {
 
     // ── Delegation ────────────────────────────────────────────────────────
 
-    /// Sets the agent registry for delegation functionality.
-    ///
-    /// Also auto-registers `DelegationMiddleware` when the registry is non-empty
-    /// and `auto_inject` is enabled.
-    pub fn with_agent_registry(mut self, registry: Arc<dyn AgentRegistry + Send + Sync>) -> Self {
-        self.agent_registry = registry.clone();
-
-        // Remove old DelegateTool and add new one with registry
-        self.tool_registry.remove("delegate");
-        self.tool_registry
-            .add(Arc::new(crate::agent::builtin_tools::DelegateTool::new()));
-
-        if self.delegation_context_config.auto_inject && !registry.list_agents().is_empty() {
-            let middleware = DelegationMiddleware::new(
-                self.provider.history_store(),
-                registry,
-                DelegationConfig {
-                    context_timing: self.delegation_context_config.timing,
-                    prevent_duplicates: false,
-                    auto_inject: true,
-                },
-            );
-            self.middleware_drivers.push(Arc::new(middleware));
-        }
-
-        self
-    }
-
-    /// Sets the agent registry without auto-registering `DelegateTool` or
-    /// `DelegationMiddleware`. Use this when you wire delegation externally
-    /// (e.g. via a `DelegationOrchestrator` added as an observer).
-    pub fn with_agent_registry_only(
-        mut self,
-        registry: Arc<dyn AgentRegistry + Send + Sync>,
-    ) -> Self {
-        self.agent_registry = registry;
+    /// Gives this agent a roster to delegate to. Only the root builder
+    /// (`delegation::build_root`) does this.
+    pub(crate) fn with_roster(mut self, roster: Arc<AgentRoster>) -> Self {
+        self.roster = Some(roster);
         self
     }
 
@@ -315,24 +270,6 @@ impl AgentConfigBuilder {
         overrides: crate::delegation::DelegateModelOverrideStore,
     ) -> Self {
         self.delegate_model_overrides = overrides;
-        self
-    }
-
-    /// Sets the delegation context timing.
-    pub fn with_delegation_context_timing(mut self, timing: DelegationContextTiming) -> Self {
-        self.delegation_context_config.timing = timing;
-        self
-    }
-
-    /// Enables or disables auto delegation context injection.
-    pub fn with_auto_delegation_context(mut self, enabled: bool) -> Self {
-        self.delegation_context_config.auto_inject = enabled;
-        self
-    }
-
-    /// Sets the delegation context config directly.
-    pub fn with_delegation_context_config(mut self, config: DelegationContextConfig) -> Self {
-        self.delegation_context_config = config;
         self
     }
 
@@ -387,17 +324,6 @@ impl AgentConfigBuilder {
     pub fn with_context_management(mut self, config: ContextConfig) -> Self {
         self.middleware_drivers
             .push(Arc::new(ContextMiddleware::new(config)));
-        self
-    }
-
-    /// Adds delegation middleware.
-    pub fn with_delegation(mut self, config: DelegationConfig) -> Self {
-        let middleware = DelegationMiddleware::new(
-            self.provider.history_store(),
-            self.agent_registry.clone(),
-            config,
-        );
-        self.middleware_drivers.push(Arc::new(middleware));
         self
     }
 
@@ -713,7 +639,7 @@ impl AgentConfigBuilder {
         self.tool_registry.clone()
     }
 
-    /// Borrow the `SessionProvider` (used by `DelegationMiddleware` constructor in quorum).
+    /// Borrow the `SessionProvider` .
     pub fn provider(&self) -> &Arc<SessionProvider> {
         &self.provider
     }
@@ -731,16 +657,6 @@ impl AgentConfigBuilder {
     /// Borrow the `StorageBackend` used to build this config.
     pub fn storage(&self) -> &Arc<dyn StorageBackend> {
         &self.storage
-    }
-
-    /// Borrow the `agent_registry` (used by `DelegationMiddleware` constructor in quorum).
-    pub fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
-        self.agent_registry.clone()
-    }
-
-    /// Borrow the `delegation_context_config` (used when building DelegationMiddleware).
-    pub fn delegation_context_config(&self) -> &DelegationContextConfig {
-        &self.delegation_context_config
     }
 
     /// Apply execution policy and snapshot backend from an `ExecutionPolicy`.

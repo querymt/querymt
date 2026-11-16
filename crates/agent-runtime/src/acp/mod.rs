@@ -26,7 +26,7 @@ pub use stdio::{AcpSessionLoadOutcome, load_session_with_replay, serve_stdio};
 // Existing manual JSON-RPC implementation (for dashboard compatibility)
 use crate::acp::shared::{
     AcpLiveEventTranslator, PendingElicitationMap, RpcMessage, SessionOwnerMap,
-    collect_event_sources, dispatch_rpc_message, is_event_owned,
+    dispatch_rpc_message, is_event_owned,
 };
 use querymt_agent_services::event_fanout::EventFanout;
 
@@ -37,7 +37,7 @@ use tokio::sync::mpsc;
 pub struct AcpServer {
     agent: Arc<crate::agent::LocalAgentHandle>,
     pending_elicitations: PendingElicitationMap,
-    event_sources: Vec<Arc<EventFanout>>,
+    event_source: Arc<EventFanout>,
     session_owners: SessionOwnerMap,
 }
 
@@ -45,48 +45,43 @@ pub struct AcpServer {
 struct ServerState {
     agent: Arc<crate::agent::LocalAgentHandle>,
     pending_elicitations: PendingElicitationMap,
-    event_sources: Vec<Arc<EventFanout>>,
+    event_source: Arc<EventFanout>,
     session_owners: SessionOwnerMap,
 }
 
 fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sender<String>) {
     let translator = Arc::new(StdMutex::new(AcpLiveEventTranslator::new()));
-    for event_source in &state.event_sources {
-        let mut events = event_source.subscribe();
-        let tx_events = tx.clone();
-        let conn_id_events = conn_id.clone();
-        let session_owners = state.session_owners.clone();
-        let translator = translator.clone();
-        tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
-                if !is_event_owned(&session_owners, &conn_id_events, &event).await {
-                    continue;
-                }
-                let notifications = translator
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .translate_notifications(&event);
-                for notification in notifications {
-                    let json = serde_json::to_string(&notification).unwrap_or_default();
-                    if tx_events.send(json).await.is_err() {
-                        break;
-                    }
+    let mut events = state.event_source.subscribe();
+    let session_owners = state.session_owners.clone();
+    tokio::spawn(async move {
+        while let Ok(event) = events.recv().await {
+            if !is_event_owned(&session_owners, &conn_id, &event).await {
+                continue;
+            }
+            let notifications = translator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .translate_notifications(&event);
+            for notification in notifications {
+                let json = serde_json::to_string(&notification).unwrap_or_default();
+                if tx.send(json).await.is_err() {
+                    break;
                 }
             }
-        });
-    }
+        }
+    });
 }
 
 impl AcpServer {
     pub fn new(agent: Arc<crate::agent::LocalAgentHandle>) -> Self {
-        let event_sources = collect_event_sources(&agent);
+        let event_source = agent.config.event_sink.fanout().clone();
         let pending_elicitations = agent.pending_elicitations();
         let session_owners = SessionOwnerMap::default();
 
         Self {
             agent,
             pending_elicitations,
-            event_sources,
+            event_source,
             session_owners,
         }
     }
@@ -95,7 +90,7 @@ impl AcpServer {
         let state = ServerState {
             agent: self.agent,
             pending_elicitations: self.pending_elicitations,
-            event_sources: self.event_sources,
+            event_source: self.event_source,
             session_owners: self.session_owners,
         };
 

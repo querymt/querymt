@@ -11,7 +11,6 @@ Verification commands use the querymt-agent CI feature set. `QMT_UI_DIST` must p
   - deny first;
   - then allow;
   - then a session grant passes;
-  - then a non-interactive catalog fails;
   - then prompt with "Allow", "Allow for this session" and "Deny", where "Allow for this session" inserts the callable ID.
 
   Tests in `crates/agent/src/skills/tool.rs` with `RecordingContext` and the MCP harness. Each asserts the number of questions asked and the result:
@@ -22,7 +21,6 @@ Verification commands use the querymt-agent CI feature set. `QMT_UI_DIST` must p
   - `skill_denial_is_not_remembered` covers agent-skills / Skill denial is not remembered
   - `session_allow_applies_to_an_ask_configured_local_skill` covers agent-skills / Session allow applies to an ask-configured local skill
   - `configured_deny_overrides_a_session_allow`: grant `harness.a` for the session, then bind with `"harness.*" = "deny"` and assert a permission error with zero questions. It covers agent-skills / Configured deny overrides a session allow.
-  - also assert that a `NonInteractive` catalog still fails with the pattern hint even when the grant set is non-empty.
 - [x] 1.3 Session isolation through the production path. In `crates/agent/src/agent/execution/tool_calls.rs` tests, next to the existing approval test that answers via `take_pending_elicitation_sender`:
   - run `execute_tool_call` for `skill` `harness.a` in one execution context and answer "Allow for this session";
   - call it again in the same context and assert no `ElicitationRequested` event;

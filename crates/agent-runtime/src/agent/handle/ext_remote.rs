@@ -102,6 +102,7 @@ impl LocalAgentHandle {
                 replace,
                 handoff,
                 windowed,
+                fork_origin: None,
             },
         )
         .await

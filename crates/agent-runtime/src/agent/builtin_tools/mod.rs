@@ -17,27 +17,34 @@ pub use use_remote_provider::UseRemoteProviderTool;
 use crate::tools::Tool;
 use std::sync::Arc;
 
-/// Returns all builtin tools.
+/// Returns the built-in tools that need no runtime state.
 ///
-/// This is the canonical source of truth for which tools are built-in.
-/// Used for capability inference and tool registration. `route_delegation_to_peer`
-/// and `use_remote_provider` are registered separately by the quorum builder.
+/// `delegate` is not in this list: it holds its runtime's roster and is
+/// registered only by `delegation::build_root`. Use [`builtin_tool_names`] for
+/// the full list of names. `route_delegation_to_peer` and `use_remote_provider`
+/// are also registered by `build_root`.
 pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
-    let mut tools = crate::tools::builtins::base_builtin_tools();
-    // `delegate` sits right before `delete_file`, as it always has.
-    let at = tools
+    crate::tools::builtins::base_builtin_tools()
+}
+
+/// Every built-in tool name, with `delegate` in its historical place before
+/// `delete_file`. Used by selector validation and capability inference.
+pub fn builtin_tool_names() -> Vec<String> {
+    let mut names: Vec<String> = all_builtin_tools()
         .iter()
-        .position(|tool| tool.name() == "delete_file")
-        .unwrap_or(tools.len());
-    tools.insert(at, Arc::new(DelegateTool::new()));
-    tools
+        .map(|tool| tool.name().to_string())
+        .collect();
+    let at = names
+        .iter()
+        .position(|name| name == "delete_file")
+        .unwrap_or(names.len());
+    names.insert(at, DelegateTool::NAME.to_string());
+    names
 }
 
 /// The tool names baseline recorded before the crate split (task 0.1).
 #[cfg(test)]
 mod name_list_tests {
-    use super::all_builtin_tools;
-
     #[test]
     fn builtin_tool_names_unchanged_after_split() {
         let expected: Vec<&str> =
@@ -45,11 +52,7 @@ mod name_list_tests {
                 .lines()
                 .filter(|line| !line.trim().is_empty())
                 .collect();
-        let actual: Vec<String> = all_builtin_tools()
-            .iter()
-            .map(|tool| tool.name().to_string())
-            .collect();
-        assert_eq!(actual, expected);
+        assert_eq!(super::builtin_tool_names(), expected);
     }
 }
 
@@ -152,7 +155,6 @@ mod read_only_tests {
         "browse",
         "complete_task",
         "create_task",
-        "delegate",
         "find_symbol_references",
         "get_function",
         "get_symbol",

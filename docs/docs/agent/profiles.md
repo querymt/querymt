@@ -132,15 +132,14 @@ Profiles can define two types of agents:
    # ... agent settings
    ```
 
-2. **Multi-Agent (Quorum)**:
+2. **Agent with delegates**:
    ```toml
-   [quorum]
+   [agent]
    cwd = "."
-   
-   [planner]
    provider = "anthropic"
    model = "claude-sonnet-4-5-20250929"
-   # ... planner settings
+   tools = ["delegate"]
+   # ... agent settings
    
    [[delegates]]
    id = "coder"
@@ -409,14 +408,11 @@ name = "Multi-Agent Team"
 description = "Planner with specialized delegates"
 tags = ["multi-agent", "delegation"]
 
-[quorum]
+[agent]
 cwd = "."
-delegation = { auto = true, require_approval = false, timeout_secs = 300 }
-
-[planner]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-tools = ["create_task", "todowrite", "todoread", "question"]
+tools = ["delegate", "create_task", "todowrite", "todoread", "question"]
 system = """You are a planning agent. Analyze tasks and delegate to specialists."""
 
 [[delegates]]

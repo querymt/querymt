@@ -59,7 +59,7 @@ impl Config {
     /// A server shared by several delegates is yielded once per declaration.
     pub fn mcp_servers(&self) -> impl Iterator<Item = &McpServerConfig> {
         let (top, delegates): (&[McpServerConfig], &[DelegateConfig]) = match self {
-            Self::Single(config) => (&config.mcp, &[]),
+            Self::Single(config) => (&config.mcp, &config.delegates),
             Self::Multi(config) => (&config.mcp, &config.delegates),
         };
         top.iter()

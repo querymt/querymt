@@ -202,15 +202,16 @@ pub(super) const VISIBLE_FORK_ORIGINS: &str = "('user', 'worktree')";
 fn session_scope_where(scope: SessionScope, alias: &str) -> String {
     match scope {
         SessionScope::All => "1 = 1".to_string(),
-        SessionScope::Root => format!("{alias}.parent_session_id IS NULL"),
+        // A delegated session opened on this node by a remote delegator has no
+        // parent row here, but it is not a root user session either.
+        SessionScope::Root => format!(
+            "{alias}.parent_session_id IS NULL AND ({alias}.fork_origin IS NULL OR {alias}.fork_origin <> 'delegation')"
+        ),
         SessionScope::Forks => format!(
             "{alias}.parent_session_id IS NOT NULL AND {alias}.fork_origin IN {VISIBLE_FORK_ORIGINS}"
         ),
         SessionScope::Children => format!("{alias}.parent_session_id IS NOT NULL"),
-        SessionScope::Delegates => format!(
-            "{}.parent_session_id IS NOT NULL AND {}.fork_origin = 'delegation'",
-            alias, alias
-        ),
+        SessionScope::Delegates => format!("{alias}.fork_origin = 'delegation'"),
     }
 }
 
@@ -765,8 +766,7 @@ impl ViewStore for SqliteStorage {
             let sessions_with_descendants = attach_children(&mut root, &parent_children_map);
             for session in sessions_with_descendants {
                 // Only include parent sessions or non-delegated children
-                let is_delegated_child = session.parent_session_id.is_some()
-                    && session.fork_origin.as_deref() == Some("delegation");
+                let is_delegated_child = session.fork_origin.as_deref() == Some("delegation");
                 if !is_delegated_child {
                     flat_items.push(session);
                 }

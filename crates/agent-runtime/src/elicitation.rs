@@ -185,22 +185,10 @@ pub async fn take_pending_elicitation_sender(
         return Some(sender);
     }
 
-    let registry = agent.agent_registry();
     let mut seen_agents = HashSet::new();
 
-    for info in registry.list_agents() {
-        let Some(handle) = registry.get_handle(&info.id) else {
-            continue;
-        };
-
-        let Some(delegate) = handle
-            .as_any()
-            .downcast_ref::<crate::agent::LocalAgentHandle>()
-        else {
-            continue;
-        };
-
-        let ptr = delegate as *const _ as usize;
+    for delegate in agent.local_members() {
+        let ptr = Arc::as_ptr(&delegate) as usize;
         if !seen_agents.insert(ptr) {
             continue;
         }
@@ -395,17 +383,7 @@ fn push_agent_pending_maps(
     if seen.insert(Arc::as_ptr(&map) as usize) {
         maps.push(map);
     }
-    let registry = agent.agent_registry();
-    for info in registry.list_agents() {
-        let Some(handle) = registry.get_handle(&info.id) else {
-            continue;
-        };
-        let Some(delegate) = handle
-            .as_any()
-            .downcast_ref::<crate::agent::LocalAgentHandle>()
-        else {
-            continue;
-        };
+    for delegate in agent.local_members() {
         let map = delegate.pending_elicitations();
         if seen.insert(Arc::as_ptr(&map) as usize) {
             maps.push(map);
@@ -423,17 +401,7 @@ fn push_agent_registries(
     if seen.insert(Arc::as_ptr(&agent.registry) as usize) {
         registries.push(agent.registry.clone());
     }
-    let registry = agent.agent_registry();
-    for info in registry.list_agents() {
-        let Some(handle) = registry.get_handle(&info.id) else {
-            continue;
-        };
-        let Some(delegate) = handle
-            .as_any()
-            .downcast_ref::<crate::agent::LocalAgentHandle>()
-        else {
-            continue;
-        };
+    for delegate in agent.local_members() {
         if seen.insert(Arc::as_ptr(&delegate.registry) as usize) {
             registries.push(delegate.registry.clone());
         }

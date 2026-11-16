@@ -5573,6 +5573,7 @@ async fn remote_bookmark_point_lookup_round_trip() {
         cwd: Some("/remote/dir".to_string()),
         created_at: 42,
         title: Some("My remote session".to_string()),
+        fork_origin: None,
     };
     storage
         .save_remote_session_bookmark(&bookmark)
@@ -5585,6 +5586,77 @@ async fn remote_bookmark_point_lookup_round_trip() {
         .unwrap()
         .expect("bookmark must round-trip through the store");
     assert_eq!(got, bookmark);
+}
+
+#[tokio::test]
+async fn remote_bookmark_fork_origin_round_trips_and_survives_later_saves() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let mut bookmark = RemoteSessionBookmark {
+        session_id: "s-del".to_string(),
+        node_id: "node-1".to_string(),
+        peer_label: "remote-host".to_string(),
+        cwd: None,
+        created_at: 42,
+        title: None,
+        fork_origin: Some(ForkOrigin::Delegation),
+    };
+    storage
+        .save_remote_session_bookmark(&bookmark)
+        .await
+        .unwrap();
+    let got = storage
+        .get_remote_session_bookmark("s-del")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.fork_origin, Some(ForkOrigin::Delegation));
+
+    // A later save that does not carry an origin must not erase it.
+    bookmark.fork_origin = None;
+    bookmark.title = Some("renamed".to_string());
+    storage
+        .save_remote_session_bookmark(&bookmark)
+        .await
+        .unwrap();
+    let listed = storage.list_remote_session_bookmarks().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].fork_origin, Some(ForkOrigin::Delegation));
+    assert_eq!(listed[0].title.as_deref(), Some("renamed"));
+}
+
+/// A session a remote delegator opened here has the delegation origin but no
+/// parent row. It is a delegate, never a root user session.
+#[tokio::test]
+async fn delegated_session_without_a_parent_is_not_a_root_session() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let root = storage
+        .create_session(Some("root".into()), Some("/workspace".into()), None, None)
+        .await
+        .unwrap();
+    let orphan = storage
+        .create_session(
+            Some("remote-delegate".into()),
+            Some("/workspace".into()),
+            None,
+            Some(ForkOrigin::Delegation),
+        )
+        .await
+        .unwrap();
+    let view: &dyn ViewStore = &storage;
+
+    let (groups, _, total) = view
+        .browse_session_groups(None, 20, 10, SessionScope::Root)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(session_ids(&groups), vec![root.public_id.clone()]);
+
+    let (groups, _, total) = view
+        .browse_session_groups(None, 20, 10, SessionScope::Delegates)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(session_ids(&groups), vec![orphan.public_id.clone()]);
 }
 
 #[tokio::test]

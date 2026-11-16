@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build an agent with delegates, using closure-based configuration
     let runner = Agent::single()
         .cwd(".")
-        .db("./quorum.db")
+        .db("./delegates.db")
         .provider("openai", "gpt-4")
         .system(
             "You are a principal engineer coordinating specialist agents. \
@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     println!("Agent with delegates ready!");
-    println!("- Planner: OpenAI GPT-4");
+    println!("- Root agent: OpenAI GPT-4");
     println!("- Coder: Ollama Qwen 2.5 Coder");
     println!("- Researcher: Anthropic Claude 3 Sonnet\n");
 

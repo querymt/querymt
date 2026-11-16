@@ -88,8 +88,8 @@ Failures raise `querymt_agent.WorktreeError` (a `RuntimeError`) with a stable
 `workspace_not_found`. Unknown keys in the `worktrees`
 dict raise `ValueError`. Isolation is a separate checkout, not a sandbox.
 
-`Agent.from_config(path)` reads `[agent.workspace]` / `[quorum.workspace]` from
-TOML. See the repository's `docs/docs/agent/worktrees.md` for the full guide.
+`Agent.from_config(path)` reads `[agent.workspace]` (and `[quorum.workspace]` of the
+deprecated quorum form) from TOML. See the repository's `docs/docs/agent/worktrees.md` for the full guide.
 
 ### Tests
 

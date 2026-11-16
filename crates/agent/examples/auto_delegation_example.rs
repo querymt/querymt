@@ -2,7 +2,7 @@ use querymt_agent::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let quorum = Agent::single()
+    let agent = Agent::single()
         .cwd(".")
         .provider("openai", "gpt-4")
         .system("Delegate research tasks to specialists.")
@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    let result = quorum
+    let result = agent
         .chat("Summarize recent Rust async improvements.")
         .await?;
     println!("Result: {}", result);

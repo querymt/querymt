@@ -105,8 +105,12 @@ impl LocalAgentHandle {
                 }))
             })?;
 
-        let mut delegates = runtime.handle().agent_registry().list_agents();
-        delegates.sort_by(|left, right| left.id.cmp(&right.id));
+        let delegates: Vec<crate::delegation::AgentInfo> = runtime
+            .handle()
+            .config
+            .roster()
+            .map(|roster| roster.snapshot().infos().cloned().collect())
+            .unwrap_or_default();
         let mut agents = vec![serde_json::json!({
             "id": "primary",
             "name": "Session",
@@ -115,11 +119,11 @@ impl LocalAgentHandle {
         })];
         agents.extend(delegates.into_iter().map(|agent| {
             serde_json::json!({
-                "id": agent.id,
+                "id": agent.id.as_str(),
                 "name": agent.name,
                 "description": agent.description,
                 "capabilities": agent.capabilities,
-                "configured_default_model_id": Self::configured_delegate_model_id(&runtime.handle(), &agent.id),
+                "configured_default_model_id": Self::configured_delegate_model_id(&runtime.handle(), agent.id.as_str()),
             })
         }));
 
@@ -180,12 +184,15 @@ impl LocalAgentHandle {
             .map_err(Error::into_internal_error)?;
         let editable = binding.agent_id.is_none()
             && session.fork_origin != Some(crate::session::domain::ForkOrigin::Delegation);
-        let mut agents = if editable {
-            handle.agent_registry().list_agents()
+        let agents: Vec<crate::delegation::AgentInfo> = if editable {
+            handle
+                .config
+                .roster()
+                .map(|roster| roster.snapshot().infos().cloned().collect())
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
-        agents.sort_by(|left, right| left.id.cmp(&right.id));
         let legacy_routes = if state.is_none() {
             Some(
                 handle
@@ -201,19 +208,19 @@ impl LocalAgentHandle {
         for agent in agents {
             let route = match &state {
                 Some(state) => crate::delegation::DelegateRouteOverrides {
-                    model: state.overrides.get(&agent.id).cloned(),
-                    reasoning_effort: state.reasoning_overrides.get(&agent.id).copied(),
+                    model: state.overrides.get(agent.id.as_str()).cloned(),
+                    reasoning_effort: state.reasoning_overrides.get(agent.id.as_str()).copied(),
                 },
                 None => legacy_routes
                     .as_ref()
-                    .and_then(|routes| routes.get(&agent.id))
+                    .and_then(|routes| routes.get(agent.id.as_str()))
                     .cloned()
                     .unwrap_or_default(),
             };
             let model = route.model;
             let reasoning_effort = route.reasoning_effort;
             assignments.push(DelegateAssignmentInfo {
-                agent_id: agent.id.clone(),
+                agent_id: agent.id.to_string(),
                 name: agent.name,
                 description: agent.description,
                 source: if model.is_some() {
@@ -222,8 +229,11 @@ impl LocalAgentHandle {
                     DelegateAssignmentSource::ProfileDefault
                 },
                 model: model.into(),
-                configured_default_model_id: Self::configured_delegate_model_id(&handle, &agent.id)
-                    .into(),
+                configured_default_model_id: Self::configured_delegate_model_id(
+                    &handle,
+                    agent.id.as_str(),
+                )
+                .into(),
                 reasoning_effort: reasoning_effort.into(),
             });
         }
@@ -250,7 +260,7 @@ impl LocalAgentHandle {
         };
         let orphaned_overrides = routes
             .into_iter()
-            .filter(|(agent_id, _)| handle.agent_registry().get_agent(agent_id).is_none())
+            .filter(|(agent_id, _)| !Self::roster_has(&handle, agent_id))
             .map(|(agent_id, route)| OrphanedDelegateAssignment {
                 model: route.model.into(),
                 reasoning_effort: route.reasoning_effort.into(),
@@ -270,11 +280,18 @@ impl LocalAgentHandle {
         })
     }
 
+    fn roster_has(handle: &LocalAgentHandle, agent_id: &str) -> bool {
+        handle
+            .config
+            .roster()
+            .is_some_and(|roster| roster.contains(agent_id))
+    }
+
     // This is profile configuration, not a resolved Mesh route or historical execution identity.
     fn configured_delegate_model_id(handle: &LocalAgentHandle, agent_id: &str) -> Option<String> {
-        let target = handle.agent_registry().get_handle(agent_id)?;
-        let local = target.as_any().downcast_ref::<LocalAgentHandle>()?;
-        let config = local.config.provider.initial_config();
+        // Reads the configuration; listing a member never builds it.
+        let snapshot = handle.config.roster()?.snapshot();
+        let config = snapshot.get(agent_id)?.llm_params()?;
         Some(format!(
             "{}/{}",
             config.provider.as_deref()?,
@@ -384,12 +401,7 @@ impl LocalAgentHandle {
                 crate::control::delegate_models::OptionalNullable::Null => true,
                 crate::control::delegate_models::OptionalNullable::Value(_) => false,
             };
-        if profile_handle
-            .agent_registry()
-            .get_agent(agent_id)
-            .is_none()
-            && !(stored_orphan && clears_orphan)
-        {
+        if !Self::roster_has(&profile_handle, agent_id) && !(stored_orphan && clears_orphan) {
             return Err(Error::invalid_params().data(serde_json::json!({
                 "message": "unknown delegate agent",
                 "sessionId": session_id,

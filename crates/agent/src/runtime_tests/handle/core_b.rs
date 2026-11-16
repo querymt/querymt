@@ -1083,9 +1083,7 @@ async fn test_event_subscribe_works() {
 }
 
 #[tokio::test]
-async fn test_agent_registry_accessible() {
+async fn test_roster_absent_without_build_root() {
     let f = HandleFixture::new().await;
-    let registry = f.handle.agent_registry();
-    // DefaultAgentRegistry starts empty
-    assert!(registry.list_agents().is_empty());
+    assert!(f.handle.config.roster().is_none());
 }

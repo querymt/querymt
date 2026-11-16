@@ -888,6 +888,14 @@ peer = "gpu-server"
 capabilities = ["gpu", "fast-model"]
 ```
 
+A remote agent is a member of the root's agent list, like any local delegate. The root delegates to it with the same `delegate` tool.
+
+**Resolved on first delegation, no startup wait:**
+- Startup does not contact the peer. The agent is listed in the `delegate` tool whether or not its peer is reachable, and a peer that is down or slow to join never delays the root.
+- The peer is looked up when the root first delegates to the agent. If it cannot be reached, the delegation fails with an error that names the peer.
+- Once the peer appears on the mesh, the next delegation succeeds. No restart is needed.
+- The session a delegation opens on the peer is attached to the root, so the peer's activity and permission or elicitation requests reach the client that owns the parent session. It is recorded on the peer with fork origin `delegation` and is not listed as a user session, on either node.
+
 ### Remote Delegate
 
 Delegates can run on remote nodes:

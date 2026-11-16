@@ -134,8 +134,11 @@ pub struct AgentBuilder {
     pub(super) mcp_servers: Vec<McpServerConfig>,
     /// Runtime MCP attachment source (e.g., mobile in-process MCP peers).
     session_mcp_attachment_source: Option<Arc<dyn SessionMcpAttachmentSource>>,
-    /// Optional pre-built agent registry (Phase 7: injected by `from_single_config_with_registry`).
-    pub(super) agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+    /// Members that already exist (for example tests' handles); listed before
+    /// the configured delegates.
+    pub(super) preregistered: Vec<crate::delegation::roster::Member>,
+    /// The first problem found while configuring delegates; `build` reports it.
+    delegate_error: Option<anyhow::Error>,
     /// Members the root can delegate to, built when the agent is.
     pub(super) delegates: Vec<crate::delegation::member::MemberBuildSpec>,
     /// Whether delegation is on (default). It also needs the root's `tools`
@@ -144,20 +147,22 @@ pub struct AgentBuilder {
     pub(super) delegation_settings: crate::config::DelegationSettings,
     /// Set for profile runtimes so each delegation service claims only its own sessions.
     profile_id: Option<String>,
-    /// Set by `[quorum]` configs, which keep their old root behaviour: the root
-    /// is named `planner`, gets a git snapshot backend whenever the snapshot
-    /// policy is not `none`, and a `skill` tool without configured skills is
-    /// an error.
-    quorum_shape: bool,
+    /// The root's agent ID (`agent` unless set).
+    root_id: Option<String>,
+    /// Whether the root gets a git snapshot backend whenever the snapshot
+    /// policy is not `none`, as `[quorum]` configs always did.
+    git_snapshots: bool,
+    /// Whether a `skill` tool without configured skills is an error for the root.
+    require_skills_for_skill_tool: bool,
     /// Optional pre-built infrastructure (plugin registry + storage).
     infra: Option<AgentInfra>,
     #[cfg(feature = "remote")]
     mesh: Option<Mesh>,
     #[cfg(feature = "remote")]
     mesh_auto_fallback: bool,
-    /// Delegates with a `peer`: `(delegate_id, peer_name)`.
+    /// Delegates whose LLM calls run on a mesh peer.
     #[cfg(feature = "remote")]
-    pub(super) peer_delegates: Vec<(String, String)>,
+    pub(super) peer_delegates: Vec<crate::delegation::PeerRoute>,
     /// Override: maximum execution steps (forwarded to AgentConfigBuilder).
     max_steps_override: Option<usize>,
     /// Override: maximum prompt bytes (forwarded to AgentConfigBuilder).
@@ -198,12 +203,15 @@ impl AgentBuilder {
             repository_knowledge_registry: None,
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: None,
-            agent_registry: None,
+            preregistered: Vec::new(),
             delegates: Vec::new(),
             delegation_enabled: true,
             delegation_settings: crate::config::DelegationSettings::default(),
             profile_id: None,
-            quorum_shape: false,
+            root_id: None,
+            git_snapshots: false,
+            require_skills_for_skill_tool: false,
+            delegate_error: None,
             infra: None,
             #[cfg(feature = "remote")]
             mesh: None,
@@ -248,8 +256,18 @@ impl AgentBuilder {
     where
         F: FnOnce(super::config::DelegateConfigBuilder) -> super::config::DelegateConfigBuilder,
     {
-        let builder = super::config::DelegateConfigBuilder::new(id);
-        self.delegates.push(configure(builder).build());
+        let id = id.into();
+        let spec = crate::delegation::roster::AgentId::try_from(id.as_str())
+            .map_err(|error| anyhow!("delegate '{id}': {error}"))
+            .and_then(|agent_id| {
+                configure(super::config::DelegateConfigBuilder::new(agent_id)).build()
+            });
+        match spec {
+            Ok(spec) => self.delegates.push(spec),
+            Err(error) => {
+                self.delegate_error.get_or_insert(error);
+            }
+        }
         self
     }
 
@@ -270,6 +288,34 @@ impl AgentBuilder {
     pub fn with_profile_id(mut self, profile_id: impl Into<String>) -> Self {
         self.profile_id = Some(profile_id.into());
         self
+    }
+
+    /// Lowers configured delegates into members, noting the ones whose LLM
+    /// calls run on a mesh peer. The one lowering for `[agent]` and `[quorum]`.
+    fn lower_delegates(
+        &mut self,
+        delegates: Vec<crate::config::DelegateConfig>,
+        top_level_mcp: &[McpServerConfig],
+    ) -> Result<()> {
+        use crate::delegation::member::{MemberBuildSpec, available_local_tool_names};
+
+        let local_tools = available_local_tool_names();
+        for delegate in delegates {
+            let spec = MemberBuildSpec::from_delegate_config(
+                delegate.clone(),
+                top_level_mcp,
+                &local_tools,
+            )?;
+            #[cfg(feature = "remote")]
+            if let Some(peer) = delegate.peer {
+                self.peer_delegates.push(crate::delegation::PeerRoute {
+                    delegate: spec.id.clone(),
+                    peer,
+                });
+            }
+            self.delegates.push(spec);
+        }
+        Ok(())
     }
 
     pub fn db(mut self, path: impl Into<PathBuf>) -> Self {
@@ -563,15 +609,10 @@ impl AgentBuilder {
         if let Some(error) = self.tool_error.take() {
             return Err(anyhow!("invalid `tools` selector: {error}"));
         }
-        if let Some(member) = self.delegates.iter().find(|m| m.tool_error.is_some())
-            && let Some(error) = &member.tool_error
-        {
-            return Err(anyhow!(
-                "delegate '{}': invalid `tools` selector: {error}",
-                member.id
-            ));
+        if let Some(error) = self.delegate_error.take() {
+            return Err(error);
         }
-        if self.quorum_shape {
+        if self.require_skills_for_skill_tool {
             check_skill_tool(&self.tools, self.skills_config.as_ref(), "planner")?;
         }
         for member in &self.delegates {
@@ -701,13 +742,9 @@ impl AgentBuilder {
 
         let mut builder =
             AgentConfigBuilder::new(plugin_registry.clone(), backend.clone(), llm_config)
-                .with_agent_id(if self.quorum_shape {
-                    "planner"
-                } else {
-                    "agent"
-                })
+                .with_agent_id(self.root_id.as_deref().unwrap_or("agent"))
                 .with_snapshot_policy(snapshot_policy);
-        if self.quorum_shape && snapshot_policy != SnapshotPolicy::None {
+        if self.git_snapshots && snapshot_policy != SnapshotPolicy::None {
             builder =
                 builder.with_snapshot_backend(Arc::new(crate::snapshot::GitSnapshotBackend::new()));
         }
@@ -715,27 +752,24 @@ impl AgentBuilder {
             builder = builder.with_event_fanout(event_fanout);
         }
 
-        // Phase 7: inject pre-populated agent registry (remote agents from config).
+        // Remote agents from config are registered ahead of the delegates.
+        #[allow(unused_mut)]
+        let mut preregistered = std::mem::take(&mut self.preregistered);
         #[cfg(feature = "remote")]
         let mesh_handle = match &self.mesh {
             Some(mesh) => Some(mesh.start().await?.handle().as_mesh_handle().clone()),
             None => None,
         };
+        // Remote agents from config are listed without contacting their peers.
         #[cfg(feature = "remote")]
         if let Some(mesh) = &self.mesh
-            && let Some(mesh_handle) = &mesh_handle
             && !mesh.remote_agents().is_empty()
             && let MeshSpec::Toml(cfg) = mesh.spec_for_internal_use()
         {
-            let registry = crate::agent::remote::register_remote_agents_from_config(
-                mesh_handle,
-                mesh.remote_agents(),
-                &cfg.peers,
-            )
-            .await?;
-            self.agent_registry = Some(registry);
+            let members =
+                crate::agent::remote::remote_members_from_config(mesh.remote_agents(), &cfg.peers)?;
+            preregistered.extend(members);
         }
-        let preregistered = self.agent_registry.take();
         let protocol_plans = dotagents_manifest
             .as_ref()
             .map(crate::dotagents::DotagentsSubAgentPlans::from_manifest);
@@ -905,27 +939,9 @@ impl AgentBuilder {
         // Members, the delegate tool, middleware and the delegation service are
         // all assembled by the runtime's one root builder.
         let members = std::mem::take(&mut self.delegates);
-        for member in &members {
-            if let Some(error) = &member.tool_error {
-                return Err(anyhow!(
-                    "delegate '{}': invalid `tools` selector: {error}",
-                    member.id
-                ));
-            }
-        }
-        if workspace_service.is_none()
-            && let Some(member) = members
-                .iter()
-                .find(|m| m.isolation == crate::worktree::DelegationIsolation::Isolated)
-        {
-            return Err(anyhow!(
-                "delegate '{}' is configured `isolated` but the workspace service is not enabled",
-                member.id
-            ));
-        }
         let handle = crate::delegation::build_root(
             builder,
-            crate::delegation::RootDelegation {
+            crate::delegation::RootParts {
                 enabled: self.delegation_enabled,
                 settings: self.delegation_settings.clone(),
                 profile_id: self.profile_id.clone(),
@@ -935,9 +951,6 @@ impl AgentBuilder {
                     plugin_registry: plugin_registry.clone(),
                     snapshot_policy,
                     skills_project_root: cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
-                    wait_policy: self.delegation_settings.wait_policy.clone(),
-                    wait_timeout_secs: self.delegation_settings.wait_timeout_secs,
-                    cancel_grace_secs: self.delegation_settings.cancel_grace_secs,
                     workspace_service,
                     repository_knowledge,
                 },
@@ -978,8 +991,14 @@ impl AgentBuilder {
         // Start the scheduler actor if the backend supports scheduling.
         handle.start_scheduler().await;
 
+        let roster = handle
+            .config
+            .roster()
+            .cloned()
+            .ok_or_else(|| anyhow!("the root agent was built without a roster"))?;
         let agent = Agent {
             inner: handle,
+            roster,
             storage: backend,
             default_session_id: Arc::new(Mutex::new(None)),
             cwd,
@@ -1000,6 +1019,8 @@ impl AgentBuilder {
 #[derive(Clone)]
 pub struct Agent {
     pub(super) inner: Arc<AgentHandle>,
+    /// The members the root can delegate to; the roster `build_root` gave the root.
+    roster: Arc<crate::delegation::roster::AgentRoster>,
     #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(super) storage: Arc<dyn StorageBackend>,
     pub(super) default_session_id: Arc<Mutex<Option<String>>>,
@@ -1487,24 +1508,51 @@ impl Agent {
         self.inner.clone()
     }
 
-    /// Returns `true` when the root's registry lists members it can delegate to.
+    /// Returns `true` when the roster lists members the root can delegate to.
+    /// That includes `.agents` delegation targets, not only configured delegates.
     pub fn is_multi(&self) -> bool {
-        !self.inner.config.agent_registry().list_agents().is_empty()
+        !self.roster.snapshot().is_empty()
+    }
+
+    /// The members the root can delegate to. Read it with `snapshot()`.
+    pub fn roster(&self) -> &Arc<crate::delegation::roster::AgentRoster> {
+        &self.roster
+    }
+
+    /// Adds a member while the agent runs and returns the new roster
+    /// generation. Connected clients receive `querymt/agents/changed`. The
+    /// change lasts until the agent stops; configuration is not touched.
+    pub async fn add_member(
+        &self,
+        spec: crate::delegation::member::MemberSpec,
+    ) -> Result<crate::delegation::roster::RosterGeneration, crate::delegation::roster::RosterError>
+    {
+        self.inner.add_roster_member(spec).await
+    }
+
+    /// Removes a member, whatever its origin. A delegation already running on
+    /// it finishes.
+    pub async fn remove_member(
+        &self,
+        id: &str,
+    ) -> Result<crate::delegation::roster::RosterGeneration, crate::delegation::roster::RosterError>
+    {
+        self.inner.remove_roster_member(id).await
     }
 
     /// MCP servers this agent's runtimes were built with, including those
     /// merged in from `.agents/`: the root's and every local member's.
     pub fn mcp_server_configs(&self) -> Vec<crate::config::McpServerConfig> {
         let mut servers = self.inner.config.mcp_servers.clone();
-        for (_, member) in self.inner.local_members() {
+        for member in self.inner.local_members() {
             servers.extend(member.config.mcp_servers.iter().cloned());
         }
         servers
     }
 
     /// A member handle by ID (`None` when the root has no such member).
-    pub fn delegate(&self, id: &str) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
-        self.inner.config.agent_registry().get_handle(id)
+    pub fn delegate(&self, id: &str) -> Option<Arc<AgentHandle>> {
+        self.roster.local_member(id)
     }
 
     async fn ensure_default_session(&self) -> Result<String> {
@@ -1595,7 +1643,7 @@ impl Agent {
         config: SingleAgentConfig,
         infra: Option<AgentInfra>,
     ) -> Result<Self> {
-        let mut builder = Self::builder_from_config(config, None)?;
+        let mut builder = Self::builder_from_config(config)?;
         if let Some(infra) = infra {
             builder = builder.infra(infra);
         }
@@ -1610,10 +1658,10 @@ impl Agent {
     ) -> Result<AgentBuilder> {
         match config {
             crate::config::Config::Single(config) => {
-                Self::builder_from_config_with_dotagents(*config, None, dotagents_workspace)
+                Self::builder_from_config_with_dotagents(*config, dotagents_workspace)
             }
             crate::config::Config::Multi(config) => {
-                let builder = Self::builder_from_quorum_config(*config, None)?;
+                let builder = Self::builder_from_quorum_config(*config)?;
                 Ok(match dotagents_workspace {
                     Some(workspace) => builder.with_dotagents_workspace(workspace),
                     None => builder,
@@ -1626,11 +1674,8 @@ impl Agent {
     ///
     /// Returns the builder before `build()` is called, allowing further
     /// customization (e.g., `.infra()`, `.middleware()`).
-    pub fn builder_from_config(
-        config: SingleAgentConfig,
-        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
-    ) -> Result<AgentBuilder> {
-        Self::builder_from_config_with_dotagents(config, initial_registry, None)
+    pub fn builder_from_config(config: SingleAgentConfig) -> Result<AgentBuilder> {
+        Self::builder_from_config_with_dotagents(config, None)
     }
 
     /// Configure an `AgentBuilder` from a `SingleAgentConfig` with protocol context.
@@ -1642,7 +1687,6 @@ impl Agent {
     /// protocol profiles itself.
     pub fn builder_from_config_with_dotagents(
         config: SingleAgentConfig,
-        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
         dotagents_workspace: Option<&std::path::Path>,
     ) -> Result<AgentBuilder> {
         let dotagents_options = config.dotagents.load_options();
@@ -1673,11 +1717,11 @@ impl Agent {
         }
         builder.mode = config.agent.mode;
         builder.permissions = config.agent.permissions.to_permissions();
-
-        // Inject pre-populated registry (Phase 7).
-        if let Some(registry) = initial_registry {
-            builder.agent_registry = Some(registry);
+        builder.delegation_settings = config.agent.delegation;
+        if let Some(policy) = config.agent.snapshot_policy {
+            builder.snapshot_policy = policy.parse().map_err(|error: String| anyhow!(error))?;
         }
+        builder.lower_delegates(config.delegates, &config.mcp)?;
 
         // Apply middleware from config
         if !config.middleware.is_empty() {
@@ -1721,7 +1765,7 @@ impl Agent {
         config: crate::config::QuorumConfig,
         infra: AgentInfra,
     ) -> Result<Self> {
-        Self::builder_from_quorum_config(config, None)?
+        Self::builder_from_quorum_config(config)?
             .infra(infra)
             .build()
             .await
@@ -1729,26 +1773,24 @@ impl Agent {
 
     /// Build an Agent from a quorum config (default infrastructure).
     pub async fn from_quorum_config(config: crate::config::QuorumConfig) -> Result<Self> {
-        Self::builder_from_quorum_config(config, None)?
-            .build()
-            .await
+        Self::builder_from_quorum_config(config)?.build().await
     }
 
     /// Configure an `AgentBuilder` from a `QuorumConfig`.
     ///
     /// Returns the builder before `build()` is called, allowing further
     /// customization (e.g., `.infra()`).
-    pub fn builder_from_quorum_config(
-        config: crate::config::QuorumConfig,
-        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
-    ) -> Result<AgentBuilder> {
-        use crate::delegation::member::{MemberBuildSpec, infer_required_capabilities};
-
-        let snapshot_policy = parse_snapshot_policy(config.quorum.snapshot_policy)?;
+    pub fn builder_from_quorum_config(config: crate::config::QuorumConfig) -> Result<AgentBuilder> {
+        let snapshot_policy = match config.quorum.snapshot_policy {
+            Some(policy) => policy.parse().map_err(|error: String| anyhow!(error))?,
+            None => SnapshotPolicy::None,
+        };
         let mut builder = AgentBuilder::new()
             .provider(config.planner.provider, config.planner.model)
             .dotagents_options(config.dotagents.load_options());
-        builder.quorum_shape = true;
+        builder.root_id = Some("planner".to_string());
+        builder.git_snapshots = true;
+        builder.require_skills_for_skill_tool = true;
         builder.snapshot_policy = snapshot_policy;
         if let Some(cwd) = config.quorum.cwd {
             builder.cwd = Some(cwd);
@@ -1758,17 +1800,13 @@ impl Agent {
             wait_policy: config.quorum.delegation_wait_policy,
             wait_timeout_secs: config.quorum.delegation_wait_timeout_secs,
             cancel_grace_secs: config.quorum.delegation_cancel_grace_secs,
-            max_parallel: config.quorum.max_parallel_delegations,
+            max_parallel: std::num::NonZeroUsize::new(config.quorum.max_parallel_delegations)
+                .ok_or_else(|| anyhow!("`[quorum] max_parallel_delegations` must be at least 1"))?,
             verification: config.quorum.verification,
             summary: config.quorum.delegation_summary,
         };
 
-        let mut available_local_tool_names: std::collections::HashSet<String> =
-            crate::agent::builtin_tools::all_builtin_tools()
-                .iter()
-                .map(|tool| tool.name().to_string())
-                .collect();
-        available_local_tool_names.insert(crate::skills::SkillTool::NAME.to_string());
+        let available_local_tool_names = crate::delegation::member::available_local_tool_names();
 
         for part in config.planner.system {
             if let Some(system) = part.resolved() {
@@ -1804,56 +1842,7 @@ impl Agent {
         builder.execution = Some(config.planner.execution);
         builder.skills_config = Some(config.planner.skills);
 
-        for delegate in config.delegates {
-            #[cfg(feature = "remote")]
-            if let Some(peer_name) = delegate.peer.clone() {
-                builder
-                    .peer_delegates
-                    .push((delegate.id.clone(), peer_name));
-            }
-
-            let mut spec = MemberBuildSpec::new(delegate.id.clone());
-            let mut llm = querymt::LLMParams::new()
-                .provider(delegate.provider)
-                .model(delegate.model);
-            for part in delegate.system {
-                if let Some(system) = part.resolved() {
-                    llm = llm.system(system);
-                }
-            }
-            if let Some(api_key) = delegate.api_key {
-                llm = llm.api_key(api_key);
-            }
-            for (key, value) in delegate.parameters.into_iter().flatten() {
-                llm = llm.parameter(key, value);
-            }
-            spec.llm_config = Some(llm);
-            spec.description = delegate.description;
-            spec.capabilities = delegate.capabilities;
-
-            let resolved = crate::config::resolve_tools(
-                &delegate.tools,
-                &config.mcp,
-                &delegate.mcp,
-                &available_local_tool_names,
-            )?;
-            spec.tools = resolved.runtime_tool_selectors();
-            spec.mcp_servers = resolved
-                .mcp_servers
-                .values()
-                .map(|(config, _)| config.clone())
-                .collect();
-            spec.required_capabilities = infer_required_capabilities(&spec.tools)
-                .into_iter()
-                .collect();
-            spec.mode = delegate.mode;
-            spec.middleware = delegate.middleware;
-            spec.execution = delegate.execution;
-            spec.skills = Some(delegate.skills);
-            spec.permissions = delegate.permissions.to_permissions();
-            spec.isolation = delegate.isolation;
-            builder.delegates.push(spec);
-        }
+        builder.lower_delegates(config.delegates, &config.mcp)?;
 
         if config.quorum.workspace.enabled {
             builder.workspace = Some(config.quorum.workspace);
@@ -1861,7 +1850,6 @@ impl Agent {
         if config.quorum.repository_knowledge.enabled {
             builder.repository_knowledge = Some(config.quorum.repository_knowledge);
         }
-        builder.agent_registry = initial_registry;
         #[cfg(feature = "remote")]
         {
             builder.mesh_auto_fallback = config.mesh.auto_fallback;
@@ -1872,18 +1860,6 @@ impl Agent {
         }
 
         Ok(builder)
-    }
-}
-
-fn parse_snapshot_policy(policy: Option<String>) -> Result<SnapshotPolicy> {
-    match policy.as_deref() {
-        None | Some("none") => Ok(SnapshotPolicy::None),
-        Some("metadata") => Ok(SnapshotPolicy::Metadata),
-        Some("diff") => Ok(SnapshotPolicy::Diff),
-        Some(other) => Err(anyhow!(
-            "Invalid snapshot_policy '{}'. Valid options: 'none', 'metadata', 'diff'",
-            other
-        )),
     }
 }
 

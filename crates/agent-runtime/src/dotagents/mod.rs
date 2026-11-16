@@ -36,7 +36,6 @@ mod parsers;
 mod reconcile;
 mod settings;
 mod subagent;
-mod target_factory;
 mod target_registry;
 mod tasks;
 
@@ -145,11 +144,7 @@ pub use parsers::{
 };
 pub use settings::DotagentsSettings;
 pub use subagent::{DotagentsSubAgentPlan, DotagentsSubAgentPlans, plan_agent as plan_sub_agent};
-pub use target_factory::DotagentsTargetFactory;
-pub use target_registry::{
-    DotagentsTargetMerge, DotagentsTargetRegistry, ProtocolTargetFactory, merge_protocol_targets,
-    protocol_layer_collision,
-};
+pub use target_registry::{DotagentsTargetMerge, merge_protocol_targets, protocol_layer_collision};
 pub use tasks::{
     DotagentsActivationDisposition, DotagentsActivationFacility, DotagentsAutomationBinding,
     DotagentsScheduleRecord, DotagentsStartupFire, DotagentsStartupPlan,
