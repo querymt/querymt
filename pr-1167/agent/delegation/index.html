@@ -2863,8 +2863,11 @@ not in the roster fails. The response is <code>{"generation": n}</code>.</p>
 <h3 id="notification">Notification</h3>
 <p>Every successful add or remove sends one notification to every connected client; a
 failed request sends nothing:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a><span class="p">{</span><span class="nt">"method"</span><span class="p">:</span><span class="s2">"querymt/agents/changed"</span><span class="p">,</span><span class="nt">"params"</span><span class="p">:{</span><span class="nt">"generation"</span><span class="p">:</span><span class="mi">3</span><span class="p">,</span><span class="nt">"profileId"</span><span class="p">:</span><span class="s2">"quorum"</span><span class="p">}}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a><span class="p">{</span><span class="nt">"method"</span><span class="p">:</span><span class="s2">"querymt/agents/changed"</span><span class="p">,</span><span class="nt">"params"</span><span class="p">:{</span><span class="nt">"generation"</span><span class="p">:</span><span class="mi">3</span><span class="p">,</span><span class="nt">"removed"</span><span class="p">:</span><span class="s2">"coder"</span><span class="p">,</span><span class="nt">"profileId"</span><span class="p">:</span><span class="s2">"quorum"</span><span class="p">}}</span>
 </code></pre></div></td></tr></table></div>
+<p><code>added</code> or <code>removed</code> names the member the change concerned, so a client does not need to
+list again to learn what happened. The replies to <code>querymt/agents/add</code> and
+<code>querymt/agents/remove</code> carry the same fields.</p>
 <p><code>profileId</code> is present when the change was made to a profile's runtime. Treat the
 notification as an invalidation hint and call <code>querymt/agents/list</code> for the state.</p>
 <h2 id="delegation-lifecycle">Delegation Lifecycle</h2>
@@ -3490,7 +3493,7 @@ Planner: Integrates both results</p>
 <h2 id="troubleshooting">Troubleshooting</h2>
 <h3 id="delegation-not-starting">Delegation Not Starting</h3>
 <ol>
-<li>Check the delegate is in the roster: <code>Agent::is_multi()</code> is true when the root has members, and <code>Agent::delegate(id)</code> returns a member by ID</li>
+<li>Check the delegate is in the roster: <code>Agent::has_subagents()</code> is true when the root has members, and <code>Agent::delegate(id)</code> returns a member by ID</li>
 <li>Verify delegate configuration is valid</li>
 <li>Check for middleware errors</li>
 <li>Review logs for delegation events</li>
