@@ -872,6 +872,104 @@ mod tests {
         assert_eq!(prompt_ids(&snapshot), expected);
     }
 
+    /// A fork copies prompt/assistant events with the fork's own message ids.
+    /// A windowed load of an inherited conversation must still return the
+    /// structured records of the prompts in its window.
+    #[tokio::test]
+    async fn windowed_load_of_a_fork_includes_inherited_prompt_records() {
+        use crate::session::run_reconcile::tests::seed;
+        use querymt::chat::ChatRole;
+        use querymt_agent_core::events::AgentEventKind;
+        use querymt_agent_core::model::{AgentMessage, MessagePart};
+        use querymt_agent_core::session::domain::ForkOrigin;
+        use querymt_agent_core::session::store::SessionStore;
+
+        let f = crate::session::run_reconcile::tests::fixture().await;
+        let sid = f
+            .storage
+            .create_session(None, None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        // Assistant events between prompts keep each prompt its own turn.
+        for i in 0..30i64 {
+            let prompt_id = format!("prompt-{i}");
+            let reply_id = format!("reply-{i}");
+            seed(
+                &f.storage,
+                &sid,
+                AgentEventKind::PromptReceived {
+                    content: format!("prompt {i}"),
+                    message_id: Some(prompt_id.clone()),
+                },
+            )
+            .await;
+            seed(
+                &f.storage,
+                &sid,
+                AgentEventKind::AssistantMessageStored {
+                    content: format!("reply {i}"),
+                    thinking: None,
+                    reasoning_parts: Vec::new(),
+                    message_id: Some(reply_id.clone()),
+                },
+            )
+            .await;
+            for (id, role, part) in [
+                (
+                    prompt_id,
+                    ChatRole::User,
+                    MessagePart::Prompt {
+                        blocks: vec![crate::acp::protocol::ContentBlock::Text(
+                            crate::acp::protocol::TextContent::new(format!("prompt {i}")),
+                        )],
+                    },
+                ),
+                (
+                    reply_id,
+                    ChatRole::Assistant,
+                    MessagePart::Text {
+                        content: format!("reply {i}"),
+                    },
+                ),
+            ] {
+                f.storage
+                    .add_message(
+                        &sid,
+                        AgentMessage {
+                            id,
+                            session_id: sid.clone(),
+                            role,
+                            parts: vec![part],
+                            created_at: 1_000 + i,
+                            parent_message_id: None,
+                            source_provider: None,
+                            source_model: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let fork = f
+            .storage
+            .fork_session(&sid, "reply-29", ForkOrigin::User)
+            .await
+            .unwrap();
+
+        let snapshot = windowed(&f, &fork, 20).await;
+        assert!(
+            !snapshot.history.as_ref().unwrap().complete,
+            "30 inherited turns must not fit a 20-turn window"
+        );
+        let window_ids = super::prompt_message_ids(&snapshot.audit.events);
+        assert_eq!(window_ids.len(), 20);
+        assert_eq!(prompt_ids(&snapshot), window_ids);
+        for record in snapshot.user_prompts.as_ref().unwrap() {
+            assert_eq!(record.blocks.len(), 1, "structured blocks are included");
+        }
+    }
+
     #[tokio::test]
     async fn windowed_load_of_a_short_session_includes_every_prompt() {
         let f = crate::session::run_reconcile::tests::fixture().await;

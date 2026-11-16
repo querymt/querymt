@@ -229,6 +229,7 @@ flowchart LR
 - **Windowed load** (`windowed_snapshot`):
   - When `read.history.complete`, it passes `None` (every prompt, as today).
   - Otherwise it passes `Some(&prompt_message_ids(&audit.events))`. This replaces the timestamp filter and fixes the same-second over-inclusion.
+  - Selection by event id requires events to name messages that exist in the session. A fork used to copy events with the source's message ids while its messages got new ids, so inherited prompts matched nothing. `fork_session_with_isolation_intent` now keeps an old-to-new public id map while copying messages and rewrites `message_id` in the copied `PromptReceived` / `AssistantMessageStored` payloads before inserting them. Forks created earlier keep the old ids (no data migration).
   - Remote windowed loads are unaffected in practice: they have no local rows (`SessionNotFound` → empty), and `build_remote_attach_snapshot_with_budget` merges the owner's records for the window ids.
 - **ACP replay** (`agent-runtime/src/acp/stdio.rs`):
   - `stored_user_prompt_blocks` takes `Vec<UserPromptRecord>` instead of `Vec<AgentMessage>`.

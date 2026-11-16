@@ -90,6 +90,7 @@ The zbus/systemd features only take effect on Linux, so on macOS those paths sta
   - Plans: history messages `SEARCH messages USING INDEX idx_messages_session_order`; history parts `SEARCH message_parts USING INDEX idx_message_parts_message`, no temp B-tree; prompt query `COVERING INDEX idx_messages_session_order` plus `idx_message_parts_prompt`, with only the final `USE TEMP B-TREE FOR ORDER BY` over the returned rows. This matches decisions 3 and 3a.
   - The temporary measuring example was deleted afterwards; the NAS effect remains in the workflow follow-up.
 - [x] 4.5 Run `openspec validate fast-session-prompt-records --strict`. Verify: valid.
+- [x] 4.6 Review follow-up: forks copied prompt/assistant events with the source's message ids while their messages got new ids, so a windowed load of a fork matched no inherited prompt records. `fork_session_with_isolation_intent` now maps old to new message public ids while copying messages and rewrites `message_id` in the copied events. Tests: `fork_copies_events_that_point_at_the_forks_own_messages` (sqlite) and `windowed_load_of_a_fork_includes_inherited_prompt_records` (runtime); both fail with the mapping disabled. Forks created earlier keep the old ids (no data migration).
 
 ## Workflow follow-up
 

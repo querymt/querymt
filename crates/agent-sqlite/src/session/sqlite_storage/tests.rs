@@ -6674,6 +6674,101 @@ async fn full_history_read_emits_a_span() {
 }
 
 #[tokio::test]
+async fn fork_copies_events_that_point_at_the_forks_own_messages() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let sid = new_session_id(&storage).await;
+    store_all(
+        &storage,
+        &sid,
+        vec![
+            prompt_message(&sid, "p1", "one", 1),
+            assistant_message(&sid, "a1", 2),
+            prompt_message(&sid, "p2", "two", 3),
+        ],
+    )
+    .await;
+    let prompt_event = |id: &str, text: &str| {
+        new_durable(
+            &sid,
+            AgentEventKind::PromptReceived {
+                content: text.to_string(),
+                message_id: Some(id.to_string()),
+            },
+        )
+    };
+    for event in [
+        prompt_event("p1", "one"),
+        new_durable(
+            &sid,
+            AgentEventKind::AssistantMessageStored {
+                content: "reply a1".to_string(),
+                thinking: None,
+                reasoning_parts: Vec::new(),
+                message_id: Some("a1".to_string()),
+            },
+        ),
+        // After the fork point: must not be copied.
+        prompt_event("p2", "two"),
+    ] {
+        storage.append_durable(&event).await.unwrap();
+    }
+
+    let fork_id = storage
+        .fork_session(&sid, "a1", ForkOrigin::User)
+        .await
+        .unwrap();
+
+    let fork_history = storage.get_history(&fork_id).await.unwrap();
+    let fork_ids: Vec<String> = fork_history.iter().map(|m| m.id.clone()).collect();
+    assert_eq!(fork_ids.len(), 2);
+    assert!(!fork_ids.contains(&"p1".to_string()), "copies get new ids");
+
+    let events = storage
+        .load_session_stream(&fork_id, None, None)
+        .await
+        .unwrap();
+    let event_message_ids: Vec<(&str, String)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AgentEventKind::PromptReceived {
+                message_id: Some(id),
+                ..
+            } => Some(("prompt", id.clone())),
+            AgentEventKind::AssistantMessageStored {
+                message_id: Some(id),
+                ..
+            } => Some(("assistant", id.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        event_message_ids,
+        [
+            ("prompt", fork_ids[0].clone()),
+            ("assistant", fork_ids[1].clone())
+        ],
+        "copied events reference the fork's own messages, in order"
+    );
+
+    // The prompt record is selectable through the copied event's id.
+    let prompt_event_id = event_message_ids[0].1.clone();
+    let records = storage
+        .get_user_prompts(&fork_id, Some(std::slice::from_ref(&prompt_event_id)))
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].message_id, prompt_event_id);
+    assert_eq!(records[0].blocks.len(), 1);
+
+    // The source session's events are untouched.
+    let source_events = storage.load_session_stream(&sid, None, None).await.unwrap();
+    assert!(source_events.iter().any(|e| matches!(
+        &e.kind,
+        AgentEventKind::PromptReceived { message_id: Some(id), .. } if id == "p1"
+    )));
+}
+
+#[tokio::test]
 async fn prompt_row_decoding_to_another_part_is_skipped_but_counted() {
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
     let sid = new_session_id(&storage).await;

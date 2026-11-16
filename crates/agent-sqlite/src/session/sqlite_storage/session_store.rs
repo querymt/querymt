@@ -1014,7 +1014,7 @@ impl SessionStore for SqliteStorage {
                 .map(|(_, public_id, _, _, _, _)| public_id.clone())
                 .collect();
 
-            let conversational_events_to_copy: Vec<JournalRow> = {
+            let conversational_events_to_copy: Vec<(JournalRow, AgentEventKind)> = {
                 let mut stmt = tx.prepare(
                     "SELECT timestamp, origin, source_node, kind, payload_json \
                      FROM event_journal \
@@ -1036,30 +1036,37 @@ impl SessionStore for SqliteStorage {
 
                 // Allowlist: only prompts and assistant messages that belong
                 // to the copied message range. Rows that do not decode are
-                // dropped.
+                // dropped. The decoded kind is kept so the copy can point at
+                // the fork's own message ids.
                 rows.into_iter()
-                    .filter(|row| {
-                        match serde_json::from_str::<AgentEventKind>(&row.payload_json) {
-                            Ok(
-                                AgentEventKind::PromptReceived {
-                                    message_id: Some(message_id),
-                                    ..
-                                }
-                                | AgentEventKind::AssistantMessageStored {
-                                    message_id: Some(message_id),
-                                    ..
-                                },
-                            ) => copied_message_ids.contains(&message_id),
-                            _ => false,
+                    .filter_map(|row| {
+                        let kind = serde_json::from_str::<AgentEventKind>(&row.payload_json).ok()?;
+                        match &kind {
+                            AgentEventKind::PromptReceived {
+                                message_id: Some(message_id),
+                                ..
+                            }
+                            | AgentEventKind::AssistantMessageStored {
+                                message_id: Some(message_id),
+                                ..
+                            } if copied_message_ids.contains(message_id) => Some((row, kind)),
+                            _ => None,
                         }
                     })
                     .collect()
             };
 
+            // Old public id -> the copy's public id, filled while copying
+            // messages below. Copied events must reference the fork's own
+            // messages: prompt records, replay and undo all resolve a prompt
+            // event through its `message_id`.
+            let mut copied_message_id_map: std::collections::HashMap<String, String> =
+                std::collections::HashMap::with_capacity(messages_to_copy.len());
+
             // 3. Copy messages and their parts with new UUID v7 public_ids
             for (
                 old_internal_id,
-                _old_public_id,
+                old_public_id,
                 role,
                 created_at,
                 source_provider,
@@ -1067,6 +1074,7 @@ impl SessionStore for SqliteStorage {
             ) in messages_to_copy
             {
                 let new_msg_public_id = Uuid::now_v7().to_string();
+                copied_message_id_map.insert(old_public_id, new_msg_public_id.clone());
 
                 // Insert Message with new public_id and internal session_id
                 tx.execute(
@@ -1126,7 +1134,9 @@ impl SessionStore for SqliteStorage {
             // delegation telemetry) are intentionally excluded because replaying them in a fork can
             // create contradictory state and duplicate execution traces. The downside is inherited
             // UI telemetry before the fork point is intentionally partial.
-            for (index, row) in conversational_events_to_copy.into_iter().enumerate() {
+            for (index, (row, mut event_kind)) in
+                conversational_events_to_copy.into_iter().enumerate()
+            {
                 let JournalRow {
                     timestamp,
                     origin,
@@ -1134,6 +1144,27 @@ impl SessionStore for SqliteStorage {
                     kind,
                     payload_json,
                 } = row;
+                // Re-point the event at the fork's copy of its message. The
+                // allowlist guarantees the old id is in the map.
+                let payload_json = match &mut event_kind {
+                    AgentEventKind::PromptReceived {
+                        message_id: Some(message_id),
+                        ..
+                    }
+                    | AgentEventKind::AssistantMessageStored {
+                        message_id: Some(message_id),
+                        ..
+                    } => match copied_message_id_map.get(message_id.as_str()) {
+                        Some(new_id) => {
+                            *message_id = new_id.clone();
+                            serde_json::to_string(&event_kind).map_err(|err| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+                            })?
+                        }
+                        None => payload_json,
+                    },
+                    _ => payload_json,
+                };
                 // Copied events are numbered 1..n so the fork's own sequencer
                 // continues after them.
                 let session_seq = index as i64 + 1;

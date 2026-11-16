@@ -220,6 +220,12 @@
   the window's prompt events, no longer older prompts stored in the same second.
   Messages stored in the same second are now ordered by insertion. The remote
   speed-up applies once the session's owner runs this version.
+- **Forked sessions copy conversation events that point at the fork's own
+  messages.** A fork gave its copied messages new ids but copied the prompt and
+  assistant events with the source's ids, so inherited prompts had no structured
+  records in a windowed load and replay fell back to flattened text. The copied
+  events now carry the fork's message ids. Forks created before this version keep
+  the old ids.
 - **llama.cpp Qwen3 (JSON tool-call format) calls were dropped.** The tool
   grammar forced the tool name without JSON quotes (`"name": glob`), which the
   parser cannot read. The name is now a JSON string.
