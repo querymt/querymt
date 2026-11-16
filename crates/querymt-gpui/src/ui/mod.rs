@@ -104,6 +104,13 @@ pub struct QmtApp {
     general_advanced_open: bool,
     general_danger_open: bool,
     confirm_reset: bool,
+    /// Profiles settings: curated templates (or why they could not be read),
+    /// per-row feedback `(message, is_error)`, open Details rows and the
+    /// "How profiles work" disclosure.
+    templates: Result<Vec<crate::profile_templates::TemplateInfo>, String>,
+    template_feedback: HashMap<String, (String, bool)>,
+    template_details: HashSet<String>,
+    templates_help_open: bool,
     /// Workspace undo awaiting confirmation: user turn to go back to.
     confirm_undo: Option<String>,
     /// Appearance settings: the mouse-wheel scrolling disclosure.
@@ -317,6 +324,10 @@ impl QmtApp {
             failed_plugins_open: false,
             general_advanced_open: false,
             general_danger_open: false,
+            templates: crate::profile_templates::list(),
+            template_feedback: HashMap::new(),
+            template_details: HashSet::new(),
+            templates_help_open: false,
             confirm_reset: false,
             confirm_undo: None,
             appearance_scroll_open: false,

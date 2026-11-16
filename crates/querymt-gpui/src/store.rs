@@ -463,9 +463,6 @@ pub struct Profile {
     pub id: String,
     pub name: String,
     pub description: String,
-    pub tags: Vec<String>,
-    pub kind: String,
-    pub source: String,
 }
 
 #[derive(Clone, Debug)]
@@ -4634,9 +4631,6 @@ async fn load_extras(
                             name: text(p, "name").unwrap_or_else(|| id.clone()),
                             id,
                             description: text(p, "description").unwrap_or_default(),
-                            tags: strs(p.get("tags")),
-                            kind: text(p, "config_kind").unwrap_or_default(),
-                            source: text(p, "source").unwrap_or_default(),
                         })
                     })
                     .collect();
