@@ -43,7 +43,7 @@ derive_more = { version = "2", features = ["add", "add_assign", "debug", "deref"
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid", "rand_core"] }
 ed25519 = { version = "2", default-features = false, features = ["pem", "std"] }
-ed25519-dalek = { version = "2", features = ["pem"] }
+ed25519-dalek = { version = "3", features = ["pem"] }
 either = { version = "1", features = ["use_std"] }
 fastrand = { version = "2" }
 flate2 = { version = "1" }
