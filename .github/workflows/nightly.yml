@@ -116,8 +116,9 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: artifacts/
-          # Match qmt-* and qmtcode-*, but not the internal dashboard-ui artifact.
-          pattern: 'qmt*-*'
+          # Match qmt-*, qmtcode-*, qmacp-* and qmcp-*, but not the internal
+          # dashboard-ui artifact.
+          pattern: 'qm*-*'
           merge-multiple: true
 
       # Machine-readable manifest: consumers read the version and commit from

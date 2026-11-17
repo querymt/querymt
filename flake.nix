@@ -115,6 +115,43 @@
               runHook postInstall
             '';
           };
+
+          # Standalone ACP/MCP client binaries (crates/qmacp, crates/qmcp). They do
+          # not use the agent stack, so they need no dashboard or bindgen setup.
+          # The build sandbox has no .git, so build.rs reads the SHA from env.
+          mkAcpClient = {
+            name,
+            shaVar,
+          }:
+            pkgs.rustPlatform.buildRustPackage {
+              pname = name;
+              version = workspaceCargoToml.workspace.package.version;
+              src = ./.;
+              cargoLock = {
+                lockFile = ./Cargo.lock;
+                allowBuiltinFetchGit = true;
+              };
+              cargoBuildFlags = [
+                "-p"
+                name
+                "--bin"
+                name
+              ];
+              nativeBuildInputs = [
+                pkgs.pkg-config
+                pkgs.cmake
+              ];
+              # rustPlatform sets AWS_LC_SYS_USE_SYSTEM=1; qmcp reaches aws-lc-sys
+              # through reqwest's rustls.
+              buildInputs = [pkgs.aws-lc];
+              env.${shaVar} = self.shortRev or self.dirtyShortRev or "unknown";
+              # See qmt below: cargo-auditable fails on this workspace's `dep:` features.
+              auditable = false;
+              # Tested by .github/workflows/test-qmacp.yml; workspace-level cargo
+              # test in Nix is not scoped yet (see qmt below).
+              doCheck = false;
+              meta.mainProgram = name;
+            };
         in {
           packages = {
             dashboard-ui = dashboardUi;
@@ -202,6 +239,15 @@
                 runHook postInstall
               '';
             };
+
+            qmacp = mkAcpClient {
+              name = "qmacp";
+              shaVar = "QMACP_GIT_SHA";
+            };
+            qmcp = mkAcpClient {
+              name = "qmcp";
+              shaVar = "QMCP_GIT_SHA";
+            };
           };
 
           apps = {
@@ -212,6 +258,14 @@
             qmt = {
               type = "app";
               program = "${self.packages.${system}.qmt}/bin/qmt";
+            };
+            qmacp = {
+              type = "app";
+              program = "${self.packages.${system}.qmacp}/bin/qmacp";
+            };
+            qmcp = {
+              type = "app";
+              program = "${self.packages.${system}.qmcp}/bin/qmcp";
             };
           };
 

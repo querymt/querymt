@@ -1,0 +1,36 @@
+[package]
+name = "qmcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP server for controlling a running QueryMT ACP WebSocket server."
+authors = ["Ivan Zatevakhin <ivan@query.mt>"]
+repository = "https://github.com/querymt/querymt"
+homepage = "https://query.mt"
+readme = "README.md"
+
+[[bin]]
+name = "qmcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+qmacp = { path = "../qmacp" }
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
+rmcp = { version = "3.9", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+subtle = "2.6"
+tokio = { version = "1.0", features = ["full"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid.workspace = true
+
+[dev-dependencies]
+futures-util = "0.3"
+jsonschema = { version = "0.60", default-features = false }
+tokio-tungstenite = "0.29"

@@ -11577,6 +11577,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "qmacp"
+version = "0.6.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "clap",
+ "futures-util",
+ "rustls 0.23.46",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "url",
+ "uuid 1.29.2",
+]
+
+[[package]]
+name = "qmcp"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "futures-util",
+ "jsonschema",
+ "qmacp",
+ "reqwest 0.13.5",
+ "rmcp",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tracing",
+ "tracing-subscriber",
+ "uuid 1.29.2",
+]
+
+[[package]]
 name = "qmt-alibaba"
 version = "0.6.0"
 dependencies = [
@@ -16134,7 +16176,11 @@ checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
+ "rustls 0.23.46",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls 0.26.6",
  "tungstenite 0.29.0",
 ]
 
@@ -16873,6 +16919,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.5",
+ "rustls 0.23.46",
+ "rustls-pki-types",
  "sha1 0.10.7",
  "thiserror 2.0.21",
 ]

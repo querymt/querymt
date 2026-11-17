@@ -15,8 +15,15 @@ not for browsing unrelated sessions or modifying the session database.
 [querymt-dev](querymt-dev/SKILL.md) supports autonomous QueryMT backend development
 and validation on Linux and macOS. UI work belongs to its separate repository/workflow:
 report needed UI follow-up, do not execute it here.
-Load the existing qmacp skill for client operation. This skill supplies only the
+Load the [qmacp](#qmacp) skill for client operation. This skill supplies only the
 availability checks and acceptance focus, not another client manual.
+
+## qmacp
+
+[qmacp](qmacp/SKILL.md) operates a running QueryMT ACP WebSocket server
+(`qmtcode --acp-ws`) through the `qmacp` JSON CLI built from `crates/qmacp`:
+find/create sessions, prompt, follow, steer, queue, configure, cancel, and set up
+agent callbacks. It requires the `qmacp` binary on `PATH`.
 
 Read only task-relevant references. This is a local development workflow, not a
 mandatory full-suite pipeline.
