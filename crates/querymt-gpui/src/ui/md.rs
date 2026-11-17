@@ -1,32 +1,26 @@
 //! Markdown in the transcript, styled like the desktop app: inline code as a
 //! soft rounded chip, fenced code as a card with a header (language on the
 //! left, copy button on the right).
+//!
+//! Code uses the native markdown block and one selection participant. Its
+//! actions slot supplies the header without nesting another text view.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
-use gpui_kit::component::text::{MarkdownNode, TextView, markdown_ast};
-use gpui_kit::component::{Sizable as _, Theme, h_flex, v_flex};
+use gpui_kit::component::text::{MarkdownNode, TextView, TextViewStyle, markdown_ast};
+use gpui_kit::component::{Sizable as _, Theme, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::code::HighlightedLines;
 use super::kit;
 use crate::theme::{Palette, palette};
 
-/// Name of the custom markdown block that replaces fenced code.
-const CODE_BLOCK: &str = "qmt-code-block";
 /// Name of the custom markdown block that wraps tables (adds a copy button).
 const TABLE_BLOCK: &str = "qmt-table";
 /// Language shown (and highlighted) for fences without one, as the desktop does.
 const DEFAULT_LANG: &str = "text";
 /// How long the copy button shows its check.
 const COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1200);
-
-/// A fenced code block: language from the info string, and the code.
-struct Code {
-    lang: Option<String>,
-    code: String,
-}
 
 fn code_lang(lang: Option<&str>) -> &str {
     lang.map(str::trim)
@@ -41,23 +35,53 @@ pub fn markdown(
     p: &Palette,
 ) -> TextView {
     let id: SharedString = id.into();
-    let copy_prefix = id.clone();
     let table_prefix = id.clone();
     TextView::markdown(id, text)
+        .style(TextViewStyle {
+            code_block: StyleRefinement::default()
+                .rounded(px(8.))
+                .pt(px(42.))
+                .pb_3()
+                .text_size(px(13.)),
+            ..TextViewStyle::default()
+        })
         .inline_code_style(inline_code_style(p))
-        .markdown_block_parser(|node, cx| match node {
-            markdown_ast::Node::Code(c) => {
-                let block = Code {
-                    lang: c.lang.clone(),
-                    code: c.value.clone(),
-                };
-                let source = cx.node_source(node).unwrap_or(&c.value).to_string();
-                Some(
-                    MarkdownNode::new(CODE_BLOCK, block)
-                        .text(c.value.clone())
-                        .markdown(source),
+        .code_block_actions(|block, _, cx| {
+            let p = *palette(cx);
+            let lang = block.lang();
+            let row = h_flex()
+                .w_full()
+                .id("code-header")
+                .justify_between()
+                .gap_3()
+                .h(px(30.))
+                .pl_3()
+                .pr_1()
+                .border_b_1()
+                .border_color(p.border)
+                .font_family(Theme::global(cx).font_family.clone())
+                .text_xs()
+                .text_color(p.muted)
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(code_lang(lang.as_deref()).to_string()),
                 )
+                .child(CopyButton {
+                    id: "copy".into(),
+                    value: block.code(),
+                });
+            #[cfg(test)]
+            let row = {
+                use gpui_kit::test::TestSupportExt as _;
+                row.test_support()
+            };
+            CodeHeader {
+                row: row.into_any_element(),
             }
+        })
+        .markdown_block_parser(|node, cx| match node {
             markdown_ast::Node::Table(_) => {
                 let source = cx.node_source(node)?.to_string();
                 Some(
@@ -76,14 +100,86 @@ pub fn markdown(
             let id = format!("{table_prefix}-table-{start}");
             table_card(&id, source).into_any_element()
         })
-        .markdown_block_renderer(CODE_BLOCK, move |node, _, cx| {
-            let Some(code) = node.data::<Code>() else {
-                return div().into_any_element();
-            };
-            let start = node.source_range().map_or(0, |r| r.start);
-            let copy_id = SharedString::from(format!("{copy_prefix}-copy-{start}"));
-            code_card(code, copy_id, cx).into_any_element()
-        })
+}
+
+/// Expands the built-in code block's corner action slot into a header.
+/// This is presentation only: the native code block remains the sole owner
+/// of text selection. The slot is inset by `top_2/right_2` in GPUI Kit;
+/// expand that measured slot to the block's inner edges without retaining
+/// geometry or creating a second selectable document.
+struct CodeHeader {
+    row: AnyElement,
+}
+
+impl IntoElement for CodeHeader {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for CodeHeader {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        _: &mut App,
+    ) -> (LayoutId, ()) {
+        let layout = window.request_measured_layout(Style::default(), |known, available, _, _| {
+            let width = known.width.unwrap_or(match available.width {
+                AvailableSpace::Definite(width) => width,
+                _ => px(0.),
+            });
+            size(width, px(30.))
+        });
+        (layout, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let inset = window.rem_size() * 0.5;
+        self.row.prepaint_as_root(
+            bounds.origin - point(px(0.), inset),
+            size(
+                AvailableSpace::Definite(bounds.size.width + inset),
+                AvailableSpace::Definite(px(30.)),
+            ),
+            window,
+            cx,
+        );
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.row.paint(window, cx);
+    }
 }
 
 /// Desktop `.markdown-body code`: rounded, faint fill, padded.
@@ -98,52 +194,6 @@ fn inline_code_style(p: &Palette) -> StyleRefinement {
         .text_color(Hsla::from(fg))
         .rounded(px(6.))
         .px(px(5.))
-}
-
-/// Desktop `.code-block-shell`: header row, then the highlighted code.
-fn code_card(code: &Code, copy_id: SharedString, cx: &App) -> impl IntoElement {
-    let p = *palette(cx);
-    let theme = Theme::global(cx);
-    let (bg, highlight) = (theme.muted, theme.highlight_theme.clone());
-    let lang = code_lang(code.lang.as_deref()).to_string();
-    let lines = HighlightedLines::new(&code.code, Some(&lang), &highlight);
-    v_flex()
-        .w_full()
-        .min_w_0()
-        .overflow_hidden()
-        .rounded(px(8.))
-        .border_1()
-        .border_color(p.border)
-        .bg(bg)
-        .child(
-            h_flex()
-                .justify_between()
-                .gap_3()
-                .h(px(30.))
-                .pl_3()
-                .pr_1()
-                .border_b_1()
-                .border_color(p.border)
-                .text_xs()
-                .text_color(p.muted)
-                .child(div().min_w_0().truncate().child(lang))
-                .child(CopyButton {
-                    id: copy_id,
-                    value: code.code.clone().into(),
-                }),
-        )
-        .child(
-            v_flex()
-                .w_full()
-                .min_w_0()
-                .px_4()
-                .py_3()
-                .font_family(kit::MONO)
-                .text_size(px(13.))
-                .line_height(relative(1.6))
-                .text_color(p.text)
-                .children((0..lines.len()).map(|ix| lines.line(ix))),
-        )
 }
 
 /// A markdown table (rendered by a nested view of its own source, without
@@ -339,6 +389,118 @@ mod tests {
             "Title Some code and a link."
         );
         assert_eq!(plain_text("  "), "");
+    }
+
+    struct SelectionFixture;
+
+    impl gpui_kit::Render for SelectionFixture {
+        fn render(
+            &mut self,
+            _: &mut gpui_kit::Window,
+            cx: &mut gpui_kit::Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            use gpui_kit::component::v_flex;
+            use gpui_kit::test::TestSupportExt as _;
+            use gpui_kit::{InteractiveElement as _, ParentElement as _, Styled as _, div, px};
+            let p = *crate::theme::palette(cx);
+            v_flex()
+                .w(gpui_kit::px(600.))
+                .gap_4()
+                .children([
+                    div().id("before").test_support().child(super::markdown(
+                        "before-md",
+                        "Before code",
+                        &p,
+                    )),
+                    div().id("code").test_support().child(super::markdown(
+                        "code-md",
+                        "```rust\nfn main() {\n    println!(\"Hello, world!\");\n}\n```",
+                        &p,
+                    )),
+                    div().id("after").test_support().child(super::markdown(
+                        "after-md",
+                        "After code",
+                        &p,
+                    )),
+                ])
+                .p(px(16.))
+        }
+    }
+
+    #[gpui_kit::test]
+    fn cross_message_copy_contains_code_once_and_header_spans_card(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{AppContext as _, point, px};
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let (handle, _view) = cx.update(|cx| {
+            gpui_kit::open_window(Default::default(), cx, |_, cx| cx.new(|_| SelectionFixture))
+                .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let before = window.find("before").bounds();
+            let after = window.find("after").bounds();
+            let code = window.find("code").bounds();
+            let header = window.find("code-header").bounds();
+            assert!((header.left() - code.left()).abs() <= px(2.));
+            assert!((header.right() - code.right()).abs() <= px(2.));
+            assert!((header.top() - code.top()).abs() <= px(2.));
+            window.drag(
+                point(before.left() + px(1.), before.top() + px(8.)),
+                point(after.right() - px(1.), after.top() + px(8.)),
+                cx,
+            );
+            let selected = gpui_kit::base::TextSelection::selected_text(window, cx);
+            assert_eq!(selected.matches("fn main()").count(), 1, "{selected}");
+            assert!(
+                selected.contains("Before code") && selected.contains("After code"),
+                "{selected}"
+            );
+            window.press("secondary-c", cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|c| c.text()).unwrap(),
+                selected.trim_end()
+            );
+            assert_eq!(
+                selected.trim_end(),
+                "Before code\n\nfn main() {\n    println!(\"Hello, world!\");\n}\n\nAfter code"
+            );
+
+            // Select one word within the native block, not its whole card.
+            use gpui_kit::test::ClickOptions;
+            window.click_with_options(
+                "code",
+                ClickOptions::new()
+                    .with_offset(point(px(19.), px(52.)))
+                    .with_count(2),
+                cx,
+            );
+            assert_eq!(
+                gpui_kit::base::TextSelection::selected_text(window, cx).trim(),
+                "fn"
+            );
+            window.press("secondary-c", cx);
+            assert_eq!(
+                cx.read_from_clipboard()
+                    .and_then(|c| c.text())
+                    .unwrap()
+                    .trim(),
+                "fn"
+            );
+
+            // The header's copy button still copies the entire block.
+            window.click("copy", cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|c| c.text()).unwrap(),
+                "fn main() {\n    println!(\"Hello, world!\");\n}"
+            );
+        })
+        .unwrap();
     }
 
     #[test]
