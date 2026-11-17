@@ -366,9 +366,10 @@ fn keycap(k: &str, p: &Palette) -> Div {
         .min_w(px(22.))
         .text_center()
         .rounded(px(5.))
-        .bg(p.card)
-        .border_1()
-        .border_color(p.border)
+        // Translucent fill, no outline: matches the segment track and stays
+        // visible on the `card` rows the keycaps sit on.
+        .bg(p.chip)
+        .text_color(p.muted)
         .font_family(kit::MONO)
         .text_xs()
         .child(k.to_string())
