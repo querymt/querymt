@@ -76,6 +76,94 @@ impl Dismissed {
     }
 }
 
+/// Fade durations (ms) of hover-revealed chrome.
+pub const FADE_IN_MS: f64 = 100.;
+pub const FADE_OUT_MS: f64 = 100.;
+
+/// Opacity fade of hover-revealed chrome (scrollbars, copy buttons): where
+/// the opacity was when the target last changed, so a change midway reverses
+/// from the current value instead of jumping to an endpoint.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Fade {
+    shown: bool,
+    from: f32,
+    at: f64,
+}
+
+impl Fade {
+    /// Eased opacity at `now` (ms) and whether the fade is still running.
+    /// With reduced motion the opacity snaps to the target.
+    pub fn value(&self, now: f64, reduce_motion: bool) -> (f32, bool) {
+        let (target, ms) = if self.shown {
+            (1., FADE_IN_MS)
+        } else {
+            (0., FADE_OUT_MS)
+        };
+        if reduce_motion {
+            return (target, false);
+        }
+        let t = ((now - self.at) / ms).clamp(0., 1.) as f32;
+        // Smoothstep: eases in and out.
+        let eased = t * t * (3. - 2. * t);
+        (self.from + (target - self.from) * eased, t < 1.)
+    }
+
+    /// Retarget the fade; `false` when it already heads there.
+    pub fn show(&mut self, shown: bool, now: f64, reduce_motion: bool) -> bool {
+        if self.shown == shown {
+            return false;
+        }
+        self.from = self.value(now, reduce_motion).0;
+        self.shown = shown;
+        self.at = now;
+        true
+    }
+}
+
+/// Current opacity of the [`Fade`] state `fade`, asking for the next frame
+/// while it runs (so only animating elements redraw).
+pub fn fade_opacity(fade: &Entity<Fade>, window: &mut Window, cx: &App) -> f32 {
+    let (opacity, running) = fade
+        .read(cx)
+        .value(crate::util::now_ms(), cx.reduce_motion());
+    if running {
+        window.request_animation_frame();
+    }
+    opacity
+}
+
+#[cfg(test)]
+mod fade_tests {
+    use super::{FADE_IN_MS, FADE_OUT_MS, Fade};
+
+    #[test]
+    fn fade_eases_and_reverses_midway() {
+        let mut fade = Fade::default();
+        assert!(fade.show(true, 0., false));
+        assert!(!fade.show(true, 0., false));
+        assert_eq!(fade.value(0., false), (0., true));
+        let (mid, running) = fade.value(FADE_IN_MS / 2., false);
+        assert!((mid - 0.5).abs() < 1e-6 && running);
+        // Eased: slow start.
+        assert!(fade.value(FADE_IN_MS / 4., false).0 < 0.25);
+        assert_eq!(fade.value(FADE_IN_MS * 2., false), (1., false));
+        // Leaving midway fades out from where it was, not from fully shown.
+        let mut out = fade;
+        out.show(false, FADE_IN_MS / 2., false);
+        assert_eq!(out.value(FADE_IN_MS / 2., false).0, mid);
+        assert_eq!(out.value(FADE_IN_MS / 2. + FADE_OUT_MS, false), (0., false));
+    }
+
+    #[test]
+    fn reduced_motion_snaps() {
+        let mut fade = Fade::default();
+        fade.show(true, 0., true);
+        assert_eq!(fade.value(0., true), (1., false));
+        fade.show(false, 1., true);
+        assert_eq!(fade.value(1., true), (0., false));
+    }
+}
+
 #[cfg(test)]
 mod dismissed_tests {
     use super::Dismissed;

@@ -1219,32 +1219,6 @@ fn scroll_area(
     }
 }
 
-/// Scrollbar fade durations (ms): quick to appear, a little slower to leave.
-const SCROLLBAR_FADE_IN_MS: f64 = 140.;
-const SCROLLBAR_FADE_OUT_MS: f64 = 260.;
-
-/// Per-block fade state: where the opacity was when the hover last changed.
-struct ScrollbarFade {
-    hovered: bool,
-    from: f32,
-    at: f64,
-}
-
-impl ScrollbarFade {
-    /// Eased opacity now, and whether the fade is still running.
-    fn value(&self, now: f64) -> (f32, bool) {
-        let (target, ms) = if self.hovered {
-            (1., SCROLLBAR_FADE_IN_MS)
-        } else {
-            (0., SCROLLBAR_FADE_OUT_MS)
-        };
-        let t = ((now - self.at) / ms).clamp(0., 1.) as f32;
-        // Smoothstep: eases in and out.
-        let eased = t * t * (3. - 2. * t);
-        (self.from + (target - self.from) * eased, t < 1.)
-    }
-}
-
 /// A scroll block whose scrollbars fade in while the pointer is anywhere over
 /// it and fade out when it leaves (the library's own Hover mode only reacts
 /// to the thin bar itself, and switches without easing).
@@ -1261,18 +1235,9 @@ impl RenderOnce for FadingScroll {
         let fade = window.use_keyed_state(
             SharedString::from(format!("{}-fade", self.key)),
             cx,
-            |_, _| ScrollbarFade {
-                hovered: false,
-                from: 0.,
-                at: 0.,
-            },
+            |_, _| kit::Fade::default(),
         );
-        let now = crate::util::now_ms();
-        let (opacity, running) = fade.read(cx).value(now);
-        if running {
-            // Only animating blocks ask for frames.
-            window.request_animation_frame();
-        }
+        let opacity = kit::fade_opacity(&fade, window, cx);
         let weak = fade.downgrade();
         div()
             .id(SharedString::from(format!("{}-wrap", self.key)))
@@ -1280,12 +1245,9 @@ impl RenderOnce for FadingScroll {
             .w_full()
             .bg(self.bg)
             .on_hover(move |hovered, _, cx| {
+                let reduce = cx.reduce_motion();
                 let _ = weak.update(cx, |f, cx| {
-                    if f.hovered != *hovered {
-                        let now = crate::util::now_ms();
-                        f.from = f.value(now).0;
-                        f.hovered = *hovered;
-                        f.at = now;
+                    if f.show(*hovered, crate::util::now_ms(), reduce) {
                         cx.notify();
                     }
                 });
@@ -4669,11 +4631,10 @@ impl QmtApp {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: the gpui glob brings a `test` macro that shadows `#[test]`.
-    use super::{
-        SCROLLBAR_FADE_IN_MS, SCROLLBAR_FADE_OUT_MS, ScrollbarFade, humanize_tool_name, is_read,
-        is_shell, link_ranges, tool_label, workspace_relative,
-    };
     use super::{WorkBlock, group_work, reasoning_title};
+    use super::{
+        humanize_tool_name, is_read, is_shell, link_ranges, tool_label, workspace_relative,
+    };
     use crate::session::{Thought, WorkEntry};
 
     fn thought(id: &str, part: Option<&str>) -> WorkEntry {
@@ -4733,28 +4694,6 @@ mod tests {
         assert!(link_ranges("https:// nothing, xhttps://glued.com").is_empty());
     }
 
-    #[test]
-    fn scrollbar_fade_eases_and_reverses_midway() {
-        let fade = ScrollbarFade {
-            hovered: true,
-            from: 0.,
-            at: 0.,
-        };
-        assert_eq!(fade.value(0.), (0., true));
-        let (mid, running) = fade.value(SCROLLBAR_FADE_IN_MS / 2.);
-        assert!((mid - 0.5).abs() < 1e-6 && running);
-        // Eased: slow start.
-        assert!(fade.value(SCROLLBAR_FADE_IN_MS / 4.).0 < 0.25);
-        assert_eq!(fade.value(SCROLLBAR_FADE_IN_MS * 2.), (1., false));
-        // Leaving midway fades out from where it was, not from fully shown.
-        let out = ScrollbarFade {
-            hovered: false,
-            from: mid,
-            at: 0.,
-        };
-        assert_eq!(out.value(0.).0, mid);
-        assert_eq!(out.value(SCROLLBAR_FADE_OUT_MS), (0., false));
-    }
     use crate::session::ToolCall;
 
     fn call(title: &str, kind: &str) -> ToolCall {

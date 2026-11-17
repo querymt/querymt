@@ -6,6 +6,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::text::{MarkdownNode, TextView, markdown_ast};
 use gpui_kit::component::{Sizable as _, Theme, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::code::HighlightedLines;
@@ -14,6 +15,8 @@ use crate::theme::{Palette, palette};
 
 /// Name of the custom markdown block that replaces fenced code.
 const CODE_BLOCK: &str = "qmt-code-block";
+/// Name of the custom markdown block that wraps tables (adds a copy button).
+const TABLE_BLOCK: &str = "qmt-table";
 /// Language shown (and highlighted) for fences without one, as the desktop does.
 const DEFAULT_LANG: &str = "text";
 /// How long the copy button shows its check.
@@ -39,6 +42,7 @@ pub fn markdown(
 ) -> TextView {
     let id: SharedString = id.into();
     let copy_prefix = id.clone();
+    let table_prefix = id.clone();
     TextView::markdown(id, text)
         .inline_code_style(inline_code_style(p))
         .markdown_block_parser(|node, cx| match node {
@@ -54,7 +58,23 @@ pub fn markdown(
                         .markdown(source),
                 )
             }
+            markdown_ast::Node::Table(_) => {
+                let source = cx.node_source(node)?.to_string();
+                Some(
+                    MarkdownNode::new(TABLE_BLOCK, source.clone())
+                        .text(source.clone())
+                        .markdown(source),
+                )
+            }
             _ => None,
+        })
+        .markdown_block_renderer(TABLE_BLOCK, move |node, _, _| {
+            let Some(source) = node.data::<String>() else {
+                return div().into_any_element();
+            };
+            let start = node.source_range().map_or(0, |r| r.start);
+            let id = format!("{table_prefix}-table-{start}");
+            table_card(&id, source).into_any_element()
         })
         .markdown_block_renderer(CODE_BLOCK, move |node, _, cx| {
             let Some(code) = node.data::<Code>() else {
@@ -124,6 +144,124 @@ fn code_card(code: &Code, copy_id: SharedString, cx: &App) -> impl IntoElement {
                 .text_color(p.text)
                 .children((0..lines.len()).map(|ix| lines.line(ix))),
         )
+}
+
+/// A markdown table (rendered by a nested view of its own source, without
+/// this module's block hooks so it is not wrapped again) with a copy button
+/// in its corner, like the transcript's message copy buttons. Copies the
+/// table's markdown.
+fn table_card(id: &str, source: &str) -> impl IntoElement {
+    TableCard {
+        id: SharedString::from(id.to_string()),
+        source: source.to_string().into(),
+    }
+}
+
+/// Hover and copy state of one [`TableCard`]. The fade is retargeted only
+/// from the hover and copy handlers, never during render.
+#[derive(Default)]
+struct TableChrome {
+    hovered: bool,
+    copied: bool,
+    fade: kit::Fade,
+}
+
+impl TableChrome {
+    /// The check keeps the button up after the pointer leaves.
+    fn retarget(&mut self, reduce_motion: bool) -> bool {
+        let shown = self.hovered || self.copied;
+        self.fade.show(shown, crate::util::now_ms(), reduce_motion)
+    }
+}
+
+/// See [`table_card`]. The button and its backing chip fade in together
+/// while the pointer is over the table (or the check still shows) and are
+/// fully gone otherwise; with reduced motion they appear and vanish at once.
+#[derive(IntoElement)]
+struct TableCard {
+    id: SharedString,
+    source: SharedString,
+}
+
+impl RenderOnce for TableCard {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = *palette(cx);
+        let chrome = window.use_keyed_state(
+            SharedString::from(format!("{}-chrome", self.id)),
+            cx,
+            |_, _| TableChrome::default(),
+        );
+        let state = chrome.read(cx);
+        let (copied, fade) = (state.copied, state.fade);
+        let (opacity, running) = fade.value(crate::util::now_ms(), cx.reduce_motion());
+        if running {
+            // Only an animating chip asks for frames.
+            window.request_animation_frame();
+        }
+
+        let table = TextView::markdown(self.id.clone(), self.source.clone())
+            .inline_code_style(inline_code_style(&p));
+        let (hover, click, value) = (chrome.clone(), chrome, self.source);
+        let button = kit::icon_button(
+            SharedString::from(format!("{}-copy", self.id)),
+            if copied {
+                IconName::Check
+            } else {
+                IconName::Copy
+            },
+            if copied { "Copied" } else { "Copy table" },
+        )
+        .xsmall()
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()));
+            let reduce = cx.reduce_motion();
+            click.update(cx, |c, cx| {
+                c.copied = true;
+                c.retarget(reduce);
+                cx.notify();
+            });
+            let click = click.clone();
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(COPIED_FOR).await;
+                let reduce = cx.update(|cx| cx.reduce_motion());
+                click.update(cx, |c, cx| {
+                    c.copied = false;
+                    c.retarget(reduce);
+                    cx.notify();
+                });
+            })
+            .detach();
+        });
+        div()
+            .id(SharedString::from(format!("{}-card", self.id)))
+            .relative()
+            .w_full()
+            .min_w_0()
+            .on_hover(move |hovered, _, cx| {
+                let reduce = cx.reduce_motion();
+                hover.update(cx, |c, cx| {
+                    c.hovered = *hovered;
+                    if c.retarget(reduce) {
+                        cx.notify();
+                    }
+                })
+            })
+            .child(table)
+            // Fully transparent means no chip at all, and nothing to click.
+            .when(opacity > 0., |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top(px(4.))
+                        .right(px(4.))
+                        .rounded(px(6.))
+                        .bg(p.surface)
+                        .opacity(opacity)
+                        .child(button),
+                )
+            })
+    }
 }
 
 /// Copy icon that turns into a check for a moment after copying.
