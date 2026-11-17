@@ -14,6 +14,8 @@ members = [
     "crates/provider-common",
     "crates/querymt-utils",
     "crates/service-client",
+    "crates/qmacp",
+    "crates/qmcp",
     "crates/providers/*",
     "crates/querymt-extism-macros",
     "crates/querymt-mobile-ffi",
@@ -43,6 +45,8 @@ default-members = [
     "crates/provider-common",
     "crates/querymt-utils",
     "crates/service-client",
+    "crates/qmacp",
+    "crates/qmcp",
 ]
 
 [workspace.package]
