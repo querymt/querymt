@@ -893,14 +893,7 @@ impl QmtApp {
             .border_1()
             .border_color(p.border)
             .shadow_sm()
-            .child(
-                h_flex()
-                    .px_2()
-                    .rounded(px(8.))
-                    .bg(p.card)
-                    .child(kit::icon(IconName::FolderOpen, 15., p.dim))
-                    .child(Input::new(&self.cwd).appearance(false).flex_1()),
-            )
+            .child(self.workspace_field(&p, cx))
             .child(div().px_1().text_xs().text_color(p.dim).child(match &host {
                 Some(host) => format!("Use an absolute path on {host}, where the agent runs."),
                 None => "Use an absolute path on the machine where the agent runs.".to_string(),
