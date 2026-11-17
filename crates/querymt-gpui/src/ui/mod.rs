@@ -15,6 +15,7 @@ mod sessions;
 mod settings;
 mod smooth_scroll;
 mod start;
+mod workspace_select;
 
 use gpui_kit::assets::IconName;
 use std::collections::{HashMap, HashSet};
@@ -170,6 +171,15 @@ pub struct QmtApp {
     profile_menu_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// Popovers just closed by an outside mouse down, so their triggers toggle.
     dismissed: kit::Dismissed,
+    /// Workspace path completion of the Start composer: list shown,
+    /// highlighted row, last folder listing (base dir, names) and the
+    /// directory being listed.
+    ws_open: bool,
+    ws_cursor: usize,
+    ws_scroll: ScrollHandle,
+    ws_dirs: Option<(String, Vec<String>)>,
+    ws_loading: Option<String>,
+    ws_task: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
 
@@ -230,10 +240,18 @@ impl QmtApp {
                     cx.notify();
                 }
             }),
-            cx.subscribe_in(&cwd, window, |_, _, ev: &InputEvent, _, cx| {
-                if matches!(ev, InputEvent::Change) {
+            cx.subscribe_in(&cwd, window, |this, _, ev: &InputEvent, _, cx| match ev {
+                InputEvent::Change => {
+                    this.ws_open = true;
+                    this.refresh_workspace_dirs(cx);
                     cx.notify();
                 }
+                InputEvent::Focus => this.open_workspace_suggestions(cx),
+                InputEvent::Blur => {
+                    this.ws_open = false;
+                    cx.notify();
+                }
+                _ => {}
             }),
             cx.subscribe_in(
                 &model_query,
@@ -365,6 +383,12 @@ impl QmtApp {
             profile_viewport_h: px(0.),
             profile_menu_bounds: Default::default(),
             dismissed: kit::Dismissed::default(),
+            ws_open: false,
+            ws_cursor: 0,
+            ws_scroll: ScrollHandle::new(),
+            ws_dirs: None,
+            ws_loading: None,
+            ws_task: None,
             _subs: subs,
         }
     }
