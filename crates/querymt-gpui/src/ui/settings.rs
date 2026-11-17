@@ -263,6 +263,9 @@ fn theme_mock(pal: &Palette, accent: &str) -> Div {
                 .flex_none()
                 .gap(px(6.))
                 .p(px(8.))
+                // Overflow clipping is rectangular; round the painted child
+                // to the frame's inner radius (8px minus its 1px border).
+                .rounded_l(px(7.))
                 .bg(pal.card)
                 .child(div().size(px(6.)).rounded(px(2.)).bg(pal.border))
                 .child(bar(34.))
