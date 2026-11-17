@@ -145,6 +145,10 @@ pub fn action_btn(
         })
 }
 
+/// Track of a segmented picker. The fill is a translucent overlay rather than
+/// an opaque palette color, so the track stays visible on every background:
+/// popovers (`surface`) as well as settings cards (`card`), where an opaque
+/// `card` fill would vanish and leave the options looking like loose text.
 pub fn segment_bar(p: &Palette) -> Div {
     h_flex()
         .flex_none()
@@ -152,7 +156,7 @@ pub fn segment_bar(p: &Palette) -> Div {
         .p_0p5()
         .gap_0p5()
         .rounded(px(8.))
-        .bg(p.card)
+        .bg(p.chip)
 }
 
 /// One option of a segmented picker. The selected option gets a clearly
