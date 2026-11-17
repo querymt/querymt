@@ -40,7 +40,7 @@
           };
 
           pkgsCuda =
-            if pkgs.stdenv.isLinux
+            if pkgs.stdenv.hostPlatform.isLinux
             then
               import nixpkgs {
                 inherit system overlays;
@@ -48,8 +48,8 @@
                   nixpkgsConfig
                   // {
                     cudaSupport = true;
+                    # CUDA 13 dropped these capabilities; the cuda shell pins cudaPackages_12.
                     cudaCapabilities = ["5.2" "6.0" "6.1" "7.0" "7.5" "8.0" "8.6"];
-                    cudaVersion = "12";
                   };
               }
             else null;
@@ -59,6 +59,18 @@
           };
 
           workspaceCargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+
+          # typeshare 1.13.4 labels non-compilable sample output as a Rust doctest.
+          # Keep its tests enabled and mark only that output example as text.
+          patchedTypeshare = pkgs.typeshare.overrideAttrs (oldAttrs: {
+            postPatch =
+              (oldAttrs.postPatch or "")
+              + ''
+                substituteInPlace core/src/language/mod.rs \
+                  --replace-fail $'/// ```rust\n    /// /// Generated type representing' \
+                    $'/// ```text\n    /// /// Generated type representing'
+              '';
+          });
 
           commonInputs = with pkgs; [
             rustToolchain
@@ -72,7 +84,7 @@
             llvmPackages.libclang
             rust-bindgen
             pkg-config
-            typeshare
+            patchedTypeshare
             libgcc
             gdb
           ];
@@ -218,7 +230,7 @@
                   '';
               };
             }
-            // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
               vulkan = pkgs.mkShell {
                 buildInputs = commonInputs ++ (with pkgs; [vulkan-loader]);
 
@@ -239,8 +251,8 @@
                 buildInputs =
                   commonInputs
                   ++ (with pkgsCuda; [
-                    cudaPackages.cudatoolkit
-                    cudaPackages.libcublas.static
+                    cudaPackages_12.cudatoolkit
+                    cudaPackages_12.libcublas.static
                   ]);
 
                 shellHook =
@@ -249,10 +261,10 @@
                   */
                   ''
                     export LIBCLANG_PATH="${pkgsCuda.llvmPackages.libclang.lib}/lib"
-                    export CUDA_PATH="${pkgsCuda.cudaPackages.cudatoolkit}"
-                    export LIBRARY_PATH="/run/opengl-driver/lib:${pkgsCuda.lib.makeLibraryPath (with pkgsCuda; [gcc.cc.lib cudaPackages.cudatoolkit])}:$LIBRARY_PATH"
-                    export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgsCuda.lib.makeLibraryPath (with pkgsCuda; [gcc.cc.lib cudaPackages.cudatoolkit])}:$LD_LIBRARY_PATH"
-                    export RUSTFLAGS="-L native=$CUDA_PATH/lib -L native=${pkgsCuda.cudaPackages.libcublas.static}/lib"
+                    export CUDA_PATH="${pkgsCuda.cudaPackages_12.cudatoolkit}"
+                    export LIBRARY_PATH="/run/opengl-driver/lib:${pkgsCuda.lib.makeLibraryPath (with pkgsCuda; [gcc.cc.lib cudaPackages_12.cudatoolkit])}:$LIBRARY_PATH"
+                    export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgsCuda.lib.makeLibraryPath (with pkgsCuda; [gcc.cc.lib cudaPackages_12.cudatoolkit])}:$LD_LIBRARY_PATH"
+                    export RUSTFLAGS="-L native=$CUDA_PATH/lib -L native=${pkgsCuda.cudaPackages_12.libcublas.static}/lib"
 
                     export PS1="(env:querymt-cuda) $PS1"
                   '';
