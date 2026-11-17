@@ -1133,7 +1133,8 @@ impl QmtApp {
                             .text_color(p.muted)
                             .when(logs.is_empty(), |el| el.child("No log lines yet."))
                             .children(logs.into_iter().map(|l| div().child(l))),
-                    ),
+                    )
+                    .map(|el| self.smooth_scroll.region("agent-details", el)),
             );
 
         scrim

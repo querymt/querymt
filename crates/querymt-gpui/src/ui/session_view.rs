@@ -136,6 +136,7 @@ struct RenderCtx {
     /// Syntax colors of the active component theme (dark/light).
     syntax: std::sync::Arc<gpui_kit::component::highlighter::HighlightTheme>,
     weak: WeakEntity<QmtApp>,
+    smooth_scroll: super::smooth_scroll::SmoothScroll,
     expanded: HashSet<String>,
     running: bool,
     /// Index of the first item of the current (possibly running) turn.
@@ -1210,7 +1211,10 @@ fn scroll_area(
                 cx.stop_propagation();
             }
         })
-        .child(child)
+        .child(child);
+    let area = rc
+        .smooth_scroll
+        .region(SharedString::from(key.clone()), area)
         .into_any_element();
     let bar = Scrollbar::new(&handle)
         .id(SharedString::from(format!("{key}-bar")))
@@ -3590,6 +3594,7 @@ impl QmtApp {
                                     .child(e.content.clone()),
                             )
                     }))
+                    .map(|el| self.smooth_scroll.region("plan-panel", el))
             });
             div()
                 .relative()
@@ -4018,6 +4023,7 @@ impl QmtApp {
                 .highlight_theme
                 .clone(),
             weak: cx.entity().downgrade(),
+            smooth_scroll: self.smooth_scroll.clone(),
             expanded: self.expanded_items.clone(),
             running,
             last_turn_start: view
@@ -4120,6 +4126,7 @@ impl QmtApp {
                             .map(|l| div().min_h(px(14.)).child(l.to_string()))
                             .collect::<Vec<_>>(),
                     )
+                    .map(|el| self.smooth_scroll.region("load-error-details", el))
             });
             let actions = h_flex()
                 .gap_2()
@@ -4230,19 +4237,22 @@ impl QmtApp {
                                 .min_h_0()
                                 .w_full()
                                 .child(
-                                    list(self.transcript.list.clone(), move |ix, _, _| {
-                                        let item = items.borrow().get(ix).cloned();
-                                        match item {
-                                            Some(item) => render_item(ix, &item, &rc2),
-                                            None => div().into_any_element(),
-                                        }
-                                    })
-                                    .size_full()
-                                    // Top: start below the fade, so nothing is dimmed at rest.
-                                    // Bottom: the composer floats over the list's end, so the
-                                    // last message can scroll above it.
-                                    .pt(px(TRANSCRIPT_TOP_FADE_H))
-                                    .pb(px(composer_h)),
+                                    self.smooth_scroll.region(
+                                        "transcript",
+                                        list(self.transcript.list.clone(), move |ix, _, _| {
+                                            let item = items.borrow().get(ix).cloned();
+                                            match item {
+                                                Some(item) => render_item(ix, &item, &rc2),
+                                                None => div().into_any_element(),
+                                            }
+                                        })
+                                        .size_full()
+                                        // Top: start below the fade, so nothing is dimmed at rest.
+                                        // Bottom: the composer floats over the list's end, so the
+                                        // last message can scroll above it.
+                                        .pt(px(TRANSCRIPT_TOP_FADE_H))
+                                        .pb(px(composer_h)),
+                                    ),
                                 )
                                 // Same layered falloff as the composer halo: each copy
                                 // fades from the background to transparent, and stacking
@@ -4499,7 +4509,8 @@ impl QmtApp {
                         .max_h(px(256.))
                         .overflow_y_scroll()
                         .gap(px(3.))
-                        .children(rows),
+                        .children(rows)
+                        .map(|el| self.smooth_scroll.region("waiting-list", el)),
                 )
         });
         // Desktop `SessionScrollToBottomPill`: pinned to the dock's right end,
@@ -4601,7 +4612,7 @@ impl QmtApp {
                     .gap_2()
                     .children(request_cards)
                     .children(dock)
-                    .child(composer),
+                    .child(self.smooth_scroll.region("composer", composer)),
             );
 
         v_flex()

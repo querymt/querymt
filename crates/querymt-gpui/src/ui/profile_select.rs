@@ -353,7 +353,8 @@ impl QmtApp {
                                 .text_color(p.dim)
                                 .child("No matching profiles"),
                         )
-                    }),
+                    })
+                    .map(|el| self.smooth_scroll.region("profile-list", el)),
             )
     }
 }
