@@ -1626,7 +1626,8 @@ impl QmtApp {
                     .overflow_y_scroll()
                     .px_2()
                     .pb_2()
-                    .children(rows),
+                    .children(rows)
+                    .map(|el| self.smooth_scroll.region("model-list", el)),
             )
             .children(reasoning_footer)
             .child(

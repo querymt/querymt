@@ -370,7 +370,8 @@ impl QmtApp {
                             .items_center()
                             .justify_center()
                             .child(picture),
-                    ),
+                    )
+                    .map(|el| self.smooth_scroll.region("preview-stage", el)),
             )
             .child(
                 h_flex().absolute().top_0().left_0().right(px(48.)).child(

@@ -7,8 +7,8 @@
 //! This swallows notch events in the capture phase (before any container sees
 //! them), converts them to a pixel target, and each frame re-dispatches a
 //! fraction of the remaining distance as a precise `ScrollDelta::Pixels` event
-//! at the current mouse position. Containers see a stream of small scrolls and
-//! animate without knowing about it.
+//! within the originating scroll region. Crossing a region boundary cancels
+//! pending motion; containers never inherit another region's wheel gesture.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -167,6 +167,102 @@ struct State {
     /// listener lets it through.
     injecting: bool,
     last_tick: Option<Instant>,
+    owner: Option<SharedString>,
+    regions: Vec<(SharedString, Bounds<Pixels>)>,
+}
+
+impl State {
+    fn region_at(&self, position: Point<Pixels>) -> Option<SharedString> {
+        self.regions
+            .iter()
+            .rev()
+            .find(|(_, bounds)| bounds.contains(&position))
+            .map(|(id, _)| id.clone())
+    }
+
+    fn reset_motion(&mut self) {
+        self.remaining = Point::default();
+        self.velocity = Point::default();
+        self.spin = Spin::default();
+        self.stretch = 1.;
+        self.owner = None;
+    }
+
+    fn retain_owner(&mut self, position: Point<Pixels>) {
+        if self.owner.is_some() && self.owner != self.region_at(position) {
+            self.reset_motion();
+        }
+    }
+}
+
+/// Geometry-only wrapper: delegates the child's layout unchanged and records
+/// the clipped viewport, not a canvas inside the moving scroll content.
+struct ScrollRegion {
+    state: Rc<RefCell<State>>,
+    id: SharedString,
+    element: AnyElement,
+}
+
+impl IntoElement for ScrollRegion {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for ScrollRegion {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.element.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let bounds = bounds.intersect(&window.content_mask().bounds);
+        if bounds.size.width > px(0.) && bounds.size.height > px(0.) {
+            // Parents register before children; deferred overlays register last.
+            self.state
+                .borrow_mut()
+                .regions
+                .push((self.id.clone(), bounds));
+        }
+        self.element.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.element.paint(window, cx);
+    }
 }
 
 #[derive(Clone)]
@@ -198,8 +294,7 @@ impl SmoothScroll {
         if s.tau != tau {
             s.tau = tau;
             if tau.is_none() {
-                s.remaining = Point::default();
-                s.velocity = Point::default();
+                s.reset_motion();
             }
         }
         if s.curve != curve {
@@ -208,12 +303,27 @@ impl SmoothScroll {
         }
     }
 
-    /// Element to paint once per frame, first in the root, so its capture
-    /// listener runs before any scroll container's.
+    /// Register resolved geometry without adding a layout container. Only
+    /// visible regions are retained, and the allocation is reused each frame.
+    pub fn region(
+        &self,
+        id: impl Into<SharedString>,
+        element: impl IntoElement,
+    ) -> impl IntoElement {
+        ScrollRegion {
+            state: self.0.clone(),
+            id: id.into(),
+            element: element.into_any_element(),
+        }
+    }
+
+    /// Place first in the root: starts the region list during prepaint and
+    /// installs capture listeners before any scroll container's listeners.
     pub fn element(&self) -> impl IntoElement {
         let this = self.clone();
+        let state = self.0.clone();
         canvas(
-            |_, _, _| (),
+            move |_, _, _| state.borrow_mut().regions.clear(),
             move |_, _, window, cx| this.install(window, cx),
         )
         .absolute()
@@ -224,18 +334,24 @@ impl SmoothScroll {
         if cx.reduce_motion() || self.0.borrow().tau.is_none() {
             return;
         }
+        let movement = self.0.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, _| {
+            if phase == DispatchPhase::Capture {
+                movement.borrow_mut().retain_owner(event.position);
+            }
+        });
         let state = self.0.clone();
         let line_height = window.line_height();
         window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
             if phase != DispatchPhase::Capture {
                 return;
             }
-            // Precise devices (trackpads), touch pans and our own injected
-            // events pass through untouched.
-            if state.borrow().injecting
-                || event.delta.precise()
-                || event.source != ScrollSource::Pointer
-            {
+            if state.borrow().injecting {
+                return;
+            }
+            // Native precise scrolling takes over without adding a wheel tail.
+            if event.delta.precise() || event.source != ScrollSource::Pointer {
+                state.borrow_mut().reset_motion();
                 return;
             }
             let delta = event.delta.pixel_delta(line_height);
@@ -243,6 +359,16 @@ impl SmoothScroll {
             let now = cx.background_executor().now();
             {
                 let mut s = state.borrow_mut();
+                let owner = s.region_at(event.position);
+                if s.owner != owner {
+                    s.reset_motion();
+                }
+                let Some(owner) = owner else {
+                    // Unregistered native controls keep their normal wheel
+                    // behavior rather than borrowing a window-wide gesture.
+                    return;
+                };
+                s.owner = Some(owner);
                 // A new notch takes over from any coast.
                 s.stretch = 1.;
                 if let Some(inertia) = s.inertia {
@@ -334,6 +460,10 @@ impl SmoothScroll {
         let now = cx.background_executor().now();
         let step = {
             let mut s = state.borrow_mut();
+            s.retain_owner(window.mouse_position());
+            if cx.reduce_motion() {
+                s.reset_motion();
+            }
             let dt = s
                 .last_tick
                 .map_or(MAX_DT, |t| now.saturating_duration_since(t))
@@ -414,6 +544,7 @@ impl SmoothScroll {
             s.spin = Spin::default();
             s.animating = false;
             s.last_tick = None;
+            s.owner = None;
         } else {
             Self::schedule(state, window);
         }
@@ -434,7 +565,147 @@ fn ease_step(rem: f32, f: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Curve, ease_step};
+    use super::{Curve, SmoothScroll, State, ease_step};
+
+    #[test]
+    fn regions_use_nested_and_overlay_order_and_reset_all_motion() {
+        use gpui_kit::{Bounds, point, px, size};
+        let outer = Bounds::new(point(px(0.), px(0.)), size(px(500.), px(500.)));
+        let inner = Bounds::new(point(px(20.), px(20.)), size(px(100.), px(100.)));
+        let mut state = State {
+            regions: vec![("outer".into(), outer), ("inner".into(), inner)],
+            owner: Some("inner".into()),
+            remaining: point(10., -600.),
+            velocity: point(3., -100.),
+            spin: super::Spin {
+                streak: 4,
+                ..Default::default()
+            },
+            stretch: 3.,
+            ..Default::default()
+        };
+        state.retain_owner(point(px(40.), px(40.)));
+        assert_eq!(state.remaining.y, -600.);
+        // Crossing into the parent clears every part of the gesture.
+        state.retain_owner(point(px(150.), px(40.)));
+        assert_eq!(state.remaining, Default::default());
+        assert_eq!(state.velocity, Default::default());
+        assert_eq!(state.spin.streak, 0);
+        assert_eq!(state.stretch, 1.);
+        assert!(state.owner.is_none());
+        // A later overlay wins even when larger than the nested block.
+        state.regions.push(("overlay".into(), outer));
+        assert_eq!(
+            state.region_at(point(px(40.), px(40.))).as_deref(),
+            Some("overlay")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn wheel_motion_does_not_transfer_between_scroll_regions(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::{TestEventExt as _, TestSupportExt as _, TestWindowExt as _};
+        use gpui_kit::{
+            AppContext as _, Context, InteractiveElement as _, IntoElement, ParentElement as _,
+            Render, ScrollDelta, ScrollHandle, StatefulInteractiveElement as _, Styled as _,
+            Window, div, point, px,
+        };
+        struct Fixture {
+            smooth: SmoothScroll,
+            a: ScrollHandle,
+            b: ScrollHandle,
+        }
+        impl Render for Fixture {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let area = |id, handle: &ScrollHandle| {
+                    self.smooth.region(
+                        id,
+                        div()
+                            .id(id)
+                            .test_support()
+                            .w(px(200.))
+                            .h(px(120.))
+                            .overflow_y_scroll()
+                            .track_scroll(handle)
+                            .child(div().h(px(1000.)).w_full()),
+                    )
+                };
+                div().size_full().child(self.smooth.element()).child(
+                    div()
+                        .flex()
+                        .gap_4()
+                        .child(area("a", &self.a))
+                        .child(area("b", &self.b)),
+                )
+            }
+        }
+        cx.update(gpui_kit::init);
+        let smooth = SmoothScroll::default();
+        smooth.set_preset("smooth", "ease_in_out", "strong");
+        let a = ScrollHandle::new();
+        let b = ScrollHandle::new();
+        let (handle, _view) = cx.update(|cx| {
+            gpui_kit::open_window(Default::default(), cx, |_, cx| {
+                cx.new(|_| Fixture {
+                    smooth: smooth.clone(),
+                    a: a.clone(),
+                    b: b.clone(),
+                })
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            a.set_offset(point(px(0.), -a.max_offset().y));
+            window.render_frame(cx);
+            window.hover("a", cx);
+            for _ in 0..4 {
+                window.scroll("a", ScrollDelta::Lines(point(0., -6.)), cx);
+            }
+            assert!(smooth.0.borrow().remaining.y < 0.);
+            assert!(smooth.0.borrow().spin.streak > 0);
+            assert_eq!(a.offset().y, -a.max_offset().y);
+            let inside = window.find("a").bounds().center() + point(px(10.), px(0.));
+            window.pointer_move(inside, None, cx);
+            assert!(
+                smooth.0.borrow().remaining.y < 0.,
+                "moving within a region must preserve the gesture"
+            );
+            window.hover("b", cx);
+            assert_eq!(smooth.0.borrow().remaining, Default::default());
+            assert_eq!(smooth.0.borrow().velocity, Default::default());
+            assert_eq!(smooth.0.borrow().spin.streak, 0);
+            window.render_frame(cx);
+            assert_eq!(
+                b.offset(),
+                Default::default(),
+                "the new region must not inherit motion"
+            );
+            window.scroll("b", ScrollDelta::Lines(point(0., -1.)), cx);
+            assert_eq!(
+                smooth.0.borrow().spin.streak,
+                0,
+                "new region starts a fresh spin"
+            );
+            assert_eq!(smooth.0.borrow().owner.as_deref(), Some("b"));
+
+            // Precise-device input remains native and cancels any wheel tail.
+            window.scroll("b", ScrollDelta::Pixels(point(px(0.), px(-5.))), cx);
+            assert_eq!(smooth.0.borrow().remaining, Default::default());
+            assert!(smooth.0.borrow().owner.is_none());
+
+            // Smoothing without inertia must have the same ownership rules.
+            smooth.set_preset("normal", "ease_out", "off");
+            window.hover("a", cx);
+            window.scroll("a", ScrollDelta::Lines(point(0., -6.)), cx);
+            assert!(smooth.0.borrow().remaining.y < 0.);
+            let before = b.offset();
+            window.hover("b", cx);
+            window.render_frame(cx);
+            assert_eq!(smooth.0.borrow().remaining, Default::default());
+            assert_eq!(b.offset(), before);
+        })
+        .unwrap();
+    }
 
     #[test]
     fn ease_step_never_panics_or_overshoots() {

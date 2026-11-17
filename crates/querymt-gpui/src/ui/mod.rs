@@ -1157,20 +1157,26 @@ impl Render for QmtApp {
                     .flex_1()
                     .min_h_0()
                     .items_stretch()
-                    .child(self.render_sidebar(cx))
-                    .child(if self.page == Page::Session {
-                        div().id("page").flex_1().min_w_0().h_full().child(body)
-                    } else {
-                        div()
-                            .id("page")
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .overflow_y_scroll()
-                            .child(body)
-                    }),
+                    .child({
+                        let sidebar = self.render_sidebar(cx);
+                        self.smooth_scroll.region("sidebar", sidebar)
+                    })
+                    .child(self.smooth_scroll.region(
+                        "page",
+                        if self.page == Page::Session {
+                            div().id("page").flex_1().min_w_0().h_full().child(body)
+                        } else {
+                            div()
+                                .id("page")
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .overflow_y_scroll()
+                                .child(body)
+                        },
+                    )),
             )
-            .children(overlay)
+            .children(overlay.map(|el| self.smooth_scroll.region("overlay", el)))
             .into_any_element()
     }
 }

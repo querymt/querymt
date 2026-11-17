@@ -431,7 +431,8 @@ impl QmtApp {
                     // Keep focus in the field: the shell would take it on
                     // mouse down and the blur would close the list first.
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                    .children(rows),
+                    .children(rows)
+                    .map(|el| self.smooth_scroll.region("workspace-list", el)),
             )
             .with_priority(1)
         });
