@@ -2,13 +2,14 @@
 
 ## Use the existing client skill
 
-Before the first ACP check, look for and load the available qmacp skill; it may
-still be advertised as `qmtacp`. Verify `command -v qmacp` and `qmacp --version`
+Before the first ACP check, look for and load the available qmacp skill
+([`skills/qmacp`](../qmacp/SKILL.md)). Verify `command -v qmacp` and `qmacp --version`
 in the selected environment. The client skill owns command syntax, capability
-discovery, output handling, permissions and interaction policies.
+discovery, output handling, permissions and interaction policies. In this
+repository, `cargo run -p qmacp -- <args>` runs the client from source.
 
 Only if the skill or binary is unavailable, use the
-[qmacp installation instructions](https://github.com/querymt/qmacp#install) to install
+[qmacp installation instructions](../qmacp/cli.md#install) to install
 the missing component; do not reinstall components already available. Do not invent a replacement command catalog here. Finish independent
 backend tests while a client check is blocked; use installed help to resolve
 version-specific differences.

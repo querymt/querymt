@@ -33,6 +33,8 @@ workspace-members = [
     "qmt-ollama", "qmt-openai", "qmt-openrouter", "qmt-xai", "qmt-zai",
     "querymt-agent-py", "querymt-py", "querymt-mobile-ffi", "querymt-extism-macros",
     "querymt-provider-common", "querymt-cli",
+    # Standalone ACP/MCP client binaries: keep the agent stack out of their builds.
+    "qmacp", "qmcp",
 ]
 
 # `querymt` is shared with the wasm32-wasip1 provider plugins, which must not

@@ -1,0 +1,78 @@
+name: Test qmacp and qmcp
+
+# Standalone ACP/MCP client binaries. They do not depend on other workspace
+# crates, so only their own sources and the shared build inputs trigger this.
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'crates/qmacp/**'
+      - 'crates/qmcp/**'
+      - '.config/nextest.toml'
+      - '.cargo/**'
+      - 'rust-toolchain.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/actions/rust-setup/**'
+      - '.github/workflows/test-qmacp.yml'
+  pull_request:
+    paths:
+      - 'crates/qmacp/**'
+      - 'crates/qmcp/**'
+      - '.config/nextest.toml'
+      - '.cargo/**'
+      - 'rust-toolchain.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/actions/rust-setup/**'
+      - '.github/workflows/test-qmacp.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  clippy:
+    name: Clippy lints
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          components: clippy
+          cache-key: qmacp-clippy
+
+      - name: Run Clippy
+        run: >
+          cargo clippy --locked
+          --package qmacp
+          --package qmcp
+          --all-targets -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          cache-key: qmacp-test
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Run tests
+        run: >
+          cargo nextest run --locked --profile ci
+          --package qmacp
+          --package qmcp

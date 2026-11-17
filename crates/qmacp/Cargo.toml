@@ -1,0 +1,33 @@
+[package]
+name = "qmacp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI and native client for controlling a running QueryMT ACP WebSocket server."
+authors = ["Ivan Zatevakhin <ivan@query.mt>"]
+repository = "https://github.com/querymt/querymt"
+homepage = "https://query.mt"
+
+[[bin]]
+name = "qmacp"
+path = "src/main.rs"
+
+[dependencies]
+agent-client-protocol.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+# The client selects this provider explicitly for each TLS connection.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1.0", features = ["full"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# Reproduce an embedding application that enables the other TLS provider.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+tokio = { version = "1", features = ["test-util"] }

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- **`qmacp` and `qmcp` live in this workspace.** The ACP client CLI (`qmacp`,
+  `crates/qmacp`) and the MCP-to-ACP bridge (`qmcp`, `crates/qmcp`) moved from
+  their separate repositories, follow the workspace version, and are built for
+  every platform and attached to stable and nightly releases. The qmacp agent
+  skill moved to `skills/qmacp`.
+
 ### Behavior changes
 
 - **Subagents API (Rust, Python, hooks, ACP):** `Agent::builder()`,
