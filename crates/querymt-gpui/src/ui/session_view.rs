@@ -249,9 +249,15 @@ impl Transcript {
         let old_len = self.sigs.len();
         let mut items = self.items.borrow_mut();
         for ix in 0..old_len.min(view.len()) {
-            if self.sigs[ix] != sigs[ix] {
+            if self.keys[ix] != keys[ix] || self.sigs[ix] != sigs[ix] {
                 items[ix] = Rc::new(view[ix].clone());
-                self.list.splice(ix..ix + 1, 1);
+                if self.keys[ix] == keys[ix] {
+                    // Height changed, not identity: keep the reader's offset
+                    // inside a potentially very tall work-group row.
+                    self.list.remeasure_items(ix..ix + 1);
+                } else {
+                    self.list.splice(ix..ix + 1, 1);
+                }
             }
         }
         if view.len() > old_len {
@@ -1652,6 +1658,8 @@ fn tool_content(call: &ToolCall, rc: &RenderCtx) -> Div {
 
 fn toggle_expanded(weak: &WeakEntity<QmtApp>, key: String, cx: &mut App) {
     let _ = weak.update(cx, |this, cx| {
+        // Inspecting a block is a reading action, not new content to follow.
+        this.transcript.list.pause_following_tail();
         if !this.expanded_items.remove(&key) {
             this.expanded_items.insert(key);
         }
@@ -4636,6 +4644,107 @@ mod tests {
         humanize_tool_name, is_read, is_shell, link_ranges, tool_label, workspace_relative,
     };
     use crate::session::{Thought, WorkEntry};
+
+    // Exercise the list operations used by expansion and transcript sync.
+    #[gpui_kit::test]
+    fn expansion_preserves_scroll_anchor_and_streaming_still_follows(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{
+            AppContext as _, Context, FollowMode, IntoElement as _, ListAlignment, ListOffset,
+            ListState, Render, Styled as _, Window, div, list, point, px, size,
+        };
+        use std::{cell::Cell, rc::Rc};
+        struct Fixture {
+            state: ListState,
+            expanded: Rc<Cell<bool>>,
+        }
+        impl Render for Fixture {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut Context<Self>,
+            ) -> impl gpui_kit::IntoElement {
+                let expanded = self.expanded.clone();
+                list(self.state.clone(), move |ix, _, _| {
+                    let height = if ix == 1 {
+                        if expanded.get() { 2400. } else { 2000. }
+                    } else {
+                        100.
+                    };
+                    div().h(px(height)).w_full().into_any_element()
+                })
+                .size_full()
+            }
+        }
+        let cx = cx.add_empty_window();
+        let state = ListState::new(5, ListAlignment::Top, px(1200.));
+        let expanded = Rc::new(Cell::new(false));
+        let draw = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.draw(point(px(0.), px(0.)), size(px(600.), px(500.)), |_, cx| {
+                cx.new(|_| Fixture {
+                    state: state.clone(),
+                    expanded: expanded.clone(),
+                })
+                .into_any_element()
+            });
+        };
+        state.set_follow_mode(FollowMode::Tail);
+        draw(cx);
+        state.scroll_to(ListOffset {
+            item_ix: 1,
+            offset_in_item: px(900.),
+        });
+        draw(cx);
+        let before = state.logical_scroll_top();
+        state.pause_following_tail();
+        expanded.set(true);
+        state.remeasure_items(1..2);
+        draw(cx);
+        assert_eq!(before.offset_in_item, px(900.));
+        assert_eq!(state.logical_scroll_top(), before);
+        assert!(!state.is_following_tail());
+
+        state.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(25.),
+        });
+        draw(cx);
+        let before = state.logical_scroll_top();
+        state.pause_following_tail();
+        expanded.set(false);
+        state.remeasure_items(1..2);
+        draw(cx);
+        assert_eq!(state.logical_scroll_top(), before);
+
+        state.set_follow_mode(FollowMode::Tail);
+        state.scroll_to_end();
+        draw(cx);
+        let before = state.logical_scroll_top();
+        state.pause_following_tail();
+        expanded.set(true);
+        state.remeasure_items(1..2);
+        draw(cx);
+        assert_eq!(state.logical_scroll_top(), before);
+        assert!(!state.is_following_tail());
+
+        // Re-enable follow, as the jump-to-bottom control does. Streaming
+        // changes must still follow the end without a user disclosure click.
+        expanded.set(false);
+        state.remeasure_items(1..2);
+        state.set_follow_mode(FollowMode::Tail);
+        state.scroll_to_end();
+        draw(cx);
+        let before = state.logical_scroll_top();
+        expanded.set(true);
+        state.remeasure_items(1..2);
+        draw(cx);
+        assert!(state.is_following_tail());
+        assert_eq!(
+            state.logical_scroll_top().offset_in_item - before.offset_in_item,
+            px(400.)
+        );
+    }
 
     fn thought(id: &str, part: Option<&str>) -> WorkEntry {
         WorkEntry::Thought(Thought {
