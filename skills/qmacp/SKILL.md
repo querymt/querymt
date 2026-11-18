@@ -48,7 +48,7 @@ qmacp --quiet prompt --new --cwd "$PWD" --timeout 900 'do the task and report'
 Keep the returned `sessionId` as `SESSION_ID`. To continue from that workspace:
 
 ```sh
-qmacp --quiet prompt --cwd "$PWD" --timeout 900 "$SESSION_ID" 'next step'
+qmacp --quiet prompt --timeout 900 "$SESSION_ID" 'next step'
 qmacp --quiet runtime "$SESSION_ID"
 ```
 

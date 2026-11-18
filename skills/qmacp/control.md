@@ -10,8 +10,8 @@ permissions (default `allow-once`), and output validation.
 
 ```sh
 qmacp --quiet prompt --new --cwd "$PWD" --profile '<profile>' --mode build --model '<model-id>' --effort high --timeout 900 'text'
-qmacp --quiet prompt --cwd "$PWD" --delivery auto --timeout 900 "$SESSION_ID" 'text'
-qmacp --quiet prompt --cwd "$PWD" --delivery queue --until-idle false "$SESSION_ID" 'text'
+qmacp --quiet prompt --delivery auto --timeout 900 "$SESSION_ID" 'text'
+qmacp --quiet prompt --delivery queue --until-idle false "$SESSION_ID" 'text'
 qmacp --quiet --permission allow-once prompt --new --cwd "$PWD" --timeout 900 - < instructions.txt
 ```
 

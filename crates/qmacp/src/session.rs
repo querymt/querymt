@@ -10,23 +10,35 @@ const SESSION_LOAD_SNAPSHOT_META_KEY: &str = "querymt/sessionLoadSnapshot.v1";
 const INSPECT_TEXT_LIMIT: usize = 4_000;
 const FIND_PAGE_CAP: usize = 20;
 
-pub fn resolve_cwd(cwd: Option<PathBuf>) -> Result<PathBuf> {
-    let path = cwd.unwrap_or(std::env::current_dir().context("current directory")?);
-    let path = if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()
-            .context("current directory")?
-            .join(path)
+/// Check only the absolute path syntax; QueryMT validates it on the server host.
+pub fn is_absolute_server_cwd(path: &Path) -> bool {
+    let Some(path) = path.to_str() else {
+        return false;
     };
-    if !path.is_absolute() {
-        bail!("cwd must be an absolute path: {}", path.display());
+    path.starts_with('/')
+        || matches!(path.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
+        || path.strip_prefix(r"\\").is_some_and(|path| {
+            let mut parts = path.split(['\\', '/']);
+            parts.next().is_some_and(|part| !part.is_empty())
+                && parts.next().is_some_and(|part| !part.is_empty())
+        })
+}
+
+pub fn resolve_cwd(cwd: Option<PathBuf>) -> Result<PathBuf> {
+    match resolve_optional_cwd(cwd)? {
+        Some(path) => Ok(path),
+        None => std::env::current_dir().context("current directory"),
     }
-    Ok(path)
 }
 
 pub fn resolve_optional_cwd(cwd: Option<PathBuf>) -> Result<Option<PathBuf>> {
-    cwd.map(|cwd| resolve_cwd(Some(cwd))).transpose()
+    if cwd
+        .as_deref()
+        .is_some_and(|path| !is_absolute_server_cwd(path))
+    {
+        bail!("cwd must be an absolute path on the QueryMT host");
+    }
+    Ok(cwd)
 }
 
 /// cwd for a load/resume of an existing session. An omitted cwd is sent empty,
@@ -454,6 +466,26 @@ fn truncate_opt(text: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_server_paths_are_passed_through_on_any_client_os() {
+        for raw in [
+            "/srv/workspace",
+            r"C:\repo\..\src",
+            "C:/workspace",
+            r"\\server\share\src",
+        ] {
+            let path = PathBuf::from(raw);
+            assert_eq!(resolve_cwd(Some(path.clone())).unwrap().as_os_str(), raw);
+            assert_eq!(existing_session_cwd(Some(path)).unwrap().as_os_str(), raw);
+        }
+        for raw in ["", ".", "relative", "C:relative", r"\relative", r"\\server"] {
+            assert!(
+                resolve_optional_cwd(Some(PathBuf::from(raw))).is_err(),
+                "{raw:?}"
+            );
+        }
+    }
 
     #[test]
     fn compact_inspect_extracts_user_and_tool_events() {

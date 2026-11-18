@@ -68,7 +68,7 @@ Requires qmacp on the watcher host and a reachable `qmtcode --acp-ws`; see
 `allow-once` policy lets tools run; callbacks do not bypass or restrict the
 session's permissions.
 
-Set `QMACP_URL`, `SESSION_ID`, `SESSION_CWD`, and `CALLBACK_ID` from the
+Set `QMACP_URL`, `SESSION_ID`, and `CALLBACK_ID` from the
 registered task. `RESOURCE` identifies the watched resource. Put this Bash
 helper and a watcher body adapted to your task in the same script; run that
 script in the background runner, not in the agent's foreground tool call.
@@ -98,7 +98,7 @@ notify_callback() {
     "## Callback\n\n\($result)"
   ') || return
   qmacp --url "$QMACP_URL" --quiet prompt \
-    --cwd "$SESSION_CWD" --delivery auto --until-idle false --timeout 900 \
+    --delivery auto --until-idle false --timeout 900 \
     "$SESSION_ID" - <<< "$payload"
 }
 ```

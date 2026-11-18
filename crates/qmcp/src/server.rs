@@ -358,6 +358,22 @@ mod tests {
                 "schema/decoder disagree for {name}: {arguments}"
             );
         };
+        let cwd = std::env::current_dir().unwrap();
+        check("new", json!({}));
+        for path in [
+            "/srv/workspace",
+            r"C:\repo",
+            "C:/repo",
+            r"\\server\share",
+            "relative",
+            "C:relative",
+            "",
+            r"\\server",
+        ] {
+            check("new", json!({"cwd": path}));
+            check("prompt", json!({"new": true, "cwd": path, "text": "x"}));
+            check("sessions", json!({"cwd": path}));
+        }
         for new in [
             None,
             Some(Value::Null),
@@ -372,6 +388,8 @@ mod tests {
                 if let Some(value) = session {
                     args["session_id"] = value;
                 }
+                check("prompt", args.clone());
+                args["cwd"] = json!(cwd);
                 check("prompt", args);
             }
         }
@@ -409,7 +427,7 @@ mod tests {
                 json!(u64::MAX),
             ] {
                 let mut args = if name == "prompt" {
-                    json!({"new": true, "text": "x"})
+                    json!({"new": true, "cwd": cwd, "text": "x"})
                 } else {
                     json!({"session_id": "s"})
                 };
@@ -432,7 +450,7 @@ mod tests {
             "-",
             "\u{3000}x",
         ] {
-            check("prompt", json!({"new": true, "text": text}));
+            check("prompt", json!({"new": true, "cwd": cwd, "text": text}));
             check("steer", json!({"session_id": "s", "text": text}));
             check("queue", json!({"session_id": "s", "text": text}));
         }
