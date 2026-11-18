@@ -2,7 +2,6 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Map, Value, json};
@@ -10,16 +9,11 @@ use serde_json::{Map, Value, json};
 use qmacp::client::AcpClient;
 use qmacp::error::{CliError, ExitCode};
 use qmacp::output;
-use qmacp::session;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
-pub enum Delivery {
-    #[default]
-    Auto,
-    Prompt,
-    Steer,
-    Queue,
-}
+use qmacp::session::{
+    self, Delivery, apply_config, cancel, choose_delivery, close, delivery_name, discard_queued,
+    extension_payload, open_session, request_failure, require_observed_phase, runtime,
+    stop_reason_name, submit_text,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ResolutionFilter {
@@ -537,7 +531,7 @@ async fn new_session(
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
     let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
-    let (created, created_raw) = client
+    let (created, _) = client
         .new_session(cwd.clone(), profile.as_deref())
         .await
         .map_err(|error| request_failure(error, json!({"stage": "create"})))?;
@@ -558,10 +552,7 @@ async fn new_session(
     apply_config(client, &session_id, mode, model, effort)
         .await
         .map_err(|error| error.with_recovery(recovery))?;
-    let status = match open_session(client, session_id.clone(), cwd.clone()).await {
-        Ok(opened) => opened.status,
-        Err(_) => session::config_status(&session_id, created.modes.as_ref(), &created_raw),
-    };
+    let status = session::created_session_status(client, &session_id, cwd.clone()).await;
     let mut result = json!({
         "sessionId": session_id,
         "cwd": cwd,
@@ -998,12 +989,8 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
     } = args;
     let (session_id, text) = parse_prompt_args(new, args)?;
     let text = read_prompt_text(text)?;
-    // A session keeps its own workspace; only a new session takes a cwd.
-    if !new && cwd.is_some() {
-        return Err(CliError::Usage(
-            "--cwd applies only with --new; an existing session keeps its own cwd".into(),
-        ));
-    }
+    session::validate_prompt(new, cwd.as_deref(), false, delivery)
+        .map_err(|error| CliError::Usage(error.into()))?;
     let cwd = if new {
         Some(session::resolve_cwd(cwd).map_err(CliError::rpc)?)
     } else {
@@ -1072,7 +1059,7 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
             } else {
                 "querymt/session/queue"
             };
-            let submitted = submit_text(client, method, session_id.clone(), run_id, text)
+            let submitted = submit_text(client, method, session_id.clone(), run_id, text, |_| {})
                 .await
                 .map_err(|error| error.with_recovery(recovery.clone()))?;
             recovery["clientInputId"] = submitted["clientInputId"].clone();
@@ -1099,24 +1086,21 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
     if chosen == Delivery::Prompt {
         recovery["stopReason"] = json!(stop_reason);
     }
-    let observed = if until_idle {
-        let observed = wait_until_idle(
-            client,
-            &session_id,
-            timeout.unwrap_or(Duration::from_secs(120)),
-        )
-        .await
-        .map_err(|error| error.with_recovery(recovery.clone()))?;
-        Some(observed)
-    } else {
-        None
-    };
-    let text = client.take_assistant_text().await;
+    let observed = session::observe_prompt_completion(
+        client,
+        &session_id,
+        until_idle,
+        &stop_reason,
+        timeout.unwrap_or(Duration::from_secs(120)),
+    )
+    .await
+    .map_err(|error| error.with_recovery(recovery.clone()))?;
+    let (text, truncated) = client.finish_assistant_text().await;
     let mut done = json!({
         "type": "done", "ok": true, "sessionId": session_id,
         "delivery": delivery_name(chosen), "deliveryState": "accepted",
-        "observationState": if until_idle { "idle" } else if chosen == Delivery::Prompt { "prompt_returned" } else { "not_waited" },
-        "stopReason": stop_reason, "text": text,
+        "observationState": if observed.is_some() { "idle" } else if chosen == Delivery::Prompt { "prompt_returned" } else { "not_waited" },
+        "stopReason": stop_reason, "text": text, "textTruncated": truncated,
         "loadSession": initialized.agent_capabilities.load_session,
     });
     if let Some(observed) = observed {
@@ -1133,98 +1117,6 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
     })
 }
 
-fn delivery_name(delivery: Delivery) -> &'static str {
-    match delivery {
-        Delivery::Auto => "auto",
-        Delivery::Prompt => "prompt",
-        Delivery::Steer => "steer",
-        Delivery::Queue => "queue",
-    }
-}
-
-async fn choose_delivery(
-    client: &AcpClient,
-    session_id: &str,
-    requested: Delivery,
-) -> Result<(Delivery, Option<String>), CliError> {
-    if requested != Delivery::Auto {
-        return Ok((requested, None));
-    }
-    let state = runtime(client, session_id.to_string()).await?;
-    let phase = require_observed_phase(&state)?;
-    let steerable = state
-        .pointer("/runtime/steerable")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| {
-            CliError::rpc("runtime response has no valid steerable flag; input was not submitted")
-        })?;
-    let delivery = delivery_from_runtime(phase, steerable);
-    let run_id = if delivery == Delivery::Steer {
-        Some(session::observed_run_id(&state["runtime"]).ok_or_else(|| {
-            CliError::rpc("runtime response has no active run ID; input was not submitted")
-        })?)
-    } else {
-        None
-    };
-    Ok((delivery, run_id))
-}
-
-fn require_observed_phase(state: &Value) -> Result<&str, CliError> {
-    session::observed_phase(&state["runtime"]).ok_or_else(|| {
-        CliError::rpc(
-            "session runtime observation is unavailable or invalid; execution state is unknown",
-        )
-        .with_recovery(json!({
-            "sessionId": state["sessionId"], "stage": "observe",
-            "observationState": "unavailable", "runtime": state["runtime"],
-        }))
-    })
-}
-
-fn delivery_from_runtime(phase: &str, steerable: bool) -> Delivery {
-    if phase == "idle" {
-        Delivery::Prompt
-    } else if steerable {
-        Delivery::Steer
-    } else {
-        Delivery::Queue
-    }
-}
-
-async fn wait_until_idle(
-    client: &AcpClient,
-    session_id: &str,
-    timeout: Duration,
-) -> Result<Value, CliError> {
-    wait_until_idle_every(client, session_id, timeout, Duration::from_millis(400)).await
-}
-
-async fn wait_until_idle_every(
-    client: &AcpClient,
-    session_id: &str,
-    timeout: Duration,
-    interval: Duration,
-) -> Result<Value, CliError> {
-    let mut last_runtime = Value::Null;
-    tokio::time::timeout(timeout.max(Duration::from_secs(1)), async {
-        loop {
-            let value = runtime_observation(client, session_id.to_string(), true).await
-                .map_err(|error| error.with_recovery(json!({"runtime": last_runtime})))?;
-            last_runtime = value["runtime"].clone();
-            if require_observed_phase(&value)? == "idle" {
-                return Ok(value);
-            }
-            tokio::time::sleep(interval.max(Duration::from_millis(200))).await;
-        }
-    }).await.map_err(|_| CliError::Timeout(format!(
-        "timed out after {}s waiting for session {session_id} to become idle (last phase: {}); remote work was not cancelled",
-        timeout.as_secs(), last_runtime["phase"].as_str().unwrap_or("unknown"),
-    )).with_recovery(json!({
-        "sessionId": session_id, "stage": "observe", "observationState": "unavailable",
-        "runtime": last_runtime,
-    })))?
-}
-
 async fn follow(
     client: &AcpClient,
     session_id: String,
@@ -1232,36 +1124,23 @@ async fn follow(
     timeout: u64,
     pretty: bool,
 ) -> Result<CommandOutcome, CliError> {
-    client.initialize().await.map_err(CliError::from_request)?;
-    open_session(client, session_id.clone(), PathBuf::new())
-        .await
-        .map_err(|error| {
-            error.with_recovery(json!({
-                "sessionId": session_id, "stage": "open", "observationState": "unavailable",
-            }))
-        })?;
-    client.capture_assistant_text(Some(&session_id)).await;
-    let observed = wait_until_idle_every(
+    let followed = session::follow(
         client,
         &session_id,
+        PathBuf::new(),
         Duration::from_secs(timeout.max(1)),
         Duration::from_secs(interval.max(1)),
     )
-    .await
-    .map_err(|error| {
-        error.with_recovery(json!({
-            "sessionId": session_id, "stage": "observe", "observationState": "unavailable",
-        }))
-    })?;
-    let text = client.take_assistant_text().await;
+    .await?;
     let done = json!({
         "type": "done",
         "ok": true,
         "sessionId": session_id,
         "stopReason": "idle",
         "observationState": "idle",
-        "runtime": observed["runtime"],
-        "text": text,
+        "runtime": followed.runtime,
+        "text": followed.text,
+        "textTruncated": followed.truncated,
         "interval": interval,
     });
     if pretty {
@@ -1270,35 +1149,6 @@ async fn follow(
         output::write_event(&done).map_err(CliError::rpc)?;
     }
     Ok(CommandOutcome { exit: ExitCode::Ok })
-}
-
-async fn runtime(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
-    runtime_observation(client, session_id, false).await
-}
-
-async fn runtime_observation(
-    client: &AcpClient,
-    session_id: String,
-    wait_for_updates: bool,
-) -> Result<Value, CliError> {
-    let recovery = json!({
-        "sessionId": session_id, "stage": "observe", "observationState": "unavailable",
-    });
-    client
-        .initialize()
-        .await
-        .map_err(|error| CliError::from_request(error).with_recovery(recovery.clone()))?;
-    let response = client
-        .extension(
-            "querymt/session/runtimeState",
-            json!({ "session_id": session_id, "wait_for_updates": wait_for_updates }),
-        )
-        .await
-        .map_err(|error| CliError::from_request(error).with_recovery(recovery))?;
-    Ok(json!({
-        "sessionId": session_id,
-        "runtime": extension_payload(&response),
-    }))
 }
 
 async fn watch(
@@ -1347,101 +1197,7 @@ async fn submit_input(
     let text = join_prompt_args(text)
         .ok_or_else(|| CliError::Usage("text is required (pass TEXT or - for stdin)".into()))?;
     let text = read_prompt_text(Some(text))?;
-    submit_text(client, method, session_id, run_id, text).await
-}
-
-async fn submit_text(
-    client: &AcpClient,
-    method: &str,
-    session_id: String,
-    run_id: Option<String>,
-    text: String,
-) -> Result<Value, CliError> {
-    let not_submitted = json!({
-        "sessionId": session_id, "stage": "submit", "deliveryState": "not_submitted",
-    });
-    client
-        .initialize()
-        .await
-        .map_err(|error| CliError::from_request(error).with_recovery(not_submitted.clone()))?;
-    let run_id = if method.ends_with("/steer") {
-        let run_id = match run_id {
-            Some(id) => Some(id),
-            None => runtime(client, session_id.clone())
-                .await
-                .map_err(|error| error.with_recovery(not_submitted.clone()))?
-                .pointer("/runtime/active_run_id")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        };
-        Some(run_id.filter(|id| !id.trim().is_empty()).ok_or_else(|| {
-            CliError::rpc(
-                "steer requires an active run or a nonempty --run-id; input was not submitted",
-            )
-            .with_recovery(not_submitted.clone())
-        })?)
-    } else {
-        run_id
-    };
-    let client_input_id = uuid::Uuid::new_v4().to_string();
-    let mut recovery = json!({
-        "sessionId": session_id, "clientInputId": client_input_id, "stage": "submit",
-    });
-    let mut params = json!({
-        "session_id": session_id,
-        "client_input_id": client_input_id,
-        "prompt": [{ "type": "text", "text": text }],
-    });
-    if let Some(run_id) = run_id {
-        params["expected_run_id"] = json!(run_id);
-    }
-    let response = client
-        .extension(method, params)
-        .await
-        .map_err(|error| request_failure(error, recovery.clone()))?;
-    let result = extension_payload(&response);
-    let input_id = result.get("input_id").and_then(Value::as_str);
-    let status_valid = matches!(
-        response.get("status").and_then(Value::as_str),
-        Some("queued" | "started" | "steered")
-    );
-    // A JSON-RPC result alone is not a correlated acceptance receipt.
-    if input_id != Some(client_input_id.as_str())
-        || !status_valid
-        || response.get("ok") == Some(&Value::Bool(false))
-        || result.get("ok") == Some(&Value::Bool(false))
-    {
-        recovery["deliveryState"] = json!("unknown");
-        recovery["response"] = response;
-        return Err(CliError::rpc(
-            "invalid submission receipt; acceptance is unknown; inspect before retrying",
-        )
-        .with_recovery(recovery));
-    }
-    Ok(json!({
-        "sessionId": session_id,
-        "clientInputId": client_input_id,
-        "deliveryState": "accepted",
-        "result": result,
-    }))
-}
-
-fn request_failure(error: anyhow::Error, mut recovery: Value) -> CliError {
-    let state = if error
-        .downcast_ref::<qmacp::client::RpcResponseError>()
-        .is_some_and(qmacp::client::RpcResponseError::is_rejection)
-    {
-        "rejected"
-    } else {
-        "unknown"
-    };
-    let field = if recovery["stage"] == "create" {
-        "creationState"
-    } else {
-        "deliveryState"
-    };
-    recovery[field] = json!(state);
-    CliError::from_request(error).with_recovery(recovery)
+    submit_text(client, method, session_id, run_id, text, |_| {}).await
 }
 
 async fn exec(
@@ -1477,6 +1233,9 @@ async fn exec(
             "stdin payloads cannot be read inside a stdin exec batch".into(),
         ));
     }
+    for command in &commands {
+        validate_batch_command(command)?;
+    }
     let mut last = CommandOutcome { exit: ExitCode::Ok };
     for command in commands {
         last = Box::pin(run(client, command, pretty)).await?;
@@ -1485,6 +1244,32 @@ async fn exec(
         }
     }
     Ok(last)
+}
+
+fn validate_batch_command(command: &Command) -> Result<(), CliError> {
+    let validation = match command {
+        Command::Prompt {
+            new, cwd, delivery, ..
+        } => session::validate_prompt(*new, cwd.as_deref(), false, *delivery),
+        Command::New { cwd, .. }
+        | Command::Sessions { cwd, .. }
+        | Command::Find { cwd, .. }
+        | Command::Inspect { cwd, .. }
+        | Command::Status { cwd, .. } => session::validate_cwd(cwd.as_deref(), false),
+        Command::Exec { commands } => {
+            if commands.is_empty() {
+                return Err(CliError::Usage(
+                    "nested exec requires explicit commands for batch preflight".into(),
+                ));
+            }
+            for line in commands {
+                validate_batch_command(&parse_exec_line(line)?)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    };
+    validation.map_err(|error| CliError::Usage(error.into()))
 }
 
 #[derive(Parser)]
@@ -1526,41 +1311,6 @@ fn split_exec_args(line: &str) -> Vec<String> {
     args
 }
 
-async fn discard_queued(
-    client: &AcpClient,
-    session_id: String,
-    input_id: String,
-) -> Result<Value, CliError> {
-    client.initialize().await.map_err(CliError::from_request)?;
-    let response = client
-        .extension(
-            "querymt/session/discardQueuedInput",
-            json!({
-                "session_id": session_id,
-                "input_id": input_id,
-            }),
-        )
-        .await
-        .map_err(CliError::from_request)?;
-    Ok(json!({
-        "sessionId": session_id,
-        "inputId": input_id,
-        "result": extension_payload(&response),
-    }))
-}
-
-async fn cancel(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
-    client.initialize().await.map_err(CliError::from_request)?;
-    client
-        .cancel(session_id.clone())
-        .await
-        .map_err(CliError::from_notification)?;
-    Ok(json!({
-        "sessionId": session_id,
-        "cancellationState": "notification_sent",
-    }))
-}
-
 fn parse_prompt_args(
     new: bool,
     args: Vec<String>,
@@ -1583,83 +1333,6 @@ fn join_prompt_args(args: Vec<String>) -> Option<String> {
     } else {
         Some(args.join(" "))
     }
-}
-
-async fn close(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
-    client.initialize().await.map_err(CliError::from_request)?;
-    client
-        .close_session(session_id.clone())
-        .await
-        .map_err(CliError::from_request)?;
-    Ok(json!({
-        "sessionId": session_id,
-        "closed": true,
-    }))
-}
-
-async fn apply_config(
-    client: &AcpClient,
-    session_id: &str,
-    mode: Option<String>,
-    model: Option<String>,
-    effort: Option<String>,
-) -> Result<(), CliError> {
-    if let Some(mode) = mode {
-        client
-            .set_mode(session_id.to_string(), mode)
-            .await
-            .map_err(CliError::from_request)?;
-    }
-    if let Some(model) = model {
-        client
-            .set_config(session_id.to_string(), "model", &model)
-            .await
-            .map_err(CliError::from_request)?;
-    }
-    if let Some(effort) = effort {
-        client
-            .set_config(session_id.to_string(), "reasoning_effort", &effort)
-            .await
-            .map_err(CliError::from_request)?;
-    }
-    Ok(())
-}
-
-struct OpenedSession {
-    status: Value,
-}
-
-async fn open_session(
-    client: &AcpClient,
-    session_id: String,
-    cwd: PathBuf,
-) -> Result<OpenedSession, CliError> {
-    let resumed_status = match client.resume_session(session_id.clone(), cwd.clone()).await {
-        Ok((response, raw)) => {
-            let status = session::config_status(&session_id, response.modes.as_ref(), &raw);
-            if status.get("model").is_some_and(|value| !value.is_null()) {
-                return Ok(OpenedSession { status });
-            }
-            Some(status)
-        }
-        Err(_) => None,
-    };
-    match client.load_session(session_id.clone(), cwd).await {
-        Ok((loaded, raw)) => Ok(OpenedSession {
-            status: session::config_status(&session_id, loaded.modes.as_ref(), &raw),
-        }),
-        Err(err) => match resumed_status {
-            Some(status) => Ok(OpenedSession { status }),
-            None => Err(CliError::from_request(err)),
-        },
-    }
-}
-
-fn extension_payload(response: &Value) -> Value {
-    response
-        .get("data")
-        .cloned()
-        .unwrap_or_else(|| response.clone())
 }
 
 fn read_prompt_text(text: Option<String>) -> Result<String, CliError> {
@@ -1690,20 +1363,10 @@ fn atty_stdin() -> bool {
     std::io::IsTerminal::is_terminal(&io::stdin())
 }
 
-fn stop_reason_name(reason: &acp::StopReason) -> String {
-    match reason {
-        acp::StopReason::EndTurn => "endTurn".to_string(),
-        acp::StopReason::MaxTokens => "maxTokens".to_string(),
-        acp::StopReason::MaxTurnRequests => "maxTurnRequests".to_string(),
-        acp::StopReason::Refusal => "refusal".to_string(),
-        acp::StopReason::Cancelled => "cancelled".to_string(),
-        other => format!("{other:?}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qmacp::session::delivery_from_runtime;
 
     #[test]
     fn lifecycle_capabilities_require_feature_and_operation_method() {

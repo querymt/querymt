@@ -44,7 +44,7 @@ impl std::fmt::Debug for BearerToken {
 impl BearerToken {
     /// Validate a nonempty RFC 6750 token without including its value in errors.
     pub fn new(token: &str) -> Result<Self> {
-        if !valid_token(token) {
+        if token.len() > 4096 || !valid_token(token) {
             bail!("bearer token must be 1..4096 ASCII token characters without whitespace");
         }
         Ok(Self(Sha256::digest(token.as_bytes()).into()))
@@ -73,7 +73,6 @@ pub(crate) fn bearer_credential(headers: &HeaderMap) -> Option<&str> {
 fn valid_token(value: &str) -> bool {
     let token = value.trim_end_matches('=');
     !token.is_empty()
-        && value.len() <= 4096
         && token
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-._~+/".contains(&b))

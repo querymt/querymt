@@ -2,12 +2,19 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use qmacp::protocol::schema::v1 as acp;
 use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use qmacp::{client::AcpClient, error::CliError, session};
+use qmacp::{
+    client::AcpClient,
+    error::CliError,
+    session::{
+        self, Delivery, apply_config, cancel, choose_delivery, close, delivery_name,
+        discard_queued, extension_payload, open_session, request_failure, runtime,
+        stop_reason_name,
+    },
+};
 
 use crate::output::{self, BatchState, OperationState};
 
@@ -18,16 +25,6 @@ const MAX_BATCH_CALLS: usize = 100;
 // Match Rust's Unicode whitespace set, rather than a regex engine's differing \\s.
 const NON_BLANK_TEXT_PATTERN: &str =
     r"[^\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]";
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Delivery {
-    #[default]
-    Auto,
-    Prompt,
-    Steer,
-    Queue,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -252,6 +249,7 @@ pub fn decode(name: &str, mut arguments: Map<String, Value>) -> Result<Command> 
             text,
             timeout,
             cwd,
+            delivery,
             ..
         } => {
             if *new == session_id.is_some() {
@@ -260,11 +258,12 @@ pub fn decode(name: &str, mut arguments: Map<String, Value>) -> Result<Command> 
             if text.trim().is_empty() {
                 bail!("text must not be empty");
             }
-            validate_session_cwd(*new, cwd.as_deref()).map_err(anyhow::Error::msg)?;
+            session::validate_prompt(*new, cwd.as_deref(), true, *delivery)
+                .map_err(anyhow::Error::msg)?;
             validate_timeout(*timeout)?;
         }
         Command::New { cwd, .. } => {
-            validate_session_cwd(true, cwd.as_deref()).map_err(anyhow::Error::msg)?;
+            session::validate_cwd(cwd.as_deref(), true).map_err(anyhow::Error::msg)?;
         }
         Command::Queue { text, .. } | Command::Steer { text, .. } if text.trim().is_empty() => {
             bail!("text must not be empty")
@@ -274,11 +273,9 @@ pub fn decode(name: &str, mut arguments: Map<String, Value>) -> Result<Command> 
         | Command::Inspect { cwd, .. }
         | Command::Status { cwd, .. }
         | Command::Follow { cwd, .. }
-            if cwd
-                .as_deref()
-                .is_some_and(|path| !session::is_absolute_server_cwd(path)) =>
+            if session::validate_cwd(cwd.as_deref(), false).is_err() =>
         {
-            bail!("cwd must be an absolute path on the QueryMT host");
+            session::validate_cwd(cwd.as_deref(), false).map_err(anyhow::Error::msg)?;
         }
         Command::Follow {
             interval, timeout, ..
@@ -408,7 +405,7 @@ fn constrain_input_schema(name: &str, input: &mut Map<String, Value>) {
     }
     if name == "prompt" {
         input.insert("oneOf".into(), json!([
-            {"required": ["new", "cwd"], "properties": {"new": {"const": true}, "session_id": {"type": "null"}, "cwd": {"type": "string", "minLength": 1}}},
+            {"required": ["new", "cwd"], "properties": {"new": {"const": true}, "session_id": {"type": "null"}, "cwd": {"type": "string", "minLength": 1}, "delivery": {"enum": ["auto", "prompt"]}}},
             {"required": ["session_id"], "properties": {"new": {"const": false}, "session_id": {"type": "string"}, "cwd": {"type": "null"}}},
         ]));
     } else if name == "new" {
@@ -461,7 +458,8 @@ pub async fn run(
         None => operation.await,
     };
     let mut result = output::normalize(outcome.unwrap_or_else(output::failure));
-    let truncated = client.text_truncated().await
+    let _ = client.finish_assistant_text().await;
+    let truncated = result["textTruncated"] == true
         || (is_batch
             && state
                 .batch
@@ -710,17 +708,14 @@ async fn new_session(
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
     let cwd = new_session_cwd(cwd)?;
-    let (created, created_raw) = client
+    let (created, _) = client
         .new_session(cwd.clone(), profile.as_deref())
         .await
         .map_err(CliError::from_request)?;
     let session_id = created.session_id.to_string();
     state.session(&session_id, Some(&cwd), true);
     apply_config(client, &session_id, mode, model, effort).await?;
-    let status = match open_session(client, session_id.clone(), cwd.clone()).await {
-        Ok(opened) => opened.status,
-        Err(_) => session::config_status(&session_id, created.modes.as_ref(), &created_raw),
-    };
+    let status = session::created_session_status(client, &session_id, cwd.clone()).await;
     Ok(json!({
         "sessionId": session_id,
         "cwd": cwd,
@@ -1154,7 +1149,8 @@ async fn prompt(
         delivery,
         until_idle,
     } = args;
-    validate_session_cwd(new, cwd.as_deref()).map_err(|err| CliError::Usage(err.into()))?;
+    session::validate_prompt(new, cwd.as_deref(), true, delivery)
+        .map_err(|err| CliError::Usage(err.into()))?;
     let initialized = client.initialize().await.map_err(CliError::from_request)?;
     let session_id = if new {
         let (created, _) = client
@@ -1198,7 +1194,11 @@ async fn prompt(
             let response = client
                 .prompt(session_id.clone(), text, Some(Duration::from_secs(86_400)))
                 .await
-                .map_err(CliError::from_request)?;
+                .map_err(|error| {
+                    let error = request_failure(error, json!({"stage": "submit"}));
+                    state.submission_failed(&error);
+                    error
+                })?;
             stop_reason_name(&response.stop_reason)
         }
         Delivery::Steer | Delivery::Queue => {
@@ -1221,98 +1221,27 @@ async fn prompt(
         .recovery
         .insert("deliveryState".into(), json!("accepted"));
     state.recovery.insert("stage".into(), json!("observe"));
-    if until_idle {
-        wait_until_idle(client, &session_id, Duration::from_secs(u32::MAX.into())).await?;
-    }
-    let text = client.take_assistant_text().await;
+    let observed = session::observe_prompt_completion(
+        client,
+        &session_id,
+        until_idle,
+        &stop_reason,
+        Duration::from_secs(u32::MAX.into()),
+    )
+    .await?;
+    let (text, truncated) = client.finish_assistant_text().await;
     Ok(json!({
         "type": "done",
         "sessionId": session_id,
         "delivery": delivery_name(chosen),
         "stopReason": stop_reason,
         "text": text,
+        "textTruncated": truncated,
         "submitted": submitted,
         "deliveryState": "accepted",
-        "observationState": if until_idle { "idle" } else if chosen == Delivery::Prompt { "prompt_returned" } else { "not_waited" },
+        "observationState": if observed.is_some() { "idle" } else if chosen == Delivery::Prompt { "prompt_returned" } else { "not_waited" },
         "loadSession": initialized.agent_capabilities.load_session,
     }))
-}
-
-fn delivery_name(delivery: Delivery) -> &'static str {
-    match delivery {
-        Delivery::Auto => "auto",
-        Delivery::Prompt => "prompt",
-        Delivery::Steer => "steer",
-        Delivery::Queue => "queue",
-    }
-}
-
-async fn choose_delivery(
-    client: &AcpClient,
-    session_id: &str,
-    requested: Delivery,
-) -> Result<(Delivery, Option<String>), CliError> {
-    if requested != Delivery::Auto {
-        return Ok((requested, None));
-    }
-    let state = runtime(client, session_id.to_string()).await?;
-    let phase = require_observed_phase(&state)?;
-    let steerable = state
-        .pointer("/runtime/steerable")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| {
-            CliError::rpc("runtime response has no valid steerable flag; input was not submitted")
-        })?;
-    let delivery = delivery_from_runtime(phase, steerable);
-    let run_id = if delivery == Delivery::Steer {
-        Some(session::observed_run_id(&state["runtime"]).ok_or_else(|| {
-            CliError::rpc("runtime response has no active run ID; input was not submitted")
-        })?)
-    } else {
-        None
-    };
-    Ok((delivery, run_id))
-}
-
-fn delivery_from_runtime(phase: &str, steerable: bool) -> Delivery {
-    if phase == "idle" {
-        Delivery::Prompt
-    } else if steerable {
-        Delivery::Steer
-    } else {
-        Delivery::Queue
-    }
-}
-
-async fn wait_until_idle(
-    client: &AcpClient,
-    session_id: &str,
-    timeout: Duration,
-) -> Result<(), CliError> {
-    wait_until_idle_every(client, session_id, timeout, Duration::from_millis(400)).await
-}
-
-async fn wait_until_idle_every(
-    client: &AcpClient,
-    session_id: &str,
-    timeout: Duration,
-    interval: Duration,
-) -> Result<(), CliError> {
-    let deadline = tokio::time::Instant::now() + timeout.max(Duration::from_secs(1));
-    loop {
-        let value = runtime_observation(client, session_id.to_string(), true).await?;
-        let phase = require_observed_phase(&value)?;
-        if phase == "idle" {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(CliError::Timeout(format!(
-                "timed out after {}s while session {session_id} was {phase}",
-                timeout.as_secs()
-            )));
-        }
-        tokio::time::sleep(interval.max(Duration::from_millis(200))).await;
-    }
 }
 
 async fn follow(
@@ -1322,59 +1251,21 @@ async fn follow(
     interval: u64,
     timeout: u64,
 ) -> Result<Value, CliError> {
-    client.initialize().await.map_err(CliError::from_request)?;
     let cwd = session::existing_session_cwd(cwd).map_err(CliError::rpc)?;
-    open_session(client, session_id.clone(), cwd.clone()).await?;
-    client.capture_assistant_text(Some(&session_id)).await;
-    wait_until_idle_every(
+    let followed = session::follow(
         client,
         &session_id,
+        cwd,
         Duration::from_secs(timeout),
         Duration::from_secs(interval),
     )
     .await?;
-    let mut text = client.take_assistant_text().await;
-    if text.is_empty()
-        && let Ok(snapshot) = inspect(client, session_id.clone(), None, false, Some(1), false).await
-    {
-        text = session::last_assistant_text(&snapshot).unwrap_or_default();
-    }
     Ok(json!({
         "type": "done",
         "sessionId": session_id,
         "stopReason": "idle",
-        "text": text,
-    }))
-}
-
-fn require_observed_phase(state: &Value) -> Result<&str, CliError> {
-    session::observed_phase(&state["runtime"]).ok_or_else(|| {
-        CliError::rpc(
-            "session runtime observation is unavailable or invalid; execution state is unknown",
-        )
-    })
-}
-
-async fn runtime(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
-    runtime_observation(client, session_id, false).await
-}
-
-async fn runtime_observation(
-    client: &AcpClient,
-    session_id: String,
-    wait_for_updates: bool,
-) -> Result<Value, CliError> {
-    client.initialize().await.map_err(CliError::from_request)?;
-    let response = client
-        .extension(
-            "querymt/session/runtimeState",
-            json!({ "session_id": session_id, "wait_for_updates": wait_for_updates }),
-        )
-        .await
-        .map_err(CliError::from_request)?;
-    Ok(json!({
-        "sessionId": session_id,
-        "runtime": extension_payload(&response),
+        "text": followed.text,
+        "textTruncated": followed.truncated,
     }))
 }
 
@@ -1389,8 +1280,8 @@ async fn watch(
     loop {
         let value = runtime(client, session_id.clone()).await?;
         let phase = value
-            .pointer("/runtime/phase")
-            .and_then(Value::as_str)
+            .get("runtime")
+            .and_then(session::observed_phase)
             .unwrap_or("unknown");
         client.emit(json!({ "type": "runtime", "sessionId": session_id, "phase": phase, "runtime": value.get("runtime") })).await;
         if !wait_idle || phase == "idle" {
@@ -1418,69 +1309,31 @@ async fn submit_input(
     state
         .recovery
         .insert("deliveryState".into(), json!("not_submitted"));
-    client.initialize().await.map_err(CliError::from_request)?;
     let delivery = if method.ends_with("/steer") {
         "steer"
     } else {
         "queue"
     };
-    let run_id = if delivery == "steer" {
-        let run_id = match run_id {
-            Some(id) => Some(id),
-            None => runtime(client, session_id.clone())
-                .await?
-                .pointer("/runtime/active_run_id")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        };
-        Some(run_id.filter(|id| !id.trim().is_empty()).ok_or_else(|| {
-            CliError::rpc(
-                "steer requires an active run or a nonempty run_id; input was not submitted",
-            )
-        })?)
-    } else {
-        run_id
-    };
-    let client_input_id = uuid::Uuid::new_v4().to_string();
-    state.submission_started(&session_id, &client_input_id, delivery);
-    let mut params = json!({
-        "session_id": session_id,
-        "client_input_id": client_input_id,
-        "prompt": [{ "type": "text", "text": text }],
-    });
-    if let Some(run_id) = run_id {
-        params["expected_run_id"] = json!(run_id);
-    }
-    let response = client
-        .extension(method, params)
+    let receipt =
+        match session::submit_text(client, method, session_id.clone(), run_id, text, |id| {
+            state.submission_started(&session_id, id, delivery);
+        })
         .await
-        .map_err(CliError::from_request)?;
-    let acknowledgement = extension_payload(&response);
-    if acknowledgement.get("input_id").and_then(Value::as_str) != Some(client_input_id.as_str())
-        || !matches!(
-            response.get("status").and_then(Value::as_str),
-            Some("queued" | "started" | "steered")
-        )
-        || response.get("ok") == Some(&Value::Bool(false))
-        || acknowledgement.get("ok") == Some(&Value::Bool(false))
-    {
-        return Err(CliError::rpc(
-            "invalid submission receipt; acceptance is unknown; inspect before retrying",
-        ));
-    }
-    state.submission_acknowledged(&acknowledgement);
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                state.submission_failed(&error);
+                return Err(error);
+            }
+        };
+    state.submission_acknowledged(&receipt["result"]);
     client
         .emit(json!({
-            "type": "submitted", "sessionId": session_id, "clientInputId": client_input_id,
-            "delivery": delivery, "deliveryState": "accepted", "result": acknowledgement,
+            "type": "submitted", "sessionId": session_id, "clientInputId": receipt["clientInputId"],
+            "delivery": delivery, "deliveryState": "accepted", "result": receipt["result"],
         }))
         .await;
-    Ok(json!({
-        "sessionId": session_id,
-        "clientInputId": client_input_id,
-        "deliveryState": "accepted",
-        "result": acknowledgement,
-    }))
+    Ok(receipt)
 }
 
 async fn exec(
@@ -1519,149 +1372,17 @@ async fn exec(
     Ok(json!({ "results": batch.results }))
 }
 
-async fn discard_queued(
-    client: &AcpClient,
-    session_id: String,
-    input_id: String,
-) -> Result<Value, CliError> {
-    client.initialize().await.map_err(CliError::from_request)?;
-    let response = client
-        .extension(
-            "querymt/session/discardQueuedInput",
-            json!({
-                "session_id": session_id,
-                "input_id": input_id,
-            }),
-        )
-        .await
-        .map_err(CliError::from_request)?;
-    Ok(json!({
-        "sessionId": session_id,
-        "inputId": input_id,
-        "result": extension_payload(&response),
-    }))
-}
-
-async fn cancel(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
-    client.initialize().await.map_err(CliError::from_request)?;
-    client
-        .cancel(session_id.clone())
-        .await
-        .map_err(CliError::from_notification)?;
-    Ok(json!({
-        "sessionId": session_id,
-        "cancellationRequested": true,
-    }))
-}
-
-async fn close(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
-    client.initialize().await.map_err(CliError::from_request)?;
-    client
-        .close_session(session_id.clone())
-        .await
-        .map_err(CliError::from_request)?;
-    Ok(json!({
-        "sessionId": session_id,
-        "closed": true,
-    }))
-}
-
-async fn apply_config(
-    client: &AcpClient,
-    session_id: &str,
-    mode: Option<String>,
-    model: Option<String>,
-    effort: Option<String>,
-) -> Result<(), CliError> {
-    if let Some(mode) = mode {
-        client
-            .set_mode(session_id.to_string(), mode)
-            .await
-            .map_err(CliError::from_request)?;
-    }
-    if let Some(model) = model {
-        client
-            .set_config(session_id.to_string(), "model", &model)
-            .await
-            .map_err(CliError::from_request)?;
-    }
-    if let Some(effort) = effort {
-        client
-            .set_config(session_id.to_string(), "reasoning_effort", &effort)
-            .await
-            .map_err(CliError::from_request)?;
-    }
-    Ok(())
-}
-
-struct OpenedSession {
-    status: Value,
-}
-
 /// A new session needs an explicit absolute cwd on the QueryMT host; qmcp's
 /// own working directory means nothing there.
 fn new_session_cwd(cwd: Option<PathBuf>) -> Result<PathBuf, CliError> {
-    validate_session_cwd(true, cwd.as_deref()).map_err(|err| CliError::Usage(err.into()))?;
+    session::validate_cwd(cwd.as_deref(), true).map_err(|err| CliError::Usage(err.into()))?;
     Ok(cwd.expect("validated new session cwd is present"))
-}
-
-fn validate_session_cwd(new: bool, cwd: Option<&std::path::Path>) -> Result<(), &'static str> {
-    if new && !cwd.is_some_and(session::is_absolute_server_cwd) {
-        return Err("a new session requires an absolute cwd on the QueryMT host");
-    }
-    if !new && cwd.is_some() {
-        return Err("cwd applies only with new=true; an existing session keeps its own cwd");
-    }
-    Ok(())
-}
-
-async fn open_session(
-    client: &AcpClient,
-    session_id: String,
-    cwd: PathBuf,
-) -> Result<OpenedSession, CliError> {
-    let resumed_status = match client.resume_session(session_id.clone(), cwd.clone()).await {
-        Ok((response, raw)) => {
-            let status = session::config_status(&session_id, response.modes.as_ref(), &raw);
-            if status.get("model").is_some_and(|value| !value.is_null()) {
-                return Ok(OpenedSession { status });
-            }
-            Some(status)
-        }
-        Err(_) => None,
-    };
-    match client.load_session(session_id.clone(), cwd).await {
-        Ok((loaded, raw)) => Ok(OpenedSession {
-            status: session::config_status(&session_id, loaded.modes.as_ref(), &raw),
-        }),
-        Err(err) => match resumed_status {
-            Some(status) => Ok(OpenedSession { status }),
-            None => Err(CliError::from_request(err)),
-        },
-    }
-}
-
-fn extension_payload(response: &Value) -> Value {
-    response
-        .get("data")
-        .cloned()
-        .unwrap_or_else(|| response.clone())
-}
-
-fn stop_reason_name(reason: &acp::StopReason) -> String {
-    match reason {
-        acp::StopReason::EndTurn => "endTurn".to_string(),
-        acp::StopReason::MaxTokens => "maxTokens".to_string(),
-        acp::StopReason::MaxTurnRequests => "maxTurnRequests".to_string(),
-        acp::StopReason::Refusal => "refusal".to_string(),
-        acp::StopReason::Cancelled => "cancelled".to_string(),
-        other => format!("{other:?}"),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qmacp::session::delivery_from_runtime;
 
     fn args(value: Value) -> Map<String, Value> {
         value.as_object().unwrap().clone()

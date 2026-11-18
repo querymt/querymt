@@ -208,6 +208,12 @@ pub struct GetRuntimeStatus;
 #[derive(Serialize, Deserialize)]
 pub struct SessionDeliveryBarrier;
 
+#[derive(Serialize, Deserialize)]
+pub struct SessionDeliveryObservation {
+    pub runtime: SessionRuntimeStatus,
+    pub tip: i64,
+}
+
 /// Get current LLM config for this session.
 #[derive(Serialize, Deserialize)]
 pub struct GetLlmConfig;

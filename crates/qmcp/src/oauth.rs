@@ -489,7 +489,8 @@ mod tests {
             0,
             "missing credentials must not reach the provider"
         );
-        let response = call(Some("active-token")).await.unwrap();
+        let long_token = "x".repeat(5 * 1024);
+        let response = call(Some(&long_token)).await.unwrap();
         assert_eq!(response.status(), 200);
         assert_eq!(
             response.json::<Value>().await.unwrap()["result"]["tools"]

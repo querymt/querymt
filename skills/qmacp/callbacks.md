@@ -69,7 +69,8 @@ Requires qmacp on the watcher host and a reachable `qmtcode --acp-ws`; see
 session's permissions.
 
 Set `QMACP_URL`, `SESSION_ID`, and `CALLBACK_ID` from the
-registered task. `RESOURCE` identifies the watched resource. Put this Bash
+registered task. `RESOURCE` identifies the watched resource. Set `CALLBACK_PAYLOAD`
+to an absolute artifact path in the watcher's private job directory. Put this Bash
 helper and a watcher body adapted to your task in the same script; run that
 script in the background runner, not in the agent's foreground tool call.
 
@@ -97,9 +98,10 @@ notify_callback() {
     "resource: \($resource | tojson)\n---\n\n" +
     "## Callback\n\n\($result)"
   ') || return
+  (umask 077; printf '%s\n' "$payload" > "$CALLBACK_PAYLOAD") || return
   qmacp --url "$QMACP_URL" --quiet prompt \
     --delivery auto --until-idle false --timeout 900 \
-    "$SESSION_ID" - <<< "$payload"
+    "$SESSION_ID" - < "$CALLBACK_PAYLOAD"
 }
 ```
 
@@ -115,7 +117,8 @@ notify_callback() {
   delivery process supervised.
 - Keep stdout NDJSON and stderr in the watcher logs; check exit status and the
   final `done` event. Submission/`done` alone does not prove the agent handled
-  this callback. Have the agent record the event ID and outcome in the task
+  this callback. Keep the payload artifact until handling is confirmed, even if
+  sending fails. Have the agent record the event ID and outcome in the task
   notes. Keep the transport `clientInputId` separately from `CALLBACK_ID`;
   see [CLI output](cli.md#output) for receipt and recovery fields.
 - A timeout or disconnect can happen after acceptance. Inspect `runtime` and
@@ -165,12 +168,13 @@ Use an approved command array and the project's required environment (for
 example, `JOB_COMMAND=(cargo test --locked)` or
 `JOB_COMMAND=(nix develop -c cargo test --locked)`). Set `JOB_LOG` to an
 absolute log path accessible to the target agent, or provide an accessible
-artifact reference for remote jobs. Bound the job with the background runner's
-timeout.
+artifact reference for remote jobs. With GNU `timeout`, set `JOB_TIMEOUT`
+(for example, `10m`) for the child command. Give the outer watcher additional
+time to report the result, including exit status 124 on timeout.
 
 ```bash
 RESOURCE="job:$CALLBACK_ID"
-if "${JOB_COMMAND[@]}" >"$JOB_LOG" 2>&1; then
+if timeout --kill-after=10s "$JOB_TIMEOUT" "${JOB_COMMAND[@]}" >"$JOB_LOG" 2>&1; then
   result="Command exited with status 0. Log: $JOB_LOG"
 else
   result="Command exited with status $?. Log: $JOB_LOG"

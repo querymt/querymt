@@ -1109,7 +1109,9 @@ impl SessionActorRef {
         }
     }
 
-    pub(crate) async fn session_delivery_barrier(&self) -> Result<i64, AgentError> {
+    pub(crate) async fn session_delivery_barrier(
+        &self,
+    ) -> Result<messages::SessionDeliveryObservation, AgentError> {
         match self {
             Self::Local(actor_ref) => actor_ref
                 .ask(messages::SessionDeliveryBarrier)

@@ -94,10 +94,6 @@ enum EventSink {
 }
 
 impl EventSink {
-    fn enabled(&self) -> bool {
-        !matches!(self, Self::Cli(false))
-    }
-
     async fn emit(&self, event: Value) {
         match self {
             Self::Cli(true) => {
@@ -141,7 +137,7 @@ impl AcpClient {
     }
 
     /// Connect without writing events to stdout. The caller must drain the bounded receiver.
-    /// Assistant text is capped at 1 MiB; inspect text_truncated() after an operation.
+    /// Assistant text is capped at 1 MiB; finish capture to get the text and truncation flag.
     pub async fn connect_with_events(
         url: &str,
         endpoint: &str,
@@ -269,13 +265,14 @@ impl AcpClient {
         buffer.truncated = false;
     }
 
-    pub async fn text_truncated(&self) -> bool {
-        self.assistant_text.lock().await.truncated
-    }
-
-    pub async fn take_assistant_text(&self) -> String {
-        let mut text = self.assistant_text.lock().await;
-        std::mem::take(&mut text.text)
+    /// End capture and take the text and its truncation flag atomically.
+    pub async fn finish_assistant_text(&self) -> (String, bool) {
+        let mut buffer = self.assistant_text.lock().await;
+        buffer.session_id = None;
+        (
+            std::mem::take(&mut buffer.text),
+            std::mem::take(&mut buffer.truncated),
+        )
     }
 
     pub async fn initialize(&self) -> Result<acp::InitializeResponse> {
@@ -573,11 +570,13 @@ async fn handle_inbound(
         .unwrap_or_default()
         .to_string();
     let params = value.get("params").cloned().unwrap_or(Value::Null);
-    if event_sink.enabled() && method == "session/update" {
+    if method == "session/update" {
         let session_id = params.get("sessionId").cloned().unwrap_or(Value::Null);
         let update = params.get("update").cloned().unwrap_or(Value::Null);
         if let Some(event) = events::compact_session_update(&session_id, &update) {
-            assistant_text.lock().await.observe(&event);
+            if params["_meta"]["querymtReplay"] != true {
+                assistant_text.lock().await.observe(&event);
+            }
             event_sink.emit(event).await;
         }
     } else if matches!(

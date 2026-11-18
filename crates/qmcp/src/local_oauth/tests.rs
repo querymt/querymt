@@ -46,7 +46,39 @@ async fn start(auth: LocalOAuth) -> App {
     }
 }
 
+// Extract the fields the browser actually receives. This fixture only handles
+// the consent template's hidden-input markup, not arbitrary HTML.
+fn rendered_fields(html: &str) -> Vec<(&str, String)> {
+    html.split("<input type=\"hidden\" name=\"")
+        .skip(1)
+        .map(|input| {
+            let (name, value) = input.split_once("\" value=\"").unwrap();
+            let (value, _) = value.split_once('\"').unwrap();
+            let value = value
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&");
+            (name, value)
+        })
+        .collect()
+}
+
 impl App {
+    async fn assert_tools_list(&self, token: &str) {
+        let response = self.mcp(Some(token)).await;
+        assert_eq!(response.status(), 200);
+        let payload: Value = response.json().await.unwrap();
+        assert_eq!(payload["id"], 1, "{payload}");
+        assert!(
+            payload["result"]["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty()),
+            "{payload}"
+        );
+    }
+
     async fn register(&self) -> String {
         let response = self
             .client
@@ -193,11 +225,11 @@ async fn registration_consent_token_refresh_and_mcp_access() {
     assert!(html.contains("ChatGPT"));
     assert!(!html.contains("name=\"redirect_uri\""));
 
-    let mut wrong = form.clone();
+    let mut wrong = rendered_fields(&html);
     wrong.extend([("decision", "approve".into()), ("password", "nope".into())]);
     assert_eq!(app.submit(&wrong).await.0, StatusCode::UNAUTHORIZED);
 
-    let mut approve = form.clone();
+    let mut approve = rendered_fields(&html);
     approve.extend([
         ("decision", "approve".into()),
         ("password", "approval-password".into()),
@@ -220,7 +252,7 @@ async fn registration_consent_token_refresh_and_mcp_access() {
     assert_eq!(app.token(&exchange).await.1["error"], "invalid_grant");
 
     let access = tokens["access_token"].as_str().unwrap();
-    assert_eq!(app.mcp(Some(access)).await.status(), 200);
+    app.assert_tools_list(access).await;
 
     let refresh = tokens["refresh_token"].as_str().unwrap();
     let (status, refreshed) = app
@@ -232,7 +264,7 @@ async fn registration_consent_token_refresh_and_mcp_access() {
         .await;
     assert_eq!(status, 200, "{refreshed}");
     let access = refreshed["access_token"].as_str().unwrap();
-    assert_eq!(app.mcp(Some(access)).await.status(), 200);
+    app.assert_tools_list(access).await;
     // A refresh token is not an access token.
     assert_eq!(app.mcp(Some(refresh)).await.status(), 401);
 }

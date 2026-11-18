@@ -1502,7 +1502,7 @@ impl Message<GetRuntimeStatus> for SessionActor {
 }
 
 impl Message<SessionDeliveryBarrier> for SessionActor {
-    type Reply = Result<i64, kameo::error::Infallible>;
+    type Reply = Result<SessionDeliveryObservation, kameo::error::Infallible>;
 
     async fn handle(
         &mut self,
@@ -1510,12 +1510,15 @@ impl Message<SessionDeliveryBarrier> for SessionActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let runtime = self.runtime_status(self.published_pending_steering);
-        Ok(self
+        let tip = self
             .config
             .event_sink
             .session_stream(&self.session_id)
-            .emit_ephemeral_seq(AgentEventKind::RuntimeChanged { runtime })
-            .await)
+            .emit_ephemeral_seq(AgentEventKind::RuntimeChanged {
+                runtime: runtime.clone(),
+            })
+            .await;
+        Ok(SessionDeliveryObservation { runtime, tip })
     }
 }
 
