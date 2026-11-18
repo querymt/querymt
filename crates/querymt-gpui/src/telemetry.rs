@@ -39,6 +39,35 @@ mod web {
 #[cfg(target_family = "wasm")]
 pub use web::*;
 
+/// Session open in flight: id and start time (ms since epoch).
+static SESSION_OPEN: std::sync::Mutex<Option<(String, f64)>> = std::sync::Mutex::new(None);
+
+/// A session open started (click → `session/load`).
+pub fn mark_session_open(session_id: &str) {
+    if let Ok(mut open) = SESSION_OPEN.lock() {
+        *open = Some((session_id.to_string(), crate::util::now_ms()));
+    }
+}
+
+/// The transcript of `session_id` rendered with `items` rows after loading:
+/// logs time from the open once per open.
+pub fn session_rendered(session_id: &str, items: usize) {
+    let Ok(mut open) = SESSION_OPEN.lock() else {
+        return;
+    };
+    if let Some((id, started)) = open.as_ref()
+        && id == session_id
+    {
+        let elapsed = crate::util::now_ms() - started;
+        tracing::info!(
+            session.open_to_render_ms = elapsed,
+            session.items = items,
+            "session first render"
+        );
+        *open = None;
+    }
+}
+
 #[cfg(not(target_family = "wasm"))]
 mod native {
     use std::sync::Mutex;

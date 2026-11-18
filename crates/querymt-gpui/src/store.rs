@@ -9,6 +9,7 @@ use std::{collections::HashMap, rc::Rc, time::Duration};
 use gpui_kit::{AsyncApp, Context, Image, ImageFormat, Task, WeakEntity};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tracing::Instrument as _;
 
 use crate::rpc::{Incoming, RpcClient};
 use crate::session::{ParentSession, SessionView, UndoFrame, UserAttachment};
@@ -1065,6 +1066,8 @@ pub struct AgentRuntime {
     pub models: Vec<Model>,
     pub sessions: Vec<SessionSummary>,
     pub sessions_loaded: bool,
+    /// Older catalog pages are still loading after the first one was shown.
+    pub catalog_loading: bool,
     /// Why the last `session/list` failed; cleared by the next success.
     pub sessions_error: Option<String>,
     /// Session ids with a pin / lifecycle / delete request in flight.
@@ -2317,8 +2320,17 @@ impl AgentsStore {
         cx.notify();
 
         let id = id.to_string();
-        let task = cx.spawn(async move |this, cx| {
-            let conn = match transport::connect(config.target()).await {
+        // Connect → initialize → details (capabilities, models, catalog, mesh).
+        let connect_span = tracing::info_span!(
+            "agent.connect",
+            agent.id = %id,
+            agent.endpoint = %config.endpoint_label(),
+        );
+        let task = cx.spawn(async move |this, cx| { async move {
+            let conn = match transport::connect(config.target())
+                .instrument(tracing::info_span!("transport.connect"))
+                .await
+            {
                 Ok(conn) => conn,
                 Err(err) => {
                     let _ = this.update(cx, |s, cx| s.fail(&id, generation, err, cx));
@@ -2423,7 +2435,7 @@ impl AgentsStore {
                 cx.notify();
             });
             load_details(this, id, generation, rpc, cx).await;
-        });
+        }.instrument(connect_span).await });
         if let Some(rt) = self.runtime.get_mut(&config_id) {
             rt.tasks.push(task);
         }
@@ -2685,10 +2697,22 @@ impl AgentsStore {
         };
         let request_params = params.clone();
         let (agent_id, session_id) = (agent_id.to_string(), session_id.to_string());
+        let load_span = tracing::info_span!(
+            "session.open",
+            session.windowed = windowed,
+            session.items = tracing::field::Empty,
+            session.apply_ms = tracing::field::Empty,
+            session.error = tracing::field::Empty,
+        );
+        crate::telemetry::mark_session_open(&session_id);
         cx.spawn(async move |this, cx| {
             let started = now_ms();
-            let result = rpc.request_detailed("session/load", params).await;
+            let result = rpc
+                .request_detailed("session/load", params)
+                .instrument(load_span.clone())
+                .await;
             let elapsed_ms = now_ms() - started;
+            let apply_started = now_ms();
             let _ = this.update(cx, |s, cx| {
                 let Some(view) = s
                     .session
@@ -2733,9 +2757,16 @@ impl AgentsStore {
                         ));
                     }
                 }
+                if let Some(view) = s.session.as_ref() {
+                    load_span.record("session.items", view.items.len());
+                    if let Some(err) = &view.error {
+                        load_span.record("session.error", err.as_str());
+                    }
+                }
                 s.refresh_undo_stack(cx);
                 cx.notify();
             });
+            load_span.record("session.apply_ms", now_ms() - apply_started);
         })
         .detach();
     }
@@ -4043,7 +4074,9 @@ impl AgentsStore {
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             // The first page holds everything that changed recently; merge it in.
-            let sessions = fetch_sessions(&rpc, &id, 1).await;
+            let sessions = fetch_session_page(&rpc, &id, Some(&root_scope()), None)
+                .await
+                .map(|(page, _)| page);
             let _ = this.update(cx, |s, cx| {
                 let Some(rt) = s.live(&id, generation) else {
                     return;
@@ -4051,12 +4084,7 @@ impl AgentsStore {
                 rt.refresh_scheduled = false;
                 match sessions {
                     Ok(fresh) => {
-                        let ids: std::collections::HashSet<String> =
-                            fresh.iter().map(|s| s.id.clone()).collect();
-                        let mut merged = fresh;
-                        merged.extend(rt.sessions.drain(..).filter(|s| !ids.contains(&s.id)));
-                        merged.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-                        rt.sessions = merged;
+                        merge_sessions(rt, fresh);
                         rt.sessions_loaded = true;
                         rt.sessions_error = None;
                     }
@@ -4076,12 +4104,21 @@ const CATALOG_PAGES: usize = 200;
 /// Children pages of one parent (10 per page).
 const CHILD_PAGES: usize = 50;
 
-async fn fetch_sessions(
-    rpc: &RpcClient,
-    agent_id: &str,
-    max_pages: usize,
-) -> Result<Vec<SessionSummary>, String> {
-    fetch_session_pages(rpc, agent_id, None, max_pages).await
+/// `session/list` scope of the catalog: root sessions only, as the desktop
+/// app lists (`DEFAULT_SESSION_LIST_SCOPE`). Forks load per parent, and
+/// delegates are never listed; unscoped, they were ~3/4 of every page.
+fn root_scope() -> Value {
+    json!({ "session_scope": "root" })
+}
+
+/// Merge listed sessions into `rt`, newest first; listed entries replace
+/// the known ones of the same id.
+fn merge_sessions(rt: &mut AgentRuntime, listed: Vec<SessionSummary>) {
+    let ids: std::collections::HashSet<String> = listed.iter().map(|s| s.id.clone()).collect();
+    let mut merged = listed;
+    merged.extend(rt.sessions.drain(..).filter(|s| !ids.contains(&s.id)));
+    merged.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    rt.sessions = merged;
 }
 
 /// Follow `session/list` cursors up to `max_pages`, with optional `_meta`.
@@ -4094,27 +4131,9 @@ async fn fetch_session_pages(
     let mut sessions = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..max_pages {
-        let mut params = match &cursor {
-            Some(c) => json!({ "cursor": c }),
-            None => json!({}),
-        };
-        if let Some(meta) = &meta {
-            params["_meta"] = meta.clone();
-        }
-        let page = rpc.request("session/list", params).await?;
-        sessions.extend(
-            page.get("sessions")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .map(|s| SessionSummary::from_list_entry(agent_id, s))
-                .filter(|s| !s.id.is_empty()),
-        );
-        let next = page
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .filter(|c| !c.is_empty())
-            .map(str::to_owned);
+        let (page, next) =
+            fetch_session_page(rpc, agent_id, meta.as_ref(), cursor.as_deref()).await?;
+        sessions.extend(page);
         // A repeated cursor would loop forever; stop instead.
         if next.is_none() || next == cursor {
             break;
@@ -4122,6 +4141,43 @@ async fn fetch_session_pages(
         cursor = next;
     }
     Ok(sessions)
+}
+
+/// One `session/list` page and the cursor of the next, if any.
+async fn fetch_session_page(
+    rpc: &RpcClient,
+    agent_id: &str,
+    meta: Option<&Value>,
+    cursor: Option<&str>,
+) -> Result<(Vec<SessionSummary>, Option<String>), String> {
+    let mut params = match cursor {
+        Some(c) => json!({ "cursor": c }),
+        None => json!({}),
+    };
+    if let Some(meta) = meta {
+        params["_meta"] = meta.clone();
+    }
+    let page = rpc
+        .request("session/list", params)
+        .instrument(tracing::info_span!(
+            "sessions.page",
+            page.cursor = cursor.is_some()
+        ))
+        .await?;
+    let sessions = page
+        .get("sessions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|s| SessionSummary::from_list_entry(agent_id, s))
+        .filter(|s| !s.id.is_empty())
+        .collect();
+    let next = page
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned);
+    Ok((sessions, next))
 }
 
 /// After a (re)connect, re-attach the questions still pending for sessions
@@ -4253,7 +4309,10 @@ async fn load_details(
         };
     }
 
-    let caps = rpc.request("_querymt/capabilities", json!({})).await;
+    let caps = rpc
+        .request("_querymt/capabilities", json!({}))
+        .instrument(tracing::info_span!("agent.capabilities"))
+        .await;
     let has_mesh = caps
         .as_ref()
         .ok()
@@ -4266,10 +4325,15 @@ async fn load_details(
         Err(err) => rt.log(format!("Capabilities unavailable: {err}")),
     });
     if recovery {
-        recover_elicitations(&this, &id, generation, &rpc, cx).await;
+        recover_elicitations(&this, &id, generation, &rpc, cx)
+            .instrument(tracing::info_span!("agent.recover_elicitations"))
+            .await;
     }
 
-    let models = rpc.request("_querymt/models", json!({})).await;
+    let models = rpc
+        .request("_querymt/models", json!({}))
+        .instrument(tracing::info_span!("agent.models"))
+        .await;
     let parsed = match &models {
         Ok(v) => Some(parse_models(v)),
         Err(_) => None,
@@ -4282,16 +4346,32 @@ async fn load_details(
     // Capabilities (context window, modalities) come from a second call; apply
     // them once they arrive so the list is usable immediately.
     if let Some(models) = parsed.filter(|m| !m.is_empty()) {
-        let models = hydrate_model_info(&rpc, models).await;
+        let models = hydrate_model_info(&rpc, models)
+            .instrument(tracing::info_span!("agent.model_info"))
+            .await;
         apply!(|rt: &mut AgentRuntime| rt.models = models);
     }
 
     // The whole catalog, so lifecycle tab counts and search cover every session.
-    let sessions = fetch_sessions(&rpc, &id, CATALOG_PAGES).await;
-    apply!(|rt: &mut AgentRuntime| match sessions {
-        Ok(sessions) => {
+    let catalog_span = tracing::info_span!(
+        "sessions.catalog",
+        sessions.count = tracing::field::Empty,
+        sessions.apply_ms = tracing::field::Empty,
+    );
+    // The first page (most recent sessions) is shown at once: the sidebar,
+    // the Sessions page and deep links need only it. Paging the whole catalog
+    // took ~15s for ~6k sessions and blocked all of them until it finished.
+    let scope = root_scope();
+    let first = fetch_session_page(&rpc, &id, Some(&scope), None)
+        .instrument(catalog_span.clone())
+        .await;
+    let next = first.as_ref().ok().and_then(|(_, next)| next.clone());
+    let apply_started = now_ms();
+    apply!(|rt: &mut AgentRuntime| match first {
+        Ok((sessions, _)) => {
             rt.sessions = sessions;
             rt.sessions_loaded = true;
+            rt.catalog_loading = next.is_some();
             rt.sessions_error = None;
             // Expanded children reload on next expansion.
             rt.children.clear();
@@ -4299,11 +4379,65 @@ async fn load_details(
         Err(err) => {
             rt.log(format!("Sessions unavailable: {err}"));
             rt.sessions_loaded = true;
+            rt.catalog_loading = false;
             rt.sessions_error = Some(err);
         }
     });
+    catalog_span.record("sessions.apply_ms", now_ms() - apply_started);
 
-    load_extras(
+    // The rest of the catalog (tab counts, search) loads alongside the
+    // extras, each page shown as it arrives (as the desktop app does).
+    let rest = {
+        let (rpc, id, span) = (rpc.clone(), id.clone(), catalog_span.clone());
+        let (this, mut cx2) = (this.clone(), cx.clone());
+        async move {
+            let Some(cursor) = next else {
+                return Ok(());
+            };
+            let mut cursor = Some(cursor);
+            for _ in 1..CATALOG_PAGES {
+                let Some(current) = cursor.take() else { break };
+                // The agent answers a `session/load` far slower while catalog
+                // pages are in flight (6.1s instead of 0.3s): let an open
+                // session load first.
+                while this
+                    .read_with(&cx2, |s, _| s.session.as_ref().is_some_and(|v| v.loading))
+                    .unwrap_or(false)
+                {
+                    cx2.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                }
+                let (page, next) =
+                    fetch_session_page(&rpc, &id, Some(&scope), Some(&current)).await?;
+                let live = this
+                    .update(&mut cx2, |s, cx| {
+                        let Some(rt) = s.live(&id, generation) else {
+                            return false;
+                        };
+                        // Entries listed meanwhile (a refresh) are newer: keep them.
+                        let known: std::collections::HashSet<&str> =
+                            rt.sessions.iter().map(|s| s.id.as_str()).collect();
+                        let older: Vec<SessionSummary> = page
+                            .into_iter()
+                            .filter(|s| !known.contains(s.id.as_str()))
+                            .collect();
+                        merge_sessions(rt, older);
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !live {
+                    return Ok(());
+                }
+                // A repeated cursor would loop forever; stop instead.
+                cursor = next.filter(|n| *n != current);
+            }
+            Ok::<_, String>(())
+        }
+        .instrument(span)
+    };
+    let extras = load_extras(
         this.clone(),
         id.clone(),
         generation,
@@ -4311,7 +4445,20 @@ async fn load_details(
         has_mesh,
         cx,
     )
-    .await;
+    .instrument(tracing::info_span!("agent.extras"));
+    let (rest, ()) = futures::join!(rest, extras);
+    apply!(|rt: &mut AgentRuntime| {
+        rt.catalog_loading = false;
+        if let Err(err) = rest {
+            rt.log(format!("Older sessions unavailable: {err}"));
+        }
+    });
+    if let Ok(Some(count)) =
+        this.read_with(cx, |s, _| s.runtime.get(&id).map(|rt| rt.sessions.len()))
+    {
+        catalog_span.record("sessions.count", count);
+    }
+    drop(catalog_span);
     apply!(|rt: &mut AgentRuntime| {
         rt.busy = false;
         let summary = format!(
