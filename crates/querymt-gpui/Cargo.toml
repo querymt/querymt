@@ -33,14 +33,15 @@ dirs = "6"
 tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # OpenTelemetry export, same stack and versions as querymt-utils::telemetry.
-# OTLP over HTTP/protobuf with a blocking client: the app has no Tokio
-# runtime for the gRPC (tonic) exporter QueryMT uses, and the SDK's batch
-# processors already export from their own threads.
+# OTLP over gRPC (tonic), as QueryMT exports.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-opentelemetry = "0.33"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["logs", "metrics"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "logs", "metrics"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "tls-ring", "tls-webpki-roots", "trace", "logs", "metrics"] }
+tonic = { version = "0.14", default-features = false, features = ["tls-webpki-roots"] }
+# Runs the tonic gRPC channel; the UI itself does not use Tokio.
+tokio = { version = "1", features = ["rt-multi-thread"] }
 opentelemetry-appender-tracing = "0.32"
 opentelemetry-semantic-conventions = "0.32"
 

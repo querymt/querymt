@@ -3,17 +3,16 @@
 //! environment variables and the same subscriber shape (console `fmt` layer,
 //! then OTLP traces, logs and metrics).
 //!
-//! Differences, both deliberate:
+//! Differences:
 //! - **Off by default.** QueryMT exports unless `QMT_NO_TELEMETRY` is set; this
 //!   UI only exports when `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector.
 //!   `QMT_NO_TELEMETRY` still turns it off.
-//! - **OTLP over HTTP/protobuf** (port 4318) instead of gRPC (4317): gRPC needs
-//!   a Tokio runtime, which this app does not run. The SDK's batch and
-//!   periodic processors export from their own threads with a blocking client.
+//! - **A dedicated one-thread Tokio runtime** hosts the gRPC (tonic) channels,
+//!   since the UI does not run on Tokio. Export is OTLP/gRPC as in QueryMT.
 //!
 //! | Variable | Default | Meaning |
 //! |---|---|---|
-//! | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset: off)* | Collector base URL, e.g. `http://localhost:4318`. |
+//! | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset: off)* | Collector base URL, e.g. `http://localhost:4317` (OTLP/gRPC). |
 //! | `QMT_NO_TELEMETRY` | *(unset)* | Any value disables export. |
 //! | `QMT_TELEMETRY_LEVEL` | `info` | Filter for exported spans and logs; `info,querymt_gpui=debug` adds per-frame scroll samples. |
 //! | `OTEL_METRIC_EXPORT_INTERVAL` | `60000` | Metric export interval in ms (SDK standard). |
@@ -48,7 +47,6 @@ mod native {
     use opentelemetry::KeyValue;
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-    use opentelemetry_otlp::{Protocol, WithExportConfig};
     use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::logs::SdkLoggerProvider;
     use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -61,10 +59,17 @@ mod native {
 
     /// Exporter internals must not feed their own spans and logs back into the
     /// exporter; QueryMT's `iroh=warn` default serves the same purpose.
-    const EXPORTER_QUIET: &str = "hyper=off,hyper_util=off,h2=off,reqwest=off,opentelemetry=off,opentelemetry_sdk=off,opentelemetry_otlp=off,opentelemetry_http=off";
+    const EXPORTER_QUIET: &str = "hyper=off,hyper_util=off,h2=off,tonic=off,tower=off,opentelemetry=off,opentelemetry_sdk=off,opentelemetry_otlp=off,opentelemetry_http=off";
 
     static ENABLED: AtomicBool = AtomicBool::new(false);
-    type Providers = (SdkTracerProvider, SdkLoggerProvider, SdkMeterProvider);
+    struct Providers {
+        tracer: SdkTracerProvider,
+        logger: SdkLoggerProvider,
+        meter: SdkMeterProvider,
+        // Keep the tonic channel workers alive through provider shutdown.
+        _runtime: tokio::runtime::Runtime,
+    }
+
     static PROVIDERS: Mutex<Option<Providers>> = Mutex::new(None);
 
     /// Whether OTLP export is on; instrumentation that does real work per frame
@@ -115,8 +120,8 @@ mod native {
         let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![console];
 
         let endpoint = requested_endpoint();
-        let providers = endpoint.as_ref().and_then(|_| build_providers().ok());
-        if let Some((tracer, logger, meter)) = &providers {
+        let providers = endpoint.as_ref().map(|_| build_providers());
+        if let Some(Ok(Providers { tracer, logger, .. })) = &providers {
             let level = std::env::var("QMT_TELEMETRY_LEVEL").unwrap_or_else(|_| "info".into());
             let filter = || EnvFilter::new(format!("{level},{EXPORTER_QUIET}"));
             layers.push(
@@ -130,7 +135,6 @@ mod native {
                     .with_filter(filter())
                     .boxed(),
             );
-            opentelemetry::global::set_meter_provider(meter.clone());
         }
         if tracing::subscriber::set_global_default(Registry::default().with(layers)).is_err() {
             return None;
@@ -138,48 +142,69 @@ mod native {
         let (Some(endpoint), Some(providers)) = (endpoint, providers) else {
             return None;
         };
-        if let Ok(mut slot) = PROVIDERS.lock() {
-            *slot = Some(providers);
-        }
+        let providers = match providers {
+            Ok(providers) => providers,
+            Err(error) => {
+                tracing::error!(%error, "OTLP telemetry initialization failed");
+                return None;
+            }
+        };
+        let mut slot = PROVIDERS.lock().ok()?;
+        opentelemetry::global::set_meter_provider(providers.meter.clone());
+        *slot = Some(providers);
         ENABLED.store(true, Ordering::Relaxed);
         tracing::info!(endpoint = %endpoint, "OTLP telemetry initialized");
         Some(endpoint)
     }
 
-    /// Exporters read `OTEL_EXPORTER_OTLP_ENDPOINT` themselves and append the
-    /// signal path (`/v1/traces`, `/v1/logs`, `/v1/metrics`).
+    /// Exporters read `OTEL_EXPORTER_OTLP_ENDPOINT` themselves.
     fn build_providers() -> Result<Providers, String> {
+        use opentelemetry_otlp::WithTonicConfig as _;
+        // tonic spawns each channel's connection worker on the runtime that is
+        // current when the exporter is built; the SDK's export threads then
+        // only hand requests to that worker, so they need no runtime of their own.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("otlp-export")
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let guard = runtime.enter();
+        let tls = || tonic::transport::ClientTlsConfig::new().with_enabled_roots();
         let spans = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_protocol(Protocol::HttpBinary)
+            .with_tonic()
+            .with_tls_config(tls())
             .build()
             .map_err(|e| e.to_string())?;
         let logs = opentelemetry_otlp::LogExporter::builder()
-            .with_http()
-            .with_protocol(Protocol::HttpBinary)
+            .with_tonic()
+            .with_tls_config(tls())
             .build()
             .map_err(|e| e.to_string())?;
         let metrics = opentelemetry_otlp::MetricExporter::builder()
-            .with_http()
-            .with_protocol(Protocol::HttpBinary)
+            .with_tonic()
+            .with_tls_config(tls())
             .build()
             .map_err(|e| e.to_string())?;
-        Ok((
-            SdkTracerProvider::builder()
-                .with_resource(resource())
+        drop(guard);
+        let resource = resource();
+        Ok(Providers {
+            tracer: SdkTracerProvider::builder()
+                .with_resource(resource.clone())
                 .with_batch_exporter(spans)
                 .build(),
-            SdkLoggerProvider::builder()
-                .with_resource(resource())
+            logger: SdkLoggerProvider::builder()
+                .with_resource(resource.clone())
                 // Normalize before the batch processor clones the record.
                 .with_log_processor(EventTimestampProcessor)
                 .with_batch_exporter(logs)
                 .build(),
-            SdkMeterProvider::builder()
-                .with_resource(resource())
+            meter: SdkMeterProvider::builder()
+                .with_resource(resource)
                 .with_periodic_exporter(metrics)
                 .build(),
-        ))
+            _runtime: runtime,
+        })
     }
 
     /// As in QueryMT: `tracing` events carry no event timestamp, so use the
@@ -225,13 +250,13 @@ mod native {
 
     /// Flush and shut the providers down; call once on exit. Best effort.
     pub fn shutdown() {
-        let Some((tracer, logger, meter)) = PROVIDERS.lock().ok().and_then(|mut p| p.take()) else {
+        let Some(providers) = PROVIDERS.lock().ok().and_then(|mut p| p.take()) else {
             return;
         };
         ENABLED.store(false, Ordering::Relaxed);
-        let _ = tracer.shutdown();
-        let _ = logger.shutdown();
-        let _ = meter.shutdown();
+        let _ = providers.tracer.shutdown();
+        let _ = providers.logger.shutdown();
+        let _ = providers.meter.shutdown();
     }
 
     /// Scroll-path metric instruments (no-ops until a meter provider is set).
