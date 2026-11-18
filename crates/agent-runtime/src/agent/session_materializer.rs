@@ -977,8 +977,8 @@ impl SessionMaterializer {
             return Ok(PreparedSessionResult::AlreadyRegistered(existing));
         }
 
-        // Validate session exists in DB (heavy I/O)
-        let _session = self
+        // Validate session exists in DB (heavy I/O) and prefer its persisted cwd.
+        let session = self
             .config
             .provider
             .history_store()
@@ -992,27 +992,17 @@ impl SessionMaterializer {
                 }))
             })?;
 
-        let cwd = if req.cwd.as_os_str().is_empty() {
-            None
-        } else {
-            if !req.cwd.is_absolute() {
-                return Err(Error::invalid_params().data(serde_json::json!({
-                    "message": "cwd must be an absolute path",
-                    "cwd": req.cwd.display().to_string(),
-                })));
-            }
-            Some(req.cwd.clone())
-        };
-
+        let request_cwd = acp_cwd_to_optional(&req.cwd)?;
         // Resolve the persisted workspace binding ahead of any caller cwd:
         // resume of a bound session always uses the persisted execution
         // path, conflicting cwd requests and missing checkouts fail closed.
         let workspace = self
-            .resolve_existing_workspace(&session_id, cwd.as_deref())
+            .resolve_existing_workspace(&session_id, request_cwd.as_deref())
             .await?;
+        // Same precedence as load: a resumed session keeps its own workspace.
         let cwd = match &workspace {
             Some(binding) => Some(binding.effective_cwd.clone()),
-            None => cwd,
+            None => session.cwd.or(request_cwd),
         };
 
         // Resolve MCP inputs (config + request + runtime attachments)
@@ -2770,6 +2760,31 @@ mod worktree_binding_tests {
             format!("{err:?}").contains("conflicting cwd"),
             "diagnostic: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn resume_without_cwd_uses_the_stored_session_cwd() {
+        let fx = worktree_fixture(false).await;
+        let stored = fx.repo.path().to_path_buf();
+        let session_id = fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(stored.clone()))
+            .await
+            .expect("session prepares")
+            .session_id
+            .clone();
+
+        let resume = ResumeSessionRequest::new(SessionId::from(session_id), PathBuf::new());
+        let resumed = match fx
+            .materializer
+            .prepare_resume_session(resume, None)
+            .await
+            .expect("resume without cwd")
+        {
+            PreparedSessionResult::Prepared(prepared) => prepared,
+            PreparedSessionResult::AlreadyRegistered(_) => panic!("session was never registered"),
+        };
+        assert_eq!(resumed.cwd.as_deref(), Some(stored.as_path()));
     }
 
     #[tokio::test]
