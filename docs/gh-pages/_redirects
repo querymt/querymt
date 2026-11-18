@@ -1,0 +1,22 @@
+# Cloudflare Pages redirects, copied to the root of the gh-pages branch by
+# docs/gh-pages/sync-root.sh (see .github/workflows/publish-docs.yml).
+#
+# The docs are versioned with mike, so every page lives under /<version>/.
+# These rules keep pre-versioning links (e.g. /core/available-providers/)
+# working instead of 404ing. Keep this list in sync with the top-level
+# sections of docs/docs/.
+
+/core            /latest/core/            301
+/core/*          /latest/core/:splat      301
+/agent           /latest/agent/           301
+/agent/*         /latest/agent/:splat     301
+/plugins         /latest/plugins/         301
+/plugins/*       /latest/plugins/:splat   301
+/cli             /latest/cli/             301
+/cli/*           /latest/cli/:splat       301
+/mcp             /latest/mcp/             301
+/mcp/*           /latest/mcp/:splat       301
+/architecture    /latest/architecture/    301
+/architecture/*  /latest/architecture/:splat  301
+/telemetry       /latest/telemetry/       301
+/telemetry/*     /latest/telemetry/:splat 301

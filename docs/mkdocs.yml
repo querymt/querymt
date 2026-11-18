@@ -3,6 +3,7 @@ site_url: https://docs.query.mt
 repo_url: https://github.com/querymt/querymt
 theme:
   name: material
+  custom_dir: overrides
   features:
     - navigation.tabs
     - navigation.sections

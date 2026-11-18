@@ -1,0 +1,73 @@
+{#-
+  Custom 404 page. Rendered with the regular site chrome (header, nav,
+  palette, search), so it inherits the site's styling automatically.
+
+  The publish workflow also copies the built `latest/404.html` to the root of
+  the gh-pages branch so Cloudflare Pages serves it for unknown top-level paths
+  (instead of falling back to the root redirect page and looping forever).
+-#}
+{% extends "main.html" %}
+
+{% block htmltitle %}
+  <title>404 · Page not found - {{ config.site_name }}</title>
+{% endblock %}
+
+{% block extrahead %}
+  <meta name="robots" content="noindex">
+  <style>
+    .qmt-404__status {
+      margin: 0;
+      font-family: var(--md-code-font-family);
+      font-size: 4rem;
+      font-weight: 700;
+      line-height: 1;
+      color: var(--md-accent-fg-color);
+    }
+    .qmt-404 h1 { margin-top: 0.4em; }
+    .qmt-404__path { word-break: break-all; }
+    .qmt-404__actions .md-button { margin: 0 0.4em 0.6em 0; }
+  </style>
+{% endblock %}
+
+{% block content %}
+  {% set home = config.extra.homepage | d(nav.homepage.url, true) | url %}
+  <div class="qmt-404">
+    <p class="qmt-404__status" aria-hidden="true">404</p>
+    <h1>Err(PageNotFound)</h1>
+
+    <p>
+      We queried every configured provider, fanned the request out across the
+      mesh, and even woke up the local llama on the GPU. Even at
+      <code>temperature = 0</code> the verdict is unanimous: this page does not
+      exist. If someone linked you here, the URL was probably hallucinated.
+    </p>
+
+    <pre><code>error[E0404]: cannot find page in this scope
+ --&gt; docs.query.mt<span class="qmt-404__path" data-qmt-404-path>/???</span>
+  |
+  = note: the docs are versioned now; pages live under /latest/ or /stable/
+  = help: try the links below, or press `/` to search
+  = note: `.unwrap()` was not called. nobody panicked. not even you.</code></pre>
+
+    <div class="admonition tip">
+      <p class="admonition-title">Following an old link?</p>
+      <p>
+        Unversioned URLs such as <code>/core/available-providers/</code> moved
+        to <code>/latest/core/available-providers/</code>. Same content, more
+        semver.
+      </p>
+    </div>
+
+    <p class="qmt-404__actions">
+      <a href="{{ home }}" class="md-button md-button--primary">cd ~ (docs home)</a>
+      <a href="/stable/" class="md-button">Stable docs</a>
+      <a href="https://github.com/querymt/querymt/issues/new" class="md-button">Report a broken link</a>
+    </p>
+  </div>
+
+  <script>
+    document.querySelectorAll("[data-qmt-404-path]").forEach(function (el) {
+      el.textContent = window.location.pathname;
+    });
+  </script>
+{% endblock %}

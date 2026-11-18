@@ -2,7 +2,7 @@
 #
 # Copy this file to ~/.qmt/providers.toml and uncomment the providers you need.
 # For full configuration reference, GPU selection, and copy-pasteable recipes see:
-# https://docs.query.mt/core/available-providers/
+# https://docs.query.mt/latest/core/available-providers/
 #
 # WASM providers (API-based) are also available automatically via the provider
 # repository at https://repo.query.mt -- no manual configuration required unless
@@ -62,7 +62,7 @@ path = "oci://ghcr.io/querymt/xai:latest"
 # ─── Native Providers (local inference, platform-specific) ────────────────────
 # Native providers run models locally on your hardware. The `latest` tag selects
 # the CPU-only build; use feature tags for GPU acceleration (Metal, CUDA, Vulkan).
-# See https://docs.query.mt/core/available-providers/#native-providers for the
+# See https://docs.query.mt/latest/core/available-providers/#native-providers for the
 # full list of feature tags and a GPU-to-SM mapping table.
 
 [[providers]]
