@@ -73,7 +73,7 @@ pub(crate) struct BatchState {
 }
 
 impl OperationState {
-    pub fn session(&mut self, session_id: &str, cwd: &std::path::Path, created: bool) {
+    pub fn session(&mut self, session_id: &str, cwd: Option<&std::path::Path>, created: bool) {
         self.recovery.insert("sessionId".into(), json!(session_id));
         self.recovery.insert("cwd".into(), json!(cwd));
         self.recovery

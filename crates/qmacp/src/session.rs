@@ -29,6 +29,12 @@ pub fn resolve_optional_cwd(cwd: Option<PathBuf>) -> Result<Option<PathBuf>> {
     cwd.map(|cwd| resolve_cwd(Some(cwd))).transpose()
 }
 
+/// cwd for a load/resume of an existing session. An omitted cwd is sent empty,
+/// which QueryMT treats as "no cwd" and answers with the session's stored cwd.
+pub fn existing_session_cwd(cwd: Option<PathBuf>) -> Result<PathBuf> {
+    Ok(resolve_optional_cwd(cwd)?.unwrap_or_default())
+}
+
 pub fn profile_meta(profile_id: &str) -> Map<String, Value> {
     let mut meta = Map::new();
     meta.insert("querymt".to_string(), json!({ "profile_id": profile_id }));
@@ -185,7 +191,7 @@ fn current_config_value(option: &Value) -> Option<Value> {
 
 pub fn compact_inspect(
     session_id: &str,
-    cwd: &Path,
+    cwd: Option<&Path>,
     modes: Option<&acp::SessionModeState>,
     load_value: &Value,
     message_limit: Option<usize>,
@@ -200,7 +206,7 @@ pub fn compact_inspect(
     }
     json!({
         "sessionId": session_id,
-        "cwd": path_string(cwd),
+        "cwd": cwd.map(path_string),
         "status": config_status(session_id, modes, load_value),
         "messages": messages,
         "tools": if include_tools {
@@ -474,7 +480,7 @@ mod tests {
                 }
             }
         });
-        let compact = compact_inspect("s1", Path::new("/repo"), None, &load, None, true);
+        let compact = compact_inspect("s1", Some(Path::new("/repo")), None, &load, None, true);
         assert_eq!(compact["messages"][0]["role"], "user");
         assert_eq!(compact["messages"][0]["text"], "hello");
         assert_eq!(compact["tools"][0]["name"], "read");
