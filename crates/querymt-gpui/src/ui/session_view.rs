@@ -144,35 +144,7 @@ struct ScrollProbe {
     anchor: Option<(usize, f32)>,
     following: bool,
     item_count: usize,
-    tail: [Option<TailRow>; TAIL_ROWS],
-    composer_h: f32,
     layout_seq: u64,
-}
-
-/// Rows at the end of the transcript whose heights are recorded per layout.
-const TAIL_ROWS: usize = 4;
-
-#[derive(Clone, Copy, PartialEq)]
-struct TailRow {
-    id: u64,
-    ix: usize,
-    kind: &'static str,
-    height: f32,
-}
-
-// IDs stay stable as history is prepended, without exporting the agent's keys.
-fn telemetry_row_id(key: &str) -> u64 {
-    use std::hash::{BuildHasher as _, RandomState};
-    static KEYS: std::sync::OnceLock<RandomState> = std::sync::OnceLock::new();
-    KEYS.get_or_init(RandomState::new).hash_one(key)
-}
-
-fn fmt_rows(rows: &[Option<TailRow>; TAIL_ROWS]) -> String {
-    rows.iter()
-        .flatten()
-        .map(|r| format!("{}:{:016x}:{}:{}", r.ix, r.id, r.kind, r.height))
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 /// Frame movement beyond which content moving with the input is still a jump.
@@ -184,7 +156,6 @@ fn sample_transcript(
     list: &ListState,
     probe: &RefCell<ScrollProbe>,
     smooth: &super::smooth_scroll::SmoothScroll,
-    items: &[Rc<Item>],
     composer_h: f32,
 ) {
     let (input, gesture) = smooth.take_frame_input();
@@ -264,58 +235,9 @@ fn sample_transcript(
             "transcript frame"
         );
     }
-    // GPUI only exposes bounds for measured rows at or below the anchor.
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        let tail = std::array::from_fn(|i| {
-            let ix = count.saturating_sub(TAIL_ROWS) + i;
-            let item = items.get(ix)?;
-            let bounds = list.bounds_for_item(ix)?;
-            Some(TailRow {
-                id: telemetry_row_id(&item.key),
-                ix,
-                kind: match item.kind {
-                    ItemKind::User { .. } => "user",
-                    ItemKind::Agent { .. } => "agent",
-                    ItemKind::Work(_) => "work",
-                    ItemKind::Notice { .. } => "notice",
-                    ItemKind::Compaction(_) => "compaction",
-                },
-                height: f32::from(bounds.size.height),
-            })
-        });
-        let padding_changed = (composer_h - p.composer_h).abs() > 0.5;
-        if tail != p.tail
-            || padding_changed
-            || (tail.iter().any(Option::is_some) && (input != 0. || shift.is_some_and(|s| s != 0.)))
-        {
-            let changed = tail.map(|row| {
-                let row = row?;
-                let old = p.tail.iter().flatten().find(|old| old.id == row.id)?;
-                let delta = row.height - old.height;
-                (delta.abs() > 0.5).then_some(TailRow {
-                    height: delta,
-                    ..row
-                })
-            });
-            tracing::debug!(
-                parent: &span,
-                layout_seq,
-                rows.tail = %fmt_rows(&tail),
-                rows.changed = %fmt_rows(&changed),
-                list.bottom_padding_px = composer_h,
-                list.bottom_padding_delta_px = composer_h - p.composer_h,
-                list.follow_tail = following,
-                list.max_offset_px = max_offset,
-                list.offset_px = offset,
-                "transcript tail layout"
-            );
-        }
-        p.tail = tail;
-    }
     p.anchor = anchor_top.map(|t| (top.item_ix, t));
     p.following = following;
     p.item_count = count;
-    p.composer_h = composer_h;
 }
 
 /// Per-render facts the item renderer needs besides the item itself.
@@ -471,7 +393,6 @@ impl Transcript {
                     // inside a potentially very tall work-group row.
                     self.list.remeasure_items(ix..ix + 1);
                     crate::telemetry::record_remeasure();
-                    tracing::debug!(row.ix = ix, row.id = %format_args!("{:016x}", telemetry_row_id(&keys[ix])), "transcript row remeasured");
                 } else {
                     self.list.splice(ix..ix + 1, 1);
                 }
@@ -4502,11 +4423,7 @@ impl QmtApp {
                                         canvas(
                                             move |_, _, _| {
                                                 sample_transcript(
-                                                    &list,
-                                                    &probe,
-                                                    &smooth,
-                                                    &items.borrow(),
-                                                    composer_h,
+                                                    &list, &probe, &smooth, composer_h,
                                                 )
                                             },
                                             |_, _, _, _| {},
@@ -4842,24 +4759,10 @@ impl QmtApp {
         // Measure the floating area; re-render once when its height changes.
         let measure = {
             let (cell, weak) = (self.transcript.composer_h.clone(), cx.entity().downgrade());
-            let probe = crate::telemetry::enabled().then(|| self.transcript.probe.clone());
-            let scroll_pill_shown = !at_bottom;
-            let activity_shown = running || waiting;
             canvas(
                 move |bounds, window, _| {
                     let h = f32::from(bounds.size.height);
                     if (cell.get() - h).abs() > 0.5 {
-                        if let Some(probe) = &probe {
-                            tracing::debug!(
-                                layout_seq = probe.borrow().layout_seq,
-                                dock.height_px = h,
-                                dock.previous_height_px = cell.get(),
-                                dock.scroll_pill = scroll_pill_shown,
-                                dock.activity = activity_shown,
-                                dock.waiting = waiting,
-                                "transcript dock measured"
-                            );
-                        }
                         cell.set(h);
                         window.on_next_frame(move |_, cx| {
                             let _ = weak.update(cx, |_, cx| cx.notify());
