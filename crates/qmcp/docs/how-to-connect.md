@@ -148,9 +148,14 @@ qmcp --transport http --oauth-local-resource https://mcp.example.com/mcp
 ```
 
 On first start qmcp stores a signing key and an approval password in the
-QueryMT secret store and prints the password once. Show or change it with
-`qmt secrets get|set qmcp.oauth.password`. Deleting `qmcp.oauth.signing_key`
-revokes all clients and tokens; ChatGPT must then reconnect.
+QueryMT secret store. If stderr is a terminal, it displays the password once;
+otherwise it prints only the retrieval command: `qmt secrets get qmcp.oauth.password`.
+
+To change the approval password, stop all qmcp instances using it, run
+`qmt secrets set qmcp.oauth.password`, and restart them. This affects new approvals,
+not tokens already issued. To revoke all existing tokens and client IDs, stop all
+instances using the key, run `qmt secrets delete qmcp.oauth.signing_key`, and
+restart them to generate a new key. Clients may need to re-register.
 
 Forward `/mcp`, `/register`, `/authorize`, `/token`,
 `/.well-known/oauth-authorization-server` and both
