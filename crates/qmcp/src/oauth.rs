@@ -156,7 +156,7 @@ impl OAuthAuth {
     }
 }
 
-fn https_url(value: &str) -> Result<Url> {
+pub(crate) fn https_url(value: &str) -> Result<Url> {
     let url = Url::parse(value)
         .map_err(|_| anyhow::anyhow!("OAuth identifiers and endpoints must be HTTPS URLs"))?;
     if url.scheme() != "https"
