@@ -24,12 +24,25 @@ base64 = "0.22"
 similar = "2"
 # Already built for gpui-kit's TextView; used to turn markdown into plain text.
 markdown = "1.0.0"
+# Instrumentation; spans and events cost nothing without a subscriber.
+tracing = "0.1"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 dirs = "6"
 # Native WebSocket client (ws:// and wss://) on a background thread.
 tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# OpenTelemetry export, same stack and versions as querymt-utils::telemetry.
+# OTLP over HTTP/protobuf with a blocking client: the app has no Tokio
+# runtime for the gRPC (tonic) exporter QueryMT uses, and the SDK's batch
+# processors already export from their own threads.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["logs", "metrics"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "logs", "metrics"] }
+opentelemetry-appender-tracing = "0.32"
+opentelemetry-semantic-conventions = "0.32"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 # Must match the wasm-bindgen CLI version in flake.nix exactly.
