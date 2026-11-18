@@ -35,13 +35,14 @@ cargo install --locked --path crates/qmacp
 
 ```sh
 qmacp --quiet caps
-qmacp --quiet prompt --new --cwd . --timeout 900 'fix the build'
+qmacp --quiet prompt --new --cwd "$PWD" --timeout 900 'fix the build'
 qmacp --quiet prompt --timeout 900 "$SESSION_ID" 'run the tests'
 qmacp --quiet runtime "$SESSION_ID"
 qmacp --quiet follow "$SESSION_ID"
 ```
 
 Globals come before the subcommand: `--url`, `--allow-insecure`, `--pretty`, `--permission`, `--quiet`.
+Explicit `--cwd` values must be absolute paths on the QueryMT host. POSIX and Windows paths are sent unchanged.
 
 `--permission` defaults to `allow-once`. `reject-once` rejects one tool call. `cancel` selects nothing.
 

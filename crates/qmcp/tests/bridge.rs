@@ -1171,6 +1171,28 @@ async fn existing_sessions_keep_their_stored_cwd() {
         "rejected calls must not reach the backend"
     );
 
+    for invalid in [
+        json!({"name": "new", "arguments": {}}),
+        json!({"name": "new", "arguments": {"cwd": "relative"}}),
+        json!({"name": "prompt", "arguments": {"new": true, "text": "x"}}),
+        json!({"name": "prompt", "arguments": {"session_id": "fixture-session", "cwd": "/tmp", "text": "x"}}),
+    ] {
+        let result = mcp
+            .tool(
+                "exec",
+                json!({"calls": [
+                    {"name": "close", "arguments": {"session_id": "fixture-session"}},
+                    invalid,
+                ]}),
+            )
+            .await;
+        assert_eq!(result["isError"], true, "{result}");
+    }
+    assert!(
+        backend.recorded().is_empty(),
+        "invalid batches must not reach the backend"
+    );
+
     let status = mcp
         .tool("status", json!({"session_id": "fixture-session"}))
         .await;
@@ -1190,6 +1212,30 @@ async fn existing_sessions_keep_their_stored_cwd() {
         opened.iter().all(|r| r["params"]["cwd"] == ""),
         "{opened:?}"
     );
+    backend.wait_disconnected().await;
+}
+
+#[tokio::test]
+async fn new_session_preserves_absolute_server_paths_on_any_client_os() {
+    let backend = MockAcp::start().await;
+    let mut mcp = Mcp::start(&backend.url, false).await;
+    let paths = [
+        "/srv/workspace",
+        r"C:\repo\..\src",
+        "C:/workspace",
+        r"\\server\share\src",
+    ];
+    for cwd in paths {
+        let result = mcp.tool("new", json!({"cwd": cwd})).await;
+        assert_eq!(result["isError"], false, "{result}");
+    }
+    let sent = backend
+        .recorded()
+        .into_iter()
+        .filter(|r| r["method"] == "session/new")
+        .map(|r| r["params"]["cwd"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(sent, paths.map(|path| json!(path)));
     backend.wait_disconnected().await;
 }
 

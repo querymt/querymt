@@ -251,6 +251,7 @@ pub fn decode(name: &str, mut arguments: Map<String, Value>) -> Result<Command> 
             session_id,
             text,
             timeout,
+            cwd,
             ..
         } => {
             if *new == session_id.is_some() {
@@ -259,10 +260,25 @@ pub fn decode(name: &str, mut arguments: Map<String, Value>) -> Result<Command> 
             if text.trim().is_empty() {
                 bail!("text must not be empty");
             }
+            validate_session_cwd(*new, cwd.as_deref()).map_err(anyhow::Error::msg)?;
             validate_timeout(*timeout)?;
+        }
+        Command::New { cwd, .. } => {
+            validate_session_cwd(true, cwd.as_deref()).map_err(anyhow::Error::msg)?;
         }
         Command::Queue { text, .. } | Command::Steer { text, .. } if text.trim().is_empty() => {
             bail!("text must not be empty")
+        }
+        Command::Sessions { cwd, .. }
+        | Command::Find { cwd, .. }
+        | Command::Inspect { cwd, .. }
+        | Command::Status { cwd, .. }
+        | Command::Follow { cwd, .. }
+            if cwd
+                .as_deref()
+                .is_some_and(|path| !session::is_absolute_server_cwd(path)) =>
+        {
+            bail!("cwd must be an absolute path on the QueryMT host");
         }
         Command::Follow {
             interval, timeout, ..
@@ -385,11 +401,20 @@ fn constrain_input_schema(name: &str, input: &mut Map<String, Value>) {
     if matches!(name, "prompt" | "steer" | "queue") {
         properties["text"]["pattern"] = json!(NON_BLANK_TEXT_PATTERN);
     }
+    if let Some(cwd) = properties.get_mut("cwd") {
+        cwd["description"] = json!("Absolute path on the QueryMT host.");
+        // Keep this in sync with qmacp::session::is_absolute_server_cwd.
+        cwd["pattern"] = json!(r"^(?:/|[A-Za-z]:[/\\]|\\\\[^/\\]+[/\\][^/\\]+)");
+    }
     if name == "prompt" {
         input.insert("oneOf".into(), json!([
-            {"required": ["new"], "properties": {"new": {"const": true}, "session_id": {"type": "null"}}},
-            {"required": ["session_id"], "properties": {"new": {"const": false}, "session_id": {"type": "string"}}},
+            {"required": ["new", "cwd"], "properties": {"new": {"const": true}, "session_id": {"type": "null"}, "cwd": {"type": "string", "minLength": 1}}},
+            {"required": ["session_id"], "properties": {"new": {"const": false}, "session_id": {"type": "string"}, "cwd": {"type": "null"}}},
         ]));
+    } else if name == "new" {
+        input.insert("required".into(), json!(["cwd"]));
+        input["properties"]["cwd"]["type"] = json!("string");
+        input["properties"]["cwd"]["minLength"] = json!(1);
     } else if name == "set_lifecycle" {
         input.insert(
             "anyOf".into(),
@@ -1129,17 +1154,7 @@ async fn prompt(
         delivery,
         until_idle,
     } = args;
-    // A session keeps its own workspace; only a new session takes a cwd.
-    if !new && cwd.is_some() {
-        return Err(CliError::Usage(
-            "cwd applies only with new=true; an existing session keeps its own cwd".into(),
-        ));
-    }
-    let cwd = if new {
-        Some(new_session_cwd(cwd)?)
-    } else {
-        None
-    };
+    validate_session_cwd(new, cwd.as_deref()).map_err(|err| CliError::Usage(err.into()))?;
     let initialized = client.initialize().await.map_err(CliError::from_request)?;
     let session_id = if new {
         let (created, _) = client
@@ -1586,9 +1601,18 @@ struct OpenedSession {
 /// A new session needs an explicit absolute cwd on the QueryMT host; qmcp's
 /// own working directory means nothing there.
 fn new_session_cwd(cwd: Option<PathBuf>) -> Result<PathBuf, CliError> {
-    cwd.filter(|cwd| cwd.is_absolute()).ok_or_else(|| {
-        CliError::Usage("a new session requires an absolute cwd on the QueryMT host".into())
-    })
+    validate_session_cwd(true, cwd.as_deref()).map_err(|err| CliError::Usage(err.into()))?;
+    Ok(cwd.expect("validated new session cwd is present"))
+}
+
+fn validate_session_cwd(new: bool, cwd: Option<&std::path::Path>) -> Result<(), &'static str> {
+    if new && !cwd.is_some_and(session::is_absolute_server_cwd) {
+        return Err("a new session requires an absolute cwd on the QueryMT host");
+    }
+    if !new && cwd.is_some() {
+        return Err("cwd applies only with new=true; an existing session keeps its own cwd");
+    }
+    Ok(())
 }
 
 async fn open_session(
@@ -1645,7 +1669,11 @@ mod tests {
 
     #[test]
     fn json_arguments_are_strict_and_defaults_match_the_api() {
-        let command = decode("prompt", args(json!({"new": true, "text": "-"}))).unwrap();
+        let command = decode(
+            "prompt",
+            args(json!({"new": true, "cwd": "/workspace", "text": "-"})),
+        )
+        .unwrap();
         assert!(
             matches!(command, Command::Prompt { text, timeout: 600, until_idle: true, delivery: Delivery::Auto, .. } if text == "-")
         );
