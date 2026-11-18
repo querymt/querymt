@@ -14,7 +14,10 @@ async fn secure_connection_works_with_both_providers_without_installing_a_global
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("wss://{}/acp/ws", listener.local_addr().unwrap());
     let peer = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("TLS fixture did not receive a connection")
+            .unwrap();
         let mut byte = [0];
         tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut byte))
             .await

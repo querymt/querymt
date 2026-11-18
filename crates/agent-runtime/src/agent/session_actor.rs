@@ -1501,6 +1501,24 @@ impl Message<GetRuntimeStatus> for SessionActor {
     }
 }
 
+impl Message<SessionDeliveryBarrier> for SessionActor {
+    type Reply = Result<i64, kameo::error::Infallible>;
+
+    async fn handle(
+        &mut self,
+        _msg: SessionDeliveryBarrier,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let runtime = self.runtime_status(self.published_pending_steering);
+        Ok(self
+            .config
+            .event_sink
+            .session_stream(&self.session_id)
+            .emit_ephemeral_seq(AgentEventKind::RuntimeChanged { runtime })
+            .await)
+    }
+}
+
 impl Message<GetLlmConfig> for SessionActor {
     type Reply = Result<Option<LLMConfig>, AgentError>;
 

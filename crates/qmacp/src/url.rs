@@ -29,8 +29,7 @@ pub fn normalize_acp_ws_url(value: &str, allow_insecure: bool) -> Result<String>
     };
 
     let explicit_port = explicit_port(&candidate)?;
-    let mut url =
-        Url::parse(&candidate).with_context(|| format!("invalid WebSocket URL: {value}"))?;
+    let mut url = Url::parse(&candidate).context("invalid WebSocket URL")?;
     if !matches!(url.scheme(), "ws" | "wss") {
         bail!("WebSocket URL must use ws:// or wss://");
     }
@@ -97,11 +96,8 @@ fn explicit_port(value: &str) -> Result<Option<u16>> {
     } else {
         authority.rsplit_once(':').map(|(_, port)| port)
     };
-    port.map(|port| {
-        port.parse::<u16>()
-            .with_context(|| format!("invalid WebSocket port: {port}"))
-    })
-    .transpose()
+    port.map(|port| port.parse::<u16>().context("invalid WebSocket port"))
+        .transpose()
 }
 
 fn insert_port(value: &str, port: u16) -> String {
@@ -166,6 +162,13 @@ mod tests {
             normalize_acp_ws_url("::1", false).unwrap(),
             "ws://[::1]:3030/acp/ws"
         );
+    }
+
+    #[test]
+    fn invalid_endpoint_does_not_disclose_input() {
+        let error =
+            normalize_acp_ws_url("wss://user:secret@[invalid]?token=secret", true).unwrap_err();
+        assert!(!format!("{error:#}").contains("secret"));
     }
 
     #[test]

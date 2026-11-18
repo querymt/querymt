@@ -19,15 +19,10 @@ pub fn permission_response(
         PermissionPolicy::RejectOnce => Some(acp::PermissionOptionKind::RejectOnce),
         PermissionPolicy::Cancel => None,
     };
-    let selected = wanted.and_then(|kind| {
-        request
-            .options
-            .iter()
-            .find(|option| option.kind == kind)
-            .or_else(|| request.options.first())
-    });
+    let selected =
+        wanted.and_then(|kind| request.options.iter().find(|option| option.kind == kind));
     match selected {
-        Some(option) if wanted.is_some() => (
+        Some(option) => (
             acp::RequestPermissionResponse::new(acp::RequestPermissionOutcome::Selected(
                 acp::SelectedPermissionOutcome::new(option.option_id.clone()),
             )),
@@ -122,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_cancel_does_not_select_always() {
+    fn permission_without_matching_kind_cancels() {
         let request = acp::RequestPermissionRequest::new(
             "session-1",
             acp::ToolCallUpdate::new("tool-1", acp::ToolCallUpdateFields::new()),
@@ -132,11 +127,17 @@ mod tests {
                 acp::PermissionOptionKind::RejectAlways,
             )],
         );
-        let (response, event) = permission_response(&request, PermissionPolicy::Cancel);
-        assert!(matches!(
-            response.outcome,
-            acp::RequestPermissionOutcome::Cancelled
-        ));
-        assert_eq!(event["cancelled"], true);
+        for policy in [
+            PermissionPolicy::Cancel,
+            PermissionPolicy::AllowOnce,
+            PermissionPolicy::RejectOnce,
+        ] {
+            let (response, event) = permission_response(&request, policy);
+            assert!(matches!(
+                response.outcome,
+                acp::RequestPermissionOutcome::Cancelled
+            ));
+            assert_eq!(event["cancelled"], true);
+        }
     }
 }
