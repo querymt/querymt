@@ -19,10 +19,8 @@
       <meta name="generator" content="zensical-0.1.2">
     
     
-      
-        <title>QueryMate</title>
-      
-    
+  <title>404 · Page not found - QueryMate</title>
+
     
       
         
@@ -57,6 +55,21 @@
 
     
     
+  <meta name="robots" content="noindex">
+  <style>
+    .qmt-404__status {
+      margin: 0;
+      font-family: var(--md-code-font-family);
+      font-size: 4rem;
+      font-weight: 700;
+      line-height: 1;
+      color: var(--md-accent-fg-color);
+    }
+    .qmt-404 h1 { margin-top: 0.4em; }
+    .qmt-404__path { word-break: break-all; }
+    .qmt-404__actions .md-button { margin: 0 0.4em 0.6em 0; }
+  </style>
+
   </head>
   
   
@@ -1681,7 +1694,46 @@
               <article class="md-content__inner md-typeset">
                 <a id="__skip" tabindex="-1"></a>
                 
-  <h1>404 - Not found</h1>
+  
+  <div class="qmt-404">
+    <p class="qmt-404__status" aria-hidden="true">404</p>
+    <h1>Err(PageNotFound)</h1>
+
+    <p>
+      We queried every configured provider, fanned the request out across the
+      mesh, and even woke up the local llama on the GPU. Even at
+      <code>temperature = 0</code> the verdict is unanimous: this page does not
+      exist. If someone linked you here, the URL was probably hallucinated.
+    </p>
+
+    <pre><code>error[E0404]: cannot find page in this scope
+ --&gt; docs.query.mt<span class="qmt-404__path" data-qmt-404-path>/???</span>
+  |
+  = note: the docs are versioned now; pages live under /latest/ or /stable/
+  = help: try the links below, or press `/` to search
+  = note: `.unwrap()` was not called. nobody panicked. not even you.</code></pre>
+
+    <div class="admonition tip">
+      <p class="admonition-title">Following an old link?</p>
+      <p>
+        Unversioned URLs such as <code>/core/available-providers/</code> moved
+        to <code>/latest/core/available-providers/</code>. Same content, more
+        semver.
+      </p>
+    </div>
+
+    <p class="qmt-404__actions">
+      <a href="/latest/" class="md-button md-button--primary">cd ~ (docs home)</a>
+      <a href="/stable/" class="md-button">Stable docs</a>
+      <a href="https://github.com/querymt/querymt/issues/new" class="md-button">Report a broken link</a>
+    </p>
+  </div>
+
+  <script>
+    document.querySelectorAll("[data-qmt-404-path]").forEach(function (el) {
+      el.textContent = window.location.pathname;
+    });
+  </script>
 
               </article>
             </div>
