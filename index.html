@@ -3,16 +3,21 @@
 <head>
   <meta charset="utf-8">
   <title>Redirecting</title>
+  <!--
+    Root redirect template for `mike set-default -T`. Unlike mike's built-in
+    template this uses an absolute URL, so the page can never redirect
+    relative to an unknown path (/core/ -> /core/latest/ -> /core/latest/latest/ ...).
+  -->
   <noscript>
-    <meta http-equiv="refresh" content="1; url=latest/" />
+    <meta http-equiv="refresh" content="1; url=/latest/" />
   </noscript>
   <script>
     window.location.replace(
-      "latest/" + window.location.search + window.location.hash
+      "/latest/" + window.location.search + window.location.hash
     );
   </script>
 </head>
 <body>
-  Redirecting to <a href="latest/">latest/</a>...
+  Redirecting to <a href="/latest/">/latest/</a>...
 </body>
 </html>
