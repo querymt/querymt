@@ -128,6 +128,105 @@ pub struct Transcript {
     /// Measured height of the floating composer area, so the list can pad
     /// its end and the last message can scroll clear of the composer.
     composer_h: Rc<Cell<f32>>,
+    /// Previous frame's telemetry sample (only used while export is on).
+    probe: Rc<RefCell<ScrollProbe>>,
+}
+
+/// Last transcript frame seen by the telemetry sampler.
+#[derive(Default)]
+struct ScrollProbe {
+    /// First visible row and its top edge on screen.
+    anchor: Option<(usize, f32)>,
+    following: bool,
+    item_count: usize,
+}
+
+/// Frame movement beyond which content moving with the input is still a jump.
+const JUMP_SLACK_PX: f32 = 40.;
+
+/// After the transcript list's layout: record where the content is, and flag
+/// frames whose visible movement disagrees with the injected scroll input.
+fn sample_transcript(
+    list: &ListState,
+    probe: &RefCell<ScrollProbe>,
+    smooth: &super::smooth_scroll::SmoothScroll,
+    composer_h: f32,
+) {
+    let (input, gesture) = smooth.take_frame_input();
+    let top = list.logical_scroll_top();
+    let count = list.item_count();
+    let following = list.is_following_tail();
+    let offset = -f32::from(list.scroll_px_offset_for_scrollbar().y);
+    let max_offset = f32::from(list.max_offset_for_scrollbar().y);
+    let viewport = list.viewport_bounds();
+    let anchor_top = list
+        .bounds_for_item(top.item_ix)
+        .map(|b| f32::from(b.top()));
+    let mut p = probe.borrow_mut();
+    // Content movement of the row that was first on screen last frame, when
+    // it is still laid out and no rows were inserted above it.
+    let shift = p
+        .anchor
+        .filter(|_| p.item_count == count)
+        .and_then(|(ix, was)| list.bounds_for_item(ix).map(|b| f32::from(b.top()) - was));
+    let span = gesture.unwrap_or_else(tracing::Span::current);
+    let engaged = following && !p.following;
+    if engaged {
+        crate::telemetry::record_follow_engaged();
+    }
+    if let Some(shift) = shift {
+        crate::telemetry::record_shift(f64::from(shift));
+        let against = input != 0. && shift * input < 0. && shift.abs() > 2.;
+        // Content moving further than the input asked (a stalled list at an
+        // edge is not a jump).
+        let past = shift.abs() - input.abs() > JUMP_SLACK_PX;
+        if against || past {
+            let kind = if against {
+                "against_input"
+            } else {
+                "past_input"
+            };
+            crate::telemetry::record_jump(kind);
+            tracing::warn!(
+                parent: &span,
+                jump.kind = kind,
+                jump.shift_px = shift,
+                scroll.input_px = input,
+                list.offset_px = offset,
+                list.max_offset_px = max_offset,
+                list.scroll_top_ix = top.item_ix,
+                list.scroll_top_offset_px = f32::from(top.offset_in_item),
+                list.follow_tail = following,
+                list.follow_tail_engaged = engaged,
+                list.item_count = count,
+                list.viewport_h = f32::from(viewport.size.height),
+                list.content_h = max_offset + f32::from(viewport.size.height),
+                composer_h,
+                "transcript scroll jump"
+            );
+        }
+    }
+    if input != 0. || shift.is_some_and(|s| s != 0.) || engaged || following != p.following {
+        tracing::debug!(
+            parent: &span,
+            scroll.input_px = input,
+            frame.shift_px = shift.unwrap_or(0.),
+            list.offset_px = offset,
+            list.max_offset_px = max_offset,
+            list.scroll_top_ix = top.item_ix,
+            list.scroll_top_offset_px = f32::from(top.offset_in_item),
+            list.follow_tail = following,
+            list.follow_tail_engaged = engaged,
+            list.scrolled_to_end = list.is_scrolled_to_end().unwrap_or(false),
+            list.item_count = count,
+            list.viewport_h = f32::from(viewport.size.height),
+            composer_h,
+            "transcript frame"
+        );
+    }
+    p.anchor = anchor_top.map(|t| (top.item_ix, t));
+    p.following = following;
+    p.item_count = count;
 }
 
 /// Per-render facts the item renderer needs besides the item itself.
@@ -216,6 +315,7 @@ impl Transcript {
             scroll_hooked: false,
             block_scrolls: Rc::default(),
             composer_h: Rc::new(Cell::new(0.)),
+            probe: Rc::default(),
         }
     }
 
@@ -248,6 +348,7 @@ impl Transcript {
             self.sigs.splice(0..0, sigs[..added].iter().copied());
             self.keys.splice(0..0, keys[..added].iter().cloned());
             self.list.splice(0..0, added);
+            tracing::debug!(rows = added, "older history rows prepended");
         }
         let old_len = self.sigs.len();
         let mut items = self.items.borrow_mut();
@@ -258,6 +359,8 @@ impl Transcript {
                     // Height changed, not identity: keep the reader's offset
                     // inside a potentially very tall work-group row.
                     self.list.remeasure_items(ix..ix + 1);
+                    crate::telemetry::record_remeasure();
+                    tracing::debug!(row.ix = ix, row.key = %keys[ix], "transcript row remeasured");
                 } else {
                     self.list.splice(ix..ix + 1, 1);
                 }
@@ -4270,6 +4373,25 @@ impl QmtApp {
                                         .pb(px(composer_h)),
                                     ),
                                 )
+                                // Telemetry: sample the list after its layout (siblings
+                                // prepaint in order). Absent unless export is on.
+                                .when(crate::telemetry::enabled(), |el| {
+                                    let list = self.transcript.list.clone();
+                                    let probe = self.transcript.probe.clone();
+                                    let smooth = self.smooth_scroll.clone();
+                                    el.child(
+                                        canvas(
+                                            move |_, _, _| {
+                                                sample_transcript(
+                                                    &list, &probe, &smooth, composer_h,
+                                                )
+                                            },
+                                            |_, _, _, _| {},
+                                        )
+                                        .absolute()
+                                        .size_0(),
+                                    )
+                                })
                                 // Same layered falloff as the composer halo: each copy
                                 // fades from the background to transparent, and stacking
                                 // them builds the dense edge. Plain divs have no hitbox,

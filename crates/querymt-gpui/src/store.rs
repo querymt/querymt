@@ -2791,6 +2791,8 @@ impl AgentsStore {
                             .cloned()
                             .unwrap_or_default();
                         view.prepend_events(&events, &prompts);
+                        crate::telemetry::record_history_load("ok");
+                        tracing::info!(events = events.len(), "older history page loaded");
                         let complete = page
                             .pointer("/history/complete")
                             .and_then(Value::as_bool)
@@ -2804,11 +2806,16 @@ impl AgentsStore {
                     }
                     // An undo rewrote history: the cursor is void, reload from scratch.
                     Err(err) if err.contains("history_changed") => {
+                        crate::telemetry::record_history_load("history_changed");
                         cx.notify();
                         s.reload_session(cx);
                         return;
                     }
-                    Err(err) => view.history_error = Some(err),
+                    Err(err) => {
+                        crate::telemetry::record_history_load("error");
+                        tracing::warn!(error = %err, "older history page failed");
+                        view.history_error = Some(err);
+                    }
                 }
                 cx.notify();
             });

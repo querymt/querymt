@@ -16,6 +16,7 @@ mod profile_templates;
 mod rpc;
 mod session;
 mod store;
+mod telemetry;
 mod theme;
 mod transport;
 mod ui;
@@ -28,6 +29,7 @@ use gpui_kit::*;
 
 #[cfg(not(target_family = "wasm"))]
 fn main() {
+    telemetry::init();
     let app = gpui_kit::application().with_assets(AppAssets(gpui_kit::assets::AllAssets));
     run(app);
 }
@@ -154,6 +156,8 @@ pub fn run(app: Application) {
         theme::apply(dark, &accent, cx);
 
         cx.on_action(|_: &Quit, cx| cx.quit());
+        #[cfg(not(target_family = "wasm"))]
+        cx.on_app_quit(|_| async { telemetry::shutdown() }).detach();
         cx.bind_keys([
             KeyBinding::new("ctrl-q", Quit, None),
             KeyBinding::new("cmd-q", Quit, None),

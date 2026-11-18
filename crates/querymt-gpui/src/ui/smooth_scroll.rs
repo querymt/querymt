@@ -169,6 +169,12 @@ struct State {
     last_tick: Option<Instant>,
     owner: Option<SharedString>,
     regions: Vec<(SharedString, Bounds<Pixels>)>,
+    /// `scroll.gesture` span from the first notch until the motion settles
+    /// or is cancelled; step events and transcript frame samples attach to it.
+    gesture: Option<tracing::Span>,
+    /// Injected distance (px, + = toward the start) not yet consumed by a
+    /// transcript frame sample.
+    pending_input: f32,
 }
 
 impl State {
@@ -181,6 +187,9 @@ impl State {
     }
 
     fn reset_motion(&mut self) {
+        if let Some(span) = self.gesture.take() {
+            tracing::debug!(parent: &span, remaining_y = self.remaining.y, "scroll motion cancelled");
+        }
         self.remaining = Point::default();
         self.velocity = Point::default();
         self.spin = Spin::default();
@@ -240,7 +249,17 @@ impl Element for ScrollRegion {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let raw = bounds;
         let bounds = bounds.intersect(&window.content_mask().bounds);
+        if crate::telemetry::enabled() {
+            tracing::trace!(
+                scroll.region = %self.id,
+                raw_y = f32::from(raw.origin.y),
+                raw_h = f32::from(raw.size.height),
+                visible_h = f32::from(bounds.size.height),
+                "scroll region prepaint"
+            );
+        }
         if bounds.size.width > px(0.) && bounds.size.height > px(0.) {
             // Parents register before children; deferred overlays register last.
             self.state
@@ -301,6 +320,13 @@ impl SmoothScroll {
             s.curve = curve;
             s.velocity = Point::default();
         }
+    }
+
+    /// Injected distance since the last call, and the current gesture span,
+    /// for the transcript's per-frame telemetry sample.
+    pub fn take_frame_input(&self) -> (f32, Option<tracing::Span>) {
+        let mut s = self.0.borrow_mut();
+        (std::mem::take(&mut s.pending_input), s.gesture.clone())
     }
 
     /// Register resolved geometry without adding a layout container. Only
@@ -368,6 +394,26 @@ impl SmoothScroll {
                     // behavior rather than borrowing a window-wide gesture.
                     return;
                 };
+                if s.gesture.is_none() {
+                    s.gesture = Some(tracing::info_span!(
+                        "scroll.gesture",
+                        scroll.owner = %owner,
+                        scroll.curve = ?s.curve,
+                        scroll.tau_ms = s.tau.map_or(0, |t| t.as_millis() as u64),
+                        scroll.inertia = s.inertia.is_some(),
+                    ));
+                }
+                if let Some(span) = &s.gesture {
+                    tracing::debug!(
+                        parent: span,
+                        scroll.owner = %owner,
+                        scroll.regions = %s.regions.iter().map(|(id, _)| id.as_ref()).collect::<Vec<_>>().join(","),
+                        pointer_y = f32::from(event.position.y),
+                        wheel_dy = dy,
+                        remaining_y = s.remaining.y,
+                        "wheel notch"
+                    );
+                }
                 s.owner = Some(owner);
                 // A new notch takes over from any coast.
                 s.stretch = 1.;
@@ -513,6 +559,20 @@ impl SmoothScroll {
             }
         };
         if step.x != 0. || step.y != 0. {
+            {
+                let mut s = state.borrow_mut();
+                s.pending_input += step.y;
+                crate::telemetry::record_step(f64::from(step.y));
+                if let Some(span) = &s.gesture {
+                    tracing::debug!(
+                        parent: span,
+                        step_y = step.y,
+                        remaining_y = s.remaining.y,
+                        scroll.owner = s.owner.as_deref().unwrap_or(""),
+                        "smooth step injected"
+                    );
+                }
+            }
             state.borrow_mut().injecting = true;
             window.dispatch_event(
                 PlatformInput::Scroll(ScrollEvent {
@@ -545,6 +605,8 @@ impl SmoothScroll {
             s.animating = false;
             s.last_tick = None;
             s.owner = None;
+            // Ends the gesture span.
+            s.gesture = None;
         } else {
             Self::schedule(state, window);
         }
