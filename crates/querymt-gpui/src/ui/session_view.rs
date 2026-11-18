@@ -38,6 +38,9 @@ use crate::util::{human_size, workspace_name};
 const OUTPUT_LINES: usize = 80;
 /// Floating composer: height of the fade above it, and its background-colored halo.
 const COMPOSER_FADE_H: f32 = 28.;
+/// Height of the slot the activity bar, waiting bubble and scroll pill float
+/// in above the composer (their pill height).
+const DOCK_ROW_H: f32 = 32.;
 const COMPOSER_HALO_BLUR: f32 = 10.;
 const COMPOSER_HALO_SPREAD: f32 = 2.;
 /// Stacked copies of the halo: more layers = denser edge.
@@ -130,6 +133,8 @@ pub struct Transcript {
     composer_h: Rc<Cell<f32>>,
     /// Previous frame's telemetry sample (only used while export is on).
     probe: Rc<RefCell<ScrollProbe>>,
+    /// Parsed Markdown of the rows, kept while they are off screen.
+    md: md::Kept,
 }
 
 /// Last transcript frame seen by the telemetry sampler.
@@ -344,6 +349,7 @@ struct RenderCtx {
     agent_id: String,
     /// Appearance setting: fade streamed reply and reasoning text in.
     stream_fade: bool,
+    md: md::Kept,
 }
 
 impl RenderCtx {
@@ -390,9 +396,21 @@ impl Transcript {
     pub fn new() -> Self {
         let list = ListState::new(0, ListAlignment::Top, px(1200.));
         list.set_follow_mode(FollowMode::Tail);
+        let items: Rc<RefCell<Vec<Rc<Item>>>> = Rc::default();
+        let md = md::Kept::default();
+        // A row whose Markdown is still parsing measures short: keep that
+        // height provisional so the list neither anchors to it nor re-engages
+        // tail-follow from it.
+        list.set_item_measurement_readiness({
+            let (items, md) = (items.clone(), md.clone());
+            move |ix, cx| {
+                let key = items.borrow().get(ix).map(|i| i.key.clone());
+                key.is_none_or(|key| md.row_ready(&key, cx))
+            }
+        });
         Self {
             list,
-            items: Rc::default(),
+            items,
             sigs: vec![],
             keys: vec![],
             session: String::new(),
@@ -400,6 +418,7 @@ impl Transcript {
             block_scrolls: Rc::default(),
             composer_h: Rc::new(Cell::new(0.)),
             probe: Rc::default(),
+            md,
         }
     }
 
@@ -420,6 +439,7 @@ impl Transcript {
                 };
             }
             self.block_scrolls.borrow_mut().clear();
+            self.md.clear();
             *self.items.borrow_mut() = view.iter().cloned().map(Rc::new).collect();
             self.sigs = sigs;
             self.keys = keys;
@@ -1574,7 +1594,7 @@ fn render_skill_content(call: &ToolCall, skill: &SkillContent<'_>, rc: &RenderCt
                         .rounded_lg()
                         .bg(p.card)
                         .text_sm()
-                        .child(md::markdown(
+                        .child(rc.md.markdown(
                             format!("skill-md-{}", call.id),
                             skill.content.to_string(),
                             p,
@@ -1606,7 +1626,7 @@ fn render_delegate_content(call: &ToolCall, brief: &DelegateBrief, rc: &RenderCt
             div()
                 .min_w_0()
                 .text_sm()
-                .child(md::markdown(
+                .child(rc.md.markdown(
                     format!("delegate-objective-{}", call.id),
                     brief.objective.clone(),
                     p,
@@ -1633,7 +1653,7 @@ fn render_delegate_content(call: &ToolCall, brief: &DelegateBrief, rc: &RenderCt
                     v_flex()
                         .gap_1()
                         .child(div().text_xs().text_color(p.dim).child(label.clone()))
-                        .child(div().min_w_0().text_sm().child(md::markdown(
+                        .child(div().min_w_0().text_sm().child(rc.md.markdown(
                             format!("delegate-detail-{}-{ix}", call.id),
                             text.clone(),
                             p,
@@ -2183,7 +2203,7 @@ fn render_reasoning(thoughts: &[&Thought], live: bool, rc: &RenderCtx) -> AnyEle
                     .items_start()
                     .gap_1p5()
                     .child(div().flex_none().child("-"))
-                    .child(div().flex_1().min_w_0().child(md::markdown(
+                    .child(div().flex_1().min_w_0().child(rc.md.markdown(
                         format!("th-md-{}", t.id),
                         t.text.trim().to_string(),
                         p,
@@ -2194,7 +2214,8 @@ fn render_reasoning(thoughts: &[&Thought], live: bool, rc: &RenderCtx) -> AnyEle
         v_flex()
             .gap_2()
             .children(thoughts.iter().map(|t| {
-                md::markdown(format!("th-md-{}", t.id), t.text.trim().to_string(), p)
+                rc.md
+                    .markdown(format!("th-md-{}", t.id), t.text.trim().to_string(), p)
                     .motion(md::stream_motion(rc.stream_fade))
             }))
             .into_any_element()
@@ -2593,7 +2614,7 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
                             })
                             // Markdown like the desktop app's user messages.
                             .when(!text.is_empty(), |el| {
-                                el.min_w_0().child(md::markdown(
+                                el.min_w_0().child(rc.md.markdown(
                                     format!("umd-{}", item.key),
                                     text.clone(),
                                     p,
@@ -2633,7 +2654,8 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
             .px_1()
             .text_sm()
             .child(
-                md::markdown(format!("md-{}", item.key), text.clone(), p)
+                rc.md
+                    .markdown(format!("md-{}", item.key), text.clone(), p)
                     .motion(md::stream_motion(rc.stream_fade)),
             )
             .when_some(actions, |el, stats| {
@@ -2811,11 +2833,10 @@ fn render_compaction(item: &Item, c: &Compaction, rc: &RenderCtx) -> AnyElement 
         } else {
             div()
                 .text_sm()
-                .child(md::markdown(
-                    format!("cmd-{}", item.key),
-                    c.summary.clone(),
-                    p,
-                ))
+                .child(
+                    rc.md
+                        .markdown(format!("cmd-{}", item.key), c.summary.clone(), p),
+                )
                 .into_any_element()
         };
         div()
@@ -4261,6 +4282,7 @@ impl QmtApp {
             }),
             agent_id: view.agent_id.clone(),
             stream_fade: store.prefs.stream_fade.unwrap_or(true),
+            md: self.transcript.md.clone(),
         });
         self.transcript.sync(&key, &view.items, &rc);
         if !self.transcript.scroll_hooked {
@@ -4453,7 +4475,12 @@ impl QmtApp {
                                         list(self.transcript.list.clone(), move |ix, _, _| {
                                             let item = render_items.borrow().get(ix).cloned();
                                             match item {
-                                                Some(item) => render_item(ix, &item, &rc2),
+                                                Some(item) => {
+                                                    rc2.md.begin_row(&item.key);
+                                                    let el = render_item(ix, &item, &rc2);
+                                                    rc2.md.end_row();
+                                                    el
+                                                }
                                                 None => div().into_any_element(),
                                             }
                                         })
@@ -4766,9 +4793,21 @@ impl QmtApp {
                 })
                 .on_click(cx.listener(|this, _, _, cx| this.scroll_to_latest(cx)))
         });
-        let dock = (activity_bar.is_some() || waiting_bubble.is_some() || scroll_pill.is_some())
-            .then(|| {
-                v_flex().gap_2().children(waiting_panel).child(
+        // The dock floats in a slot of constant height above the composer:
+        // the measured floating area pads the transcript's end, so a dock that
+        // took space when the activity bar or pill appeared moved the content
+        // (40px at the pill, 29px at the bar). The slot keeps the last message
+        // clear of the dock row; the waiting panel grows upward over the
+        // transcript like a popover.
+        let dock = div().relative().flex_none().h(px(DOCK_ROW_H)).child(
+            v_flex()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .gap_2()
+                .children(waiting_panel)
+                .child(
                     h_flex()
                         .px_1()
                         .gap(px(6.4))
@@ -4776,8 +4815,8 @@ impl QmtApp {
                         .children(waiting_bubble)
                         .children(activity_bar)
                         .children(scroll_pill),
-                )
-            });
+                ),
+        );
 
         // ---- requests + composer
         let request_cards: Vec<AnyElement> = requests
@@ -4859,7 +4898,7 @@ impl QmtApp {
                     .max_w(px(CHAT_MAX))
                     .gap_2()
                     .children(request_cards)
-                    .children(dock)
+                    .child(dock)
                     .child(self.smooth_scroll.region("composer", composer)),
             );
 
