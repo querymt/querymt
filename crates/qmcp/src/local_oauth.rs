@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    io::IsTerminal,
     sync::{Arc, Mutex, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -67,7 +68,7 @@ impl OAuthKeys {
     }
 
     /// Load the keys from the QueryMT secret store, creating missing ones.
-    /// A newly created approval password is printed once to stderr.
+    /// A newly created approval password is displayed only on a terminal.
     pub async fn load_or_create() -> Result<Self> {
         let store = SecretStore::new_async()
             .await
@@ -95,10 +96,10 @@ impl OAuthKeys {
             .await
             .context("read OAuth keys from the QueryMT secret store")?;
         if created {
-            eprintln!(
-                "qmcp: created OAuth approval password {password}\n\
-                 qmcp: it is stored as {PASSWORD_KEY}; show it again with `qmt secrets get {PASSWORD_KEY}`"
-            );
+            if std::io::stderr().is_terminal() {
+                eprintln!("qmcp: created OAuth approval password {password}");
+            }
+            eprintln!("qmcp: retrieve the approval password with `qmt secrets get {PASSWORD_KEY}`");
         }
         let signing_key = B64
             .decode(signing_key.trim())
@@ -142,6 +143,7 @@ enum Claims {
 struct PendingCode {
     client_id: String,
     redirect_uri: String,
+    redirect_required: bool,
     challenge: String,
     exp: u64,
 }
@@ -236,6 +238,22 @@ impl LocalOAuth {
         )
     }
 
+    fn matches_resource(&self, requested: &str) -> bool {
+        fn parts(value: &str) -> Option<(&str, &str, &str)> {
+            let (scheme, rest) = value.split_once("://")?;
+            let (authority, path) = rest.split_once('/')?;
+            Some((scheme, authority, path))
+        }
+        let Some((scheme, authority, path)) = parts(requested) else {
+            return false;
+        };
+        let (expected_scheme, expected_authority, expected_path) =
+            parts(&self.0.resource).expect("validated resource URL");
+        scheme.eq_ignore_ascii_case(expected_scheme)
+            && authority.eq_ignore_ascii_case(expected_authority)
+            && path == expected_path
+    }
+
     fn check(&self, params: &AuthorizeParams) -> Result<Approved, Box<Response>> {
         let client_id = params.client_id.as_deref().unwrap_or_default();
         let Some(Claims::Client {
@@ -274,7 +292,7 @@ impl LocalOAuth {
         if params
             .resource
             .as_deref()
-            .is_some_and(|resource| resource != self.0.resource)
+            .is_some_and(|resource| !self.matches_resource(resource))
         {
             return fail("invalid_target");
         }
@@ -471,6 +489,7 @@ async fn authorize_submit(
             PendingCode {
                 client_id: approved.client_id,
                 redirect_uri: approved.redirect_uri.clone(),
+                redirect_required: params.redirect_uri.is_some(),
                 challenge: approved.challenge,
                 exp: now + CODE_TTL,
             },
@@ -504,7 +523,7 @@ fn consent_page(params: &AuthorizeParams, approved: &Approved, error: Option<&st
     let hidden: String = [
         ("response_type", params.response_type.as_deref()),
         ("client_id", Some(approved.client_id.as_str())),
-        ("redirect_uri", Some(approved.redirect_uri.as_str())),
+        ("redirect_uri", params.redirect_uri.as_deref()),
         ("code_challenge", params.code_challenge.as_deref()),
         (
             "code_challenge_method",
@@ -560,7 +579,11 @@ struct TokenParams {
 
 async fn token(State(auth): State<LocalOAuth>, Form(params): Form<TokenParams>) -> Response {
     let resource = &auth.0.resource;
-    if params.resource.as_ref().is_some_and(|r| r != resource) {
+    if params
+        .resource
+        .as_deref()
+        .is_some_and(|r| !auth.matches_resource(r))
+    {
         return oauth_error("invalid_target");
     }
     let client_id = match params.grant_type.as_deref() {
@@ -574,7 +597,12 @@ async fn token(State(auth): State<LocalOAuth>, Form(params): Form<TokenParams>) 
             let valid = |pending: &PendingCode| {
                 pending.exp > now()
                     && params.client_id.as_ref() == Some(&pending.client_id)
-                    && params.redirect_uri.as_ref() == Some(&pending.redirect_uri)
+                    && params
+                        .redirect_uri
+                        .as_ref()
+                        .map_or(!pending.redirect_required, |uri| {
+                            uri == &pending.redirect_uri
+                        })
                     && params.code_verifier.as_deref().is_some_and(|verifier| {
                         B64.encode(Sha256::digest(verifier.as_bytes())) == pending.challenge
                     })

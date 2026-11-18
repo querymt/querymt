@@ -175,7 +175,12 @@ async fn registration_consent_token_refresh_and_mcp_access() {
     );
 
     let client_id = app.register().await;
-    let form = app.authorize_form(&client_id);
+    let mut form = app.authorize_form(&client_id);
+    form.retain(|(name, _)| *name != "redirect_uri");
+    form.iter_mut()
+        .find(|(name, _)| *name == "resource")
+        .unwrap()
+        .1 = "HTTPS://MCP.EXAMPLE.COM/mcp".into();
     let page = app
         .client
         .get(format!("{}/authorize", app.base))
@@ -184,7 +189,9 @@ async fn registration_consent_token_refresh_and_mcp_access() {
         .await
         .unwrap();
     assert_eq!(page.status(), 200);
-    assert!(page.text().await.unwrap().contains("ChatGPT"));
+    let html = page.text().await.unwrap();
+    assert!(html.contains("ChatGPT"));
+    assert!(!html.contains("name=\"redirect_uri\""));
 
     let mut wrong = form.clone();
     wrong.extend([("decision", "approve".into()), ("password", "nope".into())]);
@@ -205,9 +212,8 @@ async fn registration_consent_token_refresh_and_mcp_access() {
         ("grant_type", "authorization_code"),
         ("code", code.as_str()),
         ("client_id", client_id.as_str()),
-        ("redirect_uri", REDIRECT),
         ("code_verifier", VERIFIER),
-        ("resource", RESOURCE),
+        ("resource", "HTTPS://MCP.EXAMPLE.COM/mcp"),
     ];
     let (status, tokens) = app.token(&exchange).await;
     assert_eq!(status, 200, "{tokens}");
