@@ -13,12 +13,31 @@ use crate::theme::{Palette, palette};
 use crate::util::workspace_name;
 
 pub const HEADER_HEIGHT: Pixels = px(44.);
+/// Gap between the title bar's columns.
+const HEADER_GAP: Pixels = px(12.);
+/// Inset of the title bar's right edge.
+const HEADER_PAD_RIGHT: Pixels = px(8.);
 const IS_WEB: bool = cfg!(target_family = "wasm");
 const IS_LINUX: bool = cfg!(target_os = "linux");
 const IS_MACOS: bool = cfg!(target_os = "macos");
 const IS_WINDOWS: bool = cfg!(target_os = "windows");
 
 /// Linux client-side decorations need application-owned header controls.
+/// Session title bar geometry: the width of the brand's lead block, and the
+/// extra base width the right column needs, so the title centres over the
+/// page area (right of a `sidebar` wide sidebar) rather than the window.
+///
+/// The left spacer starts at `pad_left + lead + HEADER_GAP` and the right
+/// column ends `HEADER_PAD_RIGHT` from the window edge; both flex equally.
+/// The lead puts the spacer's start `HEADER_PAD_RIGHT` past the sidebar. When
+/// the left padding alone already reaches further (macOS window buttons over
+/// the collapsed rail), the lead is empty and the right column gets the
+/// difference instead.
+fn session_title_insets(sidebar: Pixels, pad_left: Pixels) -> (Pixels, Pixels) {
+    let lead = sidebar + HEADER_PAD_RIGHT - HEADER_GAP - pad_left;
+    (lead.max(px(0.)), (-lead).max(px(0.)))
+}
+
 fn client_tiling(window: &Window) -> Option<Tiling> {
     match window.window_decorations() {
         Decorations::Client { tiling } if IS_LINUX => Some(tiling),
@@ -193,6 +212,50 @@ impl QmtApp {
         let page_title_center = session_title;
         let page_title_left = div().text_sm().text_color(p.muted).child(page_title);
         let narrow = window.viewport_size().width < px(760.);
+        let pad_left = if IS_MACOS && !window.is_fullscreen() {
+            px(80.)
+        } else {
+            px(14.)
+        };
+        // Session: the title group centres over the page area (right of the
+        // sidebar), where the transcript column is centred, not over the
+        // whole window. The brand sits in a lead block as wide as the
+        // sidebar; the two flex columns after it then mirror each other
+        // inside the page. The lead's width puts the left column's start
+        // `HEADER_PAD_RIGHT` past the sidebar (minus the bar's gap), the same
+        // inset the bar keeps on the right, so the centre lands exactly on
+        // the page's. The block keeps that width even when the brand is wider
+        // (collapsed rail): the brand overflows into the left spacer, which
+        // keeps at least that overflow free, so the title never covers it.
+        let (lead_w, right_extra) = session_title_insets(self.sidebar_width(cx), pad_left);
+        let wordmark = !(is_session && narrow);
+        let brand_overflow = if is_session {
+            let mut brand_w = px(22.);
+            if wordmark {
+                let text = SharedString::from("QueryMT");
+                let run = TextRun {
+                    len: text.len(),
+                    font: Font {
+                        weight: FontWeight::SEMIBOLD,
+                        ..font(gpui_kit::component::Theme::global(cx).font_family.clone())
+                    },
+                    color: p.text,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let size = window.rem_size() * 0.875;
+                // `gap_2` between mark and wordmark, then the shaped text.
+                brand_w += window.rem_size() * 0.5
+                    + window
+                        .text_system()
+                        .shape_line(text, size, &[run], None)
+                        .width();
+            }
+            (brand_w - lead_w).max(px(0.))
+        } else {
+            px(0.)
+        };
 
         let brand = h_flex()
             .gap_2()
@@ -222,7 +285,7 @@ impl QmtApp {
                     ),
             )
             // Narrow session windows drop the wordmark to give the title room.
-            .when(!(is_session && narrow), |el| {
+            .when(wordmark, |el| {
                 el.child(div().text_sm().font_semibold().child("QueryMT"))
             })
             .when(!is_session, |el| {
@@ -234,13 +297,9 @@ impl QmtApp {
             .flex_none()
             .h(HEADER_HEIGHT)
             .w_full()
-            .gap_3()
-            .pr_2()
-            .pl(if IS_MACOS && !window.is_fullscreen() {
-                px(80.)
-            } else {
-                px(14.)
-            })
+            .gap(HEADER_GAP)
+            .pr(HEADER_PAD_RIGHT)
+            .pl(pad_left)
             // No background here: the root paints a rounded `p.bg` underneath,
             // and GPUI's overflow mask is rectangular, so a square quad flush
             // with the top would overpaint the frame's rounded corners.
@@ -284,20 +343,27 @@ impl QmtApp {
                     window.show_window_menu(ev.position)
                 })
             })
-            // Session: three columns whose outer two share one flex basis, so
-            // the title is centred on the window rather than on leftover space.
-            // The sides never shrink below their content (no `min_w_0`), so when
-            // the window narrows only the title gives way and truncates; icons
-            // never slide under each other. Other pages keep the
-            // `QueryMT / Page` breadcrumb on the left.
-            .child(
-                h_flex()
-                    .flex_1()
-                    .gap_3()
-                    .child(brand)
-                    .when(!is_session, |el| el.child(page_title_left))
-                    .child(h_flex().gap_1p5().children(slot)),
-            )
+            // Session: two columns sharing one flex basis around the title, so
+            // it is centred on the page area rather than on leftover space.
+            // The sides never shrink below their content (no `min_w_0`): when
+            // the actions need the room, the title moves left, and only then
+            // gives way and truncates; icons never slide under each other.
+            // Other pages keep the `QueryMT / Page` breadcrumb on the left.
+            .map(|el| {
+                if is_session {
+                    el.child(h_flex().flex_none().w(lead_w).child(brand))
+                        .child(div().flex_1().min_w(brand_overflow))
+                } else {
+                    el.child(
+                        h_flex()
+                            .flex_1()
+                            .gap_3()
+                            .child(brand)
+                            .child(page_title_left)
+                            .child(h_flex().gap_1p5().children(slot)),
+                    )
+                }
+            })
             // The title stays a drag handle; it truncates before the sides shrink.
             .children(page_title_center.map(|title| {
                 h_flex()
@@ -313,6 +379,10 @@ impl QmtApp {
                     .flex_1()
                     .justify_end()
                     .gap_1()
+                    // Leading padding adds to this column's flex base, so it
+                    // takes `right_extra` more than the left spacer: that
+                    // offsets a left side pushed past the sidebar edge.
+                    .when(is_session, |el| el.pl(right_extra))
                     .children(session_actions)
                     .child(
                         kit::title_icon_button(
@@ -351,5 +421,32 @@ impl QmtApp {
                         )
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HEADER_GAP, HEADER_PAD_RIGHT, session_title_insets};
+    use gpui_kit::{Pixels, px};
+
+    /// Centre of the title between the two equal flex columns, for a window
+    /// `width` wide: halfway between the left spacer's start and the right
+    /// column's end once its extra base width is taken off.
+    fn title_centre(sidebar: f32, pad_left: f32, width: f32) -> Pixels {
+        let (lead, extra) = session_title_insets(px(sidebar), px(pad_left));
+        let start = px(pad_left) + lead + HEADER_GAP;
+        let end = px(width) - HEADER_PAD_RIGHT - extra;
+        (start + end) / 2.
+    }
+
+    #[test]
+    fn session_title_centres_over_the_page_area() {
+        // Expanded sidebar, collapsed rail, and macOS window buttons over the rail.
+        for (sidebar, pad_left) in [(253., 14.), (56., 14.), (253., 80.), (56., 80.)] {
+            for width in [1300., 1960.] {
+                let page_centre = px((sidebar + width) / 2.);
+                assert_eq!(title_centre(sidebar, pad_left, width), page_centre);
+            }
+        }
     }
 }

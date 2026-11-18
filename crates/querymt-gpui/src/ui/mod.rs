@@ -34,6 +34,11 @@ gpui_kit::actions!(querymt, [ToggleSidebar]);
 use crate::util::{short_time, workspace_name};
 pub use keys::bind_keys;
 
+/// Width of the expanded sidebar column, without its 1px hairline.
+const SIDEBAR_W: f32 = 252.;
+/// Width of the collapsed sidebar rail.
+const RAIL_W: f32 = 56.;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Start,
@@ -616,7 +621,7 @@ impl QmtApp {
         // card, no borders; tiles are ghost buttons that only fill on hover.
         div()
             .flex_none()
-            .w(px(56.))
+            .w(px(RAIL_W))
             .h_full()
             .pl_2()
             .pb_2()
@@ -715,6 +720,16 @@ impl QmtApp {
                     .child(self.collapse_button(true, cx)),
             )
             .into_any_element()
+    }
+
+    /// Width the sidebar (or the collapsed rail) takes from the window's left
+    /// edge, including the hairline after the full sidebar.
+    pub(super) fn sidebar_width(&self, cx: &App) -> Pixels {
+        if self.store.read(cx).prefs.sidebar_collapsed {
+            px(RAIL_W)
+        } else {
+            px(SIDEBAR_W + 1.)
+        }
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -930,7 +945,7 @@ impl QmtApp {
             .items_stretch()
             .child(
                 v_flex()
-                    .w(px(252.))
+                    .w(px(SIDEBAR_W))
                     .h_full()
                     .pl(px(9.))
                     .pr_2()
