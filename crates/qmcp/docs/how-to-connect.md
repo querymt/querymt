@@ -8,6 +8,7 @@
 | [Bearer over HTTPS](#bearer-over-https) | Clients with custom authorization headers | Shared token |
 | [Private tunnel](#private-tunnel-chatgpt) | ChatGPT without a public endpoint | OpenAI tunnel access |
 | [OAuth over HTTPS](#oauth-over-https-chatgpt) | Public authenticated ChatGPT connections | External OAuth provider |
+| [Built-in OAuth](#built-in-oauth-chatgpt) | Public ChatGPT connections without an identity provider | qmcp approval password |
 
 Bearer and OAuth are HTTP authentication modes. The tunnel privately connects
 ChatGPT to qmcp over stdio; it is not another MCP transport.
@@ -135,6 +136,28 @@ The default `qmcp:access` scope grants all tools on this backend, not isolated
 per-user workspaces. Tokens are checked on every request without caching;
 provider outages deny access. Live ChatGPT sign-in depends on your provider
 configuration and has not been verified by the project's mock-provider tests.
+
+## Built-in OAuth (ChatGPT)
+
+qmcp can act as its own OAuth server (dynamic client registration,
+authorization code + PKCE `S256`). Run it behind your HTTPS proxy with the public
+`/mcp` URL:
+
+```sh
+qmcp --transport http --oauth-local-resource https://mcp.example.com/mcp
+```
+
+On first start qmcp stores a signing key and an approval password in the
+QueryMT secret store and prints the password once. Show or change it with
+`qmt secrets get|set qmcp.oauth.password`. Deleting `qmcp.oauth.signing_key`
+revokes all clients and tokens; ChatGPT must then reconnect.
+
+Forward `/mcp`, `/register`, `/authorize`, `/token`,
+`/.well-known/oauth-authorization-server` and both
+`/.well-known/oauth-protected-resource` paths. In ChatGPT add a custom MCP server
+with the `/mcp` URL and select **OAuth**; approve the connection with the
+password. On Linux without Secret Service or systemd credentials the store falls
+back to keyutils, which loses the keys on reboot.
 
 ## Remote Access Checklist
 

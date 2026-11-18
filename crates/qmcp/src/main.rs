@@ -47,9 +47,14 @@ struct Cli {
         long,
         env = "QMCP_BEARER_TOKEN",
         hide_env_values = true,
-        conflicts_with = "oauth_config"
+        conflicts_with_all = ["oauth_config", "oauth_local_resource"]
     )]
     bearer_token: Option<String>,
+
+    /// Built-in OAuth server for the public HTTPS /mcp URL (HTTP only). Keys are
+    /// kept in the QueryMT secret store; a new approval password is printed once.
+    #[arg(long, conflicts_with = "oauth_config")]
+    oauth_local_resource: Option<String>,
 
     /// OAuth resource/provider JSON configuration (HTTP only; see README).
     #[arg(long, requires = "oauth_client_secret")]
@@ -88,6 +93,7 @@ async fn main() -> Result<()> {
         Transport::Stdio => {
             if cli.bearer_token.is_some()
                 || cli.oauth_config.is_some()
+                || cli.oauth_local_resource.is_some()
                 || !cli.allowed_hosts.is_empty()
             {
                 bail!("HTTP authentication options require --transport http");
@@ -109,6 +115,10 @@ async fn main() -> Result<()> {
                     .context("OAuth client secret is required")?;
                 let auth = qmcp::oauth::OAuthAuth::new(config, secret)?;
                 transport::http_router_with_oauth(server, cli.bind, auth, &cli.allowed_hosts)?
+            } else if let Some(resource) = cli.oauth_local_resource {
+                let keys = qmcp::local_oauth::OAuthKeys::load_or_create().await?;
+                let auth = qmcp::local_oauth::LocalOAuth::new(&resource, keys)?;
+                transport::http_router_with_local_oauth(server, cli.bind, auth, &cli.allowed_hosts)?
             } else {
                 transport::http_router_with_auth(server, cli.bind, token, &cli.allowed_hosts)?
             };
@@ -193,5 +203,23 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn local_oauth_excludes_other_http_authentication() {
+        for other in [
+            ["--bearer-token", "static-token"],
+            ["--oauth-config", "oauth.json"],
+        ] {
+            let mut args = vec![
+                "qmcp",
+                "--transport",
+                "http",
+                "--oauth-local-resource",
+                "https://mcp.example.com/mcp",
+            ];
+            args.extend(other);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 }
