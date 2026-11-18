@@ -214,21 +214,69 @@ fn anthropic_refresh_retryable(error: &anthropic_auth::AnthropicAuthError) -> bo
     error.is_transient()
 }
 
+/// OAuth error codes meaning the refresh token itself is revoked, expired or
+/// already rotated, so only signing in again helps.
+const REFRESH_REJECTION_CODES: &[&str] = &[
+    "invalid_grant",
+    "refresh_token_expired",
+    "refresh_token_reused",
+    "refresh_token_invalidated",
+];
+
+/// The refresh-rejection code in an HTTP error body, if there is one.
+///
+/// Looks for a JSON object anywhere in `body` (libraries prefix it with the
+/// status line) and reads its `error` member, either a string
+/// (`{"error":"invalid_grant"}`) or an object with a `code`/`type`.
+/// Non-JSON bodies, such as an HTML page from a proxy, never match.
+fn refresh_rejection_code(body: &str) -> Option<&'static str> {
+    let json = body.get(body.find('{')?..=body.rfind('}')?)?;
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let error = value.get("error")?;
+    let code = match error {
+        serde_json::Value::String(code) => code.as_str(),
+        serde_json::Value::Object(map) => map
+            .get("code")
+            .or_else(|| map.get("type"))
+            .and_then(|code| code.as_str())?,
+        _ => return None,
+    };
+    REFRESH_REJECTION_CODES
+        .iter()
+        .copied()
+        .find(|known| *known == code)
+}
+
 /// Map a final Anthropic refresh failure to an error callers can classify.
 ///
-/// 400/401/403 on a refresh means the refresh token is revoked, expired or
-/// already rotated (`invalid_grant`), so only signing in again helps. Anything
-/// else is passed through unchanged.
+/// Only a 400/401/403 whose body carries a refresh-rejection code such as
+/// `invalid_grant` means the login is dead. Any other failure (a proxy error
+/// page, an unrelated 4xx) is passed through unchanged.
 fn map_anthropic_refresh_error(
     display: &str,
     error: anthropic_auth::AnthropicAuthError,
 ) -> anyhow::Error {
     if error.is_credential_rejected()
         && let anthropic_auth::AnthropicAuthError::Http { body, .. } = &error
+        && let Some(code) = refresh_rejection_code(body)
     {
-        let first_line = body.lines().next().unwrap_or_default();
-        let detail: String = first_line.chars().take(200).collect();
-        return anyhow::Error::new(TokenRefreshError::relogin(display, detail));
+        return anyhow::Error::new(TokenRefreshError::relogin(display, code));
+    }
+    error.into()
+}
+
+/// Map a Codex refresh failure to an error callers can classify.
+///
+/// `openai-auth` reports a rejected refresh as an HTTP-style error carrying the
+/// response body. Only a rejection code in that body means signing in again is
+/// required; connection failures and server outages stay transient.
+fn map_codex_refresh_error(display: &str, error: openai_auth::OpenAIAuthError) -> anyhow::Error {
+    use openai_auth::OpenAIAuthError::{ApiKeyExchange, Http};
+    if let ApiKeyExchange { status, body } | Http { status, body } = &error
+        && matches!(status, 400 | 401 | 403)
+        && let Some(code) = refresh_rejection_code(body)
+    {
+        return anyhow::Error::new(TokenRefreshError::relogin(display, code));
     }
     error.into()
 }
@@ -307,7 +355,11 @@ impl OAuthProvider for CodexProvider {
     }
 
     async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
-        let tokens = self.client.refresh_token(refresh_token).await?;
+        let tokens = self
+            .client
+            .refresh_token(refresh_token)
+            .await
+            .map_err(|error| map_codex_refresh_error(self.display_name(), error))?;
 
         Ok(convert_openai_tokens(tokens))
     }
@@ -668,9 +720,14 @@ impl OAuthProvider for XaiProvider {
             .request_async(&http_client)
             .await
             .map_err(|error| {
+                // Only an error response from the token endpoint means the
+                // refresh token was rejected; transport or parse failures
+                // may succeed on a later attempt.
+                let relogin_required =
+                    matches!(error, oauth2::RequestTokenError::ServerResponse(_));
                 anyhow!(XaiOAuthError::RefreshFailed {
                     message: error.to_string(),
-                    relogin_required: true,
+                    relogin_required,
                 })
             })?;
 
@@ -1663,12 +1720,22 @@ mod token_cache {
         provider: &str,
         refresh_token: &str,
     ) -> Option<TokenRefreshError> {
+        refresh_failure_at(provider, refresh_token, Instant::now())
+    }
+
+    /// [`refresh_failure`] evaluated at `now`, so back-off expiry can be tested
+    /// without sleeping.
+    pub(super) fn refresh_failure_at(
+        provider: &str,
+        refresh_token: &str,
+        now: Instant,
+    ) -> Option<TokenRefreshError> {
         let mut state = state();
         let failure = state.refresh_failures.get(provider)?;
         let stale = failure.fingerprint != fingerprint(refresh_token);
         let relogin = failure.error.relogin_required();
         let remaining = REFRESH_FAILURE_BACKOFF
-            .checked_sub(failure.at.elapsed())
+            .checked_sub(now.saturating_duration_since(failure.at))
             .filter(|remaining| !remaining.is_zero());
         let error = failure.error.clone();
         if stale || (!relogin && remaining.is_none()) {
@@ -2058,6 +2125,30 @@ mod tests {
         assert!(!hit.relogin_required());
         // The remaining back-off is reported, like the keyring back-off message.
         assert!(hit.to_string().contains("retrying in"), "{hit}");
+
+        // Still blocked just before the back-off ends, retryable right after.
+        let failed_at = std::time::Instant::now();
+        let just_before = failed_at + token_cache::REFRESH_FAILURE_BACKOFF - Duration::from_secs(1);
+        assert!(token_cache::refresh_failure_at(provider, "tok", just_before).is_some());
+        let after = failed_at + token_cache::REFRESH_FAILURE_BACKOFF + Duration::from_secs(1);
+        assert!(token_cache::refresh_failure_at(provider, "tok", after).is_none());
+        // The expired entry is dropped.
+        assert!(token_cache::refresh_failure(provider, "tok").is_none());
+        token_cache::clear(provider);
+    }
+
+    #[test]
+    fn rejected_refresh_token_is_not_released_by_elapsed_time() {
+        let provider = "refresh-rejected-time-test";
+        token_cache::record_refresh_failure(
+            provider,
+            "tok",
+            TokenRefreshError::relogin("Test", "invalid_grant"),
+        );
+        let later = std::time::Instant::now()
+            + token_cache::REFRESH_FAILURE_BACKOFF
+            + Duration::from_secs(60);
+        assert!(token_cache::refresh_failure_at(provider, "tok", later).is_some());
         token_cache::clear(provider);
     }
 
@@ -2082,30 +2173,107 @@ mod tests {
     #[test]
     fn anthropic_credential_rejection_requires_relogin() {
         use anthropic_auth::AnthropicAuthError::Http;
+        // The library renders the body as `HTTP <status> - <raw>\nHint: ...`.
+        let rejection = |status| Http {
+            status,
+            body: format!(
+                "HTTP {status} - {{\"error\":\"invalid_grant\",\"error_description\":\"expired\"}}\nHint: retry"
+            ),
+        };
         for status in [400, 401, 403] {
-            let error = map_anthropic_refresh_error(
-                "Anthropic",
-                Http {
+            let error = map_anthropic_refresh_error("Anthropic", rejection(status));
+            let typed = token_refresh_error(&error).expect("typed refresh error");
+            assert!(typed.relogin_required(), "status {status}");
+            assert_eq!(typed.provider(), "Anthropic");
+            assert_eq!(typed.detail(), "invalid_grant");
+        }
+        // Not a refresh rejection: statuses outside 400/401/403, a proxy error
+        // page, or an unrelated 4xx error code.
+        let others = [
+            Http {
+                status: 429,
+                body: "busy".into(),
+            },
+            Http {
+                status: 503,
+                body: "{\"error\":\"invalid_grant\"}".into(),
+            },
+            Http {
+                status: 403,
+                body: "HTTP 403 - <html>Forbidden</html>".into(),
+            },
+            Http {
+                status: 400,
+                body: "HTTP 400 - {\"error\":\"invalid_request\"}".into(),
+            },
+        ];
+        for other in others {
+            let error = map_anthropic_refresh_error("Anthropic", other);
+            assert!(token_refresh_error(&error).is_none());
+        }
+    }
+
+    #[test]
+    fn refresh_rejection_code_reads_known_codes_only() {
+        assert_eq!(
+            refresh_rejection_code("{\"error\":\"invalid_grant\"}"),
+            Some("invalid_grant")
+        );
+        assert_eq!(
+            refresh_rejection_code("{\"error\":{\"code\":\"refresh_token_expired\"}}"),
+            Some("refresh_token_expired")
+        );
+        assert_eq!(
+            refresh_rejection_code("{\"error\":{\"type\":\"invalid_grant\"}}"),
+            Some("invalid_grant")
+        );
+        assert_eq!(refresh_rejection_code("{\"error\":\"server_error\"}"), None);
+        assert_eq!(refresh_rejection_code("<html>invalid_grant</html>"), None);
+        assert_eq!(refresh_rejection_code("} not json {"), None);
+        assert_eq!(refresh_rejection_code(""), None);
+    }
+
+    #[test]
+    fn codex_refresh_rejection_requires_relogin_but_outages_do_not() {
+        use openai_auth::OpenAIAuthError::{ApiKeyExchange, Http};
+        let body = "{\"error\":{\"code\":\"refresh_token_expired\"}}";
+        for status in [400, 401] {
+            let error = map_codex_refresh_error(
+                "Codex",
+                ApiKeyExchange {
                     status,
-                    body: "invalid_grant\nHint: expired".into(),
+                    body: body.into(),
                 },
             );
             let typed = token_refresh_error(&error).expect("typed refresh error");
             assert!(typed.relogin_required(), "status {status}");
-            assert_eq!(typed.provider(), "Anthropic");
-            // Only the first line of the body is kept.
-            assert_eq!(typed.detail(), "invalid_grant");
+            assert_eq!(typed.detail(), "refresh_token_expired");
         }
-        for status in [429, 500, 503] {
-            let error = map_anthropic_refresh_error(
-                "Anthropic",
-                Http {
-                    status,
-                    body: "busy".into(),
-                },
-            );
-            assert!(token_refresh_error(&error).is_none(), "status {status}");
-        }
+        let error = map_codex_refresh_error(
+            "Codex",
+            Http {
+                status: 400,
+                body: body.into(),
+            },
+        );
+        assert!(token_refresh_error(&error).is_some());
+        // A server outage, even with a rejection-looking body, stays transient.
+        let error = map_codex_refresh_error(
+            "Codex",
+            ApiKeyExchange {
+                status: 503,
+                body: body.into(),
+            },
+        );
+        assert!(token_refresh_error(&error).is_none());
+        let error = map_codex_refresh_error(
+            "Codex",
+            ApiKeyExchange {
+                status: 400,
+                body: "{\"error\":\"other\"}".into(),
+            },
+        );
+        assert!(token_refresh_error(&error).is_none());
     }
 
     #[test]

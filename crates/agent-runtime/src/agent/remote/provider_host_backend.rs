@@ -8,6 +8,29 @@ use querymt_remote::{
 };
 use std::sync::Arc;
 
+/// Map a session error to the host error sent to the peer.
+///
+/// A failed credential refresh keeps its classification: a rejected login
+/// arrives as a non-retryable `AuthError`, a temporary failure as a retryable
+/// `Transport` error. Everything else is an opaque internal error.
+fn host_error(
+    operation: &str,
+    context: Option<String>,
+    error: crate::session::error::SessionError,
+) -> RemoteProviderHostError {
+    use crate::session::error::SessionError;
+    match error {
+        error @ SessionError::CredentialRefresh { .. } => RemoteProviderHostError::provider_chat(
+            operation,
+            &querymt::error::LLMError::from(error),
+        ),
+        error => RemoteProviderHostError::Internal(match context {
+            Some(context) => format!("{context}: {error}"),
+            None => error.to_string(),
+        }),
+    }
+}
+
 struct AgentConfigProviderBackend {
     config: Arc<AgentConfig>,
 }
@@ -32,7 +55,7 @@ impl RemoteProviderBackend for AgentConfigProviderBackend {
             )
             .await
             .map(|snapshot| snapshot.contract_info())
-            .map_err(|error| RemoteProviderHostError::Internal(error.to_string()))
+            .map_err(|error| host_error("contract_info", None, error))
     }
 
     async fn build_provider(
@@ -47,10 +70,14 @@ impl RemoteProviderBackend for AgentConfigProviderBackend {
             )
             .await
             .map_err(|e| {
-                RemoteProviderHostError::Internal(format!(
-                    "ProviderHostActor: failed to build provider '{}' model '{}': {}",
-                    request.provider_name, request.model, e
-                ))
+                host_error(
+                    "build_provider",
+                    Some(format!(
+                        "ProviderHostActor: failed to build provider '{}' model '{}'",
+                        request.provider_name, request.model
+                    )),
+                    e,
+                )
             })
     }
 }
