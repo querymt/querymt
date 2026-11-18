@@ -24,6 +24,18 @@ remote="${REMOTE:-origin}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(git -C "$here" rev-parse --show-toplevel)"
 
+# Resolve the branch explicitly via refs/heads/ so a same-named path can never
+# be mistaken for it. mike creates the local branch from $remote/$branch during
+# deploy; fall back to doing that ourselves if the script is run standalone.
+if ! git -C "$repo" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
+  if git -C "$repo" rev-parse --verify --quiet "refs/remotes/$remote/$branch" >/dev/null; then
+    git -C "$repo" branch --quiet "$branch" "refs/remotes/$remote/$branch"
+  else
+    echo "error: branch '$branch' not found locally or on '$remote'" >&2
+    exit 1
+  fi
+fi
+
 wt="$(mktemp -d)"
 cleanup() { git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1 || true; }
 trap cleanup EXIT

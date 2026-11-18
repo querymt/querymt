@@ -40,7 +40,7 @@ jobs:
         if: github.ref == 'refs/heads/main'
         run: |
           mike deploy --push --update-aliases latest
-          mike set-default --push latest
+          mike set-default --push -T pages-root/redirect.html latest
         working-directory: ./docs
 
       - name: Deploy documentation for tagged release
@@ -48,5 +48,12 @@ jobs:
         run: |
           VERSION=$(echo $GITHUB_REF_NAME | sed -e 's/^v//' | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')
           mike deploy --push --update-aliases $VERSION stable
-          mike set-default --push stable
+          mike set-default --push -T pages-root/redirect.html stable
+        working-directory: ./docs
+
+      # mike only manages version directories and the root index.html. Root
+      # 404.html and _redirects are needed so Cloudflare Pages doesn't serve the
+      # root redirect page for unknown paths (which looped: /core/latest/latest/...).
+      - name: Sync gh-pages root files (404.html, _redirects)
+        run: ./pages-root/sync-root.sh --push latest
         working-directory: ./docs

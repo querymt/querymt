@@ -1,5 +1,5 @@
 # Cloudflare Pages redirects, copied to the root of the gh-pages branch by
-# docs/gh-pages/sync-root.sh (see .github/workflows/publish-docs.yml).
+# docs/pages-root/sync-root.sh (see .github/workflows/publish-docs.yml).
 #
 # The docs are versioned with mike, so every page lives under /<version>/.
 # These rules keep pre-versioning links (e.g. /core/available-providers/)
