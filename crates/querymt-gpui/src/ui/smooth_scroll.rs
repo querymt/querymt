@@ -249,17 +249,7 @@ impl Element for ScrollRegion {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let raw = bounds;
         let bounds = bounds.intersect(&window.content_mask().bounds);
-        if crate::telemetry::enabled() {
-            tracing::trace!(
-                scroll.region = %self.id,
-                raw_y = f32::from(raw.origin.y),
-                raw_h = f32::from(raw.size.height),
-                visible_h = f32::from(bounds.size.height),
-                "scroll region prepaint"
-            );
-        }
         if bounds.size.width > px(0.) && bounds.size.height > px(0.) {
             // Parents register before children; deferred overlays register last.
             self.state
