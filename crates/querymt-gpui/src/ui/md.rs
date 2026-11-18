@@ -7,8 +7,12 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use gpui_kit::component::text::{
-    MarkdownNode, TextView, TextViewMotion, TextViewStyle, markdown_ast,
+    MarkdownNode, TextView, TextViewMotion, TextViewState, TextViewStyle, markdown_ast,
 };
 use gpui_kit::component::{Sizable as _, Theme, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -53,77 +57,249 @@ fn code_lang(lang: Option<&str>) -> &str {
 }
 
 /// Markdown view for transcript text; `id` must be unique in the window.
+/// The transcript itself uses [`Kept::markdown`].
+#[cfg(test)]
 pub fn markdown(
     id: impl Into<SharedString>,
     text: impl Into<SharedString>,
     p: &Palette,
 ) -> TextView {
     let id: SharedString = id.into();
-    let table_prefix = id.clone();
-    TextView::markdown(id, text)
-        .style(TextViewStyle {
-            code_block: StyleRefinement::default()
-                .rounded(px(8.))
-                .pt(px(42.))
-                .pb_3()
-                .text_size(px(13.)),
-            ..TextViewStyle::default()
-        })
-        .inline_code_style(inline_code_style(p))
-        .code_block_actions(|block, _, cx| {
-            let p = *palette(cx);
-            let lang = block.lang();
-            let row = h_flex()
-                .w_full()
-                .id("code-header")
-                .justify_between()
-                .gap_3()
-                .h(px(30.))
-                .pl_3()
-                .pr_1()
-                .border_b_1()
-                .border_color(p.border)
-                .font_family(Theme::global(cx).font_family.clone())
-                .text_xs()
-                .text_color(p.muted)
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .child(code_lang(lang.as_deref()).to_string()),
-                )
-                .child(CopyButton {
-                    id: "copy".into(),
-                    value: block.code(),
-                });
-            #[cfg(test)]
-            let row = {
-                use gpui_kit::test::TestSupportExt as _;
-                row.test_support()
-            };
-            CodeHeader {
-                row: row.into_any_element(),
+    styled(TextView::markdown(id.clone(), text), id, p)
+}
+
+/// Transcript styling and extensions; `id` prefixes the table ids.
+fn styled(view: TextView, id: SharedString, p: &Palette) -> TextView {
+    let table_prefix = id;
+    view.style(TextViewStyle {
+        code_block: StyleRefinement::default()
+            .rounded(px(8.))
+            .pt(px(42.))
+            .pb_3()
+            .text_size(px(13.)),
+        ..TextViewStyle::default()
+    })
+    .inline_code_style(inline_code_style(p))
+    .code_block_actions(|block, _, cx| {
+        let p = *palette(cx);
+        let lang = block.lang();
+        let row = h_flex()
+            .w_full()
+            .id("code-header")
+            .justify_between()
+            .gap_3()
+            .h(px(30.))
+            .pl_3()
+            .pr_1()
+            .border_b_1()
+            .border_color(p.border)
+            .font_family(Theme::global(cx).font_family.clone())
+            .text_xs()
+            .text_color(p.muted)
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .child(code_lang(lang.as_deref()).to_string()),
+            )
+            .child(CopyButton {
+                id: "copy".into(),
+                value: block.code(),
+            });
+        #[cfg(test)]
+        let row = {
+            use gpui_kit::test::TestSupportExt as _;
+            row.test_support()
+        };
+        CodeHeader {
+            row: row.into_any_element(),
+        }
+    })
+    .markdown_block_parser(|node, cx| match node {
+        markdown_ast::Node::Table(_) => {
+            let source = cx.node_source(node)?.to_string();
+            Some(
+                MarkdownNode::new(TABLE_BLOCK, source.clone())
+                    .text(source.clone())
+                    .markdown(source),
+            )
+        }
+        _ => None,
+    })
+    .markdown_block_renderer(TABLE_BLOCK, move |node, _, _| {
+        let Some(source) = node.data::<String>() else {
+            return div().into_any_element();
+        };
+        let start = node.source_range().map_or(0, |r| r.start);
+        let id = format!("{table_prefix}-table-{start}");
+        table_card(&id, source).into_any_element()
+    })
+}
+
+/// Parsed Markdown of transcript rows, kept for the open session.
+///
+/// A [`TextView::markdown`] keeps its parsed document in element state, which
+/// GPUI drops once the element skips a frame. The transcript list does not
+/// render rows above the viewport, so a reply scrolled out at the top lost its
+/// document, and on scrolling back a reply over the synchronous parse limit
+/// first laid out empty: the list took that as the row's height. Keeping the
+/// state here preserves the document; [`Self::row_ready`] reports a parse that
+/// is still pending, so the list keeps such a height provisional.
+#[derive(Clone, Default)]
+pub struct Kept(Rc<RefCell<KeptInner>>);
+
+#[derive(Default)]
+struct KeptInner {
+    views: HashMap<String, KeptView>,
+    /// Transcript row key → ids of the views it built when last rendered.
+    rows: HashMap<String, Vec<String>>,
+    /// Row being rendered, which views built now belong to.
+    row: Option<String>,
+}
+
+struct KeptView {
+    state: Entity<TextViewState>,
+    text: SharedString,
+    /// Set while the list was told the row is not ready; the next parse
+    /// commit then asks for a frame so the list measures the row again.
+    awaited: Rc<Cell<bool>>,
+    _observe: Subscription,
+}
+
+impl KeptView {
+    /// A full replacement (a new view, or new text) has not been parsed yet.
+    /// Streamed appends are not pending: the committed document is a prefix.
+    fn parse_pending(&self, cx: &App) -> bool {
+        let rendered = self.state.read(cx).rendered_text();
+        let source = rendered.source();
+        !self.text.starts_with(source) || (source.is_empty() && !self.text.is_empty())
+    }
+}
+
+impl Kept {
+    /// Drop every kept view (another session opened).
+    pub fn clear(&self) {
+        *self.0.borrow_mut() = KeptInner::default();
+    }
+
+    /// Views built from now until [`Self::end_row`] belong to row `key`.
+    pub fn begin_row(&self, key: &str) {
+        let mut inner = self.0.borrow_mut();
+        inner.rows.insert(key.to_string(), Vec::new());
+        inner.row = Some(key.to_string());
+    }
+
+    pub fn end_row(&self) {
+        self.0.borrow_mut().row = None;
+    }
+
+    /// Whether every view of row `key` shows its current text, so the row's
+    /// measured height is final.
+    pub fn row_ready(&self, key: &str, cx: &App) -> bool {
+        let inner = self.0.borrow();
+        let Some(ids) = inner.rows.get(key) else {
+            return true;
+        };
+        let mut ready = true;
+        for view in ids.iter().filter_map(|id| inner.views.get(id)) {
+            if view.parse_pending(cx) {
+                view.awaited.set(true);
+                ready = false;
             }
-        })
-        .markdown_block_parser(|node, cx| match node {
-            markdown_ast::Node::Table(_) => {
-                let source = cx.node_source(node)?.to_string();
-                Some(
-                    MarkdownNode::new(TABLE_BLOCK, source.clone())
-                        .text(source.clone())
-                        .markdown(source),
-                )
+        }
+        ready
+    }
+
+    /// Transcript Markdown whose parsed document outlives the element;
+    /// `id` must be unique in the window.
+    pub fn markdown(
+        &self,
+        id: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        p: &Palette,
+    ) -> KeptMarkdown {
+        let id: SharedString = id.into();
+        {
+            let mut inner = self.0.borrow_mut();
+            if let Some(row) = inner.row.clone()
+                && let Some(ids) = inner.rows.get_mut(&row)
+            {
+                ids.push(id.to_string());
             }
-            _ => None,
-        })
-        .markdown_block_renderer(TABLE_BLOCK, move |node, _, _| {
-            let Some(source) = node.data::<String>() else {
-                return div().into_any_element();
-            };
-            let start = node.source_range().map_or(0, |r| r.start);
-            let id = format!("{table_prefix}-table-{start}");
-            table_card(&id, source).into_any_element()
-        })
+        }
+        KeptMarkdown {
+            kept: self.clone(),
+            id,
+            text: text.into(),
+            p: *p,
+            motion: None,
+        }
+    }
+
+    fn state(&self, id: &str, text: &SharedString, cx: &mut App) -> Entity<TextViewState> {
+        let existing = self.0.borrow_mut().views.get_mut(id).map(|view| {
+            let same = view.text.as_ptr() == text.as_ptr() && view.text.len() == text.len();
+            let changed = !same && view.text != *text;
+            if changed {
+                view.text = text.clone();
+            }
+            (view.state.clone(), changed)
+        });
+        if let Some((state, changed)) = existing {
+            if changed {
+                state.update(cx, |state, cx| state.set_text(text, cx));
+            }
+            return state;
+        }
+        let state = cx.new(|cx| TextViewState::markdown(text, cx));
+        let awaited = Rc::new(Cell::new(false));
+        let observe = cx.observe(&state, {
+            let awaited = awaited.clone();
+            move |_, cx| {
+                if awaited.replace(false) {
+                    cx.refresh_windows();
+                }
+            }
+        });
+        self.0.borrow_mut().views.insert(
+            id.to_string(),
+            KeptView {
+                state: state.clone(),
+                text: text.clone(),
+                awaited,
+                _observe: observe,
+            },
+        );
+        state
+    }
+}
+
+/// See [`Kept::markdown`].
+#[derive(IntoElement)]
+pub struct KeptMarkdown {
+    kept: Kept,
+    id: SharedString,
+    text: SharedString,
+    p: Palette,
+    motion: Option<TextViewMotion>,
+}
+
+impl KeptMarkdown {
+    pub fn motion(mut self, motion: TextViewMotion) -> Self {
+        self.motion = Some(motion);
+        self
+    }
+}
+
+impl RenderOnce for KeptMarkdown {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let state = self.kept.state(&self.id, &self.text, cx);
+        let view = styled(TextView::new(&state), self.id, &self.p);
+        match self.motion {
+            Some(motion) => view.motion(motion),
+            None => view,
+        }
+    }
 }
 
 /// Expands the built-in code block's corner action slot into a header.
@@ -401,6 +577,35 @@ pub fn plain_text(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_LANG, code_lang, plain_text, stream_motion};
+
+    /// A reply over the synchronous parse limit is not ready until its parse
+    /// lands, and its document survives being rebuilt (scrolled back in).
+    #[gpui_kit::test]
+    fn kept_row_waits_for_large_parse_and_keeps_document(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let kept = super::Kept::default();
+        let text: gpui_kit::SharedString = "word ".repeat(2000).into();
+        let p = cx.update(|cx| *crate::theme::palette(cx));
+        kept.begin_row("row");
+        let _ = kept.markdown("md-row", text.clone(), &p);
+        kept.end_row();
+        let state = cx.update(|cx| kept.state("md-row", &text, cx));
+        assert!(
+            !cx.update(|cx| kept.row_ready("row", cx)),
+            "parse still pending"
+        );
+        cx.run_until_parked();
+        assert!(cx.update(|cx| kept.row_ready("row", cx)), "parse landed");
+        // Rebuilding the row reuses the parsed state instead of starting over.
+        let again = cx.update(|cx| kept.state("md-row", &text, cx));
+        assert_eq!(state.entity_id(), again.entity_id());
+        assert!(cx.update(|cx| kept.row_ready("row", cx)));
+        // Rows the store never saw do not hold the list back.
+        assert!(cx.update(|cx| kept.row_ready("other", cx)));
+    }
 
     #[test]
     fn stream_motion_follows_the_setting() {
