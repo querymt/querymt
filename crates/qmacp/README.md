@@ -155,8 +155,9 @@ events.await?;
 
 The caller must continuously drain the bounded event receiver while operations
 are running. Library-mode assistant text is limited to 1 MiB and reports
-truncation through `text_truncated()`. `connect(..., stream_events)` retains the
-CLI event sink and unbounded assistant text behavior. The CLI and library use
+truncation alongside the text through `finish_assistant_text()`.
+`connect(..., stream_events)` retains the CLI event sink and unbounded assistant
+text behavior; `stream_events` does not affect explicit text capture. The CLI and library use
 the same implementation of WebSocket RPCs, permissions, and event parsing.
 
 Dropping a client aborts its reader/writer tasks and releases the connection;

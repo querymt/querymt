@@ -38,6 +38,7 @@ enum SubmissionBehavior {
     MissingReceiptStatus,
     WrongReceiptId,
     Unavailable,
+    RejectSubmission,
 }
 
 impl MockAcp {
@@ -246,6 +247,10 @@ async fn serve_acp(
                 if matches!(behavior, SubmissionBehavior::NoReply) {
                     continue;
                 }
+                if matches!(behavior, SubmissionBehavior::RejectSubmission) {
+                    send(&mut socket, json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "fixture method unavailable"}})).await;
+                    continue;
+                }
                 let input_id = &params["client_input_id"];
                 match behavior {
                     SubmissionBehavior::MissingReceiptStatus => {
@@ -260,7 +265,9 @@ async fn serve_acp(
                     }),
                 }
             }
-            "_querymt/session/discardQueuedInput" => json!({"accepted": true}),
+            "_querymt/session/discardQueuedInput" => {
+                json!({"status": "not_pending", "data": {"input_id": params["input_id"]}})
+            }
             "session/set_mode" if params["modeId"] == "flood-config" => {
                 for _ in 0..300 {
                     send(&mut socket, json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "fixture-session", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "event"}}}})).await;
@@ -851,6 +858,44 @@ async fn nonwaiting_delivery_skips_unavailable_history_and_returns_the_receipt()
 }
 
 #[tokio::test]
+async fn explicit_rejection_and_not_pending_are_not_reported_as_acceptance_or_removal() {
+    let backend = MockAcp::with_submission(SubmissionBehavior::RejectSubmission).await;
+    let mut mcp = Mcp::start(&backend.url, false).await;
+    let response = mcp
+        .tool(
+            "steer",
+            json!({"session_id": "fixture-session", "run_id": "fixture-run", "text": "x"}),
+        )
+        .await;
+    assert_eq!(response["isError"], true, "{response}");
+    let recovery = &response["structuredContent"]["recovery"];
+    assert_eq!(recovery["deliveryState"], "rejected");
+    assert_eq!(recovery["submission"]["state"], "rejected");
+    let discard = mcp
+        .tool(
+            "discard_queued",
+            json!({"session_id": "fixture-session", "input_id": "already-started"}),
+        )
+        .await;
+    assert_eq!(
+        discard["structuredContent"]["result"]["status"], "not_pending",
+        "{discard}"
+    );
+}
+
+#[tokio::test]
+async fn new_session_reports_unobserved_status_without_losing_its_id() {
+    let backend = MockAcp::with_submission(SubmissionBehavior::HistoryUnavailable).await;
+    let mut mcp = Mcp::start(&backend.url, false).await;
+    let response = mcp.tool("new", json!({"cwd": "/tmp"})).await;
+    assert_eq!(response["isError"], false, "{response}");
+    let result = &response["structuredContent"];
+    assert_eq!(result["sessionId"], "fixture-session");
+    assert_eq!(result["status"]["observationState"], "unavailable");
+    assert!(result["status"].get("model").is_none());
+}
+
+#[tokio::test]
 async fn invalid_receipts_stay_unconfirmed_and_stop_a_batch() {
     for behavior in [
         SubmissionBehavior::MissingReceiptStatus,
@@ -964,6 +1009,13 @@ async fn cancelled_batch_step_is_an_error_and_prevents_later_mutations() {
         assert_eq!(result["results"].as_array().unwrap().len(), 1);
         assert_eq!(result["results"][0]["result"]["ok"], false);
         assert_eq!(result["results"][0]["result"]["stopReason"], "cancelled");
+        assert_eq!(result["results"][0]["result"]["text"], "reply:cancelled");
+        assert!(
+            !backend
+                .recorded()
+                .iter()
+                .any(|r| r["method"] == "_querymt/session/runtimeState")
+        );
         assert_no_implicit_cancel(&backend);
     }
 }
@@ -1175,6 +1227,7 @@ async fn existing_sessions_keep_their_stored_cwd() {
         json!({"name": "new", "arguments": {}}),
         json!({"name": "new", "arguments": {"cwd": "relative"}}),
         json!({"name": "prompt", "arguments": {"new": true, "text": "x"}}),
+        json!({"name": "prompt", "arguments": {"new": true, "cwd": "/tmp", "delivery": "steer", "text": "x"}}),
         json!({"name": "prompt", "arguments": {"session_id": "fixture-session", "cwd": "/tmp", "text": "x"}}),
     ] {
         let result = mcp
@@ -1639,11 +1692,23 @@ async fn cli_auth_configuration_fails_closed_without_leaking_the_token() {
             Some(TOKEN),
         ),
     ];
-    for (args, token) in cases {
+    let diagnostics = [
+        "non-loopback HTTP binds and custom hosts require a bearer token",
+        "non-loopback HTTP binds and custom hosts require a bearer token",
+        "wildcard HTTP binds require at least one --allowed-host",
+        "bearer token must be 1..4096 ASCII token characters",
+        "bearer token must be 1..4096 ASCII token characters",
+        "HTTP authentication options require --transport http",
+        "allowed HTTP hosts must be explicit hostnames or IP addresses",
+    ];
+    assert_eq!(cases.len(), diagnostics.len());
+    for ((args, token), diagnostic) in cases.iter().zip(diagnostics) {
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_qmcp"));
         command
+            .args(["--url", "ws://127.0.0.1:3030/acp/ws"])
             .args(*args)
             .env_remove("QMCP_BEARER_TOKEN")
+            .env_remove("QMCP_OAUTH_CLIENT_SECRET")
             .kill_on_drop(true)
             .stdin(Stdio::null());
         if let Some(token) = token {
@@ -1657,6 +1722,10 @@ async fn cli_auth_configuration_fails_closed_without_leaking_the_token() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stdout.is_empty(), "startup errors must not pollute stdout");
+        assert!(
+            stderr.contains(diagnostic),
+            "expected {diagnostic:?}, got {stderr:?}"
+        );
         assert!(!stderr.contains(TOKEN));
         assert!(!stderr.contains("bad token"));
     }

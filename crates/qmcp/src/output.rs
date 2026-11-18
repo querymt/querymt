@@ -92,6 +92,23 @@ impl OperationState {
         );
     }
 
+    pub fn submission_failed(&mut self, error: &CliError) {
+        if let Some(recovery) = error.recovery().and_then(Value::as_object) {
+            for key in ["deliveryState", "runtime", "observationState"] {
+                if let Some(value) = recovery.get(key) {
+                    self.recovery.insert(key.into(), value.clone());
+                }
+            }
+            if recovery
+                .get("deliveryState")
+                .is_some_and(|state| state == "rejected")
+                && let Some(submission) = self.recovery.get_mut("submission")
+            {
+                submission["state"] = json!("rejected");
+            }
+        }
+    }
+
     pub fn submission_acknowledged(&mut self, result: &Value) {
         self.recovery
             .insert("deliveryState".into(), json!("accepted"));

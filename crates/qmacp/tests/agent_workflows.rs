@@ -187,9 +187,14 @@ async fn prompt_keeps_prefix_when_idle_barrier_delivers_more_text() {
 }
 
 #[tokio::test]
-async fn follow_collects_final_text_before_idle_response() {
+async fn follow_collects_live_text_during_attachment_and_before_idle() {
     let server = MockServer::start(|request| match request["method"].as_str() {
-        Some("session/resume" | "session/load") => Reply::Result(json!({})),
+        Some("session/resume") => Reply::Result(json!({})),
+        Some("session/load") => {
+            let mut replay = assistant_chunk("history");
+            replay["params"]["_meta"]["querymtReplay"] = json!(true);
+            Reply::WithNotifications(vec![assistant_chunk("live "), replay], json!({}))
+        }
         Some("_querymt/session/runtimeState") => {
             assert_eq!(request["params"]["wait_for_updates"], true);
             let Reply::Result(idle) = runtime("idle", false) else {
@@ -206,7 +211,7 @@ async fn follow_collects_final_text_before_idle_response() {
     )
     .await;
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(events(&output).last().unwrap()["text"], "final");
+    assert_eq!(events(&output).last().unwrap()["text"], "live final");
     server.finish().await;
 }
 
@@ -430,6 +435,58 @@ async fn stdin_exec_batches_reject_payload_reads_before_any_earlier_write() {
         assert_eq!(output.status.code(), Some(1));
         assert!(server.finish().await.is_empty());
     }
+}
+
+#[tokio::test]
+async fn exec_checks_cwd_before_any_mutation_including_nested_commands() {
+    for invalid in [
+        "new --cwd relative",
+        "exec 'new --cwd relative'",
+        "prompt --cwd /tmp worker-b work",
+    ] {
+        let server = MockServer::start(unexpected).await;
+        let output = invoke(
+            cli().args(["--url", &server.url, "--quiet", "exec"]),
+            Some(&format!("queue worker-a first\n{invalid}\n")),
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(server.finish().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn follow_can_capture_without_stdout_streaming() {
+    let server = MockServer::start(|request| match request["method"].as_str() {
+        Some("session/resume") => {
+            Reply::WithNotifications(vec![assistant_chunk("live")], json!({}))
+        }
+        Some("session/load") => Reply::Result(json!({})),
+        Some("_querymt/session/runtimeState") => runtime("idle", false),
+        _ => unexpected(request),
+    })
+    .await;
+    let client = qmacp::client::AcpClient::connect(
+        &server.url,
+        &server.url,
+        qmacp::policy::PermissionPolicy::Cancel,
+        false,
+    )
+    .await
+    .unwrap();
+    let result = qmacp::session::follow(
+        &client,
+        "session-1",
+        Default::default(),
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.text, "live");
+    assert!(!result.truncated);
+    drop(client);
+    server.finish().await;
 }
 
 #[tokio::test]
@@ -1279,13 +1336,14 @@ async fn accepted_queue_and_steer_recovery_does_not_claim_prompt_outcome() {
 }
 
 #[tokio::test]
-async fn returned_prompt_keeps_its_stop_reason_when_later_observation_fails() {
+async fn cancelled_prompt_returns_its_text_without_an_idle_poll() {
     let server = MockServer::start(|request| match request["method"].as_str().unwrap() {
         "session/new" => Reply::Result(json!({"sessionId": "created-session"})),
-        "session/prompt" => Reply::Result(json!({"stopReason": "cancelled"})),
-        "_querymt/session/runtimeState" => Reply::Result(json!({
-            "phase": "unknown", "observation": {"availability": "unavailable"},
-        })),
+        "session/prompt" => {
+            let mut chunk = assistant_chunk("partial answer");
+            chunk["params"]["sessionId"] = json!("created-session");
+            Reply::WithNotifications(vec![chunk], json!({"stopReason": "cancelled"}))
+        }
         _ => unexpected(request),
     })
     .await;
@@ -1294,15 +1352,15 @@ async fn returned_prompt_keeps_its_stop_reason_when_later_observation_fails() {
         None,
     )
     .await;
-    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
     let events = events(&output);
-    let recovery = &events.last().unwrap()["recovery"];
-    assert_eq!(recovery["sessionId"], "created-session");
-    assert_eq!(recovery["creationState"], "created");
-    assert_eq!(recovery["deliveryState"], "accepted");
-    assert_eq!(recovery["stopReason"], "cancelled");
-    assert_eq!(recovery["observationState"], "unavailable");
-    assert!(events.iter().all(|event| event["type"] != "done"));
+    let done = events.last().unwrap();
+    assert_eq!(done["type"], "done");
+    assert_eq!(done["sessionId"], "created-session");
+    assert_eq!(done["deliveryState"], "accepted");
+    assert_eq!(done["stopReason"], "cancelled");
+    assert_eq!(done["observationState"], "prompt_returned");
+    assert_eq!(done["text"], "partial answer");
     server.finish().await;
 }
 

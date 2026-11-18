@@ -65,7 +65,7 @@ qmacp --quiet close "$SESSION_ID"
 ```
 
 - `follow` requires successful session open, then streams events until self idle;
-  run it from the session workspace (cwd comes from the current process).
+  QueryMT uses the stored cwd, so the client does not need the server's workspace.
 - `watch` polls `runtime` (`"type":"runtime"`) until self idle unless `--idle false`.
   Default `follow`/`watch` timeout is 120s. Unknown/unavailable observation fails
   rather than completing either command, including nonwaiting watch.
@@ -90,7 +90,8 @@ After a timeout, inspect `runtime` and session history before resending or
 changing work. Do not steer, queue, discard, or cancel just because time ran out.
 Require exit 0 and JSON `ok` not false; prompt/follow also need a terminal
 `"type":"done"`. For cancel, exit 0 and JSON `ok: true` prove only notification
-sending; for discard/close they confirm the respective operation. A submission
+sending. For discard, check `result.status == "discarded"`; `not_pending`
+means the input was not removed. For close, check `closed: true`. A submission
 receipt is not proof the agent completed the task.
 
 For event-driven waiting outside the agent turn, see [callbacks](callbacks.md).

@@ -1539,6 +1539,24 @@ async fn loaded_profile_session_replays_through_the_top_level_handle() {
     )
     .await
     .expect("profile-bound session replays after load");
+
+    let marker = f
+        .handle
+        .session_delivery_barrier(
+            &session_id,
+            crate::agent::messages::SessionRuntimeStatus::unavailable("stale snapshot"),
+        )
+        .await
+        .expect("profile-owned actor publishes the barrier");
+    assert_eq!(
+        marker.runtime.phase,
+        crate::agent::messages::SessionRuntimePhase::Idle
+    );
+    assert_eq!(
+        marker.runtime.observation.availability,
+        crate::agent::messages::RuntimeAvailability::Live
+    );
+    assert!(marker.tip > 0);
 }
 
 #[tokio::test]

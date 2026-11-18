@@ -3143,13 +3143,16 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                                 return Err(error);
                                             }
                                         };
-                                        notifications.extend(replay.into_iter().map(|params| {
-                                            serde_json::json!({
+                                        for notification in replay {
+                                            let mut params = serde_json::to_value(notification)
+                                                .map_err(Error::into_internal_error)?;
+                                            params["_meta"]["querymtReplay"] = serde_json::Value::Bool(true);
+                                            notifications.push(serde_json::json!({
                                                 "jsonrpc": "2.0",
                                                 "method": "session/update",
                                                 "params": params,
-                                            })
-                                        }));
+                                            }));
+                                        }
                                     }
                                     if let Some(notification) =
                                         available_commands_session_update(agent, &session_id).await
@@ -3514,11 +3517,16 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                     let runtime = serde_json::from_value(value.clone())
                                         .map_err(Error::into_internal_error)?;
                                     let synced = tokio::time::timeout(PROMPT_WAIT_LIMIT, async {
-                                        let tip = local.session_delivery_barrier(&session_id, runtime).await?;
-                                        Ok::<_, Error>(delivery.wait_for_tip(&session_id, tip, PROMPT_WAIT_LIMIT).await)
+                                        let marker = local.session_delivery_barrier(&session_id, runtime).await?;
+                                        if marker.runtime.phase == crate::agent::messages::SessionRuntimePhase::Idle
+                                            && delivery.wait_for_tip(&session_id, marker.tip, PROMPT_WAIT_LIMIT).await != WaitOutcome::Delivered
+                                        {
+                                            return Err(Error::internal_error().data("session update delivery could not be confirmed"));
+                                        }
+                                        serde_json::to_value(marker.runtime).map_err(Error::into_internal_error)
                                     }).await;
                                     match synced {
-                                        Ok(Ok(WaitOutcome::Delivered)) => {},
+                                        Ok(Ok(observed)) => value = observed,
                                         Ok(Err(error)) => return Err(error),
                                         _ => return Err(Error::internal_error().data("session update delivery could not be confirmed")),
                                     }
@@ -6230,7 +6238,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&wire).expect("json message");
             if value.get("method").is_some() {
                 assert_eq!(value["method"], "session/update");
-                saw_replay_update = true;
+                saw_replay_update |= value["params"]["_meta"]["querymtReplay"] == true;
             } else {
                 assert_eq!(value["id"], 1);
                 assert!(value.get("error").is_none(), "load failed: {value}");

@@ -106,6 +106,9 @@ struct Position {
     release_reason: Option<ReleaseReason>,
     /// A journal recovery for this session failed during the current lag.
     recovery_failed: bool,
+    // Once the baseline advances past a missing update, this connection
+    // cannot prove delivery through that gap, even for a later waiter.
+    first_missing: Option<i64>,
     /// `(low, high]` range recovered from the journal after a lag; lagged
     /// copies of these events still sitting in the channel are duplicates.
     recovered: Option<(i64, i64)>,
@@ -255,20 +258,35 @@ impl ConnectionDelivery {
         {
             Ok(recovered) => recovered,
             Err(()) => {
+                state.send_modify(|p| {
+                    p.first_missing.get_or_insert(position.admitted + 1);
+                });
                 release(&state, ReleaseReason::RecoveryFailed);
                 Vec::new()
             }
         };
         let mut out: Vec<Admitted> = Vec::with_capacity(recovered.len() + 1);
         let mut supplied = false;
+        let mut highest = position.admitted;
         for durable in recovered {
+            if durable.session_seq > highest + 1 {
+                state.send_modify(|p| {
+                    p.first_missing.get_or_insert(highest + 1);
+                });
+            }
+            highest = highest.max(durable.session_seq);
             supplied |= durable.session_seq == seq;
             out.push(Self::admitted(&state, EventEnvelope::Durable(durable)));
         }
         if !supplied {
             out.push(Self::admitted(&state, event));
         }
-        state.send_modify(|p| p.admitted = seq);
+        state.send_modify(|p| {
+            if highest < seq - 1 {
+                p.first_missing.get_or_insert(highest + 1);
+            }
+            p.admitted = seq;
+        });
         out
     }
 
@@ -305,6 +323,11 @@ impl ConnectionDelivery {
                 Ok(recovered) => {
                     let mut highest = admitted;
                     for durable in recovered {
+                        if durable.session_seq > highest + 1 {
+                            state.send_modify(|p| {
+                                p.first_missing.get_or_insert(highest + 1);
+                            });
+                        }
                         highest = highest.max(durable.session_seq);
                         out.push(Self::admitted(&state, EventEnvelope::Durable(durable)));
                     }
@@ -318,7 +341,10 @@ impl ConnectionDelivery {
                         });
                     }
                 }
-                Err(()) => state.send_modify(|p| p.recovery_failed = true),
+                Err(()) => state.send_modify(|p| {
+                    p.recovery_failed = true;
+                    p.first_missing.get_or_insert(admitted + 1);
+                }),
             }
         }
         out
@@ -393,12 +419,18 @@ impl ConnectionDelivery {
         let start_epoch = rx.borrow().release_epoch;
 
         let wait = async {
-            rx.wait_for(|p| p.delivered >= tip || p.release_epoch > start_epoch)
-                .await
-                .map(|position| *position)
+            rx.wait_for(|p| {
+                p.delivered >= tip
+                    || p.release_epoch > start_epoch
+                    || p.first_missing.is_some_and(|seq| seq <= tip)
+            })
+            .await
+            .map(|position| *position)
         };
         tokio::select! {
             result = wait => match result {
+                Ok(position) if position.first_missing.is_some_and(|seq| seq <= tip) =>
+                    WaitOutcome::Released(ReleaseReason::RecoveryFailed),
                 Ok(position) if position.delivered >= tip => WaitOutcome::Delivered,
                 Ok(position) => WaitOutcome::Released(
                     position.release_reason.unwrap_or(ReleaseReason::Lagged),
@@ -746,6 +778,18 @@ mod tests {
         }
 
         let delivery = ConnectionDelivery::new(Some(Arc::new(Broken)), CancellationToken::new());
+        drop(delivery.admit(delta("gap", 1)).await);
+        drop(delivery.admit(delta("gap", 3)).await);
+        assert_eq!(delivery.delivered("gap"), 3);
+        assert_eq!(
+            delivery.wait_for_tip("gap", 3, Duration::ZERO).await,
+            WaitOutcome::Released(ReleaseReason::RecoveryFailed)
+        );
+        assert_eq!(
+            delivery.wait_for_tip("gap", 1, Duration::ZERO).await,
+            WaitOutcome::Delivered
+        );
+
         drop(delivery.admit(delta("s", 1)).await);
         let waiter = {
             let delivery = delivery.clone();

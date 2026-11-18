@@ -9,7 +9,7 @@ use rmcp::{
     },
     service::RequestContext,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 use qmacp::{client::AcpClient, error::CliError, policy::PermissionPolicy, url};
@@ -106,9 +106,6 @@ impl QmcpServer {
         while let Ok(event) = event_rx.try_recv() {
             log.push(event);
         }
-        let mut result = result;
-        let truncated = result["textTruncated"] == true || client.text_truncated().await;
-        result["textTruncated"] = json!(truncated);
         log.attach(state.finish(result))
     }
 }
@@ -211,6 +208,7 @@ fn tool_catalog() -> Result<Vec<Tool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[tokio::test]
     async fn cancellation_during_connection_setup_releases_the_socket_promptly() {
@@ -359,6 +357,12 @@ mod tests {
             );
         };
         let cwd = std::env::current_dir().unwrap();
+        for delivery in ["auto", "prompt", "steer", "queue"] {
+            check(
+                "prompt",
+                json!({"new": true, "cwd": cwd, "text": "x", "delivery": delivery}),
+            );
+        }
         check("new", json!({}));
         for path in [
             "/srv/workspace",

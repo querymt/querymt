@@ -239,25 +239,28 @@ impl LocalAgentHandle {
         ext_json_response(&state)
     }
 
-    pub(crate) async fn session_delivery_barrier(
+    #[doc(hidden)]
+    pub async fn session_delivery_barrier(
         &self,
         session_id: &str,
         runtime: crate::agent::messages::SessionRuntimeStatus,
-    ) -> Result<i64, Error> {
-        // A mesh session must emit the marker at its owner, in the owner's sequence space.
-        let actor = self.registry.lock().await.get(session_id).cloned();
-        if let Some(actor) = actor {
+    ) -> Result<crate::agent::messages::SessionDeliveryObservation, Error> {
+        // Emit in the owning runtime's sequence space, without loading a runtime.
+        if let Some(actor) = self.owned_session_ref(session_id).await {
             return actor.session_delivery_barrier().await.map_err(Error::from);
         }
         let config = self
             .hosting_config(session_id)
             .await
             .ok_or_else(|| Error::internal_error().data("session event stream is unavailable"))?;
-        Ok(config
+        let tip = config
             .event_sink
             .session_stream(session_id)
-            .emit_ephemeral_seq(AgentEventKind::RuntimeChanged { runtime })
-            .await)
+            .emit_ephemeral_seq(AgentEventKind::RuntimeChanged {
+                runtime: runtime.clone(),
+            })
+            .await;
+        Ok(crate::agent::messages::SessionDeliveryObservation { runtime, tip })
     }
 
     pub(super) async fn handle_ext_session_undo(
