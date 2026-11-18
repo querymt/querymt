@@ -823,8 +823,11 @@ impl QmtApp {
                     el.child(section("Pinned"))
                         .children(pinned.iter().map(|s| {
                             let hover_bg = p.card_hover;
+                            let group =
+                                SharedString::from(format!("pinned-session-title-{}", s.id));
                             h_flex()
                                 .id(kit::keyed("pinned-session", s.id.clone()))
+                                .group(group.clone())
                                 .gap_2()
                                 .px_2()
                                 .h(px(28.))
@@ -837,14 +840,12 @@ impl QmtApp {
                                     cx.listener(move |this, _, _, cx| this.open_summary(&s, cx))
                                 })
                                 .child(kit::identicon(&s.id, 14.))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .text_sm()
-                                        .truncate()
-                                        .child(s.display_title()),
-                                )
+                                .child(kit::fading_title(
+                                    s.display_title(),
+                                    group,
+                                    p.bg,
+                                    p.bg.blend(hover_bg),
+                                ))
                                 .when(s.running(), |el| {
                                     el.child(kit::spinner(
                                         kit::keyed("pin-spin", s.id.clone()),
@@ -860,8 +861,15 @@ impl QmtApp {
                     let current = self.page == Page::Session
                         && store.session.as_ref().is_some_and(|v| v.session_id == s.id);
                     let s2 = s.clone();
+                    let group = SharedString::from(format!("open-session-title-{}", s.id));
+                    let background = if current {
+                        p.bg.blend(p.accent_dim)
+                    } else {
+                        p.bg
+                    };
                     v_flex()
                         .id(kit::keyed("open-session", s.id.clone()))
+                        .group(group.clone())
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| this.open_summary(&s2, cx)))
                         .px_2()
@@ -874,14 +882,18 @@ impl QmtApp {
                             h_flex()
                                 .gap_2()
                                 .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .text_sm()
-                                        .text_color(if current { p.text } else { p.muted })
-                                        .when(current, |el| el.font_medium())
-                                        .truncate()
-                                        .child(s.display_title()),
+                                    kit::fading_title(
+                                        s.display_title(),
+                                        group,
+                                        background,
+                                        if current {
+                                            background
+                                        } else {
+                                            p.bg.blend(hover_bg)
+                                        },
+                                    )
+                                    .text_color(if current { p.text } else { p.muted })
+                                    .when(current, |el| el.font_medium()),
                                 )
                                 .when(s.running(), |el| {
                                     el.child(kit::spinner(
