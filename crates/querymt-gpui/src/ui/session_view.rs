@@ -159,6 +159,8 @@ struct RenderCtx {
     reverted_from: Option<usize>,
     /// Agent of the open session; delegated child sessions live on it too.
     agent_id: String,
+    /// Appearance setting: fade streamed reply and reasoning text in.
+    stream_fade: bool,
 }
 
 impl RenderCtx {
@@ -1997,11 +1999,10 @@ fn render_reasoning(thoughts: &[&Thought], live: bool, rc: &RenderCtx) -> AnyEle
     } else {
         v_flex()
             .gap_2()
-            .children(
-                thoughts
-                    .iter()
-                    .map(|t| md::markdown(format!("th-md-{}", t.id), t.text.trim().to_string(), p)),
-            )
+            .children(thoughts.iter().map(|t| {
+                md::markdown(format!("th-md-{}", t.id), t.text.trim().to_string(), p)
+                    .motion(md::stream_motion(rc.stream_fade))
+            }))
             .into_any_element()
     };
     v_flex()
@@ -2437,7 +2438,10 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
             .w_full()
             .px_1()
             .text_sm()
-            .child(md::markdown(format!("md-{}", item.key), text.clone(), p))
+            .child(
+                md::markdown(format!("md-{}", item.key), text.clone(), p)
+                    .motion(md::stream_motion(rc.stream_fade)),
+            )
             .when_some(actions, |el, stats| {
                 el.child(turn_actions(ix, item, stats, rc))
             })
@@ -4051,6 +4055,7 @@ impl QmtApp {
                     .position(|i| i.key == id && matches!(i.kind, ItemKind::User { .. }))
             }),
             agent_id: view.agent_id.clone(),
+            stream_fade: store.prefs.stream_fade.unwrap_or(true),
         });
         self.transcript.sync(&key, &view.items, &rc);
         if !self.transcript.scroll_hooked {

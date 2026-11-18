@@ -1266,6 +1266,9 @@ pub struct Prefs {
     /// Mouse-wheel inertia (`off`, `light`, `strong`).
     #[serde(default)]
     pub scroll_inertia: String,
+    /// Fade streamed reply text in word by word; `None` means on.
+    #[serde(default)]
+    pub stream_fade: Option<bool>,
     /// How image attachments are sent in prompts.
     #[serde(default)]
     pub image_send_mode: ImageSendMode,
