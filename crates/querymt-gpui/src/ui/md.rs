@@ -7,7 +7,9 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
-use gpui_kit::component::text::{MarkdownNode, TextView, TextViewStyle, markdown_ast};
+use gpui_kit::component::text::{
+    MarkdownNode, TextView, TextViewMotion, TextViewStyle, markdown_ast,
+};
 use gpui_kit::component::{Sizable as _, Theme, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -21,6 +23,28 @@ const TABLE_BLOCK: &str = "qmt-table";
 const DEFAULT_LANG: &str = "text";
 /// How long the copy button shows its check.
 const COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1200);
+/// How long one streamed word takes to reach full color.
+const STREAM_FADE: std::time::Duration = std::time::Duration::from_millis(280);
+/// Delay between consecutive words of one streamed chunk (the library's own
+/// default). Longer staggers let later chunks show before earlier words of a
+/// previous chunk have started fading, which reads as text out of order.
+const STREAM_STAGGER: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Motion for text that streams in (agent replies, reasoning): each appended
+/// word fades in, staggered behind the one before it. The text view only
+/// fades text that extends what it already shows, so history, reloads and
+/// edits appear at once, and it shows everything at once under reduced motion.
+/// A chunk too long to stagger within one fade fades in as a whole.
+/// `enabled` is the Appearance setting; off shows streamed text at once.
+pub fn stream_motion(enabled: bool) -> TextViewMotion {
+    if !enabled {
+        return TextViewMotion::default();
+    }
+    TextViewMotion::default()
+        .with_stream_fade(STREAM_FADE)
+        .with_stream_fade_stagger(STREAM_STAGGER)
+        .with_stream_fade_easing(gpui_kit::base::Easing::EaseOut)
+}
 
 fn code_lang(lang: Option<&str>) -> &str {
     lang.map(str::trim)
@@ -376,7 +400,15 @@ pub fn plain_text(source: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_LANG, code_lang, plain_text};
+    use super::{DEFAULT_LANG, code_lang, plain_text, stream_motion};
+
+    #[test]
+    fn stream_motion_follows_the_setting() {
+        assert!(stream_motion(false).stream_fade().is_zero());
+        let on = stream_motion(true);
+        assert!(!on.stream_fade().is_zero());
+        assert_eq!(on.stream_fade_stagger().as_millis(), 10);
+    }
 
     #[test]
     fn plain_text_drops_markdown() {

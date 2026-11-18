@@ -706,13 +706,27 @@ impl QmtApp {
                             this.apply_theme(window, cx);
                         }))
                 }));
-        let accent_card = settings_card(p).child(simple_row(
-            "Accent color",
-            "Highlights buttons, prompts and selections. Applies instantly.",
-            swatches,
-            true,
-            p,
-        ));
+        let accent_card = settings_card(p)
+            .child(simple_row(
+                "Accent color",
+                "Highlights buttons, prompts and selections. Applies instantly.",
+                swatches,
+                true,
+                p,
+            ))
+            .child(simple_row(
+                "Fade in streamed text",
+                "Replies and reasoning fade in word by word as they arrive. Off when the system reduces motion.",
+                Switch::new("sw-stream-fade")
+                    .checked(prefs.stream_fade.unwrap_or(true))
+                    .on_click(cx.listener(|this, v: &bool, _, cx| {
+                        let v = *v;
+                        this.store
+                            .update(cx, |s, cx| s.update_prefs(|p| p.stream_fade = Some(v), cx));
+                    })),
+                false,
+                p,
+            ));
 
         // ---- Mouse-wheel scrolling (collapsible: rarely changed).
         let scroll_open = self.appearance_scroll_open;
