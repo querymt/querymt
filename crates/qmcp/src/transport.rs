@@ -27,6 +27,7 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     QmcpServer,
+    local_oauth::{self, LocalOAuth},
     oauth::{self, OAuthAuth},
 };
 
@@ -159,25 +160,65 @@ pub fn http_router_with_oauth(
         .route("/.well-known/oauth-protected-resource/mcp", discovery))
 }
 
-async fn guard_discovery(
-    State(hosts): State<Vec<String>>,
-    request: Request,
-    next: Next,
-) -> Response {
+/// Protect MCP requests with the built-in authorization server. Its public
+/// host is accepted automatically; TLS must terminate at the resource URL.
+pub fn http_router_with_local_oauth(
+    server: QmcpServer,
+    bind: SocketAddr,
+    auth: LocalOAuth,
+    allowed_hosts: &[String],
+) -> Result<Router> {
+    let mut hosts = allowed_hosts.to_vec();
+    if !hosts
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(auth.public_host()))
+    {
+        hosts.push(auth.public_host().to_owned());
+    }
+    let config = http_config(bind, true, &hosts)?;
+    let routes = auth.routes().layer(middleware::from_fn_with_state(
+        config.allowed_hosts.clone(),
+        guard_host,
+    ));
+    Ok(build_http_router(server, config)
+        .layer(middleware::from_fn_with_state(
+            auth,
+            local_oauth::require_token,
+        ))
+        .merge(routes))
+}
+
+/// Host check for OAuth endpoints. Browsers post the consent form, so Origin
+/// is allowed here, unlike on discovery for the external provider.
+async fn guard_host(State(hosts): State<Vec<String>>, request: Request, next: Next) -> Response {
+    if !host_allowed(&hosts, &request) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
+}
+
+fn host_allowed(hosts: &[String], request: &Request) -> bool {
     let authority = request
         .headers()
         .get("host")
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.parse::<Authority>().ok());
-    let allowed = authority.is_some_and(|authority| {
+    authority.is_some_and(|authority| {
         hosts.iter().any(|host| {
             host.eq_ignore_ascii_case(authority.as_str())
                 || host
                     .trim_matches(['[', ']'])
                     .eq_ignore_ascii_case(authority.host().trim_matches(['[', ']']))
         })
-    });
-    if !allowed || request.headers().contains_key("origin") {
+    })
+}
+
+async fn guard_discovery(
+    State(hosts): State<Vec<String>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !host_allowed(&hosts, &request) || request.headers().contains_key("origin") {
         return StatusCode::FORBIDDEN.into_response();
     }
     next.run(request).await
