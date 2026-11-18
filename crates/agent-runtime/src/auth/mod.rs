@@ -120,7 +120,19 @@ impl ApiKeyResolver for OAuthKeyResolver {
         Box::pin(async {
             let token = get_or_refresh_token(&self.provider_name)
                 .await
-                .map_err(|e| LLMError::AuthError(format!("OAuth refresh failed: {}", e)))?;
+                .map_err(|e| {
+                    // A rejected login is permanent (AuthError); a temporary
+                    // refresh failure is retryable (Transport).
+                    if let Some(refresh) = querymt_utils::oauth::token_refresh_error(&e) {
+                        return LLMError::from(
+                            crate::session::error::SessionError::CredentialRefresh {
+                                message: refresh.to_string(),
+                                relogin_required: refresh.relogin_required(),
+                            },
+                        );
+                    }
+                    LLMError::AuthError(format!("OAuth refresh failed: {}", e))
+                })?;
             *self.cached_key.write() = token;
             Ok(())
         })

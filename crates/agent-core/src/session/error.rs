@@ -1,6 +1,6 @@
 //! Error types for session and repository operations
 
-use querymt::error::LLMError;
+use querymt::error::{LLMError, TransportErrorKind};
 use thiserror::Error;
 
 /// Errors that can occur during session operations
@@ -86,6 +86,18 @@ pub enum SessionError {
     /// A managed workspace checkout path is already registered.
     #[error("Workspace checkout path already registered: {0}")]
     WorkspaceCheckoutTaken(String),
+
+    /// Stored OAuth tokens exist but could not be refreshed.
+    ///
+    /// Distinct from "not logged in": the credential chain must not fall back
+    /// to another credential source for this error. `relogin_required` is true
+    /// when the server rejected the refresh token (only signing in again helps);
+    /// otherwise the failure is transient and the operation may be retried.
+    #[error("{message}")]
+    CredentialRefresh {
+        message: String,
+        relogin_required: bool,
+    },
 
     /// Provider error (from LLM operations)
     #[error("Provider error: {0}")]
@@ -228,11 +240,60 @@ impl From<SessionError> for LLMError {
             }
             SessionError::SerializationError(msg) => LLMError::ProviderError(msg),
             SessionError::ProviderError(e) => e,
+            // A rejected login is permanent (not retryable); anything else is a
+            // transient transport-level failure that the retry policy may retry.
+            SessionError::CredentialRefresh {
+                message,
+                relogin_required: true,
+            } => LLMError::AuthError(message),
+            SessionError::CredentialRefresh {
+                message,
+                relogin_required: false,
+            } => LLMError::Transport {
+                kind: TransportErrorKind::Other,
+                message,
+            },
             SessionError::Other(msg) => LLMError::ProviderError(msg),
             // `LLMError` stores only strings, so render the full source chain.
             err @ (SessionError::Database(_) | SessionError::TaskFailed(_)) => {
                 LLMError::ProviderError(render_chain(&err))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_credential_refresh_is_a_permanent_auth_error() {
+        let error = LLMError::from(SessionError::CredentialRefresh {
+            message: "login expired".into(),
+            relogin_required: true,
+        });
+        assert!(matches!(&error, LLMError::AuthError(m) if m == "login expired"));
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn transient_credential_refresh_stays_retryable() {
+        let error = LLMError::from(SessionError::CredentialRefresh {
+            message: "connection reset".into(),
+            relogin_required: false,
+        });
+        assert!(
+            matches!(&error, LLMError::Transport { message, .. } if message == "connection reset")
+        );
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn credential_refresh_displays_its_message() {
+        let error = SessionError::CredentialRefresh {
+            message: "sign in again".into(),
+            relogin_required: true,
+        };
+        assert_eq!(error.to_string(), "sign in again");
     }
 }

@@ -911,6 +911,8 @@ impl SessionHandle {
                     "agent.provider.build",
                     provider = %config.provider,
                     model = %config.model,
+                    // Filled in by `record_auth_source` during credential resolution.
+                    auth.source = tracing::field::Empty,
                 );
                 tracing::Instrument::instrument(
                     self.provider.build_provider_snapshot(request),
@@ -1247,7 +1249,7 @@ impl SessionHandle {
 /// Stored in the system keyring under `auth_method_{provider}` and used by
 /// the credential resolution logic to determine the order in which OAuth,
 /// stored API key, and environment variable sources are tried.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[typeshare::typeshare]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
@@ -1330,6 +1332,24 @@ pub(crate) async fn resolve_api_key_with_preference(
                             return Ok(Some(token));
                         }
                         Err(error) => {
+                            // Tokens are stored but unusable: the user is logged in
+                            // and the login is broken. Falling back to another
+                            // credential would hide that (and may bill a different
+                            // account), so fail with the real reason. The failure
+                            // is already logged once, at warn, by querymt-utils.
+                            if let Some(refresh) =
+                                querymt_utils::oauth::token_refresh_error(&error)
+                            {
+                                log::debug!(
+                                    "OAuth refresh failed for {}: {}",
+                                    provider_name,
+                                    refresh
+                                );
+                                return Err(SessionError::CredentialRefresh {
+                                    message: refresh.to_string(),
+                                    relogin_required: refresh.relogin_required(),
+                                });
+                            }
                             log::debug!("OAuth unavailable for {}: {}", provider_name, error);
                         }
                     }
@@ -1374,6 +1394,60 @@ pub(crate) async fn resolve_api_key_with_preference(
     .await
 }
 
+/// Which credential a provider build used, as recorded in `auth.source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthSource {
+    OAuth,
+    ApiKey,
+    EnvVar,
+    /// An explicit `api_key_override` on the request.
+    Override,
+    /// An inline `api_key` in the provider config.
+    Config,
+    /// Stored OAuth tokens exist but could not be refreshed.
+    OAuthRefreshFailed,
+}
+
+impl AuthSource {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::OAuth => "oauth",
+            Self::ApiKey => "api_key",
+            Self::EnvVar => "env_var",
+            Self::Override => "override",
+            Self::Config => "config",
+            Self::OAuthRefreshFailed => "oauth_refresh_failed",
+        }
+    }
+}
+
+impl From<AuthMethod> for AuthSource {
+    fn from(method: AuthMethod) -> Self {
+        match method {
+            AuthMethod::OAuth => Self::OAuth,
+            AuthMethod::ApiKey => Self::ApiKey,
+            AuthMethod::EnvVar => Self::EnvVar,
+        }
+    }
+}
+
+/// Record which credential source a provider build used on the current span.
+///
+/// Spans that want the attribute declare an empty `auth.source` field (tracing
+/// field names must be literals, so each declaration repeats the name):
+/// `agent.provider.build`, `remote.provider_host.build_provider_for_request`
+/// and `remote.provider_host.contract_info`. Elsewhere (for example catalog
+/// listing, which has no provider-build span) this is a no-op. Only the source
+/// kind is recorded, never the credential.
+pub(crate) fn record_auth_source(source: AuthSource) {
+    tracing::Span::current().record("auth.source", source.as_str());
+}
+
+/// True when `error` means stored OAuth tokens could not be refreshed.
+fn is_oauth_refresh_failure(error: &SessionError) -> bool {
+    matches!(error, SessionError::CredentialRefresh { .. })
+}
+
 async fn resolve_credential_chain<Fut>(
     preferred: SessionResult<Option<AuthMethod>>,
     use_oauth_resolver: &mut bool,
@@ -1405,9 +1479,15 @@ where
                 if is_oauth {
                     *use_oauth_resolver = true;
                 }
+                record_auth_source(method.into());
                 return Ok(Some(key));
             }
             Ok(None) => {}
+            // A broken OAuth login must not be masked by another credential.
+            Err(error) if is_oauth && is_oauth_refresh_failure(&error) => {
+                record_auth_source(AuthSource::OAuthRefreshFailed);
+                return Err(error);
+            }
             Err(error) => {
                 first_error.get_or_insert(error);
             }
@@ -1929,6 +2009,90 @@ pub mod tests {
             assert_eq!(result.as_deref(), Some("key"));
             assert_eq!(attempted, expected);
             assert_eq!(use_oauth, winner == OAuth);
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_records_auth_source_on_current_span() {
+        use AuthMethod::{ApiKey, EnvVar, OAuth};
+        use querymt_agent_services::tools::trace_support::genai_trace::{attr, capture_info};
+
+        // (winner, oauth refresh failed, expected auth.source)
+        for (winner, refresh_failed, expected) in [
+            (OAuth, false, "oauth"),
+            (ApiKey, false, "api_key"),
+            (EnvVar, false, "env_var"),
+            (OAuth, true, "oauth_refresh_failed"),
+        ] {
+            let (_, spans) = capture_info(async {
+                let span = tracing::info_span!(
+                    "agent.provider.build",
+                    auth.source = tracing::field::Empty
+                );
+                tracing::Instrument::instrument(
+                    async {
+                        let mut use_oauth = false;
+                        let result = resolve_credential_chain(Ok(None), &mut use_oauth, |method| {
+                            let result = if refresh_failed && method == OAuth {
+                                Err(SessionError::CredentialRefresh {
+                                    message: "login expired".into(),
+                                    relogin_required: true,
+                                })
+                            } else if method == winner {
+                                Ok(Some("secret-key".to_string()))
+                            } else {
+                                Ok(None)
+                            };
+                            std::future::ready(result)
+                        })
+                        .await;
+                        assert_eq!(result.is_err(), refresh_failed);
+                    },
+                    span,
+                )
+                .await;
+            })
+            .await;
+            let span = spans
+                .iter()
+                .find(|s| s.name == "agent.provider.build")
+                .expect("span exported");
+            assert_eq!(
+                attr(span, "auth.source").map(|v| v.to_string()),
+                Some(expected.to_string())
+            );
+            // Only the source kind is exported, never the credential.
+            assert!(!format!("{spans:?}").contains("secret-key"));
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_oauth_refresh_failure_does_not_fall_back() {
+        use AuthMethod::{ApiKey, EnvVar, OAuth};
+        for preferred in [None, Some(OAuth)] {
+            let mut attempted = Vec::new();
+            let mut use_oauth = false;
+            let result = resolve_credential_chain(Ok(preferred), &mut use_oauth, |method| {
+                let result = match method {
+                    OAuth => Err(SessionError::CredentialRefresh {
+                        message: "login expired".into(),
+                        relogin_required: true,
+                    }),
+                    ApiKey | EnvVar => Ok(Some("fallback".into())),
+                };
+                attempted.push(method);
+                std::future::ready(result)
+            })
+            .await;
+            assert!(matches!(
+                result,
+                Err(SessionError::CredentialRefresh {
+                    relogin_required: true,
+                    ..
+                })
+            ));
+            assert_eq!(attempted, vec![OAuth]);
+            assert!(!use_oauth);
         }
     }
 

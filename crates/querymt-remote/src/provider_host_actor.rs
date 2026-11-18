@@ -171,6 +171,13 @@ impl ProviderHostActor {
 impl Message<GetProviderContractInfo> for ProviderHostActor {
     type Reply = Result<ProviderContractInfo, RemoteProviderHostError>;
 
+    #[tracing::instrument(
+        name = "remote.provider_host.contract_info",
+        // `msg` is skipped: its params may carry an inline API key.
+        skip(self, msg, _ctx),
+        // `auth.source` is recorded by the backend's credential resolution.
+        fields(provider = %msg.provider, model = %msg.model, auth.source = tracing::field::Empty)
+    )]
     async fn handle(
         &mut self,
         msg: GetProviderContractInfo,
@@ -184,7 +191,6 @@ impl Message<GetProviderContractInfo> for ProviderHostActor {
                 crate::ProviderBuildRequest::new(&msg.provider, &msg.model).with_params(params),
             )
             .await
-            .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))
     }
 }
 
@@ -194,7 +200,8 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
 
     #[tracing::instrument(
         name = "remote.provider_host.chat",
-        skip(self, ctx),
+        // `msg` is skipped: its params may carry an inline API key.
+        skip(self, msg, ctx),
         fields(
             provider = %msg.provider,
             model = %msg.model,
@@ -220,8 +227,7 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
                 &msg.model,
                 msg.params.as_ref(),
             )
-            .await
-            .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
+            .await?;
 
             let call = ChatCall::new(&msg.messages)
                 .maybe_tools(msg.tools.as_deref())
@@ -249,7 +255,8 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
 
     #[tracing::instrument(
         name = "remote.provider_host.stream",
-        skip(self, ctx),
+        // `msg` is skipped: its params may carry an inline API key.
+        skip(self, msg, ctx),
         fields(
             provider = %msg.provider,
             model = %msg.model,
@@ -323,8 +330,7 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                     &msg.model,
                     msg.params.as_ref(),
                 )
-                .await
-                .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
+                .await?;
 
                 let call = ChatCall::new(&msg.messages)
                     .maybe_tools(msg.tools.as_deref())

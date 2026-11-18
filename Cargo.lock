@@ -314,9 +314,9 @@ dependencies = [
 
 [[package]]
 name = "anthropic-auth"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87149067342ea4249602e6de0a319e80cb74caf2698ce03cc4a578b7354e43b0"
+checksum = "604ccc54a4cacb7201602d91ec3d11a79c777341f3becb90296257d23e55adc9"
 dependencies = [
  "axum",
  "base64 0.23.1",
