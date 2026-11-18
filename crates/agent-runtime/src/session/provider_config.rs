@@ -127,8 +127,14 @@ pub(crate) async fn resolve_provider_config(
             if let Some(http_factory) = factory.as_http() {
                 let env_var_name = http_factory.api_key_name();
                 let api_key = if let Some(key) = api_key_override {
+                    crate::session::provider::record_auth_source(
+                        crate::session::provider::AuthSource::Override,
+                    );
                     Some(key.to_string())
                 } else if let Some(key) = api_key_from_config(builder.value()) {
+                    crate::session::provider::record_auth_source(
+                        crate::session::provider::AuthSource::Config,
+                    );
                     log::debug!(
                         "Using inline API key from config for provider '{}'",
                         provider_name

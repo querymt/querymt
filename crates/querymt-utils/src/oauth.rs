@@ -185,15 +185,8 @@ impl OAuthProvider for AnthropicProvider {
             match client.refresh_token(refresh_token).await {
                 Ok(tokens) => return Ok(tokens),
                 Err(error) => {
-                    let retryable = match &error {
-                        anthropic_auth::AnthropicAuthError::Http { status, .. } => *status >= 500,
-                        anthropic_auth::AnthropicAuthError::Network(error) => {
-                            error.is_connect() || error.is_timeout()
-                        }
-                        _ => false,
-                    };
-                    if !retryable || attempt == 2 {
-                        return Err(error.into());
+                    if !anthropic_refresh_retryable(&error) || attempt == 2 {
+                        return Err(map_anthropic_refresh_error(self.display_name(), error));
                     }
                     tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
                 }
@@ -214,6 +207,30 @@ impl OAuthProvider for AnthropicProvider {
     fn api_key_name(&self) -> Option<&str> {
         Some("ANTHROPIC_API_KEY")
     }
+}
+
+/// Whether a failed Anthropic refresh is worth retrying immediately.
+fn anthropic_refresh_retryable(error: &anthropic_auth::AnthropicAuthError) -> bool {
+    error.is_transient()
+}
+
+/// Map a final Anthropic refresh failure to an error callers can classify.
+///
+/// 400/401/403 on a refresh means the refresh token is revoked, expired or
+/// already rotated (`invalid_grant`), so only signing in again helps. Anything
+/// else is passed through unchanged.
+fn map_anthropic_refresh_error(
+    display: &str,
+    error: anthropic_auth::AnthropicAuthError,
+) -> anyhow::Error {
+    if error.is_credential_rejected()
+        && let anthropic_auth::AnthropicAuthError::Http { body, .. } = &error
+    {
+        let first_line = body.lines().next().unwrap_or_default();
+        let detail: String = first_line.chars().take(200).collect();
+        return anyhow::Error::new(TokenRefreshError::relogin(display, detail));
+    }
+    error.into()
 }
 
 fn convert_openai_tokens(tokens: openai_auth::TokenSet) -> TokenSet {
@@ -321,6 +338,91 @@ struct XaiFlowSnapshot {
 }
 
 type XaiTokenResponse = oauth2::basic::BasicTokenResponse;
+
+/// A token refresh that failed even though OAuth tokens are stored.
+///
+/// Callers use this to tell "the user is not logged in" (no tokens, so another
+/// credential source is fine) from "the user is logged in but the login no
+/// longer works" (falling back to another credential silently hides the real
+/// problem).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenRefreshError {
+    provider: String,
+    detail: String,
+    relogin_required: bool,
+}
+
+impl TokenRefreshError {
+    /// Provider display name, e.g. `Anthropic`.
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// Short, secret-free description of what the server or transport said.
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    /// The server rejected the refresh token itself (revoked, expired or
+    /// already rotated); only signing in again can fix this. When false the
+    /// failure is transient and a later attempt may succeed.
+    pub fn relogin_required(&self) -> bool {
+        self.relogin_required
+    }
+
+    /// The same error with the remaining back-off appended to the detail.
+    fn retrying_in(&self, remaining: Duration) -> Self {
+        Self {
+            detail: format!(
+                "{}; retrying in {}s",
+                self.detail,
+                remaining.as_secs().max(1)
+            ),
+            ..self.clone()
+        }
+    }
+
+    fn relogin(provider: &str, detail: impl Into<String>) -> Self {
+        Self {
+            provider: provider.to_string(),
+            detail: detail.into(),
+            relogin_required: true,
+        }
+    }
+
+    fn failed(provider: &str, detail: impl Into<String>) -> Self {
+        Self {
+            provider: provider.to_string(),
+            detail: detail.into(),
+            relogin_required: false,
+        }
+    }
+}
+
+impl std::fmt::Display for TokenRefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.relogin_required {
+            write!(
+                f,
+                "{} OAuth login is no longer valid ({}); sign in again",
+                self.provider, self.detail
+            )
+        } else {
+            write!(
+                f,
+                "{} OAuth token refresh failed: {}",
+                self.provider, self.detail
+            )
+        }
+    }
+}
+
+impl std::error::Error for TokenRefreshError {}
+
+/// The [`TokenRefreshError`] inside `error`, if it is one.
+pub fn token_refresh_error(error: &anyhow::Error) -> Option<&TokenRefreshError> {
+    error.downcast_ref::<TokenRefreshError>()
+}
 
 /// Structured error type for xAI OAuth operations.
 #[derive(Debug, Clone)]
@@ -1212,6 +1314,20 @@ pub fn extract_code_from_query(input: &str) -> Option<String> {
 ///
 /// The access token or an error
 ///
+/// # Errors
+///
+/// Fails with "No OAuth tokens found" when the user is not logged in, and with
+/// a keyring error (backed off for 30s) when the keyring cannot be read.
+///
+/// When tokens are stored but cannot be refreshed the error is a
+/// [`TokenRefreshError`] (see [`token_refresh_error`]):
+/// [`relogin_required`](TokenRefreshError::relogin_required) is true when the
+/// server rejected the refresh token, false for transient failures. The failure
+/// is logged once and remembered: later calls return it immediately, without
+/// contacting the server, until the stored refresh token changes (re-login or
+/// rotation by another process) or, for transient failures, a 15s back-off
+/// ends.
+///
 /// # Examples
 ///
 /// ```rust,no_run
@@ -1276,14 +1392,25 @@ pub async fn get_or_refresh_token(provider: &str) -> Result<String> {
         }
     };
 
-    if !tokens.is_expired() {
-        let access_token = tokens.access_token.clone();
-        token_cache::store(provider, tokens);
-        return Ok(access_token);
-    }
-
-    log::info!("{display} OAuth token expired, attempting to refresh...");
-    let refreshed = refresh_remote(oauth_provider.as_ref(), &tokens.refresh_token).await?;
+    let provider_key = provider.to_string();
+    let resolved = resolve_tokens(provider, oauth_provider.as_ref(), tokens, || {
+        let name = provider_key.clone();
+        keyring_blocking(move |store| {
+            store
+                .try_get_oauth_tokens(&name)
+                .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .map_err(anyhow::Error::new)?;
+    let refreshed = match resolved {
+        Resolved::Valid(tokens) => {
+            let access_token = tokens.access_token.clone();
+            token_cache::store(provider, tokens);
+            return Ok(access_token);
+        }
+        Resolved::Refreshed(refreshed) => refreshed,
+    };
 
     // Refresh tokens rotate: keep the new set in memory before touching the
     // keyring so a failed write cannot lose it.
@@ -1309,6 +1436,94 @@ pub async fn get_or_refresh_token(provider: &str) -> Result<String> {
     }
 
     Ok(access_token)
+}
+
+/// Outcome of [`resolve_tokens`].
+enum Resolved {
+    /// The stored tokens are still valid.
+    Valid(TokenSet),
+    /// The stored tokens were expired and have been refreshed (not yet persisted).
+    Refreshed(RefreshedTokens),
+}
+
+/// Return usable tokens for `provider`, refreshing `tokens` when expired.
+///
+/// A refresh token the server has rejected is not retried until the stored
+/// token changes. On a rejection the keyring is re-read once through
+/// `reread_keyring`: another process may already have rotated the token, in
+/// which case the new one is used. The failure is logged here, once, when it is
+/// first recorded.
+async fn resolve_tokens<F, Fut>(
+    provider: &str,
+    oauth_provider: &dyn OAuthProvider,
+    mut tokens: TokenSet,
+    mut reread_keyring: F,
+) -> std::result::Result<Resolved, TokenRefreshError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<TokenSet>>>,
+{
+    let display = oauth_provider.display_name();
+    let mut reread_after_rejection = false;
+    loop {
+        if !tokens.is_expired() {
+            return Ok(Resolved::Valid(tokens));
+        }
+
+        // Do not hammer the token endpoint with a refresh token that was just
+        // rejected; it stays rejected until the stored token changes.
+        if let Some(error) = token_cache::refresh_failure(provider, &tokens.refresh_token) {
+            return Err(error);
+        }
+
+        log::info!("{display} OAuth token expired, attempting to refresh...");
+        let error = match refresh_remote(oauth_provider, &tokens.refresh_token).await {
+            Ok(refreshed) => return Ok(Resolved::Refreshed(refreshed)),
+            Err(error) => classify_refresh_error(display, error),
+        };
+
+        if error.relogin_required() && !reread_after_rejection {
+            reread_after_rejection = true;
+            match reread_keyring().await {
+                Ok(Some(latest)) if latest.refresh_token != tokens.refresh_token => {
+                    log::info!("{display} refresh token was rotated by another process; retrying");
+                    tokens = latest;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(reread_error) => log::debug!(
+                    "Could not re-read {display} OAuth tokens after a rejected refresh: {reread_error}"
+                ),
+            }
+        }
+
+        log::warn!(
+            "{display} OAuth token refresh failed (relogin_required={}): {}",
+            error.relogin_required(),
+            error.detail()
+        );
+        token_cache::record_refresh_failure(provider, &tokens.refresh_token, error.clone());
+        return Err(error);
+    }
+}
+
+/// Turn any refresh failure into a [`TokenRefreshError`].
+fn classify_refresh_error(display: &str, error: anyhow::Error) -> TokenRefreshError {
+    let error = match error.downcast::<TokenRefreshError>() {
+        Ok(typed) => return typed,
+        Err(error) => error,
+    };
+    match error.downcast::<XaiOAuthError>() {
+        Ok(XaiOAuthError::RefreshFailed {
+            message,
+            relogin_required: true,
+        }) => TokenRefreshError::relogin(display, message),
+        Ok(XaiOAuthError::RefreshFailed { message, .. }) => {
+            TokenRefreshError::failed(display, message)
+        }
+        Ok(other) => TokenRefreshError::failed(display, other.to_string()),
+        Err(error) => TokenRefreshError::failed(display, error.to_string()),
+    }
 }
 
 /// Acquire the per-provider OAuth token lock shared with [`get_or_refresh_token`].
@@ -1369,7 +1584,7 @@ where
 
 /// Per-process token cache and keyring failure back-off, keyed by provider.
 mod token_cache {
-    use super::TokenSet;
+    use super::{TokenRefreshError, TokenSet};
     use std::collections::HashMap;
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, Instant};
@@ -1377,10 +1592,28 @@ mod token_cache {
     /// How long to avoid the keyring after a failed read.
     pub(super) const KEYRING_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 
+    /// How long a transient refresh failure suppresses further attempts.
+    pub(super) const REFRESH_FAILURE_BACKOFF: Duration = Duration::from_secs(15);
+
+    /// A failed refresh, tied to the refresh token that failed.
+    struct RefreshFailure {
+        fingerprint: u64,
+        at: Instant,
+        error: TokenRefreshError,
+    }
+
+    fn fingerprint(refresh_token: &str) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        refresh_token.hash(&mut hasher);
+        hasher.finish()
+    }
+
     #[derive(Default)]
     struct State {
         tokens: HashMap<String, TokenSet>,
         failures: HashMap<String, Instant>,
+        refresh_failures: HashMap<String, RefreshFailure>,
     }
 
     fn state() -> MutexGuard<'static, State> {
@@ -1403,7 +1636,49 @@ mod token_cache {
     pub(super) fn store(provider: &str, tokens: TokenSet) {
         let mut state = state();
         state.failures.remove(provider);
+        state.refresh_failures.remove(provider);
         state.tokens.insert(provider.to_string(), tokens);
+    }
+
+    pub(super) fn record_refresh_failure(
+        provider: &str,
+        refresh_token: &str,
+        error: TokenRefreshError,
+    ) {
+        state().refresh_failures.insert(
+            provider.to_string(),
+            RefreshFailure {
+                fingerprint: fingerprint(refresh_token),
+                at: Instant::now(),
+                error,
+            },
+        );
+    }
+
+    /// The recorded failure for this exact refresh token, if it still applies.
+    ///
+    /// A rejected token (`relogin_required`) stays failed until the stored token
+    /// changes; other failures expire after [`REFRESH_FAILURE_BACKOFF`].
+    pub(super) fn refresh_failure(
+        provider: &str,
+        refresh_token: &str,
+    ) -> Option<TokenRefreshError> {
+        let mut state = state();
+        let failure = state.refresh_failures.get(provider)?;
+        let stale = failure.fingerprint != fingerprint(refresh_token);
+        let relogin = failure.error.relogin_required();
+        let remaining = REFRESH_FAILURE_BACKOFF
+            .checked_sub(failure.at.elapsed())
+            .filter(|remaining| !remaining.is_zero());
+        let error = failure.error.clone();
+        if stale || (!relogin && remaining.is_none()) {
+            state.refresh_failures.remove(provider);
+            return None;
+        }
+        Some(match remaining {
+            Some(remaining) if !relogin => error.retrying_in(remaining),
+            _ => error,
+        })
     }
 
     pub(super) fn record_failure(provider: &str) {
@@ -1429,6 +1704,7 @@ mod token_cache {
         let mut state = state();
         state.tokens.remove(provider);
         state.failures.remove(provider);
+        state.refresh_failures.remove(provider);
     }
 }
 
@@ -1734,6 +2010,288 @@ mod tests {
         let error = get_or_refresh_token("codex").await.unwrap_err().to_string();
         assert!(error.contains("unavailable"), "{error}");
         token_cache::clear("codex");
+    }
+
+    #[test]
+    fn rejected_refresh_token_stays_failed_until_it_changes() {
+        let provider = "refresh-failure-test";
+        let error = TokenRefreshError::relogin("Test", "invalid_grant");
+        token_cache::record_refresh_failure(provider, "old", error);
+
+        let hit = token_cache::refresh_failure(provider, "old").expect("still failed");
+        assert!(hit.relogin_required());
+        assert!(hit.to_string().contains("sign in again"));
+
+        // A different refresh token (re-login or rotation elsewhere) clears it.
+        assert!(token_cache::refresh_failure(provider, "new").is_none());
+        assert!(token_cache::refresh_failure(provider, "old").is_none());
+    }
+
+    #[test]
+    fn store_and_clear_reset_refresh_failure() {
+        let provider = "refresh-failure-reset-test";
+        for reset in [true, false] {
+            token_cache::record_refresh_failure(
+                provider,
+                "old",
+                TokenRefreshError::relogin("Test", "invalid_grant"),
+            );
+            if reset {
+                token_cache::store(provider, token_set(3600));
+            } else {
+                token_cache::clear(provider);
+            }
+            assert!(token_cache::refresh_failure(provider, "old").is_none());
+        }
+        token_cache::clear(provider);
+    }
+
+    #[test]
+    fn transient_refresh_failure_is_not_permanent() {
+        let provider = "refresh-transient-test";
+        token_cache::record_refresh_failure(
+            provider,
+            "tok",
+            TokenRefreshError::failed("Test", "timed out"),
+        );
+        let hit = token_cache::refresh_failure(provider, "tok").expect("within back-off");
+        assert!(!hit.relogin_required());
+        // The remaining back-off is reported, like the keyring back-off message.
+        assert!(hit.to_string().contains("retrying in"), "{hit}");
+        token_cache::clear(provider);
+    }
+
+    #[test]
+    fn classify_refresh_error_preserves_typed_errors() {
+        let typed = anyhow::Error::new(TokenRefreshError::relogin("Anthropic", "invalid_grant"));
+        assert!(classify_refresh_error("Anthropic", typed).relogin_required());
+        let other = classify_refresh_error("Anthropic", anyhow!("connection reset"));
+        assert!(!other.relogin_required());
+        assert!(other.detail().contains("connection reset"));
+        for (relogin, expected) in [(true, true), (false, false)] {
+            let xai = anyhow::Error::new(XaiOAuthError::RefreshFailed {
+                message: "bad".into(),
+                relogin_required: relogin,
+            });
+            let classified = classify_refresh_error("xAI", xai);
+            assert_eq!(classified.relogin_required(), expected);
+            assert_eq!(classified.detail(), "bad");
+        }
+    }
+
+    #[test]
+    fn anthropic_credential_rejection_requires_relogin() {
+        use anthropic_auth::AnthropicAuthError::Http;
+        for status in [400, 401, 403] {
+            let error = map_anthropic_refresh_error(
+                "Anthropic",
+                Http {
+                    status,
+                    body: "invalid_grant\nHint: expired".into(),
+                },
+            );
+            let typed = token_refresh_error(&error).expect("typed refresh error");
+            assert!(typed.relogin_required(), "status {status}");
+            assert_eq!(typed.provider(), "Anthropic");
+            // Only the first line of the body is kept.
+            assert_eq!(typed.detail(), "invalid_grant");
+        }
+        for status in [429, 500, 503] {
+            let error = map_anthropic_refresh_error(
+                "Anthropic",
+                Http {
+                    status,
+                    body: "busy".into(),
+                },
+            );
+            assert!(token_refresh_error(&error).is_none(), "status {status}");
+        }
+    }
+
+    #[test]
+    fn anthropic_refresh_retries_only_transient_errors() {
+        use anthropic_auth::AnthropicAuthError::Http;
+        let http = |status| Http {
+            status,
+            body: String::new(),
+        };
+        assert!(anthropic_refresh_retryable(&http(503)));
+        assert!(anthropic_refresh_retryable(&http(429)));
+        assert!(!anthropic_refresh_retryable(&http(400)));
+        assert!(!anthropic_refresh_retryable(&http(401)));
+    }
+
+    /// What a [`FakeProvider`] answers to one refresh call.
+    enum FakeRefresh {
+        Tokens(TokenSet),
+        Rejected,
+        Transient,
+    }
+
+    struct FakeProvider {
+        answers: std::sync::Mutex<std::collections::VecDeque<FakeRefresh>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeProvider {
+        fn new(answers: impl IntoIterator<Item = FakeRefresh>) -> Self {
+            Self {
+                answers: std::sync::Mutex::new(answers.into_iter().collect()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl OAuthProvider for FakeProvider {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn display_name(&self) -> &str {
+            "Fake"
+        }
+        async fn start_flow(&self) -> Result<OAuthFlowData> {
+            Err(anyhow!("unused"))
+        }
+        async fn exchange_code(&self, _: &str, _: &str, _: &str) -> Result<TokenSet> {
+            Err(anyhow!("unused"))
+        }
+        async fn refresh_token(&self, _refresh_token: &str) -> Result<TokenSet> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let answer = self.answers.lock().unwrap().pop_front();
+            match answer.expect("unexpected refresh call") {
+                FakeRefresh::Tokens(tokens) => Ok(tokens),
+                FakeRefresh::Rejected => Err(anyhow::Error::new(TokenRefreshError::relogin(
+                    "Fake",
+                    "invalid_grant",
+                ))),
+                FakeRefresh::Transient => Err(anyhow!("connection reset")),
+            }
+        }
+        async fn create_api_key(&self, _: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn api_key_name(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    fn expired(refresh_token: &str) -> TokenSet {
+        TokenSet {
+            access_token: "stale".into(),
+            refresh_token: refresh_token.into(),
+            expires_at: 0,
+        }
+    }
+
+    fn fresh(access_token: &str, refresh_token: &str) -> TokenSet {
+        TokenSet {
+            access_token: access_token.into(),
+            refresh_token: refresh_token.into(),
+            expires_at: current_epoch_seconds() + 3600,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_tokens_returns_valid_tokens_without_refreshing() {
+        let provider = FakeProvider::new([]);
+        let resolved = resolve_tokens("resolve-valid-test", &provider, fresh("live", "r"), || {
+            std::future::ready(Ok(None))
+        })
+        .await
+        .unwrap();
+        assert!(matches!(resolved, Resolved::Valid(t) if t.access_token == "live"));
+        assert_eq!(provider.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_tokens_uses_token_rotated_by_another_process() {
+        let key = "resolve-rotated-test";
+        let provider = FakeProvider::new([
+            FakeRefresh::Rejected,
+            FakeRefresh::Tokens(fresh("new-access", "new-refresh")),
+        ]);
+        let rotated = expired("rotated-elsewhere");
+        let resolved = resolve_tokens(key, &provider, expired("old"), || {
+            std::future::ready(Ok(Some(rotated.clone())))
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(resolved, Resolved::Refreshed(r) if r.tokens.access_token == "new-access")
+        );
+        assert_eq!(provider.calls(), 2);
+        token_cache::clear(key);
+    }
+
+    #[tokio::test]
+    async fn resolve_tokens_remembers_a_rejected_refresh_token() {
+        let key = "resolve-rejected-test";
+        let provider = FakeProvider::new([FakeRefresh::Rejected]);
+        let same = expired("old");
+        let error = match resolve_tokens(key, &provider, expired("old"), || {
+            std::future::ready(Ok(Some(same.clone())))
+        })
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a rejected refresh must fail"),
+        };
+        assert!(error.relogin_required());
+        assert_eq!(provider.calls(), 1);
+
+        // The same refresh token fails fast, without contacting the server.
+        let again = resolve_tokens(key, &provider, expired("old"), || {
+            std::future::ready(Ok(None))
+        })
+        .await;
+        assert!(matches!(again, Err(e) if e.relogin_required()));
+        assert_eq!(provider.calls(), 1);
+
+        // A new refresh token (re-login) is attempted again.
+        let provider = FakeProvider::new([FakeRefresh::Tokens(fresh("a", "r2"))]);
+        let relogged = resolve_tokens(key, &provider, expired("new"), || {
+            std::future::ready(Ok(None))
+        })
+        .await;
+        assert!(matches!(relogged, Ok(Resolved::Refreshed(_))));
+        token_cache::clear(key);
+    }
+
+    #[tokio::test]
+    async fn resolve_tokens_does_not_reread_keyring_for_transient_failures() {
+        let key = "resolve-transient-test";
+        let provider = FakeProvider::new([FakeRefresh::Transient]);
+        let rereads = std::sync::atomic::AtomicUsize::new(0);
+        let result = resolve_tokens(key, &provider, expired("old"), || {
+            rereads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(None))
+        })
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a failed refresh must fail"),
+        };
+        assert!(!error.relogin_required());
+        assert!(error.detail().contains("connection reset"));
+        assert_eq!(rereads.load(std::sync::atomic::Ordering::SeqCst), 0);
+        token_cache::clear(key);
+    }
+
+    #[tokio::test]
+    async fn resolve_tokens_survives_a_failing_keyring_reread() {
+        let key = "resolve-reread-error-test";
+        let provider = FakeProvider::new([FakeRefresh::Rejected]);
+        let result = resolve_tokens(key, &provider, expired("old"), || {
+            std::future::ready(Err(anyhow!("keychain denied")))
+        })
+        .await;
+        assert!(matches!(result, Err(e) if e.relogin_required()));
+        token_cache::clear(key);
     }
 
     #[tokio::test(start_paused = true)]

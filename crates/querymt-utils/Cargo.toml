@@ -42,7 +42,7 @@ keyring-core = { version = "1.0", optional = true }
 serde_json = { workspace = true, optional = true }
 
 # OAuth dependencies (optional, behind oauth feature)
-anthropic-auth = { version = "0.2", default-features = false, features = ["async", "callback-server", "rustls-tls"], optional = true }
+anthropic-auth = { version = "0.2.1", default-features = false, features = ["async", "callback-server", "rustls-tls"], optional = true }
 openai-auth = { version = "1.0", features = ["async", "callback-server"], optional = true }
 kimi-auth = { git = "https://github.com/querymt/kimi-auth", tag = "v0.1.0", default-features = false, features = ["async", "rustls-tls"], optional = true }
 async-trait = { workspace = true, optional = true }

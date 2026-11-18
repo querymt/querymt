@@ -171,6 +171,12 @@ impl ProviderHostActor {
 impl Message<GetProviderContractInfo> for ProviderHostActor {
     type Reply = Result<ProviderContractInfo, RemoteProviderHostError>;
 
+    #[tracing::instrument(
+        name = "remote.provider_host.contract_info",
+        skip(self, _ctx),
+        // `auth.source` is recorded by the backend's credential resolution.
+        fields(provider = %msg.provider, model = %msg.model, auth.source = tracing::field::Empty)
+    )]
     async fn handle(
         &mut self,
         msg: GetProviderContractInfo,

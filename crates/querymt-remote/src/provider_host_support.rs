@@ -124,7 +124,8 @@ pub fn merge_remote_provider_params(
 #[tracing::instrument(
     name = "remote.provider_host.build_provider_for_request",
     skip(backend, request_params),
-    fields(provider = %provider_name, model = %model)
+    // `auth.source` is recorded by the backend's credential resolution.
+    fields(provider = %provider_name, model = %model, auth.source = tracing::field::Empty)
 )]
 pub async fn build_provider_for_request<E>(
     backend: &dyn RemoteProviderBackend<Error = E>,
