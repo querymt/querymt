@@ -767,6 +767,12 @@ impl QmtApp {
                     .runtime(&c.id)
                     .is_some_and(|r| r.is_connected() && !r.sessions_loaded)
         });
+        // Older catalog pages still arriving after the first was shown.
+        let catalog_loading = store.configs.iter().any(|c| {
+            store
+                .runtime(&c.id)
+                .is_some_and(|r| r.is_connected() && r.catalog_loading)
+        });
 
         // Quiet group labels: small caps in the dim tone, no widget-heading weight.
         let section = |text: &'static str| {
@@ -802,6 +808,19 @@ impl QmtApp {
                 .id("sidebar-open-header")
                 .cursor_pointer()
                 .child(section("Open sessions").flex_1())
+                .when(catalog_loading, |el| {
+                    el.child(
+                        div()
+                            .id("sidebar-catalog-loading")
+                            .pt_3()
+                            .pb_1()
+                            .pr_1()
+                            .child(kit::spinner("sidebar-catalog-spinner", 11., p.dim))
+                            .tooltip(|window, cx| {
+                                kit::wrap_tip("Loading older sessions…").build(window, cx)
+                            }),
+                    )
+                })
                 .when(open_total > 0, |el| {
                     el.child(
                         div()
@@ -1097,6 +1116,7 @@ fn initial_view(store: &Entity<AgentsStore>, cx: &App) -> (Page, Option<String>)
 impl Render for QmtApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *palette(cx);
+        let render_started = crate::util::now_ms();
         let body = match self.page {
             Page::Start => self.render_start(cx).into_any_element(),
             Page::Sessions => self.render_sessions(cx).into_any_element(),
@@ -1115,6 +1135,10 @@ impl Render for QmtApp {
             .or_else(|| self.render_model_modal(radii, cx))
             .or_else(|| self.render_overlay(radii, cx));
         let header = self.render_header(window, cx).into_any_element();
+        let render_ms = crate::util::now_ms() - render_started;
+        if render_ms > 16. {
+            tracing::warn!(render.ms = render_ms, "slow app render");
+        }
 
         let root = v_flex()
             .track_focus(&self.app_focus)

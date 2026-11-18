@@ -51,7 +51,8 @@ impl std::fmt::Display for RpcError {
     }
 }
 
-type Pending = oneshot::Sender<Result<Value, RpcError>>;
+/// A request awaiting its response, and the `rpc.request` span timing it.
+type Pending = (oneshot::Sender<Result<Value, RpcError>>, tracing::Span);
 
 pub struct RpcClient {
     outgoing: Sender<String>,
@@ -86,18 +87,30 @@ impl RpcClient {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         let (tx, rx) = oneshot::channel();
-        self.pending.borrow_mut().insert(id, tx);
+        // Round trip from send to the response being parsed on the UI thread.
+        let span = tracing::info_span!(
+            "rpc.request",
+            rpc.method = method,
+            rpc.id = id,
+            rpc.request_bytes = tracing::field::Empty,
+            rpc.response_bytes = tracing::field::Empty,
+            rpc.parse_ms = tracing::field::Empty,
+            rpc.error = tracing::field::Empty,
+        );
+        self.pending.borrow_mut().insert(id, (tx, span.clone()));
         let text =
             json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
+        span.record("rpc.request_bytes", text.len());
         let outgoing = self.outgoing.clone();
-        async move {
+        let request = async move {
             outgoing
                 .send(text)
                 .await
                 .map_err(|_| RpcError::local("Connection closed."))?;
             rx.await
                 .map_err(|_| RpcError::local("Connection closed."))?
-        }
+        };
+        tracing::Instrument::instrument(request, span)
     }
 
     /// Fire-and-forget JSON-RPC notification.
@@ -122,7 +135,9 @@ impl RpcClient {
         if std::env::var_os("QMT_DEBUG").is_some() {
             eprintln!("[rpc <-] {}", text.chars().take(200).collect::<String>());
         }
+        let parse_started = crate::util::now_ms();
         let message: Value = serde_json::from_str(text).ok()?;
+        let parse_ms = crate::util::now_ms() - parse_started;
         if let Some(method) = message.get("method").and_then(Value::as_str) {
             let params = message.get("params").cloned().unwrap_or(Value::Null);
             return Some(match message.get("id") {
@@ -138,7 +153,9 @@ impl RpcClient {
             });
         }
         let id = message.get("id").and_then(Value::as_u64)?;
-        let pending = self.pending.borrow_mut().remove(&id)?;
+        let (pending, span) = self.pending.borrow_mut().remove(&id)?;
+        span.record("rpc.response_bytes", text.len());
+        span.record("rpc.parse_ms", parse_ms);
         let result = match message.get("error") {
             Some(error) => {
                 let mut text = error
@@ -160,12 +177,15 @@ impl RpcClient {
             }
             None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
         };
+        if let Err(err) = &result {
+            span.record("rpc.error", err.message.as_str());
+        }
         let _ = pending.send(result);
         None
     }
 
     pub fn fail_all(&self, reason: &str) {
-        for (_, pending) in self.pending.borrow_mut().drain() {
+        for (_, (pending, _)) in self.pending.borrow_mut().drain() {
             let _ = pending.send(Err(RpcError::local(reason)));
         }
     }

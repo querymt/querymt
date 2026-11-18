@@ -244,6 +244,11 @@ impl QmtApp {
         let loading = connected
             .iter()
             .any(|id| store.runtime(id).is_some_and(|r| !r.sessions_loaded));
+        // First page shown, older pages still arriving: counts and search
+        // are incomplete until they finish.
+        let catalog_loading = connected
+            .iter()
+            .any(|id| store.runtime(id).is_some_and(|r| r.catalog_loading));
         let errors: Vec<String> = connected
             .iter()
             .filter_map(|id| {
@@ -384,6 +389,16 @@ impl QmtApp {
             .bg(p.card)
             .child(kit::icon(IconName::Search, 15., p.dim))
             .child(Input::new(&self.session_query).appearance(false).flex_1());
+        let catalog_note = catalog_loading.then(|| {
+            h_flex()
+                .ml_auto()
+                .pb_2()
+                .gap_1p5()
+                .text_xs()
+                .text_color(p.dim)
+                .child(kit::spinner("sessions-catalog-spinner", 12., p.dim))
+                .child("Loading older sessions…")
+        });
         let tabs = h_flex()
             .gap_5()
             .border_b_1()
@@ -407,7 +422,8 @@ impl QmtApp {
                         this.session_tab = t;
                         cx.notify();
                     }))
-            }));
+            }))
+            .children(catalog_note);
         // Agents without lifecycle support only appear in All; say so.
         let coverage = (tab != SessionTab::All && unknown_lifecycle > 0).then(|| {
             h_flex()

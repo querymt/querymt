@@ -4142,6 +4142,9 @@ impl QmtApp {
         let loading = view.loading;
         let error = view.error.clone();
         let error_details = view.error_details.clone();
+        if !view.loading {
+            crate::telemetry::session_rendered(&view.session_id, view.items.len());
+        }
         let history_more = view.history_more;
         let history_loading = view.history_loading;
         let history_error = view.history_error.clone();
