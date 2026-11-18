@@ -117,7 +117,7 @@ impl ServerHandler for QmcpServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("qmcp", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Control an existing QueryMT ACP WebSocket server. Discover capabilities, profiles, models, and session ids rather than inventing values. Keep returned sessionId values. Pass cwd for session operations. Timeouts and MCP cancellation do not cancel remote work: check runtime before retrying. Only close sessions when explicitly requested. Streaming ACP events are collected in each tool result.")
+            .with_instructions("Control an existing QueryMT ACP WebSocket server. Discover capabilities, profiles, models, and session ids rather than inventing values. Keep returned sessionId values. Pass an absolute cwd on the QueryMT host when creating a session; existing sessions keep their stored cwd. Timeouts and MCP cancellation do not cancel remote work: check runtime before retrying. Only close sessions when explicitly requested. Streaming ACP events are collected in each tool result.")
     }
 
     async fn list_tools(

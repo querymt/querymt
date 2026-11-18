@@ -36,7 +36,7 @@ cargo install --locked --path crates/qmacp
 ```sh
 qmacp --quiet caps
 qmacp --quiet prompt --new --cwd . --timeout 900 'fix the build'
-qmacp --quiet prompt --cwd . --timeout 900 "$SESSION_ID" 'run the tests'
+qmacp --quiet prompt --timeout 900 "$SESSION_ID" 'run the tests'
 qmacp --quiet runtime "$SESSION_ID"
 qmacp --quiet follow "$SESSION_ID"
 ```

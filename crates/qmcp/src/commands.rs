@@ -174,7 +174,7 @@ pub enum Command {
     },
     /// Current QueryMT runtime state for a session.
     Runtime { session_id: String },
-    /// Collect compact session events until idle. Supply cwd for the session workspace.
+    /// Collect compact session events until idle.
     Follow {
         session_id: String,
         cwd: Option<PathBuf>,
@@ -684,13 +684,13 @@ async fn new_session(
     effort: Option<String>,
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
-    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
+    let cwd = new_session_cwd(cwd)?;
     let (created, created_raw) = client
         .new_session(cwd.clone(), profile.as_deref())
         .await
         .map_err(CliError::from_request)?;
     let session_id = created.session_id.to_string();
-    state.session(&session_id, &cwd, true);
+    state.session(&session_id, Some(&cwd), true);
     apply_config(client, &session_id, mode, model, effort).await?;
     let status = match open_session(client, session_id.clone(), cwd.clone()).await {
         Ok(opened) => opened.status,
@@ -1009,9 +1009,9 @@ async fn inspect(
     if !initialized.agent_capabilities.load_session {
         return Err(CliError::rpc("agent does not support session/load"));
     }
-    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
+    let cwd = session::resolve_optional_cwd(cwd).map_err(CliError::rpc)?;
     let (loaded, load_value) = client
-        .load_session(session_id.clone(), cwd.clone())
+        .load_session(session_id.clone(), cwd.clone().unwrap_or_default())
         .await
         .map_err(CliError::from_request)?;
     if full {
@@ -1028,7 +1028,7 @@ async fn inspect(
     }
     Ok(session::compact_inspect(
         &session_id,
-        &cwd,
+        cwd.as_deref(),
         loaded.modes.as_ref(),
         &load_value,
         messages,
@@ -1042,7 +1042,7 @@ async fn status(
     cwd: Option<PathBuf>,
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
-    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
+    let cwd = session::existing_session_cwd(cwd).map_err(CliError::rpc)?;
     let opened = open_session(client, session_id.clone(), cwd).await?;
     Ok(opened.status)
 }
@@ -1129,20 +1129,30 @@ async fn prompt(
         delivery,
         until_idle,
     } = args;
+    // A session keeps its own workspace; only a new session takes a cwd.
+    if !new && cwd.is_some() {
+        return Err(CliError::Usage(
+            "cwd applies only with new=true; an existing session keeps its own cwd".into(),
+        ));
+    }
+    let cwd = if new {
+        Some(new_session_cwd(cwd)?)
+    } else {
+        None
+    };
     let initialized = client.initialize().await.map_err(CliError::from_request)?;
-    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
     let session_id = if new {
         let (created, _) = client
-            .new_session(cwd.clone(), profile.as_deref())
+            .new_session(cwd.clone().unwrap_or_default(), profile.as_deref())
             .await
             .map_err(CliError::from_request)?;
         let session_id = created.session_id.to_string();
-        state.session(&session_id, &cwd, true);
+        state.session(&session_id, cwd.as_deref(), true);
         session_id
     } else {
         let session_id = session_id
             .ok_or_else(|| CliError::Usage("prompt requires session_id or new=true".into()))?;
-        state.session(&session_id, &cwd, false);
+        state.session(&session_id, None, false);
         session_id
     };
     // Keep the session id observable even if configuration or the prompt later fails.
@@ -1159,7 +1169,7 @@ async fn prompt(
         choose_delivery(client, &session_id, delivery).await?
     };
     if !new && chosen == Delivery::Prompt {
-        open_session(client, session_id.clone(), cwd.clone()).await?;
+        open_session(client, session_id.clone(), PathBuf::new()).await?;
     }
     apply_config(client, &session_id, mode, model, effort).await?;
     client.capture_assistant_text(Some(&session_id)).await;
@@ -1298,7 +1308,7 @@ async fn follow(
     timeout: u64,
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
-    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
+    let cwd = session::existing_session_cwd(cwd).map_err(CliError::rpc)?;
     open_session(client, session_id.clone(), cwd.clone()).await?;
     client.capture_assistant_text(Some(&session_id)).await;
     wait_until_idle_every(
@@ -1310,8 +1320,7 @@ async fn follow(
     .await?;
     let mut text = client.take_assistant_text().await;
     if text.is_empty()
-        && let Ok(snapshot) =
-            inspect(client, session_id.clone(), Some(cwd), false, Some(1), false).await
+        && let Ok(snapshot) = inspect(client, session_id.clone(), None, false, Some(1), false).await
     {
         text = session::last_assistant_text(&snapshot).unwrap_or_default();
     }
@@ -1572,6 +1581,14 @@ async fn apply_config(
 
 struct OpenedSession {
     status: Value,
+}
+
+/// A new session needs an explicit absolute cwd on the QueryMT host; qmcp's
+/// own working directory means nothing there.
+fn new_session_cwd(cwd: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    cwd.filter(|cwd| cwd.is_absolute()).ok_or_else(|| {
+        CliError::Usage("a new session requires an absolute cwd on the QueryMT host".into())
+    })
 }
 
 async fn open_session(
