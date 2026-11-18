@@ -91,6 +91,30 @@ impl LocalAgentHandle {
         Ok(Some((session_handle, binding)))
     }
 
+    /// Live actor for a session, wherever it is registered: this handle or an
+    /// already built profile runtime or delegate. `None` when no actor is
+    /// materialized. Unlike [`Self::bound_session_handle`], never builds a
+    /// runtime or delegate.
+    pub(crate) async fn owned_session_ref(&self, session_id: &str) -> Option<SessionActorRef> {
+        let own = self.registry.lock().await.get(session_id).cloned();
+        if own.is_some() {
+            return own;
+        }
+        // Observe only: neither the binding lookup nor delegate resolution may
+        // run, both build runtimes. An unbuilt runtime holds no live actor.
+        for runtime in self.profiles()?.materialized_runtimes().await {
+            let handle = runtime.handle();
+            let delegates = handle.local_members();
+            for handle in std::iter::once(handle).chain(delegates) {
+                let session_ref = handle.registry.lock().await.get(session_id).cloned();
+                if session_ref.is_some() {
+                    return session_ref;
+                }
+            }
+        }
+        None
+    }
+
     #[doc(hidden)]
     pub async fn session_ref_for_agent_session(
         &self,

@@ -1504,6 +1504,93 @@ async fn test_profile_handle_adopts_stored_unbound_session_on_load_and_resume() 
 }
 
 #[tokio::test]
+async fn loaded_profile_session_replays_through_the_top_level_handle() {
+    let (f, _profile_dir) = profile_fixture_with_files(&[
+        ("alpha.toml", ALPHA_PROFILE_TOML),
+        ("beta.toml", BETA_PROFILE_TOML),
+    ])
+    .await;
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "querymt".to_string(),
+        serde_json::json!({ "profile_id": "beta" }),
+    );
+    let session_id = f
+        .handle
+        .new_session(NewSessionRequest::new(std::path::PathBuf::new()).meta(meta))
+        .await
+        .expect("new profile session")
+        .session_id
+        .to_string();
+    f.handle
+        .load_session(LoadSessionRequest::new(
+            SessionId::from(session_id.clone()),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .expect("load profile session");
+    // The actor lives in the profile runtime's registry, not the top-level one.
+    assert!(f.handle.registry.lock().await.get(&session_id).is_none());
+
+    crate::acp::stdio::replay_loaded_session(
+        &f.handle,
+        &session_id,
+        &crate::acp::shared::AcpSessionUpdateCapabilities::default(),
+    )
+    .await
+    .expect("profile-bound session replays after load");
+}
+
+#[tokio::test]
+async fn replay_does_not_materialize_an_unloaded_profile_runtime() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountingCatalog(Arc<AtomicUsize>);
+    #[async_trait]
+    impl ProfileCatalog for CountingCatalog {
+        async fn list_profiles(&self) -> anyhow::Result<Vec<crate::profiles::ProfileMetadata>> {
+            Ok(vec![])
+        }
+        async fn load_profile(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<crate::profiles::ProfileDocument> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("replay must not build this profile")
+        }
+    }
+    let f = RealStorageHandleFixture::new().await;
+    let session_id = seed_session_with_reasoning(&f, None).await;
+    f.storage
+        .session_store()
+        .set_profile_binding(&session_id, "unloaded")
+        .await
+        .unwrap();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(CountingCatalog(builds.clone()));
+    let (plugins, _dir) = empty_plugin_registry().unwrap();
+    let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        catalog,
+        "unloaded",
+        AgentInfra {
+            plugin_registry: Arc::new(plugins),
+            storage: Some(f.storage.clone()),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        },
+    ));
+    f.handle.set_profiles(profiles.clone());
+
+    let _ = crate::acp::stdio::replay_loaded_session(
+        &f.handle,
+        &session_id,
+        &crate::acp::shared::AcpSessionUpdateCapabilities::default(),
+    )
+    .await;
+    assert_eq!(builds.load(Ordering::SeqCst), 0);
+    assert!(profiles.materialized_runtimes().await.is_empty());
+}
+
+#[tokio::test]
 async fn test_profile_handle_does_not_bind_unknown_session_ids() {
     let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
     let err = f
