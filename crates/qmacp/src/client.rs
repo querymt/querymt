@@ -57,6 +57,7 @@ type Outbound = (Message, Option<oneshot::Sender<Result<(), String>>>);
 
 #[derive(Default)]
 struct AssistantText {
+    session_id: Option<String>,
     text: String,
     truncated: bool,
     limit: Option<usize>,
@@ -64,7 +65,12 @@ struct AssistantText {
 
 impl AssistantText {
     fn observe(&mut self, event: &Value) {
-        if self.truncated {
+        if self.truncated
+            || !self
+                .session_id
+                .as_deref()
+                .is_some_and(|id| event["sessionId"].as_str() == Some(id))
+        {
             return;
         }
         events::observe_assistant_text(&mut self.text, event);
@@ -256,14 +262,11 @@ impl AcpClient {
         self.event_sink.emit(event).await;
     }
 
-    pub async fn clear_assistant_text(&self) {
+    pub async fn capture_assistant_text(&self, session_id: Option<&str>) {
         let mut buffer = self.assistant_text.lock().await;
+        buffer.session_id = session_id.map(str::to_owned);
         buffer.text.clear();
         buffer.truncated = false;
-    }
-
-    pub async fn snapshot_assistant_text(&self) -> String {
-        self.assistant_text.lock().await.text.clone()
     }
 
     pub async fn text_truncated(&self) -> bool {
@@ -691,7 +694,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("wss://{}/acp/ws", listener.local_addr().unwrap());
         let peer = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("TLS fixture did not receive a connection")
+                .unwrap();
             let mut first_byte = [0];
             tokio::time::timeout(Duration::from_secs(2), socket.read_exact(&mut first_byte))
                 .await
@@ -713,13 +719,17 @@ mod tests {
     #[test]
     fn bounded_assistant_text_preserves_a_utf8_prefix_and_reports_truncation() {
         let mut buffer = AssistantText {
+            session_id: Some("wanted".into()),
             limit: Some(5),
             ..Default::default()
         };
-        buffer.observe(&json!({"type": "text", "role": "assistant", "text": "\u{e9}\u{e9}\u{e9}"}));
+        buffer.observe(&json!({"type": "text", "role": "assistant", "sessionId": "other", "text": "not this session"}));
+        buffer.observe(&json!({"type": "text", "role": "assistant", "sessionId": "wanted", "text": "\u{e9}\u{e9}\u{e9}"}));
         assert_eq!(buffer.text, "\u{e9}\u{e9}");
         assert!(buffer.truncated);
-        buffer.observe(&json!({"type": "text", "role": "assistant", "text": "later"}));
+        buffer.observe(
+            &json!({"type": "text", "role": "assistant", "sessionId": "wanted", "text": "later"}),
+        );
         assert_eq!(buffer.text, "\u{e9}\u{e9}");
     }
 

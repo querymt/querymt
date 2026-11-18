@@ -321,6 +321,15 @@ jobs:
             README="crates/${{ matrix.binary }}/README.md"
           fi
           cp "$README" LICENSE "$STAGING/"
+          case "${{ matrix.binary }}" in
+            qmacp) cp crates/qmacp/LICENSE "$STAGING/LICENSE-qmacp" ;;
+            qmcp)
+              cp crates/qmacp/LICENSE "$STAGING/LICENSE-qmacp"
+              cp crates/qmcp/LICENSE "$STAGING/LICENSE-qmcp"
+              mkdir -p "$STAGING/docs"
+              cp crates/qmcp/docs/how-to-connect.md "$STAGING/docs/"
+              ;;
+          esac
           tar -czf "$ARTIFACT_DIR/${PKG}.tar.gz" -C "$ARTIFACT_DIR" "$PKG"
           echo "ASSET_PATH=$ARTIFACT_DIR/${PKG}.tar.gz" >> $GITHUB_ENV
 
@@ -346,6 +355,15 @@ jobs:
             $README = "crates/${{ matrix.binary }}/README.md"
           }
           Copy-Item $README, LICENSE -Destination $STAGING
+          if ("${{ matrix.binary }}" -in @("qmacp", "qmcp")) {
+            Copy-Item crates/qmacp/LICENSE -Destination (Join-Path $STAGING 'LICENSE-qmacp')
+          }
+          if ("${{ matrix.binary }}" -eq "qmcp") {
+            Copy-Item crates/qmcp/LICENSE -Destination (Join-Path $STAGING 'LICENSE-qmcp')
+            $DOCS = Join-Path $STAGING 'docs'
+            New-Item -ItemType Directory -Force -Path $DOCS
+            Copy-Item crates/qmcp/docs/how-to-connect.md -Destination $DOCS
+          }
           $ZIP_PATH = "$ARTIFACT_DIR/${PKG}.zip"
           Compress-Archive -Path (Join-Path $STAGING '*') -DestinationPath $ZIP_PATH -Force
           echo "ASSET_PATH=${ZIP_PATH}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append

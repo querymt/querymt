@@ -426,7 +426,7 @@ pub async fn run(
     let is_batch = matches!(command, Command::Exec { .. });
     state.recovery.clear();
     let operation = async {
-        client.clear_assistant_text().await;
+        client.capture_assistant_text(None).await;
         run_inner(client, command, state).await
     };
     let outcome = match deadline {
@@ -1153,8 +1153,8 @@ async fn prompt(
     state
         .recovery
         .insert("deliveryState".into(), json!("not_submitted"));
-    let chosen = if new {
-        Delivery::Prompt
+    let (chosen, run_id) = if new {
+        (Delivery::Prompt, None)
     } else {
         choose_delivery(client, &session_id, delivery).await?
     };
@@ -1162,7 +1162,7 @@ async fn prompt(
         open_session(client, session_id.clone(), cwd.clone()).await?;
     }
     apply_config(client, &session_id, mode, model, effort).await?;
-    client.clear_assistant_text().await;
+    client.capture_assistant_text(Some(&session_id)).await;
     let mut submitted = None;
     let stop_reason = match chosen {
         Delivery::Prompt => {
@@ -1183,7 +1183,7 @@ async fn prompt(
                 "querymt/session/queue"
             };
             submitted =
-                Some(submit_input(client, state, method, session_id.clone(), None, text).await?);
+                Some(submit_input(client, state, method, session_id.clone(), run_id, text).await?);
             if chosen == Delivery::Steer {
                 "steered".to_string()
             } else {
@@ -1226,25 +1226,27 @@ async fn choose_delivery(
     client: &AcpClient,
     session_id: &str,
     requested: Delivery,
-) -> Result<Delivery, CliError> {
+) -> Result<(Delivery, Option<String>), CliError> {
     if requested != Delivery::Auto {
-        return Ok(requested);
+        return Ok((requested, None));
     }
     let state = runtime(client, session_id.to_string()).await?;
-    let phase = state
-        .pointer("/runtime/phase")
-        .and_then(Value::as_str)
-        .filter(|phase| !phase.is_empty())
-        .ok_or_else(|| {
-            CliError::rpc("runtime response has no valid phase; input was not submitted")
-        })?;
+    let phase = require_observed_phase(&state)?;
     let steerable = state
         .pointer("/runtime/steerable")
         .and_then(Value::as_bool)
         .ok_or_else(|| {
             CliError::rpc("runtime response has no valid steerable flag; input was not submitted")
         })?;
-    Ok(delivery_from_runtime(phase, steerable))
+    let delivery = delivery_from_runtime(phase, steerable);
+    let run_id = if delivery == Delivery::Steer {
+        Some(session::observed_run_id(&state["runtime"]).ok_or_else(|| {
+            CliError::rpc("runtime response has no active run ID; input was not submitted")
+        })?)
+    } else {
+        None
+    };
+    Ok((delivery, run_id))
 }
 
 fn delivery_from_runtime(phase: &str, steerable: bool) -> Delivery {
@@ -1273,11 +1275,8 @@ async fn wait_until_idle_every(
 ) -> Result<(), CliError> {
     let deadline = tokio::time::Instant::now() + timeout.max(Duration::from_secs(1));
     loop {
-        let value = runtime(client, session_id.to_string()).await?;
-        let phase = value
-            .pointer("/runtime/phase")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
+        let value = runtime_observation(client, session_id.to_string(), true).await?;
+        let phase = require_observed_phase(&value)?;
         if phase == "idle" {
             return Ok(());
         }
@@ -1301,7 +1300,7 @@ async fn follow(
     client.initialize().await.map_err(CliError::from_request)?;
     let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
     open_session(client, session_id.clone(), cwd.clone()).await?;
-    client.clear_assistant_text().await;
+    client.capture_assistant_text(Some(&session_id)).await;
     wait_until_idle_every(
         client,
         &session_id,
@@ -1324,12 +1323,28 @@ async fn follow(
     }))
 }
 
+fn require_observed_phase(state: &Value) -> Result<&str, CliError> {
+    session::observed_phase(&state["runtime"]).ok_or_else(|| {
+        CliError::rpc(
+            "session runtime observation is unavailable or invalid; execution state is unknown",
+        )
+    })
+}
+
 async fn runtime(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
+    runtime_observation(client, session_id, false).await
+}
+
+async fn runtime_observation(
+    client: &AcpClient,
+    session_id: String,
+    wait_for_updates: bool,
+) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
     let response = client
         .extension(
             "querymt/session/runtimeState",
-            json!({ "session_id": session_id }),
+            json!({ "session_id": session_id, "wait_for_updates": wait_for_updates }),
         )
         .await
         .map_err(CliError::from_request)?;

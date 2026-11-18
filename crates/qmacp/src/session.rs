@@ -36,6 +36,13 @@ pub fn profile_meta(profile_id: &str) -> Map<String, Value> {
 }
 
 /// A usable self-execution phase requires an available backend observation.
+pub fn observed_run_id(runtime: &Value) -> Option<String> {
+    runtime["active_run_id"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned)
+}
+
 pub fn observed_phase(runtime: &Value) -> Option<&str> {
     let phase = runtime.get("phase")?.as_str()?;
     match runtime.pointer("/observation/availability")?.as_str()? {

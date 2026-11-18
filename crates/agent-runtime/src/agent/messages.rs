@@ -204,6 +204,10 @@ pub struct GetSessionLimits;
 #[derive(Serialize, Deserialize)]
 pub struct GetRuntimeStatus;
 
+/// Publish an ordered runtime observation and return its delivery watermark.
+#[derive(Serialize, Deserialize)]
+pub struct SessionDeliveryBarrier;
+
 /// Get current LLM config for this session.
 #[derive(Serialize, Deserialize)]
 pub struct GetLlmConfig;
