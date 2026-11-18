@@ -52,7 +52,7 @@ struct Cli {
     bearer_token: Option<String>,
 
     /// Built-in OAuth server for the public HTTPS /mcp URL (HTTP only). Keys are
-    /// kept in the QueryMT secret store; a new approval password is printed once.
+    /// kept in the QueryMT secret store; a new approval password is shown once on a terminal.
     #[arg(long, conflicts_with = "oauth_config")]
     oauth_local_resource: Option<String>,
 
@@ -208,8 +208,13 @@ mod tests {
     #[test]
     fn local_oauth_excludes_other_http_authentication() {
         for other in [
-            ["--bearer-token", "static-token"],
-            ["--oauth-config", "oauth.json"],
+            &["--bearer-token", "static-token"][..],
+            &[
+                "--oauth-config",
+                "oauth.json",
+                "--oauth-client-secret",
+                "fixture-secret",
+            ][..],
         ] {
             let mut args = vec![
                 "qmcp",
@@ -218,8 +223,11 @@ mod tests {
                 "--oauth-local-resource",
                 "https://mcp.example.com/mcp",
             ];
-            args.extend(other);
-            assert!(Cli::try_parse_from(args).is_err());
+            args.extend(other.iter().copied());
+            let error = Cli::try_parse_from(args)
+                .err()
+                .expect("conflicting auth options");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
         }
     }
 }
