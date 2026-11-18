@@ -2552,8 +2552,11 @@ impl AgentsStore {
                     match find_option(&options, &aliases) {
                         Some((id, values)) if values.iter().any(|v| v == &reasoning) => {
                             let params = json!({ "sessionId": session_id, "configId": id, "value": reasoning });
-                            if let Err(err) = rpc.request("session/set_config_option", params).await {
-                                log(format!("Could not set reasoning {reasoning}: {err}"), cx);
+                            match rpc.request("session/set_config_option", params).await {
+                                // The view is built from `options` below, so it must
+                                // carry the applied level, not the pre-change `auto`.
+                                Ok(resp) => apply_option_value(&mut options, &resp, &id, &reasoning),
+                                Err(err) => log(format!("Could not set reasoning {reasoning}: {err}"), cx),
                             }
                         }
                         _ => log(format!("Reasoning effort {reasoning} is not offered for this model."), cx),
@@ -4356,6 +4359,19 @@ fn update_options(options: &mut Vec<Value>, response: &Value) {
     }
 }
 
+/// Record a successful `set_config_option`: the agent's fresh option list
+/// when it sends one, otherwise the chosen value on the option itself.
+fn apply_option_value(options: &mut Vec<Value>, response: &Value, id: &str, value: &str) {
+    if !config_options(response).is_empty() {
+        update_options(options, response);
+    } else if let Some(o) = options
+        .iter_mut()
+        .find(|o| o.get("id").and_then(Value::as_str) == Some(id))
+    {
+        o["currentValue"] = Value::String(value.to_string());
+    }
+}
+
 /// Find a select config option by id/category/name alias; returns its id and choice values.
 fn find_option(options: &[Value], aliases: &[&str]) -> Option<(String, Vec<String>)> {
     let norm = |v: Option<&Value>| {
@@ -4646,6 +4662,23 @@ async fn load_extras(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applied_reasoning_level_reaches_the_new_session_options() {
+        let option = |current: &str| {
+            json!({ "id": "reasoning_effort", "type": "select", "currentValue": current,
+                    "options": [{ "value": "auto" }, { "value": "high" }] })
+        };
+        // The agent acknowledges without an option list: set the value ourselves.
+        let mut options = vec![option("auto")];
+        apply_option_value(&mut options, &json!({}), "reasoning_effort", "high");
+        assert_eq!(options[0]["currentValue"], "high");
+        // The agent returns fresh options: trust them.
+        let mut options = vec![option("auto")];
+        let resp = json!({ "configOptions": [option("high")] });
+        apply_option_value(&mut options, &resp, "reasoning_effort", "low");
+        assert_eq!(options[0]["currentValue"], "high");
+    }
 
     #[test]
     fn session_list_entry_reads_relations_worktree_remote_and_status() {
