@@ -616,8 +616,7 @@ pub(crate) async fn restore_session_history(
     {
         return Vec::new();
     }
-    let session_ref = agent.registry.lock().await.get(session_id).cloned();
-    let Some(session_ref) = session_ref else {
+    let Some(session_ref) = agent.owned_session_ref(session_id).await else {
         return Vec::new();
     };
     let events = session_events(agent, session_id, &session_ref).await;

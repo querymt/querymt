@@ -142,10 +142,8 @@ pub async fn replay_loaded_session(
     session_id: &str,
     capabilities: &crate::acp::shared::AcpSessionUpdateCapabilities,
 ) -> Result<(Vec<SessionNotification>, usize), acp::Error> {
-    let session_ref = {
-        let registry = agent.registry.lock().await;
-        registry.get(session_id).cloned()
-    };
+    // Profile-bound sessions live in their owning runtime's registry.
+    let session_ref = agent.owned_session_ref(session_id).await;
     let session_ref_missing = session_ref.is_none();
     let (events, prompt_blocks) = match session_ref {
         Some(session_ref) => {
