@@ -1098,6 +1098,8 @@ pub struct AgentRuntime {
     rpc: Option<Rc<RpcClient>>,
     tasks: Vec<Task<()>>,
     generation: u64,
+    /// Consecutive automatic reconnect attempts since the last success.
+    reconnect_attempt: u32,
     refresh_scheduled: bool,
     /// Session id -> resume authority for re-attaching its pending questions
     /// after a reconnect (`querymt/elicitation/recoveryAuthority`).
@@ -2407,11 +2409,17 @@ impl AgentsStore {
                     .is_some_and(|d| !d.is_null() && d.as_bool() != Some(false));
                 rt.state = ConnState::Connected;
                 rt.connected_at = Some(now_ms());
+                let reconnected = std::mem::take(&mut rt.reconnect_attempt) > 0;
                 rt.log(format!(
                     "Initialized {} {}",
                     rt.agent_title.as_deref().unwrap_or("agent"),
                     rt.agent_version.as_deref().unwrap_or("")
                 ));
+                // The open session's live updates were lost with the old
+                // connection: load it again on the new one.
+                if reconnected && s.session.as_ref().is_some_and(|v| v.agent_id == id) {
+                    s.reload_session(cx);
+                }
                 cx.notify();
             });
             load_details(this, id, generation, rpc, cx).await;
@@ -2424,6 +2432,7 @@ impl AgentsStore {
     pub fn disconnect(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(rt) = self.runtime.get_mut(id) {
             rt.generation += 1;
+            rt.reconnect_attempt = 0;
             if let Some(rpc) = rt.rpc.take() {
                 rpc.close();
             }
@@ -3830,7 +3839,44 @@ impl AgentsStore {
         rt.state = ConnState::Failed(reason);
         rt.busy = false;
         self.retire_requests(id);
+        self.schedule_reconnect(id, generation, cx);
         cx.notify();
+    }
+
+    /// Like the web client: a WebSocket agent that is set to start
+    /// automatically retries after a dropped or failed connection, backing
+    /// off from 250 ms to 8 s. A manual connect or disconnect bumps the
+    /// generation, which cancels the pending retry.
+    fn schedule_reconnect(&mut self, id: &str, generation: u64, cx: &mut Context<Self>) {
+        let Some(config) = self.config(id) else {
+            return;
+        };
+        if !config.is_websocket() || !config.auto_start {
+            return;
+        }
+        let Some(rt) = self.live(id, generation) else {
+            return;
+        };
+        let delay = reconnect_delay(rt.reconnect_attempt);
+        rt.reconnect_attempt += 1;
+        rt.log(format!(
+            "Reconnecting in {:.1}s (attempt {})…",
+            delay.as_secs_f32(),
+            rt.reconnect_attempt
+        ));
+        let id = id.to_string();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |s, cx| {
+                let waiting = s
+                    .live(&id, generation)
+                    .is_some_and(|rt| matches!(rt.state, ConnState::Failed(_)));
+                if waiting {
+                    s.connect(&id, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn on_incoming(
@@ -4352,6 +4398,13 @@ fn config_options(response: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// Delay before automatic reconnect attempt `attempt` (0-based): doubling
+/// from 250 ms, capped at 8 s, as the web client does.
+fn reconnect_delay(attempt: u32) -> std::time::Duration {
+    let ms = (250u64 << attempt.min(5)).min(8_000);
+    std::time::Duration::from_millis(ms)
+}
+
 fn update_options(options: &mut Vec<Value>, response: &Value) {
     let fresh = config_options(response);
     if !fresh.is_empty() {
@@ -4662,6 +4715,12 @@ async fn load_extras(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_backs_off_like_the_web_client() {
+        let ms: Vec<u128> = (0..8).map(|a| reconnect_delay(a).as_millis()).collect();
+        assert_eq!(ms, [250, 500, 1000, 2000, 4000, 8000, 8000, 8000]);
+    }
 
     #[test]
     fn applied_reasoning_level_reaches_the_new_session_options() {

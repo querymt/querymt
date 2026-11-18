@@ -2907,7 +2907,13 @@ impl QmtApp {
         let Some(view) = store.session.as_ref() else {
             return;
         };
-        let ready = !view.loading
+        // Without a connection the prompt would be dropped: keep it in the
+        // composer until the agent is back.
+        let connected = store
+            .runtime(&view.agent_id)
+            .is_some_and(|rt| rt.is_connected());
+        let ready = connected
+            && !view.loading
             && view.error.is_none()
             && (!view.running() || store.session_can_control_run());
         if (text.is_empty() && self.session_attachments.is_empty()) || !ready {
@@ -3749,7 +3755,12 @@ impl QmtApp {
         let loading = view.loading;
         let has_text = !self.session_prompt.read(cx).value().trim().is_empty();
         let has_draft = has_text || !self.session_attachments.is_empty();
-        let blocked = loading || view.error.is_some();
+        let connected = self
+            .store
+            .read(cx)
+            .runtime(&view.agent_id)
+            .is_some_and(|rt| rt.is_connected());
+        let blocked = loading || view.error.is_some() || !connected;
         let pending = view.pending_options.clone();
         let mode = view.mode_option();
         let reasoning = view.reasoning_option();
