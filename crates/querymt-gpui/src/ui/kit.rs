@@ -13,6 +13,41 @@ use crate::theme::Palette;
 
 pub const MONO: &str = "IBM Plex Mono";
 
+/// Single-line sidebar title that fades into its row instead of showing an
+/// ellipsis. The row owns the hover group so the fade follows its background.
+pub fn fading_title(
+    title: impl Into<SharedString>,
+    group: SharedString,
+    background: Hsla,
+    hovered_background: Hsla,
+) -> Div {
+    let fade = |color: Hsla| {
+        linear_gradient(
+            90.,
+            linear_color_stop(color.opacity(0.), 0.),
+            linear_color_stop(color, 1.),
+        )
+    };
+    div()
+        .relative()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_sm()
+        .child(title.into())
+        .child(
+            div()
+                .absolute()
+                .right_0()
+                .top_0()
+                .bottom_0()
+                .w_6()
+                .bg(fade(background))
+                .group_hover(group, move |el| el.bg(fade(hovered_background))),
+        )
+}
+
 /// Stable identity for a repeated element, keyed by a domain id (session id,
 /// agent id, attachment id, …) rather than its position, so hover, tooltip and
 /// other keyed element state stays with the item when the list reorders.
