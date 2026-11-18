@@ -46,8 +46,9 @@ Start with `caps`, `profiles`, and `models` to discover available capabilities.
 | `exec` | Run a batch sequentially on one ACP connection |
 
 Use `prompt` with `new: true` to start a session, then its returned `sessionId`
-as `session_id` to continue. Pass an explicit `cwd` for workspace operations;
-paths refer to the QueryMT host. `profiles`, `models`, lifecycle, and pin tools
+as `session_id` to continue. A new session requires an absolute `cwd` on the
+QueryMT host; existing sessions keep their stored `cwd`, and `prompt` rejects a
+`cwd` when continuing one. `profiles`, `models`, lifecycle, and pin tools
 return provider data under `result`, separate from bridge status and event metadata.
 
 ## Important Behavior

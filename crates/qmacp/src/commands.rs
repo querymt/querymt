@@ -878,9 +878,9 @@ async fn inspect(
     if !initialized.agent_capabilities.load_session {
         return Err(CliError::rpc("agent does not support session/load"));
     }
-    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
+    let cwd = session::resolve_optional_cwd(cwd).map_err(CliError::rpc)?;
     let (loaded, load_value) = client
-        .load_session(session_id.clone(), cwd.clone())
+        .load_session(session_id.clone(), cwd.clone().unwrap_or_default())
         .await
         .map_err(CliError::from_request)?;
     if full {
@@ -897,7 +897,7 @@ async fn inspect(
     }
     Ok(session::compact_inspect(
         &session_id,
-        &cwd,
+        cwd.as_deref(),
         loaded.modes.as_ref(),
         &load_value,
         messages,
@@ -911,7 +911,7 @@ async fn status(
     cwd: Option<PathBuf>,
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
-    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
+    let cwd = session::existing_session_cwd(cwd).map_err(CliError::rpc)?;
     let opened = open_session(client, session_id.clone(), cwd).await?;
     Ok(opened.status)
 }
@@ -998,11 +998,21 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
     } = args;
     let (session_id, text) = parse_prompt_args(new, args)?;
     let text = read_prompt_text(text)?;
-    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
+    // A session keeps its own workspace; only a new session takes a cwd.
+    if !new && cwd.is_some() {
+        return Err(CliError::Usage(
+            "--cwd applies only with --new; an existing session keeps its own cwd".into(),
+        ));
+    }
+    let cwd = if new {
+        Some(session::resolve_cwd(cwd).map_err(CliError::rpc)?)
+    } else {
+        None
+    };
     let initialized = client.initialize().await.map_err(CliError::from_request)?;
     let session_id = if new {
         let (created, _) = client
-            .new_session(cwd.clone(), profile.as_deref())
+            .new_session(cwd.clone().unwrap_or_default(), profile.as_deref())
             .await
             .map_err(|error| request_failure(error, json!({"stage": "create"})))?;
         created.session_id.to_string()
@@ -1031,7 +1041,7 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
     };
     // Queue/steer do not need replay or runtime restoration, even when waiting later.
     if !new && chosen == Delivery::Prompt {
-        open_session(client, session_id.clone(), cwd.clone())
+        open_session(client, session_id.clone(), PathBuf::new())
             .await
             .map_err(|error| error.with_recovery(recovery.clone()))?;
     }
@@ -1223,8 +1233,7 @@ async fn follow(
     pretty: bool,
 ) -> Result<CommandOutcome, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
-    let cwd = session::resolve_cwd(None).map_err(CliError::rpc)?;
-    open_session(client, session_id.clone(), cwd)
+    open_session(client, session_id.clone(), PathBuf::new())
         .await
         .map_err(|error| {
             error.with_recovery(json!({

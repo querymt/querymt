@@ -487,7 +487,7 @@ async fn exercise_bridge(http: bool) {
     let continued = mcp
         .tool(
             "prompt",
-            json!({"session_id": "fixture-session", "cwd": cwd, "text": "continue", "until_idle": false}),
+            json!({"session_id": "fixture-session", "text": "continue", "until_idle": false}),
         )
         .await;
     assert_eq!(continued["structuredContent"]["text"], "reply:continue");
@@ -575,14 +575,17 @@ async fn failures_are_tool_errors_and_timeouts_do_not_cancel_remote_work() {
     let invalid = mcp
         .tool(
             "prompt",
-            json!({"new": true, "text": "x", "session_id": "s"}),
+            json!({"new": true, "cwd": "/tmp", "text": "x", "session_id": "s"}),
         )
         .await;
     assert_eq!(invalid["isError"], true);
     assert!(backend.recorded().is_empty());
 
     let timeout = mcp
-        .tool("prompt", json!({"new": true, "text": "wait", "timeout": 1}))
+        .tool(
+            "prompt",
+            json!({"new": true, "cwd": "/tmp", "text": "wait", "timeout": 1}),
+        )
         .await;
     assert_eq!(timeout["isError"], true, "{timeout}");
     assert_eq!(timeout["structuredContent"]["code"], 4);
@@ -640,7 +643,7 @@ async fn long_prompt_does_not_block_concurrent_runtime_requests() {
     let waiting = tokio::spawn(async move {
         client.post(url).header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", "2025-11-25")
-            .json(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "prompt", "arguments": {"new": true, "text": "wait", "timeout": 1}}}))
+            .json(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "prompt", "arguments": {"new": true, "cwd": "/tmp", "text": "wait", "timeout": 1}}}))
             .send().await.unwrap().json::<Value>().await.unwrap()
     });
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -921,8 +924,8 @@ async fn batch_keeps_each_steps_truncation_status_after_a_later_short_answer() {
             .tool(
                 "exec",
                 json!({"calls": [
-                    {"name": "prompt", "arguments": {"new": true, "text": "oversized"}},
-                    {"name": "prompt", "arguments": {"new": true, "text": "short"}},
+                    {"name": "prompt", "arguments": {"new": true, "cwd": "/tmp", "text": "oversized"}},
+                    {"name": "prompt", "arguments": {"new": true, "cwd": "/tmp", "text": "short"}},
                 ]}),
             )
             .await;
@@ -949,7 +952,7 @@ async fn cancelled_batch_step_is_an_error_and_prevents_later_mutations() {
             .tool(
                 "exec",
                 json!({"calls": [
-                    {"name": "prompt", "arguments": {"new": true, "text": "cancelled"}},
+                    {"name": "prompt", "arguments": {"new": true, "cwd": "/tmp", "text": "cancelled"}},
                     {"name": "close", "arguments": {"session_id": "fixture-session"}},
                 ]}),
             )
@@ -975,7 +978,7 @@ async fn batch_failure_keeps_prior_results_and_failed_step_recovery() {
                 "exec",
                 json!({"calls": [
                     {"name": "runtime", "arguments": {"session_id": "fixture-session"}},
-                    {"name": "new", "arguments": {"mode": "invalid"}},
+                    {"name": "new", "arguments": {"cwd": "/tmp", "mode": "invalid"}},
                     {"name": "close", "arguments": {"session_id": "fixture-session"}},
                 ]}),
             )
@@ -1001,7 +1004,7 @@ async fn operation_deadlines_cover_a_stalled_acp_handshake_on_both_transports() 
         for (name, arguments) in [
             (
                 "prompt",
-                json!({"new": true, "text": "never sent", "timeout": 1}),
+                json!({"new": true, "cwd": "/tmp", "text": "never sent", "timeout": 1}),
             ),
             ("follow", json!({"session_id": "s", "timeout": 1})),
             ("watch", json!({"session_id": "s", "timeout": 1})),
@@ -1042,7 +1045,10 @@ async fn connection_time_is_not_added_to_the_command_budget() {
         let mut mcp = Mcp::start(&backend.url, http).await;
         let response = tokio::time::timeout(
             Duration::from_millis(1600),
-            mcp.tool("prompt", json!({"new": true, "text": "wait", "timeout": 1})),
+            mcp.tool(
+                "prompt",
+                json!({"new": true, "cwd": "/tmp", "text": "wait", "timeout": 1}),
+            ),
         )
         .await
         .expect("the command deadline must use the budget left after the handshake");
@@ -1141,6 +1147,50 @@ async fn session_listing_discloses_remaining_pages_on_each_return_path() {
             assert_eq!(result["truncated"], truncated);
         }
     }
+}
+
+#[tokio::test]
+async fn existing_sessions_keep_their_stored_cwd() {
+    let backend = MockAcp::start().await;
+    let mut mcp = Mcp::start(&backend.url, false).await;
+    for (tool, arguments) in [
+        ("new", json!({})),
+        ("new", json!({"cwd": "relative"})),
+        (
+            "prompt",
+            json!({"session_id": "fixture-session", "cwd": "/tmp", "text": "x"}),
+        ),
+    ] {
+        let rejected = mcp.tool(tool, arguments).await;
+        assert_eq!(rejected["isError"], true, "{rejected}");
+    }
+    assert!(
+        !backend.recorded().iter().any(|r| r["method"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("session/"))),
+        "rejected calls must not reach the backend"
+    );
+
+    let status = mcp
+        .tool("status", json!({"session_id": "fixture-session"}))
+        .await;
+    assert_eq!(status["isError"], false, "{status}");
+    let opened: Vec<_> = backend
+        .recorded()
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                r["method"].as_str(),
+                Some("session/load" | "session/resume")
+            )
+        })
+        .collect();
+    assert!(!opened.is_empty());
+    assert!(
+        opened.iter().all(|r| r["params"]["cwd"] == ""),
+        "{opened:?}"
+    );
+    backend.wait_disconnected().await;
 }
 
 #[tokio::test]
@@ -1396,7 +1446,7 @@ async fn bearer_auth_guards_every_http_request_before_protocol_or_backend_work()
     let url = url.clone();
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let request = json!({"jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {
-        "name": "new", "arguments": {},
+        "name": "new", "arguments": {"cwd": "/tmp"},
     }});
     for authorization in [
         None,
@@ -1489,7 +1539,7 @@ async fn bearer_auth_guards_every_http_request_before_protocol_or_backend_work()
             "a valid token must not bypass Host/Origin checks"
         );
     }
-    let created = mcp.tool("new", json!({})).await;
+    let created = mcp.tool("new", json!({"cwd": "/tmp"})).await;
     assert_eq!(created["isError"], false);
     assert_eq!(created["structuredContent"]["sessionId"], "fixture-session");
     let response = client.post(&url).json(&request).send().await.unwrap();
@@ -1700,13 +1750,12 @@ async fn second_interrupt_forces_exit_during_a_stalled_http_call() {
     })
     .await
     .unwrap();
-    let pending =
-        tokio::spawn(async move {
-            client.post(url).header("accept", "application/json, text/event-stream")
+    let pending = tokio::spawn(async move {
+        client.post(url).header("accept", "application/json, text/event-stream")
             .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
-                "name": "prompt", "arguments": {"new": true, "text": "wait", "timeout": 120},
+                "name": "prompt", "arguments": {"new": true, "cwd": "/tmp", "text": "wait", "timeout": 120},
             }})).send().await
-        });
+    });
     tokio::time::timeout(Duration::from_secs(3), async {
         while !backend
             .recorded()
