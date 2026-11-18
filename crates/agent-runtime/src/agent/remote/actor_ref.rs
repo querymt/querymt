@@ -1109,6 +1109,20 @@ impl SessionActorRef {
         }
     }
 
+    pub(crate) async fn session_delivery_barrier(&self) -> Result<i64, AgentError> {
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(messages::SessionDeliveryBarrier)
+                .await
+                .map_err(|error| AgentError::RemoteActor(error.to_string())),
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&messages::SessionDeliveryBarrier)
+                .await
+                .map_err(Self::map_infallible_remote_send_error),
+        }
+    }
+
     /// Query current runtime status with bounded mailbox and reply timeouts.
     pub async fn get_runtime_status_with_timeout(
         &self,

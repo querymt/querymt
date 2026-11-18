@@ -37,6 +37,7 @@ enum SubmissionBehavior {
     HistoryUnavailable,
     MissingReceiptStatus,
     WrongReceiptId,
+    Unavailable,
 }
 
 impl MockAcp {
@@ -226,10 +227,16 @@ async fn serve_acp(
                     send(&mut socket, json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "poll failed after submission"}})).await;
                     continue;
                 }
-                if matches!(behavior, SubmissionBehavior::Idle) {
-                    json!({"phase": "idle", "steerable": false})
-                } else {
-                    json!({"phase": "tools", "steerable": true, "active_run_id": "fixture-run"})
+                match behavior {
+                    SubmissionBehavior::Idle => {
+                        json!({"phase": "idle", "steerable": false, "observation": {"availability": "live"}})
+                    }
+                    SubmissionBehavior::Unavailable => {
+                        json!({"phase": "unknown", "steerable": false, "observation": {"availability": "unavailable"}})
+                    }
+                    _ => {
+                        json!({"phase": "tools", "steerable": true, "active_run_id": "fixture-run", "observation": {"availability": "live"}})
+                    }
                 }
             }
             "_querymt/session/getLifecycle" => json!({"resolved": false, "archived": false}),
@@ -287,7 +294,10 @@ async fn serve_acp(
                 } else {
                     format!("reply:{text}")
                 };
-                send(&mut socket, json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "fixture-session", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": reply}}}})).await;
+                if text == "interleaved" {
+                    send(&mut socket, json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "other-session", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "not this session"}}}})).await;
+                }
+                send(&mut socket, json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": params["sessionId"], "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": reply}}}})).await;
                 json!({"stopReason": if text == "cancelled" { "cancelled" } else { "end_turn" }})
             }
             _ => {
@@ -752,6 +762,37 @@ async fn submission_identity_survives_poll_failures_and_timeouts_without_input_e
 }
 
 #[tokio::test]
+async fn unavailable_runtime_does_not_submit_auto_prompt() {
+    let backend = MockAcp::with_submission(SubmissionBehavior::Unavailable).await;
+    let mut mcp = Mcp::start(&backend.url, false).await;
+    let reply = mcp
+        .tool(
+            "prompt",
+            json!({"session_id": "fixture-session", "text": "x"}),
+        )
+        .await;
+    assert_eq!(reply["isError"], true, "{reply}");
+    assert!(backend.recorded().iter().all(|r| !matches!(
+        r["method"].as_str(),
+        Some("session/prompt" | "_querymt/session/queue" | "_querymt/session/steer")
+    )));
+}
+
+#[tokio::test]
+async fn batch_reply_text_excludes_other_sessions() {
+    let backend = MockAcp::start().await;
+    let mut mcp = Mcp::start(&backend.url, false).await;
+    let result = mcp.tool("exec", json!({"calls": [
+        {"name": "prompt", "arguments": {"session_id": "fixture-session", "text": "interleaved"}},
+        {"name": "prompt", "arguments": {"session_id": "other-session", "text": "second"}},
+    ]})).await;
+    assert_eq!(result["isError"], false, "{result}");
+    let results = &result["structuredContent"]["results"];
+    assert_eq!(results[0]["result"]["text"], "reply:interleaved");
+    assert_eq!(results[1]["result"]["text"], "reply:second");
+}
+
+#[tokio::test]
 async fn nonwaiting_delivery_skips_unavailable_history_and_returns_the_receipt() {
     for delivery in ["queue", "auto"] {
         let backend = MockAcp::with_submission(SubmissionBehavior::HistoryUnavailable).await;
@@ -782,12 +823,27 @@ async fn nonwaiting_delivery_skips_unavailable_history_and_returns_the_receipt()
             event["type"] == "submitted"
                 && event["clientInputId"] == result["submitted"]["clientInputId"]
         }));
-        assert!(backend.recorded().iter().all(|request| {
+        let recorded = backend.recorded();
+        assert!(recorded.iter().all(|request| {
             !matches!(
                 request["method"].as_str(),
                 Some("session/load" | "session/resume" | "session/prompt")
             )
         }));
+        if delivery == "auto" {
+            assert_eq!(
+                recorded
+                    .iter()
+                    .filter(|r| r["method"] == "_querymt/session/runtimeState")
+                    .count(),
+                1
+            );
+            let steer = recorded
+                .iter()
+                .find(|r| r["method"] == "_querymt/session/steer")
+                .unwrap();
+            assert_eq!(steer["params"]["expected_run_id"], "fixture-run");
+        }
     }
 }
 

@@ -3505,6 +3505,25 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                     return Err(error);
                                 }
                                 drop(post_attach_guard);
+                                if ext_method == "querymt/session/runtimeState"
+                                    && rpc_params["wait_for_updates"] == true
+                                    && value["phase"] == "idle"
+                                    && let Some(delivery) = context.delivery.as_ref()
+                                    && let Some(local) = agent.as_any().downcast_ref::<AgentHandle>()
+                                {
+                                    use crate::acp::delivery::{PROMPT_WAIT_LIMIT, WaitOutcome};
+                                    let runtime = serde_json::from_value(value.clone())
+                                        .map_err(Error::into_internal_error)?;
+                                    let synced = tokio::time::timeout(PROMPT_WAIT_LIMIT, async {
+                                        let tip = local.session_delivery_barrier(&session_id, runtime).await?;
+                                        Ok::<_, Error>(delivery.wait_for_tip(&session_id, tip, PROMPT_WAIT_LIMIT).await)
+                                    }).await;
+                                    match synced {
+                                        Ok(Ok(WaitOutcome::Delivered)) => {},
+                                        Ok(Err(error)) => return Err(error),
+                                        _ => return Err(Error::internal_error().data("session update delivery could not be confirmed")),
+                                    }
+                                }
                                 if let Some(attached_id) = remote_attached_session_id(
                                     ext_method,
                                     &rpc_params,
@@ -6083,6 +6102,70 @@ mod tests {
                 .expect("notification json");
         assert_docs_catalog(&notification, &session_id);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn idle_runtime_reply_waits_for_ordered_session_updates() {
+        use crate::acp::delivery::ConnectionDelivery;
+        use tokio_util::sync::CancellationToken;
+
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = fixture
+            .handle
+            .new_session(crate::acp::protocol::NewSessionRequest::new(
+                fixture._tempdir.path().to_path_buf(),
+            ))
+            .await
+            .unwrap()
+            .session_id
+            .to_string();
+        let mut events = fixture.config.event_sink.fanout().subscribe();
+        let delivery = ConnectionDelivery::new(None, CancellationToken::new());
+        let owners = SessionOwnerMap::default();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let request = handle_rpc_message_with_context(
+            fixture.handle.as_ref(),
+            &owners,
+            &pending,
+            "conn-order",
+            RpcMessage {
+                jsonrpc: "2.0".into(),
+                method: "querymt/session/runtimeState".into(),
+                params: serde_json::json!({"session_id": session_id, "wait_for_updates": true}),
+                id: Some(serde_json::json!(1)),
+            },
+            RpcDispatchContext {
+                delivery: Some(delivery.clone()),
+                ..Default::default()
+            },
+        );
+        tokio::pin!(request);
+        let marker = tokio::select! {
+            response = &mut request => panic!("idle response before marker: {:?}", response.response.map(|r| r.error)),
+            event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()) => event.unwrap().unwrap(),
+        };
+        assert_eq!(marker.session_id(), session_id);
+        assert!(matches!(
+            marker.kind(),
+            AgentEventKind::RuntimeChanged { .. }
+        ));
+        let admitted = delivery.admit(marker).await;
+        assert_eq!(admitted.len(), 1);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                request.as_mut().poll(cx).is_pending()
+            ))
+            .await,
+            "admission is not delivery"
+        );
+        drop(admitted);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["phase"], "idle");
     }
 
     #[tokio::test]

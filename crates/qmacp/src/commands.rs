@@ -1022,8 +1022,8 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
         }))
         .map_err(|error| CliError::rpc(error).with_recovery(recovery.clone()))?;
     }
-    let chosen = if new {
-        Delivery::Prompt
+    let (chosen, run_id) = if new {
+        (Delivery::Prompt, None)
     } else {
         choose_delivery(client, &session_id, delivery)
             .await
@@ -1044,7 +1044,7 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
         "delivery": delivery_name(chosen),
     }))
     .map_err(|error| CliError::rpc(error).with_recovery(recovery.clone()))?;
-    let _ = client.take_assistant_text().await;
+    client.capture_assistant_text(Some(&session_id)).await;
     let timeout = timeout.map(Duration::from_secs);
     recovery["stage"] = json!("submit");
     let mut receipt = None;
@@ -1062,7 +1062,7 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
             } else {
                 "querymt/session/queue"
             };
-            let submitted = submit_text(client, method, session_id.clone(), None, text)
+            let submitted = submit_text(client, method, session_id.clone(), run_id, text)
                 .await
                 .map_err(|error| error.with_recovery(recovery.clone()))?;
             recovery["clientInputId"] = submitted["clientInputId"].clone();
@@ -1089,7 +1089,6 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
     if chosen == Delivery::Prompt {
         recovery["stopReason"] = json!(stop_reason);
     }
-    let mut text = client.take_assistant_text().await;
     let observed = if until_idle {
         let observed = wait_until_idle(
             client,
@@ -1098,14 +1097,11 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
         )
         .await
         .map_err(|error| error.with_recovery(recovery.clone()))?;
-        let more = client.snapshot_assistant_text().await;
-        if !more.is_empty() {
-            text = more;
-        }
         Some(observed)
     } else {
         None
     };
+    let text = client.take_assistant_text().await;
     let mut done = json!({
         "type": "done", "ok": true, "sessionId": session_id,
         "delivery": delivery_name(chosen), "deliveryState": "accepted",
@@ -1140,9 +1136,9 @@ async fn choose_delivery(
     client: &AcpClient,
     session_id: &str,
     requested: Delivery,
-) -> Result<Delivery, CliError> {
+) -> Result<(Delivery, Option<String>), CliError> {
     if requested != Delivery::Auto {
-        return Ok(requested);
+        return Ok((requested, None));
     }
     let state = runtime(client, session_id.to_string()).await?;
     let phase = require_observed_phase(&state)?;
@@ -1152,7 +1148,15 @@ async fn choose_delivery(
         .ok_or_else(|| {
             CliError::rpc("runtime response has no valid steerable flag; input was not submitted")
         })?;
-    Ok(delivery_from_runtime(phase, steerable))
+    let delivery = delivery_from_runtime(phase, steerable);
+    let run_id = if delivery == Delivery::Steer {
+        Some(session::observed_run_id(&state["runtime"]).ok_or_else(|| {
+            CliError::rpc("runtime response has no active run ID; input was not submitted")
+        })?)
+    } else {
+        None
+    };
+    Ok((delivery, run_id))
 }
 
 fn require_observed_phase(state: &Value) -> Result<&str, CliError> {
@@ -1194,7 +1198,7 @@ async fn wait_until_idle_every(
     let mut last_runtime = Value::Null;
     tokio::time::timeout(timeout.max(Duration::from_secs(1)), async {
         loop {
-            let value = runtime(client, session_id.to_string()).await
+            let value = runtime_observation(client, session_id.to_string(), true).await
                 .map_err(|error| error.with_recovery(json!({"runtime": last_runtime})))?;
             last_runtime = value["runtime"].clone();
             if require_observed_phase(&value)? == "idle" {
@@ -1227,7 +1231,7 @@ async fn follow(
                 "sessionId": session_id, "stage": "open", "observationState": "unavailable",
             }))
         })?;
-    let _ = client.take_assistant_text().await;
+    client.capture_assistant_text(Some(&session_id)).await;
     let observed = wait_until_idle_every(
         client,
         &session_id,
@@ -1260,6 +1264,14 @@ async fn follow(
 }
 
 async fn runtime(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
+    runtime_observation(client, session_id, false).await
+}
+
+async fn runtime_observation(
+    client: &AcpClient,
+    session_id: String,
+    wait_for_updates: bool,
+) -> Result<Value, CliError> {
     let recovery = json!({
         "sessionId": session_id, "stage": "observe", "observationState": "unavailable",
     });
@@ -1270,7 +1282,7 @@ async fn runtime(client: &AcpClient, session_id: String) -> Result<Value, CliErr
     let response = client
         .extension(
             "querymt/session/runtimeState",
-            json!({ "session_id": session_id }),
+            json!({ "session_id": session_id, "wait_for_updates": wait_for_updates }),
         )
         .await
         .map_err(|error| CliError::from_request(error).with_recovery(recovery))?;

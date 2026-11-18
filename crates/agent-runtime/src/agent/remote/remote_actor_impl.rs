@@ -170,6 +170,11 @@ remote_msg_impl!(
     REG_GET_RUNTIME_STATUS
 );
 remote_msg_impl!(
+    messages::SessionDeliveryBarrier,
+    "querymt::SessionDeliveryBarrier",
+    REG_SESSION_DELIVERY_BARRIER
+);
+remote_msg_impl!(
     messages::SetProvider,
     "querymt::SetProvider",
     REG_SET_PROVIDER

@@ -142,6 +142,74 @@ fn unexpected(request: &Value) -> Reply {
     panic!("unexpected RPC: {}", request["method"])
 }
 
+fn assistant_chunk(text: &str) -> Value {
+    json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "session-1", "update": {"sessionUpdate": "agent_message_chunk",
+        "content": {"type": "text", "text": text}},
+    }})
+}
+
+#[tokio::test]
+async fn prompt_keeps_prefix_when_idle_barrier_delivers_more_text() {
+    let server = MockServer::start(|request| match request["method"].as_str() {
+        Some("session/resume" | "session/load") => Reply::Result(json!({})),
+        Some("session/prompt") => Reply::WithNotifications(
+            vec![assistant_chunk("prefix ")],
+            json!({"stopReason": "end_turn"}),
+        ),
+        Some("_querymt/session/runtimeState") => {
+            assert_eq!(request["params"]["wait_for_updates"], true);
+            let Reply::Result(idle) = runtime("idle", false) else {
+                unreachable!()
+            };
+            Reply::WithNotifications(vec![assistant_chunk("suffix")], idle)
+        }
+        _ => unexpected(request),
+    })
+    .await;
+    let output = invoke(
+        cli().args([
+            "--url",
+            &server.url,
+            "--quiet",
+            "prompt",
+            "--delivery",
+            "prompt",
+            "session-1",
+            "text",
+        ]),
+        None,
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(events(&output).last().unwrap()["text"], "prefix suffix");
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn follow_collects_final_text_before_idle_response() {
+    let server = MockServer::start(|request| match request["method"].as_str() {
+        Some("session/resume" | "session/load") => Reply::Result(json!({})),
+        Some("_querymt/session/runtimeState") => {
+            assert_eq!(request["params"]["wait_for_updates"], true);
+            let Reply::Result(idle) = runtime("idle", false) else {
+                unreachable!()
+            };
+            Reply::WithNotifications(vec![assistant_chunk("final")], idle)
+        }
+        _ => unexpected(request),
+    })
+    .await;
+    let output = invoke(
+        cli().args(["--url", &server.url, "--quiet", "follow", "session-1"]),
+        None,
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(events(&output).last().unwrap()["text"], "final");
+    server.finish().await;
+}
+
 #[tokio::test]
 async fn queue_and_steer_preserve_explicit_stdin_payloads_without_loading_history() {
     for method in ["queue", "steer"] {
