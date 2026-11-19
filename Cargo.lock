@@ -12696,7 +12696,6 @@ dependencies = [
  "serde_core",
  "serde_json",
  "serde_with",
- "serde_with_macros",
  "sha1 0.11.0",
  "sha2 0.10.9",
  "signature 2.2.0",
