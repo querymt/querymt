@@ -97,6 +97,50 @@ runs:
       with:
         version: ${{ inputs.cuda_version }}
 
+    - name: Add swap (Linux CUDA)
+      # Hosted runners have 16GB RAM and only a small swapfile. Parallel nvcc
+      # (cicc peaks ~7GB on CUTLASS kernels) plus rustc can exhaust it, which
+      # makes the VM thrash until the runner agent loses contact and the job
+      # is killed ("exit code 143" / "runner lost communication").
+      # Swap turns that hard kill into a slowdown.
+      if: inputs.os == 'linux' && inputs.needs_cuda == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "Before:"; free -h; df -h / /mnt || true
+
+        # Prefer the temporary /mnt disk so swap does not eat the space the
+        # build needs on / (workspace, target dir, CUDA toolkit).
+        SWAP_DIR=/mnt
+        if ! mountpoint -q /mnt; then
+          SWAP_DIR=/
+        fi
+        SWAP_FILE="${SWAP_DIR%/}/qmt-swapfile"
+
+        # Drop the default swapfile first so its space is available.
+        sudo swapoff -a || true
+        sudo rm -f /mnt/swapfile "$SWAP_FILE"
+
+        # 24GB wanted; cap to free space on the chosen disk minus 2GB headroom.
+        free_gb=$(df -BG --output=avail "$SWAP_DIR" | tail -1 | tr -dc '0-9')
+        size_gb=$(( free_gb - 2 ))
+        if (( size_gb > 24 )); then size_gb=24; fi
+        if (( size_gb < 4 )); then
+          echo "Not enough free space on $SWAP_DIR for extra swap (${free_gb}G free); skipping" >&2
+          exit 0
+        fi
+
+        echo "Creating ${size_gb}G swapfile at $SWAP_FILE"
+        sudo fallocate -l "${size_gb}G" "$SWAP_FILE"
+        sudo chmod 600 "$SWAP_FILE"
+        sudo mkswap "$SWAP_FILE"
+        sudo swapon "$SWAP_FILE"
+
+        # Let the kernel use swap before it is starved of page cache.
+        sudo sysctl -w vm.swappiness=60
+
+        echo "After:"; free -h; swapon --show
+
     - name: Set CUDA_PATH_vX_Y for MSBuild (Windows)
       if: inputs.os == 'windows' && inputs.needs_cuda == 'true'
       shell: powershell
