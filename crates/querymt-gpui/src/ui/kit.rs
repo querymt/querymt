@@ -697,6 +697,34 @@ pub fn icon_tone_chip(name: IconName, text: impl Into<SharedString>, fg: Hsla) -
         .child(text.into())
 }
 
+/// Icon button for list rows and cards: square, transparent at rest, and a
+/// fill on hover that stays visible over a row's own hover tint (the kit's
+/// ghost hover blends into `card`).
+pub fn row_icon_button(
+    id: impl Into<ElementId>,
+    name: IconName,
+    tooltip: impl Into<SharedString>,
+    p: &Palette,
+    cx: &App,
+) -> Button {
+    let (hover, active) = if p.dark {
+        (hsla(0., 0., 1., 0.1), hsla(0., 0., 1., 0.14))
+    } else {
+        (p.muted.opacity(0.14), p.muted.opacity(0.2))
+    };
+    button(id)
+        .custom(
+            gpui_kit::component::button::ButtonCustomVariant::new(cx)
+                .foreground(p.text)
+                .hover(hover)
+                .active(active),
+        )
+        .small()
+        .px_0()
+        .icon(name)
+        .tooltip(tooltip)
+}
+
 pub fn icon_button(
     id: impl Into<ElementId>,
     name: IconName,
