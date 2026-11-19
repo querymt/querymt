@@ -2209,6 +2209,17 @@ impl SessionView {
                 return;
             }
         }
+        // The reply already started earlier in this turn (work streamed in
+        // after it): continue that row rather than add a second one with the
+        // same key, which split the text and confused the list.
+        if kind == "agent_message_chunk"
+            && let Some(ix) = message_id.as_deref().and_then(|id| self.turn_agent_ix(id))
+            && let ItemKind::Agent { text: t } = &mut self.items[ix].kind
+        {
+            t.push_str(&text);
+            self.touch(ix);
+            return;
+        }
         if text.is_empty() {
             return;
         }
@@ -2226,24 +2237,40 @@ impl SessionView {
 
     /// Append a reasoning chunk: to the last thought when it is the same
     /// message and part, otherwise as a new thought.
+    /// Append a reasoning chunk: to the last thought when it is the same
+    /// message and part, otherwise as a new thought.
     fn apply_thought(&mut self, message_id: Option<String>, part: Option<String>, text: String) {
+        // Reasoning can stream after its message's text has started: it goes
+        // in the work group before that reply, as a reload shows it. Pushed
+        // after the reply, it split the reply in two rows with one key.
+        if let Some(ax) = message_id.as_deref().and_then(|id| self.turn_agent_ix(id)) {
+            let wx = match ax.checked_sub(1).map(|w| &self.items[w].kind) {
+                Some(ItemKind::Work(_)) => ax - 1,
+                _ => {
+                    if text.is_empty() {
+                        return;
+                    }
+                    let key = format!("work-{}", message_id.as_deref().unwrap_or_default());
+                    let rev = self.next_rev();
+                    self.items.insert(
+                        ax,
+                        Item {
+                            key,
+                            rev,
+                            kind: ItemKind::Work(Vec::new()),
+                        },
+                    );
+                    self.reindex_tools();
+                    ax
+                }
+            };
+            self.thought_into(wx, message_id, part, text);
+            return;
+        }
         if let Some(ix) = self.items.len().checked_sub(1)
-            && let ItemKind::Work(entries) = &mut self.items[ix].kind
+            && matches!(self.items[ix].kind, ItemKind::Work(_))
         {
-            if let Some(WorkEntry::Thought(t)) = entries.last_mut()
-                && message_id.as_ref().is_none_or(|m| *m == t.message)
-                && part == t.part
-            {
-                t.text.push_str(&text);
-                self.touch(ix);
-                return;
-            }
-            if text.is_empty() {
-                return;
-            }
-            let message = message_id.unwrap_or_else(|| format!("thought-{}", self.counter + 1));
-            entries.push(WorkEntry::Thought(Thought::new(message, part, text)));
-            self.touch(ix);
+            self.thought_into(ix, message_id, part, text);
             return;
         }
         if text.is_empty() {
@@ -2255,6 +2282,47 @@ impl SessionView {
             format!("work-{}", thought.id),
             ItemKind::Work(vec![WorkEntry::Thought(thought)]),
         );
+    }
+
+    /// Add a reasoning chunk to work item `ix`: merged into its last thought
+    /// when that is the same message and part.
+    fn thought_into(
+        &mut self,
+        ix: usize,
+        message_id: Option<String>,
+        part: Option<String>,
+        text: String,
+    ) {
+        let ItemKind::Work(entries) = &mut self.items[ix].kind else {
+            return;
+        };
+        if let Some(WorkEntry::Thought(t)) = entries.last_mut()
+            && message_id.as_ref().is_none_or(|m| *m == t.message)
+            && part == t.part
+        {
+            t.text.push_str(&text);
+            self.touch(ix);
+            return;
+        }
+        if text.is_empty() {
+            return;
+        }
+        let message = message_id.unwrap_or_else(|| format!("thought-{}", self.counter + 1));
+        entries.push(WorkEntry::Thought(Thought::new(message, part, text)));
+        self.touch(ix);
+    }
+
+    /// Index of the reply `message_id` in the current turn (after the last
+    /// user message), if it has started.
+    fn turn_agent_ix(&self, message_id: &str) -> Option<usize> {
+        for (ix, item) in self.items.iter().enumerate().rev() {
+            match &item.kind {
+                ItemKind::User { .. } => return None,
+                ItemKind::Agent { .. } if item.key == message_id => return Some(ix),
+                _ => {}
+            }
+        }
+        None
     }
 
     fn apply_tool(&mut self, update: &Value, created: bool) {
@@ -2527,6 +2595,106 @@ mod history_tests {
         // Live `delegationUpdate` / windowed summary links.
         view.apply_child_links(&[json!({ "toolCallId": "t3", "childSessionId": "c3" })]);
         assert_eq!(child_of(&view, "t3").as_deref(), Some("c3"));
+    }
+
+    /// (key, kind) of every item, in order.
+    fn layout(view: &SessionView) -> Vec<(String, &'static str)> {
+        view.items
+            .iter()
+            .map(|i| {
+                let kind = match &i.kind {
+                    ItemKind::User { .. } => "user",
+                    ItemKind::Agent { .. } => "agent",
+                    ItemKind::Work(_) => "work",
+                    _ => "other",
+                };
+                (i.key.clone(), kind)
+            })
+            .collect()
+    }
+
+    fn agent_text(view: &SessionView, key: &str) -> String {
+        view.items
+            .iter()
+            .filter(|i| i.key == key)
+            .filter_map(|i| match &i.kind {
+                ItemKind::Agent { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// Reasoning of a reply that already started streaming goes in the work
+    /// group before it, and the reply keeps one row (it split in two around
+    /// a spinner row while streaming).
+    #[test]
+    fn late_reasoning_does_not_split_the_streaming_reply() {
+        let mut view = SessionView::new("a", "s", "/w", "t");
+        let text = |t: &str| {
+            json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m1",
+                "content": { "type": "text", "text": t } })
+        };
+        view.apply(
+            &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u1",
+            "content": { "type": "text", "text": "go" } }),
+        );
+        view.apply(&text("in qmac"));
+        view.apply(
+            &json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "m1",
+            "content": { "type": "text", "text": "**Inspecting replay test mocks**" },
+            "_meta": { "querymt": { "reasoning_part_id": "rs:summary:0" } } }),
+        );
+        view.apply(&text("p."));
+        assert_eq!(
+            layout(&view),
+            [
+                ("u1".to_string(), "user"),
+                ("work-m1".to_string(), "work"),
+                ("m1".to_string(), "agent"),
+            ]
+        );
+        assert_eq!(agent_text(&view, "m1"), "in qmacp.");
+        assert_eq!(thoughts(&view).len(), 1);
+    }
+
+    /// Late reasoning joins the work group already before the reply, and
+    /// tool lookups still find their rows after the insert.
+    #[test]
+    fn late_reasoning_joins_the_preceding_work_group() {
+        let mut view = SessionView::new("a", "s", "/w", "t");
+        view.apply(
+            &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u1",
+            "content": { "type": "text", "text": "go" } }),
+        );
+        view.apply(&json!({ "sessionUpdate": "tool_call", "toolCallId": "t1",
+            "title": "Shell", "kind": "execute", "status": "completed" }));
+        view.apply(
+            &json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m1",
+            "content": { "type": "text", "text": "Done" } }),
+        );
+        view.apply(&json!({ "sessionUpdate": "tool_call", "toolCallId": "t2",
+            "title": "Shell", "kind": "execute", "status": "in_progress" }));
+        view.apply(
+            &json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "m1",
+            "content": { "type": "text", "text": "late" } }),
+        );
+        view.apply(
+            &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t2",
+            "status": "completed" }),
+        );
+        let kinds: Vec<&str> = layout(&view).into_iter().map(|(_, k)| k).collect();
+        assert_eq!(kinds, ["user", "work", "agent", "work"]);
+        let ItemKind::Work(first) = &view.items[1].kind else {
+            panic!("work group expected");
+        };
+        assert!(matches!(first.last(), Some(WorkEntry::Thought(t)) if t.text == "late"));
+        let ItemKind::Work(last) = &view.items[3].kind else {
+            panic!("work group expected");
+        };
+        assert!(
+            matches!(last.first(), Some(WorkEntry::Tool(c)) if c.id == "t2" && c.status == "completed")
+        );
     }
 
     #[test]

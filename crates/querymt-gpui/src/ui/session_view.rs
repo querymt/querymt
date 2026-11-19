@@ -251,6 +251,8 @@ struct RenderCtx {
     running: bool,
     /// Index of the first item of the current (possibly running) turn.
     last_turn_start: usize,
+    /// Index of the transcript's last item: only it can still be streaming.
+    last_ix: usize,
     /// Items that close a turn → (added, removed, files) of that turn's edits.
     turn_end: HashMap<usize, (usize, usize, usize)>,
     copied: Option<String>,
@@ -298,6 +300,7 @@ impl RenderCtx {
                     }
                 }
                 (self.running && ix >= self.last_turn_start).hash(&mut h);
+                (self.running && ix == self.last_ix).hash(&mut h);
             }
             _ => self.expanded.contains(&item.key).hash(&mut h),
         }
@@ -2234,7 +2237,9 @@ fn render_work(ix: usize, item: &Item, entries: &[WorkEntry], rc: &RenderCtx) ->
         &blocks[blocks.len() - 2..]
     };
     let hidden = blocks.len() - visible.len();
-    let last_live = rc.running && ix >= rc.last_turn_start;
+    // Only the last row streams: reasoning in an earlier work group of the
+    // turn is done once a reply or another group follows it.
+    let last_live = rc.running && ix == rc.last_ix;
     let header: Option<AnyElement> = if settled {
         Some(
             h_flex()
@@ -4185,6 +4190,7 @@ impl QmtApp {
                 .iter()
                 .rposition(|i| matches!(i.kind, ItemKind::User { .. }))
                 .unwrap_or(0),
+            last_ix: view.items.len().saturating_sub(1),
             turn_end: turn_ends(&view.items),
             copied: self.copied.clone(),
             block_scrolls: self.transcript.block_scrolls.clone(),
