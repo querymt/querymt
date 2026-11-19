@@ -131,6 +131,10 @@ async fn run(
         backend_sampling: None,
         json_schema: None,
         grammar_backend: None,
+        devices: None,
+        tensor_split: None,
+        split_mode: None,
+        main_gpu: None,
     };
 
     println!("Loading model: {}", args.model);

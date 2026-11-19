@@ -58,6 +58,10 @@ fn test_config_serialization() {
         backend_sampling: None,
         json_schema: None,
         grammar_backend: None,
+        devices: None,
+        tensor_split: None,
+        split_mode: None,
+        main_gpu: None,
     };
 
     let json = serde_json::to_string(&config).expect("Failed to serialize config");
@@ -91,6 +95,7 @@ fn test_speculative_config_serialization() {
         n_min: Some(0),
         p_min: Some(0.0),
         n_gpu_layers: None,
+        main_gpu: None,
     };
 
     let json = serde_json::to_value(&speculative).unwrap();

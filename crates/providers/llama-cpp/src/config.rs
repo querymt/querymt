@@ -182,6 +182,53 @@ pub struct LlamaCppConfig {
     /// sampled token and is applied to the whole vocabulary only when that
     /// token is rejected.
     pub grammar_backend: Option<GrammarBackend>,
+    /// Backend devices the model is loaded onto, by name (case-insensitive),
+    /// e.g. `["CUDA0", "CUDA1"]` or `["Vulkan1"]`.
+    ///
+    /// Names are the ggml device names (see llama.cpp's `--list-devices`).
+    /// When omitted, llama.cpp uses every detected GPU. CPU/ACCEL devices do
+    /// not need to be listed. The order here defines the order of
+    /// `tensor_split` and the meaning of `main_gpu`.
+    pub devices: Option<Vec<String>>,
+    /// Each device's relative share of the model, parallel to `devices`
+    /// (or to llama.cpp's device enumeration order when `devices` is unset).
+    ///
+    /// Shares are relative and need not sum to one: `[3, 1]` puts 75% of the
+    /// model on the first device and 25% on the second. When omitted,
+    /// llama.cpp splits in proportion to each device's free memory.
+    pub tensor_split: Option<Vec<f32>>,
+    /// How the model is split across devices. llama.cpp defaults to `layer`.
+    pub split_mode: Option<SplitMode>,
+    /// Index into the selected device list of the GPU used for the whole
+    /// model (`split_mode = none`) or for intermediate results (`row`).
+    /// Defaults to 0.
+    pub main_gpu: Option<u32>,
+}
+
+/// How a model is distributed across devices. See [`LlamaCppConfig::split_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitMode {
+    /// Use a single device (`main_gpu`).
+    None,
+    /// Split layers and KV cache across devices (llama.cpp default).
+    Layer,
+    /// Split layers and KV cache across devices, using tensor parallelism
+    /// where supported.
+    Row,
+    /// Experimental tensor parallelism across devices.
+    Tensor,
+}
+
+impl From<SplitMode> for llama_cpp_2::model::params::LlamaSplitMode {
+    fn from(mode: SplitMode) -> Self {
+        match mode {
+            SplitMode::None => Self::None,
+            SplitMode::Layer => Self::Layer,
+            SplitMode::Row => Self::Row,
+            SplitMode::Tensor => Self::Tensor,
+        }
+    }
 }
 
 /// Grammar engine for tool calls. See [`LlamaCppConfig::grammar_backend`].
@@ -218,6 +265,10 @@ pub struct SpeculativeConfig {
     pub p_min: Option<f32>,
     /// GPU layers for a sidecar model. Defaults to the target model setting.
     pub n_gpu_layers: Option<u32>,
+    /// Device used for a sidecar model, as an index into the target's
+    /// selected `devices` list. A sidecar is small, so it is always loaded on
+    /// a single device rather than split. Defaults to the target's `main_gpu`.
+    pub main_gpu: Option<u32>,
 }
 
 impl SpeculativeConfig {
@@ -393,6 +444,7 @@ mod tests {
             n_min: Some(n_min),
             p_min: Some(p_min),
             n_gpu_layers: None,
+            main_gpu: None,
         }
     }
 

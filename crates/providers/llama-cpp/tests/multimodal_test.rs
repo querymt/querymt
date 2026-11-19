@@ -92,6 +92,10 @@ fn make_provider(model: String, mmproj_path: Option<String>) -> Box<dyn querymt:
         backend_sampling: None,
         json_schema: None,
         grammar_backend: None,
+        devices: None,
+        tensor_split: None,
+        split_mode: None,
+        main_gpu: None,
     };
     create_provider(cfg).expect("Failed to create provider")
 }
@@ -353,6 +357,10 @@ fn test_config_with_multimodal_fields() {
         backend_sampling: None,
         json_schema: None,
         grammar_backend: None,
+        devices: None,
+        tensor_split: None,
+        split_mode: None,
+        main_gpu: None,
     };
 
     let json = serde_json::to_string(&config).expect("serialize");

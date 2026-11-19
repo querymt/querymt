@@ -565,6 +565,10 @@ mod tests {
             backend_sampling: None,
             json_schema: None,
             grammar_backend: None,
+            devices: None,
+            tensor_split: None,
+            split_mode: None,
+            main_gpu: None,
         };
 
         // Case: multiple top-level images + tool result with nested images

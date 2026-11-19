@@ -9,6 +9,7 @@ mod memory;
 mod messages;
 mod mtp;
 mod multimodal;
+mod placement;
 mod provider;
 mod response;
 mod template;
@@ -16,7 +17,7 @@ mod template;
 mod test_vocab;
 mod tools;
 
-pub use config::{GrammarBackend, LlamaCppConfig, SpeculativeConfig, SpeculativeType};
+pub use config::{GrammarBackend, LlamaCppConfig, SpeculativeConfig, SpeculativeType, SplitMode};
 use provider::LlamaCppProvider;
 
 /// Create a provider directly from a config struct (useful for testing and embedding).
@@ -45,7 +46,7 @@ pub fn create_factory() -> std::sync::Arc<dyn LLMProviderFactory> {
 struct LlamaCppFactory {
     /// Single-slot model cache. Stores the most recently loaded model
     /// (`Arc<LlamaModel>` + `Arc<MultimodalContext>`) keyed on hardware
-    /// params (model path, n_gpu_layers).
+    /// params (model path, n_gpu_layers, device placement).
     ///
     /// Capacity = 1 matches the common case: one model on the peer,
     /// multiple delegates sharing it with different system prompts.
