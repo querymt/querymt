@@ -36,5 +36,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 futures-util = "0.3"
-jsonschema = { version = "0.60", default-features = false }
+jsonschema.workspace = true
 tokio-tungstenite = "0.29"
