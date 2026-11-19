@@ -49,6 +49,11 @@ jobs:
 
       - name: Regenerate workspace-hack
         run: |
+          # Empty the generated section first. When a bump crosses a `links`
+          # boundary (e.g. rusqlite -> libsqlite3-sys), the stale pins make the
+          # workspace unresolvable and every cargo command, hakari included, fails.
+          sed -i '/^### BEGIN HAKARI SECTION/,/^### END HAKARI SECTION/{/^### /!d;}' \
+            crates/workspace-hack/Cargo.toml
           cargo hakari generate
           cargo hakari manage-deps --yes
 
