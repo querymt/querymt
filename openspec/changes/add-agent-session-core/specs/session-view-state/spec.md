@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Turns the agent's session output (load snapshot, ACP session updates, older-history pages) and client observations into one deterministic conversation view with change reports, so every QueryMT client renders sessions the same way, natively or as WebAssembly.
+Turns the agent's session output (load snapshot, ACP session updates, older-history pages) and client observations into one deterministic conversation view with change reports, so every QueryMT client renders sessions the same way, as a native Rust library or as WebAssembly.
 
 ## ADDED Requirements
 
@@ -19,9 +19,17 @@ Given a session load response that carries `querymt/sessionLoadSnapshot.v1`, the
 - **THEN** token totals, the current model, pending inputs and child session links come from `summary`, and totals marked partial are reported as approximate
 - **AND** the history paging state carries the `before` token and marks older history as available
 
-#### Scenario: Load response without a snapshot yields an empty view
-- **WHEN** a load response without `querymt/sessionLoadSnapshot.v1` is applied
-- **THEN** the view has no turns and is ready to receive replayed ACP session updates
+#### Scenario: Replayed updates before a load response without a snapshot are kept
+- **WHEN** replayed ACP session updates for 2 turns are applied, followed by a load response without `querymt/sessionLoadSnapshot.v1`
+- **THEN** the view keeps the 2 replayed turns and takes config options and modes from the response
+
+#### Scenario: Snapshot replaces replayed turns
+- **WHEN** replayed ACP session updates are applied, followed by a load response whose snapshot describes the same session
+- **THEN** the view's turns are the ones the snapshot describes, each appearing once
+
+#### Scenario: Snapshot with an idle runtime keeps unfinished tool status
+- **WHEN** a snapshot whose runtime status is idle contains a tool call with no result
+- **THEN** the tool call keeps its last reported status and is not reported as the active tool call
 
 ### Requirement: Live ACP session updates
 ACP `session/update` notifications SHALL be applied in arrival order. Notifications for a different session id SHALL be ignored and reported as ignored.
@@ -39,7 +47,7 @@ ACP `session/update` notifications SHALL be applied in arrival order. Notificati
 - **THEN** the view is unchanged and the change report lists the notification as ignored
 
 ### Requirement: Standard ACP context compaction
-Context compaction SHALL be read from the standard ACP `compaction_update` and `compaction_summary_chunk` session updates (client capability `session.compaction`, `CompactionCapabilities`), following the ACP contract: ID-addressed upsert, position fixed by the first update, patch semantics for `summary`, `error` and `_meta`, chunks appended in receive order.
+Context compaction SHALL be read from the standard ACP `compaction_update` and `compaction_summary_chunk` session updates (client capability `session.compaction`, `CompactionCapabilities`), following the ACP contract: ID-addressed upsert, position fixed by the first update, patch semantics for `summary`, `error` and `_meta`, chunks appended in receive order. A compaction whose status is completed, failed or cancelled SHALL NOT return to in progress; later patches to its other fields still apply.
 
 #### Scenario: First compaction update fixes the timeline position
 - **WHEN** a `compaction_update` with a new `compactionId` and status `in_progress` arrives after turn 3, and a later update with the same id and status `completed` arrives after turn 5 has started
@@ -56,6 +64,10 @@ Context compaction SHALL be read from the standard ACP `compaction_update` and `
 #### Scenario: Unknown compaction status is not completed
 - **WHEN** a `compaction_update` carries status `_vendor_paused`
 - **THEN** the compaction is kept with an other status and is not shown as completed
+
+#### Scenario: Settled compaction is not reopened
+- **WHEN** a compaction with status `completed` receives a `compaction_update` with status `in_progress` and a new `summary`
+- **THEN** the compaction keeps status `completed` and takes the new summary
 
 ### Requirement: Snapshot and live stream equivalence
 Hydrating a snapshot SHALL produce the same turns as applying the equivalent sequence of live ACP session updates, ignoring arrival timestamps. Splitting the same text into different chunk sizes SHALL produce the same view.
@@ -79,8 +91,15 @@ Every applied batch SHALL return a change report that lists the ids of added, up
 - **WHEN** a tool call update for the last turn is applied
 - **THEN** every other turn has the same id and equal content before and after the update
 
+### Requirement: Turn entries with stable identity
+Each turn SHALL hold its content as ordered entries (user message, assistant message, reasoning part, tool call, compaction boundary). Each entry SHALL have an id that is stable for the life of the view and a revision that grows whenever that entry changes. A turn's revision SHALL grow whenever any of its entries changes.
+
+#### Scenario: Streaming chunk changes one entry
+- **WHEN** an `agent_message_chunk` extends the assistant message of a turn that also holds 3 tool calls
+- **THEN** only the assistant message entry gets a new revision, the 3 tool call entries keep their ids and revisions, and the turn's revision grows
+
 ### Requirement: Older history pages
-An older-history page SHALL be merged in front of the existing turns by history position. Events already in the view SHALL NOT be duplicated, and the streaming turn, optimistic prompts and live updates received since the load SHALL be kept.
+An older-history page SHALL be applied from the agent's raw older-history response, including its structured user prompts and truncation entries. It SHALL be merged in front of the existing turns by history position. Events already in the view SHALL NOT be duplicated, and the streaming turn, optimistic prompts and live updates received since the load SHALL be kept.
 
 #### Scenario: Older page is prepended
 - **WHEN** an older-history page with 10 turns is applied to a view loaded from a window
@@ -94,6 +113,10 @@ An older-history page SHALL be merged in front of the existing turns by history 
 #### Scenario: Overlapping page events are not duplicated
 - **WHEN** a page contains events that the view already holds
 - **THEN** each event appears once in the view
+
+#### Scenario: Older page restores prompt attachments
+- **WHEN** an older-history page carries a structured user prompt with a text block and an image block
+- **THEN** that turn's user message holds the text and the image attachment
 
 ### Requirement: Optimistic prompts
 A prompt submitted by the client SHALL appear at once as a pending user message identified by its client prompt id. The agent's echo with the same client prompt id SHALL replace it in place. A prompt reported as failed SHALL be marked failed.
@@ -133,7 +156,7 @@ The view SHALL report the session's run state (idle, submitting, thinking, strea
 - **THEN** the run state becomes idle and tools still marked running are no longer reported as active
 
 ### Requirement: Usage and cost
-The view SHALL report context usage and cumulative cost from `usage_update` notifications and from the snapshot's accounting, keeping the most recent authoritative value. Cost SHALL be taken only from accounting data, never summed from individual requests.
+The view SHALL report context usage, the token breakdown (latest request and session totals, with a partial flag) and cumulative cost from `usage_update` notifications and from the snapshot's accounting and summary, keeping the most recent authoritative value. Cost SHALL be taken only from accounting data, never summed from individual requests.
 
 #### Scenario: Usage update replaces context usage
 - **WHEN** a `usage_update` with `used = 12000` and `size = 200000` arrives
@@ -142,6 +165,21 @@ The view SHALL report context usage and cumulative cost from `usage_update` noti
 #### Scenario: Snapshot accounting sets cost
 - **WHEN** a snapshot with session accounting of 0.42 USD complete is applied
 - **THEN** the view reports a cost of 0.42 USD marked complete
+
+#### Scenario: Usage update carries the token breakdown
+- **WHEN** a `usage_update` carries `_meta.querymt.usage` with latest-request and session-total tokens marked partial
+- **THEN** the view reports both token breakdowns and marks the totals as approximate
+
+### Requirement: Plans and reasoning parts
+The view SHALL hold the session's current plan, replaced by `plan` and `plan_update` and cleared by `plan_removed`. Reasoning SHALL be kept as separate parts when updates carry a reasoning part id (`_meta.querymt.reasoning_part_id`); chunks of the same part SHALL merge.
+
+#### Scenario: Plan update replaces and plan removal clears
+- **WHEN** a `plan_update` with 3 entries arrives, then a `plan_update` with 2 entries, then a `plan_removed` for the same plan
+- **THEN** the view's plan has 3 entries, then the 2 new entries, then no plan
+
+#### Scenario: Reasoning parts stay separate
+- **WHEN** `agent_thought_chunk` updates for one message arrive with reasoning part ids `p0`, `p0`, `p1`
+- **THEN** that message holds two reasoning parts, `p0` with both of its chunks and `p1` with one
 
 ### Requirement: Session configuration, undo, inputs and delegations
 The view SHALL hold the current config options, the undo stack and last undo result, pending queued and steered inputs, and delegation activity, each updated by its matching event and merged by id.
@@ -185,7 +223,7 @@ The same sequence of inputs SHALL produce the same view and change reports, byte
 - **THEN** the serialized views and change reports are identical
 
 ### Requirement: Tolerant input handling
-Unknown session update kinds and unknown agent event kinds SHALL be skipped and counted in the change report. A malformed input SHALL be rejected with an error in the change report and SHALL NOT change the view. No input SHALL abort the reducer.
+Unknown session update kinds and unknown agent event kinds SHALL be skipped and counted in the change report. A malformed input SHALL be rejected with an error in the change report and SHALL NOT change the view. Inside a snapshot or an older-history page, decoding SHALL be per event: an event that fails to decode SHALL be skipped and reported with its history position, and the other events SHALL be applied. No input SHALL abort the reducer.
 
 #### Scenario: Unknown update kind is skipped
 - **WHEN** a notification with an unknown `sessionUpdate` value arrives
@@ -195,12 +233,27 @@ Unknown session update kinds and unknown agent event kinds SHALL be skipped and 
 - **WHEN** a batch contains a notification whose `update` is not an object, followed by a valid chunk
 - **THEN** the change report holds an error for the first input and the valid chunk is applied
 
+#### Scenario: Bad event inside a snapshot is skipped
+- **WHEN** a snapshot of 200 events contains one event of a known kind whose fields fail to decode
+- **THEN** the other 199 events are applied and the change report holds one error naming that event's history position
+
 ### Requirement: Bounded debug event log
 The view SHALL keep a debug log of applied inputs (kind, short summary, message id) limited to the newest 1,000 entries, with a count of dropped entries.
 
 #### Scenario: Debug log keeps the newest entries
 - **WHEN** 1,500 inputs are applied
 - **THEN** the debug log holds the newest 1,000 entries and reports 500 dropped
+
+### Requirement: Native Rust library
+The session view reducer SHALL be usable as a native Rust library by clients outside the QueryMT workspace. Its dependency tree SHALL contain no async runtime, no database driver and no workspace-internal helper crate, and a view SHALL be movable between threads.
+
+#### Scenario: Out-of-workspace client builds
+- **WHEN** a crate outside the workspace depends on the reducer through a git dependency pinned to a revision
+- **THEN** it builds natively and for `wasm32-unknown-unknown`, and its dependency tree contains no tokio, rusqlite or `querymt-workspace-hack`
+
+#### Scenario: Snapshot hydrated on a background thread
+- **WHEN** a native client applies a large snapshot to a view on a background thread and then moves the view to its UI thread
+- **THEN** the view on the UI thread equals a view that applied the same snapshot on the UI thread
 
 ### Requirement: Published WebAssembly module
 Each nightly and stable QueryMT release SHALL publish the session view reducer as a WebAssembly module with JavaScript bindings, TypeScript declarations and a schema version, as `agent-session-core-wasm-<version>.tar.gz` with a `.sha256` file, both listed in `release.json`.
