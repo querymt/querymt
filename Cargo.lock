@@ -115,6 +115,7 @@ dependencies = [
  "futures",
  "futures-concurrency",
  "rustc-hash 2.1.3",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "tracing",
@@ -139,6 +140,7 @@ checksum = "5d27fec60e79b5682eae06f9c94e028eb7043dfc972a4a38e7008701b4408d21"
 dependencies = [
  "anyhow",
  "derive_more",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "serde_with",
@@ -12696,6 +12698,7 @@ dependencies = [
  "serde_core",
  "serde_json",
  "serde_with",
+ "serde_with_macros",
  "sha1 0.11.0",
  "sha2 0.10.9",
  "signature 2.2.0",

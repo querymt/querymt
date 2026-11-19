@@ -408,7 +408,7 @@ mod tests {
             message: "invalid base64 attachment data".to_string(),
         }
         .into();
-        assert_eq!(error.code, ErrorCode::InvalidParams);
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
     }
 
     #[test]
@@ -418,7 +418,7 @@ mod tests {
             found: 31,
         }
         .into();
-        assert_eq!(error.code, ErrorCode::InternalError);
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
         assert!(error.message.contains("expected 30"));
         assert!(error.message.contains("found 31"));
     }
@@ -429,7 +429,7 @@ mod tests {
             session_id: "s-1".to_string(),
         }
         .into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
         assert_eq!(acp.message, "session is running in another process");
         assert_eq!(
             acp.data.as_ref().and_then(|d| d.get("session_id")),
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn provider_required_maps_to_internal_error() {
         let acp: AcpError = AgentError::ProviderRequired.into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
         assert!(acp.message.contains("provider is required"));
     }
 
@@ -450,7 +450,7 @@ mod tests {
             name: "bad-llm".to_string(),
         }
         .into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
         assert!(acp.message.contains("bad-llm"));
     }
 
@@ -460,7 +460,7 @@ mod tests {
             method: "session/set_mode".to_string(),
         }
         .into();
-        assert_eq!(acp.code, ErrorCode::MethodNotFound);
+        assert_eq!(acp.code, ErrorCode::METHOD_NOT_FOUND);
         assert!(acp.message.contains("session/set_mode"));
     }
 
@@ -470,7 +470,7 @@ mod tests {
             session_id: "abc-123".to_string(),
         }
         .into();
-        assert_eq!(acp.code, ErrorCode::ResourceNotFound);
+        assert_eq!(acp.code, ErrorCode::RESOURCE_NOT_FOUND);
         assert!(acp.message.contains("abc-123"));
     }
 
@@ -480,7 +480,7 @@ mod tests {
             details: "DHT lookup missed".to_string(),
         }
         .into();
-        assert_eq!(acp.code, ErrorCode::ResourceNotFound);
+        assert_eq!(acp.code, ErrorCode::RESOURCE_NOT_FOUND);
         assert!(acp.message.contains("DHT lookup missed"));
     }
 
@@ -490,7 +490,7 @@ mod tests {
             details: "exceeded 30s".to_string(),
         }
         .into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
         assert!(acp.message.contains("exceeded 30s"));
     }
 
@@ -501,7 +501,7 @@ mod tests {
             reason: "process exited".to_string(),
         }
         .into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
         assert!(acp.message.contains("stdio"));
         assert!(acp.message.contains("process exited"));
     }
@@ -513,7 +513,7 @@ mod tests {
             reason: "rate limit".to_string(),
         }
         .into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
         assert!(acp.message.contains("chat_with_tools"));
         assert!(acp.message.contains("rate limit"));
     }
@@ -536,7 +536,7 @@ mod tests {
         }
         .into();
 
-        assert_eq!(acp.code, ErrorCode::Other(-32010));
+        assert_eq!(acp.code, ErrorCode::new(-32010));
         assert_eq!(acp.message, "Provider request failed");
         assert_eq!(
             acp.data,
@@ -572,7 +572,7 @@ mod tests {
         }
         .into();
 
-        assert_eq!(acp.code, ErrorCode::Other(-32010));
+        assert_eq!(acp.code, ErrorCode::new(-32010));
         assert_eq!(
             acp.data,
             Some(serde_json::json!({
@@ -604,7 +604,7 @@ mod tests {
         }
         .into();
 
-        assert_eq!(acp.code, ErrorCode::Other(-32010));
+        assert_eq!(acp.code, ErrorCode::new(-32010));
         assert_eq!(
             acp.data,
             Some(serde_json::json!({
@@ -625,26 +625,26 @@ mod tests {
     #[test]
     fn client_bridge_closed_maps_to_internal_error() {
         let acp: AcpError = AgentError::ClientBridgeClosed.into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
         assert!(acp.message.contains("client bridge closed"));
     }
 
     #[test]
     fn permission_cancelled_maps_to_internal_error() {
         let acp: AcpError = AgentError::PermissionCancelled.into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
     }
 
     #[test]
     fn permission_channel_dropped_maps_to_internal_error() {
         let acp: AcpError = AgentError::PermissionChannelDropped.into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
     }
 
     #[test]
     fn remote_actor_maps_to_internal_error() {
         let acp: AcpError = AgentError::RemoteActor("actor dead".to_string()).into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
         assert!(acp.message.contains("actor dead"));
     }
 
@@ -656,7 +656,7 @@ mod tests {
             "connection closed",
         ))
         .into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
         assert!(acp.message.contains("connection closed"));
         assert!(acp.message.contains("kind=connection_closed"));
         assert_eq!(
@@ -711,27 +711,27 @@ mod tests {
             reason: "timeout".to_string(),
         }
         .into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
         assert!(acp.message.contains("session::abc"));
     }
 
     #[test]
     fn empty_session_fork_maps_to_internal_error() {
         let acp: AcpError = AgentError::EmptySessionFork.into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
     }
 
     #[test]
     fn mesh_not_bootstrapped_maps_to_internal_error() {
         let acp: AcpError = AgentError::MeshNotBootstrapped.into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
         assert!(acp.message.contains("--mesh"));
     }
 
     #[test]
     fn internal_maps_to_internal_error() {
         let acp: AcpError = AgentError::Internal("oops".to_string()).into();
-        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
         assert!(acp.message.contains("oops"));
     }
 

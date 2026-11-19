@@ -660,7 +660,7 @@ async fn worktree_operations_fail_closed_without_a_workspace_service() {
         .expect_err("no workspace service: list must fail closed");
     assert_eq!(
         err.code,
-        agent_client_protocol::ErrorCode::InternalError,
+        agent_client_protocol::ErrorCode::INTERNAL_ERROR,
         "err: {err:?}"
     );
 
@@ -674,7 +674,7 @@ async fn worktree_operations_fail_closed_without_a_workspace_service() {
         .expect_err("no workspace service: status must fail closed");
     assert_eq!(
         err.code,
-        agent_client_protocol::ErrorCode::InternalError,
+        agent_client_protocol::ErrorCode::INTERNAL_ERROR,
         "err: {err:?}"
     );
 }
@@ -877,7 +877,7 @@ async fn worktree_lifecycle_reports_ids_paths_baselines_and_errors_consistently(
         .expect_err("active owner blocks removal");
     assert_eq!(
         err.code,
-        agent_client_protocol::ErrorCode::InvalidRequest,
+        agent_client_protocol::ErrorCode::INVALID_REQUEST,
         "err: {err:?}"
     );
 
@@ -892,7 +892,7 @@ async fn worktree_lifecycle_reports_ids_paths_baselines_and_errors_consistently(
         .expect_err("unknown workspace");
     assert_eq!(
         err.code,
-        agent_client_protocol::ErrorCode::InvalidRequest,
+        agent_client_protocol::ErrorCode::INVALID_REQUEST,
         "err: {err:?}"
     );
 
@@ -1015,7 +1015,7 @@ async fn ext_recover_releases_a_pending_fork_barrier_by_session_id() {
         ))
         .await
         .expect_err("ambiguous recover request");
-    assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+    assert_eq!(err.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
 
     // Session-scoped recovery completes provisioning and releases the barrier.
     let recovered = ext_method_json(

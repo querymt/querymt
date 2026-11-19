@@ -20,7 +20,7 @@ fn local_prompt_handler_error_preserves_structured_provider_data() {
 
     let acp = SessionActorRef::map_local_prompt_send_error(error);
 
-    assert_eq!(acp.code, ErrorCode::Other(-32010));
+    assert_eq!(acp.code, ErrorCode::new(-32010));
     assert_eq!(
         acp.data,
         Some(serde_json::json!({
@@ -44,7 +44,7 @@ fn local_prompt_transport_error_remains_internal() {
 
     let acp = SessionActorRef::map_local_prompt_send_error(error);
 
-    assert_eq!(acp.code, ErrorCode::InternalError);
+    assert_eq!(acp.code, ErrorCode::INTERNAL_ERROR);
     assert!(acp.message.contains("actor stopped"));
 }
 

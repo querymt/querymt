@@ -293,9 +293,9 @@ impl From<AuthFlowError> for agent_client_protocol::Error {
             AuthFlowError::EmptyProvider
             | AuthFlowError::UnknownMcpServer(_)
             | AuthFlowError::ConflictingMcpServer { .. } => {
-                agent_client_protocol::ErrorCode::InvalidParams
+                agent_client_protocol::ErrorCode::INVALID_PARAMS
             }
-            _ => agent_client_protocol::ErrorCode::InternalError,
+            _ => agent_client_protocol::ErrorCode::INTERNAL_ERROR,
         };
         // `error` is kept for clients that read the previous shape.
         Self::new(i32::from(code), message.clone())

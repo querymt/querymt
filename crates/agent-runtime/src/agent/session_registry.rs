@@ -1556,7 +1556,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             err.to_string().contains("empty")
-                || err.code == agent_client_protocol::ErrorCode::InternalError,
+                || err.code == agent_client_protocol::ErrorCode::INTERNAL_ERROR,
             "unexpected error: {}",
             err
         );

@@ -130,7 +130,7 @@ async fn unknown_profile_is_rejected() {
         ),
     ] {
         let error = call(&f.handle, method, params).await.unwrap_err();
-        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
         assert!(
             error.data.as_ref().unwrap().to_string().contains("missing"),
             "{method}: {error:?}"

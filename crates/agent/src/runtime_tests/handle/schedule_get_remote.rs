@@ -120,6 +120,9 @@ async fn test_querymt_schedule_get_remote_missing_returns_not_found() {
         .await
         .expect_err("missing remote schedule should reject get");
 
-    assert_eq!(err.code, agent_client_protocol::ErrorCode::ResourceNotFound);
+    assert_eq!(
+        err.code,
+        agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND
+    );
     assert!(err.message.contains("missing-remote-schedule"));
 }

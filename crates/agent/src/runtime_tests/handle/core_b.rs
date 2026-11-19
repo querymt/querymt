@@ -11,7 +11,7 @@ async fn test_unknown_ext_method_returns_method_not_found() {
         .ext_method(req)
         .await
         .expect_err("unknown ext_method should fail");
-    assert_eq!(err.code, agent_client_protocol::ErrorCode::MethodNotFound);
+    assert_eq!(err.code, agent_client_protocol::ErrorCode::METHOD_NOT_FOUND);
 }
 
 #[tokio::test]
@@ -114,7 +114,7 @@ async fn test_querymt_profile_set_active_rejects_invalid_requests() {
         .ext_method(req)
         .await
         .expect_err("profiles must be configured");
-    assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+    assert_eq!(err.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
 
     let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
     for params in ["{}", r#"{"profile_id":" "}"#, r#"{"profile_id":"missing"}"#] {
@@ -125,7 +125,7 @@ async fn test_querymt_profile_set_active_rejects_invalid_requests() {
             .ext_method(req)
             .await
             .expect_err("invalid profile request should fail");
-        assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+        assert_eq!(err.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
     }
 }
 
@@ -193,7 +193,7 @@ async fn test_querymt_profile_agents_rejects_unknown_profile() {
         .ext_method(req)
         .await
         .expect_err("unknown profile should fail");
-    assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+    assert_eq!(err.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
 }
 
 async fn persisted_delegate_parent(f: &HandleFixture) -> String {
@@ -407,7 +407,7 @@ async fn delegate_assignments_custom_storage_uses_legacy_memory_without_false_no
         ))
         .await
         .unwrap_err();
-    assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+    assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
 
     handle
         .config
@@ -739,7 +739,7 @@ async fn delegate_assignment_child_cannot_edit_parent_routing() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+    assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
 }
 
 #[tokio::test]
@@ -872,7 +872,7 @@ async fn test_querymt_session_set_delegate_model_sets_and_clears_override() {
     }).to_string()))).await.unwrap_err();
     assert_eq!(
         stale.code,
-        agent_client_protocol::ErrorCode::Other(
+        agent_client_protocol::ErrorCode::new(
             crate::control::delegate_models::DELEGATE_ASSIGNMENT_CONFLICT_ACP_CODE
         )
     );
@@ -950,7 +950,7 @@ async fn test_querymt_session_set_delegate_model_rejects_invalid_targets() {
             .ext_method(req)
             .await
             .expect_err("invalid target should fail");
-        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
     }
     let unchanged = ext_method_json(
         &f.handle,
@@ -1054,7 +1054,7 @@ async fn test_set_llm_config_unknown_provider_fails() {
     // Should be an UnknownProvider error mapped to ACP
     assert_eq!(
         err.code,
-        agent_client_protocol::ErrorCode::InternalError,
+        agent_client_protocol::ErrorCode::INTERNAL_ERROR,
         "expected internal error code"
     );
 }

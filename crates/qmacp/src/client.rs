@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use agent_client_protocol::{
     JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, UntypedMessage,
-    schema::ProtocolVersion, schema::v1 as acp,
+    schema::ProtocolVersion, v1::schema as acp,
 };
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
@@ -423,7 +423,7 @@ impl AcpClient {
         let message = request.to_untyped_message()?;
         let method = message.method.clone();
         let result = self.request_raw(&method, message.params, timeout).await?;
-        let typed = R::Response::from_value(&method, result.clone())?;
+        let typed = R::Response::from_json(&method, result.clone())?;
         Ok((typed, result))
     }
 

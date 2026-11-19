@@ -2141,7 +2141,7 @@ async fn websocket_bridge_forwards_notifications_elicitations_and_control_messag
             .await
             .expect_err("workspace query is unsupported")
             .code,
-        agent_client_protocol::ErrorCode::MethodNotFound
+        agent_client_protocol::ErrorCode::METHOD_NOT_FOUND
     );
 
     let elicitation = tokio::spawn({

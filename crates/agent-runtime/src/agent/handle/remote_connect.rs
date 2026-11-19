@@ -868,7 +868,7 @@ impl LocalAgentHandle {
                 .resolve_handoff(session_id, handoff)
                 .await
                 .map_err(|e| {
-                    if e.code == agent_client_protocol::ErrorCode::ResourceNotFound {
+                    if e.code == agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND {
                         RemoteSessionConnectError::SessionNotFoundOnHost {
                             session_id: session_id.to_string(),
                             node_id: node_id.clone(),
@@ -1014,7 +1014,7 @@ impl LocalAgentHandle {
             .resolve_handoff(session_id, resumed.handoff)
             .await
             .map_err(|e| {
-                if e.code == agent_client_protocol::ErrorCode::ResourceNotFound {
+                if e.code == agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND {
                     RemoteSessionConnectError::SessionNotFoundOnHost {
                         session_id: session_id.to_string(),
                         node_id: node_id.clone(),
@@ -1861,7 +1861,10 @@ mod tests {
             message: "Session not found: s-1".into(),
         };
         let acp = err.to_acp_error();
-        assert_eq!(acp.code, agent_client_protocol::ErrorCode::ResourceNotFound);
+        assert_eq!(
+            acp.code,
+            agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND
+        );
         assert!(acp.message.contains("not found"));
         assert!(acp.message.contains("s-1"));
         let data = acp.data.expect("structured data present");

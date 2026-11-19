@@ -134,7 +134,7 @@ semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip", "preserve_order", "raw_value"] }
-serde_with = { version = "3", features = ["base64", "json"] }
+serde_with = { version = "3", features = ["base64", "json", "schemars_1"] }
 sha1 = { version = "0.11" }
 sha2 = { version = "0.10", features = ["oid"] }
 signature-7b89eefb6aaa9bf3 = { package = "signature", version = "3", default-features = false, features = ["alloc", "digest", "rand_core"] }
@@ -237,6 +237,7 @@ semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip", "preserve_order", "raw_value"] }
+serde_with_macros = { version = "3", default-features = false, features = ["schemars_1"] }
 sha2 = { version = "0.10", features = ["oid"] }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "union", "write"] }
 subtle = { version = "2", features = ["const-generics"] }

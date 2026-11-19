@@ -85,7 +85,10 @@ async fn test_querymt_schedule_ext_create_remote_missing_session_surfaces_error(
         .await
         .expect_err("missing persisted remote session should reject schedule create");
 
-    assert_eq!(err.code, agent_client_protocol::ErrorCode::ResourceNotFound);
+    assert_eq!(
+        err.code,
+        agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND
+    );
     assert!(
         err.message.contains("session not found") || err.message.contains("Session not found"),
         "error should mention missing session: {}",
@@ -151,7 +154,10 @@ async fn test_querymt_remote_attach_session_missing_persisted_session_surfaces_e
         .await
         .expect_err("missing persisted remote session should reject attach");
 
-    assert_eq!(err.code, agent_client_protocol::ErrorCode::ResourceNotFound);
+    assert_eq!(
+        err.code,
+        agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND
+    );
     assert!(
         err.message.contains("session not found") || err.message.contains("Session not found"),
         "error should mention missing session: {}",
@@ -309,7 +315,10 @@ async fn test_querymt_schedule_get_missing_returns_not_found() {
         .await
         .expect_err("missing schedule should reject get");
 
-    assert_eq!(err.code, agent_client_protocol::ErrorCode::ResourceNotFound);
+    assert_eq!(
+        err.code,
+        agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND
+    );
     assert!(err.message.contains("missing-schedule"));
 }
 
