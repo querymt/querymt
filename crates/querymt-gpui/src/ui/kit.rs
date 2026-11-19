@@ -3,7 +3,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{
-    Disableable as _, Icon, Selectable as _, Sizable as _, StyledExt as _, h_flex,
+    Disableable as _, Icon, Selectable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -268,6 +268,64 @@ pub fn action_btn(
         })
 }
 
+/// Borderless app button: [`action_btn`] sizing on a soft fill, the style of
+/// the flat buttons used across the app (Settings, Agents, Mesh).
+pub fn flat_btn(
+    id: impl Into<ElementId>,
+    enabled: bool,
+    compact: bool,
+    p: &Palette,
+) -> Stateful<Div> {
+    let (fill, fill_hover) = if p.dark {
+        (hsla(0., 0., 1., 0.045), hsla(0., 0., 1., 0.09))
+    } else {
+        (p.muted.opacity(0.07), p.muted.opacity(0.13))
+    };
+    action_btn(id, enabled, compact, p)
+        .border_color(transparent_black())
+        .bg(fill)
+        .when(enabled, |el| el.hover(move |s| s.bg(fill_hover)))
+}
+
+/// [`flat_btn`] in the destructive tone (Clear API key, Reset app data).
+pub fn danger_btn(id: impl Into<ElementId>, enabled: bool, p: &Palette) -> Stateful<Div> {
+    let danger = p.danger;
+    flat_btn(id, enabled, true, p)
+        .bg(danger.opacity(0.1))
+        .text_color(danger)
+        .when(enabled, |el| el.hover(move |s| s.bg(danger.opacity(0.16))))
+}
+
+/// [`action_btn`] in the accent fill: the one primary action of a dialog or
+/// panel (desktop `.action-btn-accent`).
+pub fn accent_btn(
+    id: impl Into<ElementId>,
+    enabled: bool,
+    compact: bool,
+    p: &Palette,
+) -> Stateful<Div> {
+    let (fill, hover, text) = (p.accent, p.accent_hover, p.on_accent);
+    action_btn(id, enabled, compact, p)
+        .border_color(transparent_black())
+        .bg(fill)
+        .text_color(text)
+        .when(enabled, |el| el.hover(move |s| s.bg(hover)))
+}
+
+/// Square, icon-only [`flat_btn`] with a tooltip.
+pub fn flat_icon_btn(
+    id: impl Into<ElementId>,
+    name: IconName,
+    tooltip: &'static str,
+    p: &Palette,
+) -> Stateful<Div> {
+    flat_btn(id, true, true, p)
+        .w(px(32.))
+        .px_0()
+        .child(icon(name, 15., p.text))
+        .tooltip(move |window, cx| wrap_tip(tooltip).build(window, cx))
+}
+
 /// Track of a segmented picker. The fill is a translucent overlay rather than
 /// an opaque palette color, so the track stays visible on every background:
 /// popovers (`surface`) as well as settings cards (`card`), where an opaque
@@ -378,6 +436,187 @@ pub fn menu_item(
         .hover(move |s| s.bg(hover))
         .child(icon(name, 14., p.muted))
         .child(div().min_w_0().truncate().child(label.into()))
+}
+
+/// Widest page column.
+pub const PAGE_MAX_W: f32 = 1040.;
+
+/// Header every page shares: the title with an optional badge beside it,
+/// an optional description, and the page's actions on the right (refresh,
+/// when the page has one, is the last of them).
+pub fn page_header(
+    title: &'static str,
+    badge: Option<AnyElement>,
+    desc: Option<&'static str>,
+    actions: Vec<AnyElement>,
+    p: &Palette,
+) -> Div {
+    h_flex()
+        .gap_3()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().text_2xl().font_bold().child(title))
+                        .children(badge),
+                )
+                .children(desc.map(|d| div().text_sm().text_color(p.muted).child(d))),
+        )
+        .when(!actions.is_empty(), |el| {
+            el.child(h_flex().flex_none().gap_1().children(actions))
+        })
+}
+
+/// Centered, padded page column holding `content` (header first).
+pub fn page(content: impl IntoIterator<Item = AnyElement>) -> Div {
+    div().w_full().flex().justify_center().px_8().py_6().child(
+        v_flex()
+            .w_full()
+            .max_w(px(PAGE_MAX_W))
+            .gap_5()
+            .children(content),
+    )
+}
+
+/// Desktop `--subtle-border` / `--subtle-surface`.
+pub fn subtle(p: &Palette) -> (Hsla, Hsla) {
+    if p.dark {
+        (hsla(0., 0., 1., 0.075), rgb(0x222222).into())
+    } else {
+        (
+            Hsla::from(rgb(0x241f31)).opacity(0.09),
+            hsla(0., 0., 1., 0.72),
+        )
+    }
+}
+
+/// Rounded card grouping [`card_row`]s, as the Settings lists do.
+pub fn card(p: &Palette) -> Div {
+    v_flex()
+        .min_w_0()
+        .rounded(px(12.))
+        .overflow_hidden()
+        .bg(p.card)
+}
+
+/// One row of a [`card`], divided from the row above unless `first`.
+pub fn card_row(first: bool, p: &Palette) -> Div {
+    let (divider, _) = subtle(p);
+    h_flex()
+        .min_h(px(59.))
+        .gap_4()
+        .px(px(14.4))
+        .py(px(11.5))
+        .when(!first, |el| el.border_t_1().border_color(divider))
+}
+
+/// Last child of a [`card`] whose rows tint on hover: GPUI clips children to
+/// rectangles, so a tinted first or last row would show square corners past
+/// the card's rounding. Paints the page background over them.
+pub fn card_mask(p: &Palette) -> impl IntoElement {
+    corner_mask(12., p.bg)
+}
+
+/// Switch with the pointer cursor, like the app's buttons.
+pub fn switch(id: impl Into<ElementId>) -> gpui_kit::component::switch::Switch {
+    gpui_kit::component::switch::Switch::new(id).cursor_pointer()
+}
+
+/// Copy-to-clipboard icon button that turns into a check once copied.
+pub fn copy_button(
+    id: impl Into<ElementId>,
+    value: impl Into<SharedString>,
+    tooltip: &'static str,
+) -> gpui_kit::component::clipboard::Clipboard {
+    gpui_kit::component::clipboard::Clipboard::new(id)
+        .value(value)
+        .tooltip(tooltip)
+        .accessibility_label(tooltip)
+        .xsmall()
+}
+
+/// QR code of `text`, dark modules on a light tile with a quiet zone so it
+/// scans in either theme.
+pub fn qr_code(text: &str, max: f32) -> Option<impl IntoElement> {
+    let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
+    let width = code.width();
+    let dark: Vec<bool> = code
+        .to_colors()
+        .into_iter()
+        .map(|c| c == qrcode::Color::Dark)
+        .collect();
+    // Four-module quiet zone on every side.
+    let cells = width + 8;
+    let module = (max / cells as f32).floor().max(1.);
+    let side = module * cells as f32;
+    Some(
+        canvas(
+            |_, _, _| {},
+            move |b, _, window, _| {
+                window.paint_quad(fill(
+                    Bounds::new(b.origin, size(px(side), px(side))),
+                    hsla(0., 0., 1., 1.),
+                ));
+                let ink = hsla(0., 0., 0.08, 1.);
+                for y in 0..width {
+                    for x in 0..width {
+                        if dark[y * width + x] {
+                            let o = point(
+                                b.origin.x + px((x + 4) as f32 * module),
+                                b.origin.y + px((y + 4) as f32 * module),
+                            );
+                            window.paint_quad(fill(
+                                Bounds::new(o, size(px(module), px(module))),
+                                ink,
+                            ));
+                        }
+                    }
+                }
+            },
+        )
+        .flex_none()
+        .size(px(side)),
+    )
+}
+
+/// Title and help of a page section, with the section's action on the right.
+pub fn section_header(
+    title: &'static str,
+    desc: &'static str,
+    action: Option<AnyElement>,
+    p: &Palette,
+) -> Div {
+    h_flex()
+        .gap_3()
+        .items_end()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(div().font_semibold().child(title))
+                .child(div().text_sm().text_color(p.muted).child(desc)),
+        )
+        .children(action)
+}
+
+/// Square tile holding an object's icon, as Settings' state panels.
+pub fn icon_tile(name: IconName, active: bool, p: &Palette) -> Div {
+    let (_, surface) = subtle(p);
+    div()
+        .relative()
+        .flex_none()
+        .size(px(34.4))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.))
+        .bg(if active { p.accent_dim } else { surface })
+        .child(icon(name, 17., if active { p.accent } else { p.muted }))
 }
 
 pub fn dot(color: Hsla) -> Div {

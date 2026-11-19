@@ -4,7 +4,8 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::input::Input;
-use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::{Icon, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -14,6 +15,8 @@ use crate::store::{AgentConfig, ConnState, Endpoint, normalize_address};
 use crate::theme::{Palette, palette};
 
 const CAN_SPAWN: bool = cfg!(not(target_family = "wasm"));
+/// Width of the stats columns of an agent row (four 60px columns).
+const STATS_W: f32 = 252.;
 
 impl QmtApp {
     // ---- dialog state --------------------------------------------------------
@@ -111,49 +114,49 @@ impl QmtApp {
         let store = self.store.read(cx);
         let configs = store.configs.clone();
         let connected = store.connected_ids().len();
+        let refreshing = store.configs.iter().any(|c| {
+            store.state(&c.id) == ConnState::Connecting
+                || store.runtime(&c.id).is_some_and(|r| r.busy)
+        });
         let attention: Vec<(AgentConfig, String)> = configs
             .iter()
             .filter_map(|c| store.needs_attention(&c.id).map(|r| (c.clone(), r)))
             .collect();
 
-        let header = h_flex()
-            .gap_3()
-            .items_start()
-            .child(
-                v_flex()
-                    .flex_1()
-                    .gap_1()
-                    .child(div().text_2xl().font_bold().child("Agents"))
-                    .child(div().text_sm().text_color(p.muted).child(
-                        "Connect local or remote qmtcode instances, inspect their status, and control their runtimes.",
-                    )),
-            );
-
-        let summary = h_flex()
-            .gap_3()
-            .child(kit::count_pill(
-                format!("{connected}/{}", configs.len()),
-                "connected",
-                &p,
-            ))
-            .when(!attention.is_empty(), |el| {
-                el.child(kit::count_pill(
-                    attention.len().to_string(),
-                    "need attention",
-                    &p,
-                ))
-            });
+        let header = kit::page_header(
+            "Agents",
+            (!configs.is_empty()).then(|| {
+                kit::count_pill(format!("{connected}/{}", configs.len()), "connected", &p)
+                    .into_any_element()
+            }),
+            Some("Configure connections, inspect status, and control agent runtimes."),
+            vec![
+                kit::flat_btn("agents-add", true, true, &p)
+                    .child(kit::icon(IconName::Plus, 14., p.text))
+                    .child("Add agent")
+                    .on_click(cx.listener(|this, _, window, cx| this.open_add_dialog(window, cx)))
+                    .into_any_element(),
+                kit::loading_icon_button(
+                    "agents-refresh",
+                    IconName::RefreshCw,
+                    "Refresh agents",
+                    refreshing,
+                    24.,
+                )
+                .on_click(
+                    cx.listener(|this, _, _, cx| this.store.update(cx, |s, cx| s.refresh_all(cx))),
+                )
+                .into_any_element(),
+            ],
+            &p,
+        );
 
         let list = if configs.is_empty() {
-            v_flex()
+            kit::card(&p)
                 .items_center()
                 .gap_2()
                 .p_8()
-                .rounded(px(14.))
-                .bg(p.surface)
-                .border_1()
-                .border_color(p.border)
-                .child(kit::icon(IconName::Bot, 22., p.accent))
+                .child(kit::icon_tile(IconName::Bot, false, &p))
                 .child(div().font_semibold().child("No agents configured"))
                 .child(div().text_sm().text_color(p.muted).child(if CAN_SPAWN {
                     "Add a local ACP command, or connect to an ACP WebSocket server on another machine."
@@ -161,81 +164,109 @@ impl QmtApp {
                     "Connect to an ACP WebSocket server (host:port)."
                 }))
                 .child(
-                    kit::button("empty-add")
-                        .primary()
-                        .label("Add agent")
+                    kit::accent_btn("empty-add", true, true, &p)
+                        .child(kit::icon(IconName::Plus, 14., p.on_accent))
+                        .child("Add agent")
                         .on_click(cx.listener(|this, _, window, cx| this.open_add_dialog(window, cx))),
                 )
                 .into_any_element()
         } else {
             let mut rows = Vec::new();
-            for c in configs.iter() {
-                rows.push(self.agent_row(c, &p, cx).into_any_element());
+            for (ix, c) in configs.iter().enumerate() {
+                rows.push(self.agent_row(c, ix == 0, &p, cx).into_any_element());
             }
-            v_flex().gap_2().children(rows).into_any_element()
+            kit::card(&p)
+                .children(rows)
+                .child(kit::card_mask(&p))
+                .into_any_element()
         };
 
         let attention_section = (!attention.is_empty()).then(|| {
+            let count = attention.len();
             v_flex()
-                .gap_2()
+                .gap_3()
+                .child(kit::section_header(
+                    "Needs attention",
+                    "Agents with connection or runtime issues.",
+                    Some(kit::chip(count.to_string(), &p).into_any_element()),
+                    &p,
+                ))
                 .child(
-                    v_flex()
-                        .child(div().font_semibold().child("Needs attention"))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(p.muted)
-                                .child("Agents with connection or runtime issues."),
-                        ),
-                )
-                .children(attention.into_iter().map(|(c, reason)| {
-                    let id = c.id.clone();
-                    h_flex()
-                        .gap_3()
-                        .px_4()
-                        .py_3()
-                        .rounded(px(12.))
-                        .bg(p.warn.opacity(0.08))
-                        .border_1()
-                        .border_color(p.warn.opacity(0.3))
-                        .child(kit::icon(IconName::TriangleAlert, 16., p.warn))
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .child(div().text_sm().font_medium().child(c.name.clone()))
+                    kit::card(&p).children(attention.into_iter().enumerate().map(
+                        |(ix, (c, reason))| {
+                            let (id, details) = (c.id.clone(), c.id.clone());
+                            kit::card_row(ix == 0, &p)
+                                .child(kit::icon_tile(IconName::TriangleAlert, false, &p))
                                 .child(
-                                    div().text_xs().text_color(p.muted).truncate().child(reason),
-                                ),
-                        )
-                        .child(
-                            kit::button(kit::keyed("attention-retry", id.clone()))
-                                .small()
-                                .label(if c.is_websocket() {
-                                    "Reconnect"
-                                } else {
-                                    "Restart"
-                                })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.store.update(cx, |s, cx| s.connect(&id, cx))
-                                })),
-                        )
-                }))
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(
+                                            div().text_sm().font_semibold().child(c.name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .mt(px(3.2))
+                                                .text_xs()
+                                                .text_color(p.warn)
+                                                .truncate()
+                                                .child(reason),
+                                        ),
+                                )
+                                .child(
+                                    kit::flat_btn(
+                                        kit::keyed("attention-details", c.id.clone()),
+                                        true,
+                                        true,
+                                        &p,
+                                    )
+                                    .child("Details")
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.details = Some(details.clone());
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    kit::flat_btn(
+                                        kit::keyed("attention-retry", c.id.clone()),
+                                        true,
+                                        true,
+                                        &p,
+                                    )
+                                    .child(kit::icon(IconName::RotateCcw, 14., p.text))
+                                    .child(if c.is_websocket() {
+                                        "Reconnect"
+                                    } else {
+                                        "Restart"
+                                    })
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.store.update(cx, |s, cx| s.connect(&id, cx))
+                                        },
+                                    )),
+                                )
+                        },
+                    )),
+                )
         });
 
-        div().w_full().flex().justify_center().px_8().py_8().child(
-            v_flex()
-                .w_full()
-                .max_w(px(1040.))
-                .gap_5()
-                .child(header)
-                .child(summary)
-                .child(list)
-                .children(attention_section),
+        kit::page(
+            [Some(header.into_any_element()), Some(list)]
+                .into_iter()
+                .flatten()
+                .chain(attention_section.map(IntoElement::into_any_element)),
         )
     }
 
-    fn agent_row(&self, c: &AgentConfig, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    fn agent_row(
+        &self,
+        c: &AgentConfig,
+        first: bool,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let store = self.store.read(cx);
         let state = store.state(&c.id);
         let rt = store.runtime(&c.id);
@@ -250,59 +281,43 @@ impl QmtApp {
         let host = rt.and_then(|r| r.mesh.as_ref()?.hostname.clone());
         let peers = rt.and_then(|r| r.mesh.as_ref().map(|m| m.peers));
         let is_primary = store.primary_agent().as_deref() == Some(c.id.as_str());
+        let issue = store.needs_attention(&c.id);
         let live = matches!(state, ConnState::Connected | ConnState::Connecting);
         let connected = state == ConnState::Connected;
         let status = kit::status_color(&state, p);
-        let hover_border = p.border_strong;
-
-        let (id_details, id_edit, id_toggle, id_restart, id_auto, id_delete) = (
-            c.id.clone(),
-            c.clone(),
-            c.id.clone(),
-            c.id.clone(),
-            c.id.clone(),
-            c.id.clone(),
-        );
         let websocket = c.is_websocket();
+        let (_, subtle_surface) = kit::subtle(p);
 
-        // Avatar tile with the status dot in its corner.
-        let avatar = div()
-            .relative()
-            .flex_none()
-            .size(px(40.))
-            .rounded(px(10.))
-            .bg(if connected { p.accent_dim } else { p.card })
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(kit::icon(
-                if websocket {
-                    IconName::Globe
-                } else {
-                    IconName::Terminal
-                },
-                18.,
-                if connected { p.accent } else { p.dim },
-            ))
-            .child(
-                div()
-                    .absolute()
-                    .right(px(-2.))
-                    .bottom(px(-2.))
-                    .size(px(12.))
-                    .rounded_full()
-                    .bg(p.surface)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(kit::dot(status)),
-            );
+        // Object icon with the connection state in its corner.
+        let avatar = kit::icon_tile(
+            if websocket {
+                IconName::Globe
+            } else {
+                IconName::Terminal
+            },
+            connected,
+            p,
+        )
+        .child(
+            div()
+                .absolute()
+                .right(px(-3.))
+                .bottom(px(-3.))
+                .size(px(12.))
+                .rounded_full()
+                .bg(p.card)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(kit::dot(status)),
+        );
 
         let title = h_flex()
             .gap_2()
+            .min_w_0()
             .child(
                 div()
-                    .text_sm()
+                    .text_size(px(13.4))
                     .font_semibold()
                     .truncate()
                     .child(c.name.clone()),
@@ -311,12 +326,21 @@ impl QmtApp {
             .when(is_primary && connected, |el| {
                 el.child(kit::tone_chip("default", p.accent))
             })
-            .when(c.host_managed, |el| el.child(kit::chip("host managed", p)));
+            .when(c.host_managed, |el| el.child(kit::chip("host managed", p)))
+            .when(issue.is_some(), |el| {
+                el.child(kit::icon_tone_chip(
+                    IconName::TriangleAlert,
+                    "Issue",
+                    p.warn,
+                ))
+            });
 
         let meta = h_flex()
+            .mt(px(3.2))
             .gap_1p5()
+            .min_w_0()
             .text_xs()
-            .text_color(p.dim)
+            .text_color(p.muted)
             .child(
                 div()
                     .font_family(kit::MONO)
@@ -327,161 +351,179 @@ impl QmtApp {
             .when_some(version, |el, v| {
                 el.child("·")
                     .child(div().font_family(kit::MONO).child(format!("v{v}")))
-            })
-            .when(c.auto_start && !c.host_managed, |el| {
-                el.child("·").child("auto-start")
             });
 
         let stat = |value: String, label: &'static str, color: Hsla| {
             v_flex()
-                .w(px(68.))
+                .w(px(60.))
                 .items_end()
                 .child(
                     div()
+                        .font_family(kit::MONO)
                         .text_sm()
                         .font_semibold()
                         .text_color(color)
                         .child(value),
                 )
-                .child(div().text_xs().text_color(p.dim).child(label))
+                .child(div().text_xs().text_color(p.muted).child(label))
         };
-        let stats = connected.then(|| {
-            h_flex()
-                .flex_none()
-                .gap_1()
-                .child(stat(sessions.to_string(), "open", p.text))
-                .child(stat(
-                    running.to_string(),
-                    "running",
-                    if running > 0 { p.success } else { p.text },
-                ))
-                .child(stat(models.to_string(), "models", p.text))
-                .when_some(peers, |el, n| {
-                    el.child(stat(n.to_string(), "peers", p.text))
-                })
-        });
-
-        // Primary actions always visible; config actions appear on hover.
-        let actions = h_flex()
-            .gap_0p5()
+        // Fixed width whether or not the agent is connected, so the action
+        // icons of every row line up.
+        let stats = h_flex()
             .flex_none()
-            .pl_2()
-            .child(
-                kit::icon_button(
-                    kit::keyed("toggle", c.id.clone()),
-                    if live {
-                        IconName::Square
-                    } else {
-                        IconName::Play
-                    },
-                    match (live, websocket) {
-                        (true, true) => "Disconnect",
-                        (true, false) => "Stop",
-                        (false, true) => "Connect",
-                        (false, false) => "Start",
-                    },
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.store.update(cx, |s, cx| {
-                        if live {
-                            s.disconnect(&id_toggle, cx)
-                        } else {
-                            s.connect(&id_toggle, cx)
-                        }
+            .w(px(STATS_W))
+            .justify_end()
+            .gap_1()
+            .when(connected, |el| {
+                el.child(stat(sessions.to_string(), "open", p.text))
+                    .child(stat(
+                        running.to_string(),
+                        "running",
+                        if running > 0 { p.success } else { p.text },
+                    ))
+                    .child(stat(models.to_string(), "models", p.text))
+                    .when_some(peers, |el, n| {
+                        el.child(stat(n.to_string(), "peers", p.text))
                     })
-                })),
-            )
-            .when(live, |el| {
-                el.child(
-                    kit::icon_button(
-                        kit::keyed("restart", c.id.clone()),
-                        IconName::RotateCcw,
-                        if websocket { "Reconnect" } else { "Restart" },
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.store.update(cx, |s, cx| s.connect(&id_restart, cx))
-                    })),
-                )
-            })
-            .child(
-                kit::icon_button(
-                    kit::keyed("details", c.id.clone()),
-                    IconName::Info,
-                    "Details",
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.details = Some(id_details.clone());
-                    cx.notify();
-                })),
-            )
-            .when(!c.host_managed, |el| {
-                el.child(
-                    h_flex()
-                        .gap_0p5()
-                        .opacity(0.)
-                        .group_hover("arow", |s| s.opacity(1.))
-                        .child(
-                            kit::icon_button(
-                                kit::keyed("edit", c.id.clone()),
-                                IconName::Pencil,
-                                "Edit",
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    this.open_edit_dialog(&id_edit, window, cx)
-                                },
-                            )),
-                        )
-                        .child(
-                            kit::icon_button(
-                                kit::keyed("auto", c.id.clone()),
-                                if c.auto_start {
-                                    IconName::ToggleRight
-                                } else {
-                                    IconName::ToggleLeft
-                                },
-                                if c.auto_start {
-                                    "Disable auto-start"
-                                } else {
-                                    "Enable auto-start"
-                                },
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.store
-                                        .update(cx, |s, cx| s.toggle_auto_start(&id_auto, cx))
-                                },
-                            )),
-                        )
-                        .child(
-                            kit::icon_button(
-                                kit::keyed("delete", c.id.clone()),
-                                IconName::Trash,
-                                "Delete",
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.confirm_delete = Some(id_delete.clone());
-                                    cx.notify();
-                                },
-                            )),
-                        ),
-                )
             });
 
+        // Visible: start/stop and auto-start. Everything else: the menu.
+        let toggle_id = c.id.clone();
+        let start_stop = kit::flat_icon_btn(
+            kit::keyed("toggle", c.id.clone()),
+            if live {
+                IconName::Square
+            } else {
+                IconName::Play
+            },
+            match (live, websocket) {
+                (true, true) => "Disconnect",
+                (true, false) => "Stop",
+                (false, true) => "Connect",
+                (false, false) => "Start",
+            },
+            p,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            this.store.update(cx, |s, cx| {
+                if live {
+                    s.disconnect(&toggle_id, cx)
+                } else {
+                    s.connect(&toggle_id, cx)
+                }
+            })
+        }));
+
+        // Auto-start state at a glance; it is changed from the menu.
+        let auto_start = (!c.host_managed).then(|| {
+            let on = c.auto_start;
+            let tip = match (on, websocket) {
+                (true, true) => "Auto-start on: connects when the app starts",
+                (true, false) => "Auto-start on: starts when the app starts",
+                (false, _) => "Auto-start off",
+            };
+            div()
+                .id(kit::keyed("auto-state", c.id.clone()))
+                .flex_none()
+                .size(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(kit::icon(
+                    if on {
+                        IconName::Power
+                    } else {
+                        IconName::PowerOff
+                    },
+                    15.,
+                    if on { p.success } else { p.dim },
+                ))
+                .tooltip(move |window, cx| kit::wrap_tip(tip).build(window, cx))
+        });
+
+        let menu = {
+            let app = cx.entity().downgrade();
+            let store_h = self.store.clone();
+            let (id, config) = (c.id.clone(), c.clone());
+            let host_managed = c.host_managed;
+            let auto_on = c.auto_start;
+            kit::icon_button(
+                kit::keyed("agent-menu", c.id.clone()),
+                IconName::Ellipsis,
+                "Agent actions",
+            )
+            // Same square as the start/stop button beside it.
+            .size(px(32.))
+            .px_0()
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                let (a1, a2, a3, a4) = (app.clone(), app.clone(), app.clone(), store_h.clone());
+                let (i1, i3, i4) = (id.clone(), id.clone(), id.clone());
+                let (a5, i5) = (store_h.clone(), id.clone());
+                let config = config.clone();
+                menu.item(
+                    PopupMenuItem::new("Details")
+                        .icon(Icon::new(IconName::Info))
+                        .on_click(move |_, _, cx| {
+                            let _ = a1.update(cx, |this, cx| {
+                                this.details = Some(i1.clone());
+                                cx.notify();
+                            });
+                        }),
+                )
+                .when(live, |m| {
+                    m.item(
+                        PopupMenuItem::new(if websocket { "Reconnect" } else { "Restart" })
+                            .icon(Icon::new(IconName::RotateCcw))
+                            .on_click(move |_, _, cx| a4.update(cx, |s, cx| s.connect(&i4, cx))),
+                    )
+                })
+                .when(!host_managed, |m| {
+                    m.item(
+                        PopupMenuItem::new(if auto_on {
+                            "Disable auto-start"
+                        } else {
+                            "Enable auto-start"
+                        })
+                        .icon(Icon::new(if auto_on {
+                            IconName::PowerOff
+                        } else {
+                            IconName::Power
+                        }))
+                        .on_click(move |_, _, cx| {
+                            a5.update(cx, |s, cx| s.toggle_auto_start(&i5, cx))
+                        }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Edit…")
+                            .icon(Icon::new(IconName::Pencil))
+                            .on_click(move |_, window, cx| {
+                                let _ = a2.update(cx, |this, cx| {
+                                    this.open_edit_dialog(&config, window, cx)
+                                });
+                            }),
+                    )
+                    .separator()
+                    .item(
+                        PopupMenuItem::new("Delete…")
+                            .icon(Icon::new(IconName::Trash))
+                            .on_click(move |_, _, cx| {
+                                let _ = a3.update(cx, |this, cx| {
+                                    this.confirm_delete = Some(i3.clone());
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                })
+            })
+        };
+
         let name_id = c.id.clone();
-        h_flex()
+        let hover = subtle_surface;
+        kit::card_row(first, p)
             .id(kit::keyed("agent-row", c.id.clone()))
-            .group("arow")
-            .gap_3()
-            .px_4()
-            .py_3()
-            .rounded(px(14.))
-            .bg(p.surface)
-            .border_1()
-            .border_color(p.border)
-            .hover(move |el| el.border_color(hover_border))
             .cursor_pointer()
+            .hover(move |el| el.bg(hover))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.details = Some(name_id.clone());
                 cx.notify();
@@ -491,7 +533,6 @@ impl QmtApp {
                 v_flex()
                     .flex_1()
                     .min_w_0()
-                    .gap_1()
                     .child(title)
                     .child(meta)
                     .when_some(
@@ -500,12 +541,38 @@ impl QmtApp {
                             _ => None,
                         },
                         |el, reason| {
-                            el.child(div().text_xs().text_color(p.warn).truncate().child(reason))
+                            el.child(
+                                div()
+                                    .mt(px(3.2))
+                                    .text_xs()
+                                    .text_color(p.warn)
+                                    .truncate()
+                                    .child(reason),
+                            )
                         },
                     ),
             )
-            .children(stats)
-            .child(actions)
+            .child(stats)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_2()
+                    .pl_2()
+                    // Slot kept for host-managed agents too, for alignment.
+                    .child(auto_start.map_or_else(
+                        || div().flex_none().size(px(24.)).into_any_element(),
+                        IntoElement::into_any_element,
+                    ))
+                    .child(start_stop)
+                    .child(
+                        div()
+                            .id(kit::keyed("agent-menu-wrap", c.id.clone()))
+                            // A little apart from start/stop.
+                            .ml_1()
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(menu),
+                    ),
+            )
     }
 
     // ---- overlays -----------------------------------------------------------
@@ -717,6 +784,80 @@ impl QmtApp {
                         )),
                 );
             return Some(self.centered(scrim("scrim-delete"), card, cx));
+        }
+
+        // New mesh invite: a dialog like Add agent, not an inline form.
+        if self.invite_form
+            && let Some(agent) = self.store.read(cx).primary_agent()
+        {
+            let creating = self.store.read(cx).is_pending(&agent, "invite");
+            let ttl = self.invite_ttl;
+            let field = |label: &'static str, help: &'static str, input: AnyElement| {
+                v_flex()
+                    .gap_1()
+                    .child(div().text_sm().font_medium().child(label))
+                    .child(input)
+                    .child(div().text_xs().text_color(p.dim).child(help))
+            };
+            let card = self
+                .modal_card(&p)
+                .w(px(460.))
+                .child(
+                    v_flex()
+                        .child(div().text_lg().font_semibold().child("New invite"))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(p.muted)
+                                .child("A link another machine uses to join this mesh."),
+                        ),
+                )
+                .child(field(
+                    "Expires after",
+                    "The link stops working after this time.",
+                    kit::segment_bar(&p)
+                        .children(super::mesh::INVITE_TTLS.iter().enumerate().map(
+                            |(ix, (v, label))| {
+                                let v: &'static str = v;
+                                kit::segment(("ttl", ix), ttl == v, &p)
+                                    .flex_1()
+                                    .label(*label)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.invite_ttl = v;
+                                        cx.notify();
+                                    }))
+                            },
+                        ))
+                        .into_any_element(),
+                ))
+                .child(field(
+                    "Maximum uses",
+                    "How many machines can join with it. Leave empty for unlimited.",
+                    Input::new(&self.invite_uses).into_any_element(),
+                ))
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            kit::button("invite-cancel")
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.invite_form = false;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            kit::button("invite-create")
+                                .primary()
+                                .label("Create invite")
+                                .map(|b| kit::loading_button(b, "invite-spinner", creating, 12.))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.create_invite(&agent, cx)
+                                })),
+                        ),
+                );
+            return Some(self.centered(scrim("scrim-invite"), card, cx));
         }
 
         if let Some(dialog) = &self.dialog {

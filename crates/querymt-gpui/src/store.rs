@@ -1280,6 +1280,31 @@ pub struct Prefs {
     /// Shortcut that sends a prompt from the composers.
     #[serde(default)]
     pub send_shortcut: SendShortcut,
+    /// List sessions owned by mesh peers alongside local ones.
+    #[serde(default)]
+    pub show_remote_sessions: bool,
+    /// Mesh peers (node ids) whose sessions are listed when
+    /// `show_remote_sessions` is on.
+    #[serde(default)]
+    pub remote_session_peers: Vec<String>,
+}
+
+impl Prefs {
+    /// Peers whose sessions the catalog asks for (desktop `remoteNodeIds`).
+    pub fn remote_node_ids(&self) -> Vec<String> {
+        if self.show_remote_sessions {
+            self.remote_session_peers.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Whether a session of `node` (None: local) belongs in the catalog.
+    pub fn shows_node(&self, node: Option<&str>) -> bool {
+        node.is_none_or(|n| {
+            self.show_remote_sessions && self.remote_session_peers.iter().any(|p| p == n)
+        })
+    }
 }
 
 /// Key combination that sends a prompt; the others insert a new line.
@@ -1568,12 +1593,40 @@ impl AgentsStore {
             .or_else(|| connected.first().cloned())
     }
 
+    /// Sessions of connected agents; remote ones only from included peers.
     pub fn all_sessions(&self) -> Vec<&SessionSummary> {
         self.runtime
             .values()
             .filter(|r| r.is_connected())
             .flat_map(|r| r.sessions.iter())
+            .filter(|s| {
+                self.prefs
+                    .shows_node(s.remote.as_ref().map(|r| r.node_id.as_str()))
+            })
             .collect()
+    }
+
+    /// Turn listing of mesh peers' sessions on or off, then reload the
+    /// catalogs so they include or drop those sessions.
+    pub fn set_show_remote_sessions(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.prefs.show_remote_sessions = on;
+        self.save();
+        self.refresh_all(cx);
+        cx.notify();
+    }
+
+    /// Include or exclude one mesh peer's sessions, then reload the catalogs.
+    pub fn set_remote_session_peer(&mut self, node: &str, on: bool, cx: &mut Context<Self>) {
+        let peers = &mut self.prefs.remote_session_peers;
+        peers.retain(|p| p != node);
+        if on {
+            peers.push(node.to_string());
+        }
+        self.save();
+        if self.prefs.show_remote_sessions {
+            self.refresh_all(cx);
+        }
+        cx.notify();
     }
 
     pub fn models(&self, id: &str) -> &[Model] {
@@ -4074,7 +4127,10 @@ impl AgentsStore {
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             // The first page holds everything that changed recently; merge it in.
-            let sessions = fetch_session_page(&rpc, &id, Some(&root_scope()), None)
+            let remote_nodes = this
+                .read_with(cx, |s, _| s.prefs.remote_node_ids())
+                .unwrap_or_default();
+            let sessions = fetch_session_page(&rpc, &id, Some(&root_scope(&remote_nodes)), None)
                 .await
                 .map(|(page, _)| page);
             let _ = this.update(cx, |s, cx| {
@@ -4107,8 +4163,13 @@ const CHILD_PAGES: usize = 50;
 /// `session/list` scope of the catalog: root sessions only, as the desktop
 /// app lists (`DEFAULT_SESSION_LIST_SCOPE`). Forks load per parent, and
 /// delegates are never listed; unscoped, they were ~3/4 of every page.
-fn root_scope() -> Value {
-    json!({ "session_scope": "root" })
+fn root_scope(remote_nodes: &[String]) -> Value {
+    let mut meta = json!({ "session_scope": "root" });
+    // Mesh peers whose sessions are listed too (desktop `remoteNodeIds`).
+    if !remote_nodes.is_empty() {
+        meta["remoteNodeIds"] = json!(remote_nodes);
+    }
+    meta
 }
 
 /// Merge listed sessions into `rt`, newest first; listed entries replace
@@ -4361,7 +4422,10 @@ async fn load_details(
     // The first page (most recent sessions) is shown at once: the sidebar,
     // the Sessions page and deep links need only it. Paging the whole catalog
     // took ~15s for ~6k sessions and blocked all of them until it finished.
-    let scope = root_scope();
+    let remote_nodes = this
+        .read_with(cx, |s, _| s.prefs.remote_node_ids())
+        .unwrap_or_default();
+    let scope = root_scope(&remote_nodes);
     let first = fetch_session_page(&rpc, &id, Some(&scope), None)
         .instrument(catalog_span.clone())
         .await;

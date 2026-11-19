@@ -3,12 +3,11 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::input::Input;
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::kit::action_btn;
+use super::kit::{danger_btn, flat_btn, subtle};
 use super::mesh::panel;
 use super::{QmtApp, kit};
 use crate::store::{ImageSendMode, ProviderAuth, SendShortcut};
@@ -336,29 +335,6 @@ fn theme_preview(mode: Option<bool>, accent: &str, p: &Palette) -> Div {
     }
 }
 
-/// Borderless settings button: [`action_btn`] sizing on a soft fill, the
-/// style of the flat buttons used across the app.
-fn flat_btn(id: impl Into<ElementId>, enabled: bool, compact: bool, p: &Palette) -> Stateful<Div> {
-    let (fill, fill_hover) = if p.dark {
-        (hsla(0., 0., 1., 0.045), hsla(0., 0., 1., 0.09))
-    } else {
-        (p.muted.opacity(0.07), p.muted.opacity(0.13))
-    };
-    action_btn(id, enabled, compact, p)
-        .border_color(transparent_black())
-        .bg(fill)
-        .when(enabled, |el| el.hover(move |s| s.bg(fill_hover)))
-}
-
-/// [`flat_btn`] in the destructive tone (Clear API key, Reset app data).
-fn danger_btn(id: impl Into<ElementId>, enabled: bool, p: &Palette) -> Stateful<Div> {
-    let danger = p.danger;
-    flat_btn(id, enabled, true, p)
-        .bg(danger.opacity(0.1))
-        .text_color(danger)
-        .when(enabled, |el| el.hover(move |s| s.bg(danger.opacity(0.16))))
-}
-
 /// Key combination and what it does, for the Keybindings tab.
 type Binding = (Vec<&'static str>, &'static str);
 
@@ -436,85 +412,81 @@ impl QmtApp {
             .map(|x| (x.2, x.3))
             .unwrap_or_default();
 
-        div().w_full().flex().justify_center().px_8().py_6().child(
-            v_flex()
-                .w_full()
-                .max_w(px(1040.))
-                .gap_5()
+        kit::page([
+            kit::page_header(
+                "Settings",
+                None,
+                Some("Appearance, behavior, provider access and profiles."),
+                Vec::new(),
+                &p,
+            )
+            .into_any_element(),
+            h_flex()
+                .items_start()
+                .gap_6()
+                .child(nav)
                 .child(
                     v_flex()
-                        .gap_1()
-                        .child(div().text_2xl().font_bold().child("Settings"))
+                        .flex_1()
+                        .min_w_0()
+                        .gap_3()
                         .child(
-                            div()
-                                .text_sm()
-                                .text_color(p.muted)
-                                .child("Appearance, behavior, provider access and profiles."),
-                        ),
-                )
-                .child(
-                    h_flex().items_start().gap_6().child(nav).child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_3()
-                            .child(
-                                h_flex()
-                                    .items_start()
-                                    .justify_between()
-                                    .gap_4()
-                                    .child(
-                                        v_flex()
-                                            .child(div().text_lg().font_semibold().child(title))
-                                            .child(div().text_sm().text_color(p.muted).child(desc)),
+                            h_flex()
+                                .items_start()
+                                .justify_between()
+                                .gap_4()
+                                .child(
+                                    v_flex()
+                                        .child(div().text_lg().font_semibold().child(title))
+                                        .child(div().text_sm().text_color(p.muted).child(desc)),
+                                )
+                                .when(tab == SettingsTab::Profiles, |el| {
+                                    el.child(
+                                        kit::loading_icon_button(
+                                            "tpl-refresh",
+                                            IconName::RefreshCw,
+                                            "Refresh profiles",
+                                            false,
+                                            32.,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.refresh_templates();
+                                                cx.notify();
+                                            }),
+                                        ),
                                     )
-                                    .when(tab == SettingsTab::Profiles, |el| {
-                                        el.child(
-                                            kit::loading_icon_button(
-                                                "tpl-refresh",
-                                                IconName::RefreshCw,
-                                                "Refresh profiles",
-                                                false,
-                                                32.,
-                                            )
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.refresh_templates();
-                                                    cx.notify();
-                                                }),
-                                            ),
+                                })
+                                .when(tab == SettingsTab::Providers, |el| {
+                                    let store = self.store.read(cx);
+                                    let agent = store.primary_agent();
+                                    let loading = agent
+                                        .as_ref()
+                                        .is_some_and(|a| store.is_pending(a, "extras"));
+                                    el.child(
+                                        kit::loading_icon_button(
+                                            "prov-refresh",
+                                            IconName::RefreshCw,
+                                            "Refresh providers",
+                                            loading,
+                                            32.,
                                         )
-                                    })
-                                    .when(tab == SettingsTab::Providers, |el| {
-                                        let store = self.store.read(cx);
-                                        let agent = store.primary_agent();
-                                        let loading = agent
-                                            .as_ref()
-                                            .is_some_and(|a| store.is_pending(a, "extras"));
-                                        el.child(
-                                            kit::loading_icon_button(
-                                                "prov-refresh",
-                                                IconName::RefreshCw,
-                                                "Refresh providers",
-                                                loading,
-                                                32.,
-                                            )
-                                            .on_click(
-                                                cx.listener(move |this, _, _, cx| {
-                                                    if let Some(a) = agent.clone() {
-                                                        this.store.update(cx, |s, cx| {
-                                                            s.refresh_extras(&a, cx)
-                                                        });
-                                                    }
-                                                }),
-                                            ),
-                                        )
-                                    }),
-                            )
-                            .child(body),
-                    ),
-                ),
-        )
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                if let Some(a) = agent.clone() {
+                                                    this.store.update(cx, |s, cx| {
+                                                        s.refresh_extras(&a, cx)
+                                                    });
+                                                }
+                                            }),
+                                        ),
+                                    )
+                                }),
+                        )
+                        .child(body),
+                )
+                .into_any_element(),
+        ])
     }
 
     fn settings_general(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -524,7 +496,7 @@ impl QmtApp {
             .child(simple_row(
                 "Show pinned sessions in sidebar",
                 "Keep pinned sessions above Open sessions.",
-                Switch::new("sw-pinned")
+                kit::switch("sw-pinned")
                     .checked(prefs.show_pinned_sidebar)
                     .on_click(cx.listener(|this, v: &bool, _, cx| {
                         let v = *v;
@@ -538,7 +510,7 @@ impl QmtApp {
             .child(simple_row(
                 "Collapse sidebar",
                 "Show only icons in the left panel. Toggle anytime with Ctrl+B.",
-                Switch::new("sw-collapse")
+                kit::switch("sw-collapse")
                     .checked(prefs.sidebar_collapsed)
                     .on_click(cx.listener(|this, v: &bool, _, cx| {
                         let v = *v;
@@ -717,7 +689,7 @@ impl QmtApp {
             .child(simple_row(
                 "Fade in streamed text",
                 "Replies and reasoning fade in word by word as they arrive. Off when the system reduces motion.",
-                Switch::new("sw-stream-fade")
+                kit::switch("sw-stream-fade")
                     .checked(prefs.stream_fade.unwrap_or(true))
                     .on_click(cx.listener(|this, v: &bool, _, cx| {
                         let v = *v;
@@ -1978,18 +1950,6 @@ fn provider_state(pr: &ProviderAuth) -> ProviderState {
         ProviderState::Attention
     } else {
         ProviderState::Setup
-    }
-}
-
-/// Desktop `--subtle-border` / `--subtle-surface`.
-fn subtle(p: &Palette) -> (Hsla, Hsla) {
-    if p.dark {
-        (hsla(0., 0., 1., 0.075), rgb(0x222222).into())
-    } else {
-        (
-            Hsla::from(rgb(0x241f31)).opacity(0.09),
-            hsla(0., 0., 1., 0.72),
-        )
     }
 }
 

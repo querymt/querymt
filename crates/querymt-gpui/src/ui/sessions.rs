@@ -21,6 +21,8 @@ use crate::theme::{Palette, palette};
 use crate::util::{absolute_time, short_time, workspace_name};
 
 const GROUP_ROWS: usize = 8;
+/// Side of a session row's actions button.
+const SESSION_MENU_SIZE: f32 = 28.;
 const PINNED_KEY: &str = "\u{0}pinned";
 const RECENT_KEY: &str = "\u{0}recent";
 /// Indent of one level of nested child sessions.
@@ -564,10 +566,11 @@ impl QmtApp {
         });
 
         // ---- header
-        let header = h_flex()
-            .gap_3()
-            .child(div().flex_1().text_2xl().font_bold().child("Sessions"))
-            .child(
+        let header = kit::page_header(
+            "Sessions",
+            None,
+            None,
+            vec![
                 kit::loading_icon_button(
                     "sessions-refresh",
                     IconName::RefreshCw,
@@ -577,8 +580,11 @@ impl QmtApp {
                 )
                 .on_click(
                     cx.listener(|this, _, _, cx| this.store.update(cx, |s, cx| s.refresh_all(cx))),
-                ),
-            );
+                )
+                .into_any_element(),
+            ],
+            &p,
+        );
         let search = h_flex()
             .h(px(40.))
             .px_3()
@@ -1321,7 +1327,13 @@ impl QmtApp {
             .hover(move |el| el.bg(hover))
             .child(expander)
             .child(main)
-            .child(self.session_menu(s, &info, pending, &row_key, cx))
+            // A little apart from the time beside it.
+            .child(
+                div()
+                    .flex_none()
+                    .ml_2()
+                    .child(self.session_menu(s, &info, pending, &row_key, cx)),
+            )
             .into_any_element()
     }
 
@@ -1450,7 +1462,9 @@ impl QmtApp {
         if pending {
             return kit::button(id)
                 .ghost()
-                .xsmall()
+                .small()
+                .size(px(SESSION_MENU_SIZE))
+                .px_0()
                 .loading(true)
                 .icon(IconName::Ellipsis)
                 .into_any_element();
@@ -1463,7 +1477,8 @@ impl QmtApp {
         let can_delete = info.can_delete && local;
         let (store, app, s) = (self.store.clone(), cx.entity().downgrade(), s.clone());
         kit::icon_button(id, IconName::Ellipsis, "Session actions")
-            .xsmall()
+            .size(px(SESSION_MENU_SIZE))
+            .px_0()
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                 let (agent, sid) = (s.agent_id.clone(), s.id.clone());
                 let (pinned, resolved, archived) = (s.pinned, s.resolved, s.archived);

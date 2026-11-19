@@ -98,6 +98,8 @@ pub struct QmtApp {
     /// The last header press landed on a control rather than the bare bar.
     header_press_claimed: bool,
     invite_form: bool,
+    /// The created invite shows its QR code.
+    invite_qr: bool,
     invite_ttl: &'static str,
     invite_uses: Entity<InputState>,
     settings_tab: SettingsTab,
@@ -340,6 +342,7 @@ impl QmtApp {
             header_drag: false,
             header_press_claimed: false,
             invite_form: false,
+            invite_qr: false,
             invite_ttl: "24h",
             invite_uses,
             settings_tab: SettingsTab::General,
@@ -473,6 +476,7 @@ impl QmtApp {
             || self.confirm_delete.take().is_some()
             || self.confirm_session_delete.take().is_some()
             || self.dialog.take().is_some()
+            || std::mem::take(&mut self.invite_form)
             || self.details.take().is_some()
         {
             return true;
