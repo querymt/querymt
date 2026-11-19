@@ -28,7 +28,7 @@ systemd-credentials = ["dep:base64", "dep:libc", "dep:getrandom", "dep:sha2", "d
 tracing.workspace = true
 log.workspace = true
 tracing-log = "0.2"
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["logs", "metrics"] }

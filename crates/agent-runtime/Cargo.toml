@@ -91,7 +91,7 @@ dunce = "1"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
 opentelemetry-semantic-conventions = { version = "0.32", features = ["semconv_experimental"] }
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
 tempfile = "3.0"
 querymt-agent-sqlite = { path = "../agent-sqlite", optional = true }
 mockall = { workspace = true, optional = true }
