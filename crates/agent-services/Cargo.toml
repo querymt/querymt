@@ -57,8 +57,8 @@ gix = { version = "0.90", default-features = false, features = ["basic", "worktr
 gix-error = "0.5"
 dirs.workspace = true
 dunce = "1"
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["trace", "metrics"] }
 tracing-opentelemetry = "0.33"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tempfile = "3.0"
@@ -77,4 +77,4 @@ rusqlite = { workspace = true, features = ["uuid", "time"] }
 qmt-openai = { path = "../providers/openai", default-features = false, features = ["api"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
-opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "testing"] }
+opentelemetry_sdk = { version = "0.33", features = ["trace", "metrics", "testing"] }
