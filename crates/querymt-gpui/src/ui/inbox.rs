@@ -905,22 +905,13 @@ impl QmtApp {
         let pending = store.pending_request_count();
         let disconnected = store.connected_ids().is_empty();
 
-        let header = v_flex()
-            .gap_1()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(div().text_2xl().font_bold().child("Inbox"))
-                    .when(pending > 0, |el| {
-                        el.child(kit::tone_chip(pending.to_string(), p.accent))
-                    }),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(p.muted)
-                    .child("Permission and input requests waiting for your response."),
-            );
+        let header = kit::page_header(
+            "Inbox",
+            (pending > 0).then(|| kit::tone_chip(pending.to_string(), p.accent).into_any_element()),
+            Some("Permission and input requests waiting for your response."),
+            Vec::new(),
+            &p,
+        );
 
         let body = if disconnected && keys.is_empty() {
             panel(&p)
@@ -976,13 +967,6 @@ impl QmtApp {
             v_flex().gap_3().children(cards).into_any_element()
         };
 
-        div().w_full().flex().justify_center().px_8().py_6().child(
-            v_flex()
-                .w_full()
-                .max_w(px(1040.))
-                .gap_5()
-                .child(header)
-                .child(body),
-        )
+        kit::page([header.into_any_element(), body])
     }
 }

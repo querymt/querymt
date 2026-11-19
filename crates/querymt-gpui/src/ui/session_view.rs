@@ -3163,7 +3163,7 @@ impl QmtApp {
         self.transcript.list.scroll_to_end();
     }
 
-    fn flash_copied(&mut self, key: String, cx: &mut Context<Self>) {
+    pub(super) fn flash_copied(&mut self, key: String, cx: &mut Context<Self>) {
         self.copied = Some(key.clone());
         cx.notify();
         cx.spawn(async move |this, cx| {

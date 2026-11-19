@@ -22,6 +22,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 similar = "2"
+qrcode = { version = "0.14", default-features = false }
 # Already built for gpui-kit's TextView; used to turn markdown into plain text.
 markdown = "1.0.0"
 # Instrumentation; spans and events cost nothing without a subscriber.

@@ -2,13 +2,11 @@
 //! toggle, and window controls. GPUI Kit supplies the outer window frame.
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::ButtonVariants as _;
-use gpui_kit::component::{InteractiveElementExt as _, Sizable as _, StyledExt as _, h_flex};
+use gpui_kit::component::{InteractiveElementExt as _, StyledExt as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{Page, QmtApp, kit};
-use crate::store::ConnState;
 use crate::theme::{Palette, palette};
 use crate::util::workspace_name;
 
@@ -145,35 +143,7 @@ impl QmtApp {
                 }
                 out
             }
-            Page::Agents => {
-                let store = self.store.read(cx);
-                let refreshing = store.configs.iter().any(|c| {
-                    store.state(&c.id) == ConnState::Connecting
-                        || store.runtime(&c.id).is_some_and(|r| r.busy)
-                });
-                vec![
-                    kit::button("hdr-add-agent")
-                        .ghost()
-                        .small()
-                        .icon(IconName::Plus)
-                        .label("Add agent")
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.open_add_dialog(window, cx)),
-                        )
-                        .into_any_element(),
-                    kit::loading_icon_button(
-                        "hdr-refresh",
-                        IconName::RefreshCw,
-                        "Refresh agents",
-                        refreshing,
-                        24.,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.store.update(cx, |s, cx| s.refresh_all(cx))
-                    }))
-                    .into_any_element(),
-                ]
-            }
+            // Page actions live in each page's own header (`kit::page_header`).
             _ => vec![],
         }
     }
