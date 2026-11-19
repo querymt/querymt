@@ -404,21 +404,7 @@ impl FromStr for ExecutionMode {
     }
 }
 
-/// Delegation isolation requested for a delegate relative to its parent.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum DelegationIsolation {
-    /// Resolve from the parent's execution mode: isolated parents isolate
-    /// delegates by default; local parents keep legacy shared execution.
-    #[default]
-    Inherit,
-    /// Explicitly share the parent's checkout (disclosed as shared).
-    Shared,
-    /// Explicitly request a private checkout for this delegate.
-    Isolated,
-}
+pub use querymt_agent_protocol_types::worktree::DelegationIsolation;
 
 /// Isolation resolved for execution. Shared execution is the existing
 /// behavior and is always disclosed as shared, never presented as isolated.
@@ -800,30 +786,6 @@ impl WorkspaceRecord {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-impl fmt::Display for DelegationIsolation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            DelegationIsolation::Inherit => "inherit",
-            DelegationIsolation::Shared => "shared",
-            DelegationIsolation::Isolated => "isolated",
-        };
-        f.write_str(s)
-    }
-}
-
-impl FromStr for DelegationIsolation {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "inherit" => Ok(DelegationIsolation::Inherit),
-            "shared" => Ok(DelegationIsolation::Shared),
-            "isolated" => Ok(DelegationIsolation::Isolated),
-            _ => Err(format!("Unknown delegation isolation: {}", s)),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

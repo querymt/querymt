@@ -1,0 +1,29 @@
+[package]
+name = "querymt-agent-protocol-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Plain wire types that QueryMT agents and clients exchange (events, load snapshot payloads); serde and typeshare only"
+
+[lib]
+name = "querymt_agent_protocol_types"
+path = "src/lib.rs"
+
+[features]
+# Sample values for tests in the layers above.
+test-support = []
+
+[dependencies]
+# `default-features = false` keeps `mcp`, `rmcp`, tokio and reqwest out; the crate must
+# build for wasm32-unknown-unknown.
+querymt = { path = "../querymt", default-features = false }
+agent-client-protocol-schema = { workspace = true }
+rapidhash = "4.2"
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Declared locally (not the workspace entry) so `local-offset` stays out of wasm builds.
+time = { version = "0.3", default-features = false, features = ["serde", "formatting", "parsing"] }
+typeshare.workspace = true
+
+# querymt-workspace-hack is intentionally absent (see .config/hakari.toml `final-excludes`).

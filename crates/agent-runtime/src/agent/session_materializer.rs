@@ -1712,7 +1712,7 @@ impl SessionMaterializer {
             .iter()
             .map(|server| {
                 crate::config::McpServerConfig::from_acp(server)
-                    .map(querymt_agent_core::events::McpServerInfo::from)
+                    .map(querymt_agent_core::config::mcp::McpServerConfig::server_info)
             })
             .collect::<anyhow::Result<Vec<_>>>()
             .map_err(|e| Error::invalid_params().data(e.to_string()))?;

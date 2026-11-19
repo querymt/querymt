@@ -1,0 +1,804 @@
+{
+  "name": "streaming",
+  "batches": [
+    [
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "eiusmod ut amet"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "elit aliqua"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "dolore et"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "eiusmod consectetur tempor"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "elit"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "ut labore"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "et dolore incididunt"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "eiusmod"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "eiusmod amet"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "eiusmod"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "do dolore"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "do elit elit"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "do elit"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "sit ipsum ipsum"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "adipiscing"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "tempor tempor do"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "labore"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "elit ut"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "amet dolore dolor"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "magna"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      }
+    ],
+    [
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "dolor magna"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "dolor dolor amet"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "incididunt"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "ipsum tempor do"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "dolore"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "amet"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "aliqua"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "ipsum"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "et incididunt"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "consectetur et ut"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "ut"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "dolore"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "do dolor"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "adipiscing"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "elit tempor do"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "adipiscing"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "sed consectetur"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "aliqua"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "lorem lorem sed"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m-stream",
+              "content": {
+                "type": "text",
+                "text": "elit magna"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      }
+    ]
+  ],
+  "expected": {
+    "reports": [
+      {
+        "added": [
+          "turn-live-1"
+        ],
+        "updated": [],
+        "removed": [],
+        "headerChanged": true,
+        "ignored": 0,
+        "unknown": 0,
+        "duplicates": 0,
+        "errors": []
+      },
+      {
+        "added": [],
+        "updated": [
+          "turn-live-1"
+        ],
+        "removed": [],
+        "headerChanged": false,
+        "ignored": 0,
+        "unknown": 0,
+        "duplicates": 0,
+        "errors": []
+      }
+    ],
+    "header": {
+      "sessionId": "s1",
+      "schemaVersion": 1,
+      "runState": "streaming",
+      "activeToolCallId": null,
+      "lastStopReason": null,
+      "lastError": null,
+      "context": null,
+      "tokens": null,
+      "cost": null,
+      "provider": null,
+      "title": null,
+      "currentMode": null,
+      "configOptions": [],
+      "plan": null,
+      "undoStack": [],
+      "pendingInputs": [],
+      "delegations": [],
+      "runtime": null,
+      "history": {
+        "hasOlder": false,
+        "before": null,
+        "stale": false
+      }
+    },
+    "turnIds": [
+      "turn-live-1"
+    ],
+    "turns": [
+      {
+        "id": "turn-live-1",
+        "revision": 40,
+        "entries": [
+          {
+            "id": "assistant-m-stream",
+            "revision": 40,
+            "kind": {
+              "type": "assistant_message",
+              "data": {
+                "messageId": "m-stream",
+                "text": "eiusmod ut ametelit aliquadolore eteiusmod consectetur temporelitut laboreet dolore incididunteiusmodeiusmod ameteiusmoddo doloredo elit elitdo elitsit ipsum ipsumadipiscingtempor tempor dolaboreelit utamet dolore dolormagnadolor magnadolor dolor ametincididuntipsum tempor dodoloreametaliquaipsumet incididuntconsectetur et ututdoloredo doloradipiscingelit tempor doadipiscingsed consecteturaliqualorem lorem sedelit magna"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

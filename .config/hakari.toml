@@ -40,5 +40,8 @@ workspace-members = [
 # `querymt` is shared with the wasm32-wasip1 provider plugins, which must not
 # inherit host-only features: it still counts for unification but does not get
 # the workspace-hack dependency.
+# `querymt-agent-protocol-types` (and the session-core crates) must build for
+# wasm32-unknown-unknown and for clients outside this workspace, so their closure
+# must not contain tokio, rusqlite or the workspace-hack.
 [final-excludes]
-workspace-members = ["querymt"]
+workspace-members = ["querymt", "querymt-agent-protocol-types", "querymt-agent-session-core"]

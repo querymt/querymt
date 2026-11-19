@@ -22,177 +22,73 @@
 //!   has no dollar amount rather than a known zero.
 
 use super::{
-    AccountingReason, AttemptPurpose, AttemptRef, AttemptSettlement, AttemptStart, UsageDisposition,
+    AccountingReason, AttemptPurpose, AttemptRef, AttemptSettlement, AttemptStart, ComponentSums,
+    ScopeTotals, TokenSums, UsageDisposition,
 };
 use querymt::providers::{BillingClass, ComponentCharges, IncompleteReason};
 use querymt_agent_core::events::AgentEventKind;
 use querymt_agent_core::hash::RapidHash;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 
-/// Summed USD per category. Unknown components contribute nothing.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
-pub struct ComponentSums {
-    pub input_usd: f64,
-    pub output_usd: f64,
-    pub cache_read_usd: f64,
-    pub cache_write_usd: f64,
-    pub cache_write_1h_usd: f64,
+fn add_token_usage(tokens: &mut TokenSums, usage: &querymt::Usage) {
+    tokens.input += u64::from(usage.input_tokens);
+    tokens.output += u64::from(usage.output_tokens);
+    tokens.reasoning += u64::from(usage.reasoning_tokens);
+    tokens.cache_read += u64::from(usage.cache_read);
+    // Aggregate writes only: tier detail partitions this and is not added.
+    tokens.cache_write += u64::from(usage.cache_write);
 }
 
-/// Summed reported tokens per exclusive usage category. These are usage
-/// totals for the scope only; they are never the main conversation's context
-/// size or step counters.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TokenSums {
-    pub input: u64,
-    pub output: u64,
-    pub reasoning: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
+fn add_unresolved(totals: &mut ScopeTotals) {
+    totals.unresolved_attempts = totals.unresolved_attempts.saturating_add(1);
 }
 
-impl TokenSums {
-    fn add(&mut self, usage: &querymt::Usage) {
-        self.input += u64::from(usage.input_tokens);
-        self.output += u64::from(usage.output_tokens);
-        self.reasoning += u64::from(usage.reasoning_tokens);
-        self.cache_read += u64::from(usage.cache_read);
-        // Aggregate writes only: tier detail partitions this and is not added.
-        self.cache_write += u64::from(usage.cache_write);
-    }
+fn resolve(totals: &mut ScopeTotals) {
+    totals.unresolved_attempts = totals.unresolved_attempts.saturating_sub(1);
 }
 
-/// Accumulated accounting for one scope (session, cycle or purpose).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ScopeTotals {
-    /// Supported charges that are individually known.
-    pub known_subtotal_usd: f64,
-    /// Known subtotal of the budget view (manual-rate valuation where one was
-    /// snapshotted, otherwise the same as `known_subtotal_usd`).
-    pub budget_known_subtotal_usd: f64,
-    pub components: ComponentSums,
-    /// Tokens reported by settled attempts, including excluded billing.
-    #[serde(default)]
-    pub tokens: TokenSums,
-    /// Settled metered or zero-priced attempts.
-    pub priced_attempts: u32,
-    /// Settled attempts excluded from metered API cost.
-    pub excluded_attempts: u32,
-    /// Started attempts with no settlement yet.
-    pub unresolved_attempts: u32,
-    /// Settled metered attempts that are not fully valued.
-    pub incomplete_attempts: u32,
-    /// Settled attempts whose budget view is not fully valued.
-    pub budget_incomplete_attempts: u32,
-    /// Retained local generation records with no accounting basis (legacy
-    /// request-end events). Evidence of absent coverage, never a charge.
-    #[serde(default)]
-    pub unaccounted_generations: u32,
-    settled_reasons: Vec<AccountingReason>,
-    /// Settled reasons the budget view is not fully valued (manual-rate
-    /// valuation where snapshotted, otherwise the reported valuation).
-    #[serde(default)]
-    budget_settled_reasons: Vec<AccountingReason>,
-}
-
-impl ScopeTotals {
-    /// Why this scope's budget view is incomplete, for best-effort budget
-    /// warnings. Attempts that are merely in flight are not a reason: an
-    /// ordinary pending attempt is not an uncertainty to report. Interrupted
-    /// or settled-incomplete attempts and unaccounted history are.
-    pub fn budget_reasons(&self) -> Vec<AccountingReason> {
-        let mut out = Vec::new();
-        if self.unaccounted_generations > 0 {
-            out.push(AccountingReason::UnaccountedHistory);
+fn settle(totals: &mut ScopeTotals, c: &Contribution) {
+    totals.tokens.input += c.tokens.input;
+    totals.tokens.output += c.tokens.output;
+    totals.tokens.reasoning += c.tokens.reasoning;
+    totals.tokens.cache_read += c.tokens.cache_read;
+    totals.tokens.cache_write += c.tokens.cache_write;
+    match c.kind {
+        Kind::NoCharge => return,
+        Kind::Excluded => {
+            totals.excluded_attempts = totals.excluded_attempts.saturating_add(1);
+            return;
         }
-        out.extend(self.budget_settled_reasons.iter().cloned());
-        out
-    }
-
-    /// A complete supported-estimate total, or `None` when it cannot be
-    /// claimed (nothing priced, unresolved or incomplete attempts).
-    pub fn complete_total_usd(&self) -> Option<f64> {
-        (self.priced_attempts > 0
-            && self.unresolved_attempts == 0
-            && self.incomplete_attempts == 0
-            && self.unaccounted_generations == 0)
-            .then_some(self.known_subtotal_usd)
-    }
-
-    /// Budget-view complete total under the same rules.
-    pub fn budget_complete_total_usd(&self) -> Option<f64> {
-        (self.priced_attempts > 0
-            && self.unresolved_attempts == 0
-            && self.budget_incomplete_attempts == 0
-            && self.unaccounted_generations == 0)
-            .then_some(self.budget_known_subtotal_usd)
-    }
-
-    /// Current uncertainty reasons: unresolved first, then settled ones in
-    /// first-seen order.
-    pub fn reasons(&self) -> Vec<AccountingReason> {
-        let mut out = Vec::with_capacity(self.settled_reasons.len() + 1);
-        if self.unresolved_attempts > 0 {
-            out.push(AccountingReason::UnresolvedAttempt);
-        }
-        if self.unaccounted_generations > 0 {
-            out.push(AccountingReason::UnaccountedHistory);
-        }
-        out.extend(self.settled_reasons.iter().cloned());
-        out
-    }
-
-    fn add_unresolved(&mut self) {
-        self.unresolved_attempts = self.unresolved_attempts.saturating_add(1);
-    }
-
-    fn resolve(&mut self) {
-        self.unresolved_attempts = self.unresolved_attempts.saturating_sub(1);
-    }
-
-    fn settle(&mut self, c: &Contribution) {
-        self.tokens.input += c.tokens.input;
-        self.tokens.output += c.tokens.output;
-        self.tokens.reasoning += c.tokens.reasoning;
-        self.tokens.cache_read += c.tokens.cache_read;
-        self.tokens.cache_write += c.tokens.cache_write;
-        match c.kind {
-            Kind::NoCharge => return,
-            Kind::Excluded => {
-                self.excluded_attempts = self.excluded_attempts.saturating_add(1);
-                return;
+        Kind::Priced {
+            complete,
+            budget_complete,
+        } => {
+            totals.priced_attempts = totals.priced_attempts.saturating_add(1);
+            if !complete {
+                totals.incomplete_attempts = totals.incomplete_attempts.saturating_add(1);
             }
-            Kind::Priced {
-                complete,
-                budget_complete,
-            } => {
-                self.priced_attempts = self.priced_attempts.saturating_add(1);
-                if !complete {
-                    self.incomplete_attempts = self.incomplete_attempts.saturating_add(1);
-                }
-                if !budget_complete {
-                    self.budget_incomplete_attempts =
-                        self.budget_incomplete_attempts.saturating_add(1);
-                }
+            if !budget_complete {
+                totals.budget_incomplete_attempts =
+                    totals.budget_incomplete_attempts.saturating_add(1);
             }
         }
-        self.known_subtotal_usd += c.known;
-        self.budget_known_subtotal_usd += c.budget_known;
-        self.components.input_usd += c.components.input_usd;
-        self.components.output_usd += c.components.output_usd;
-        self.components.cache_read_usd += c.components.cache_read_usd;
-        self.components.cache_write_usd += c.components.cache_write_usd;
-        self.components.cache_write_1h_usd += c.components.cache_write_1h_usd;
-        for reason in &c.reasons {
-            if !self.settled_reasons.contains(reason) {
-                self.settled_reasons.push(reason.clone());
-            }
+    }
+    totals.known_subtotal_usd += c.known;
+    totals.budget_known_subtotal_usd += c.budget_known;
+    totals.components.input_usd += c.components.input_usd;
+    totals.components.output_usd += c.components.output_usd;
+    totals.components.cache_read_usd += c.components.cache_read_usd;
+    totals.components.cache_write_usd += c.components.cache_write_usd;
+    totals.components.cache_write_1h_usd += c.components.cache_write_1h_usd;
+    for reason in &c.reasons {
+        if !totals.settled_reasons.contains(reason) {
+            totals.settled_reasons.push(reason.clone());
         }
-        for reason in &c.budget_reasons {
-            if !self.budget_settled_reasons.contains(reason) {
-                self.budget_settled_reasons.push(reason.clone());
-            }
+    }
+    for reason in &c.budget_reasons {
+        if !totals.budget_settled_reasons.contains(reason) {
+            totals.budget_settled_reasons.push(reason.clone());
         }
     }
 }
@@ -226,7 +122,7 @@ fn valid_amount(x: f64) -> bool {
 fn contribution(s: &AttemptSettlement) -> Contribution {
     let mut tokens = TokenSums::default();
     if let Some(usage) = &s.usage {
-        tokens.add(usage);
+        add_token_usage(&mut tokens, usage);
     }
     let none = |kind| Contribution {
         tokens,
@@ -590,7 +486,7 @@ impl AccountingReducer {
                         digest: digest(start),
                     },
                 );
-                self.each_scope(attempt, ScopeTotals::add_unresolved);
+                self.each_scope(attempt, add_unresolved);
                 self.note_cycle(attempt);
                 Ok(Applied::New)
             }
@@ -632,9 +528,9 @@ impl AccountingReducer {
         );
         self.each_scope(attempt, |scope| {
             if was_pending {
-                scope.resolve();
+                resolve(scope);
             }
-            scope.settle(&c);
+            settle(scope, &c);
         });
         Ok(Applied::New)
     }

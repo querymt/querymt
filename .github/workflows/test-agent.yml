@@ -35,6 +35,7 @@ jobs:
       pull-requests: read
     outputs:
       any: ${{ steps.affected.outputs.any }}
+      protocol: ${{ steps.affected.outputs.protocol }}
       core: ${{ steps.affected.outputs.core }}
       index: ${{ steps.affected.outputs.index }}
       knowledge: ${{ steps.affected.outputs.knowledge }}
@@ -69,6 +70,8 @@ jobs:
               - '.github/actions/rust-setup/**'
               - 'scripts/ci-agent-affected.sh'
               - 'scripts/split-codecov.py'
+            protocol:
+              - 'crates/agent-protocol-types/**'
             core:
               - 'crates/agent-core/**'
             index:
@@ -104,6 +107,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           F_SHARED: ${{ steps.filter.outputs.shared }}
+          F_PROTOCOL: ${{ steps.filter.outputs.protocol }}
           F_CORE: ${{ steps.filter.outputs.core }}
           F_INDEX: ${{ steps.filter.outputs.index }}
           F_KNOWLEDGE: ${{ steps.filter.outputs.knowledge }}
@@ -170,6 +174,19 @@ jobs:
 
       - name: Disable workspace-hack
         run: cargo hakari disable
+
+      # The protocol types must stay light: no async runtime, no database and no
+      # workspace-hack in their closure (design D1), on any target.
+      - name: Check querymt-agent-protocol-types dependency exclusions
+        if: ${{ matrix.name == 'protocol' }}
+        run: |
+          tree="$(cargo tree --package querymt-agent-protocol-types --edges normal --target all)"
+          for forbidden in tokio rusqlite querymt-workspace-hack; do
+            if [[ "$tree" == *"── ${forbidden} v"* ]]; then
+              echo "querymt-agent-protocol-types must not depend on ${forbidden}" >&2
+              exit 1
+            fi
+          done
 
       # Core must not depend on rmcp, querymt-utils or rusqlite (design D7 of
       # split-agent-crate). The workspace-hack lists them, so it is pruned.
@@ -277,6 +294,15 @@ jobs:
 
       # One upload per package, each with its own flag (see codecov.yml). Flags
       # of packages that were not tested carry forward from the last upload.
+      - name: Upload coverage (protocol)
+        if: ${{ needs.detect.outputs.protocol == 'true' }}
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/codecov-querymt-agent-protocol-types.json
+          flags: agent-protocol-types
+          fail_ci_if_error: false
+
       - name: Upload coverage (core)
         if: ${{ needs.detect.outputs.core == 'true' }}
         uses: codecov/codecov-action@v7

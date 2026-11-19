@@ -11,7 +11,7 @@ use std::fmt;
 /// # Examples
 ///
 /// ```
-/// use querymt_agent_core::hash::RapidHash;
+/// use querymt_agent_protocol_types::hash::RapidHash;
 ///
 /// let hash = RapidHash::new(b"hello world");
 /// println!("{}", hash); // prints hex: "779a65e7023cd2e7"

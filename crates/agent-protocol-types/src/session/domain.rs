@@ -243,7 +243,7 @@ pub struct Delegation {
     /// without the column deserialize as `inherit`.
     #[serde(default)]
     #[typeshare(serialized_as = "string")]
-    pub isolation: crate::worktree::domain::DelegationIsolation,
+    pub isolation: crate::worktree::DelegationIsolation,
     pub status: DelegationStatus,
     /// Number of retry attempts for this objective
     pub retry_count: u32,

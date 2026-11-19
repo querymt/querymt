@@ -381,7 +381,7 @@ mod session_actor_ref_remote_tests {
             );
             assert_eq!(
                 snapshot["accounting"],
-                serde_json::to_value(crate::accounting::AccountingSnapshot::from_events(
+                serde_json::to_value(crate::accounting::snapshot_from_events(
                     &sid,
                     events.iter().map(|event| &event.kind),
                 ))

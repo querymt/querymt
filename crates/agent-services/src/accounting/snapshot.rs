@@ -10,111 +10,12 @@
 //! complete total can be claimed, so a client can clear a prior complete
 //! value. A message without the payload does not update accounting.
 
-use super::{AccountingReason, AccountingReducer, ScopeTotals};
+use super::{
+    ACCOUNTING_SNAPSHOT_VERSION, AccountingBillingScope, AccountingBudgetSnapshot,
+    AccountingCycleSnapshot, AccountingReducer, AccountingScopeSnapshot, AccountingSnapshot,
+    ScopeTotals,
+};
 use querymt_agent_core::events::AgentEventKind;
-use serde::{Deserialize, Serialize};
-use typeshare::typeshare;
-
-/// Schema version of [`AccountingSnapshot`].
-pub const ACCOUNTING_SNAPSHOT_VERSION: u32 = 1;
-
-/// Which kinds of billing a scope contains.
-#[typeshare]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AccountingBillingScope {
-    /// No settled attempt yet.
-    #[default]
-    Empty,
-    /// Only metered (or explicitly zero-priced) API attempts.
-    Metered,
-    /// Only attempts excluded from API cost (subscription/OAuth). Never a
-    /// known zero-dollar invoice.
-    Excluded,
-    /// Metered attempts alongside excluded ones; amounts cover the metered
-    /// attempts only.
-    Mixed,
-}
-
-/// API-spend accounting for one scope (session or cycle).
-#[typeshare]
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AccountingScopeSnapshot {
-    /// Supported charges that are individually known.
-    pub known_subtotal_usd: f64,
-    /// Complete supported estimate, or an explicit `null`.
-    #[typeshare(serialized_as = "f64", typescript(type = "number | null"))]
-    pub complete_total_usd: Option<f64>,
-    /// Whether `complete_total_usd` is available.
-    pub complete: bool,
-    pub billing: AccountingBillingScope,
-    /// Why a complete total is unavailable (unresolved attempts first).
-    #[typeshare(typescript(type = "Array<Record<string, unknown>>"))]
-    pub reasons: Vec<AccountingReason>,
-    pub priced_attempts: u32,
-    pub excluded_attempts: u32,
-    pub unresolved_attempts: u32,
-    pub incomplete_attempts: u32,
-    /// Retained local generation with no accounting basis (legacy history).
-    pub unaccounted_generations: u32,
-}
-
-/// Budget valuation of a cycle. It uses manual rates where configured, so it
-/// is reported separately from API spend and never replaces it.
-#[typeshare]
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AccountingBudgetSnapshot {
-    pub known_subtotal_usd: f64,
-    #[typeshare(serialized_as = "f64", typescript(type = "number | null"))]
-    pub complete_total_usd: Option<f64>,
-    /// Settled reasons the budget valuation is incomplete. In-flight attempts
-    /// are not a reason.
-    #[typeshare(typescript(type = "Array<Record<string, unknown>>"))]
-    pub reasons: Vec<AccountingReason>,
-    pub incomplete_attempts: u32,
-    /// The cap is enforced against the known subtotal only.
-    pub best_effort: bool,
-}
-
-/// The active execution cycle's accounting.
-#[typeshare]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AccountingCycleSnapshot {
-    pub cycle_id: String,
-    pub scope: AccountingScopeSnapshot,
-    pub budget: AccountingBudgetSnapshot,
-}
-
-/// Versioned replacement accounting state.
-#[typeshare]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AccountingSnapshot {
-    pub version: u32,
-    /// Session-lifetime API spend.
-    pub session: AccountingScopeSnapshot,
-    /// The cycle of the most recent main-response attempt, or an explicit
-    /// `null` when none has been recorded. It is never inferred from
-    /// whichever auxiliary attempt settled last.
-    #[typeshare(
-        serialized_as = "AccountingCycleSnapshot",
-        typescript(type = "AccountingCycleSnapshot | null")
-    )]
-    pub cycle: Option<AccountingCycleSnapshot>,
-}
-
-impl Default for AccountingSnapshot {
-    fn default() -> Self {
-        Self {
-            version: ACCOUNTING_SNAPSHOT_VERSION,
-            session: AccountingScopeSnapshot::default(),
-            cycle: None,
-        }
-    }
-}
 
 fn scope_snapshot(totals: &ScopeTotals) -> AccountingScopeSnapshot {
     let complete_total_usd = totals.complete_total_usd();
@@ -149,65 +50,47 @@ fn budget_snapshot(totals: &ScopeTotals) -> AccountingBudgetSnapshot {
     }
 }
 
-impl AccountingSnapshot {
-    /// Mark the session totals as covering only locally held events because
-    /// older history of a remote session is not transferred yet: the complete
-    /// total is withdrawn and the reason is recorded. Idempotent.
-    pub fn mark_untransferred_history(&mut self) {
-        self.session.complete = false;
-        self.session.complete_total_usd = None;
-        if !self
-            .session
-            .reasons
-            .contains(&AccountingReason::UntransferredHistory)
-        {
-            self.session
-                .reasons
-                .push(AccountingReason::UntransferredHistory);
+/// Project the reducer's current state.
+pub fn snapshot_from_reducer(reducer: &AccountingReducer) -> AccountingSnapshot {
+    let cycle = reducer.latest_cycle_id().map(|id| {
+        let totals = reducer.cycle(id);
+        AccountingCycleSnapshot {
+            cycle_id: id.to_string(),
+            scope: scope_snapshot(&totals),
+            budget: budget_snapshot(&totals),
         }
+    });
+    AccountingSnapshot {
+        version: ACCOUNTING_SNAPSHOT_VERSION,
+        session: scope_snapshot(reducer.session()),
+        cycle,
     }
+}
 
-    /// Project the reducer's current state.
-    pub fn from_reducer(reducer: &AccountingReducer) -> Self {
-        let cycle = reducer.latest_cycle_id().map(|id| {
-            let totals = reducer.cycle(id);
-            AccountingCycleSnapshot {
-                cycle_id: id.to_string(),
-                scope: scope_snapshot(&totals),
-                budget: budget_snapshot(&totals),
-            }
-        });
-        Self {
-            version: ACCOUNTING_SNAPSHOT_VERSION,
-            session: scope_snapshot(reducer.session()),
-            cycle,
+/// Reduce recorded events for one session. Records the reducer rejects
+/// (another session's attempt, or a contradictory settlement) are skipped
+/// rather than failing the whole projection.
+pub fn snapshot_from_events<'a>(
+    session_id: &str,
+    kinds: impl IntoIterator<Item = &'a AgentEventKind>,
+) -> AccountingSnapshot {
+    let mut reducer = AccountingReducer::new(session_id);
+    for kind in kinds {
+        if let Err(conflict) = reducer.apply(kind) {
+            tracing::warn!(
+                session.id = %session_id,
+                attempt.id = %conflict.attempt_id,
+                detail = conflict.detail,
+                "skipping conflicting accounting record in snapshot"
+            );
         }
     }
-
-    /// Reduce recorded events for one session. Records the reducer rejects
-    /// (another session's attempt, or a contradictory settlement) are skipped
-    /// rather than failing the whole projection.
-    pub fn from_events<'a>(
-        session_id: &str,
-        kinds: impl IntoIterator<Item = &'a AgentEventKind>,
-    ) -> Self {
-        let mut reducer = AccountingReducer::new(session_id);
-        for kind in kinds {
-            if let Err(conflict) = reducer.apply(kind) {
-                tracing::warn!(
-                    session.id = %session_id,
-                    attempt.id = %conflict.attempt_id,
-                    detail = conflict.detail,
-                    "skipping conflicting accounting record in snapshot"
-                );
-            }
-        }
-        Self::from_reducer(&reducer)
-    }
+    snapshot_from_reducer(&reducer)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::AccountingReason;
     use super::*;
     use querymt::providers::{UsageValuation, value_usage};
     use querymt_agent_core::accounting::samples::{
@@ -217,7 +100,7 @@ mod tests {
     #[test]
     fn untransferred_history_withdraws_complete_total_once() {
         let kinds = settled("a1", "c1");
-        let mut snapshot = AccountingSnapshot::from_events("s1", kinds.iter());
+        let mut snapshot = snapshot_from_events("s1", kinds.iter());
         snapshot.mark_untransferred_history();
         snapshot.mark_untransferred_history();
         assert!(!snapshot.session.complete);
@@ -276,12 +159,12 @@ mod tests {
     #[test]
     fn complete_total_is_cleared_with_an_explicit_null_when_it_turns_partial() {
         let mut kinds: Vec<AgentEventKind> = settled("a1", "c1").into();
-        let complete = AccountingSnapshot::from_events("sess-1", &kinds);
+        let complete = snapshot_from_events("sess-1", &kinds);
         assert!(complete.session.complete);
         assert!(complete.session.complete_total_usd.is_some());
 
         kinds.push(missing_cache_write("a2", "c1"));
-        let partial = AccountingSnapshot::from_events("sess-1", &kinds);
+        let partial = snapshot_from_events("sess-1", &kinds);
         let json = serde_json::to_value(&partial).unwrap();
         assert!(!partial.session.complete);
         assert!(json["session"]["completeTotalUsd"].is_null());
@@ -299,7 +182,7 @@ mod tests {
         start.billing = querymt::providers::BillingClass::Excluded;
         let mut settlement = sample_settlement();
         settlement.valuation = UsageValuation::excluded();
-        let snapshot = AccountingSnapshot::from_events(
+        let snapshot = snapshot_from_events(
             "sess-1",
             &[
                 AgentEventKind::LlmAttemptStarted { start },
@@ -321,7 +204,7 @@ mod tests {
         settlement.valuation = UsageValuation::excluded();
         kinds.push(AgentEventKind::LlmAttemptStarted { start });
         kinds.push(AgentEventKind::LlmAttemptSettled { settlement });
-        let snapshot = AccountingSnapshot::from_events("sess-1", &kinds);
+        let snapshot = snapshot_from_events("sess-1", &kinds);
         assert_eq!(snapshot.session.billing, AccountingBillingScope::Mixed);
         assert!(snapshot.session.complete_total_usd.is_some());
         assert_eq!(snapshot.session.excluded_attempts, 1);
@@ -340,7 +223,7 @@ mod tests {
         settlement.attempt = start.attempt.clone();
         kinds.push(AgentEventKind::LlmAttemptStarted { start });
         kinds.push(AgentEventKind::LlmAttemptSettled { settlement });
-        let snapshot = AccountingSnapshot::from_events("sess-1", &kinds);
+        let snapshot = snapshot_from_events("sess-1", &kinds);
         let cycle = snapshot.cycle.expect("active cycle");
         assert_eq!(cycle.cycle_id, "c2");
         assert_eq!(cycle.scope.priced_attempts, 1);
@@ -361,7 +244,7 @@ mod tests {
         settlement.budget_valuation = Some(value_usage(Some(&manual), settlement.usage.as_ref()));
         kinds.push(AgentEventKind::LlmAttemptStarted { start });
         kinds.push(AgentEventKind::LlmAttemptSettled { settlement });
-        let snapshot = AccountingSnapshot::from_events("sess-1", &kinds);
+        let snapshot = snapshot_from_events("sess-1", &kinds);
         assert!(snapshot.session.complete, "API estimate stays complete");
         let cycle = snapshot.cycle.unwrap();
         assert!(cycle.budget.best_effort);
@@ -396,8 +279,8 @@ mod tests {
     #[test]
     fn duplicate_records_do_not_change_the_snapshot() {
         let kinds: Vec<AgentEventKind> = settled("a1", "c1").into();
-        let once = AccountingSnapshot::from_events("sess-1", &kinds);
-        let twice = AccountingSnapshot::from_events("sess-1", kinds.iter().chain(kinds.iter()));
+        let once = snapshot_from_events("sess-1", &kinds);
+        let twice = snapshot_from_events("sess-1", kinds.iter().chain(kinds.iter()));
         assert_eq!(once, twice);
     }
 }

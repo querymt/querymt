@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf};
 use typeshare::typeshare;
 
-use crate::config::mcp::McpServerConfig;
 use crate::hash::RapidHash;
 use crate::session::domain::{
     Alternative, Artifact, Decision, Delegation, ForkOrigin, ForkPointType, IntentSnapshot,
@@ -207,39 +206,6 @@ pub struct McpServerInfo {
     pub headers: Option<HashMap<String, String>>,
 }
 
-impl From<McpServerConfig> for McpServerInfo {
-    fn from(config: McpServerConfig) -> Self {
-        match config {
-            McpServerConfig::Stdio {
-                name,
-                command,
-                args,
-                env,
-                ..
-            } => Self {
-                transport: "stdio".into(),
-                name,
-                command: Some(command),
-                args: Some(args),
-                env: Some(env),
-                url: None,
-                headers: None,
-            },
-            McpServerConfig::Http {
-                name, url, headers, ..
-            } => Self {
-                transport: "http".into(),
-                name,
-                command: None,
-                args: None,
-                env: None,
-                url: Some(url),
-                headers: Some(headers),
-            },
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum EventOrigin {
     #[default]
@@ -343,7 +309,7 @@ pub enum AgentEventKind {
         source_epoch: String,
     },
     SessionWorkspaceBound {
-        workspace: crate::session::projection::SessionWorkspaceView,
+        workspace: crate::session::views::SessionWorkspaceView,
         #[typeshare(serialized_as = "Option<string>")]
         cwd: Option<PathBuf>,
     },
@@ -2210,36 +2176,6 @@ mod tests {
                 "duplicate sample for {expected}"
             );
         }
-    }
-
-    #[test]
-    fn mcp_stdio_info_preserves_config_wire_shape() {
-        let config = McpServerConfig::stdio("filesystem", "npx")
-            .with_args(["-y", "server-filesystem"])
-            .with_env(HashMap::from([("TOKEN".into(), "secret".into())]));
-        let expected = serde_json::to_value(&config).unwrap();
-        let info = McpServerInfo::from(config);
-
-        assert_eq!(serde_json::to_value(&info).unwrap(), expected);
-        assert_eq!(
-            serde_json::from_value::<McpServerInfo>(expected).unwrap(),
-            info
-        );
-    }
-
-    #[test]
-    fn mcp_http_info_preserves_config_wire_shape() {
-        let config = McpServerConfig::http("remote", "https://example.test/mcp").with_headers(
-            HashMap::from([("Authorization".into(), "Bearer secret".into())]),
-        );
-        let expected = serde_json::to_value(&config).unwrap();
-        let info = McpServerInfo::from(config);
-
-        assert_eq!(serde_json::to_value(&info).unwrap(), expected);
-        assert_eq!(
-            serde_json::from_value::<McpServerInfo>(expected).unwrap(),
-            info
-        );
     }
 
     #[test]

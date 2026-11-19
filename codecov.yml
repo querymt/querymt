@@ -7,6 +7,8 @@ flag_management:
   individual_flags:
     - name: agent
       paths: [crates/agent/]
+    - name: agent-protocol-types
+      paths: [crates/agent-protocol-types/]
     - name: agent-core
       paths: [crates/agent-core/]
     - name: agent-index

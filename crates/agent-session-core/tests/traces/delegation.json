@@ -1,0 +1,126 @@
+{
+  "name": "delegation",
+  "batches": [
+    [
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "tool_call",
+              "toolCallId": "t1",
+              "title": "delegate",
+              "status": "in_progress"
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "delegation_update",
+        "data": {
+          "update": {
+            "version": 1,
+            "sessionId": "s1",
+            "delegationId": "d1",
+            "toolCallId": "t1",
+            "state": "forked",
+            "targetAgentId": "coder",
+            "objective": "lorem",
+            "childSessionId": "child-1",
+            "requestedAt": 1,
+            "updatedAt": 2,
+            "activity": "historical"
+          }
+        }
+      }
+    ]
+  ],
+  "expected": {
+    "reports": [
+      {
+        "added": [
+          "turn-live-1"
+        ],
+        "updated": [],
+        "removed": [],
+        "headerChanged": true,
+        "ignored": 0,
+        "unknown": 0,
+        "duplicates": 0,
+        "errors": []
+      }
+    ],
+    "header": {
+      "sessionId": "s1",
+      "schemaVersion": 1,
+      "runState": "tool_running",
+      "activeToolCallId": "t1",
+      "lastStopReason": null,
+      "lastError": null,
+      "context": null,
+      "tokens": null,
+      "cost": null,
+      "provider": null,
+      "title": null,
+      "currentMode": null,
+      "configOptions": [],
+      "plan": null,
+      "undoStack": [],
+      "pendingInputs": [],
+      "delegations": [
+        {
+          "version": 1,
+          "sessionId": "s1",
+          "delegationId": "d1",
+          "toolCallId": "t1",
+          "state": "forked",
+          "targetAgentId": "coder",
+          "objective": "lorem",
+          "childSessionId": "child-1",
+          "requestedAt": 1,
+          "updatedAt": 2,
+          "activity": "historical"
+        }
+      ],
+      "runtime": null,
+      "history": {
+        "hasOlder": false,
+        "before": null,
+        "stale": false
+      }
+    },
+    "turnIds": [
+      "turn-live-1"
+    ],
+    "turns": [
+      {
+        "id": "turn-live-1",
+        "revision": 2,
+        "entries": [
+          {
+            "id": "tool-t1",
+            "revision": 2,
+            "kind": {
+              "type": "tool_call",
+              "data": {
+                "toolCallId": "t1",
+                "title": "delegate",
+                "kind": "other",
+                "status": "in_progress",
+                "rawInput": null,
+                "rawOutput": null,
+                "content": [],
+                "resultFullBytes": null,
+                "argumentsFullBytes": null,
+                "childSessionId": "child-1"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

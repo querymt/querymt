@@ -1,7 +1,6 @@
 //! Session domain types and storage contracts.
 
 pub mod backend;
-pub mod domain;
 pub mod domain_schedule;
 pub mod error;
 mod event_journal;
@@ -16,5 +15,7 @@ mod session_store;
 mod storage_backend;
 pub mod store;
 mod view_store;
+
+pub use querymt_agent_protocol_types::session::{domain, history};
 
 pub use error::{SessionError, SessionResult};
