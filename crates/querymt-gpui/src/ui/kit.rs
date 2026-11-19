@@ -711,35 +711,81 @@ fn identicon_cells(seed: &str) -> Vec<(f32, f32, Hsla)> {
 }
 
 /// Deterministic hexagon glyph for a session id.
+/// Deterministic hexagon glyph for a session id.
 pub fn identicon(seed: &str, size: f32) -> impl IntoElement {
-    let cells = identicon_cells(seed);
+    let paths = identicon_paths(seed, size);
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
-            let scale = f32::from(bounds.size.width) / IDENTICON_SIZE;
-            let hex_r = IDENTICON_SIZE * 0.082 * scale;
-            for (x, y, color) in &cells {
-                let (cx, cy) = (x * scale, y * scale);
-                let mut path = PathBuilder::fill();
-                for i in 0..6 {
-                    let ang = std::f32::consts::FRAC_PI_3 * i as f32 - std::f32::consts::FRAC_PI_6;
-                    let pt = bounds.origin
-                        + point(px(cx + hex_r * ang.cos()), px(cy + hex_r * ang.sin()));
-                    if i == 0 {
-                        path.move_to(pt)
-                    } else {
-                        path.line_to(pt)
-                    }
-                }
-                path.close();
-                if let Ok(path) = path.build() {
-                    window.paint_path(path, *color);
-                }
+            for (path, color) in paths.iter() {
+                window.paint_path(translated(path, bounds.origin), *color);
             }
         },
     )
     .flex_none()
     .size(px(size))
+}
+
+/// Tessellated hexagons of one identicon at the origin, with their colors.
+type IdenticonPaths = std::rc::Rc<Vec<(Path<Pixels>, Hsla)>>;
+
+/// Identicons kept before the cache starts over (a few per session).
+const IDENTICON_CACHE_MAX: usize = 4096;
+
+thread_local! {
+    /// (seed, size in 1/100 px) → paths. Tessellating every hexagon on every
+    /// paint was a measurable part of a long session list's frame.
+    static IDENTICONS: std::cell::RefCell<std::collections::HashMap<(String, u32), IdenticonPaths>> =
+        std::cell::RefCell::default();
+}
+
+fn identicon_paths(seed: &str, size: f32) -> IdenticonPaths {
+    let key = (seed.to_string(), (size * 100.).round() as u32);
+    IDENTICONS.with(|cache| {
+        if let Some(paths) = cache.borrow().get(&key) {
+            return paths.clone();
+        }
+        let paths = std::rc::Rc::new(build_identicon(seed, size));
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= IDENTICON_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(key, paths.clone());
+        paths
+    })
+}
+
+fn build_identicon(seed: &str, size: f32) -> Vec<(Path<Pixels>, Hsla)> {
+    let scale = size / IDENTICON_SIZE;
+    let hex_r = IDENTICON_SIZE * 0.082 * scale;
+    identicon_cells(seed)
+        .into_iter()
+        .filter_map(|(x, y, color)| {
+            let (cx, cy) = (x * scale, y * scale);
+            let mut path = PathBuilder::fill();
+            for i in 0..6 {
+                let ang = std::f32::consts::FRAC_PI_3 * i as f32 - std::f32::consts::FRAC_PI_6;
+                let pt = point(px(cx + hex_r * ang.cos()), px(cy + hex_r * ang.sin()));
+                if i == 0 {
+                    path.move_to(pt)
+                } else {
+                    path.line_to(pt)
+                }
+            }
+            path.close();
+            path.build().ok().map(|path| (path, color))
+        })
+        .collect()
+}
+
+/// `path` moved by `by`.
+fn translated(path: &Path<Pixels>, by: Point<Pixels>) -> Path<Pixels> {
+    let mut path = path.clone();
+    path.bounds.origin += by;
+    for vertex in &mut path.vertices {
+        vertex.xy_position += by;
+    }
+    path
 }
 
 /// Thin progress ring (context usage), like the desktop header dial.

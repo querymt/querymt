@@ -81,6 +81,8 @@ pub struct QmtApp {
     session_tab: SessionTab,
     /// Which Sessions-page groups are open.
     session_groups: sessions::GroupOpenState,
+    /// Virtualized Sessions page list.
+    session_list: sessions::SessionList,
     expanded: HashSet<String>,
     /// `agent:session` keys of Sessions-page rows showing their child sessions.
     session_children: HashSet<String>,
@@ -325,6 +327,7 @@ impl QmtApp {
             session_query,
             session_tab: SessionTab::Open,
             session_groups: Default::default(),
+            session_list: Default::default(),
             expanded: HashSet::new(),
             session_children: HashSet::new(),
             confirm_session_delete: None,
@@ -1214,7 +1217,8 @@ impl Render for QmtApp {
                     })
                     .child(self.smooth_scroll.region(
                         "page",
-                        if self.page == Page::Session {
+                        // These pages scroll their own (virtualized) lists.
+                        if matches!(self.page, Page::Session | Page::Sessions) {
                             div().id("page").flex_1().min_w_0().h_full().child(body)
                         } else {
                             div()
