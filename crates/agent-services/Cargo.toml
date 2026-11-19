@@ -59,7 +59,7 @@ dirs.workspace = true
 dunce = "1"
 opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["trace", "metrics"] }
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tempfile = "3.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
