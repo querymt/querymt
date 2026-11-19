@@ -724,7 +724,7 @@ async fn test_list_sessions_cwd_pagination_and_cursor_errors() {
             .list_sessions(ListSessionsRequest::new().cursor(cursor))
             .await
             .expect_err("invalid ACP cursor should fail");
-        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
     }
 }
 
@@ -1226,7 +1226,7 @@ async fn test_set_profile_config_option_rejects_unknown_profile() {
         .set_session_config_option(req)
         .await
         .expect_err("unknown profile should fail");
-    assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+    assert_eq!(err.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
 }
 
 #[tokio::test]
@@ -1246,7 +1246,7 @@ async fn test_set_profile_config_option_rejects_different_bound_profile() {
         .set_session_config_option(req)
         .await
         .expect_err("different profile should fail");
-    assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+    assert_eq!(err.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
 }
 
 async fn register_profile_bound_delegate_session(

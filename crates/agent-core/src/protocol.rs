@@ -1,13 +1,17 @@
 //! QueryMT ACP protocol boundary.
 //!
 //! All agent code should import ACP wire types from this module rather than
-//! directly from `agent_client_protocol::schema`. That keeps the active ACP
+//! directly from `agent_client_protocol::v1::schema`. That keeps the active ACP
 //! version localized so moving from v1 to v2 starts here.
 
-pub use agent_client_protocol::schema::v1::*;
 pub use agent_client_protocol::schema::{
     IntoMaybeUndefined, IntoOption, MaybeUndefined, ProtocolVersion,
 };
+pub use agent_client_protocol::v1::schema::*;
+// The SDK's version-neutral error types. These explicit re-exports shadow the
+// v1 schema's `Error`/`ErrorCode` from the glob above, so `protocol::Error` is
+// the type every SDK callback and connection method uses.
+pub use agent_client_protocol::{Error, ErrorCode};
 
 use agent_client_protocol::{JsonRpcRequest, JsonRpcResponse};
 use schemars::JsonSchema;

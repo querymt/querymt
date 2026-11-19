@@ -787,7 +787,7 @@ mod tests {
                 .expect_err("invalid authority must be denied");
             assert_eq!(
                 error.code,
-                agent_client_protocol::ErrorCode::Other(ELICITATION_RECOVERY_DENIED_CODE)
+                agent_client_protocol::ErrorCode::new(ELICITATION_RECOVERY_DENIED_CODE)
             );
         }
     }
@@ -816,7 +816,7 @@ mod tests {
             .expect_err("finished authority must expire");
         assert_eq!(
             error.code,
-            agent_client_protocol::ErrorCode::Other(ELICITATION_RECOVERY_DENIED_CODE)
+            agent_client_protocol::ErrorCode::new(ELICITATION_RECOVERY_DENIED_CODE)
         );
     }
 
@@ -894,7 +894,7 @@ mod tests {
             .expect_err("retired authority cannot recover a later question");
         assert_eq!(
             error.code,
-            agent_client_protocol::ErrorCode::Other(ELICITATION_RECOVERY_DENIED_CODE)
+            agent_client_protocol::ErrorCode::new(ELICITATION_RECOVERY_DENIED_CODE)
         );
     }
 
@@ -1099,7 +1099,7 @@ mod tests {
                 .expect_err("unsupported recovery attempt must be denied");
             assert_eq!(
                 error.code,
-                agent_client_protocol::ErrorCode::Other(ELICITATION_RECOVERY_DENIED_CODE)
+                agent_client_protocol::ErrorCode::new(ELICITATION_RECOVERY_DENIED_CODE)
             );
         }
     }

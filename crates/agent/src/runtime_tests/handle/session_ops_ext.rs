@@ -96,7 +96,7 @@ async fn querymt_session_undo_stack_rejects_missing_session_id() {
         .await
         .expect_err("missing session_id should be invalid params");
 
-    assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+    assert_eq!(err.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
 }
 
 #[tokio::test]
@@ -246,7 +246,7 @@ async fn querymt_session_lifecycle_ext_rejects_empty_and_null_patches() {
         .expect_err("empty patch is invalid");
     assert_eq!(
         missing.code,
-        agent_client_protocol::ErrorCode::InvalidParams
+        agent_client_protocol::ErrorCode::INVALID_PARAMS
     );
 
     let null_value = f
@@ -265,7 +265,7 @@ async fn querymt_session_lifecycle_ext_rejects_empty_and_null_patches() {
         .expect_err("null desired state is invalid");
     assert_eq!(
         null_value.code,
-        agent_client_protocol::ErrorCode::InvalidParams
+        agent_client_protocol::ErrorCode::INVALID_PARAMS
     );
 }
 
@@ -570,7 +570,7 @@ async fn querymt_session_set_pinned_notifies_only_when_state_changes() {
             ))
             .await
             .expect_err("invalid pinned state must be rejected");
-        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
     }
     let missing = f
         .handle
@@ -582,7 +582,7 @@ async fn querymt_session_set_pinned_notifies_only_when_state_changes() {
         .expect_err("missing local session must be rejected");
     assert_eq!(
         missing.code,
-        agent_client_protocol::ErrorCode::InvalidParams
+        agent_client_protocol::ErrorCode::INVALID_PARAMS
     );
     assert!(matches!(
         ext_notifications.try_recv(),

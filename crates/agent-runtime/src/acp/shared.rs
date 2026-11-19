@@ -418,7 +418,7 @@ impl RpcDispatchContext {
 /// True for the `invalid_params` "unknown session" errors raised when a session id is not
 /// live in any registry.
 fn is_unknown_session_error(error: &Error) -> bool {
-    if error.code != agent_client_protocol::ErrorCode::InvalidParams {
+    if error.code != agent_client_protocol::ErrorCode::INVALID_PARAMS {
         return false;
     }
     match error.data.as_ref() {
@@ -6942,7 +6942,7 @@ mod tests {
         assert!(response.error.is_some(), "expected error from default impl");
         let err: agent_client_protocol::Error =
             serde_json::from_value(response.error.unwrap()).unwrap();
-        assert_eq!(err.code, agent_client_protocol::ErrorCode::MethodNotFound);
+        assert_eq!(err.code, agent_client_protocol::ErrorCode::METHOD_NOT_FOUND);
     }
 
     #[tokio::test]

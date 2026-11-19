@@ -9,7 +9,7 @@ use std::{
 };
 
 use futures_util::{SinkExt, StreamExt};
-use qmacp::protocol::{JsonRpcMessage, schema::v1 as acp};
+use qmacp::protocol::{JsonRpcMessage, v1::schema as acp};
 use qmcp::{BridgeConfig, QmcpServer, policy::PermissionPolicy, transport};
 use serde_json::{Value, json};
 use tokio::{

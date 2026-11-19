@@ -37,7 +37,8 @@ use crate::acp::shared::{
 };
 use crate::acp::shutdown;
 use crate::send_agent::SendAgent;
-use agent_client_protocol::{self as acp, ByteStreams, ConnectionTo};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::{self as acp, ByteStreams};
 use querymt_agent_services::event_fanout::EventFanout;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -1064,7 +1065,7 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
     let stdout = tokio::io::stdout().compat_write();
 
     let serve_fut = acp::Agent
-        .builder()
+        .v1()
         .on_receive_request(
             {
                 let agent = agent.clone();
@@ -1289,9 +1290,9 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
             {
                 let agent = agent.clone();
                 let bridge_sender = bridge_sender.clone();
-                async move |dispatch: acp::Dispatch<ClientRequest, ClientNotification>, _cx| {
+                async move |dispatch: acp::v1::Dispatch<ClientRequest, ClientNotification>, _cx| {
                     match dispatch {
-                        acp::Dispatch::Request(ClientRequest::ExtMethodRequest(req), responder) => {
+                        acp::v1::Dispatch::Request(ClientRequest::ExtMethodRequest(req), responder) => {
                             let method = req.method.to_string();
                             let params: serde_json::Value =
                                 serde_json::from_str(req.params.get()).unwrap_or_default();
@@ -1317,20 +1318,20 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
                             send_result?;
                             Ok(acp::Handled::Yes)
                         }
-                        acp::Dispatch::Notification(ClientNotification::ExtNotification(notif)) => {
+                        acp::v1::Dispatch::Notification(ClientNotification::ExtNotification(notif)) => {
                             agent.ext_notification(notif).await?;
                             Ok(acp::Handled::Yes)
                         }
-                        acp::Dispatch::Request(request, responder) => Ok(acp::Handled::No {
-                            message: acp::Dispatch::Request(request, responder),
+                        acp::v1::Dispatch::Request(request, responder) => Ok(acp::Handled::No {
+                            message: acp::v1::Dispatch::Request(request, responder),
                             retry: false,
                         }),
-                        acp::Dispatch::Notification(notification) => Ok(acp::Handled::No {
-                            message: acp::Dispatch::Notification(notification),
+                        acp::v1::Dispatch::Notification(notification) => Ok(acp::Handled::No {
+                            message: acp::v1::Dispatch::Notification(notification),
                             retry: false,
                         }),
-                        acp::Dispatch::Response(result, router) => Ok(acp::Handled::No {
-                            message: acp::Dispatch::Response(result, router),
+                        acp::v1::Dispatch::Response(result, router) => Ok(acp::Handled::No {
+                            message: acp::v1::Dispatch::Response(result, router),
                             retry: false,
                         }),
                     }
@@ -2064,7 +2065,7 @@ mod stdio_tests {
 
         let client_task = tokio::spawn(async move {
             Client
-                .builder()
+                .v1()
                 .on_receive_request(
                     async move |request: CreateElicitationRequest, responder, _cx| {
                         *seen_request_for_handler.lock().await = Some(request);
@@ -2090,7 +2091,7 @@ mod stdio_tests {
 
         let (bridge_tx, bridge_rx) = mpsc::channel::<ClientBridgeMessage>(4);
         let bridge = ClientBridgeSender::new(bridge_tx);
-        let server = Agent.builder().connect_with(
+        let server = Agent.v1().connect_with(
             ByteStreams::new(server_write.compat_write(), server_read.compat()),
             async move |connection| {
                 run_bridge_task(bridge_rx, connection).await;
@@ -2191,7 +2192,7 @@ mod stdio_tests {
 
         let server_task = tokio::spawn(async move {
             Agent
-                .builder()
+                .v1()
                 .on_receive_request(
                     async move |_req: PromptRequest, responder, cx| {
                         let prompt_started = prompt_started_for_handler.clone();

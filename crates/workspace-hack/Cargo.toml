@@ -262,7 +262,6 @@ zeroize = { version = "1", features = ["derive"] }
 [target.aarch64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 byteorder = { version = "1" }
-crossbeam-utils = { version = "0.8" }
 errno = { version = "0.3" }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "ring", "tls12", "webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
@@ -272,7 +271,7 @@ objc2-core-foundation = { version = "0.3" }
 once_cell = { version = "1", default-features = false, features = ["critical-section"] }
 reqwest-594e8ee84c453af0 = { package = "reqwest", version = "0.13", default-features = false, features = ["http2"] }
 rmcp = { version = "3", default-features = false, features = ["transport-streamable-http-client-unix-socket"] }
-rustix = { version = "1", features = ["event", "fs", "mm", "net", "param", "pipe", "process", "termios", "thread", "time"] }
+rustix = { version = "1", features = ["event", "fs", "mm", "net", "param", "process", "termios", "thread", "time"] }
 rustls-webpki = { version = "0.103" }
 security-framework-sys = { version = "2" }
 simdutf8 = { version = "0.1", default-features = false, features = ["public_imp"] }
@@ -287,7 +286,7 @@ errno = { version = "0.3" }
 libc = { version = "0.2", features = ["extra_traits"] }
 once_cell = { version = "1", default-features = false, features = ["critical-section"] }
 portable-atomic = { version = "1", features = ["serde"] }
-rustix = { version = "1", features = ["event", "fs", "mm", "net", "param", "pipe", "process", "termios", "thread", "time"] }
+rustix = { version = "1", features = ["event", "fs", "mm", "net", "param", "process", "termios", "thread", "time"] }
 rustls-webpki = { version = "0.103" }
 siphasher = { version = "1" }
 

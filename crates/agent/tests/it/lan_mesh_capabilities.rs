@@ -97,7 +97,7 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
         ))
         .await
         .expect_err("LAN-only mesh must reject invite creation");
-    assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidRequest);
+    assert_eq!(err.code, agent_client_protocol::ErrorCode::INVALID_REQUEST);
     assert!(
         err.data.expect("structured error data")["error"]
             .as_str()
