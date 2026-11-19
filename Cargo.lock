@@ -11593,7 +11593,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.29.0",
  "url",
- "uuid 1.29.2",
+ "uuid 1.29.3",
 ]
 
 [[package]]
@@ -11621,7 +11621,7 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "tracing",
  "tracing-subscriber",
- "uuid 1.29.2",
+ "uuid 1.29.3",
 ]
 
 [[package]]
