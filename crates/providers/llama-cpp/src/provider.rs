@@ -6,6 +6,7 @@ use crate::generation::{
 };
 use crate::memory::MemoryEstimate;
 use crate::multimodal::MultimodalContext;
+use crate::placement::{ResolvedPlacement, available_devices};
 use crate::response::LlamaCppChatResponse;
 use crate::tools::{
     apply_template_for_thinking, apply_template_with_tools, generate_streaming_with_tools,
@@ -35,6 +36,9 @@ pub(crate) struct ModelCacheKey {
     pub model_path: String,
     /// Number of GPU layers (affects Metal/CUDA offloading).
     pub n_gpu_layers: Option<u32>,
+    /// Device selection, tensor split, split mode and main GPU. The sidecar's
+    /// placement is derived from this, so it needs no separate key field.
+    pub placement: ResolvedPlacement,
     /// Whether bundled MTP (NextN) tensors are loaded into the target model.
     pub load_mtp: bool,
     /// Resolved MTP sidecar path, when configured.
@@ -62,9 +66,13 @@ fn bundled_mtp_requested(cfg: &LlamaCppConfig) -> bool {
         .is_some_and(SpeculativeConfig::uses_bundled_mtp)
 }
 
-/// Model-load params for the target model: GPU offload plus opt-in loading of
-/// bundled MTP tensors.
-fn target_model_params(n_gpu_layers: Option<u32>, load_mtp: bool) -> LlamaModelParams {
+/// Model-load params for the target model: GPU offload, device placement, and
+/// opt-in loading of bundled MTP tensors.
+fn target_model_params(
+    placement: &ResolvedPlacement,
+    n_gpu_layers: Option<u32>,
+    load_mtp: bool,
+) -> Result<LlamaModelParams, LLMError> {
     let mut params = LlamaModelParams::default();
     if let Some(n) = n_gpu_layers {
         params = params.with_n_gpu_layers(n);
@@ -72,7 +80,64 @@ fn target_model_params(n_gpu_layers: Option<u32>, load_mtp: bool) -> LlamaModelP
     if load_mtp {
         params = params.with_load_mtp(true);
     }
-    params
+    placement.apply(params)
+}
+
+/// Model-load params for an MTP sidecar: always a single device (see
+/// [`ResolvedPlacement::for_sidecar`]).
+fn sidecar_model_params(
+    placement: &ResolvedPlacement,
+    n_gpu_layers: Option<u32>,
+) -> Result<LlamaModelParams, LLMError> {
+    let mut params = LlamaModelParams::default();
+    if let Some(n) = n_gpu_layers {
+        params = params.with_n_gpu_layers(n);
+    }
+    placement.for_sidecar().apply(params)
+}
+
+/// Resolve and validate the placement settings of `cfg` against the devices
+/// llama.cpp currently sees. Requires the backend to be initialized.
+fn resolve_placement(cfg: &LlamaCppConfig) -> Result<ResolvedPlacement, LLMError> {
+    let placement = ResolvedPlacement::resolve(cfg, &available_devices())?;
+    if !placement.is_default() {
+        log::info!("Model placement: {}", placement.describe());
+    }
+    Ok(placement)
+}
+
+/// Load the target model and, when configured, the MTP sidecar.
+///
+/// The single place where placement is applied to model loading.
+fn load_models(
+    backend: &llama_cpp_2::llama_backend::LlamaBackend,
+    model_path: &Path,
+    n_gpu_layers: Option<u32>,
+    placement: &ResolvedPlacement,
+    load_mtp: bool,
+    mtp_model_path: Option<&Path>,
+    mtp_n_gpu_layers: Option<u32>,
+) -> Result<(Arc<LlamaModel>, Option<Arc<LlamaModel>>), LLMError> {
+    let model = Arc::new(
+        LlamaModel::load_from_file(
+            backend,
+            model_path,
+            &target_model_params(placement, n_gpu_layers, load_mtp)?,
+        )
+        .map_err(|e| LLMError::ProviderError(e.to_string()))?,
+    );
+    let mtp_model = match mtp_model_path {
+        Some(path) => Some(Arc::new(
+            LlamaModel::load_from_file(
+                backend,
+                path,
+                &sidecar_model_params(placement, mtp_n_gpu_layers)?,
+            )
+            .map_err(|e| LLMError::ProviderError(format!("Failed to load MTP sidecar: {e}")))?,
+        )),
+        None => None,
+    };
+    Ok((model, mtp_model))
 }
 
 /// The main llama.cpp provider.
@@ -128,35 +193,25 @@ impl LlamaCppProvider {
             )));
         }
 
-        let model = Arc::new(
-            LlamaModel::load_from_file(
-                &*backend,
-                &model_path,
-                &target_model_params(cfg.n_gpu_layers, bundled_mtp_requested(&cfg)),
-            )
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?,
-        );
-
-        let mtp_model =
-            if let Some(sidecar) = cfg.speculative.as_ref().and_then(|m| m.model.as_deref()) {
-                let sidecar_path = Self::resolve_model_path(sidecar)?;
-                let mut params = LlamaModelParams::default();
-                if let Some(n) = cfg
-                    .speculative
-                    .as_ref()
-                    .and_then(|m| m.n_gpu_layers)
-                    .or(cfg.n_gpu_layers)
-                {
-                    params = params.with_n_gpu_layers(n);
-                }
-                Some(Arc::new(
-                    LlamaModel::load_from_file(&*backend, &sidecar_path, &params).map_err(|e| {
-                        LLMError::ProviderError(format!("Failed to load MTP sidecar: {e}"))
-                    })?,
-                ))
-            } else {
-                None
-            };
+        let sidecar_path = cfg
+            .speculative
+            .as_ref()
+            .and_then(|m| m.model.as_deref())
+            .map(Self::resolve_model_path)
+            .transpose()?;
+        let placement = resolve_placement(&cfg)?;
+        let (model, mtp_model) = load_models(
+            &backend,
+            &model_path,
+            cfg.n_gpu_layers,
+            &placement,
+            bundled_mtp_requested(&cfg),
+            sidecar_path.as_deref(),
+            cfg.speculative
+                .as_ref()
+                .and_then(|m| m.n_gpu_layers)
+                .or(cfg.n_gpu_layers),
+        )?;
 
         let model_hf_repo = match parse_model_ref(&cfg.model) {
             Ok(ModelRef::Hf(hf_ref)) => Some(hf_ref.repo),
@@ -207,6 +262,7 @@ impl LlamaCppProvider {
         let key = ModelCacheKey {
             model_path: model_path.to_string_lossy().to_string(),
             n_gpu_layers: cfg.n_gpu_layers,
+            placement: resolve_placement(&cfg)?,
             load_mtp: bundled_mtp_requested(&cfg),
             mtp_model_path: mtp_model_path
                 .as_ref()
@@ -238,28 +294,15 @@ impl LlamaCppProvider {
                 model_path.display()
             )));
         }
-        let model = Arc::new(
-            LlamaModel::load_from_file(
-                &backend,
-                model_path,
-                &target_model_params(cfg.n_gpu_layers, key.load_mtp),
-            )
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?,
-        );
-
-        let mtp_model = if let Some(path) = &key.mtp_model_path {
-            let mut params = LlamaModelParams::default();
-            if let Some(n) = key.mtp_n_gpu_layers {
-                params = params.with_n_gpu_layers(n);
-            }
-            Some(Arc::new(
-                LlamaModel::load_from_file(&backend, Path::new(path), &params).map_err(|e| {
-                    LLMError::ProviderError(format!("Failed to load MTP sidecar: {e}"))
-                })?,
-            ))
-        } else {
-            None
-        };
+        let (model, mtp_model) = load_models(
+            &backend,
+            model_path,
+            key.n_gpu_layers,
+            &key.placement,
+            key.load_mtp,
+            key.mtp_model_path.as_deref().map(Path::new),
+            key.mtp_n_gpu_layers,
+        )?;
 
         let model_hf_repo = match parse_model_ref(&cfg.model) {
             Ok(ModelRef::Hf(hf_ref)) => Some(hf_ref.repo),
@@ -655,8 +698,9 @@ impl LLMProvider for LlamaCppProvider {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelCacheKey, bundled_mtp_requested, target_model_params};
+    use super::{ModelCacheKey, bundled_mtp_requested, sidecar_model_params, target_model_params};
     use crate::config::{LlamaCppConfig, SpeculativeConfig, SpeculativeType};
+    use crate::placement::ResolvedPlacement;
 
     fn base_config() -> LlamaCppConfig {
         LlamaCppConfig {
@@ -698,6 +742,10 @@ mod tests {
             backend_sampling: None,
             json_schema: None,
             grammar_backend: None,
+            devices: None,
+            tensor_split: None,
+            split_mode: None,
+            main_gpu: None,
         }
     }
 
@@ -709,6 +757,7 @@ mod tests {
             n_min: None,
             p_min: None,
             n_gpu_layers: None,
+            main_gpu: None,
         })
     }
 
@@ -726,19 +775,65 @@ mod tests {
 
     #[test]
     fn target_params_enable_mtp_only_when_requested() {
+        let p = ResolvedPlacement::default();
         assert!(
-            !target_model_params(None, false).load_mtp(),
+            !target_model_params(&p, None, false).unwrap().load_mtp(),
             "load_mtp stays off by default"
         );
         assert!(
-            target_model_params(Some(33), true).load_mtp(),
+            target_model_params(&p, Some(33), true).unwrap().load_mtp(),
             "load_mtp enabled when requested"
         );
         assert_eq!(
-            target_model_params(Some(33), false).n_gpu_layers(),
+            target_model_params(&p, Some(33), false)
+                .unwrap()
+                .n_gpu_layers(),
             33,
             "gpu layers preserved"
         );
+    }
+
+    fn placement_for(extra: &str) -> ResolvedPlacement {
+        use crate::placement::DeviceInfo;
+        let cfg: LlamaCppConfig =
+            serde_json::from_str(&format!(r#"{{"model":"m.gguf",{extra}}}"#)).unwrap();
+        let devs: Vec<DeviceInfo> = (0..2)
+            .map(|index| DeviceInfo {
+                index,
+                name: format!("CUDA{index}"),
+            })
+            .collect();
+        ResolvedPlacement::resolve(&cfg, &devs).unwrap()
+    }
+
+    #[test]
+    fn target_params_carry_tensor_split() {
+        let p = placement_for(r#""tensor_split":[3,1]"#);
+        let params = target_model_params(&p, None, false).unwrap();
+        assert_eq!(&params.tensor_split()[..2], &[3.0, 1.0]);
+    }
+
+    #[test]
+    fn sidecar_params_never_split() {
+        let p = placement_for(r#""tensor_split":[3,1],"split_mode":"layer""#);
+        let params = sidecar_model_params(&p, Some(7)).unwrap();
+        assert!(params.tensor_split().is_empty(), "sidecar is not split");
+        assert_eq!(params.n_gpu_layers(), 7);
+    }
+
+    #[test]
+    fn cache_key_distinguishes_placement() {
+        let base = ModelCacheKey {
+            model_path: "/path/to/model.gguf".to_string(),
+            n_gpu_layers: None,
+            placement: placement_for(r#""tensor_split":[3,1]"#),
+            load_mtp: false,
+            mtp_model_path: None,
+            mtp_n_gpu_layers: None,
+        };
+        let mut other = base.clone();
+        other.placement = placement_for(r#""tensor_split":[1,1]"#);
+        assert_ne!(base, other, "tensor_split must invalidate the cache key");
     }
 
     #[test]
@@ -746,6 +841,7 @@ mod tests {
         let base = ModelCacheKey {
             model_path: "/path/to/model.gguf".to_string(),
             n_gpu_layers: None,
+            placement: ResolvedPlacement::default(),
             load_mtp: false,
             mtp_model_path: None,
             mtp_n_gpu_layers: None,

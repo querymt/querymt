@@ -461,8 +461,31 @@ Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models,
 | `enable_thinking` | bool | Render the chat template with reasoning enabled (default: `true`) |
 | `reasoning_effort` | string | `"low"` \| `"medium"` \| `"high"` \| `"max"`; applied only when the chat template exposes `reasoning_effort`. A per-request override takes precedence |
 | `thinking_budget` | integer | Maximum reasoning tokens per reply. When spent, the provider closes the reasoning block so the model must answer. The budget is reduced to fit within `max_tokens` (leaving room for the closing marker and at least one answer token), so with the default cap of 256 a budget of 4,096 allows fewer than 256 reasoning tokens; it is disabled when the cap cannot fit the marker plus one answer token. Unset = unbounded; not applied with `speculative` decoding, with schema-constrained output (`json_schema`), or to plain non-streaming chat calls |
+| `devices` | string[] | Backend devices to load the model onto, by ggml name (case-insensitive), e.g. `["CUDA0", "CUDA1"]`. Unset = all detected GPUs. See [Multi-GPU placement](#multi-gpu-placement) |
+| `tensor_split` | float[] | Relative share of the model per device, in `devices` order (`[3, 1]` = 75% / 25%). Unset = proportional to free memory |
+| `split_mode` | string | `"none"` \| `"layer"` (llama.cpp default) \| `"row"` \| `"tensor"` (experimental) |
+| `main_gpu` | integer | Index into `devices` of the GPU used for the whole model (`split_mode = "none"`) or intermediate results (`"row"`). Default `0` |
 | `mmproj_path` | string | Path to multimodal projection file (vision models only) |
 | `grammar_backend` | string | `"llguidance"` (default) \| `"gbnf"`. Engine that enforces tool-call grammars; see [Tool-call grammars](#tool-call-grammars) |
+
+#### Multi-GPU placement
+
+Place a model deliberately across several GPUs, for example a small GPU beside a large one:
+
+```toml
+[providers.config]
+model = "/path/to/model.gguf"
+n_gpu_layers = 99
+devices = ["CUDA0", "CUDA1"]
+tensor_split = [3, 1]        # 75% of the model on CUDA0, 25% on CUDA1
+```
+
+- Device names are llama.cpp's ggml names (as printed by `llama-cli --list-devices`). An unknown name fails configuration with an error listing the available devices.
+- `tensor_split` shares are relative and parallel to `devices`; they may be shorter than `devices` (remaining devices get no share) but not longer. Shares must be finite, non-negative and not all zero. It cannot be combined with `split_mode = "none"`.
+- `main_gpu` is an index into `devices`, and is range-checked against it.
+- Changing any placement option reloads the model instead of reusing the cached one.
+- An MTP `speculative` sidecar model is never split: it loads on a single device from the same `devices` list, chosen by `speculative.main_gpu` (default: the target's `main_gpu`). Bundled MTP tensors follow the target model's placement.
+- The startup memory advisory estimates against a single GPU, so it can over-warn for split setups.
 
 #### Tool-call grammars
 
