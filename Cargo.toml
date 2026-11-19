@@ -84,6 +84,10 @@ agent-client-protocol = { version = "5.4", features = ["unstable", "schemars"] }
 rust-stemmers = "1.2"
 mockall = "0.15"
 rusqlite = { version = "0.43", features = ["bundled"] }
+# pyo3 sets `links = "pyo3-python"` and pyo3-async-runtimes 0.N requires pyo3 0.N:
+# always bump these two together.
+pyo3 = { version = "0.30", features = ["abi3-py310"] }
+pyo3-async-runtimes = { version = "0.30", features = ["attributes", "tokio-runtime"] }
 
 [profile.dev]
 debug = "line-tables-only"

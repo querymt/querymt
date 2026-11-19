@@ -62,7 +62,7 @@ struct PyChatResponse {
     output: Option<Value>,
 }
 
-#[pyclass(name = "Usage", skip_from_py_object)]
+#[pyclass(name = "Usage")]
 #[derive(Clone)]
 struct PyUsage {
     #[pyo3(get)]
@@ -83,7 +83,7 @@ struct PyUsage {
     cache_write_1h_tokens: Option<u32>,
 }
 
-#[pyclass(name = "ToolCall", skip_from_py_object)]
+#[pyclass(name = "ToolCall")]
 #[derive(Clone)]
 struct PyToolCall {
     #[pyo3(get)]
@@ -96,7 +96,7 @@ struct PyToolCall {
     arguments: String,
 }
 
-#[pyclass(name = "StreamChunk", skip_from_py_object)]
+#[pyclass(name = "StreamChunk")]
 #[derive(Clone)]
 struct PyStreamChunk {
     #[pyo3(get)]
