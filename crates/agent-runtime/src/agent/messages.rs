@@ -211,6 +211,7 @@ pub struct SessionDeliveryBarrier;
 #[derive(Serialize, Deserialize)]
 pub struct SessionDeliveryObservation {
     pub runtime: SessionRuntimeStatus,
+    /// Zero when there is no live actor and no marker was emitted.
     pub tip: i64,
 }
 

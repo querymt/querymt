@@ -249,18 +249,9 @@ impl LocalAgentHandle {
         if let Some(actor) = self.owned_session_ref(session_id).await {
             return actor.session_delivery_barrier().await.map_err(Error::from);
         }
-        let config = self
-            .hosting_config(session_id)
-            .await
-            .ok_or_else(|| Error::internal_error().data("session event stream is unavailable"))?;
-        let tip = config
-            .event_sink
-            .session_stream(session_id)
-            .emit_ephemeral_seq(AgentEventKind::RuntimeChanged {
-                runtime: runtime.clone(),
-            })
-            .await;
-        Ok(crate::agent::messages::SessionDeliveryObservation { runtime, tip })
+        // No live actor can publish a marker; keep the observation without
+        // materializing a runtime just to synthesize one.
+        Ok(crate::agent::messages::SessionDeliveryObservation { runtime, tip: 0 })
     }
 
     pub(super) async fn handle_ext_session_undo(

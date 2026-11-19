@@ -39,6 +39,7 @@ enum SubmissionBehavior {
     WrongReceiptId,
     Unavailable,
     RejectSubmission,
+    StartSubmission,
 }
 
 impl MockAcp {
@@ -255,6 +256,9 @@ async fn serve_acp(
                 match behavior {
                     SubmissionBehavior::MissingReceiptStatus => {
                         json!({"data": {"input_id": input_id}})
+                    }
+                    SubmissionBehavior::StartSubmission => {
+                        json!({"status": "started", "data": {"input_id": input_id}})
                     }
                     SubmissionBehavior::WrongReceiptId => {
                         json!({"status": "queued", "data": {"input_id": "wrong-input"}})
@@ -896,6 +900,17 @@ async fn new_session_reports_unobserved_status_without_losing_its_id() {
 }
 
 #[tokio::test]
+async fn started_receipt_is_reported_as_started() {
+    let backend = MockAcp::with_submission(SubmissionBehavior::StartSubmission).await;
+    let mut mcp = Mcp::start(&backend.url, false).await;
+    let response = mcp.tool("prompt", json!({"session_id": "fixture-session", "delivery": "queue", "until_idle": false, "text": "x"})).await;
+    assert_eq!(response["isError"], false, "{response}");
+    let result = &response["structuredContent"];
+    assert_eq!(result["delivery"], "queue");
+    assert_eq!(result["stopReason"], "started");
+}
+
+#[tokio::test]
 async fn invalid_receipts_stay_unconfirmed_and_stop_a_batch() {
     for behavior in [
         SubmissionBehavior::MissingReceiptStatus,
@@ -1187,6 +1202,7 @@ async fn session_listing_discloses_remaining_pages_on_each_return_path() {
         for (args, cursor, truncated) in [
             (json!({}), json!("page-2"), true),
             (json!({"limit": 1}), json!("page-2"), true),
+            (json!({"limit": 0}), Value::Null, true),
             (json!({"cursor": "page-2"}), Value::Null, false),
             (json!({"all": true}), Value::Null, false),
         ] {
@@ -1229,6 +1245,7 @@ async fn existing_sessions_keep_their_stored_cwd() {
         json!({"name": "prompt", "arguments": {"new": true, "text": "x"}}),
         json!({"name": "prompt", "arguments": {"new": true, "cwd": "/tmp", "delivery": "steer", "text": "x"}}),
         json!({"name": "prompt", "arguments": {"session_id": "fixture-session", "cwd": "/tmp", "text": "x"}}),
+        json!({"name": "prompt", "arguments": {"session_id": "fixture-session", "profile": "beta", "text": "x"}}),
     ] {
         let result = mcp
             .tool(

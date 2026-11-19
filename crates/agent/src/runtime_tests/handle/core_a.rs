@@ -1560,7 +1560,7 @@ async fn loaded_profile_session_replays_through_the_top_level_handle() {
 }
 
 #[tokio::test]
-async fn replay_does_not_materialize_an_unloaded_profile_runtime() {
+async fn barrier_and_replay_do_not_materialize_an_unloaded_profile_runtime() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct CountingCatalog(Arc<AtomicUsize>);
     #[async_trait]
@@ -1573,7 +1573,7 @@ async fn replay_does_not_materialize_an_unloaded_profile_runtime() {
             _id: &str,
         ) -> anyhow::Result<crate::profiles::ProfileDocument> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            anyhow::bail!("replay must not build this profile")
+            anyhow::bail!("observation must not build this profile")
         }
     }
     let f = RealStorageHandleFixture::new().await;
@@ -1597,6 +1597,16 @@ async fn replay_does_not_materialize_an_unloaded_profile_runtime() {
         },
     ));
     f.handle.set_profiles(profiles.clone());
+
+    let idle = crate::agent::messages::SessionRuntimeStatus::Idle;
+    let marker = f
+        .handle
+        .session_delivery_barrier(&session_id, idle.clone())
+        .await
+        .unwrap();
+    assert_eq!(marker.runtime, idle);
+    assert_eq!(marker.tip, 0);
+    assert_eq!(builds.load(Ordering::SeqCst), 0);
 
     let _ = crate::acp::stdio::replay_loaded_session(
         &f.handle,

@@ -187,6 +187,42 @@ async fn prompt_keeps_prefix_when_idle_barrier_delivers_more_text() {
 }
 
 #[tokio::test]
+async fn follow_timeout_bounds_stalled_resume_and_load() {
+    for stalled in ["session/resume", "session/load"] {
+        let server = MockServer::start(move |request| match request["method"].as_str() {
+            Some(method) if method == stalled => Reply::Pending,
+            Some("session/resume") => Reply::Result(json!({})),
+            _ => unexpected(request),
+        })
+        .await;
+        let output = invoke(
+            cli().args([
+                "--url",
+                &server.url,
+                "--quiet",
+                "follow",
+                "session-1",
+                "--timeout",
+                "1",
+            ]),
+            None,
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(4), "{output:?}");
+        let error = events(&output).pop().unwrap();
+        assert_eq!(error["recovery"]["stage"], "open");
+        assert_eq!(error["recovery"]["sessionId"], "session-1");
+        assert!(
+            server
+                .finish()
+                .await
+                .iter()
+                .any(|request| request["method"] == stalled)
+        );
+    }
+}
+
+#[tokio::test]
 async fn follow_collects_live_text_during_attachment_and_before_idle() {
     let server = MockServer::start(|request| match request["method"].as_str() {
         Some("session/resume") => Reply::Result(json!({})),
@@ -443,6 +479,7 @@ async fn exec_checks_cwd_before_any_mutation_including_nested_commands() {
         "new --cwd relative",
         "exec 'new --cwd relative'",
         "prompt --cwd /tmp worker-b work",
+        "prompt --profile beta worker-b work",
     ] {
         let server = MockServer::start(unexpected).await;
         let output = invoke(
@@ -510,6 +547,81 @@ async fn blank_payloads_are_usage_errors_without_submission() {
 
 fn listed(id: &str) -> Value {
     json!({"sessionId": id, "cwd": "/workspace", "title": id})
+}
+
+#[tokio::test]
+async fn sessions_limit_never_advances_past_a_partial_page() {
+    for (limit, expected_cursor) in [
+        ("3", Value::Null),
+        ("2", json!("second")),
+        ("0", Value::Null),
+    ] {
+        let server = MockServer::start(|request| {
+            assert_eq!(request["method"], "session/list");
+            if request["params"]["cursor"] == "second" {
+                Reply::Result(
+                    json!({"sessions": [listed("c"), listed("d")], "nextCursor": "third"}),
+                )
+            } else {
+                assert!(request["params"]["cursor"].is_null());
+                Reply::Result(
+                    json!({"sessions": [listed("a"), listed("b")], "nextCursor": "second"}),
+                )
+            }
+        })
+        .await;
+        let output = invoke(
+            cli().args([
+                "--url",
+                &server.url,
+                "--quiet",
+                "sessions",
+                "--all",
+                "--limit",
+                limit,
+            ]),
+            None,
+        )
+        .await;
+        assert!(output.status.success(), "{output:?}");
+        let result = events(&output).pop().unwrap();
+        assert_eq!(
+            result["sessions"].as_array().unwrap().len(),
+            limit.parse::<usize>().unwrap()
+        );
+        assert_eq!(result["nextCursor"], expected_cursor);
+        assert_eq!(result["truncated"], true);
+        server.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn started_receipt_is_reported_as_started() {
+    let server = MockServer::start(|request| {
+        assert_eq!(request["method"], "_querymt/session/queue");
+        Reply::Result(json!({"status": "started", "data": {"input_id": request["params"]["client_input_id"]}}))
+    }).await;
+    let output = invoke(
+        cli().args([
+            "--url",
+            &server.url,
+            "--quiet",
+            "prompt",
+            "--delivery",
+            "queue",
+            "--until-idle",
+            "false",
+            "target",
+            "work",
+        ]),
+        None,
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    let done = events(&output).pop().unwrap();
+    assert_eq!(done["delivery"], "queue");
+    assert_eq!(done["stopReason"], "started");
+    server.finish().await;
 }
 
 #[tokio::test]

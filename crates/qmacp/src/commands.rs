@@ -588,7 +588,7 @@ async fn sessions(
     if pinned.is_some() {
         require_pin_support(client, None).await?;
     }
-    let limit = limit.unwrap_or(if all { usize::MAX } else { 20 }).max(1);
+    let limit = limit.unwrap_or(if all { usize::MAX } else { 20 });
     let mut sessions = Vec::new();
     let mut next = cursor;
     let mut pages = 0usize;
@@ -606,18 +606,16 @@ async fn sessions(
             .list_sessions(cwd.clone(), next.clone(), filters.clone())
             .await
             .map_err(CliError::from_request)?;
-        for item in page.sessions {
-            sessions.push(session::session_summary(&item));
-        }
-        if sessions.len() >= limit {
+        let (next_cursor, partial) = session::append_session_page(&mut sessions, page, limit);
+        if partial || sessions.len() >= limit {
             return Ok(json!({
                 "cwd": cwd,
                 "sessions": sessions,
-                "nextCursor": page.next_cursor,
-                "truncated": page.next_cursor.is_some(),
+                "nextCursor": next_cursor,
+                "truncated": partial || next_cursor.is_some(),
             }));
         }
-        match page.next_cursor {
+        match next_cursor {
             Some(cursor) if all => next = Some(cursor),
             next_cursor => {
                 return Ok(json!({
@@ -989,7 +987,7 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
     } = args;
     let (session_id, text) = parse_prompt_args(new, args)?;
     let text = read_prompt_text(text)?;
-    session::validate_prompt(new, cwd.as_deref(), false, delivery)
+    session::validate_prompt(new, cwd.as_deref(), false, profile.as_deref(), delivery)
         .map_err(|error| CliError::Usage(error.into()))?;
     let cwd = if new {
         Some(session::resolve_cwd(cwd).map_err(CliError::rpc)?)
@@ -1071,13 +1069,9 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
                 "clientInputId": submitted["clientInputId"], "receipt": submitted,
             }))
             .map_err(|error| CliError::rpc(error).with_recovery(recovery.clone()))?;
+            let reason = session::submission_stop_reason(&submitted).to_owned();
             receipt = Some(submitted);
-            if chosen == Delivery::Steer {
-                "steered"
-            } else {
-                "queued"
-            }
-            .to_string()
+            reason
         }
         Delivery::Auto => unreachable!("auto is resolved before send"),
     };
@@ -1249,8 +1243,12 @@ async fn exec(
 fn validate_batch_command(command: &Command) -> Result<(), CliError> {
     let validation = match command {
         Command::Prompt {
-            new, cwd, delivery, ..
-        } => session::validate_prompt(*new, cwd.as_deref(), false, *delivery),
+            new,
+            cwd,
+            profile,
+            delivery,
+            ..
+        } => session::validate_prompt(*new, cwd.as_deref(), false, profile.as_deref(), *delivery),
         Command::New { cwd, .. }
         | Command::Sessions { cwd, .. }
         | Command::Find { cwd, .. }

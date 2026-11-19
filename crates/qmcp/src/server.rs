@@ -103,10 +103,15 @@ impl QmcpServer {
                 }
             }
         };
-        while let Ok(event) = event_rx.try_recv() {
-            log.push(event);
-        }
+        drain_final_events(&mut event_rx, &mut log);
         log.attach(state.finish(result))
+    }
+}
+
+fn drain_final_events(event_rx: &mut mpsc::Receiver<Value>, log: &mut EventLog) {
+    event_rx.close();
+    while let Ok(event) = event_rx.try_recv() {
+        log.push(event);
     }
 }
 
@@ -209,6 +214,19 @@ fn tool_catalog() -> Result<Vec<Tool>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn final_drain_closes_intake_and_preserves_buffered_events() {
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.try_send(json!({"index": 1})).unwrap();
+        let mut log = EventLog::default();
+        drain_final_events(&mut rx, &mut log);
+        assert!(matches!(
+            tx.try_send(json!({"index": 2})),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        assert_eq!(log.attach(json!({}))["events"], json!([{"index": 1}]));
+    }
 
     #[tokio::test]
     async fn cancellation_during_connection_setup_releases_the_socket_promptly() {
@@ -357,6 +375,16 @@ mod tests {
             );
         };
         let cwd = std::env::current_dir().unwrap();
+        for profile in [Value::Null, json!("beta")] {
+            check(
+                "prompt",
+                json!({"session_id": "s", "text": "x", "profile": profile}),
+            );
+            check(
+                "prompt",
+                json!({"new": true, "cwd": cwd, "text": "x", "profile": profile}),
+            );
+        }
         for delivery in ["auto", "prompt", "steer", "queue"] {
             check(
                 "prompt",
