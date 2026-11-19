@@ -2,6 +2,8 @@
 //! workspace, nested forks and worktree children, and per-session actions.
 
 use std::collections::{BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
@@ -14,7 +16,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{Page, QmtApp, SessionTab, kit};
-use crate::store::{SessionSummary, Worktree};
+use crate::store::{AgentsStore, SessionSummary, Worktree};
 use crate::theme::{Palette, palette};
 use crate::util::{absolute_time, short_time, workspace_name};
 
@@ -93,8 +95,182 @@ struct AgentInfo {
     can_delete: bool,
 }
 
+/// One entry of the virtualized session list.
+pub(super) enum Entry {
+    Head(GroupHead),
+    Row {
+        s: Box<SessionSummary>,
+        scope: String,
+        in_pinned: bool,
+        depth: usize,
+        /// Row state kept outside the summary (expanded, pending, error).
+        state_sig: u64,
+    },
+    More {
+        key: String,
+        more: usize,
+    },
+    ChildError {
+        agent: String,
+        id: String,
+        row_key: SharedString,
+        depth: usize,
+        error: String,
+    },
+    Note {
+        parent: SharedString,
+        depth: usize,
+        text: &'static str,
+    },
+}
+
+#[derive(Hash)]
+pub(super) struct GroupHead {
+    key: String,
+    name: String,
+    kind: GroupKind,
+    collapsed: bool,
+    total: usize,
+    latest: String,
+    running: usize,
+    machines: Vec<String>,
+    has_local: bool,
+    owner: Option<String>,
+    /// First entry of the list: no gap above.
+    first: bool,
+}
+
+fn hash_of(f: impl FnOnce(&mut std::collections::hash_map::DefaultHasher)) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    f(&mut h);
+    h.finish()
+}
+
+/// Indent of the notes under the children of a row at `depth`.
+fn child_indent(depth: usize) -> Pixels {
+    px((depth + 1) as f32 * CHILD_INDENT + 30.)
+}
+
+/// Everything about a summary that shows in its row.
+fn hash_summary(s: &SessionSummary, h: &mut impl Hasher) {
+    (
+        &s.agent_id,
+        &s.id,
+        &s.cwd,
+        &s.title,
+        &s.updated_at,
+        &s.phase,
+    )
+        .hash(h);
+    (
+        s.root,
+        s.open,
+        s.resolved,
+        s.archived,
+        s.lifecycle_known,
+        s.pinned,
+    )
+        .hash(h);
+    (s.messages, s.has_errors, s.fork_count, s.has_children).hash(h);
+    (&s.parent, &s.fork_origin).hash(h);
+    s.worktree.as_ref().map(|w| format!("{w:?}")).hash(h);
+    s.remote
+        .as_ref()
+        .map(|r| (&r.node_id, &r.label, r.connected))
+        .hash(h);
+}
+
+impl Entry {
+    /// Changes whenever the entry's rendered height may change.
+    fn sig(&self) -> u64 {
+        hash_of(|h| match self {
+            Entry::Head(head) => (0u8, head).hash(h),
+            Entry::Row {
+                s,
+                scope,
+                in_pinned,
+                depth,
+                state_sig,
+            } => {
+                (1u8, scope, in_pinned, depth, state_sig).hash(h);
+                hash_summary(s, h);
+            }
+            Entry::More { key, more } => (2u8, key, more).hash(h),
+            Entry::ChildError {
+                row_key,
+                depth,
+                error,
+                ..
+            } => (3u8, row_key.as_ref(), depth, error).hash(h),
+            Entry::Note {
+                parent,
+                depth,
+                text,
+            } => (4u8, parent.as_ref(), depth, text).hash(h),
+        })
+    }
+}
+
+/// Virtualized Sessions page list: only the entries in view are built and
+/// laid out. Laying out every expanded row each frame made scrolling a few
+/// hundred sessions drop to 2-3 frames per second.
+pub(super) struct SessionList {
+    pub(super) state: ListState,
+    entries: Rc<Vec<Entry>>,
+    sigs: Vec<u64>,
+    rc: Option<Rc<RowCtx>>,
+    /// Inputs affecting every row (tab, agent column): a change starts over.
+    global: Option<u64>,
+}
+
+impl Default for SessionList {
+    fn default() -> Self {
+        Self {
+            state: ListState::new(0, ListAlignment::Top, px(600.)),
+            entries: Rc::default(),
+            sigs: Vec::new(),
+            rc: None,
+            global: None,
+        }
+    }
+}
+
+impl SessionList {
+    /// Replace the entries, invalidating only the ones whose height may have
+    /// changed so the list keeps its measurements and scroll position.
+    fn sync(&mut self, entries: Vec<Entry>, rc: RowCtx, global: u64) {
+        let sigs: Vec<u64> = entries.iter().map(Entry::sig).collect();
+        if self.global != Some(global) || self.state.item_count() != self.sigs.len() {
+            self.state.reset(sigs.len());
+        } else if self.sigs.len() == sigs.len() {
+            for (ix, (old, new)) in self.sigs.iter().zip(&sigs).enumerate() {
+                if old != new {
+                    self.state.remeasure_items(ix..ix + 1);
+                }
+            }
+        } else {
+            let old = &self.sigs;
+            let prefix = old.iter().zip(&sigs).take_while(|(a, b)| a == b).count();
+            let max_suffix = old.len().min(sigs.len()) - prefix;
+            let suffix = old
+                .iter()
+                .rev()
+                .zip(sigs.iter().rev())
+                .take(max_suffix)
+                .take_while(|(a, b)| a == b)
+                .count();
+            self.state
+                .splice(prefix..old.len() - suffix, sigs.len() - prefix - suffix);
+        }
+        self.global = Some(global);
+        self.sigs = sigs;
+        self.entries = Rc::new(entries);
+        self.rc = Some(Rc::new(rc));
+    }
+}
+
 /// Values every row of one render needs.
-struct RowCtx {
+pub(super) struct RowCtx {
     p: Palette,
     agents: HashMap<String, AgentInfo>,
     show_agent: bool,
@@ -102,8 +278,8 @@ struct RowCtx {
     searching: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GroupKind {
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum GroupKind {
     Pinned,
     Recent,
     Workspace,
@@ -364,6 +540,28 @@ impl QmtApp {
         if !rc.searching {
             self.session_groups.initialize(&groups);
         }
+        let has_groups = !groups.is_empty();
+        let mut entries = Vec::new();
+        for (i, g) in groups.into_iter().enumerate() {
+            self.push_group_entries(&mut entries, g, i == 0, &rc, store);
+        }
+        // Inputs every row depends on: a change rebuilds the whole list.
+        let global = hash_of(|h| {
+            (rc.show_agent, rc.all_tab, rc.searching).hash(h);
+            let mut agents: Vec<_> = rc.agents.iter().collect();
+            agents.sort_by(|a, b| a.0.cmp(b.0));
+            for (id, a) in agents {
+                (
+                    id,
+                    &a.name,
+                    a.connected,
+                    a.can_pin,
+                    a.can_lifecycle,
+                    a.can_delete,
+                )
+                    .hash(h);
+            }
+        });
 
         // ---- header
         let header = h_flex()
@@ -481,6 +679,7 @@ impl QmtApp {
                 .child(retry("sessions-retry-inline", "Retry", cx))
         });
 
+        let mut list_body = false;
         let body = if connected.is_empty() && roots.is_empty() {
             state_panel(
                 IconName::PlugZap,
@@ -521,7 +720,7 @@ impl QmtApp {
                 ),
                 &p,
             )
-        } else if groups.is_empty() && !query.is_empty() {
+        } else if !has_groups && !query.is_empty() {
             state_panel(
                 IconName::SearchX,
                 "No matching sessions",
@@ -539,7 +738,7 @@ impl QmtApp {
                 ),
                 &p,
             )
-        } else if groups.is_empty() {
+        } else if !has_groups {
             let (icon, title, text) = match tab {
                 SessionTab::Resolved => (
                     IconName::CircleCheck,
@@ -579,25 +778,47 @@ impl QmtApp {
                 &p,
             )
         } else {
-            let out: Vec<AnyElement> = groups
-                .into_iter()
-                .map(|g| self.session_group(g, &rc, cx))
-                .collect();
-            v_flex().gap_2().children(out).into_any_element()
+            self.session_list.sync(entries, rc, global);
+            list_body = true;
+            let render =
+                cx.processor(|this: &mut Self, ix: usize, _, cx| this.render_session_entry(ix, cx));
+            list(self.session_list.state.clone(), move |ix, window, cx| {
+                render(ix, window, cx)
+            })
+            .size_full()
+            .pb_6()
+            .into_any_element()
         };
 
-        div().w_full().flex().justify_center().px_8().py_6().child(
+        let top = div().w_full().flex().justify_center().px_8().pt_6().child(
             v_flex()
                 .w_full()
                 .max_w(px(1040.))
                 .gap_4()
+                .pb_4()
                 .child(header)
                 .child(search)
                 .child(tabs)
                 .children(coverage)
-                .children(inline_error)
-                .child(body),
-        )
+                .children(inline_error),
+        );
+        // The list scrolls itself below the fixed header; the state panels
+        // scroll with the page column.
+        v_flex().size_full().child(top).child(if list_body {
+            div().flex_1().min_h_0().child(body).into_any_element()
+        } else {
+            div()
+                .id("sessions-body")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .justify_center()
+                .px_8()
+                .pb_6()
+                .child(div().w_full().max_w(px(1040.)).child(body))
+                .into_any_element()
+        })
     }
 
     /// Prefill the Start page with this workspace and agent, then focus the prompt.
@@ -617,8 +838,15 @@ impl QmtApp {
         self.new_session(window, cx);
     }
 
-    fn session_group(&self, group: Group, rc: &RowCtx, cx: &mut Context<Self>) -> AnyElement {
-        let p = &rc.p;
+    /// Flat list entries of `group`: its head, then (when open) its rows.
+    fn push_group_entries(
+        &self,
+        out: &mut Vec<Entry>,
+        group: Group,
+        first: bool,
+        rc: &RowCtx,
+        store: &AgentsStore,
+    ) {
         let Group {
             key,
             name,
@@ -640,11 +868,12 @@ impl QmtApp {
         } else {
             total.min(GROUP_ROWS)
         };
-        let hover = p.card;
         // Machines of remote sessions in this workspace.
-        let machines: BTreeSet<String> = sessions
+        let machines: Vec<String> = sessions
             .iter()
             .filter_map(|s| s.remote.as_ref().map(|r| r.name()))
+            .collect::<BTreeSet<String>>()
+            .into_iter()
             .collect();
         let has_local = sessions.iter().any(|s| s.remote.is_none());
         // A local session's connected agent can start another one here.
@@ -656,8 +885,123 @@ impl QmtApp {
             })
             .flatten()
             .map(|s| s.agent_id.clone());
+        out.push(Entry::Head(GroupHead {
+            key: key.clone(),
+            name,
+            kind,
+            collapsed,
+            total,
+            latest,
+            running,
+            machines,
+            has_local,
+            owner,
+            first,
+        }));
+        if collapsed {
+            return;
+        }
+        for s in sessions.iter().take(shown) {
+            self.push_session_entries(out, s, &key, special, 0, rc, store);
+        }
+        if total > shown || expanded && total > GROUP_ROWS {
+            out.push(Entry::More {
+                key,
+                more: total - shown,
+            });
+        }
+    }
 
-        let (k1, k2) = (key.clone(), key.clone());
+    /// One entry of the virtualized list, centered like the page header.
+    fn render_session_entry(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let entries = self.session_list.entries.clone();
+        let (Some(entry), Some(rc)) = (entries.get(ix), self.session_list.rc.clone()) else {
+            return div().into_any_element();
+        };
+        let p = &rc.p;
+        let el = match entry {
+            Entry::Head(head) => self.render_group_head(head, &rc, cx),
+            Entry::Row {
+                s,
+                scope,
+                in_pinned,
+                depth,
+                ..
+            } => self.render_session_row(s, scope, *in_pinned, *depth, &rc, cx),
+            Entry::More { key, more } => {
+                let k = key.clone();
+                div()
+                    .id(kit::keyed("group-more", key.clone()))
+                    .ml(px(34.))
+                    .py_1()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(p.accent)
+                    .cursor_pointer()
+                    .child(if *more > 0 {
+                        format!("Show {more} more")
+                    } else {
+                        "Show less".into()
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.expanded.remove(&k) {
+                            this.expanded.insert(k.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }
+            Entry::ChildError {
+                agent,
+                id,
+                row_key,
+                depth,
+                error,
+            } => {
+                let (agent, id) = (agent.clone(), id.clone());
+                h_flex()
+                    .pl(child_indent(*depth))
+                    .py_1()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(p.danger)
+                    .child(error.clone())
+                    .child(
+                        kit::button(kit::keyed("children-retry", row_key.clone()))
+                            .ghost()
+                            .xsmall()
+                            .label("Retry")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.store
+                                    .update(cx, |st, cx| st.load_children(&agent, &id, cx))
+                            })),
+                    )
+                    .into_any_element()
+            }
+            Entry::Note { depth, text, .. } => div()
+                .pl(child_indent(*depth))
+                .py_1()
+                .text_xs()
+                .text_color(p.dim)
+                .child(*text)
+                .into_any_element(),
+        };
+        div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .px_8()
+            .child(div().w_full().max_w(px(1040.)).child(el))
+            .into_any_element()
+    }
+
+    fn render_group_head(&self, h: &GroupHead, rc: &RowCtx, cx: &mut Context<Self>) -> AnyElement {
+        let p = &rc.p;
+        let key = h.key.clone();
+        let special = h.kind != GroupKind::Workspace;
+        let collapsed = h.collapsed;
+        let hover = p.card;
+        let k1 = key.clone();
         let trigger = h_flex()
             .id(kit::keyed("group-head", key.clone()))
             .flex_1()
@@ -669,9 +1013,9 @@ impl QmtApp {
             .cursor_pointer()
             .hover(move |s| s.bg(hover))
             .child(kit::icon(
-                if kind == GroupKind::Pinned {
+                if h.kind == GroupKind::Pinned {
                     IconName::Pin
-                } else if kind == GroupKind::Recent {
+                } else if h.kind == GroupKind::Recent {
                     IconName::Clock
                 } else if collapsed {
                     IconName::Folder
@@ -686,7 +1030,7 @@ impl QmtApp {
                     .flex_none()
                     .text_sm()
                     .font_semibold()
-                    .child(name.clone()),
+                    .child(h.name.clone()),
             )
             .when(!special && !key.is_empty(), |el| {
                 el.child(
@@ -706,9 +1050,9 @@ impl QmtApp {
                         .xsmall(),
                 )
             })
-            .when(!special && !machines.is_empty(), |el| {
-                let names: Vec<String> = machines.iter().cloned().collect();
-                let text = match (has_local, names.len()) {
+            .when(!special && !h.machines.is_empty(), |el| {
+                let names = &h.machines;
+                let text = match (h.has_local, names.len()) {
                     (true, 1) => format!("local + {}", names[0]),
                     (true, n) => format!("local + {n} machines"),
                     (false, 1) => names[0].clone(),
@@ -716,7 +1060,7 @@ impl QmtApp {
                 };
                 let tip = format!(
                     "{}remote workspace on {}",
-                    if has_local { "Local and " } else { "" },
+                    if h.has_local { "Local and " } else { "" },
                     names.join(", ")
                 );
                 el.child(with_tip(
@@ -726,17 +1070,20 @@ impl QmtApp {
                 ))
             })
             .child(div().flex_1())
-            .when(running > 0, |el| {
-                el.child(kit::tone_chip(format!("{running} running"), p.success))
+            .when(h.running > 0, |el| {
+                el.child(kit::tone_chip(format!("{} running", h.running), p.success))
             })
             .when(!special, |el| {
-                let short = div().text_xs().text_color(p.dim).child(short_time(&latest));
-                el.child(match absolute_time(&latest) {
+                let short = div()
+                    .text_xs()
+                    .text_color(p.dim)
+                    .child(short_time(&h.latest));
+                el.child(match absolute_time(&h.latest) {
                     Some(full) => with_tip(kit::keyed("group-time", key.clone()), short, full),
                     None => short.into_any_element(),
                 })
             })
-            .child(div().text_xs().text_color(p.dim).child(total.to_string()))
+            .child(div().text_xs().text_color(p.dim).child(h.total.to_string()))
             .child(kit::icon(
                 if collapsed {
                     IconName::ChevronRight
@@ -752,70 +1099,103 @@ impl QmtApp {
                     cx.notify();
                 }))
             });
-        let head = h_flex()
+        h_flex()
             .gap_1()
+            // The groups' former column gap.
+            .when(!h.first, |el| el.pt_2())
             .child(trigger)
-            .when_some(owner, |el, agent| {
+            .when_some(h.owner.clone(), |el, agent| {
                 let cwd = key.clone();
                 el.child(
                     kit::icon_button(
                         kit::keyed("group-new", key.clone()),
                         IconName::Plus,
-                        format!("New session in {name}"),
+                        format!("New session in {}", h.name),
                     )
                     .xsmall()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.new_session_in(cwd.clone(), agent.clone(), window, cx)
                     })),
                 )
-            });
-
-        let mut rows = Vec::new();
-        if !collapsed {
-            for s in sessions.iter().take(shown) {
-                self.push_session_rows(&mut rows, s, &key, special, 0, rc, cx);
-            }
-            if total > shown || expanded && total > GROUP_ROWS {
-                let more = total - shown;
-                rows.push(
-                    div()
-                        .id(kit::keyed("group-more", key.clone()))
-                        .ml(px(34.))
-                        .py_1()
-                        .text_xs()
-                        .font_medium()
-                        .text_color(p.accent)
-                        .cursor_pointer()
-                        .child(if more > 0 {
-                            format!("Show {more} more")
-                        } else {
-                            "Show less".into()
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if !this.expanded.remove(&k2) {
-                                this.expanded.insert(k2.clone());
-                            }
-                            cx.notify();
-                        }))
-                        .into_any_element(),
-                );
-            }
-        }
-        v_flex().child(head).children(rows).into_any_element()
+            })
+            .into_any_element()
     }
 
     /// The row of `s`, followed by its child sessions when expanded.
     #[allow(clippy::too_many_arguments)]
-    fn push_session_rows(
+    /// The entry of `s`, followed by its child sessions when expanded.
+    #[allow(clippy::too_many_arguments)]
+    fn push_session_entries(
         &self,
-        out: &mut Vec<AnyElement>,
+        out: &mut Vec<Entry>,
+        s: &SessionSummary,
+        scope: &str,
+        in_pinned: bool,
+        depth: usize,
+        rc: &RowCtx,
+        store: &AgentsStore,
+    ) {
+        let connected = rc.agents.get(&s.agent_id).is_some_and(|a| a.connected);
+        let open_key = format!("{}:{}", s.agent_id, s.id);
+        let expandable = (s.fork_count > 0 || s.has_children) && connected;
+        let expanded = expandable && self.session_children.contains(&open_key);
+        let rt = store.runtime(&s.agent_id);
+        let state_sig = hash_of(|h| {
+            expanded.hash(h);
+            rt.is_some_and(|r| r.session_pending.contains(&s.id))
+                .hash(h);
+            rt.and_then(|r| r.session_errors.get(&s.id)).hash(h);
+        });
+        out.push(Entry::Row {
+            s: Box::new(s.clone()),
+            scope: scope.to_string(),
+            in_pinned,
+            depth,
+            state_sig,
+        });
+        if !expanded {
+            return;
+        }
+        let row_key: SharedString = format!("{scope}/{}:{}", s.agent_id, s.id).into();
+        let note = |text: &'static str| Entry::Note {
+            parent: row_key.clone(),
+            depth,
+            text,
+        };
+        match rt.and_then(|r| r.children.get(&s.id)) {
+            Some(list) if list.error.is_some() && list.sessions.is_empty() => {
+                out.push(Entry::ChildError {
+                    agent: s.agent_id.clone(),
+                    id: s.id.clone(),
+                    row_key: row_key.clone(),
+                    depth,
+                    error: list.error.clone().unwrap_or_default(),
+                });
+            }
+            Some(list) if !list.sessions.is_empty() => {
+                if depth + 1 > MAX_DEPTH {
+                    out.push(note("Open this session to see deeper children."));
+                    return;
+                }
+                for child in &list.sessions {
+                    self.push_session_entries(out, child, scope, in_pinned, depth + 1, rc, store);
+                }
+            }
+            Some(list) if list.loaded && !list.loading => out.push(note("No child sessions.")),
+            _ => out.push(note("Loading child sessions…")),
+        }
+    }
+
+    /// The row of one session.
+    fn render_session_row(
+        &self,
         s: &SessionSummary,
         scope: &str,
         in_pinned: bool,
         depth: usize,
         rc: &RowCtx,
         cx: &mut Context<Self>,
-    ) {
+    ) -> AnyElement {
         let p = &rc.p;
         let info = rc.agents.get(&s.agent_id).cloned().unwrap_or_default();
         // A session can appear in several groups; keep each row's ids distinct.
@@ -823,14 +1203,11 @@ impl QmtApp {
         let open_key = format!("{}:{}", s.agent_id, s.id);
         let expandable = (s.fork_count > 0 || s.has_children) && info.connected;
         let expanded = expandable && self.session_children.contains(&open_key);
-        let (pending, action_error, children) = {
+        let (pending, action_error) = {
             let rt = self.store.read(cx).runtime(&s.agent_id);
             (
                 rt.is_some_and(|r| r.session_pending.contains(&s.id)),
                 rt.and_then(|r| r.session_errors.get(&s.id).cloned()),
-                expanded
-                    .then(|| rt.and_then(|r| r.children.get(&s.id).cloned()))
-                    .flatten(),
             )
         };
 
@@ -934,72 +1311,18 @@ impl QmtApp {
             .child(time);
 
         let hover = p.card;
-        out.push(
-            h_flex()
-                .id(kit::keyed("session-row", row_key.clone()))
-                .gap_1()
-                .pl(px(depth as f32 * CHILD_INDENT + 2.))
-                .pr_1()
-                .py_1p5()
-                .rounded(px(10.))
-                .hover(move |el| el.bg(hover))
-                .child(expander)
-                .child(main)
-                .child(self.session_menu(s, &info, pending, &row_key, cx))
-                .into_any_element(),
-        );
-
-        if !expanded {
-            return;
-        }
-        let indent = px((depth + 1) as f32 * CHILD_INDENT + 30.);
-        let note = |text: String| {
-            div()
-                .pl(indent)
-                .py_1()
-                .text_xs()
-                .text_color(p.dim)
-                .child(text)
-                .into_any_element()
-        };
-        match children {
-            Some(list) if list.error.is_some() && list.sessions.is_empty() => {
-                let (agent, id) = (s.agent_id.clone(), s.id.clone());
-                out.push(
-                    h_flex()
-                        .pl(indent)
-                        .py_1()
-                        .gap_2()
-                        .text_xs()
-                        .text_color(p.danger)
-                        .child(list.error.unwrap_or_default())
-                        .child(
-                            kit::button(kit::keyed("children-retry", row_key.clone()))
-                                .ghost()
-                                .xsmall()
-                                .label("Retry")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.store
-                                        .update(cx, |st, cx| st.load_children(&agent, &id, cx))
-                                })),
-                        )
-                        .into_any_element(),
-                );
-            }
-            Some(list) if !list.sessions.is_empty() => {
-                if depth + 1 > MAX_DEPTH {
-                    out.push(note("Open this session to see deeper children.".into()));
-                    return;
-                }
-                for child in &list.sessions {
-                    self.push_session_rows(out, child, scope, in_pinned, depth + 1, rc, cx);
-                }
-            }
-            Some(list) if list.loaded && !list.loading => {
-                out.push(note("No child sessions.".into()))
-            }
-            _ => out.push(note("Loading child sessions…".into())),
-        }
+        h_flex()
+            .id(kit::keyed("session-row", row_key.clone()))
+            .gap_1()
+            .pl(px(depth as f32 * CHILD_INDENT + 2.))
+            .pr_1()
+            .py_1p5()
+            .rounded(px(10.))
+            .hover(move |el| el.bg(hover))
+            .child(expander)
+            .child(main)
+            .child(self.session_menu(s, &info, pending, &row_key, cx))
+            .into_any_element()
     }
 
     /// Relationship, worktree, machine and lifecycle badges of one row.
