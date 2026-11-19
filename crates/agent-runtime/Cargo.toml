@@ -70,7 +70,7 @@ arc-swap = "1.7"
 once_cell = "1.21"
 parking_lot = "0.13"
 moka = { version = "0.12", features = ["future", "sync"] }
-rmcp = { version = "3.9", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-async-rw", "elicitation", "reqwest"] }
+rmcp = { version = "3.11", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-async-rw", "elicitation", "reqwest"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
@@ -100,14 +100,14 @@ querymt-workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-rmcp = { version = "3.9", features = ["transport-streamable-http-client-unix-socket"] }
+rmcp = { version = "3.11", features = ["transport-streamable-http-client-unix-socket"] }
 
 [dev-dependencies]
 rusqlite = { workspace = true, features = ["uuid", "time"] }
 querymt-agent-core = { path = "../agent-core", features = ["test-support"] }
 querymt-agent-sqlite = { path = "../agent-sqlite", features = ["test-support"] }
 querymt-agent-services = { path = "../agent-services", features = ["test-support"] }
-rmcp = { version = "3.9", features = ["server", "transport-streamable-http-server"] }
+rmcp = { version = "3.11", features = ["server", "transport-streamable-http-server"] }
 mockall.workspace = true
 env_logger = "0.11"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

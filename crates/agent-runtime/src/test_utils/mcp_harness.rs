@@ -19,9 +19,11 @@
 //! and `resources/read` from a mutable set of [`ScriptedSkill`]s. Switches
 //! ([`Tamper`], [`EntryMode`], `fail_list`) misbehave on purpose, and the
 //! [`ServerLog`] records every skills and resource request. The protocol
-//! version stays 2026-07-28. rmcp validates every entry the server sends, so
-//! entries that break the structural rules (for example a manifest without
-//! `SKILL.md`) surface as server-side errors rather than as bad data.
+//! version stays 2026-07-28. rmcp validates every entry the server sends and
+//! rejects the whole listing if one entry is invalid, so entries that break the
+//! structural or naming rules (for example a manifest without `SKILL.md`, or a
+//! name containing `.`) surface as server-side errors rather than as bad data.
+//! The client-side filter is covered by unit tests in `skills::mcp`.
 
 use crate::agent::core::McpToolState;
 use crate::agent::protocol::serve_mcp_client;
@@ -1328,42 +1330,6 @@ mod tests {
         assert_eq!(h.log.skills_list_calls.load(Ordering::SeqCst), 1);
         assert!(h.tool_state.load().skills.is_empty());
         assert!(h.tool_state.load().tools.contains_key("echo"));
-    }
-
-    #[tokio::test]
-    async fn dotted_skill_name_is_excluded_and_siblings_remain() {
-        let h = McpHarness::start(skills_on(vec![
-            ScriptedSkill::new("v1.2", "dotted"),
-            ScriptedSkill::new("good", "fine"),
-        ]))
-        .await;
-        assert_eq!(skill_names(&h.tool_state), ["harness.good"]);
-    }
-
-    /// rmcp validates entries on the server side, so a structurally invalid
-    /// entry cannot be served by the harness; the client-side filter is
-    /// exercised directly (it is the defence against non-rmcp servers).
-    #[test]
-    fn invalid_entry_is_excluded_and_valid_siblings_remain() {
-        use crate::skills::mcp::filter_listed_skills;
-        let valid = Skill::new(
-            "skill://ok/SKILL.md",
-            SkillFrontmatter::new("ok", "fine"),
-            SkillResources::Dynamic,
-        );
-        let bad_uri = Skill::new(
-            "skill://bad/README.md",
-            SkillFrontmatter::new("bad", "x"),
-            SkillResources::Dynamic,
-        );
-        let name_mismatch = Skill::new(
-            "skill://one/SKILL.md",
-            SkillFrontmatter::new("two", "x"),
-            SkillResources::Dynamic,
-        );
-        let kept = filter_listed_skills("srv", vec![bad_uri, valid, name_mismatch]);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].name(), "ok");
     }
 
     #[tokio::test]

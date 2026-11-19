@@ -30,9 +30,6 @@ pub const MCP_SKILL_LIST_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// resource read). A stalled server must not hang the `skill` tool call.
 pub const MCP_SKILL_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Longest accepted skill name, in characters (the Agent Skills name limit).
-pub const MCP_SKILL_NAME_MAX: usize = 64;
-
 /// One valid skill published by a connected MCP server.
 pub struct McpSkill {
     pub server_name: String,
@@ -42,7 +39,8 @@ pub struct McpSkill {
 }
 
 impl McpSkill {
-    /// The skill name from the frontmatter (never contains `.`).
+    /// The skill name from the frontmatter. [`Skill::validate`] guarantees it
+    /// never contains `.`.
     pub fn name(&self) -> &str {
         self.skill.name()
     }
@@ -96,24 +94,13 @@ pub fn server_name_is_eligible(server_name: &str) -> bool {
     !server_name.contains('.')
 }
 
-/// Names are shown to the model and used in callable IDs, so they must be
-/// non-empty, bounded and free of whitespace and control characters.
-fn check_skill_name(name: &str) -> Result<(), &'static str> {
-    if name.is_empty() {
-        return Err("empty");
-    }
-    if name.chars().count() > MCP_SKILL_NAME_MAX {
-        return Err("too long");
-    }
-    if name.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err("contains whitespace or control characters");
-    }
-    Ok(())
-}
-
-/// Keep only the usable entries of a listing: structurally valid, with a
-/// well-formed name without `.`; descriptions are sanitized. Dropped entries are logged with
-/// the server name and URI.
+/// Keep only the usable entries of a listing: those that pass
+/// [`Skill::validate`] (which includes the Agent Skills naming rule, so a name
+/// never contains `.`) and whose name is unique within the server. Descriptions
+/// are sanitized. Dropped entries are logged with the server name and URI.
+///
+/// Servers built on rmcp already validate what they send; this is the defence
+/// against the ones that do not.
 pub fn filter_listed_skills(server_name: &str, listed: Vec<Skill>) -> Vec<Skill> {
     let mut seen = std::collections::HashSet::new();
     let mut kept = Vec::new();
@@ -121,20 +108,6 @@ pub fn filter_listed_skills(server_name: &str, listed: Vec<Skill>) -> Vec<Skill>
         if let Err(error) = skill.validate() {
             log::warn!(
                 "MCP server '{server_name}': excluding invalid skill '{}': {error}",
-                skill.uri
-            );
-            continue;
-        }
-        if skill.name().contains('.') {
-            log::warn!(
-                "MCP server '{server_name}': excluding skill '{}': its name contains '.'",
-                skill.uri
-            );
-            continue;
-        }
-        if let Err(why) = check_skill_name(skill.name()) {
-            log::warn!(
-                "MCP server '{server_name}': excluding skill '{}': invalid name: {why}",
                 skill.uri
             );
             continue;
@@ -584,6 +557,48 @@ pub async fn load_mcp_skill(skill: &McpSkill) -> Result<LoadedMcpSkill, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::model::SkillFrontmatter;
+
+    fn listed(uri: &str, name: &str) -> Skill {
+        Skill::new(
+            uri,
+            SkillFrontmatter::new(name, "d"),
+            SkillResources::Dynamic,
+        )
+    }
+
+    #[test]
+    fn filter_drops_invalid_entries_and_keeps_valid_siblings() {
+        let long = "a".repeat(65);
+        let invalid = [
+            listed("skill://bad/README.md", "bad"),
+            listed("skill://one/SKILL.md", "two"),
+            listed("skill://v1.2/SKILL.md", "v1.2"),
+            listed("skill://Upper/SKILL.md", "Upper"),
+            listed("skill://a--b/SKILL.md", "a--b"),
+            listed("skill://-lead/SKILL.md", "-lead"),
+            listed(&format!("skill://{long}/SKILL.md"), &long),
+        ];
+        for bad in invalid {
+            let uri = bad.uri.clone();
+            let kept = filter_listed_skills("srv", vec![bad, listed("skill://ok/SKILL.md", "ok")]);
+            let names: Vec<_> = kept.iter().map(Skill::name).collect();
+            assert_eq!(names, ["ok"], "{uri} must be dropped");
+        }
+    }
+
+    #[test]
+    fn filter_keeps_the_first_of_two_entries_with_the_same_name() {
+        let kept = filter_listed_skills(
+            "srv",
+            vec![
+                listed("skill://a/x/SKILL.md", "x"),
+                listed("skill://b/x/SKILL.md", "x"),
+            ],
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].uri, "skill://a/x/SKILL.md");
+    }
 
     #[test]
     fn normalize_accepts_plain_relative_paths() {

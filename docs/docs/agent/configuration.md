@@ -221,7 +221,7 @@ mcp = true                # Offer skills published by connected MCP servers
 An MCP server that declares the MCP Skills extension (`io.modelcontextprotocol/skills`) publishes skills that appear in the `skill` tool next to local skills. Set `mcp = false` to hide and refuse all of them.
 
 - **IDs.** A server skill is listed and loaded as `<server>.<name>`, for example `docs.release-notes`. A local skill with the same ID wins and the server skill is dropped (one warning is logged).
-- **Server names.** A server whose name contains a `.` offers no skills (a warning is logged); its tools are unaffected. Skill names containing a `.` are ignored.
+- **Server names.** A server whose name contains a `.` offers no skills (a warning is logged); its tools are unaffected. Skill names must follow the Agent Skills naming rules (lowercase letters, digits and single hyphens, at most 64 characters, so never a `.`); other entries are ignored and a warning is logged.
 - **Visibility.** Server skills follow the tool configuration: they are hidden when the agent runs built-in tools only (a restricted `tools` list with no MCP selectors and no attached servers), when `skill` is not admitted by `tools`, when the allowlist lacks `server.*`, or when the denylist contains `server.*` or the bare server name.
 - **Listing text.** Descriptions from servers are reduced to one line of at most 1024 characters.
 - **Refresh.** The list follows `resources/list_changed` notifications. If a skill is requested that is not listed, the server's list is fetched once more before failing.

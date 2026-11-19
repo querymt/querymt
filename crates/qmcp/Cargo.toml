@@ -23,7 +23,7 @@ hmac = "0.12"
 qmacp = { path = "../qmacp" }
 querymt-utils = { path = "../querymt-utils", features = ["secret-store"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
-rmcp = { version = "3.9", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.11", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
