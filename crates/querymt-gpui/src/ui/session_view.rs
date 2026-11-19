@@ -19,7 +19,7 @@ use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::input::{Enter, IndentInline, OutdentInline, Textarea};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarMode};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::component::{Selectable as _, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -301,6 +301,12 @@ impl RenderCtx {
                 }
                 (self.running && ix >= self.last_turn_start).hash(&mut h);
                 (self.running && ix == self.last_ix).hash(&mut h);
+            }
+            ItemKind::User { .. } => {
+                self.expanded.contains(&item.key).hash(&mut h);
+                self.expanded
+                    .contains(&front_matter_key(&item.key))
+                    .hash(&mut h);
             }
             _ => self.expanded.contains(&item.key).hash(&mut h),
         }
@@ -1800,6 +1806,45 @@ fn tool_content(call: &ToolCall, rc: &RenderCtx) -> Div {
     })
 }
 
+/// `expanded` key of a user message's front-matter panel.
+fn front_matter_key(item_key: &str) -> String {
+    format!("front-matter:{item_key}")
+}
+
+/// Front matter of a user message as highlighted YAML, with its own copy
+/// button (desktop `SessionMessageMetadata`).
+fn render_front_matter(
+    item_key: &str,
+    front: &crate::util::FrontMatter,
+    rc: &RenderCtx,
+) -> AnyElement {
+    let p = &rc.p;
+    // A fenced YAML block in the transcript's Markdown: the native code
+    // block gives selection, highlighting and the header copy button, as
+    // in replies. The fence outruns any backtick run in the YAML.
+    let source = fenced("yaml", front.yaml.trim_end());
+    // Width comes from the column shared with the message bubble.
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_1()
+        .child(div().text_xs().text_color(p.dim).child("Message metadata"))
+        .child(div().min_w_0().text_sm().child(rc.md.markdown(
+            format!("ufm-md-{item_key}"),
+            source,
+            p,
+        )))
+        .into_any_element()
+}
+
+/// `code` as a Markdown fenced block whose fence outruns any backtick run
+/// inside it, so the code cannot close it early.
+fn fenced(lang: &str, code: &str) -> String {
+    let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}{lang}\n{code}\n{fence}")
+}
+
 fn toggle_expanded(weak: &WeakEntity<QmtApp>, key: String, cx: &mut App) {
     let _ = weak.update(cx, |this, cx| {
         // Inspecting a block is a reading action, not new content to follow.
@@ -2502,7 +2547,15 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
             let copied = rc.copied.as_deref() == Some(item.key.as_str());
             let group = SharedString::from(format!("ug-{}", item.key));
             let (key, weak, text2) = (item.key.clone(), rc.weak.clone(), text.clone());
-            let text = text.trim().to_string();
+            // Front matter (often from automated messages) stays out of the
+            // bubble; a toggle beside Copy shows it as YAML.
+            let (front, body) = match crate::util::split_front_matter(text) {
+                Some((front, body)) => (Some(front), body),
+                None => (None, text.as_str()),
+            };
+            let fm_key = front_matter_key(&item.key);
+            let fm_open = front.is_some() && rc.expanded.contains(&fm_key);
+            let text = body.trim().to_string();
             v_flex()
                 .group(group.clone())
                 .w_full()
@@ -2525,36 +2578,75 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
                             ),
                     )
                 })
-                .when(!text.is_empty() || attachments.is_empty(), |el| {
-                    el.child(
-                        div()
-                            .max_w(relative(0.86))
-                            .px_3p5()
-                            .py_2()
-                            .rounded(px(14.))
-                            .bg(p.accent_dim)
-                            .text_sm()
-                            .when(*local, |el| el.opacity(0.7))
-                            .when(text.is_empty(), |el| {
-                                el.text_color(p.dim).child("No message body")
-                            })
-                            // Markdown like the desktop app's user messages.
-                            .when(!text.is_empty(), |el| {
-                                el.min_w_0().child(rc.md.markdown(
-                                    format!("umd-{}", item.key),
-                                    text.clone(),
-                                    p,
-                                ))
-                            }),
-                    )
-                })
+                // Metadata reads before the message it describes. One column
+                // holds both and stretches them to the wider one, so the
+                // panel and the bubble share their width.
+                .when(
+                    !text.is_empty() || attachments.is_empty() || fm_open,
+                    |el| {
+                        el.child(
+                            v_flex()
+                                .max_w(relative(0.86))
+                                .min_w_0()
+                                .items_stretch()
+                                .gap_1p5()
+                                .when_some(front.clone().filter(|_| fm_open), |el, front| {
+                                    el.child(render_front_matter(&item.key, &front, rc))
+                                })
+                                .when(!text.is_empty() || attachments.is_empty(), |el| {
+                                    el.child(
+                                        div()
+                                            .min_w_0()
+                                            .px_3p5()
+                                            .py_2()
+                                            .rounded(px(14.))
+                                            .bg(p.accent_dim)
+                                            .text_sm()
+                                            .when(*local, |el| el.opacity(0.7))
+                                            .when(text.is_empty(), |el| {
+                                                el.text_color(p.dim).child("No message body")
+                                            })
+                                            // Markdown like the desktop app's user messages.
+                                            .when(!text.is_empty(), |el| {
+                                                el.min_w_0().child(rc.md.markdown(
+                                                    format!("umd-{}", item.key),
+                                                    text.clone(),
+                                                    p,
+                                                ))
+                                            }),
+                                    )
+                                }),
+                        )
+                    },
+                )
                 .child(
                     h_flex()
                         .h(px(26.))
                         .pr_1()
+                        .gap_0p5()
                         .invisible()
                         .group_hover(group, |s| s.visible())
-                        .when(copied, |el| el.visible())
+                        .when(copied || fm_open, |el| el.visible())
+                        .when(front.is_some(), |el| {
+                            let (weak, fm_key) = (rc.weak.clone(), fm_key.clone());
+                            let label = if fm_open {
+                                "Hide metadata"
+                            } else {
+                                "Show metadata"
+                            };
+                            el.child(
+                                kit::icon_button(
+                                    SharedString::from(format!("ufm-{}", item.key)),
+                                    IconName::Braces,
+                                    label,
+                                )
+                                .xsmall()
+                                .selected(fm_open)
+                                .on_click(move |_, _, cx| {
+                                    toggle_expanded(&weak, fm_key.clone(), cx)
+                                }),
+                            )
+                        })
                         .child(
                             kit::icon_button(
                                 SharedString::from(format!("ucopy-{}", item.key)),
@@ -4849,11 +4941,20 @@ impl QmtApp {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: the gpui glob brings a `test` macro that shadows `#[test]`.
-    use super::{WorkBlock, group_work, reasoning_title};
+    use super::{WorkBlock, fenced, group_work, reasoning_title};
     use super::{
         humanize_tool_name, is_read, is_shell, link_ranges, tool_label, workspace_relative,
     };
     use crate::session::{Thought, WorkEntry};
+
+    #[test]
+    fn fences_outrun_backticks_in_the_code() {
+        assert_eq!(fenced("yaml", "a: 1"), "```yaml\na: 1\n```");
+        assert_eq!(
+            fenced("yaml", "cmd: \"````x````\""),
+            "`````yaml\ncmd: \"````x````\"\n`````"
+        );
+    }
 
     // Exercise the list operations used by expansion and transcript sync.
     #[gpui_kit::test]

@@ -151,9 +151,79 @@ fn word_score(word: &[char], text: &str) -> Option<u32> {
     Some(score)
 }
 
+/// YAML front matter leading a message (desktop `extractMessageFrontMatter`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrontMatter {
+    /// Exact prefix, delimiters and line endings included.
+    pub source: String,
+    /// The YAML between the delimiters.
+    pub yaml: String,
+}
+
+/// Split `text` into its front matter and the body after it: a first line
+/// `---`, then YAML up to a line `---` or `...`. Without a closing line the
+/// text is ordinary Markdown (a leading rule) and is left whole.
+pub fn split_front_matter(text: &str) -> Option<(FrontMatter, &str)> {
+    let bom = if text.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    let is_delim = |line: &str, marks: &[&str]| {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        marks.iter().any(|m| {
+            line.strip_prefix(m)
+                .is_some_and(|rest| rest.chars().all(|c| c == ' ' || c == '\t'))
+        })
+    };
+    let first_end = text[bom..].find('\n')? + bom;
+    if !is_delim(&text[bom..first_end], &["---"]) {
+        return None;
+    }
+    let yaml_start = first_end + 1;
+    let mut pos = yaml_start;
+    for line in text[yaml_start..].split_inclusive('\n') {
+        let next = pos + line.len();
+        if is_delim(line.strip_suffix('\n').unwrap_or(line), &["---", "..."]) {
+            let front = FrontMatter {
+                source: text[..next].to_string(),
+                yaml: text[yaml_start..pos].to_string(),
+            };
+            return Some((front, &text[next..]));
+        }
+        pos = next;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_rfc3339, fuzzy_score, parse_rfc3339_ms};
+    use super::{format_rfc3339, fuzzy_score, parse_rfc3339_ms, split_front_matter};
+
+    #[test]
+    fn front_matter_is_split_from_the_body() {
+        let text = "---\ntype: callback\nid: \"x\"\n---\nWorker turn returned.";
+        let (fm, body) = split_front_matter(text).unwrap();
+        assert_eq!(fm.yaml, "type: callback\nid: \"x\"\n");
+        assert_eq!(fm.source, "---\ntype: callback\nid: \"x\"\n---\n");
+        assert_eq!(body, "Worker turn returned.");
+        // CRLF, BOM, `...` closing and trailing blanks on delimiters.
+        let (fm, body) = split_front_matter("\u{feff}--- \r\na: 1\r\n...\t\r\nbody").unwrap();
+        assert_eq!(fm.yaml, "a: 1\r\n");
+        assert_eq!(body, "body");
+        // Front matter only, closed at the end of the text.
+        let (fm, body) = split_front_matter("---\na: 1\n---").unwrap();
+        assert_eq!((fm.yaml.as_str(), body), ("a: 1\n", ""));
+    }
+
+    #[test]
+    fn text_without_closed_front_matter_is_left_whole() {
+        assert!(split_front_matter("--- \nnot closed\nstill text").is_none());
+        assert!(split_front_matter("plain\n---\na: 1\n---\n").is_none());
+        assert!(split_front_matter("---- \na\n---\n").is_none());
+        assert!(split_front_matter("---").is_none());
+        assert!(split_front_matter("").is_none());
+    }
 
     #[test]
     fn fuzzy_score_ranks_contiguous_and_earlier_fields_higher() {
