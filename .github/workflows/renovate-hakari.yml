@@ -1,0 +1,66 @@
+name: Renovate hakari
+
+# Renovate does not know about cargo-hakari. When a Renovate bump changes the
+# feature/version unification (e.g. a new 0.x minor of a crate listed in the
+# workspace-hack), the `Verify workspace-hack` job in lint.yml fails. This
+# workflow regenerates the workspace-hack on Renovate branches and pushes the
+# result, so the PR goes green without manual work.
+#
+# The push uses HAKARI_PUSH_TOKEN (fine-grained PAT, Contents: read/write on
+# this repo). A push made with the default GITHUB_TOKEN would not trigger CI
+# again, leaving the PR stuck on the stale check.
+#
+# Loop safety: the job only runs for pushes by renovate[bot], and it only
+# commits when hakari actually produces a diff.
+#
+# The commit author below is listed in `gitIgnoredAuthors` in
+# .github/renovate.json so Renovate keeps updating these branches.
+on:
+  push:
+    branches: ["renovate/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hakari:
+    name: Regenerate workspace-hack
+    # workflow_dispatch is for manual runs from a renovate/** branch.
+    if: github.actor == 'renovate[bot]' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.HAKARI_PUSH_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-hakari
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hakari
+
+      - name: Regenerate workspace-hack
+        run: |
+          cargo hakari generate
+          cargo hakari manage-deps --yes
+
+      - name: Commit and push changes
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          if git diff --quiet; then
+            echo "workspace-hack is up to date; nothing to commit."
+            exit 0
+          fi
+          git config user.name "hakari-bot"
+          git config user.email "hakari-bot@querymt.invalid"
+          git commit -am "chore: regenerate workspace-hack"
+          git push origin "HEAD:refs/heads/${BRANCH}"
