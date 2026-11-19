@@ -43,7 +43,7 @@ querymt-agent-sqlite = { path = "../agent-sqlite" }
 querymt-agent-runtime = { path = "../agent-runtime" }
 agent-client-protocol.workspace = true
 kameo = "0.22"
-libp2p = { version = "0.56", optional = true, default-features = false }
+libp2p = { version = "0.57", optional = true, default-features = false }
 async-trait.workspace = true
 http.workspace = true
 anyhow.workspace = true
