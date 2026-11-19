@@ -10100,7 +10100,6 @@ dependencies = [
  "js-sys",
  "pin-project-lite",
  "thiserror 2.0.21",
- "tracing",
 ]
 
 [[package]]
@@ -10154,7 +10153,7 @@ dependencies = [
  "opentelemetry 0.33.1",
  "opentelemetry-http",
  "opentelemetry-proto",
- "opentelemetry_sdk 0.33.1",
+ "opentelemetry_sdk",
  "prost",
  "reqwest 0.13.5",
  "thiserror 2.0.21",
@@ -10170,7 +10169,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d576f5dddc3299341bcd85a04be17b2564844c0c9563214f02d85f2524d1afae"
 dependencies = [
  "opentelemetry 0.33.1",
- "opentelemetry_sdk 0.33.1",
+ "opentelemetry_sdk",
  "prost",
  "tonic",
  "tonic-prost",
@@ -10178,32 +10177,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-semantic-conventions"
-version = "0.32.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c913ac17a6c451661ee255f4625d143e51647ae78ebd969b75e41c4442f4fe47"
-
-[[package]]
-name = "opentelemetry-semantic-conventions"
 version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a3cf639fefd3e852869114f9925b578da6dd8e99281a2089bb0e773ead46962"
-
-[[package]]
-name = "opentelemetry_sdk"
-version = "0.32.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b59f80e1ac4d5ff7a2db8fb6c80badb7f0f3f858211fba08dd9aaec750894f9"
-dependencies = [
- "futures-channel",
- "futures-executor",
- "futures-util",
- "opentelemetry 0.32.0",
- "percent-encoding",
- "portable-atomic",
- "rand 0.9.5",
- "thiserror 2.0.21",
- "tokio",
-]
 
 [[package]]
 name = "opentelemetry_sdk"
@@ -12171,8 +12147,8 @@ dependencies = [
  "moka",
  "once_cell",
  "opentelemetry 0.33.1",
- "opentelemetry-semantic-conventions 0.33.1",
- "opentelemetry_sdk 0.33.1",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
  "parking_lot 0.13.0",
  "querymt",
  "querymt-agent-core",
@@ -12239,7 +12215,7 @@ dependencies = [
  "log",
  "mdq",
  "opentelemetry 0.33.1",
- "opentelemetry_sdk 0.33.1",
+ "opentelemetry_sdk",
  "parking_lot 0.13.0",
  "qmt-openai",
  "querymt",
@@ -12463,8 +12439,8 @@ dependencies = [
  "opentelemetry 0.33.1",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
- "opentelemetry-semantic-conventions 0.33.1",
- "opentelemetry_sdk 0.33.1",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
  "querymt-workspace-hack",
  "reqwest 0.13.5",
  "rustix",
@@ -12590,9 +12566,9 @@ dependencies = [
  "objc2-core-foundation",
  "object",
  "once_cell",
- "opentelemetry 0.32.0",
- "opentelemetry-semantic-conventions 0.32.1",
- "opentelemetry_sdk 0.32.1",
+ "opentelemetry 0.33.1",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
  "pem 4.0.0",
  "percent-encoding",
  "phf 0.13.1",
