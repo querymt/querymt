@@ -1599,8 +1599,7 @@ impl SessionUsageProjection {
         &self,
     ) -> Option<querymt_agent_services::accounting::AccountingSnapshot> {
         self.accounting.as_ref().map(|reducer| {
-            let mut snapshot =
-                querymt_agent_services::accounting::AccountingSnapshot::from_reducer(reducer);
+            let mut snapshot = querymt_agent_services::accounting::snapshot_from_reducer(reducer);
             if self.untransferred_history {
                 snapshot.mark_untransferred_history();
             }

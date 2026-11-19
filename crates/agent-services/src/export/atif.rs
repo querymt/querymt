@@ -275,7 +275,7 @@ impl ATIFBuilder {
     fn record_accounting(&mut self, events: &[AgentEvent]) {
         let session_id = self.session_id.clone();
         let own = |event: &&AgentEvent| event.session_id == session_id;
-        let snapshot = AccountingSnapshot::from_events(
+        let snapshot = crate::accounting::snapshot_from_events(
             &session_id,
             events.iter().filter(own).map(|e| &e.kind),
         );

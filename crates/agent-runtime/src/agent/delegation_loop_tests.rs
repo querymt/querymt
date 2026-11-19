@@ -1972,12 +1972,10 @@ async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct(
             );
             assert_eq!(
                 snapshot["accounting"],
-                serde_json::to_value(
-                    querymt_agent_services::accounting::AccountingSnapshot::from_events(
-                        &parent_id,
-                        events.iter().map(|event| &event.kind),
-                    )
-                )
+                serde_json::to_value(querymt_agent_services::accounting::snapshot_from_events(
+                    &parent_id,
+                    events.iter().map(|event| &event.kind),
+                ))
                 .unwrap(),
                 "idle/verifying owner snapshot must include accounting at its audit cursor"
             );

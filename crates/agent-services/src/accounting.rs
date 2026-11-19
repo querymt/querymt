@@ -120,18 +120,15 @@ pub use pricing::is_non_billable_oauth_provider;
 pub use pricing::{pricing_for, resolve_billing_basis};
 pub use projection::{PAGE_SIZE, SessionAccounting};
 pub use recorder::{AccountingError, AttemptHandle, AttemptRecorder};
-pub use reducer::{
-    AccountingConflict, AccountingReducer, Applied, ComponentSums, ScopeTotals, TokenSums,
-};
-pub use snapshot::{
-    ACCOUNTING_SNAPSHOT_VERSION, AccountingBillingScope, AccountingBudgetSnapshot,
-    AccountingCycleSnapshot, AccountingScopeSnapshot, AccountingSnapshot,
-};
+pub use reducer::{AccountingConflict, AccountingReducer, Applied};
+pub use snapshot::{snapshot_from_events, snapshot_from_reducer};
 
 pub use querymt_agent_core::accounting::{
-    AccountingReason, AttemptOutcome, AttemptPurpose, AttemptRef, AttemptSettlement, AttemptStart,
-    BillingBasis, DispatchMode, PricingApplicability, RequestAccounting, UsageDisposition,
-    non_secret_route,
+    ACCOUNTING_SNAPSHOT_VERSION, AccountingBillingScope, AccountingBudgetSnapshot,
+    AccountingCycleSnapshot, AccountingReason, AccountingScopeSnapshot, AccountingSnapshot,
+    AttemptOutcome, AttemptPurpose, AttemptRef, AttemptSettlement, AttemptStart, BillingBasis,
+    ComponentSums, DispatchMode, PricingApplicability, RequestAccounting, ScopeTotals, TokenSums,
+    UsageDisposition, non_secret_route,
 };
 
 #[cfg(test)]

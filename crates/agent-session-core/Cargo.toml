@@ -1,0 +1,35 @@
+[package]
+name = "querymt-agent-session-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic session view reducer: turns agent output (load snapshot, ACP updates, history pages) into one conversation view"
+
+[lib]
+name = "querymt_agent_session_core"
+path = "src/lib.rs"
+
+[features]
+# Seeded lorem-ipsum trace generator used by tests, benches and the regen-traces example.
+test-support = []
+
+[[example]]
+name = "regen-traces"
+required-features = ["test-support"]
+
+[[bench]]
+name = "stream_into_long_session"
+harness = false
+required-features = ["test-support"]
+
+[dependencies]
+querymt-agent-protocol-types = { path = "../agent-protocol-types" }
+serde.workspace = true
+serde_json.workspace = true
+typeshare.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false }
+proptest.workspace = true
+
+# querymt-workspace-hack is intentionally absent (see .config/hakari.toml `final-excludes`).

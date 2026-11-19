@@ -1,4 +1,5 @@
 use super::default_true;
+use crate::events::McpServerInfo;
 use crate::protocol::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerStdio};
 use anyhow::{Context, Result, anyhow};
 use schemars::JsonSchema;
@@ -227,6 +228,43 @@ impl AcpMeta {
 }
 
 impl McpServerConfig {
+    /// The flat description of this server emitted in `SessionConfigured`.
+    ///
+    /// Replaces the former `From<McpServerConfig> for McpServerInfo`, which the
+    /// orphan rule forbids now that `McpServerInfo` lives in
+    /// `querymt-agent-protocol-types`.
+    #[must_use]
+    pub fn server_info(self) -> McpServerInfo {
+        match self {
+            Self::Stdio {
+                name,
+                command,
+                args,
+                env,
+                ..
+            } => McpServerInfo {
+                transport: "stdio".into(),
+                name,
+                command: Some(command),
+                args: Some(args),
+                env: Some(env),
+                url: None,
+                headers: None,
+            },
+            Self::Http {
+                name, url, headers, ..
+            } => McpServerInfo {
+                transport: "http".into(),
+                name,
+                command: None,
+                args: None,
+                env: None,
+                url: Some(url),
+                headers: Some(headers),
+            },
+        }
+    }
+
     /// A stdio server with default settings.
     pub fn stdio(name: impl Into<String>, command: impl Into<String>) -> Self {
         Self::Stdio {
@@ -442,5 +480,40 @@ impl McpServerConfig {
             // McpServer is non-exhaustive, handle unknown variants
             _ => Err(anyhow!("unsupported MCP server transport")),
         }
+    }
+}
+
+#[cfg(test)]
+mod server_info_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_stdio_info_preserves_config_wire_shape() {
+        let config = McpServerConfig::stdio("filesystem", "npx")
+            .with_args(["-y", "server-filesystem"])
+            .with_env(HashMap::from([("TOKEN".into(), "secret".into())]));
+        let expected = serde_json::to_value(&config).unwrap();
+        let info = config.server_info();
+
+        assert_eq!(serde_json::to_value(&info).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<McpServerInfo>(expected).unwrap(),
+            info
+        );
+    }
+
+    #[test]
+    fn mcp_http_info_preserves_config_wire_shape() {
+        let config = McpServerConfig::http("remote", "https://example.test/mcp").with_headers(
+            HashMap::from([("Authorization".into(), "Bearer secret".into())]),
+        );
+        let expected = serde_json::to_value(&config).unwrap();
+        let info = config.server_info();
+
+        assert_eq!(serde_json::to_value(&info).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<McpServerInfo>(expected).unwrap(),
+            info
+        );
     }
 }

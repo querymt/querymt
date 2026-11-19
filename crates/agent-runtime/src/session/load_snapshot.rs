@@ -1,8 +1,6 @@
 use crate::agent::LocalAgentHandle;
 use crate::session::error::{SessionError, SessionResult};
-use crate::session::history_window::{
-    HistoryInfo, LoadWindow, SessionHistorySummary, TruncatedEntry, read_window, summarize_history,
-};
+use crate::session::history_window::{LoadWindow, read_window, summarize_history};
 use crate::session::projection::{AuditView, ViewStore};
 use querymt_agent_core::events::AgentEvent;
 pub use querymt_agent_core::session::prompt_records::UserPromptRecord;
@@ -10,42 +8,10 @@ pub(crate) use querymt_agent_core::session::prompt_records::{
     filter_prompt_records, user_prompt_records,
 };
 pub use querymt_agent_core::stream_cursor::{StreamCursor, observe_cursor};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use time::OffsetDateTime;
-use typeshare::typeshare;
 
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionLoadSnapshot {
-    #[serde(rename = "runtimeStatus")]
-    pub runtime_status: crate::agent::messages::SessionRuntimeStatus,
-    pub audit: AuditView,
-    pub cursor: StreamCursor,
-    /// Authoritative replacement accounting at `cursor`, reduced from the same
-    /// audit events by the shared accounting reducer. Present even when
-    /// historical replay is skipped or the context limit is unknown.
-    #[typeshare(serialized_as = "AccountingSnapshot")]
-    pub accounting: querymt_agent_services::accounting::AccountingSnapshot,
-    #[serde(rename = "delegationUpdates")]
-    pub delegation_updates:
-        Vec<querymt_agent_core::delegation_update::DelegationUpdateNotification>,
-    #[serde(
-        default,
-        rename = "userPrompts",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub user_prompts: Option<Vec<UserPromptRecord>>,
-    /// Present only for windowed loads: where the returned events sit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub history: Option<HistoryInfo>,
-    /// Present only for windowed loads: whole-session state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<SessionHistorySummary>,
-    /// Present only for windowed loads that shortened tool content.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub truncated: Option<Vec<TruncatedEntry>>,
-}
+pub use querymt_agent_protocol_types::session::load_snapshot::SessionLoadSnapshot;
 
 pub fn cursor_from_events(events: &[AgentEvent]) -> StreamCursor {
     let mut cursor = StreamCursor::default();
@@ -137,7 +103,7 @@ pub async fn load_session_snapshot_windowed(
             event.seq = position;
         }
     }
-    let accounting = querymt_agent_services::accounting::AccountingSnapshot::from_events(
+    let accounting = querymt_agent_services::accounting::snapshot_from_events(
         session_id,
         audit.events.iter().map(|event| &event.kind),
     );

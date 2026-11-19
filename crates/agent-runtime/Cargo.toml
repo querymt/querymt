@@ -43,6 +43,7 @@ querymt-agent-index = { path = "../agent-index" }
 querymt-agent-knowledge = { path = "../agent-knowledge" }
 querymt-agent-services = { path = "../agent-services" }
 agent-client-protocol.workspace = true
+querymt-agent-protocol-types = { path = "../agent-protocol-types" }
 kameo = "0.22"
 rmp-serde = "1.3"
 kameo_actors = "0.8.1"

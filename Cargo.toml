@@ -4,6 +4,8 @@ members = [
     "crates/agent",
     "crates/agent-core",
     "crates/agent-index",
+    "crates/agent-protocol-types",
+    "crates/agent-session-core",
     "crates/agent-knowledge",
     "crates/agent-runtime",
     "crates/agent-services",
@@ -35,6 +37,8 @@ default-members = [
     "crates/agent",
     "crates/agent-core",
     "crates/agent-index",
+    "crates/agent-protocol-types",
+    "crates/agent-session-core",
     "crates/agent-knowledge",
     "crates/agent-runtime",
     "crates/agent-services",
@@ -82,6 +86,9 @@ strum = { version = "0.28", features = ["derive"] }
 time = { version = "0.3", features = ["serde", "formatting", "macros", "local-offset"] }
 uuid = { version = "1.18", features = ["v4", "v5", "v7"] }
 agent-client-protocol = { version = "5.4", features = ["unstable", "schemars"] }
+# Must resolve to the same version that agent-client-protocol re-exports (asserted in agent-core).
+agent-client-protocol-schema = { version = "1.19", default-features = false, features = ["unstable"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
 rust-stemmers = "1.2"
 mockall = "0.15"
 rusqlite = { version = "0.43", features = ["bundled"] }

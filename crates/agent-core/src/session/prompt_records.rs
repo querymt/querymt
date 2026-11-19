@@ -2,23 +2,8 @@
 //! pages and peer prompt requests.
 
 use crate::model::{AgentMessage, MessagePart};
-use crate::protocol::ContentBlock;
-use serde::{Deserialize, Serialize};
-use typeshare::typeshare;
 
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct UserPromptRecord {
-    pub message_id: String,
-    /// Zero-based position in persisted message history; this is not an event sequence.
-    #[typeshare(serialized_as = "number")]
-    pub message_order: u64,
-    #[typeshare(serialized_as = "number")]
-    pub timestamp: i64,
-    #[typeshare(serialized_as = "any")]
-    pub blocks: Vec<ContentBlock>,
-}
+pub use querymt_agent_protocol_types::session::load_snapshot::UserPromptRecord;
 
 /// Restrict prompt records to `ids` (`None` keeps all).
 pub fn filter_prompt_records(
@@ -58,7 +43,7 @@ pub fn user_prompt_records(messages: &[AgentMessage]) -> Vec<UserPromptRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ImageContent, TextContent};
+    use crate::protocol::{ContentBlock, ImageContent, TextContent};
     use querymt::chat::ChatRole;
 
     #[test]

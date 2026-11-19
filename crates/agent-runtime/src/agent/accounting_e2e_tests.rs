@@ -13,8 +13,7 @@ use querymt::{CacheWriteTiers, Usage};
 use querymt_agent_core::accounting::samples::{sample_settlement, sample_start};
 use querymt_agent_core::events::AgentEvent;
 use querymt_agent_services::accounting::{
-    AccountingSnapshot, AttemptOutcome, AttemptPurpose, AttemptRecorder, CycleAccounting,
-    SessionAccounting,
+    AttemptOutcome, AttemptPurpose, AttemptRecorder, CycleAccounting, SessionAccounting,
 };
 use querymt_agent_services::event_fanout::EventFanout;
 use querymt_agent_services::session_event_stream::SessionEventStream;
@@ -232,7 +231,7 @@ async fn mixed_scenario_agrees_across_runtime_restart_acp_and_export() {
         );
 
         (
-            accounting.read(AccountingSnapshot::from_reducer),
+            accounting.read(querymt_agent_services::accounting::snapshot_from_reducer),
             c2.to_string(),
         )
     };
@@ -242,7 +241,7 @@ async fn mixed_scenario_agrees_across_runtime_restart_acp_and_export() {
     let restarted = SessionAccounting::hydrate(SESSION, storage.event_journal())
         .await
         .unwrap();
-    let after_restart = restarted.read(AccountingSnapshot::from_reducer);
+    let after_restart = restarted.read(querymt_agent_services::accounting::snapshot_from_reducer);
     assert_eq!(
         after_restart, live_snapshot,
         "restart reproduces live state"
@@ -265,8 +264,10 @@ async fn mixed_scenario_agrees_across_runtime_restart_acp_and_export() {
 
     // The journal-reduced snapshot (what SessionLoadSnapshot carries) matches.
     let journal_events = events(&storage).await;
-    let from_journal =
-        AccountingSnapshot::from_events(SESSION, journal_events.iter().map(|e| &e.kind));
+    let from_journal = querymt_agent_services::accounting::snapshot_from_events(
+        SESSION,
+        journal_events.iter().map(|e| &e.kind),
+    );
     assert_eq!(from_journal, after_restart);
 
     // ACP replay carries the same accounting metadata.

@@ -274,7 +274,13 @@
           devShells =
             {
               default = pkgs.mkShell {
-                buildInputs = commonInputs;
+                # wasm-bindgen-cli must match the locked wasm-bindgen crate (0.2.129) exactly.
+                buildInputs =
+                  commonInputs
+                  ++ (with pkgs; [
+                    binaryen
+                    wasm-bindgen-cli_0_2_129
+                  ]);
 
                 shellHook =
                   /*

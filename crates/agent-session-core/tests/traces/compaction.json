@@ -1,0 +1,127 @@
+{
+  "name": "compaction",
+  "batches": [
+    [
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "compaction_update",
+              "compactionId": "c1",
+              "status": "in_progress"
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "compaction_summary_chunk",
+              "compactionId": "c1",
+              "content": {
+                "type": "text",
+                "text": "dolor sit"
+              }
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      },
+      {
+        "type": "acp_notification",
+        "data": {
+          "notification": {
+            "sessionId": "s1",
+            "update": {
+              "sessionUpdate": "compaction_update",
+              "compactionId": "c1",
+              "status": "completed"
+            }
+          },
+          "replayed": false,
+          "at_ms": 0
+        }
+      }
+    ]
+  ],
+  "expected": {
+    "reports": [
+      {
+        "added": [
+          "turn-live-1"
+        ],
+        "updated": [],
+        "removed": [],
+        "headerChanged": false,
+        "ignored": 0,
+        "unknown": 0,
+        "duplicates": 0,
+        "errors": []
+      }
+    ],
+    "header": {
+      "sessionId": "s1",
+      "schemaVersion": 1,
+      "runState": "idle",
+      "activeToolCallId": null,
+      "lastStopReason": null,
+      "lastError": null,
+      "context": null,
+      "tokens": null,
+      "cost": null,
+      "provider": null,
+      "title": null,
+      "currentMode": null,
+      "configOptions": [],
+      "plan": null,
+      "undoStack": [],
+      "pendingInputs": [],
+      "delegations": [],
+      "runtime": null,
+      "history": {
+        "hasOlder": false,
+        "before": null,
+        "stale": false
+      }
+    },
+    "turnIds": [
+      "turn-live-1"
+    ],
+    "turns": [
+      {
+        "id": "turn-live-1",
+        "revision": 3,
+        "entries": [
+          {
+            "id": "compaction-c1",
+            "revision": 3,
+            "kind": {
+              "type": "compaction",
+              "data": {
+                "compactionId": "c1",
+                "state": "completed",
+                "otherStatus": null,
+                "summary": [
+                  {
+                    "type": "text",
+                    "text": "dolor sit"
+                  }
+                ],
+                "error": null,
+                "meta": null
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

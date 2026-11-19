@@ -16,6 +16,8 @@ echo "Generating TypeScript types..."
 typeshare \
   "$REPO_ROOT/crates/agent" \
   "$REPO_ROOT/crates/agent-core" \
+  "$REPO_ROOT/crates/agent-protocol-types" \
+  "$REPO_ROOT/crates/agent-session-core" \
   "$REPO_ROOT/crates/agent-index" \
   "$REPO_ROOT/crates/agent-knowledge" \
   "$REPO_ROOT/crates/agent-services" \

@@ -3,6 +3,15 @@
 //!
 //! Plain data only. Pricing lookups and the reducer live in `accounting`.
 
+mod snapshot;
+mod totals;
+
+pub use snapshot::{
+    ACCOUNTING_SNAPSHOT_VERSION, AccountingBillingScope, AccountingBudgetSnapshot,
+    AccountingCycleSnapshot, AccountingScopeSnapshot, AccountingSnapshot,
+};
+pub use totals::{ComponentSums, ScopeTotals, TokenSums};
+
 use querymt::Usage;
 use querymt::providers::{BillingClass, IncompleteReason, ModelPricing, UsageValuation};
 use serde::{Deserialize, Serialize};
