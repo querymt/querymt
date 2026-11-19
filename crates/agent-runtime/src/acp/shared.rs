@@ -3518,7 +3518,8 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                         .map_err(Error::into_internal_error)?;
                                     let synced = tokio::time::timeout(PROMPT_WAIT_LIMIT, async {
                                         let marker = local.session_delivery_barrier(&session_id, runtime).await?;
-                                        if marker.runtime.phase == crate::agent::messages::SessionRuntimePhase::Idle
+                                        if marker.tip > 0
+                                            && marker.runtime.phase == crate::agent::messages::SessionRuntimePhase::Idle
                                             && delivery.wait_for_tip(&session_id, marker.tip, PROMPT_WAIT_LIMIT).await != WaitOutcome::Delivered
                                         {
                                             return Err(Error::internal_error().data("session update delivery could not be confirmed"));

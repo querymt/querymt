@@ -128,18 +128,23 @@ notify_callback() {
 
 ## Example: PR merged or closed
 
-Requires authenticated `gh`, Bash, and qmacp on the watcher host. Set `REPO`
-and `PR_NUMBER` to the registered PR. This polls once per minute for up to 24
-hours, then sends one terminal event (including lookup failure or expiry),
-rather than keeping an agent busy polling.
+Requires authenticated `gh`, Bash, GNU `timeout`, and qmacp on the watcher
+host. Set `REPO` and `PR_NUMBER` to the registered PR. The watcher polls for
+up to 24 hours, reserving the last 16 minutes for `notify_callback` (whose
+prompt timeout is 15 minutes) and shutdown. Keep the callback registration
+valid through this window.
 
 ```bash
 RESOURCE="$REPO#$PR_NUMBER"
-deadline=$((SECONDS + 86400))
+poll_deadline=$((SECONDS + 86400 - 960))
 event=pr.watch_expired
-result='PR watch expired after 24 hours.'
-while (( SECONDS < deadline )); do
-  if ! state=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state --jq .state); then
+result='PR polling budget expired.'
+while (( (remaining = poll_deadline - SECONDS) > 1 )); do
+  # Leave one second for timeout to kill an unresponsive gh process.
+  call_timeout=$((remaining - 1 < 30 ? remaining - 1 : 30))
+  if ! state=$(timeout --kill-after=1s "${call_timeout}s" \
+    gh pr view "$PR_NUMBER" --repo "$REPO" --json state --jq .state); then
+    if (( SECONDS >= poll_deadline )); then break; fi
     event=pr.watch_failed
     result='Could not check the PR state; GitHub lookup failed.'
     break
@@ -151,7 +156,9 @@ while (( SECONDS < deadline )); do
       break
       ;;
   esac
-  sleep 60
+  remaining=$((poll_deadline - SECONDS))
+  if (( remaining <= 0 )); then break; fi
+  sleep "$((remaining < 60 ? remaining : 60))"
 done
 notify_callback "$event" "$result"
 ```

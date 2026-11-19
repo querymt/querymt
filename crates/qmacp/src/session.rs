@@ -90,12 +90,16 @@ pub fn validate_prompt(
     new: bool,
     cwd: Option<&Path>,
     required: bool,
+    profile: Option<&str>,
     delivery: Delivery,
 ) -> Result<(), &'static str> {
     if !new && cwd.is_some() {
         return Err(
             "cwd applies only when creating a session; an existing session keeps its own cwd",
         );
+    }
+    if !new && profile.is_some() {
+        return Err("profile applies only when creating a session");
     }
     if new && !matches!(delivery, Delivery::Auto | Delivery::Prompt) {
         return Err("new sessions require auto or prompt delivery");
@@ -130,6 +134,19 @@ pub fn observed_phase(runtime: &Value) -> Option<&str> {
         "inactive" if phase == "idle" => Some(phase),
         _ => None,
     }
+}
+
+/// Add only the portion of the page that fits. A server cursor can advance
+/// past the page only if all of its entries were returned.
+pub fn append_session_page(
+    sessions: &mut Vec<Value>,
+    page: acp::ListSessionsResponse,
+    limit: usize,
+) -> (Option<String>, bool) {
+    let remaining = limit.saturating_sub(sessions.len());
+    let partial = page.sessions.len() > remaining;
+    sessions.extend(page.sessions.iter().take(remaining).map(session_summary));
+    (if partial { None } else { page.next_cursor }, partial)
 }
 
 pub fn session_summary(session: &acp::SessionInfo) -> Value {
@@ -584,8 +601,26 @@ pub async fn wait_until_idle_every(
     timeout: Duration,
     interval: Duration,
 ) -> Result<Value, CliError> {
+    let timeout = timeout.max(Duration::from_secs(1));
+    wait_until_idle_by(
+        client,
+        session_id,
+        tokio::time::Instant::now() + timeout,
+        timeout,
+        interval,
+    )
+    .await
+}
+
+async fn wait_until_idle_by(
+    client: &AcpClient,
+    session_id: &str,
+    deadline: tokio::time::Instant,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<Value, CliError> {
     let mut last_runtime = Value::Null;
-    tokio::time::timeout(timeout.max(Duration::from_secs(1)), async {
+    tokio::time::timeout_at(deadline, async {
         loop {
             let value = runtime_observation(client, session_id.to_string(), true).await
                 .map_err(|error| error.with_recovery(json!({"runtime": last_runtime})))?;
@@ -711,14 +746,26 @@ pub async fn follow(
     timeout: Duration,
     interval: Duration,
 ) -> Result<FollowResult, CliError> {
-    client.initialize().await.map_err(CliError::from_request)?;
-    client.capture_assistant_text(Some(session_id)).await;
-    let result = async {
-        open_session(client, session_id.to_owned(), cwd).await.map_err(|error| {
-            error.with_recovery(json!({"sessionId": session_id, "stage": "open", "observationState": "unavailable"}))
-        })?;
-        wait_until_idle_every(client, session_id, timeout, interval).await
-    }.await;
+    let timeout = timeout.max(Duration::from_secs(1));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let result =
+        async {
+            tokio::time::timeout_at(deadline, async {
+            client.initialize().await.map_err(CliError::from_request)?;
+            client.capture_assistant_text(Some(session_id)).await;
+            open_session(client, session_id.to_owned(), cwd).await
+        })
+        .await
+        .unwrap_or_else(|_| Err(CliError::Timeout(format!(
+            "timed out after {}s opening session {session_id}; remote work was not cancelled",
+            timeout.as_secs(),
+        ))))
+        .map_err(|error| error.with_recovery(json!({
+            "sessionId": session_id, "stage": "open", "observationState": "unavailable",
+        })))?;
+            wait_until_idle_by(client, session_id, deadline, timeout, interval).await
+        }
+        .await;
     let (text, truncated) = client.finish_assistant_text().await;
     Ok(FollowResult {
         runtime: result?["runtime"].clone(),
@@ -824,6 +871,14 @@ pub fn request_failure(error: anyhow::Error, mut recovery: Value) -> CliError {
     };
     recovery[field] = json!(state);
     CliError::from_request(error).with_recovery(recovery)
+}
+
+/// An acknowledgement is not a turn outcome. Report the validated receipt status,
+/// which can differ from the requested delivery (for example, queue -> started).
+pub fn submission_stop_reason(receipt: &Value) -> &str {
+    receipt["result"]["status"]
+        .as_str()
+        .expect("validated submission receipt")
 }
 
 pub async fn submit_text(

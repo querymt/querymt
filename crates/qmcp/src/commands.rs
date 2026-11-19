@@ -249,6 +249,7 @@ pub fn decode(name: &str, mut arguments: Map<String, Value>) -> Result<Command> 
             text,
             timeout,
             cwd,
+            profile,
             delivery,
             ..
         } => {
@@ -258,7 +259,7 @@ pub fn decode(name: &str, mut arguments: Map<String, Value>) -> Result<Command> 
             if text.trim().is_empty() {
                 bail!("text must not be empty");
             }
-            session::validate_prompt(*new, cwd.as_deref(), true, *delivery)
+            session::validate_prompt(*new, cwd.as_deref(), true, profile.as_deref(), *delivery)
                 .map_err(anyhow::Error::msg)?;
             validate_timeout(*timeout)?;
         }
@@ -406,7 +407,7 @@ fn constrain_input_schema(name: &str, input: &mut Map<String, Value>) {
     if name == "prompt" {
         input.insert("oneOf".into(), json!([
             {"required": ["new", "cwd"], "properties": {"new": {"const": true}, "session_id": {"type": "null"}, "cwd": {"type": "string", "minLength": 1}, "delivery": {"enum": ["auto", "prompt"]}}},
-            {"required": ["session_id"], "properties": {"new": {"const": false}, "session_id": {"type": "string"}, "cwd": {"type": "null"}}},
+            {"required": ["session_id"], "properties": {"new": {"const": false}, "session_id": {"type": "string"}, "cwd": {"type": "null"}, "profile": {"type": "null"}}},
         ]));
     } else if name == "new" {
         input.insert("required".into(), json!(["cwd"]));
@@ -746,7 +747,7 @@ async fn sessions(
     if pinned.is_some() {
         require_pin_support(client, None).await?;
     }
-    let limit = limit.unwrap_or(if all { usize::MAX } else { 20 }).max(1);
+    let limit = limit.unwrap_or(if all { usize::MAX } else { 20 });
     let mut sessions = Vec::new();
     let mut next = cursor;
     let mut pages = 0usize;
@@ -764,18 +765,16 @@ async fn sessions(
             .list_sessions(cwd.clone(), next.clone(), filters.clone())
             .await
             .map_err(CliError::from_request)?;
-        for item in page.sessions {
-            sessions.push(session::session_summary(&item));
-        }
-        if sessions.len() >= limit {
+        let (next_cursor, partial) = session::append_session_page(&mut sessions, page, limit);
+        if partial || sessions.len() >= limit {
             return Ok(json!({
                 "cwd": cwd,
                 "sessions": sessions,
-                "nextCursor": page.next_cursor,
-                "truncated": page.next_cursor.is_some(),
+                "nextCursor": next_cursor,
+                "truncated": partial || next_cursor.is_some(),
             }));
         }
-        match page.next_cursor {
+        match next_cursor {
             Some(cursor) if all => next = Some(cursor),
             next_cursor => {
                 return Ok(json!({
@@ -1149,7 +1148,7 @@ async fn prompt(
         delivery,
         until_idle,
     } = args;
-    session::validate_prompt(new, cwd.as_deref(), true, delivery)
+    session::validate_prompt(new, cwd.as_deref(), true, profile.as_deref(), delivery)
         .map_err(|err| CliError::Usage(err.into()))?;
     let initialized = client.initialize().await.map_err(CliError::from_request)?;
     let session_id = if new {
@@ -1207,13 +1206,11 @@ async fn prompt(
             } else {
                 "querymt/session/queue"
             };
-            submitted =
-                Some(submit_input(client, state, method, session_id.clone(), run_id, text).await?);
-            if chosen == Delivery::Steer {
-                "steered".to_string()
-            } else {
-                "queued".to_string()
-            }
+            let receipt =
+                submit_input(client, state, method, session_id.clone(), run_id, text).await?;
+            let reason = session::submission_stop_reason(&receipt).to_owned();
+            submitted = Some(receipt);
+            reason
         }
         Delivery::Auto => unreachable!("auto is resolved before send"),
     };

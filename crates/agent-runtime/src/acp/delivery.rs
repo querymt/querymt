@@ -341,10 +341,9 @@ impl ConnectionDelivery {
                         });
                     }
                 }
-                Err(()) => state.send_modify(|p| {
-                    p.recovery_failed = true;
-                    p.first_missing.get_or_insert(admitted + 1);
-                }),
+                // A failed read does not prove that this session missed a sequence.
+                // Release current waiters, but let admission detect actual gaps.
+                Err(()) => state.send_modify(|p| p.recovery_failed = true),
             }
         }
         out
@@ -779,6 +778,8 @@ mod tests {
 
         let delivery = ConnectionDelivery::new(Some(Arc::new(Broken)), CancellationToken::new());
         drop(delivery.admit(delta("gap", 1)).await);
+        assert!(delivery.recover_after_lag().await.is_empty());
+        delivery.finish_lag_recovery();
         drop(delivery.admit(delta("gap", 3)).await);
         assert_eq!(delivery.delivered("gap"), 3);
         assert_eq!(
@@ -801,6 +802,12 @@ mod tests {
         assert_eq!(
             waiter.await.unwrap(),
             WaitOutcome::Released(ReleaseReason::RecoveryFailed)
+        );
+        drop(delivery.admit(delta("s", 2)).await);
+        assert_eq!(
+            delivery.wait_for_tip("s", 2, Duration::ZERO).await,
+            WaitOutcome::Delivered,
+            "a recovery failure without a sequence gap must not poison later waits"
         );
     }
 }
