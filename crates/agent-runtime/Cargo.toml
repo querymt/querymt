@@ -88,10 +88,10 @@ mdq = "0.10.0"
 gix = { version = "0.90", default-features = false, features = ["basic", "worktree-mutation", "attributes", "sha1", "status", "merge"] }
 dirs.workspace = true
 dunce = "1"
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
-opentelemetry-semantic-conventions = { version = "0.32", features = ["semconv_experimental"] }
-tracing-opentelemetry = "0.33"
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["trace", "metrics"] }
+opentelemetry-semantic-conventions = { version = "0.33", features = ["semconv_experimental"] }
+tracing-opentelemetry = "0.34"
 tempfile = "3.0"
 querymt-agent-sqlite = { path = "../agent-sqlite", optional = true }
 mockall = { workspace = true, optional = true }
@@ -111,4 +111,4 @@ rmcp = { version = "3.9", features = ["server", "transport-streamable-http-serve
 mockall.workspace = true
 env_logger = "0.11"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "testing"] }
+opentelemetry_sdk = { version = "0.33", features = ["trace", "metrics", "testing"] }
