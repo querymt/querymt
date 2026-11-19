@@ -1,13 +1,12 @@
 //! Sessions page: search, lifecycle tabs, pinned group, sessions grouped by
 //! workspace, nested forks and worktree children, and per-session actions.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
-use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::skeleton::Skeleton;
@@ -15,12 +14,17 @@ use gpui_kit::component::{Icon, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::{Page, QmtApp, SessionTab, kit};
+use super::{
+    ArchiveFilter, LocationFilter, Page, QmtApp, ResolutionFilter, RuntimeFilter, SessionFilters,
+    SessionTab, kit,
+};
 use crate::store::{AgentsStore, SessionSummary, Worktree};
 use crate::theme::{Palette, palette};
 use crate::util::{absolute_time, short_time, workspace_name};
 
 const GROUP_ROWS: usize = 8;
+/// Sessions added to a group per "Show more".
+const GROUP_PAGE: usize = 10;
 /// Side of a session row's actions button.
 const SESSION_MENU_SIZE: f32 = 28.;
 const PINNED_KEY: &str = "\u{0}pinned";
@@ -33,12 +37,49 @@ const MAX_DEPTH: usize = 6;
 /// Lifecycle tabs only list sessions whose state the agent reported; the rest
 /// appear in All (the desktop app's "lifecycle unavailable").
 fn in_tab(s: &SessionSummary, tab: SessionTab) -> bool {
-    match tab {
-        SessionTab::Open => s.lifecycle_known && s.open,
-        SessionTab::Resolved => s.lifecycle_known && s.resolved && !s.archived,
-        SessionTab::Archived => s.lifecycle_known && s.archived,
-        SessionTab::All => true,
+    let (resolution, archive) = tab.lifecycle();
+    matches_lifecycle(s, resolution, archive)
+}
+
+/// Desktop `sessionMatchesLifecycle`: with no lifecycle state a session only
+/// matches the unfiltered view.
+fn matches_lifecycle(
+    s: &SessionSummary,
+    resolution: ResolutionFilter,
+    archive: ArchiveFilter,
+) -> bool {
+    if (resolution, archive) == (ResolutionFilter::Any, ArchiveFilter::Include) {
+        return true;
     }
+    if !s.lifecycle_known {
+        return false;
+    }
+    let resolved = match resolution {
+        ResolutionFilter::Any => true,
+        ResolutionFilter::Open => !s.resolved,
+        ResolutionFilter::Resolved => s.resolved,
+    };
+    let archived = match archive {
+        ArchiveFilter::Include => true,
+        ArchiveFilter::Hide => !s.archived,
+        ArchiveFilter::Only => s.archived,
+    };
+    resolved && archived
+}
+
+/// Runtime and location refinements (desktop `sessionMatchesFilter`).
+fn matches_refinements(s: &SessionSummary, f: &SessionFilters, needs_input: bool) -> bool {
+    let runtime = match f.runtime {
+        RuntimeFilter::Any => true,
+        RuntimeFilter::Running => s.running() && !needs_input,
+        RuntimeFilter::NeedsInput => needs_input,
+    };
+    let location = match f.location {
+        LocationFilter::Any => true,
+        LocationFilter::Local => s.remote.is_none(),
+        LocationFilter::Remote => s.remote.is_some(),
+    };
+    runtime && location
 }
 
 fn matches_query(s: &SessionSummary, agent_name: &str, query: &str) -> bool {
@@ -108,9 +149,11 @@ pub(super) enum Entry {
         /// Row state kept outside the summary (expanded, pending, error).
         state_sig: u64,
     },
+    /// Paging footer of a group: `shown` of `total` sessions listed.
     More {
         key: String,
-        more: usize,
+        shown: usize,
+        total: usize,
     },
     ChildError {
         agent: String,
@@ -140,12 +183,50 @@ pub(super) struct GroupHead {
     owner: Option<String>,
     /// First entry of the list: no gap above.
     first: bool,
+    /// The project path was just copied (the copy button shows a check).
+    copied: bool,
 }
 
 fn hash_of(f: impl FnOnce(&mut std::collections::hash_map::DefaultHasher)) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     f(&mut h);
     h.finish()
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum GroupLimit {
+    First(usize),
+    All,
+}
+
+impl GroupLimit {
+    fn shown(self, total: usize) -> usize {
+        match self {
+            Self::First(limit) => limit.min(total),
+            Self::All => total,
+        }
+    }
+}
+
+fn show_rows(
+    key: &str,
+    limit: GroupLimit,
+    cx: &Context<QmtApp>,
+) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    let key = key.to_owned();
+    cx.listener(move |this, _, _, cx| {
+        if matches!(limit, GroupLimit::First(GROUP_ROWS)) {
+            this.group_shown.remove(&key);
+        } else {
+            this.group_shown.insert(key.clone(), limit);
+        }
+        cx.notify();
+    })
+}
+
+/// `copied` key of a group's project path.
+fn workspace_copy_key(group: &str) -> String {
+    format!("workspace:{group}")
 }
 
 /// Indent of the notes under the children of a row at `depth`.
@@ -197,7 +278,7 @@ impl Entry {
                 (1u8, scope, in_pinned, depth, state_sig).hash(h);
                 hash_summary(s, h);
             }
-            Entry::More { key, more } => (2u8, key, more).hash(h),
+            Entry::More { key, shown, total } => (2u8, key, shown, total).hash(h),
             Entry::ChildError {
                 row_key,
                 depth,
@@ -473,11 +554,33 @@ impl QmtApp {
             ),
             (SessionTab::All, "All", roots.len()),
         ];
-        let tab = self.session_tab;
+        // Location only applies while remote sessions are listed.
+        let show_location = store.prefs.show_remote_sessions;
+        let mut filters = self.session_filters;
+        if !show_location {
+            filters.location = LocationFilter::Any;
+        }
+        // The runtime can wait on work that does not require the user.
+        let needs_input: HashSet<(&str, &str)> = store
+            .requests
+            .iter()
+            .filter(|r| r.is_pending() && !r.offline)
+            .filter_map(|r| Some((r.agent_id.as_str(), r.session_id.as_deref()?)))
+            .collect();
+        let tab = filters.tab();
+        let refinements = filters.refinements(show_location);
         let unknown_lifecycle = roots.iter().filter(|s| !s.lifecycle_known).count();
         let mut visible: Vec<SessionSummary> = roots
             .iter()
-            .filter(|s| in_tab(s, tab) && matches_query(s, agent_name(&s.agent_id), &query))
+            .filter(|s| {
+                matches_lifecycle(s, filters.resolution, filters.archive)
+                    && matches_refinements(
+                        s,
+                        &filters,
+                        needs_input.contains(&(s.agent_id.as_str(), s.id.as_str())),
+                    )
+                    && matches_query(s, agent_name(&s.agent_id), &query)
+            })
             .cloned()
             .collect();
         visible.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -535,7 +638,7 @@ impl QmtApp {
         let rc = RowCtx {
             p,
             show_agent: connected.len() > 1,
-            all_tab: tab == SessionTab::All,
+            all_tab: !filters.filters_lifecycle(),
             searching: !query.is_empty(),
             agents,
         };
@@ -550,6 +653,14 @@ impl QmtApp {
         // Inputs every row depends on: a change rebuilds the whole list.
         let global = hash_of(|h| {
             (rc.show_agent, rc.all_tab, rc.searching).hash(h);
+            // A filter change starts the list over at the top.
+            (
+                filters.runtime as u8,
+                filters.location as u8,
+                filters.resolution as u8,
+                filters.archive as u8,
+            )
+                .hash(h);
             let mut agents: Vec<_> = rc.agents.iter().collect();
             agents.sort_by(|a, b| a.0.cmp(b.0));
             for (id, a) in agents {
@@ -608,7 +719,7 @@ impl QmtApp {
             .border_b_1()
             .border_color(p.border)
             .children(counts.into_iter().map(|(t, label, n)| {
-                let active = t == tab;
+                let active = Some(t) == tab;
                 h_flex()
                     .id(label)
                     .gap_1p5()
@@ -623,13 +734,33 @@ impl QmtApp {
                     .child(label)
                     .child(div().text_xs().text_color(p.dim).child(n.to_string()))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.session_tab = t;
+                        this.session_filters.set_tab(t);
                         cx.notify();
                     }))
             }))
             .children(catalog_note);
+        // Refinements beyond the tab, with a way back to just the tab.
+        let refinement_summary = (!refinements.is_empty()).then(|| {
+            h_flex()
+                .gap_2()
+                .text_xs()
+                .text_color(p.muted)
+                .child(kit::icon(IconName::SlidersHorizontal, 13., p.dim))
+                .child(refinements.join(" · "))
+                .child(
+                    kit::flat_btn("sessions-clear-refinements", true, true, &p)
+                        .h(px(24.))
+                        .px(px(8.))
+                        .text_xs()
+                        .child("Clear")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.session_filters.reset_refinements();
+                            cx.notify();
+                        })),
+                )
+        });
         // Agents without lifecycle support only appear in All; say so.
-        let coverage = (tab != SessionTab::All && unknown_lifecycle > 0).then(|| {
+        let coverage = (filters.filters_lifecycle() && unknown_lifecycle > 0).then(|| {
             h_flex()
                 .gap_2()
                 .text_xs()
@@ -654,7 +785,7 @@ impl QmtApp {
                         .xsmall()
                         .label("View all")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.session_tab = SessionTab::All;
+                            this.session_filters.set_tab(SessionTab::All);
                             cx.notify();
                         })),
                 )
@@ -726,19 +857,21 @@ impl QmtApp {
                 ),
                 &p,
             )
-        } else if !has_groups && !query.is_empty() {
+        } else if !has_groups && (!query.is_empty() || !refinements.is_empty()) {
             state_panel(
                 IconName::SearchX,
                 "No matching sessions",
-                "Try another search.",
+                "Try another search or clear the filters.",
                 Some(
                     kit::button("sessions-clear-search")
                         .small()
-                        .label("Clear search")
+                        .label("Clear filters")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.session_query.update(cx, |s, cx| {
                                 s.set_value(SharedString::default(), window, cx)
                             });
+                            this.session_filters.reset_refinements();
+                            cx.notify();
                         }))
                         .into_any_element(),
                 ),
@@ -746,12 +879,12 @@ impl QmtApp {
             )
         } else if !has_groups {
             let (icon, title, text) = match tab {
-                SessionTab::Resolved => (
+                Some(SessionTab::Resolved) => (
                     IconName::CircleCheck,
                     "No resolved sessions",
                     "Sessions you mark as resolved appear here.",
                 ),
-                SessionTab::Archived => (
+                Some(SessionTab::Archived) => (
                     IconName::Archive,
                     "No archived sessions",
                     "Sessions you archive appear here.",
@@ -762,7 +895,7 @@ impl QmtApp {
                     "Browse All to find resolved and archived sessions.",
                 ),
             };
-            let (label, target) = if tab == SessionTab::Resolved {
+            let (label, target) = if tab == Some(SessionTab::Resolved) {
                 ("View open sessions", SessionTab::Open)
             } else {
                 ("View all sessions", SessionTab::All)
@@ -776,7 +909,7 @@ impl QmtApp {
                         .small()
                         .label(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.session_tab = target;
+                            this.session_filters.set_tab(target);
                             cx.notify();
                         }))
                         .into_any_element(),
@@ -796,18 +929,28 @@ impl QmtApp {
             .into_any_element()
         };
 
-        let top = div().w_full().flex().justify_center().px_8().pt_6().child(
-            v_flex()
-                .w_full()
-                .max_w(px(1040.))
-                .gap_4()
-                .pb_4()
-                .child(header)
-                .child(search)
-                .child(tabs)
-                .children(coverage)
-                .children(inline_error),
-        );
+        let top =
+            div().w_full().flex().justify_center().px_8().pt_6().child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(1040.))
+                    .gap_4()
+                    .pb_4()
+                    .child(header)
+                    .child(h_flex().gap_2().child(search.flex_1()).child(
+                        self.session_filters_button(
+                            filters,
+                            refinements.len(),
+                            show_location,
+                            &p,
+                            cx,
+                        ),
+                    ))
+                    .child(tabs)
+                    .children(refinement_summary)
+                    .children(coverage)
+                    .children(inline_error),
+            );
         // The list scrolls itself below the fixed header; the state panels
         // scroll with the page column.
         v_flex().size_full().child(top).child(if list_body {
@@ -862,18 +1005,19 @@ impl QmtApp {
         let special = kind != GroupKind::Workspace;
         // While searching every group is open, as in the desktop app.
         let collapsed = !rc.searching && !self.session_groups.is_open(&key);
-        let expanded = self.expanded.contains(&key);
         let total = sessions.len();
         let latest = sessions
             .first()
             .map(|s| s.updated_at.clone())
             .unwrap_or_default();
         let running = sessions.iter().filter(|s| s.running()).count();
-        let shown = if expanded {
-            total
-        } else {
-            total.min(GROUP_ROWS)
-        };
+        // Grows by GROUP_PAGE per "Show more", or straight to all.
+        let shown = self
+            .group_shown
+            .get(&key)
+            .copied()
+            .unwrap_or(GroupLimit::First(GROUP_ROWS))
+            .shown(total);
         // Machines of remote sessions in this workspace.
         let machines: Vec<String> = sessions
             .iter()
@@ -903,6 +1047,7 @@ impl QmtApp {
             has_local,
             owner,
             first,
+            copied: self.copied.as_deref() == Some(workspace_copy_key(&key).as_str()),
         }));
         if collapsed {
             return;
@@ -910,12 +1055,211 @@ impl QmtApp {
         for s in sessions.iter().take(shown) {
             self.push_session_entries(out, s, &key, special, 0, rc, store);
         }
-        if total > shown || expanded && total > GROUP_ROWS {
-            out.push(Entry::More {
-                key,
-                more: total - shown,
-            });
+        if total > GROUP_ROWS {
+            out.push(Entry::More { key, shown, total });
         }
+    }
+
+    /// Filters button beside the search, with the number of refinements
+    /// beyond the tab, and its popover (desktop `session-filter-popover`).
+    fn session_filters_button(
+        &self,
+        filters: SessionFilters,
+        active: usize,
+        show_location: bool,
+        p: &Palette,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let trigger = kit::button("sessions-filters")
+            .ghost()
+            .h_10()
+            .bg(p.card)
+            .icon(IconName::SlidersHorizontal)
+            .label("Filters")
+            .when(active > 0, |button| {
+                button
+                    .accessibility_label(format!("Filters, {active} active"))
+                    .child(kit::chip(active.to_string(), p))
+            });
+
+        fn row<T: Copy + PartialEq + 'static>(
+            id: &'static str,
+            label: &'static str,
+            current: T,
+            options: &[(T, &'static str)],
+            set: fn(&mut SessionFilters, T),
+            p: &Palette,
+            owner: &WeakEntity<QmtApp>,
+        ) -> Div {
+            h_flex()
+                .gap_4()
+                .justify_between()
+                .child(div().text_sm().text_color(p.muted).child(label))
+                .child(kit::segment_bar(p).children(options.iter().enumerate().map(
+                    |(ix, (value, text))| {
+                        let (value, owner) = (*value, owner.clone());
+                        kit::segment((id, ix), value == current, p)
+                            .label(*text)
+                            .on_click(move |_, _, cx| {
+                                let _ = owner.update(cx, |this, cx| {
+                                    set(&mut this.session_filters, value);
+                                    cx.notify();
+                                });
+                            })
+                    },
+                )))
+        }
+
+        let owner = cx.entity().downgrade();
+        let p = *p;
+        gpui_kit::component::popover::Popover::new("sessions-filters-popover")
+            .anchor(Anchor::TopRight)
+            .trigger(trigger)
+            .content(move |_, _, cx| {
+                v_flex()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(div().font_semibold().child("Filters"))
+                            .child(
+                                kit::row_icon_button(
+                                    "sessions-filters-close",
+                                    IconName::X,
+                                    "Close filters",
+                                    &p,
+                                    cx,
+                                )
+                                .xsmall()
+                                .on_click(
+                                    cx.listener(|state, _, window, cx| state.dismiss(window, cx)),
+                                ),
+                            ),
+                    )
+                    .child(row(
+                        "runtime",
+                        "Runtime",
+                        filters.runtime,
+                        &[
+                            (RuntimeFilter::Any, "Any"),
+                            (RuntimeFilter::Running, "Running"),
+                            (RuntimeFilter::NeedsInput, "Needs input"),
+                        ],
+                        |f, v| f.runtime = v,
+                        &p,
+                        &owner,
+                    ))
+                    .when(show_location, |el| {
+                        el.child(row(
+                            "location",
+                            "Location",
+                            filters.location,
+                            &[
+                                (LocationFilter::Any, "Any"),
+                                (LocationFilter::Local, "Local"),
+                                (LocationFilter::Remote, "Remote"),
+                            ],
+                            |f, v| f.location = v,
+                            &p,
+                            &owner,
+                        ))
+                    })
+                    .child(div().border_t_1().border_color(p.border))
+                    .child(row(
+                        "resolution",
+                        "Resolution",
+                        filters.resolution,
+                        &[
+                            (ResolutionFilter::Any, "Any"),
+                            (ResolutionFilter::Open, "Open"),
+                            (ResolutionFilter::Resolved, "Resolved"),
+                        ],
+                        |f, v| f.resolution = v,
+                        &p,
+                        &owner,
+                    ))
+                    .child(row(
+                        "archive",
+                        "Archived",
+                        filters.archive,
+                        &[
+                            (ArchiveFilter::Hide, "Hide"),
+                            (ArchiveFilter::Only, "Only"),
+                            (ArchiveFilter::Include, "Include"),
+                        ],
+                        |f, v| f.archive = v,
+                        &p,
+                        &owner,
+                    ))
+            })
+            .into_any_element()
+    }
+
+    /// Paging footer of a group: Show 10 more and Show all while sessions
+    /// remain, Show less once more than the first rows are listed, and how
+    /// many of the group's sessions are listed.
+    fn render_group_more(
+        &self,
+        key: &str,
+        shown: usize,
+        total: usize,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let remaining = total - shown;
+        let step = remaining.min(GROUP_PAGE);
+        let button = |id: &'static str, icon: IconName, label: String| {
+            kit::flat_btn(kit::keyed(id, key.to_string()), true, true, p)
+                .h(px(28.))
+                .px(px(10.))
+                .child(kit::icon(icon, 13., p.muted))
+                .child(label)
+        };
+        h_flex()
+            // Under the session titles: expander, gap and identicon.
+            .pl(px(30.))
+            .pt_1()
+            .pb_2()
+            .gap_2()
+            .when(remaining > 0, |el| {
+                el.child(
+                    button(
+                        "group-more",
+                        IconName::ChevronDown,
+                        format!("Show {step} more"),
+                    )
+                    .on_click(show_rows(
+                        key,
+                        GroupLimit::First(shown + step),
+                        cx,
+                    )),
+                )
+                .when(remaining > step, |el| {
+                    el.child(
+                        button(
+                            "group-all",
+                            IconName::ChevronsDown,
+                            format!("Show all ({remaining} left)"),
+                        )
+                        .on_click(show_rows(key, GroupLimit::All, cx)),
+                    )
+                })
+            })
+            .when(shown > GROUP_ROWS, |el| {
+                el.child(
+                    button("group-less", IconName::ChevronsUp, "Show less".into())
+                        .on_click(show_rows(key, GroupLimit::First(GROUP_ROWS), cx)),
+                )
+            })
+            .child(
+                div()
+                    .ml_auto()
+                    .pr_2()
+                    .text_xs()
+                    .text_color(p.dim)
+                    .child(format!("{shown} of {total}")),
+            )
+            .into_any_element()
     }
 
     /// One entry of the virtualized list, centered like the page header.
@@ -934,29 +1278,7 @@ impl QmtApp {
                 depth,
                 ..
             } => self.render_session_row(s, scope, *in_pinned, *depth, &rc, cx),
-            Entry::More { key, more } => {
-                let k = key.clone();
-                div()
-                    .id(kit::keyed("group-more", key.clone()))
-                    .ml(px(34.))
-                    .py_1()
-                    .text_xs()
-                    .font_medium()
-                    .text_color(p.accent)
-                    .cursor_pointer()
-                    .child(if *more > 0 {
-                        format!("Show {more} more")
-                    } else {
-                        "Show less".into()
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.expanded.remove(&k) {
-                            this.expanded.insert(k.clone());
-                        }
-                        cx.notify();
-                    }))
-                    .into_any_element()
-            }
+            Entry::More { key, shown, total } => self.render_group_more(key, *shown, *total, p, cx),
             Entry::ChildError {
                 agent,
                 id,
@@ -1008,8 +1330,10 @@ impl QmtApp {
         let collapsed = h.collapsed;
         let hover = p.card;
         let k1 = key.clone();
+        let group = SharedString::from(format!("group-head-{key}"));
         let trigger = h_flex()
             .id(kit::keyed("group-head", key.clone()))
+            .group(group.clone())
             .flex_1()
             .min_w_0()
             .gap_2()
@@ -1048,13 +1372,43 @@ impl QmtApp {
                         .font_family(kit::MONO)
                         .child(key.clone()),
                 )
-                .child(
-                    Clipboard::new(kit::keyed("copy-workspace", key.clone()))
-                        .value(key.clone())
-                        .accessibility_label("Copy project path")
-                        .tooltip("Copy project path")
-                        .xsmall(),
-                )
+                .child({
+                    // Shown on hover (or while confirming a copy), like the
+                    // transcript's copy buttons, with the same check feedback.
+                    let (path, copy_key) = (key.clone(), workspace_copy_key(&key));
+                    let copied = h.copied;
+                    div()
+                        .flex_none()
+                        .invisible()
+                        .group_hover(group.clone(), |s| s.visible())
+                        .when(copied, |el| el.visible())
+                        .child(
+                            kit::row_icon_button(
+                                kit::keyed("copy-workspace", key.clone()),
+                                if copied {
+                                    IconName::Check
+                                } else {
+                                    IconName::Copy
+                                },
+                                if copied {
+                                    "Copied"
+                                } else {
+                                    "Copy project path"
+                                },
+                                p,
+                                cx,
+                            )
+                            .size(px(24.))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    // The group header toggles on click; copying must not.
+                                    cx.stop_propagation();
+                                    cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                                    this.flash_copied(copy_key.clone(), cx);
+                                },
+                            )),
+                        )
+                })
             })
             .when(!special && !h.machines.is_empty(), |el| {
                 let names = &h.machines;
@@ -1458,16 +1812,17 @@ impl QmtApp {
         row_key: &SharedString,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let id = kit::keyed("session-menu", row_key.clone());
+        let p = *palette(cx);
+        let trigger = kit::row_icon_button(
+            kit::keyed("session-menu", row_key.clone()),
+            IconName::Ellipsis,
+            "Session actions",
+            &p,
+            cx,
+        )
+        .size(px(SESSION_MENU_SIZE));
         if pending {
-            return kit::button(id)
-                .ghost()
-                .small()
-                .size(px(SESSION_MENU_SIZE))
-                .px_0()
-                .loading(true)
-                .icon(IconName::Ellipsis)
-                .into_any_element();
+            return trigger.loading(true).into_any_element();
         }
         let local = s.remote.is_none();
         let can_pin = info.can_pin && s.root && local;
@@ -1476,9 +1831,7 @@ impl QmtApp {
             && s.remote.as_ref().is_none_or(|r| r.connected);
         let can_delete = info.can_delete && local;
         let (store, app, s) = (self.store.clone(), cx.entity().downgrade(), s.clone());
-        kit::icon_button(id, IconName::Ellipsis, "Session actions")
-            .size(px(SESSION_MENU_SIZE))
-            .px_0()
+        trigger
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                 let (agent, sid) = (s.agent_id.clone(), s.id.clone());
                 let (pinned, resolved, archived) = (s.pinned, s.resolved, s.archived);
@@ -1571,8 +1924,10 @@ impl QmtApp {
 mod tests {
     // Not `super::*`: the gpui glob brings a `test` macro that shadows `#[test]`.
     use super::{
-        Group, GroupKind, GroupOpenState, PINNED_KEY, RECENT_KEY, SessionSummary, SessionTab,
-        Worktree, in_tab, matches_query,
+        ArchiveFilter, GROUP_PAGE, GROUP_ROWS, Group, GroupKind, GroupLimit, GroupOpenState,
+        LocationFilter, PINNED_KEY, RECENT_KEY, ResolutionFilter, RuntimeFilter, SessionFilters,
+        SessionSummary, SessionTab, Worktree, in_tab, matches_lifecycle, matches_query,
+        matches_refinements,
     };
 
     fn group(key: &str, kind: GroupKind) -> Group {
@@ -1641,6 +1996,66 @@ mod tests {
         let archived = session(Some((true, true)));
         assert!(in_tab(&archived, SessionTab::Archived));
         assert!(!in_tab(&archived, SessionTab::Resolved));
+    }
+
+    #[test]
+    fn custom_lifecycle_filter_can_show_only_resolved_archived_sessions() {
+        let filters = SessionFilters {
+            resolution: ResolutionFilter::Resolved,
+            archive: ArchiveFilter::Only,
+            ..Default::default()
+        };
+        assert!(filters.tab().is_none());
+        assert_eq!(filters.refinements(false), ["Resolved", "Archived only"]);
+        let matches =
+            |s: &SessionSummary| matches_lifecycle(s, filters.resolution, filters.archive);
+        assert!(matches(&session(Some((true, true)))));
+        assert!(!matches(&session(Some((false, true)))));
+        assert!(!matches(&session(Some((true, false)))));
+        assert!(!matches(&session(None)));
+    }
+
+    #[test]
+    fn runtime_waiting_is_running_unless_input_is_pending() {
+        let mut s = session(Some((false, false)));
+        s.phase = "waiting".into();
+        let mut filters = SessionFilters {
+            runtime: RuntimeFilter::Running,
+            ..Default::default()
+        };
+        assert!(matches_refinements(&s, &filters, false));
+        assert!(!matches_refinements(&s, &filters, true));
+        filters.runtime = RuntimeFilter::NeedsInput;
+        assert!(matches_refinements(&s, &filters, true));
+        assert!(!matches_refinements(&s, &filters, false));
+    }
+
+    #[test]
+    fn location_combines_with_runtime_and_clear_preserves_tab() {
+        let mut s = session(Some((true, true)));
+        let mut filters = SessionFilters {
+            runtime: RuntimeFilter::NeedsInput,
+            location: LocationFilter::Remote,
+            ..Default::default()
+        };
+        filters.set_tab(SessionTab::Archived);
+        assert!(!matches_refinements(&s, &filters, true));
+        s.remote = Some(crate::store::RemoteOwner::default());
+        assert!(!matches_refinements(&s, &filters, false));
+        assert!(matches_refinements(&s, &filters, true));
+        assert_eq!(filters.refinements(true), ["Needs input", "Remote"]);
+        filters.reset_refinements();
+        assert!(filters.tab() == Some(SessionTab::Archived));
+        assert!(filters.refinements(true).is_empty());
+    }
+
+    #[test]
+    fn show_all_includes_sessions_arriving_after_expansion() {
+        let one_page = GroupLimit::First(GROUP_ROWS + GROUP_PAGE);
+        assert_eq!(one_page.shown(5), 5);
+        assert_eq!(one_page.shown(120), 18);
+        assert_eq!(GroupLimit::All.shown(120), 120);
+        assert_eq!(GroupLimit::All.shown(135), 135);
     }
 
     #[test]

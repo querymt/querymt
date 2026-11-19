@@ -65,6 +65,134 @@ pub enum SessionTab {
     All,
 }
 
+/// Sessions-page refinements (desktop `SessionBrowserState`). The lifecycle
+/// tabs are presets of `resolution` + `archive`; other combinations select
+/// no tab.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SessionFilters {
+    pub runtime: RuntimeFilter,
+    pub location: LocationFilter,
+    pub resolution: ResolutionFilter,
+    pub archive: ArchiveFilter,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeFilter {
+    Any,
+    Running,
+    NeedsInput,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LocationFilter {
+    Any,
+    Local,
+    Remote,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionFilter {
+    Any,
+    Open,
+    Resolved,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFilter {
+    Hide,
+    Only,
+    Include,
+}
+
+impl SessionTab {
+    pub const ALL: [SessionTab; 4] = [
+        SessionTab::Open,
+        SessionTab::Resolved,
+        SessionTab::Archived,
+        SessionTab::All,
+    ];
+
+    /// Lifecycle filter the tab stands for.
+    pub fn lifecycle(self) -> (ResolutionFilter, ArchiveFilter) {
+        match self {
+            SessionTab::Open => (ResolutionFilter::Open, ArchiveFilter::Hide),
+            SessionTab::Resolved => (ResolutionFilter::Resolved, ArchiveFilter::Hide),
+            SessionTab::Archived => (ResolutionFilter::Any, ArchiveFilter::Only),
+            SessionTab::All => (ResolutionFilter::Any, ArchiveFilter::Include),
+        }
+    }
+}
+
+impl Default for SessionFilters {
+    fn default() -> Self {
+        let (resolution, archive) = SessionTab::Open.lifecycle();
+        Self {
+            runtime: RuntimeFilter::Any,
+            location: LocationFilter::Any,
+            resolution,
+            archive,
+        }
+    }
+}
+
+impl SessionFilters {
+    /// The tab matching the lifecycle filter, if any.
+    pub fn tab(&self) -> Option<SessionTab> {
+        SessionTab::ALL
+            .into_iter()
+            .find(|t| t.lifecycle() == (self.resolution, self.archive))
+    }
+
+    pub fn set_tab(&mut self, tab: SessionTab) {
+        (self.resolution, self.archive) = tab.lifecycle();
+    }
+
+    /// Lifecycle state narrows the list (anything but All).
+    pub fn filters_lifecycle(&self) -> bool {
+        (self.resolution, self.archive) != SessionTab::All.lifecycle()
+    }
+
+    /// Refinements beyond the selected tab, for the Filters badge and the
+    /// summary line (desktop `refinementLabels`).
+    pub fn refinements(&self, show_location: bool) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        match self.runtime {
+            RuntimeFilter::Any => {}
+            RuntimeFilter::Running => out.push("Running"),
+            RuntimeFilter::NeedsInput => out.push("Needs input"),
+        }
+        if show_location {
+            match self.location {
+                LocationFilter::Any => {}
+                LocationFilter::Local => out.push("Local"),
+                LocationFilter::Remote => out.push("Remote"),
+            }
+        }
+        if self.tab().is_none() {
+            out.push(match self.resolution {
+                ResolutionFilter::Any => "Any resolution",
+                ResolutionFilter::Open => "Open",
+                ResolutionFilter::Resolved => "Resolved",
+            });
+            out.push(match self.archive {
+                ArchiveFilter::Hide => "Not archived",
+                ArchiveFilter::Only => "Archived only",
+                ArchiveFilter::Include => "Including archived",
+            });
+        }
+        out
+    }
+
+    /// Clear runtime and location, and return to Open if no tab matches.
+    pub fn reset_refinements(&mut self) {
+        self.runtime = RuntimeFilter::Any;
+        self.location = LocationFilter::Any;
+        if self.tab().is_none() {
+            self.set_tab(SessionTab::Open);
+        }
+    }
+}
+
 pub struct QmtApp {
     store: Entity<AgentsStore>,
     page: Page,
@@ -78,12 +206,13 @@ pub struct QmtApp {
     attachments: Vec<Attachment>,
     attach_error: Option<String>,
     session_query: Entity<InputState>,
-    session_tab: SessionTab,
+    session_filters: SessionFilters,
     /// Which Sessions-page groups are open.
     session_groups: sessions::GroupOpenState,
     /// Virtualized Sessions page list.
     session_list: sessions::SessionList,
-    expanded: HashSet<String>,
+    /// Display limits for expanded Sessions-page groups, keyed by group.
+    group_shown: HashMap<String, sessions::GroupLimit>,
     /// `agent:session` keys of Sessions-page rows showing their child sessions.
     session_children: HashSet<String>,
     /// Session awaiting delete confirmation.
@@ -327,10 +456,10 @@ impl QmtApp {
             attachments: Vec::new(),
             attach_error: None,
             session_query,
-            session_tab: SessionTab::Open,
+            session_filters: SessionFilters::default(),
             session_groups: Default::default(),
             session_list: Default::default(),
-            expanded: HashSet::new(),
+            group_shown: HashMap::new(),
             session_children: HashSet::new(),
             confirm_session_delete: None,
             dialog: None,
