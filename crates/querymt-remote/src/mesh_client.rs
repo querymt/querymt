@@ -157,6 +157,38 @@ impl KameoMeshClientTransport {
         result
     }
 
+    async fn stream_control<M, R>(
+        &self,
+        host: &kameo::actor::RemoteActorRef<ProviderHostActor>,
+        message: &M,
+    ) -> Result<R, LLMError>
+    where
+        ProviderHostActor: kameo::remote::RemoteMessage<M> + kameo::message::Message<M, Reply = R>,
+        M: serde::Serialize + Send + Sync + 'static,
+        R: kameo::reply::Reply<Ok = R, Error = kameo::error::Infallible>
+            + serde::de::DeserializeOwned,
+    {
+        let peer = host
+            .id()
+            .peer_id()
+            .copied()
+            .ok_or_else(|| sharing_error(SharingCallError::Unavailable))?;
+        let timeout = Self::PROVIDER_CONTROL_TIMEOUT;
+        match self
+            .mesh
+            .select_sharing_protocol(peer, timeout)
+            .await
+            .map_err(sharing_error)?
+        {
+            SharingProtocol::V1 => ask_sharing_v1(&self.mesh, host, message, timeout)
+                .await
+                .map_err(provider_ask_error),
+            SharingProtocol::Legacy => crate::ask_remote_with_timeout(host, message, timeout)
+                .await
+                .map_err(remote_send_error_to_llm_error_no_handler),
+        }
+    }
+
     async fn get_or_create_stream_router(
         &self,
         session_id: &str,
@@ -315,6 +347,22 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: GenericProviderStreamRequest<Self::RemoteRouterRef>,
     ) -> Result<(), LLMError> {
+        let peer = host
+            .id()
+            .peer_id()
+            .copied()
+            .ok_or_else(|| sharing_error(SharingCallError::Unavailable))?;
+        if self
+            .mesh
+            .select_sharing_protocol(peer, Self::PROVIDER_CONTROL_TIMEOUT)
+            .await
+            .map_err(sharing_error)?
+            == SharingProtocol::V1
+        {
+            return ask_sharing_v1(&self.mesh, host, &request, Self::PROVIDER_CONTROL_TIMEOUT)
+                .await
+                .map_err(provider_ask_error);
+        }
         let encoded_bytes =
             crate::provider_transport::remote_tell_request_size(host, &request, None)?;
         crate::provider_transport::ensure_mesh_request_fits(encoded_bytes)?;
@@ -332,13 +380,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: CancelProviderStreamRequest,
     ) -> Result<(), LLMError> {
-        host.ask(&request)
-            .mailbox_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
-            .reply_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
-            .send()
-            .await
-            .map(|_| ())
-            .map_err(remote_send_error_to_llm_error_no_handler)
+        self.stream_control(host, &request).await.map(|_| ())
     }
 
     async fn renew_stream_lease(
@@ -348,16 +390,12 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         request_id: &str,
         lease_ttl_secs: u64,
     ) -> Result<bool, LLMError> {
-        host.ask(&crate::RenewProviderStreamLease {
+        let request = crate::RenewProviderStreamLease {
             session_id: session_id.to_string(),
             request_id: request_id.to_string(),
             lease_ttl_secs,
-        })
-        .mailbox_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
-        .reply_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
-        .send()
-        .await
-        .map_err(remote_send_error_to_llm_error_no_handler)
+        };
+        self.stream_control(host, &request).await
     }
 
     async fn get_stream_status(
@@ -365,12 +403,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: GetProviderStreamStatus,
     ) -> Result<Option<ProviderStreamStatus>, LLMError> {
-        host.ask(&request)
-            .mailbox_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
-            .reply_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
-            .send()
-            .await
-            .map_err(remote_send_error_to_llm_error_no_handler)
+        self.stream_control(host, &request).await
     }
 
     async fn is_target_peer_alive(&self, target_locator: &str) -> bool {

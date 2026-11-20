@@ -1,4 +1,4 @@
-//! Guarded provider catalog, contract, and one-shot inference routes.
+//! Guarded provider catalog, contract, and inference routes.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::mesh_ingress::{InboundAccess, InboundRouter, PeerRequest};
 use crate::peer_access::quota::{
-    AttemptUsage, QuotaAttempt, QuotaError, QuotaSettlement, QuotaStore,
+    AttemptUsage, QuotaAttempt, QuotaError, QuotaSettlement, QuotaStore, ReservationId,
 };
 use crate::peer_access::{PeerGrant, PeerGrantState};
 use crate::provider_host_actor::validate_item_aware_request;
@@ -24,6 +24,7 @@ use crate::{
     merge_remote_provider_params,
 };
 
+pub(super) mod streams;
 #[cfg(test)]
 mod tests;
 
@@ -220,13 +221,49 @@ impl GuardedProvider {
         msg: ProviderChatRequest,
         request_id: Uuid,
     ) -> Result<ProviderChatResponse, RemoteProviderHostError> {
-        let state = self.binding(peer, &msg.provider, &msg.model).await?;
         validate_item_aware_request(&msg.messages, msg.item_aware_contract_version)?;
         let request = self.build_request(&msg.provider, &msg.model, msg.params)?;
         let call = ChatCall::new(&msg.messages)
             .maybe_tools(msg.tools.as_deref())
             .options(msg.options.unwrap_or_default());
-        let bound_tokens = self.backend.quota_bound(&request, &call);
+        let (provider, id) = self
+            .prepare_attempt(peer, request, &call, request_id)
+            .await?;
+        self.mark_dispatched(id).await?;
+        let watch = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Err(error) = self.binding(peer, &msg.provider, &msg.model).await {
+                    return error;
+                }
+            }
+        };
+        let response = tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(600), provider.chat(&call)) => result
+                .map_err(|_| failure(ProviderErrorKind::UnknownPermanent, "mesh_provider_timeout", "mesh provider attempt timed out"))
+                .and_then(|result| result.map_err(|error| RemoteProviderHostError::provider_chat("chat", &error))),
+            error = watch => Err(error),
+        };
+        let usage = response
+            .as_ref()
+            .ok()
+            .and_then(|reply| reply.usage.as_ref())
+            .map_or(AttemptUsage::Unknown, AttemptUsage::from_usage);
+        self.settle(id, usage).await?;
+        self.binding(peer, &msg.provider, &msg.model).await?;
+        response.map(ProviderChatResponse::from)
+    }
+
+    async fn prepare_attempt(
+        &self,
+        peer: &PeerRequest,
+        request: ProviderBuildRequest,
+        call: &ChatCall<'_>,
+        request_id: Uuid,
+    ) -> Result<(Arc<dyn querymt::LLMProvider>, ReservationId), RemoteProviderHostError> {
+        self.binding(peer, &request.provider_name, &request.model)
+            .await?;
+        let bound_tokens = self.backend.quota_bound(&request, call);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
@@ -237,8 +274,8 @@ impl GuardedProvider {
             .reserve(QuotaAttempt {
                 peer: peer.key().clone(),
                 protocol: peer.protocol(),
-                provider_id: msg.provider,
-                model_id: msg.model,
+                provider_id: request.provider_name.clone(),
+                model_id: request.model.clone(),
                 request_id,
                 bound_tokens,
                 now,
@@ -247,7 +284,7 @@ impl GuardedProvider {
             .map_err(quota_error)?;
         let prepared = tokio::time::timeout(
             Duration::from_secs(30),
-            self.backend.build_provider(request),
+            self.backend.build_provider(request.clone()),
         )
         .await
         .unwrap_or_else(|_| {
@@ -264,40 +301,33 @@ impl GuardedProvider {
                 return Err(error);
             }
         };
-        // Never dispatch a prepared call if the owner changed the grant while
-        // it was being prepared. The store also rechecks its reservation's revision.
-        let current = self.grant(peer).await;
-        if !matches!(current, Ok(ref grant) if grant.revision == state.revision) {
+        // Release without charging if preparation lost its authorization.
+        if let Err(error) = self
+            .binding(peer, &request.provider_name, &request.model)
+            .await
+        {
             self.store.release_unused(id).await.map_err(quota_error)?;
-            return Err(current
-                .err()
-                .unwrap_or_else(|| quota_error(QuotaError::Denied)));
+            return Err(error);
         }
+        Ok((provider, id))
+    }
+
+    async fn mark_dispatched(&self, id: ReservationId) -> Result<(), RemoteProviderHostError> {
+        // The store rechecks the reservation's revision in this transaction.
         if let Err(error) = self.store.mark_dispatched(id).await {
             if let Err(release) = self.store.release_unused(id).await {
                 tracing::warn!(%release, "mesh quota reservation requires reconciliation");
             }
             return Err(quota_error(error));
         }
-        let watch = async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if let Err(error) = self.grant(peer).await {
-                    return error;
-                }
-            }
-        };
-        let response = tokio::select! {
-            result = tokio::time::timeout(Duration::from_secs(600), provider.chat(&call)) => result
-                .map_err(|_| failure(ProviderErrorKind::UnknownPermanent, "mesh_provider_timeout", "mesh provider attempt timed out"))
-                .and_then(|result| result.map_err(|error| RemoteProviderHostError::provider_chat("chat", &error))),
-            error = watch => Err(error),
-        };
-        let usage = response
-            .as_ref()
-            .ok()
-            .and_then(|reply| reply.usage.as_ref())
-            .map_or(AttemptUsage::Unknown, AttemptUsage::from_usage);
+        Ok(())
+    }
+
+    async fn settle(
+        &self,
+        id: ReservationId,
+        usage: AttemptUsage,
+    ) -> Result<(), RemoteProviderHostError> {
         if self.store.settle(id, usage).await.map_err(quota_error)?
             == QuotaSettlement::BoundExceeded
         {
@@ -307,7 +337,7 @@ impl GuardedProvider {
                 "provider exceeded its enforced token bound",
             ));
         }
-        response.map(ProviderChatResponse::from)
+        Ok(())
     }
 }
 

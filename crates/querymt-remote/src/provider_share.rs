@@ -50,12 +50,15 @@ impl ProviderShare {
     pub async fn register_on_mesh(&self, runtime: &MeshRuntimeHandle) {
         let mesh = runtime.as_mesh_handle();
         if let (Some(router), Some(store)) = (mesh.inbound_router(), mesh.quota_store()) {
-            Arc::new(guarded::GuardedProvider {
+            let provider = Arc::new(guarded::GuardedProvider {
                 backend: self.backend.clone(),
                 catalog: self.catalog.clone(),
                 store: store.clone(),
-            })
-            .install(router, self.provider_catalog.id(), self.provider_host.id());
+            });
+            provider
+                .clone()
+                .install(router, self.provider_catalog.id(), self.provider_host.id());
+            guarded::streams::install(provider, mesh, router, self.provider_host.id());
         }
         for scope in runtime.active_scopes() {
             runtime
