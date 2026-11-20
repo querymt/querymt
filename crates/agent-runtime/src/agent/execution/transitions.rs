@@ -71,6 +71,7 @@ pub(super) async fn transition_before_llm_call(
         return Ok(ExecutionState::Cancelled);
     }
 
+    exec_ctx.require_turn_authority().await?;
     let provider = match super::llm_retry::call_with_retry(
         config,
         &exec_ctx.session_id,
@@ -120,12 +121,13 @@ pub(super) async fn transition_before_llm_call(
     let (tools, tools_json, new_hash) = {
         // Synchronous block: the guard never crosses an await.
         let _guard = collect_span.enter();
-        let tools = config.collect_tools(
+        let mut tools = config.collect_tools(
             provider,
             Some(exec_ctx.runtime.as_ref()),
             Some(&exec_ctx.tool_config),
             exec_ctx.tool_set(config),
         );
+        tools.retain(|tool| exec_ctx.allows_workflow_tool(&tool.function.name));
         let tools_json =
             serde_json::to_vec(&tools).context("Failed to serialize tools for hash computation")?;
         let new_hash = querymt_agent_core::hash::RapidHash::new(&tools_json);
@@ -173,6 +175,7 @@ pub(super) async fn transition_before_llm_call(
         trigger,
         message_count = messages.len() as u64
     );
+    exec_ctx.require_turn_authority().await?;
     let hook_result = config
         .hooks
         .run_context(crate::hooks::ContextHookRequest {

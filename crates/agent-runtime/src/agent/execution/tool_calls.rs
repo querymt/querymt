@@ -236,11 +236,6 @@ async fn prepare_tool_call_inner(
         });
     }
     let mut args: serde_json::Value = serde_json::from_str(&call.function.arguments)?;
-    let tool = exec_ctx.tool_set(config).find(&call.function.name);
-    let target = ToolTarget::resolve(tool.clone(), exec_ctx, &call.function.name);
-    let schema = resolve_tool_schema(config, exec_ctx, &call.function.name).await;
-    let mut repairs: Vec<Repair> = Vec::new();
-
     let reject = |args: serde_json::Value,
                   repairs: Vec<Repair>,
                   text: String,
@@ -259,6 +254,22 @@ async fn prepare_tool_call_inner(
             span: Span::none(),
         }
     };
+
+    if !exec_ctx.allows_workflow_tool(&call.function.name) {
+        Span::current().set_attribute("querymt.tool.execution", "blocked");
+        genai::error("mesh_access_denied");
+        return Ok(reject(
+            args,
+            Vec::new(),
+            "Error: tool is not available to mesh-hosted turns".into(),
+            "blocked",
+            Vec::new(),
+        ));
+    }
+    let tool = exec_ctx.tool_set(config).find(&call.function.name);
+    let target = ToolTarget::resolve(tool.clone(), exec_ctx, &call.function.name);
+    let schema = resolve_tool_schema(config, exec_ctx, &call.function.name).await;
+    let mut repairs: Vec<Repair> = Vec::new();
 
     // Hooks must see canonical names, so normalise before running them.
     match normalize_arguments(tool.as_deref(), schema.as_ref(), &mut args) {
@@ -986,7 +997,7 @@ async fn dispatch(
     let tool = target.tool_ref(&call.function.name);
 
     // Per-session config so that runtime SetAllowedTools / SetDeniedTools apply.
-    if !exec_ctx.tool_config.allows(tool) {
+    if !exec_ctx.allows_workflow_tool(&call.function.name) || !exec_ctx.tool_config.allows(tool) {
         let text = format!("Error: tool '{}' is not allowed", call.function.name);
         return Ok((
             ToolOutcome::error_text(text, ToolSource::Blocked, Execution::PolicyBlocked),
@@ -1746,6 +1757,9 @@ pub(super) async fn record_tool_side_effects(
     }
 
     if tool_name == "delegate" {
+        if !exec_ctx.allows_workflow_tool(tool_name) {
+            return Err(crate::error::AgentError::MeshAccessDenied.into());
+        }
         let args: serde_json::Value =
             serde_json::from_str(result.tool_arguments.as_deref().unwrap_or("{}"))
                 .unwrap_or_default();
@@ -3510,6 +3524,19 @@ mod prepared_call_tests {
             .execution_context()
             .await
             .with_turn_authority(PeerTurn::test_authority(revision, store.clone()));
+        for name in [
+            "delegate",
+            "route_delegation_to_peer",
+            "use_remote_provider",
+        ] {
+            let workflow = mock_tool_call("workflow", name, "{}");
+            let prepared = prepare_tool_call(&config, &workflow, &exec).await.unwrap();
+            assert!(matches!(prepared.disposition, Disposition::Rejected(_)));
+        }
+        assert!(
+            fx.hook_inputs().is_empty(),
+            "blocked tools cannot trigger hooks"
+        );
         let call = mock_tool_call(
             "call-1",
             "rec_edit",

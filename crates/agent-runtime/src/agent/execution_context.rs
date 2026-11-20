@@ -208,6 +208,16 @@ impl ExecutionContext {
         &self.turn_authority
     }
 
+    pub(crate) fn allows_workflow_tool(&self, name: &str) -> bool {
+        // The delegation orchestrator and routing tools can outlive this turn.
+        // Until they preserve its origin, do not let them borrow host authority.
+        matches!(self.turn_authority, TurnAuthority::Local)
+            || !matches!(
+                name,
+                "delegate" | "route_delegation_to_peer" | "use_remote_provider"
+            )
+    }
+
     /// Set the knowledge store for this context.
     pub fn with_knowledge_store(mut self, store: Option<Arc<dyn KnowledgeStore>>) -> Self {
         self.knowledge_store = store;
