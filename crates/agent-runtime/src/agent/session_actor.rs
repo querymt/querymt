@@ -335,29 +335,68 @@ pub(crate) enum TurnAuthority {
 
 #[cfg(feature = "remote")]
 pub(crate) struct PeerTurn {
-    pub(crate) origin: querymt_remote::mesh_ingress::PeerRequest,
-    pub(crate) store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+    key: querymt_remote::peer_access::PeerGrantKey,
+    revision: Uuid,
+    protocol: querymt_remote::peer_access::SharingProtocol,
+    store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+}
+
+#[cfg(feature = "remote")]
+impl PeerTurn {
+    pub(crate) fn from_request(
+        origin: &querymt_remote::mesh_ingress::PeerRequest,
+        store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            key: origin.key().clone(),
+            revision: origin.revision().ok_or(AgentError::MeshAccessDenied)?,
+            protocol: origin.protocol(),
+            store,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_authority(
+        revision: Uuid,
+        store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+    ) -> TurnAuthority {
+        use querymt_remote::{
+            NodeId,
+            peer_access::{PeerGrantKey, SharingProtocol},
+        };
+        TurnAuthority::Peer(Arc::new(Self {
+            key: PeerGrantKey {
+                host: NodeId::from_peer_id(libp2p::PeerId::random()),
+                peer: NodeId::from_peer_id(libp2p::PeerId::random()),
+            },
+            revision,
+            protocol: SharingProtocol::V1,
+            store,
+        }))
+    }
 }
 
 #[cfg(feature = "remote")]
 impl std::fmt::Debug for PeerTurn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerTurn")
-            .field("origin", &self.origin)
+            .field("key", &self.key)
+            .field("revision", &self.revision)
+            .field("protocol", &self.protocol)
             .finish_non_exhaustive()
     }
 }
 
 impl TurnAuthority {
-    async fn check(&self) -> Result<(), AgentError> {
+    pub(crate) async fn check(&self) -> Result<(), AgentError> {
         match self {
             Self::Local => Ok(()),
             // Until restricted tools and hosted inference share the quota and
             // policy boundary, only a current Full grant may execute a turn.
             #[cfg(feature = "remote")]
-            Self::Peer(peer) => match peer.store.grant(peer.origin.key()).await {
+            Self::Peer(peer) => match peer.store.grant(&peer.key).await {
                 Ok(state)
-                    if Some(state.revision) == peer.origin.revision()
+                    if state.revision == peer.revision
                         && state.grant == querymt_remote::peer_access::PeerGrant::Full =>
                 {
                     Ok(())
@@ -372,9 +411,7 @@ impl TurnAuthority {
             (Self::Local, Self::Local) => true,
             #[cfg(feature = "remote")]
             (Self::Peer(a), Self::Peer(b)) => {
-                a.origin.key() == b.origin.key()
-                    && a.origin.revision() == b.origin.revision()
-                    && a.origin.protocol() == b.origin.protocol()
+                a.key == b.key && a.revision == b.revision && a.protocol == b.protocol
             }
             #[cfg(feature = "remote")]
             _ => false,
@@ -3373,6 +3410,7 @@ async fn execute_prompt_inner(
     )
     .with_cancellation_token(cancel_token.clone())
     .with_execution_origin(execution_origin)
+    .with_turn_authority(authority.clone())
     .with_knowledge_store(config.knowledge_store())
     .with_repository_knowledge(config.repository_knowledge())
     .with_event_sink(config.event_sink.clone())

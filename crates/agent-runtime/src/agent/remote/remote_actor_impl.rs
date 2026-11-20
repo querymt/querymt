@@ -170,11 +170,9 @@ where
     let actor = weak
         .upgrade()
         .ok_or_else(|| AgentError::RemoteActor("session stopped".into()))?;
+    let authority = TurnAuthority::Peer(Arc::new(PeerTurn::from_request(&origin, store)?));
     actor
-        .ask(PeerTurnMessage {
-            authority: TurnAuthority::Peer(Arc::new(PeerTurn { store, origin })),
-            message,
-        })
+        .ask(PeerTurnMessage { authority, message })
         .mailbox_timeout(Duration::from_secs(10))
         .reply_timeout(timeout)
         .send()

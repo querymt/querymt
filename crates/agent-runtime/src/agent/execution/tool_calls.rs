@@ -218,6 +218,7 @@ async fn prepare_tool_call_inner(
     call: &MiddlewareToolCall,
     exec_ctx: &ExecutionContext,
 ) -> Result<PreparedCall, anyhow::Error> {
+    exec_ctx.require_turn_authority().await?;
     // Invalid outer input never executes and never degrades to `{}`. It is
     // rejected before hooks, permissions or invocation.
     if has_invalid_input(call) {
@@ -275,6 +276,7 @@ async fn prepare_tool_call_inner(
         }
     }
 
+    exec_ctx.require_turn_authority().await?;
     let hook_result = config
         .hooks
         .run_pre_tool_use(PreToolUseRequest {
@@ -487,28 +489,33 @@ async fn execute_prepared_inner(
     let execution_is_error = is_error;
     let mut result_blocks = raw_result_blocks;
     let mut is_error = is_error;
-    let post_hook = config
-        .hooks
-        .run_post_tool_use(PostToolUseRequest {
-            session_id: exec_ctx.session_id.clone(),
-            mcp_server: target.server().map(str::to_owned),
-            mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: exec_ctx.turn_id().to_string(),
-            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
-            model: exec_ctx
-                .llm_config()
-                .map(|cfg| cfg.model.clone())
-                .unwrap_or_default(),
-            permission_mode: exec_ctx.permission_mode().to_string(),
-            tool_name: call.function.name.clone(),
-            tool_input: args.clone(),
-            content: result_blocks.clone(),
-            is_error,
-            execution_is_error,
-            tool_source: tool_source.as_str().to_string(),
-            tool_use_id: call.id.clone(),
-        })
-        .await?;
+    // Preserve the result of an already executed tool, but do not start another hook after revocation.
+    let post_hook = if exec_ctx.require_turn_authority().await.is_ok() {
+        config
+            .hooks
+            .run_post_tool_use(PostToolUseRequest {
+                session_id: exec_ctx.session_id.clone(),
+                mcp_server: target.server().map(str::to_owned),
+                mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
+                turn_id: exec_ctx.turn_id().to_string(),
+                cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+                model: exec_ctx
+                    .llm_config()
+                    .map(|cfg| cfg.model.clone())
+                    .unwrap_or_default(),
+                permission_mode: exec_ctx.permission_mode().to_string(),
+                tool_name: call.function.name.clone(),
+                tool_input: args.clone(),
+                content: result_blocks.clone(),
+                is_error,
+                execution_is_error,
+                tool_source: tool_source.as_str().to_string(),
+                tool_use_id: call.id.clone(),
+            })
+            .await?
+    } else {
+        Default::default()
+    };
     // A blocked or suppressed result must not regain information through
     // enrichment; decided before the hook result is consumed.
     // Redaction (a rewritten output or error flag) counts the same as a block:
@@ -975,6 +982,7 @@ async fn dispatch(
     target: &ToolTarget,
     approval: ApprovalNeed,
 ) -> Result<(ToolOutcome, SnapshotState), anyhow::Error> {
+    exec_ctx.require_turn_authority().await?;
     let tool = target.tool_ref(&call.function.name);
 
     // Per-session config so that runtime SetAllowedTools / SetDeniedTools apply.
@@ -1005,6 +1013,7 @@ async fn dispatch(
         }
     }
 
+    exec_ctx.require_turn_authority().await?;
     let snapshot = if target.is_read_only() {
         SnapshotState::None
     } else {
@@ -1770,6 +1779,7 @@ pub(super) async fn record_tool_side_effects(
             .unwrap_or_default()
             .unwrap_or_default();
 
+        exec_ctx.require_turn_authority().await?;
         let pre_hook = config
             .hooks
             .run_pre_delegation(PreDelegationRequest {
@@ -1897,6 +1907,7 @@ pub(super) async fn record_tool_side_effects(
             ),
         });
 
+        exec_ctx.require_turn_authority().await?;
         if let Ok(delegation) = exec_ctx
             .state
             .record_delegation(
@@ -3454,6 +3465,74 @@ mod prepared_call_tests {
         let exec = fixture.agent.execution_context().await;
         let call = mock_tool_call("call-1", "rec_edit", &args.to_string());
         execute_tool_call(config, &call, &exec).await.unwrap()
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn revoked_peer_cannot_dispatch_prepared_tool_or_run_a_new_hook() {
+        use crate::agent::session_actor::PeerTurn;
+        use crate::error::AgentError;
+        use querymt_remote::NodeId;
+        use querymt_remote::peer_access::{
+            GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState,
+        };
+
+        struct Store(parking_lot::Mutex<PeerGrantState>);
+        #[async_trait::async_trait]
+        impl GrantStore for Store {
+            async fn grant(&self, _: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+                Ok(self.0.lock().clone())
+            }
+
+            async fn replace_grant(
+                &self,
+                _: &PeerGrantKey,
+                _: Uuid,
+                _: PeerGrant,
+            ) -> Result<PeerGrantState, GrantStoreError> {
+                unreachable!("test changes the policy directly")
+            }
+
+            async fn managed_peers(&self, _: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {
+                unreachable!("unused by tool dispatch")
+            }
+        }
+
+        let fx = Fixture::new().await;
+        let config = fx.config(Some(fx.hooks(json!({}))));
+        let revision = Uuid::now_v7();
+        let store = Arc::new(Store(parking_lot::Mutex::new(PeerGrantState {
+            revision,
+            grant: PeerGrant::Full,
+        })));
+        let exec = fx
+            .agent
+            .execution_context()
+            .await
+            .with_turn_authority(PeerTurn::test_authority(revision, store.clone()));
+        let call = mock_tool_call(
+            "call-1",
+            "rec_edit",
+            r#"{"file_path":"a.rs","new_string":"y"}"#,
+        );
+        let prepared = prepare_tool_call(&config, &call, &exec).await.unwrap();
+        assert!(matches!(prepared.disposition, Disposition::Ready));
+        assert_eq!(fx.hook_inputs().len(), 1);
+
+        *store.0.lock() = PeerGrantState {
+            revision: Uuid::now_v7(),
+            grant: PeerGrant::None,
+        };
+        let result = execute_prepared_tool_call(&config, &call, prepared, &exec).await;
+        assert!(
+            matches!(result, Err(error) if matches!(error.downcast_ref::<AgentError>(), Some(AgentError::MeshAccessDenied)))
+        );
+        let result = prepare_tool_call(&config, &call, &exec).await;
+        assert!(
+            matches!(result, Err(error) if matches!(error.downcast_ref::<AgentError>(), Some(AgentError::MeshAccessDenied)))
+        );
+        assert_eq!(fx.hook_inputs().len(), 1);
+        assert!(fx.invoked().is_empty());
     }
 
     #[tokio::test]

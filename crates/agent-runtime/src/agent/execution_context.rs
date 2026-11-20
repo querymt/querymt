@@ -3,6 +3,8 @@
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig};
 use crate::agent::objective::RunObjective;
+use crate::agent::session_actor::TurnAuthority;
+use crate::error::AgentError;
 use crate::knowledge::KnowledgeStore;
 use crate::session::error::SessionResult;
 use crate::session::provider::SessionHandle;
@@ -75,6 +77,7 @@ pub(crate) struct ExecutionContext {
 
     /// Origin of this execution cycle — interactive (user/delegation) or scheduled.
     pub execution_origin: ExecutionOrigin,
+    turn_authority: TurnAuthority,
 
     /// Optional knowledge store, propagated into tool contexts so knowledge tools can access it.
     pub knowledge_store: Option<Arc<dyn KnowledgeStore>>,
@@ -141,6 +144,7 @@ impl ExecutionContext {
             cancellation_token: CancellationToken::new(),
             tool_config,
             execution_origin: ExecutionOrigin::Interactive,
+            turn_authority: TurnAuthority::Local,
             knowledge_store: None,
             repository_knowledge: None,
             delivery_budget: std::sync::Mutex::new(None),
@@ -189,6 +193,19 @@ impl ExecutionContext {
     pub fn with_execution_origin(mut self, origin: ExecutionOrigin) -> Self {
         self.execution_origin = origin;
         self
+    }
+
+    pub(crate) fn with_turn_authority(mut self, authority: TurnAuthority) -> Self {
+        self.turn_authority = authority;
+        self
+    }
+
+    pub(crate) async fn require_turn_authority(&self) -> Result<(), AgentError> {
+        self.turn_authority.check().await
+    }
+
+    pub(crate) fn turn_authority(&self) -> &TurnAuthority {
+        &self.turn_authority
     }
 
     /// Set the knowledge store for this context.

@@ -765,6 +765,8 @@ pub(super) async fn transition_call_llm(
         return Ok(ExecutionState::Cancelled);
     }
 
+    exec_ctx.require_turn_authority().await?;
+
     // Overrides last for exactly this request. Options the provider does not
     // honour are dropped (and logged); `applied` records what was really sent.
     let options = context
@@ -835,7 +837,13 @@ pub(super) async fn transition_call_llm(
                         operation,
                         session_handle.billing_basis(),
                         &cancel,
-                        || provider.chat(&call),
+                        || async {
+                            exec_ctx
+                                .require_turn_authority()
+                                .await
+                                .map_err(|error| LLMError::InvalidRequest(error.to_string()))?;
+                            provider.chat(&call).await
+                        },
                     )
                     .await
                 }
@@ -1009,6 +1017,7 @@ pub(super) async fn transition_call_llm(
                     return Ok(ExecutionState::Cancelled);
                 }
 
+                exec_ctx.require_turn_authority().await?;
                 // Durable start before the request is sent; a failure here
                 // means nothing was dispatched.
                 let mut attempt = match operation
@@ -1026,6 +1035,13 @@ pub(super) async fn transition_call_llm(
                         return Err(accounting_failure(error));
                     }
                 };
+                if let Err(error) = exec_ctx.require_turn_authority().await {
+                    attempt
+                        .settle_error(&LLMError::InvalidRequest(error.to_string()), false, None)
+                        .await
+                        .map_err(accounting_failure)?;
+                    return Err(error.into());
+                }
                 let mut response_started = false;
 
                 timing.start();
@@ -1501,7 +1517,13 @@ pub(super) async fn transition_call_llm(
                             operation,
                             session_handle.billing_basis(),
                             &cancel,
-                            || provider.chat(&call),
+                            || async {
+                                exec_ctx
+                                    .require_turn_authority()
+                                    .await
+                                    .map_err(|error| LLMError::InvalidRequest(error.to_string()))?;
+                                provider.chat(&call).await
+                            },
                         )
                         .await
                     }

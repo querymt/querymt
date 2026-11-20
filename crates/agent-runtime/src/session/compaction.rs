@@ -3,6 +3,7 @@
 //! This module implements the AI compaction layer of the 3-layer compaction system,
 //! which generates summaries when context threshold is reached.
 
+use crate::agent::session_actor::TurnAuthority;
 use crate::agent::utils::{genai, render_prompt_for_llm};
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use anyhow::Result;
@@ -206,6 +207,31 @@ impl SessionCompaction {
         ledger: &DispatchLedger,
         instructions: Option<&str>,
     ) -> Result<CompactionResult> {
+        self.process_authorized(
+            messages,
+            provider,
+            model,
+            retry_config,
+            max_prompt_bytes,
+            ledger,
+            instructions,
+            &TurnAuthority::Local,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn process_authorized(
+        &self,
+        messages: &[AgentMessage],
+        provider: Arc<dyn querymt::chat::ChatProvider>,
+        model: &str,
+        retry_config: &RetryConfig,
+        max_prompt_bytes: Option<usize>,
+        ledger: &DispatchLedger,
+        instructions: Option<&str>,
+        authority: &TurnAuthority,
+    ) -> Result<CompactionResult> {
         // Estimate original token count
         let original_token_count = self.estimate_messages_tokens(messages, max_prompt_bytes);
 
@@ -228,6 +254,7 @@ impl SessionCompaction {
                     .map(|message| message.session_id.as_str())
                     .filter(|id| !id.is_empty()),
                 ledger,
+                authority,
             )
             .await?;
 
@@ -302,6 +329,7 @@ impl SessionCompaction {
             querymt.compaction = true,
         )
     )]
+    #[allow(clippy::too_many_arguments)]
     async fn call_with_retry(
         &self,
         messages: &[querymt::chat::ChatMessage],
@@ -310,6 +338,7 @@ impl SessionCompaction {
         retry_config: &RetryConfig,
         session_id: Option<&str>,
         ledger: &DispatchLedger,
+        authority: &TurnAuthority,
     ) -> Result<String> {
         // Provider identity is unavailable on ChatProvider; canonical provenance can supply it.
         genai::finish_reason("error");
@@ -329,6 +358,7 @@ impl SessionCompaction {
                 backoff_ms = (backoff_ms as f64 * retry_config.backoff_multiplier) as u64;
             }
 
+            authority.check().await?;
             // Prefer streaming to avoid mesh request-response timeout on long
             // inference.  The streaming path uses per-chunk timeouts instead of
             // a single total-request timeout, keeping the connection alive
@@ -349,6 +379,13 @@ impl SessionCompaction {
                 .await
                 .map_err(accounting_failure)?;
 
+            if let Err(error) = authority.check().await {
+                attempt_record
+                    .settle_error(&LLMError::InvalidRequest(error.to_string()), false, None)
+                    .await
+                    .map_err(accounting_failure)?;
+                return Err(error.into());
+            }
             let raw = if streaming {
                 Self::call_streaming(messages, &provider, &mut timing, &chat_span).await
             } else {
