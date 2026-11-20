@@ -15,9 +15,7 @@ async fn test_querymt_schedule_get_remote_returns_schedule() {
     f.handle.set_mesh(mesh.clone());
 
     let remote = RealStorageHandleFixture::new().await;
-    let peer_id = libp2p::identity::Keypair::generate_ed25519()
-        .public()
-        .to_peer_id();
+    let peer_id = *mesh.peer_id();
     let node_id = peer_id.to_string();
     let node_manager = RemoteNodeManager::new(
         remote.handle.config.clone(),
@@ -81,9 +79,7 @@ async fn test_querymt_schedule_get_remote_missing_returns_not_found() {
     f.handle.set_mesh(mesh.clone());
 
     let remote = RealStorageHandleFixture::new().await;
-    let peer_id = libp2p::identity::Keypair::generate_ed25519()
-        .public()
-        .to_peer_id();
+    let peer_id = *mesh.peer_id();
     let node_id = peer_id.to_string();
     let node_manager = RemoteNodeManager::new(
         remote.handle.config.clone(),

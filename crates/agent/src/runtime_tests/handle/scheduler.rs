@@ -31,9 +31,7 @@ async fn test_querymt_schedule_ext_create_remote_missing_session_surfaces_error(
     f.handle.set_mesh(mesh.clone());
 
     let remote = RealStorageHandleFixture::new().await;
-    let peer_id = libp2p::identity::Keypair::generate_ed25519()
-        .public()
-        .to_peer_id();
+    let peer_id = *mesh.peer_id();
     let node_id = peer_id.to_string();
     let node_manager = RemoteNodeManager::new(
         remote.handle.config.clone(),
@@ -113,9 +111,7 @@ async fn test_querymt_remote_attach_session_missing_persisted_session_surfaces_e
     f.handle.set_mesh(mesh.clone());
 
     let remote = RealStorageHandleFixture::new().await;
-    let peer_id = libp2p::identity::Keypair::generate_ed25519()
-        .public()
-        .to_peer_id();
+    let peer_id = *mesh.peer_id();
     let node_id = peer_id.to_string();
     let node_manager = RemoteNodeManager::new(
         remote.handle.config.clone(),
