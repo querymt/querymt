@@ -1481,8 +1481,6 @@ impl QmtApp {
             .into_any_element()
     }
 
-    /// The row of `s`, followed by its child sessions when expanded.
-    #[allow(clippy::too_many_arguments)]
     /// The entry of `s`, followed by its child sessions when expanded.
     #[allow(clippy::too_many_arguments)]
     fn push_session_entries(
