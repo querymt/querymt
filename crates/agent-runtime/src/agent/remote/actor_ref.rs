@@ -232,21 +232,32 @@ impl SessionActorRef {
     where
         SessionActor: kameo::message::Message<M> + kameo::remote::RemoteMessage<M>,
         M: serde::Serialize + Send + Sync + 'static,
-        <SessionActor as kameo::message::Message<M>>::Reply:
-            kameo::reply::Reply<Error = AgentError>,
         <<SessionActor as kameo::message::Message<M>>::Reply as kameo::reply::Reply>::Ok:
             serde::de::DeserializeOwned,
+        <<SessionActor as kameo::message::Message<M>>::Reply as kameo::reply::Reply>::Error:
+            Into<AgentError> + serde::de::DeserializeOwned + std::fmt::Debug + std::fmt::Display,
     {
         match mesh {
             Some(mesh) => {
+                use querymt_remote::request_timeout::SharingAskError;
                 querymt_remote::request_timeout::ask_with_sharing(mesh, actor, message, timeout)
                     .await
-                    .map_err(AgentError::from_sharing_ask)
+                    .map_err(|error| {
+                        AgentError::from_sharing_ask(match error {
+                            SharingAskError::Actor(error) => {
+                                SharingAskError::Actor(error.map_err(Into::into))
+                            }
+                            SharingAskError::Sharing(error) => SharingAskError::Sharing(error),
+                        })
+                    })
             }
             None => querymt_remote::ask_remote_with_timeout(actor, message, timeout)
                 .await
                 .map_err(|error| {
-                    Self::map_agent_timeout_remote_send_error(error, "session read timed out")
+                    Self::map_agent_timeout_remote_send_error(
+                        error.map_err(Into::into),
+                        "session request timed out",
+                    )
                 }),
         }
     }
@@ -677,18 +688,17 @@ impl SessionActorRef {
                 .map_err(|e| AgentError::RemoteActor(e.to_string())),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::GetMode)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
-                .send()
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                Self::read_remote(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &messages::GetMode,
+                    Self::REMOTE_CONTROL_REPLY_TIMEOUT,
+                )
                 .await
-                .map_err(|e| {
-                    Self::map_infallible_timeout_remote_send_error(
-                        e,
-                        "GetMode timed out on remote session",
-                    )
-                }),
+            }
         }
     }
 
@@ -728,18 +738,17 @@ impl SessionActorRef {
                 .await
                 .map_err(Self::map_local_agent_send_error),
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::GetSessionControl)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
-                .send()
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                Self::read_remote(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &messages::GetSessionControl,
+                    Self::REMOTE_CONTROL_REPLY_TIMEOUT,
+                )
                 .await
-                .map_err(|e| {
-                    Self::map_agent_timeout_remote_send_error(
-                        e,
-                        "GetSessionControl timed out on remote session",
-                    )
-                }),
+            }
         }
     }
 
@@ -1190,18 +1199,17 @@ impl SessionActorRef {
                 .map_err(|e| AgentError::RemoteActor(e.to_string())),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::GetSessionLimits)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
-                .send()
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                Self::read_remote(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &messages::GetSessionLimits,
+                    Self::REMOTE_CONTROL_REPLY_TIMEOUT,
+                )
                 .await
-                .map_err(|e| {
-                    Self::map_infallible_timeout_remote_send_error(
-                        e,
-                        "GetSessionLimits timed out on remote session",
-                    )
-                }),
+            }
         }
     }
 
@@ -1214,10 +1222,17 @@ impl SessionActorRef {
                 .map_err(|e| AgentError::RemoteActor(e.to_string())),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::GetRuntimeStatus)
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                Self::read_remote(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &messages::GetRuntimeStatus,
+                    Self::REMOTE_CONTROL_REPLY_TIMEOUT,
+                )
                 .await
-                .map_err(Self::map_infallible_remote_send_error),
+            }
         }
     }
 
@@ -1230,10 +1245,17 @@ impl SessionActorRef {
                 .await
                 .map_err(|error| AgentError::RemoteActor(error.to_string())),
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::SessionDeliveryBarrier)
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                Self::read_remote(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &messages::SessionDeliveryBarrier,
+                    Self::REMOTE_CONTROL_REPLY_TIMEOUT,
+                )
                 .await
-                .map_err(Self::map_infallible_remote_send_error),
+            }
         }
     }
 
@@ -1263,22 +1285,38 @@ impl SessionActorRef {
                 }),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::GetRuntimeStatus)
-                .mailbox_timeout(mailbox_timeout)
-                .reply_timeout(reply_timeout)
-                .send()
-                .await
-                .map_err(|e| {
-                    Self::map_infallible_timeout_remote_send_error(
-                        e,
-                        format!(
-                            "GetRuntimeStatus timed out (mailbox={}ms, reply={}ms)",
-                            mailbox_timeout.as_millis(),
-                            reply_timeout.as_millis()
-                        ),
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                if let Some(mesh) = mesh
+                    .as_deref()
+                    .filter(|mesh| mesh.inbound_router().is_some())
+                {
+                    return Self::read_remote(
+                        Some(mesh),
+                        actor_ref,
+                        &messages::GetRuntimeStatus,
+                        reply_timeout,
                     )
-                }),
+                    .await;
+                }
+                actor_ref
+                    .ask(&messages::GetRuntimeStatus)
+                    .mailbox_timeout(mailbox_timeout)
+                    .reply_timeout(reply_timeout)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        Self::map_infallible_timeout_remote_send_error(
+                            e,
+                            format!(
+                                "GetRuntimeStatus timed out (mailbox={}ms, reply={}ms)",
+                                mailbox_timeout.as_millis(),
+                                reply_timeout.as_millis()
+                            ),
+                        )
+                    })
+            }
         }
     }
 

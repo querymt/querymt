@@ -38,8 +38,23 @@ pub(crate) fn register_session_read<A, M>(router: &InboundRouter, actor: &ActorR
 where
     A: RemoteActor + RemoteMessage<M> + Message<M>,
     M: serde::de::DeserializeOwned + Send + 'static,
-    A::Reply: Reply<Error = AgentError>,
     <A::Reply as Reply>::Ok: serde::Serialize + Send,
+    <A::Reply as Reply>::Error: std::fmt::Display,
+    AgentError: From<<A::Reply as Reply>::Error>,
+{
+    register_session_request::<A, M>(router, actor, InboundAccess::Sessions);
+}
+
+pub(super) fn register_session_request<A, M>(
+    router: &InboundRouter,
+    actor: &ActorRef<A>,
+    v1_access: InboundAccess,
+) where
+    A: RemoteActor + RemoteMessage<M> + Message<M>,
+    M: serde::de::DeserializeOwned + Send + 'static,
+    <A::Reply as Reply>::Ok: serde::Serialize + Send,
+    <A::Reply as Reply>::Error: std::fmt::Display,
+    AgentError: From<<A::Reply as Reply>::Error>,
 {
     let weak = actor.downgrade();
     let read = move |_, msg| {
@@ -55,13 +70,13 @@ where
                 .send()
                 .await
                 .map_err(|error| match error {
-                    kameo::error::SendError::HandlerError(error) => error,
+                    kameo::error::SendError::HandlerError(error) => error.into(),
                     other => AgentError::RemoteActor(other.to_string()),
                 })
         }
     };
     router.register_ask::<A, M, _, _, _, _>(actor.id(), InboundAccess::LegacyFull, read.clone());
-    router.register_v1_ask::<A, M, _, _, _, _>(actor.id(), InboundAccess::Sessions, read);
+    router.register_v1_ask::<A, M, _, _, _, _>(actor.id(), v1_access, read);
 }
 
 pub(crate) fn register_session_history(router: &InboundRouter, actor: &ActorRef<SessionActor>) {
@@ -80,6 +95,10 @@ pub(crate) fn register_session_routes(
         return;
     };
     register_session_history(router, actor);
+    register_session_read::<_, messages::SessionDeliveryBarrier>(router, actor);
+    register_session_read::<_, messages::GetSessionControl>(router, actor);
+    register_session_read::<_, messages::GetMode>(router, actor);
+    register_session_read::<_, messages::GetSessionLimits>(router, actor);
     register_file_proxy(router, actor);
     register_session_subscriptions(router, mesh, store.clone(), actor);
     register_session_turns(router, store.clone(), actor);
@@ -90,20 +109,35 @@ pub(super) fn register_session_turns(
     store: Arc<dyn GrantStore>,
     actor: &ActorRef<SessionActor>,
 ) {
-    register_turn_ask::<messages::Prompt, _>(router, &store, actor, Duration::from_secs(600));
-    register_turn_ask::<messages::SubmitSessionInput, _>(
+    register_peer_session_ask::<messages::Prompt, _>(
         router,
         &store,
         actor,
-        Duration::from_secs(10),
+        Duration::from_secs(600),
+        InboundAccess::LegacyFull,
     );
-    register_turn_ask::<messages::DiscardQueuedInput, _>(
+    register_peer_session_ask::<messages::SubmitSessionInput, _>(
         router,
         &store,
         actor,
         Duration::from_secs(10),
+        InboundAccess::LegacyFull,
+    );
+    register_peer_session_ask::<messages::DiscardQueuedInput, _>(
+        router,
+        &store,
+        actor,
+        Duration::from_secs(10),
+        InboundAccess::LegacyFull,
     );
 
+    register_peer_session_ask::<messages::GetRuntimeStatus, _>(
+        router,
+        &store,
+        actor,
+        Duration::from_secs(10),
+        InboundAccess::Sessions,
+    );
     let weak = actor.downgrade();
     let cancel = move |origin, message| {
         send_peer_turn(
@@ -126,11 +160,12 @@ pub(super) fn register_session_turns(
     );
 }
 
-fn register_turn_ask<M, R>(
+fn register_peer_session_ask<M, R>(
     router: &InboundRouter,
     store: &Arc<dyn GrantStore>,
     actor: &ActorRef<SessionActor>,
     timeout: Duration,
+    v1_access: InboundAccess,
 ) where
     SessionActor: RemoteMessage<M> + Message<PeerTurnMessage<M>>,
     M: serde::de::DeserializeOwned + Send + 'static,
@@ -147,11 +182,7 @@ fn register_turn_ask<M, R>(
         InboundAccess::LegacyFull,
         handle.clone(),
     );
-    router.register_v1_ask::<SessionActor, M, _, _, _, _>(
-        actor.id(),
-        InboundAccess::LegacyFull,
-        handle,
-    );
+    router.register_v1_ask::<SessionActor, M, _, _, _, _>(actor.id(), v1_access, handle);
 }
 
 async fn send_peer_turn<M, R>(

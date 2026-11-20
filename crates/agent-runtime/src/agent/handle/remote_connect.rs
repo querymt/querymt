@@ -988,7 +988,9 @@ impl LocalAgentHandle {
                     // from lookup paths): structural answer, not a transient
                     // recovery failure. Both map to ACP -32002 like the pre-
                     // coordinator pass-through did.
-                    if matches!(
+                    if matches!(e, AgentError::MeshAccessDenied) {
+                        RemoteSessionConnectError::AccessDenied
+                    } else if matches!(
                         e,
                         AgentError::SessionNotFound { .. }
                             | AgentError::RemoteSessionNotFound { .. }
@@ -1427,7 +1429,9 @@ impl LocalAgentHandle {
         session_id: &str,
     ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, AgentError> {
         use crate::agent::remote::ResumeRemoteSession;
-        querymt_remote::ask_remote_with_timeout(
+        let mesh = self.mesh().ok_or(AgentError::MeshNotBootstrapped)?;
+        querymt_remote::request_timeout::ask_with_sharing(
+            &mesh,
             node_manager_ref,
             &ResumeRemoteSession {
                 session_id: session_id.to_string(),
@@ -1435,12 +1439,7 @@ impl LocalAgentHandle {
             Self::remote_request_timeout(),
         )
         .await
-        .map_err(
-            |error| match querymt_remote::classify_remote_send_error(error) {
-                Ok(failure) => AgentError::from_transport_failure(failure),
-                Err(handler_error) => handler_error,
-            },
-        )
+        .map_err(AgentError::from_sharing_ask)
     }
 
     /// Whether a remote connect/recovery attempt is currently in flight for

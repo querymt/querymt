@@ -562,7 +562,16 @@ mod remote_impl {
             Self::register_peer_schedule_ask::<ResumeRemoteSchedule, _>(router, &store, actor);
             Self::register_peer_schedule_ask::<TriggerRemoteSchedule, _>(router, &store, actor);
             Self::register_peer_schedule_ask::<DeleteRemoteSchedule, _>(router, &store, actor);
-            use crate::agent::remote::remote_actor_impl::register_session_read;
+            use crate::agent::remote::remote_actor_impl::{
+                register_session_read, register_session_request,
+            };
+            // Cold resume initializes workspace and MCP state. Until that path
+            // is constrained, only Full can materialize the hosted runtime.
+            register_session_request::<_, ResumeRemoteSession>(
+                router,
+                actor,
+                InboundAccess::LegacyFull,
+            );
             register_session_read::<_, ListRemoteSessions>(router, actor);
             register_session_read::<_, ListRemoteSessionsWithLifecycle>(router, actor);
             register_session_read::<_, GetRemoteSessionLifecycle>(router, actor);

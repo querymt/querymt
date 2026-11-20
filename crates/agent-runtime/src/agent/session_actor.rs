@@ -1663,6 +1663,27 @@ impl Message<GetRuntimeStatus> for SessionActor {
         _msg: GetRuntimeStatus,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        Ok(self.observe_runtime().await)
+    }
+}
+
+#[cfg(feature = "remote")]
+impl Message<PeerTurnMessage<GetRuntimeStatus>> for SessionActor {
+    type Reply = Result<SessionRuntimeStatus, AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: PeerTurnMessage<GetRuntimeStatus>,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let mut status = self.observe_runtime().await;
+        status.steerable &= msg.authority.can_control(&self.active_authority);
+        Ok(status)
+    }
+}
+
+impl SessionActor {
+    async fn observe_runtime(&mut self) -> SessionRuntimeStatus {
         let pending_steering_count = match &self.active_run {
             Some(run) => run.steering.pending_count().await,
             None => 0,
@@ -1670,7 +1691,7 @@ impl Message<GetRuntimeStatus> for SessionActor {
         if pending_steering_count != self.published_pending_steering {
             self.emit_runtime_changed(pending_steering_count);
         }
-        Ok(self.runtime_status(pending_steering_count))
+        self.runtime_status(pending_steering_count)
     }
 }
 

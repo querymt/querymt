@@ -367,6 +367,13 @@ impl AgentError {
     }
 }
 
+#[cfg(feature = "remote")]
+impl From<kameo::error::Infallible> for AgentError {
+    fn from(error: kameo::error::Infallible) -> Self {
+        match error {}
+    }
+}
+
 impl From<crate::agent::turn_control::TurnControlError> for AgentError {
     fn from(error: crate::agent::turn_control::TurnControlError) -> Self {
         Self::TurnControl {

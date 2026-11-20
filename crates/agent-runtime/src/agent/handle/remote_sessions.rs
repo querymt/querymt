@@ -623,14 +623,8 @@ impl LocalAgentHandle {
     {
         use crate::agent::remote::ResumeRemoteSession;
 
-        let timeout = Self::remote_request_timeout();
-        querymt_remote::ask_remote_with_timeout(
-            node_manager_ref,
-            &ResumeRemoteSession { session_id },
-            timeout,
-        )
-        .await
-        .map_err(Self::map_remote_node_manager_error)
+        self.read_remote_session_metadata(node_manager_ref, &ResumeRemoteSession { session_id })
+            .await
     }
 
     #[cfg(feature = "remote")]

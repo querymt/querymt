@@ -1365,6 +1365,18 @@ mod node_manager_tests {
                 ));
             }
         }
+        let resume = || {
+            node_ask::<RemoteNodeManager, _>(
+                manager.id(),
+                &ResumeRemoteSession {
+                    session_id: session_id.clone(),
+                },
+            )
+        };
+        assert!(matches!(
+            ingress.handle_v1(peer, resume()).await,
+            Err(SharingRejection::Denied)
+        ));
         let create_schedule = || {
             node_ask::<RemoteNodeManager, _>(
                 manager.id(),
@@ -1620,6 +1632,16 @@ mod node_manager_tests {
         else {
             panic!("owner prompt must start");
         };
+        let status_request = || node_ask::<SessionActor, _>(session.id(), &GetRuntimeStatus);
+        let Ok(SwarmResponse::Ask(Ok(bytes))) = ingress.handle_v1(peer, status_request()).await
+        else {
+            panic!("peer should be able to observe the owner's active run");
+        };
+        let status =
+            rmp_serde::from_slice::<crate::agent::messages::SessionRuntimeStatus>(&bytes).unwrap();
+        assert_eq!(status.active_run_id.as_deref(), Some(owner_run.as_str()));
+        assert!(!status.steerable);
+        assert!(session.ask(GetRuntimeStatus).await.unwrap().steerable);
         let steer = input(InputDelivery::Steer, Some(owner_run.clone()));
         denied(
             ingress
