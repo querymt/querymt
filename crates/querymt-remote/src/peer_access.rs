@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::NodeId;
 
+pub mod quota;
 mod store;
 pub use store::{GrantStore, GrantStoreError, PeerGrantState};
 

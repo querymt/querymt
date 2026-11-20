@@ -14,7 +14,13 @@ use uuid::Uuid;
 
 // Distinguish the standalone store from existing user SQLite databases.
 const APPLICATION_ID: i64 = 0x514d_5441;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+const GRANT_SCHEMA_V1: &str = "CREATE TABLE peer_grants (
+    host_id TEXT NOT NULL, peer_id TEXT NOT NULL, revision TEXT NOT NULL,
+    grant_json TEXT NOT NULL, PRIMARY KEY (host_id, peer_id)
+) STRICT;";
+
+mod quota;
 
 /// Host-local mesh grants. Each edit is a compare-and-swap SQLite transaction.
 #[derive(Clone)]
@@ -34,10 +40,10 @@ impl SqliteMeshAccess {
         })
     }
 
-    async fn with_conn<T: Send + 'static>(
+    async fn with_conn<T: Send + 'static, E: From<GrantStoreError> + Send + 'static>(
         &self,
-        f: impl FnOnce(&mut Connection) -> Result<T, GrantStoreError> + Send + 'static,
-    ) -> Result<T, GrantStoreError> {
+        f: impl FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E> {
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || f(&mut conn.lock()))
             .await
@@ -59,7 +65,7 @@ fn open_store(path: PathBuf) -> Result<Connection, GrantStoreError> {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(backend)?;
     match (app, version) {
-        (APPLICATION_ID, SCHEMA_VERSION) => {}
+        (APPLICATION_ID, 1 | SCHEMA_VERSION) => {}
         (0, 0) => {
             let populated: bool = tx
                 .query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema)", [], |row| {
@@ -71,26 +77,22 @@ fn open_store(path: PathBuf) -> Result<Connection, GrantStoreError> {
                     "mesh store path refers to a different database",
                 )));
             }
-            tx.execute_batch(
-                "CREATE TABLE peer_grants (
-                    host_id TEXT NOT NULL,
-                    peer_id TEXT NOT NULL,
-                    revision TEXT NOT NULL,
-                    grant_json TEXT NOT NULL,
-                    PRIMARY KEY (host_id, peer_id)
-                ) STRICT;",
-            )
-            .map_err(backend)?;
+            tx.execute_batch(GRANT_SCHEMA_V1).map_err(backend)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)
                 .map_err(backend)?;
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)
-                .map_err(backend)?;
+            tx.pragma_update(None, "user_version", 1).map_err(backend)?;
         }
         _ => {
             return Err(backend(std::io::Error::other(
                 "unrecognized mesh store schema",
             )));
         }
+    }
+    if version < 2 {
+        tx.execute_batch(include_str!("mesh_access/quota_v2.sql"))
+            .map_err(backend)?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(backend)?;
     }
     tx.commit().map_err(backend)?;
     Ok(conn)
@@ -123,6 +125,21 @@ fn load_grant(conn: &Connection, key: &PeerGrantKey) -> Result<PeerGrantState, G
     Ok(PeerGrantState { revision, grant })
 }
 
+fn save_grant(
+    conn: &Connection,
+    key: &PeerGrantKey,
+    grant: &PeerGrant,
+) -> Result<Uuid, GrantStoreError> {
+    let revision = Uuid::now_v7();
+    let grant_json = serde_json::to_string(grant).map_err(backend)?;
+    conn.execute(
+        "INSERT INTO peer_grants (host_id, peer_id, revision, grant_json) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (host_id, peer_id) DO UPDATE SET revision = excluded.revision, grant_json = excluded.grant_json",
+        params![key.host.to_string(), key.peer.to_string(), revision.to_string(), grant_json],
+    ).map_err(backend)?;
+    Ok(revision)
+}
+
 #[async_trait]
 impl GrantStore for SqliteMeshAccess {
     async fn grant(&self, key: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
@@ -139,24 +156,24 @@ impl GrantStore for SqliteMeshAccess {
         grant.validate()?;
         let key = key.clone();
         self.with_conn(move |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(backend)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(backend)?;
             let current = load_grant(&tx, &key)?;
             if expected != current.revision {
-                return Err(GrantStoreError::Conflict { expected, actual: current.revision });
+                return Err(GrantStoreError::Conflict {
+                    expected,
+                    actual: current.revision,
+                });
             }
             if grant == current.grant {
                 return Ok(current);
             }
-            let revision = Uuid::now_v7();
-            let grant_json = serde_json::to_string(&grant).map_err(backend)?;
-            tx.execute(
-                "INSERT INTO peer_grants (host_id, peer_id, revision, grant_json) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (host_id, peer_id) DO UPDATE SET revision = excluded.revision, grant_json = excluded.grant_json",
-                params![key.host.to_string(), key.peer.to_string(), revision.to_string(), grant_json],
-            ).map_err(backend)?;
+            let revision = save_grant(&tx, &key, &grant)?;
             tx.commit().map_err(backend)?;
             Ok(PeerGrantState { revision, grant })
-        }).await
+        })
+        .await
     }
 
     async fn managed_peers(&self, host: &NodeId) -> Result<Vec<NodeId>, GrantStoreError> {
@@ -182,7 +199,7 @@ impl GrantStore for SqliteMeshAccess {
 mod tests {
     use super::*;
 
-    fn grant_key() -> PeerGrantKey {
+    pub(super) fn grant_key() -> PeerGrantKey {
         PeerGrantKey {
             host: NodeId::parse("12D3KooWJ5MP5JUR1c8pF37dNHGGrVhCGHEHwrCYyowX6dPJtV6t").unwrap(),
             peer: NodeId::parse("12D3KooWQKkiEPk7f8Sp2LXj7S2BJMAMePSz23RQPYGVBCGiyhJE").unwrap(),
@@ -220,6 +237,39 @@ mod tests {
         assert_eq!(
             reopened.grant(&reverse).await.unwrap(),
             PeerGrantState::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrades_v1_grants_without_changing_their_revision() {
+        use querymt_remote::peer_access::quota::{QuotaLimit, QuotaScope, QuotaStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mesh.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(GRANT_SCHEMA_V1).unwrap();
+        conn.pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        let key = grant_key();
+        let revision = save_grant(&conn, &key, &PeerGrant::Full).unwrap();
+        drop(conn);
+
+        let upgraded = SqliteMeshAccess::open(&path).await.unwrap();
+        assert_eq!(
+            upgraded.grant(&key).await.unwrap(),
+            PeerGrantState {
+                revision,
+                grant: PeerGrant::Full
+            }
+        );
+        let scope = QuotaScope {
+            provider_id: "provider".into(),
+            model_id: None,
+        };
+        assert_eq!(
+            upgraded.quota(&key, &scope, 0).await.unwrap().limit,
+            QuotaLimit::Unlimited
         );
     }
 
