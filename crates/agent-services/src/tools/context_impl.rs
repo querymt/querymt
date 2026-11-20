@@ -86,6 +86,7 @@ pub struct AgentToolContext {
     todo_store: Option<Arc<crate::tools::builtins::todo::TodoStore>>,
     repository_knowledge: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
     tool_call_id: Option<String>,
+    workspace_index: Option<querymt_agent_index::CodeCacheClient>,
 }
 
 impl AgentToolContext {
@@ -110,7 +111,18 @@ impl AgentToolContext {
             todo_store: None,
             repository_knowledge: None,
             tool_call_id: None,
+            workspace_index: None,
         }
+    }
+
+    /// Attach the session's workspace code index cache (when the index is ready).
+    #[must_use]
+    pub fn with_workspace_index(
+        mut self,
+        index: Option<querymt_agent_index::CodeCacheClient>,
+    ) -> Self {
+        self.workspace_index = index;
+        self
     }
 
     /// Attach the agent's per-session todo store.
@@ -235,6 +247,10 @@ impl ToolContext for AgentToolContext {
 
     fn todo_store(&self) -> Option<Arc<crate::tools::builtins::todo::TodoStore>> {
         self.todo_store.clone()
+    }
+
+    fn workspace_index(&self) -> Option<querymt_agent_index::CodeCacheClient> {
+        self.workspace_index.clone()
     }
 
     fn scope_policy(&self) -> Arc<dyn ScopePolicy> {

@@ -16,7 +16,9 @@ mod event_relay_mesh_tests {
     use crate::session::sqlite_storage::SqliteStorage;
     use kameo::actor::Spawn;
     use querymt_agent_core::events::{AgentEvent, AgentEventKind, EventEnvelope, EventOrigin};
-    use querymt_agent_index::{FileIndexConfig, FunctionIndexConfig, WorkspaceIndexActor};
+    use querymt_agent_index::{
+        CodeIndexCacheOptions, FileIndexConfig, FunctionIndexConfig, WorkspaceIndexActor,
+    };
     use querymt_agent_services::event_fanout::EventFanout;
     use querymt_agent_services::event_sink::EventSink;
     use std::collections::HashMap;
@@ -512,6 +514,7 @@ mod event_relay_mesh_tests {
             root.clone(),
             FileIndexConfig::default(),
             FunctionIndexConfig::default(),
+            CodeIndexCacheOptions::memory(),
         )
         .await
         .expect("create workspace index");

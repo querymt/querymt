@@ -158,6 +158,17 @@ QueryMT implements a 3-layer context management system:
 - **Symbol references**: `find_symbol_references` across codebase
 - **Multi-language support**: Rust, Python, TypeScript, Go, Java, C/C++
 
+#### Persistent code index cache
+
+Each workspace index keeps the per-file results it derives (symbols and function entries for duplicate detection) in a disk cache, so a restart re-parses only files that changed, and the symbol tools (`index`, `get_symbol`, `get_function`, `replace_symbol`, `find_symbol_references`) do not re-parse unchanged files.
+
+- **Location**: `<platform cache dir>/querymt/code-index/<16 hex digit hash of the canonical workspace root>`, one directory per workspace root.
+- **What is stored**: derived symbols and function entries per file, plus the hashes needed to check that they are still current. Tools always supply the file text they just read, so output is identical to parsing the file directly.
+- **Limits**: at most 256 MiB and 200,000 entries per workspace. Results not used for 30 days are evicted; eviction only causes recomputation.
+- **Versioning**: a different `querymt-agent-index` version or cache schema version discards the whole cache on open and rebuilds it.
+- **Fallback**: if another process holds the directory, or it cannot be created or opened, the index keeps its results in memory for that process and logs a warning. A damaged directory is deleted and recreated once before falling back. Tools parse directly when the index is not ready, does not answer within 2 seconds, or fails.
+- **Safe to delete**: remove `querymt/code-index/` at any time; the next start rebuilds it.
+
 ### Scheduled Tasks
 
 - **Interval schedules**: Run tasks at fixed intervals

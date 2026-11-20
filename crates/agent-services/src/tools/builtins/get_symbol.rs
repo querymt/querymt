@@ -14,7 +14,7 @@ use crate::tools::{
 };
 use querymt_agent_index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind, parse_kind_filter};
 
-use super::helpers::{resolve_root, resolve_target};
+use super::helpers::{resolve_root, resolve_symbols, resolve_target};
 
 pub struct GetSymbolTool;
 
@@ -153,7 +153,7 @@ impl Tool for GetSymbolTool {
                     continue;
                 }
             };
-            let symbol_index = match SymbolIndex::from_source_for_path(&target, &content) {
+            let symbol_index = match resolve_symbols(context, &target, &content).await {
                 Ok(idx) => idx,
                 Err(e) => {
                     let err = format!("{}\n- Failed to index file: {e}", target.display());

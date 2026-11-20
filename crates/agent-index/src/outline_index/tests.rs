@@ -1534,3 +1534,27 @@ fn svelte_template_routes_to_markup_and_script_to_standard_sections() {
     assert!(markup.entries.iter().any(|e| e.label.starts_with("{#if")));
     assert!(find_section(&sections, "sections").is_none());
 }
+
+#[test]
+fn index_symbols_matches_index_source_for_success_and_failure() {
+    use super::index_symbols;
+    use crate::symbol_index::SymbolIndex;
+
+    let source = "pub fn run() {}\n\npub struct Config {\n    pub name: String,\n}\n";
+    let direct = index_source(source, "rust", &default_opts()).expect("direct outline");
+    let via_symbols = index_symbols(SymbolIndex::from_source(source, "rust"), &default_opts())
+        .expect("outline from symbols");
+    assert_eq!(
+        format_outline("a.rs", "rust", &via_symbols),
+        format_outline("a.rs", "rust", &direct)
+    );
+
+    let direct_error =
+        index_source("x", "no-such-language", &default_opts()).expect_err("unsupported language");
+    let symbols_error = index_symbols(
+        SymbolIndex::from_source("x", "no-such-language"),
+        &default_opts(),
+    )
+    .expect_err("unsupported language");
+    assert_eq!(symbols_error.to_string(), direct_error.to_string());
+}

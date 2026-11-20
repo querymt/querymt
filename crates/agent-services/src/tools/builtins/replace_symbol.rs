@@ -14,9 +14,9 @@ use crate::tools::{
     AliasScope, ArgAlias, CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError,
     WrapRule, effective_root, resolve_arg_path,
 };
-use querymt_agent_index::symbol_index::{SymbolDigest, SymbolIndex, SymbolKind, parse_kind_filter};
+use querymt_agent_index::symbol_index::{SymbolDigest, SymbolKind, parse_kind_filter};
 
-use super::helpers::{resolve_root, resolve_target};
+use super::helpers::{resolve_root, resolve_symbols, resolve_target};
 
 /// Compatibility spellings accepted inside `replacements` items (never advertised).
 const REPLACE_SYMBOL_ARG_ALIASES: &[ArgAlias] = &[
@@ -224,7 +224,8 @@ impl Tool for ReplaceSymbolTool {
                     }
                 };
 
-                let symbol_index = SymbolIndex::from_source_for_path(&target, &content)
+                let symbol_index = resolve_symbols(context, &target, &content)
+                    .await
                     .map_err(|e| ToolError::ProviderError(e.to_string()))?;
 
                 let matches = symbol_index.find_by_name(&req.symbol, req.kind);

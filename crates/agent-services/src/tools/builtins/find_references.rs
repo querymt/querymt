@@ -14,7 +14,12 @@ use crate::tools::{
 };
 use querymt_agent_index::symbol_index::SymbolIndex;
 
-use super::helpers::{parse_paths, resolve_root, resolve_target};
+use super::helpers::{
+    parse_paths, resolve_root, resolve_symbols, resolve_symbols_batch, resolve_target,
+};
+
+/// Files read and resolved per workspace-index lookup during a directory search.
+const DIR_SEARCH_BATCH: usize = 256;
 
 pub struct FindSymbolReferencesTool;
 
@@ -126,6 +131,7 @@ impl Tool for FindSymbolReferencesTool {
             let resolved = resolve_target("paths", search_path, &root)?;
             if resolved.is_file() {
                 self.search_file(
+                    context,
                     &resolved,
                     &symbols,
                     find_type,
@@ -135,6 +141,7 @@ impl Tool for FindSymbolReferencesTool {
                 .await;
             } else if resolved.is_dir() {
                 self.search_dir(
+                    context,
                     &resolved,
                     &symbols,
                     find_type,
@@ -159,6 +166,7 @@ impl Tool for FindSymbolReferencesTool {
 impl FindSymbolReferencesTool {
     async fn search_file(
         &self,
+        context: &dyn ToolContext,
         path: &Path,
         symbols: &[String],
         find_type: &str,
@@ -173,11 +181,119 @@ impl FindSymbolReferencesTool {
             Err(_) => return,
         };
 
-        let symbol_index = match SymbolIndex::from_source_for_path(path, &content) {
+        let symbol_index = match resolve_symbols(context, path, &content).await {
             Ok(idx) => idx,
             Err(_) => return,
         };
 
+        scan_file(
+            path,
+            &content,
+            &symbol_index,
+            symbols,
+            find_type,
+            remaining,
+            matches,
+        );
+    }
+
+    /// Read up to [`DIR_SEARCH_BATCH`] files, resolve all their symbols with one index
+    /// lookup, then scan them in the order given, stopping once `max_results` is reached.
+    async fn search_batch(
+        &self,
+        context: &dyn ToolContext,
+        paths: &[PathBuf],
+        symbols: &[String],
+        find_type: &str,
+        max_results: usize,
+        matches: &mut Vec<RefMatch>,
+    ) {
+        let mut readable: Vec<(&PathBuf, String)> = Vec::with_capacity(paths.len());
+        for path in paths {
+            if let Ok(content) = tokio::fs::read_to_string(path).await {
+                readable.push((path, content));
+            }
+        }
+        let files: Vec<(&Path, &str)> = readable
+            .iter()
+            .map(|(path, content)| (path.as_path(), content.as_str()))
+            .collect();
+        let resolved = resolve_symbols_batch(context, &files).await;
+
+        for ((path, content), symbol_index) in readable.iter().zip(resolved) {
+            if matches.len() >= max_results {
+                break;
+            }
+            let Ok(symbol_index) = symbol_index else {
+                continue;
+            };
+            scan_file(
+                path,
+                content,
+                &symbol_index,
+                symbols,
+                find_type,
+                max_results - matches.len(),
+                matches,
+            );
+        }
+    }
+
+    async fn search_dir(
+        &self,
+        context: &dyn ToolContext,
+        dir: &Path,
+        symbols: &[String],
+        find_type: &str,
+        max_results: usize,
+        matches: &mut Vec<RefMatch>,
+    ) {
+        let types = TypesBuilder::new()
+            .add_defaults()
+            .select("rust")
+            .select("ts")
+            .select("js")
+            .select("python")
+            .select("go")
+            .select("java")
+            .select("c")
+            .select("cpp")
+            .select("csharp")
+            .select("ruby")
+            .build()
+            .unwrap_or_else(|_| TypesBuilder::new().build().unwrap());
+
+        let mut files = WalkBuilder::new(dir)
+            .types(types)
+            .hidden(true)
+            .git_ignore(true)
+            .build()
+            .flatten()
+            .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
+            .map(|entry| entry.into_path());
+
+        while matches.len() < max_results {
+            let batch: Vec<PathBuf> = files.by_ref().take(DIR_SEARCH_BATCH).collect();
+            if batch.is_empty() {
+                break;
+            }
+            self.search_batch(context, &batch, symbols, find_type, max_results, matches)
+                .await;
+        }
+    }
+}
+
+/// Collect definition and reference matches of `symbols` in one file's text.
+fn scan_file(
+    path: &Path,
+    content: &str,
+    symbol_index: &SymbolIndex,
+    symbols: &[String],
+    find_type: &str,
+    remaining: usize,
+    matches: &mut Vec<RefMatch>,
+) {
+    {
         for symbol_name in symbols {
             // Cache definition line numbers once per symbol to avoid
             // re-traversing the symbol tree for every reference match.
@@ -227,52 +343,6 @@ impl FindSymbolReferencesTool {
             }
         }
     }
-
-    async fn search_dir(
-        &self,
-        dir: &Path,
-        symbols: &[String],
-        find_type: &str,
-        max_results: usize,
-        matches: &mut Vec<RefMatch>,
-    ) {
-        let types = TypesBuilder::new()
-            .add_defaults()
-            .select("rust")
-            .select("ts")
-            .select("js")
-            .select("python")
-            .select("go")
-            .select("java")
-            .select("c")
-            .select("cpp")
-            .select("csharp")
-            .select("ruby")
-            .build()
-            .unwrap_or_else(|_| TypesBuilder::new().build().unwrap());
-
-        let walker = WalkBuilder::new(dir)
-            .types(types)
-            .hidden(true)
-            .git_ignore(true)
-            .build();
-
-        for entry in walker.flatten() {
-            if matches.len() >= max_results {
-                break;
-            }
-            if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                self.search_file(
-                    entry.path(),
-                    symbols,
-                    find_type,
-                    max_results - matches.len(),
-                    matches,
-                )
-                .await;
-            }
-        }
-    }
 }
 
 fn parse_symbols(args: &Value) -> Result<Vec<String>, ToolError> {
@@ -293,10 +363,13 @@ fn parse_symbols(args: &Value) -> Result<Vec<String>, ToolError> {
 }
 
 fn format_matches(matches: &[RefMatch], root: &Path, truncated: bool) -> String {
-    use std::collections::HashMap;
-    let mut by_file: HashMap<PathBuf, Vec<&RefMatch>> = HashMap::new();
+    // Group by file in first-seen (walk) order so the output is deterministic.
+    let mut by_file: Vec<(&PathBuf, Vec<&RefMatch>)> = Vec::new();
     for m in matches {
-        by_file.entry(m.path.clone()).or_default().push(m);
+        match by_file.iter_mut().find(|(path, _)| **path == m.path) {
+            Some((_, group)) => group.push(m),
+            None => by_file.push((&m.path, vec![m])),
+        }
     }
 
     let mut lines = Vec::new();

@@ -1,3 +1,4 @@
+pub mod code_cache;
 pub mod error;
 pub mod file_index;
 pub mod function_index;
@@ -10,6 +11,10 @@ pub mod workspace_manager_actor;
 pub mod workspace_root;
 
 // Re-export commonly used types
+pub use code_cache::{
+    CODE_CACHE_SCHEMA_VERSION, CacheStorageKind, CodeCacheClient, CodeCacheError, CodeCacheStats,
+    CodeIndexCacheOptions, CodeIndexStorage,
+};
 pub use error::IndexError;
 pub use file_index::{
     FileChangeKind, FileChangeSet, FileIndex, FileIndexConfig, FileIndexEntry, FileIndexError,

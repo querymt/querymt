@@ -2,6 +2,7 @@
 
 use super::fingerprint::{rust_structural_fingerprint, structural_simhash_from_tree};
 use super::types::{FunctionIndexConfig, IndexedFunctionEntry};
+use crate::error::IndexError;
 use ignore::WalkBuilder;
 use similarity_core::{
     AstFingerprint, extract_functions, generic_tree_sitter_parser::GenericTreeSitterParser,
@@ -10,7 +11,75 @@ use similarity_core::{
 use similarity_py::python_parser::PythonParser;
 use similarity_rs::rust_parser::RustParser;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tracing::instrument;
+
+/// Stack size of the parse pool threads.
+const PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Process-wide pool with large (64 MB) thread stacks for parsing.
+///
+/// Tree-sitter's recursive AST traversal overflows the default 8 MB stack on deeply
+/// nested sources (for example some C/C++ headers), so every per-file parse runs here.
+static PARSE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+/// Get the shared parse pool, creating it on first use.
+///
+/// # Errors
+///
+/// Returns [`IndexError::ThreadPool`] if the pool threads cannot be spawned.
+pub(crate) fn parse_pool() -> Result<&'static rayon::ThreadPool, IndexError> {
+    if let Some(pool) = PARSE_POOL.get() {
+        return Ok(pool);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .thread_name(|index| format!("qmt-parse-{index}"))
+        .stack_size(PARSE_STACK_BYTES)
+        .build()?;
+    // If another thread won the race its pool is kept and ours is dropped.
+    Ok(PARSE_POOL.get_or_init(|| pool))
+}
+
+/// Extract the function entries of one file.
+///
+/// Files larger than `config.max_file_bytes`, files with an unsupported extension and files
+/// the parser rejects yield no entries. The parse runs on [`parse_pool`], so callers on other
+/// threads (including Ajika workers) get the large stack; on a pool thread it runs inline.
+#[instrument(
+    level = "trace",
+    name = "function_index.index_file_entries",
+    skip(source, config),
+    fields(file = %file_path.display(), bytes = source.len())
+)]
+pub(crate) fn index_file_entries(
+    file_path: &Path,
+    source: &str,
+    config: &FunctionIndexConfig,
+) -> Vec<IndexedFunctionEntry> {
+    if source.len() > config.max_file_bytes {
+        log::warn!(
+            "FunctionIndex: skipping {:?} ({} bytes > {} max) to avoid stack overflow",
+            file_path,
+            source.len(),
+            config.max_file_bytes,
+        );
+        return Vec::new();
+    }
+    let Some(language) = file_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(get_language_category)
+    else {
+        return Vec::new();
+    };
+    match parse_pool() {
+        Ok(pool) => pool.install(|| index_file_with_language(file_path, source, language, config)),
+        Err(error) => {
+            log::error!("FunctionIndex: cannot index {file_path:?}: {error}");
+            Vec::new()
+        }
+    }
+}
 
 /// Index a TypeScript/JavaScript file using the oxc-based parser
 #[instrument(
@@ -208,7 +277,7 @@ pub(super) fn extract_body_text_lines(source: &str, start_line: u32, end_line: u
         files_found = tracing::field::Empty,
     )
 )]
-pub(super) fn collect_source_files(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn collect_source_files(root: &Path) -> Vec<PathBuf> {
     let supported_extensions = [
         "ts", "tsx", "js", "jsx", "mjs", "cjs",  // TypeScript/JavaScript
         "rs",   // Rust

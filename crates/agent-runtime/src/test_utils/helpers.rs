@@ -357,11 +357,14 @@ impl UndoTestFixture {
     pub(crate) async fn build_workspace_index(
         &self,
     ) -> Result<querymt_agent_index::WorkspaceHandle> {
-        use querymt_agent_index::{FileIndexConfig, FunctionIndexConfig, WorkspaceIndexActor};
+        use querymt_agent_index::{
+            CodeIndexCacheOptions, FileIndexConfig, FunctionIndexConfig, WorkspaceIndexActor,
+        };
         Ok(WorkspaceIndexActor::create(
             self.worktree.path().to_path_buf(),
             FileIndexConfig::default(),
             FunctionIndexConfig::default(),
+            CodeIndexCacheOptions::memory(),
         )
         .await?)
     }

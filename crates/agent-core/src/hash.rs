@@ -33,6 +33,14 @@ impl RapidHash {
         self.0
     }
 
+    /// Rebuild a hash from its raw u64 value, the inverse of [`RapidHash::as_u64`].
+    ///
+    /// Used to restore hashes from binary storage; no hashing is performed.
+    #[inline]
+    pub const fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+
     /// Convert to a 16-character lowercase hex string.
     ///
     /// Used for SQLite TEXT storage and debugging.
@@ -100,6 +108,14 @@ mod tests {
         assert_eq!(hex.len(), 16);
         let parsed = RapidHash::from_hex(&hex).unwrap();
         assert_eq!(hash, parsed);
+    }
+
+    #[test]
+    fn rapid_hash_from_u64_round_trips() {
+        let hash = RapidHash::new(b"test");
+        assert_eq!(RapidHash::from_u64(hash.as_u64()), hash);
+        assert_eq!(RapidHash::from_u64(0).as_u64(), 0);
+        assert_eq!(RapidHash::from_u64(u64::MAX).as_u64(), u64::MAX);
     }
 
     #[test]

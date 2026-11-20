@@ -2,6 +2,9 @@ mod extractors;
 pub mod outline_projection;
 mod types;
 
+#[cfg(test)]
+pub(crate) mod fixtures;
+
 use std::path::Path;
 
 use crate::outline_index::common::get_language_for_extension;

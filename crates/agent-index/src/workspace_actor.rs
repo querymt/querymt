@@ -4,10 +4,12 @@
 //! by the actor mailbox.  A background tokio task forwards `FileChangeSet`
 //! events from `FileIndexWatcher` as `ApplyChanges` messages to self.
 
+use super::code_cache::{CodeCacheClient, CodeIndexCacheOptions};
 use super::error::IndexError;
 use super::file_index::{FileChangeSet, FileIndex, FileIndexConfig, FileIndexWatcher};
 use super::function_index::{
     FunctionIndex, FunctionIndexConfig, IndexedFunctionEntry, SimilarFunctionMatch,
+    collect_source_files, get_language_category,
 };
 use kameo::Actor;
 use kameo::actor::{ActorRef, Spawn};
@@ -35,6 +37,10 @@ pub struct WorkspaceIndexStats {
     pub indexed_file_count: usize,
     /// Age of the file index in seconds
     pub file_index_age_secs: Option<u64>,
+    /// Per-file extractions that ran since the index started (indexing and tool lookups)
+    pub parsed_files: u64,
+    /// Per-file results answered from the cache without running since the index started
+    pub reused_files: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -49,6 +55,8 @@ pub struct WorkspaceIndexStats {
 pub struct WorkspaceHandle {
     pub actor: ActorRef<WorkspaceIndexActor>,
     pub file_watcher: Arc<FileIndexWatcher>,
+    /// Persistent per-file symbol and function cache of this workspace.
+    pub code_cache: CodeCacheClient,
 }
 
 impl WorkspaceHandle {
@@ -107,6 +115,8 @@ pub struct WorkspaceIndexActorArgs {
     pub root: PathBuf,
     pub file_watcher: Arc<FileIndexWatcher>,
     pub function_index: FunctionIndex,
+    pub function_config: FunctionIndexConfig,
+    pub code_cache: CodeCacheClient,
 }
 
 /// Per-workspace actor.  Owns `FileIndexWatcher` (shared) and `FunctionIndex` (owned).
@@ -114,6 +124,8 @@ pub struct WorkspaceIndexActor {
     root: PathBuf,
     file_watcher: Arc<FileIndexWatcher>,
     function_index: FunctionIndex,
+    function_config: FunctionIndexConfig,
+    code_cache: CodeCacheClient,
 }
 
 impl Actor for WorkspaceIndexActor {
@@ -142,33 +154,112 @@ impl Actor for WorkspaceIndexActor {
             root: args.root,
             file_watcher: args.file_watcher,
             function_index: args.function_index,
+            function_config: args.function_config,
+            code_cache: args.code_cache,
         })
+    }
+}
+
+/// Build the function index from the code cache, parsing only files whose text changed.
+///
+/// Falls back to a direct build when the cache cannot answer, so a cache failure never
+/// prevents the workspace index from starting.
+async fn build_function_index(
+    root: &Path,
+    config: &FunctionIndexConfig,
+    code_cache: &CodeCacheClient,
+) -> Result<FunctionIndex, IndexError> {
+    let walk_root = root.to_path_buf();
+    let paths = tokio::task::spawn_blocking(move || collect_source_files(&walk_root)).await?;
+    match code_cache.index_all(&paths).await {
+        Ok(entries) => Ok(FunctionIndex::from_entries(
+            root,
+            config.clone(),
+            entries.into_iter().collect(),
+        )),
+        Err(error) => {
+            log::warn!(
+                "WorkspaceIndexActor: code cache failed for {root:?} ({error}); building directly"
+            );
+            FunctionIndex::build(root, config.clone()).await
+        }
     }
 }
 
 impl WorkspaceIndexActor {
     /// Create a new `WorkspaceIndexActor` and spawn it, returning a `WorkspaceHandle`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file watcher cannot start or the cache thread cannot be spawned.
     pub async fn create(
         root: PathBuf,
         file_config: FileIndexConfig,
         function_config: FunctionIndexConfig,
+        cache: CodeIndexCacheOptions,
     ) -> Result<WorkspaceHandle, IndexError> {
         let file_watcher =
             Arc::new(FileIndexWatcher::with_config(root.clone(), file_config).await?);
 
-        let function_index = FunctionIndex::build(&root, function_config).await?;
+        let code_cache = CodeCacheClient::spawn(&root, cache, function_config.clone())
+            .map_err(IndexError::CacheThread)?;
+        let function_index = build_function_index(&root, &function_config, &code_cache).await?;
 
         let file_watcher_clone = file_watcher.clone();
         let actor = WorkspaceIndexActor::spawn(WorkspaceIndexActorArgs {
             root,
             file_watcher: file_watcher_clone.clone(),
             function_index,
+            function_config,
+            code_cache: code_cache.clone(),
         });
 
         Ok(WorkspaceHandle {
             actor,
             file_watcher: file_watcher_clone,
+            code_cache,
         })
+    }
+
+    /// Send one change set to the cache (one Ajika operation) and mirror it into the
+    /// in-memory function index. Falls back to direct indexing if the cache fails.
+    async fn apply_to_index(&mut self, changed: Vec<(PathBuf, Arc<str>)>, removed: Vec<PathBuf>) {
+        // Files without a function-index language never carry entries.
+        let (changed, unsupported): (Vec<_>, Vec<_>) =
+            changed.into_iter().partition(|(path, _)| {
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .and_then(get_language_category)
+                    .is_some()
+            });
+        for (path, _) in &unsupported {
+            self.function_index.remove_file(path);
+        }
+        if changed.is_empty() && removed.is_empty() {
+            return;
+        }
+        match self.code_cache.apply(changed.clone(), &removed).await {
+            Ok(entries) => {
+                for path in &removed {
+                    self.function_index.remove_file(path);
+                }
+                for (path, file_entries) in entries {
+                    self.function_index.set_file_entries(&path, file_entries);
+                }
+            }
+            Err(error) => {
+                log::warn!(
+                    "WorkspaceIndexActor: code cache failed for {:?} ({error}); indexing directly",
+                    self.root
+                );
+                for path in &removed {
+                    self.function_index.remove_file(path);
+                }
+                for (path, source) in &changed {
+                    self.function_index.update_file(path, source);
+                }
+            }
+        }
     }
 
     /// Root directory of this workspace.
@@ -240,7 +331,9 @@ impl Message<UpdateFile> for WorkspaceIndexActor {
         msg: UpdateFile,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.function_index.update_file(&msg.file_path, &msg.source);
+        let source: Arc<str> = Arc::from(msg.source);
+        self.apply_to_index(vec![(msg.file_path, source)], Vec::new())
+            .await;
     }
 }
 
@@ -257,7 +350,7 @@ impl Message<RemoveFile> for WorkspaceIndexActor {
         msg: RemoveFile,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.function_index.remove_file(&msg.file_path);
+        self.apply_to_index(Vec::new(), vec![msg.file_path]).await;
     }
 }
 
@@ -293,19 +386,18 @@ impl Message<ApplyChanges> for WorkspaceIndexActor {
             );
         }
 
-        // Remove deleted files
-        for path in change_set.files_to_remove() {
-            self.function_index.remove_file(path);
-            log::debug!("WorkspaceIndexActor: Removed {:?}", path);
-        }
+        let removed: Vec<PathBuf> = change_set.files_to_remove().cloned().collect();
+        // Created/modified files whose text cannot be read are skipped, as before.
+        let changed: Vec<(PathBuf, Arc<str>)> = change_set
+            .files_to_reindex()
+            .filter_map(|path| {
+                let content = std::fs::read_to_string(path).ok()?;
+                Some((path.clone(), Arc::from(content)))
+            })
+            .collect();
 
-        // Reindex created/modified files (sequential — actor mailbox enforces this)
-        for path in change_set.files_to_reindex() {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                self.function_index.update_file(path, &content);
-                log::debug!("WorkspaceIndexActor: Updated {:?}", path);
-            }
-        }
+        // One cache operation per change set.
+        self.apply_to_index(changed, removed).await;
     }
 }
 
@@ -338,11 +430,21 @@ impl Message<GetStats> for WorkspaceIndexActor {
                 .unwrap_or(0)
         });
 
+        let (parsed_files, reused_files) = match self.code_cache.stats().await {
+            Ok(stats) => (stats.parsed_files, stats.reused_files),
+            Err(error) => {
+                log::debug!("WorkspaceIndexActor: code cache stats unavailable: {error}");
+                (0, 0)
+            }
+        };
+
         Box::new(WorkspaceIndexStats {
             file_count,
             function_count: self.function_index.function_count(),
             indexed_file_count: self.function_index.file_count(),
             file_index_age_secs,
+            parsed_files,
+            reused_files,
         })
     }
 }
@@ -359,10 +461,193 @@ impl Message<Rebuild> for WorkspaceIndexActor {
         // Rebuild file index
         self.file_watcher.refresh().await?;
 
-        // Rebuild function index
-        let new_index = FunctionIndex::build(&self.root, FunctionIndexConfig::default()).await?;
-
-        self.function_index = new_index;
+        // Rebuild function index through the cache: unchanged files are reused.
+        self.function_index =
+            build_function_index(&self.root, &self.function_config, &self.code_cache).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_index::{FileChange, FileChangeKind};
+    use std::collections::BTreeSet;
+
+    fn function_source(name: &str) -> String {
+        format!(
+            "pub fn {name}(values: &[i32]) -> i32 {{\n    let mut total = 0;\n    for value in values {{\n        total += value;\n    }}\n    total\n}}\n"
+        )
+    }
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        base: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(files: &[(&str, String)]) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path().join("ws");
+            std::fs::create_dir_all(&root).expect("create root");
+            for (name, content) in files {
+                std::fs::write(root.join(name), content).expect("write file");
+            }
+            Self {
+                base: dir.path().join("cache"),
+                root,
+                _dir: dir,
+            }
+        }
+
+        async fn open(&self) -> WorkspaceHandle {
+            WorkspaceIndexActor::create(
+                self.root.clone(),
+                FileIndexConfig::default(),
+                FunctionIndexConfig::default(),
+                CodeIndexCacheOptions::in_directory(&self.base),
+            )
+            .await
+            .expect("create workspace index")
+        }
+    }
+
+    /// Release the cache directory so another index can own it.
+    async fn close(handle: &WorkspaceHandle) {
+        handle.code_cache.shutdown().await;
+        let _ = handle.actor.stop_gracefully().await;
+    }
+
+    async fn stats(handle: &WorkspaceHandle) -> WorkspaceIndexStats {
+        *handle.actor.ask(GetStats).await.expect("stats")
+    }
+
+    /// Files and names of the indexed functions that duplicate a probe function.
+    async fn duplicates(handle: &WorkspaceHandle, root: &Path) -> BTreeSet<(PathBuf, String)> {
+        let results = handle
+            .actor
+            .ask(FindSimilarToCode {
+                file_path: root.join("probe.rs"),
+                source: function_source("probe"),
+            })
+            .await
+            .expect("find similar");
+        results
+            .into_iter()
+            .flat_map(|(_, matches)| matches)
+            .map(|m| (m.function.file_path, m.function.name))
+            .collect()
+    }
+
+    async fn apply(handle: &WorkspaceHandle, changes: Vec<(PathBuf, FileChangeKind)>) {
+        let change_set = FileChangeSet {
+            changes: changes
+                .into_iter()
+                .map(|(path, kind)| FileChange {
+                    path,
+                    kind,
+                    is_dir: false,
+                })
+                .collect(),
+            timestamp: 0,
+        };
+        handle
+            .actor
+            .ask(ApplyChanges { change_set })
+            .await
+            .expect("apply changes");
+    }
+
+    fn three_files() -> [(&'static str, String); 3] {
+        [
+            ("a.rs", function_source("alpha")),
+            ("b.rs", function_source("beta")),
+            ("c.rs", function_source("gamma")),
+        ]
+    }
+
+    #[tokio::test]
+    async fn restart_with_unchanged_files_parses_nothing() {
+        let fx = Fixture::new(&three_files());
+
+        let first = fx.open().await;
+        assert_eq!(stats(&first).await.parsed_files, 3);
+        let before = duplicates(&first, &fx.root).await;
+        assert_eq!(before.len(), 3, "all three files duplicate the probe");
+        close(&first).await;
+
+        let second = fx.open().await;
+        let after_start = stats(&second).await;
+        assert_eq!(after_start.parsed_files, 0);
+        assert_eq!(after_start.reused_files, 3);
+        assert_eq!(after_start.indexed_file_count, 3);
+        assert_eq!(duplicates(&second, &fx.root).await, before);
+    }
+
+    #[tokio::test]
+    async fn file_edited_while_the_index_was_closed() {
+        let fx = Fixture::new(&three_files());
+        let first = fx.open().await;
+        close(&first).await;
+
+        std::fs::write(fx.root.join("b.rs"), function_source("beta_renamed")).expect("edit");
+
+        let second = fx.open().await;
+        let started = stats(&second).await;
+        assert_eq!(started.parsed_files, 1);
+        assert_eq!(started.reused_files, 2);
+
+        let found = duplicates(&second, &fx.root).await;
+        let b = fx.root.join("b.rs");
+        assert!(found.contains(&(b.clone(), "beta_renamed".to_owned())));
+        assert!(!found.contains(&(b, "beta".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn watcher_change_re_parses_only_the_changed_file() {
+        let fx = Fixture::new(&three_files());
+        let handle = fx.open().await;
+        let before = stats(&handle).await;
+        assert_eq!(before.parsed_files, 3);
+
+        std::fs::write(fx.root.join("a.rs"), function_source("alpha_modified")).expect("modify");
+        std::fs::write(fx.root.join("d.rs"), function_source("delta")).expect("create");
+        apply(
+            &handle,
+            vec![
+                (fx.root.join("a.rs"), FileChangeKind::Modified),
+                (fx.root.join("d.rs"), FileChangeKind::Created),
+            ],
+        )
+        .await;
+
+        let after = stats(&handle).await;
+        assert_eq!(after.parsed_files, before.parsed_files + 2);
+        let found = duplicates(&handle, &fx.root).await;
+        assert!(found.contains(&(fx.root.join("a.rs"), "alpha_modified".to_owned())));
+        assert!(found.contains(&(fx.root.join("d.rs"), "delta".to_owned())));
+        assert!(found.contains(&(fx.root.join("b.rs"), "beta".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn deleted_file_leaves_duplicate_detection() {
+        let fx = Fixture::new(&three_files());
+        let handle = fx.open().await;
+        let a = fx.root.join("a.rs");
+        assert!(
+            duplicates(&handle, &fx.root)
+                .await
+                .contains(&(a.clone(), "alpha".to_owned())),
+            "the function in file A is matched before removal"
+        );
+
+        std::fs::remove_file(&a).expect("remove file");
+        apply(&handle, vec![(a.clone(), FileChangeKind::Removed)]).await;
+
+        let found = duplicates(&handle, &fx.root).await;
+        assert!(found.iter().all(|(path, _)| path != &a));
+        assert_eq!(found.len(), 2, "the other files still match");
+        assert_eq!(stats(&handle).await.indexed_file_count, 2);
     }
 }

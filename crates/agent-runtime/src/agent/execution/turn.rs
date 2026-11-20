@@ -231,6 +231,13 @@ impl TurnEnv {
         if let Some(bridge) = &self.workspace_query_bridge {
             ctx = ctx.with_workspace_query_bridge(Arc::new(bridge.clone()));
         }
+        // The workspace index is built in the background; until it is set, tools parse directly.
+        ctx = ctx.with_workspace_index(
+            self.runtime
+                .workspace_handle
+                .get()
+                .map(|handle| handle.code_cache.clone()),
+        );
         ctx
     }
 }
@@ -693,6 +700,57 @@ mod tests {
                     .expect("propagated"),
                 enabled.as_ref().unwrap()
             ));
+        }
+
+        #[tokio::test]
+        async fn repeated_lookup_on_an_unchanged_file_is_reused_through_session() {
+            use crate::tools::Tool;
+            use querymt_agent_index::workspace_actor::GetStats;
+            use querymt_agent_index::{
+                CodeIndexCacheOptions, FileIndexConfig, FunctionIndexConfig, WorkspaceIndexActor,
+            };
+
+            let workspace_dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(
+                workspace_dir.path().join("lib.rs"),
+                "pub fn greet() -> u32 {\n    42\n}\n",
+            )
+            .unwrap();
+
+            let (env, _turn) = TestAgent::new().await.with_inert_model().turn().await;
+
+            // Before the workspace index is ready, tools get no index and parse directly.
+            assert!(env.tool_context(None).workspace_index().is_none());
+
+            let workspace = WorkspaceIndexActor::create(
+                workspace_dir.path().to_path_buf(),
+                FileIndexConfig::default(),
+                FunctionIndexConfig::default(),
+                CodeIndexCacheOptions::memory(),
+            )
+            .await
+            .expect("create workspace index");
+            assert!(env.runtime.workspace_handle.set(workspace.clone()).is_ok());
+            let stats = || async { *workspace.actor.ask(GetStats).await.expect("stats") };
+            let baseline = stats().await;
+
+            let tool_ctx = env.tool_context(None);
+            assert!(tool_ctx.workspace_index().is_some());
+            let tool = crate::tools::builtins::GetSymbolTool::new();
+            let args = serde_json::json!({
+                "requests": [{"path": "lib.rs", "symbol": "greet"}],
+                "root": workspace_dir.path()
+            });
+
+            let first = tool.call(args.clone(), &tool_ctx).await.unwrap();
+            let after_first = stats().await;
+            assert_eq!(after_first.parsed_files, baseline.parsed_files + 1);
+
+            let second = tool.call(args, &tool_ctx).await.unwrap();
+            let after_second = stats().await;
+            assert_eq!(after_second.parsed_files, after_first.parsed_files);
+            assert_eq!(after_second.reused_files, after_first.reused_files + 1);
+            assert_eq!(format!("{first:?}"), format!("{second:?}"));
         }
     }
 

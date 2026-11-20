@@ -1,5 +1,6 @@
 //! Typed errors for the workspace index.
 
+use super::code_cache::CodeCacheError;
 use super::file_index::FileIndexError;
 use thiserror::Error;
 
@@ -22,4 +23,10 @@ pub enum IndexError {
     /// The parser thread pool could not be created.
     #[error("failed to build index thread pool: {0}")]
     ThreadPool(#[from] rayon::ThreadPoolBuildError),
+    /// The persistent code cache failed.
+    #[error("code cache error: {0}")]
+    CodeCache(#[from] CodeCacheError),
+    /// The code cache owner thread could not be started.
+    #[error("failed to start code cache thread: {0}")]
+    CacheThread(#[source] std::io::Error),
 }

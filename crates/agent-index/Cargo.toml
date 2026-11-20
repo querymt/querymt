@@ -26,6 +26,12 @@ grep-regex = "0.1"
 rayon = "1.11"
 rapidhash = "4.2"
 
+# Persistent incremental query cache for per-file symbols and function entries
+ajika = "=0.2.1"
+# Same version and derive feature as ajika, for the persisted value mirrors.
+wincode = { version = "0.6.3", features = ["derive"] }
+dirs.workspace = true
+
 # Code similarity detection (local fork with tree-sitter 0.26)
 similarity-core = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
 similarity-rs = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
@@ -61,6 +67,10 @@ tree-sitter-md = "0.5"
 # Rust AST parsing for rich structural fingerprinting during function indexing
 syn = { version = "2", features = ["full", "visit"] }
 querymt-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[features]
+# Test-only helpers (unresponsive / disconnected cache clients, outline projection).
+test-support = []
 
 [dev-dependencies]
 tempfile = "3.0"
