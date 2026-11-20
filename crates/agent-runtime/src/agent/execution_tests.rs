@@ -887,6 +887,89 @@ async fn stop_hook_can_continue_after_unrecovered_token_limit_stop() {
     assert_eq!(harness.run().await, CycleOutcome::Completed);
 }
 
+/// "Prefix is stable after a reload": a Stop-hook continuation is sent to the
+/// model, so a session loaded from storage must contain it at the same place.
+/// Storage is what a reload reads, so the continuation has to be stored.
+#[tokio::test]
+async fn durable_prefix_is_stable_after_a_reload() {
+    use querymt_agent_core::model::{MessagePart, NoticeSource};
+
+    let mut harness =
+        TestHarness::new_with_tools(vec![], None, vec![provider_tool("update_task")]).await;
+    let output = json!({
+        "decision": "block",
+        "reason": "budget remains",
+        "hook_specific_output": {"hook_event_name": "stop", "additional_context": "keep going"}
+    });
+    let hooks = crate::hooks::Hooks::new(
+        serde_json::from_value::<crate::hooks::HooksConfig>(json!({
+            "enabled": true,
+            "stop": [{"hooks": [{
+                "type": "command",
+                "command": format!("cat >/dev/null; printf '%s' '{output}'"),
+                "timeout_sec": 5
+            }]}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    harness.config = Arc::new(
+        crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+            harness.config.storage.clone(),
+            harness.config.provider.clone(),
+            harness.config.event_sink.journal().clone(),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly)
+        .with_execution_policy(harness.config.execution_policy.clone())
+        .with_hooks(hooks)
+        .build(),
+    );
+    let sent: Arc<StdMutex<Vec<Vec<String>>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sent_for_mock = sent.clone();
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .returning(move |messages, _| {
+            sent_for_mock
+                .lock()
+                .unwrap()
+                .push(messages.iter().map(|message| message.text()).collect());
+            Ok(MockChatResponse::text_only("done").into())
+        })
+        .times(2);
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    // The second request carried the continuation message.
+    let sent = sent.lock().unwrap().clone();
+    let continuation = sent[1]
+        .iter()
+        .find(|text| text.contains("budget remains"))
+        .expect("second request carries the Stop-hook continuation")
+        .clone();
+
+    // A reload reads storage: the continuation must be there, as a notice.
+    let stored_notice = harness
+        .stored_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .find_map(|part| match part {
+            MessagePart::Notice {
+                source: NoticeSource::StopHook,
+                content,
+            } => Some(content.clone()),
+            _ => None,
+        });
+    assert_eq!(
+        stored_notice.as_deref(),
+        Some(continuation.as_str()),
+        "the continuation sent to the model is not in stored history"
+    );
+}
+
 #[tokio::test]
 async fn stop_hook_continues_once_by_default() {
     // The hook keeps asking, so the default cap of 1 is hit and the user is told.

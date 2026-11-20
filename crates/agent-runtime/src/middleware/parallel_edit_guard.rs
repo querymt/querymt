@@ -276,7 +276,10 @@ impl MiddlewareDriver for ParallelEditGuard {
                 let note = self.lock_pending().remove(&*context.session_id);
                 match note {
                     Some(note) => Ok(ExecutionState::BeforeLlmCall {
-                        context: Arc::new(context.inject_message(note)),
+                        context: Arc::new(context.queue_notice(
+                            querymt_agent_core::model::NoticeSource::ParallelEdit,
+                            note,
+                        )),
                     }),
                     None => Ok(ExecutionState::BeforeLlmCall { context }),
                 }
@@ -587,14 +590,18 @@ mod tests {
         assert_eq!(proceed, ["1", "2"], "warn mode runs every call");
         assert!(rejected.is_empty());
 
-        // The step after the tool results gets the note appended as the last message.
+        // The step after the tool results queues the note; the loop stores it.
         let before = ExecutionState::BeforeLlmCall { context: context() };
         let out = guard.on_step_start(before, None).await.unwrap();
         let ExecutionState::BeforeLlmCall { context } = out else {
             panic!("expected BeforeLlmCall");
         };
-        assert_eq!(context.messages.len(), 1);
-        let text = context.messages.last().unwrap().text();
+        assert_eq!(context.pending_notices.len(), 1);
+        assert_eq!(
+            context.pending_notices[0].source,
+            querymt_agent_core::model::NoticeSource::ParallelEdit
+        );
+        let text = context.pending_notices[0].content.clone();
         assert!(text.contains("design.md"), "{text}");
         assert!(text.contains("multiedit"), "{text}");
 
@@ -607,7 +614,7 @@ mod tests {
         else {
             panic!("expected BeforeLlmCall");
         };
-        assert_eq!(again.messages.len(), 1);
+        assert_eq!(again.pending_notices.len(), 1);
     }
 
     #[tokio::test]
@@ -726,7 +733,7 @@ mod tests {
         else {
             panic!("expected BeforeLlmCall");
         };
-        assert_eq!(context.messages.len(), 1);
+        assert_eq!(context.pending_notices.len(), 1);
     }
 
     async fn flag_same_file(guard: &ParallelEditGuard, root: &Path) {
@@ -741,7 +748,7 @@ mod tests {
         else {
             panic!("expected BeforeLlmCall");
         };
-        context.messages.len()
+        context.pending_notices.len()
     }
 
     #[tokio::test]

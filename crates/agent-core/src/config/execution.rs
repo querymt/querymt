@@ -568,6 +568,11 @@ pub struct ExecutionPolicy {
     /// step within one turn (default: 1). `0` makes Stop hooks advisory only.
     #[serde(default = "default_max_stop_hook_continuations")]
     pub max_stop_hook_continuations: u32,
+    /// Send the rendered run objective with every model request (default:
+    /// `false`). The objective is still tracked and its events are emitted
+    /// when this is off.
+    #[serde(default)]
+    pub run_objective: bool,
 }
 
 impl Default for ExecutionPolicy {
@@ -581,6 +586,7 @@ impl Default for ExecutionPolicy {
             task_completion_guard: default_task_completion_guard(),
             max_stop_recoveries: DEFAULT_MAX_STOP_RECOVERIES,
             max_stop_hook_continuations: DEFAULT_MAX_STOP_HOOK_CONTINUATIONS,
+            run_objective: false,
         }
     }
 }
@@ -596,6 +602,7 @@ pub struct RuntimeExecutionPolicy {
     pub task_completion_guard: bool,
     pub max_stop_recoveries: u8,
     pub max_stop_hook_continuations: u32,
+    pub run_objective: bool,
 }
 
 impl Default for RuntimeExecutionPolicy {
@@ -608,6 +615,7 @@ impl Default for RuntimeExecutionPolicy {
             task_completion_guard: default_task_completion_guard(),
             max_stop_recoveries: DEFAULT_MAX_STOP_RECOVERIES,
             max_stop_hook_continuations: DEFAULT_MAX_STOP_HOOK_CONTINUATIONS,
+            run_objective: false,
         }
     }
 }
@@ -622,6 +630,7 @@ impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
             task_completion_guard: ep.task_completion_guard,
             max_stop_recoveries: ep.max_stop_recoveries,
             max_stop_hook_continuations: ep.max_stop_hook_continuations,
+            run_objective: ep.run_objective,
         }
     }
 }

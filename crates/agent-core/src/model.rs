@@ -614,6 +614,40 @@ where
     Ok(item)
 }
 
+/// Who raised a stored [`MessagePart::Notice`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeSource {
+    AgentMode,
+    OutputLimit,
+    ProgressReview,
+    StopHook,
+    TaskCompletion,
+    DuplicateToolCall,
+    DuplicateCode,
+    ParallelEdit,
+    ContextUsage,
+    BackgroundCommand,
+}
+
+impl NoticeSource {
+    /// The wire name of this source, as stored and reported in history.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentMode => "agent_mode",
+            Self::OutputLimit => "output_limit",
+            Self::ProgressReview => "progress_review",
+            Self::StopHook => "stop_hook",
+            Self::TaskCompletion => "task_completion",
+            Self::DuplicateToolCall => "duplicate_tool_call",
+            Self::DuplicateCode => "duplicate_code",
+            Self::ParallelEdit => "parallel_edit",
+            Self::ContextUsage => "context_usage",
+            Self::BackgroundCommand => "background_command",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data")]
 pub enum MessagePart {
@@ -693,6 +727,13 @@ pub enum MessagePart {
     CompactionRequest {
         original_token_count: usize,
     },
+    /// Text the harness sends the model on its own behalf (mode reminders,
+    /// guidance, warnings). Stored so every later request carries it at the
+    /// same position; sent to the model as user text.
+    Notice {
+        source: NoticeSource,
+        content: String,
+    },
     /// Turn snapshot start: worktree state before turn (user prompt)
     TurnSnapshotStart {
         turn_id: TurnId,
@@ -735,6 +776,7 @@ impl MessagePart {
             MessagePart::Snapshot { .. } => "snapshot",
             MessagePart::Compaction { .. } => "compaction",
             MessagePart::CompactionRequest { .. } => "compaction_request",
+            MessagePart::Notice { .. } => "notice",
             MessagePart::TurnSnapshotStart { .. } => "turn_snapshot_start",
             MessagePart::TurnSnapshotPatch { .. } => "turn_snapshot_patch",
         }
@@ -979,6 +1021,9 @@ impl AgentMessage {
                 MessagePart::CompactionRequest { .. } => {
                     input_parts.push(ChatInputPart::text("Summarize our conversation so far."))
                 }
+                MessagePart::Notice { content, .. } => {
+                    input_parts.push(ChatInputPart::text(content.clone()))
+                }
                 _ => {}
             }
         }
@@ -1150,7 +1195,8 @@ fn cancelled_tool_result_parts(calls: &[ToolCall]) -> Vec<MessagePart> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentMessage, MessagePart, OutputTarget, PromptContentError, repair_unmatched_tool_calls,
+        AgentMessage, MessagePart, NoticeSource, OutputTarget, PromptContentError,
+        repair_unmatched_tool_calls,
     };
     use crate::protocol::{
         BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
@@ -1200,6 +1246,37 @@ mod tests {
 
     /// A stored turn id that is not a UUID must not fail loading, and records
     /// carrying the same text must still pair.
+    /// Rollback risk for stored notices: a reader built before the `notice`
+    /// kind existed has no variant for it and rejects the whole part. The
+    /// storage layer turns that into a failed history load.
+    #[test]
+    fn unknown_part_kind_is_rejected_by_the_deserializer() {
+        let error =
+            serde_json::from_str::<MessagePart>(r#"{"type":"future_kind","data":{"content":"x"}}"#)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn notice_part_round_trips_and_is_sent_as_user_text() {
+        let part = MessagePart::Notice {
+            source: NoticeSource::AgentMode,
+            content: "plan mode".into(),
+        };
+        let encoded = serde_json::to_string(&part).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"type":"Notice","data":{"source":"agent_mode","content":"plan mode"}}"#
+        );
+        assert_eq!(serde_json::from_str::<MessagePart>(&encoded).unwrap(), part);
+        assert_eq!(part.type_name(), "notice");
+
+        let mut message = AgentMessage::new("s".into(), ChatRole::User);
+        message.parts.push(part);
+        assert_eq!(message.to_chat_message().unwrap().text(), "plan mode");
+    }
+
     #[test]
     fn turn_id_that_is_not_a_uuid_still_pairs() {
         let literal = |kind: &str, extra: &str| {

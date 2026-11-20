@@ -280,6 +280,9 @@ pub struct SessionRuntime {
     /// Rebuildable accounting projection, hydrated from the journal on first
     /// use and released with the runtime.
     accounting: OnceCell<Arc<querymt_agent_services::accounting::SessionAccounting>>,
+    /// Fingerprint of the last completed main model request, for attributing
+    /// cache prefix changes. Never held across `.await`.
+    pub(crate) cache_prefix: ParkingMutex<crate::agent::execution::prefix::CachePrefixState>,
 }
 
 impl SessionRuntime {
@@ -342,6 +345,7 @@ impl SessionRuntime {
             managed_checkout: OnceCell::new(),
             workspace_activity: OnceCell::new(),
             accounting: OnceCell::new(),
+            cache_prefix: ParkingMutex::new(Default::default()),
         })
     }
 }

@@ -156,7 +156,9 @@ You are in review mode. Provide feedback only.
 - `review_reminder`: System message for review mode
 
 **Behavior:**
-- Injects mode-specific reminders
+- Stores the mode's reminder in the history once, when a request is first sent in that mode (or when the mode's last stored reminder is no longer in the history, for example after compaction). It is not added again to every model call, so it does not change the cached prefix.
+- When the session leaves a mode that had a reminder for a mode without one, stores a short notice that the earlier reminder no longer applies.
+- Switching modes without sending a request stores nothing
 - Restricts tool access based on mode
 - Allows runtime mode switching
 

@@ -154,7 +154,8 @@ pub(super) async fn transition_before_llm_call(
         );
     }
 
-    let mut messages = context.request_messages();
+    // The context hook sees durable history only (stored notices included).
+    let mut messages = context.messages.to_vec();
     let trigger = if messages
         .last()
         .is_some_and(|message| message.has_tool_result())
@@ -199,6 +200,10 @@ pub(super) async fn transition_before_llm_call(
         );
     }
     messages = hook_result.messages.unwrap_or_default();
+    let request_tail = request_tail(
+        context.request_objective.as_deref(),
+        &hook_result.additional_context,
+    );
     // Providers reject a tool call without its result. Reaching this point
     // with one is a bug upstream; answer it so the run survives, and make it loud.
     let unanswered = querymt_agent_core::model::answer_unanswered_tool_calls(&mut messages);
@@ -213,6 +218,20 @@ pub(super) async fn transition_before_llm_call(
             "request had unanswered tool calls: {unanswered:?}"
         );
     }
+    // Attribute any cache prefix change against the last completed request.
+    // Durable history only: the request tail is rebuilt every time.
+    let prefix_fingerprint = super::prefix::PrefixFingerprint::new(
+        &context.provider,
+        &context.model,
+        new_hash,
+        system_prompt_hash(config, exec_ctx),
+        &messages,
+    );
+    exec_ctx
+        .runtime
+        .cache_prefix
+        .lock()
+        .begin(prefix_fingerprint, std::time::Instant::now());
     // Tool definitions are model input; reuse the serialization already used for their hash.
     let tool_tokens = if tools.is_empty() {
         0
@@ -220,7 +239,13 @@ pub(super) async fn transition_before_llm_call(
         tools_json.len().div_ceil(4)
     };
     validate_tool_context_budget(tool_tokens, context_window)?;
-    let estimated_tokens = hook_result.estimated_tokens.saturating_add(tool_tokens);
+    let tail_tokens = request_tail.as_ref().map_or(0, |tail| {
+        crate::session::pruning::estimate_chat_tokens(std::slice::from_ref(tail))
+    });
+    let estimated_tokens = hook_result
+        .estimated_tokens
+        .saturating_add(tool_tokens)
+        .saturating_add(tail_tokens);
     if estimated_tokens >= context_window as usize {
         return Ok(ExecutionState::Stopped {
             message: format!(
@@ -238,6 +263,9 @@ pub(super) async fn transition_before_llm_call(
         message_count = messages.len() as u64
     )
     .in_scope(|| apply_cache_breakpoints(&messages));
+    // The tail follows the hinted durable messages and carries no hint.
+    let mut messages = messages;
+    messages.extend(request_tail);
     // Re-evaluate room after history, steering, tools, and context hooks are prepared.
     let mut options = context.request_overrides;
     if let Some(cap) = options.max_tokens {
@@ -255,6 +283,25 @@ pub(super) async fn transition_before_llm_call(
     })
 }
 
+/// Hash of the system prompt the session's provider is configured with: the
+/// turn-pinned session config when it carries one, else the agent's initial
+/// config.
+fn system_prompt_hash(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+) -> querymt_agent_core::hash::RapidHash {
+    let pinned = exec_ctx
+        .llm_config()
+        .and_then(|llm| llm.params.as_ref())
+        .and_then(|params| params.get("system"));
+    let bytes = match pinned {
+        Some(system) => serde_json::to_vec(system),
+        None => serde_json::to_vec(&config.provider.initial_config().system),
+    }
+    .unwrap_or_default();
+    querymt_agent_core::hash::RapidHash::new(&bytes)
+}
+
 /// Reject fixed tool overhead that history compaction cannot reduce.
 fn validate_tool_context_budget(tool_tokens: usize, context_window: u32) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -265,7 +312,24 @@ fn validate_tool_context_budget(tool_tokens: usize, context_window: u32) -> anyh
     Ok(())
 }
 
-/// Apply cache breakpoints to the last 2 messages in the conversation.
+/// The request tail: at most one user message holding the run objective (when
+/// enabled) followed by hook `additional_context`. Never stored, rebuilt for
+/// every request, and the only place text that is not in history may go.
+fn request_tail(objective: Option<&str>, additional_context: &[String]) -> Option<ChatMessage> {
+    let mut parts = objective
+        .into_iter()
+        .map(str::to_owned)
+        .chain(additional_context.iter().cloned())
+        .filter(|text| !text.trim().is_empty());
+    let first = parts.next()?;
+    let mut tail = ChatMessage::user().text(first).build();
+    for part in parts {
+        tail.push_input_part(querymt::chat::ChatInputPart::text(part));
+    }
+    Some(tail)
+}
+
+/// Apply cache breakpoints to the last 2 durable messages of the conversation.
 ///
 /// This enables prompt caching for the most recent context.
 pub(super) fn apply_cache_breakpoints(messages: &[ChatMessage]) -> Vec<ChatMessage> {
@@ -733,6 +797,8 @@ fn gate_function_calls_for_execution(
         gen_ai.conversation.id = %exec_ctx.session_id,
         session.id = %exec_ctx.session_id,
         gen_ai.request.stream = tracing::field::Empty,
+        qmt.cache.prefix_change = tracing::field::Empty,
+        qmt.cache.idle_secs = tracing::field::Empty,
         session_id = %exec_ctx.session_id,
         provider = %context.provider,
         model = %context.model,
@@ -755,6 +821,13 @@ pub(super) async fn transition_call_llm(
     let request_messages = request.messages.as_ref();
     genai::conversation_compacted(&chat_span, &exec_ctx.compaction_summaries, request_messages);
     let tools = &request.tools;
+    let prefix = exec_ctx.runtime.cache_prefix.lock().pending_attribution();
+    if let Some(prefix) = prefix {
+        chat_span.record("qmt.cache.prefix_change", prefix.change.as_str());
+        if let Some(idle) = prefix.idle_secs {
+            chat_span.record("qmt.cache.idle_secs", idle);
+        }
+    }
     debug!(
         "CallLlm: session={}, messages={}",
         session_id,
@@ -1574,8 +1647,16 @@ pub(super) async fn transition_call_llm(
                 turns: u32_from_usize(context.stats.turns, "context.stats.turns", Some(session_id)),
             },
             accounting: Some(operation.request_accounting()),
+            prefix_change: prefix.map(|p| p.change),
+            idle_secs: prefix.and_then(|p| p.idle_secs),
         },
     );
+    // The request completed, so its prefix is now what the provider cached.
+    exec_ctx
+        .runtime
+        .cache_prefix
+        .lock()
+        .commit(std::time::Instant::now());
 
     let mut llm_response = LlmResponse::new(response_content, llm_tool_calls, usage, finish_reason)
         .with_applied(options)
@@ -1791,7 +1872,7 @@ pub(super) async fn transition_after_llm(
         .with_session_mode(context.session_mode)
         .with_profile(context.profile.clone())
         .with_last_applied(response.applied)
-        .with_fragments(context.fragments.clone()),
+        .carrying_notices_from(context),
     );
 
     let output_status = structured_output.as_ref().and_then(|output| output.status);
@@ -2845,8 +2926,11 @@ mod tests {
                     );
                     exec.add_message(orphan).await.unwrap();
                 }
-                let (mut messages, summaries) =
-                    exec.session_handle.history_with_compaction().await.unwrap();
+                let (mut messages, summaries, _) = exec
+                    .session_handle
+                    .history_with_notice_state()
+                    .await
+                    .unwrap();
                 exec.compaction_summaries = summaries;
                 if mode == "reload_removed" {
                     assert_eq!(exec.compaction_summaries.len(), 1);
@@ -2857,8 +2941,11 @@ mod tests {
                         .delete_messages_after(&exec.session_id, &boundary_id)
                         .await
                         .unwrap();
-                    let (_, refreshed) =
-                        exec.session_handle.history_with_compaction().await.unwrap();
+                    let (_, refreshed, _) = exec
+                        .session_handle
+                        .history_with_notice_state()
+                        .await
+                        .unwrap();
                     exec.compaction_summaries = refreshed;
                 }
                 let context = Arc::new(crate::middleware::ConversationContext::new(
@@ -3578,6 +3665,328 @@ mod tests {
             );
         }
 
+        const OBJECTIVE: &str = "[Run objective revision 1]\nOBJECTIVE";
+
+        /// Prepare one request for `messages`, as the execution loop does before
+        /// every model request. `objective` is `Some` when `run_objective = true`.
+        async fn prepared(
+            fixture: &TestAgent,
+            exec: &ExecutionContext,
+            messages: Vec<ChatMessage>,
+            objective: Option<&str>,
+        ) -> Vec<ChatMessage> {
+            prepared_in(&fixture.config, exec, messages, objective).await
+        }
+
+        async fn prepared_in(
+            config: &AgentConfig,
+            exec: &ExecutionContext,
+            messages: Vec<ChatMessage>,
+            objective: Option<&str>,
+        ) -> Vec<ChatMessage> {
+            let mut context = (*crate::test_utils::test_context(&exec.session_id, 0)).clone();
+            context.messages = Arc::from(messages.into_boxed_slice());
+            let context = context.with_request_objective(objective.map(Arc::from));
+            let state = transition_before_llm_call(config, &Arc::new(context), exec)
+                .await
+                .expect("before llm call");
+            let ExecutionState::CallLlm { request, .. } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            request.messages.to_vec()
+        }
+
+        /// A config whose only context hook prints `additional_context`, naming
+        /// whether the objective text reached the hook's input.
+        fn config_with_context_hook(config: &AgentConfig) -> AgentConfig {
+            let command = r#"if grep -q OBJECTIVE; then t='saw objective'; else t='durable only'; fi; printf '{"hook_specific_output":{"hook_event_name":"context","additional_context":"%s"}}' "$t""#;
+            let hooks = crate::hooks::Hooks::new(
+                serde_json::from_value::<crate::hooks::HooksConfig>(serde_json::json!({
+                    "enabled": true,
+                    "context": [{"hooks": [{
+                        "type": "command", "command": command, "timeout_sec": 5
+                    }]}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let mut config = config.clone();
+            config.hooks = hooks;
+            config
+        }
+
+        fn hinted(message: &ChatMessage) -> bool {
+            message.cache.is_some()
+        }
+
+        /// Assert that `next` begins with every durable message of `previous`,
+        /// compared without cache hints: the prefix a provider cache written by
+        /// `previous` could serve to `next`. `previous_tail` says whether the
+        /// last message of `previous` is request-scoped context.
+        fn assert_durable_prefix(
+            previous: &[ChatMessage],
+            previous_tail: bool,
+            next: &[ChatMessage],
+        ) {
+            let strip = |messages: &[ChatMessage]| -> Vec<serde_json::Value> {
+                messages
+                    .iter()
+                    .map(|message| {
+                        let mut message = message.clone();
+                        message.cache = None;
+                        serde_json::to_value(message).unwrap()
+                    })
+                    .collect()
+            };
+            let durable_len = previous.len() - usize::from(previous_tail);
+            let (previous, next) = (strip(&previous[..durable_len]), strip(next));
+            assert!(next.len() >= previous.len(), "next request is shorter");
+            for (i, (before, after)) in previous.iter().zip(&next).enumerate() {
+                assert_eq!(
+                    before, after,
+                    "durable prefix differs at message {i} of {durable_len}"
+                );
+            }
+        }
+
+        fn tool_step(call_id: &str) -> [ChatMessage; 2] {
+            [
+                ChatMessage::assistant()
+                    .tool_use(call_id, "read_tool", serde_json::json!({"path": call_id}))
+                    .build(),
+                ChatMessage::user()
+                    .part(querymt::chat::ChatInputPart::tool_result(
+                        querymt::chat::ToolResult::text(call_id, format!("contents of {call_id}")),
+                    ))
+                    .build(),
+            ]
+        }
+
+        /// First request of a turn, then one tool step.
+        async fn prompt_to_first_tool_step(objective: Option<&str>) {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let prompt = ChatMessage::user().text("fix the build").build();
+
+            let first = prepared(&fixture, &exec, vec![prompt.clone()], objective).await;
+            let mut history = vec![prompt];
+            history.extend(tool_step("call-1"));
+            let second = prepared(&fixture, &exec, history, objective).await;
+
+            assert_durable_prefix(&first, objective.is_some(), &second);
+        }
+
+        /// Two consecutive tool steps of one turn.
+        async fn across_a_tool_step(objective: Option<&str>) {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let mut history = vec![ChatMessage::user().text("fix the build").build()];
+            history.extend(tool_step("call-1"));
+
+            let first = prepared(&fixture, &exec, history.clone(), objective).await;
+            history.extend(tool_step("call-2"));
+            let second = prepared(&fixture, &exec, history, objective).await;
+
+            assert_durable_prefix(&first, objective.is_some(), &second);
+        }
+
+        #[tokio::test]
+        async fn durable_prefix_is_stable_from_prompt_to_first_tool_step() {
+            prompt_to_first_tool_step(None).await;
+        }
+
+        #[tokio::test]
+        async fn durable_prefix_is_stable_across_a_tool_step() {
+            across_a_tool_step(None).await;
+        }
+
+        /// "Prefix is stable with the run objective enabled".
+        #[tokio::test]
+        async fn durable_prefix_is_stable_with_the_run_objective_enabled() {
+            prompt_to_first_tool_step(Some(OBJECTIVE)).await;
+            across_a_tool_step(Some(OBJECTIVE)).await;
+        }
+
+        #[tokio::test]
+        async fn durable_prefix_is_stable_across_turns() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let mut history = vec![ChatMessage::user().text("fix the build").build()];
+            history.extend(tool_step("call-1"));
+
+            let last_of_turn_one = prepared(&fixture, &exec, history.clone(), None).await;
+            history.push(ChatMessage::assistant().text("done").build());
+            history.push(ChatMessage::user().text("now the tests").build());
+            let first_of_turn_two = prepared(&fixture, &exec, history, None).await;
+
+            assert_durable_prefix(&last_of_turn_one, false, &first_of_turn_two);
+        }
+
+        #[tokio::test]
+        async fn durable_prefix_is_stable_across_a_mode_switch() {
+            use querymt_agent_core::model::NoticeSource;
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let mut history = vec![ChatMessage::user().text("fix the build").build()];
+            history.extend(tool_step("call-1"));
+
+            let before = prepared(&fixture, &exec, history.clone(), None).await;
+            // Build -> plan between requests: the reminder is stored as a notice,
+            // appended after the tool results.
+            let context = crate::test_utils::test_context(&exec.session_id, 0)
+                .queue_notice(NoticeSource::AgentMode, "plan reminder".into());
+            let mut stored = context.clone();
+            stored.messages = Arc::from(history.clone().into_boxed_slice());
+            let stored = crate::agent::execution::store_pending_notices(&exec, &Arc::new(stored))
+                .await
+                .unwrap();
+            let after = prepared(&fixture, &exec, stored.messages.to_vec(), None).await;
+
+            assert_durable_prefix(&before, false, &after);
+            assert_eq!(after.last().unwrap().text(), "plan reminder");
+        }
+
+        #[tokio::test]
+        async fn durable_prefix_is_stable_for_a_provider_without_breakpoints() {
+            // A local provider: hints are compared away, content must still match.
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "llama_cpp", None).await;
+            let exec = fixture.execution_context().await;
+            let mut history = vec![ChatMessage::user().text("fix the build").build()];
+            history.extend(tool_step("call-1"));
+
+            let first = prepared(&fixture, &exec, history.clone(), None).await;
+            history.extend(tool_step("call-2"));
+            let second = prepared(&fixture, &exec, history, None).await;
+
+            assert_durable_prefix(&first, false, &second);
+        }
+
+        #[tokio::test]
+        async fn request_without_request_scoped_context_ends_with_a_durable_message() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let prompt = ChatMessage::user().text("fix the build").build();
+
+            let request = prepared(&fixture, &exec, vec![prompt], None).await;
+
+            assert_eq!(request.len(), 1);
+            assert_eq!(request[0].text(), "fix the build");
+        }
+
+        #[tokio::test]
+        async fn context_after_the_user_prompt_follows_it() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let prompt = ChatMessage::user().text("fix the build").build();
+
+            let request = prepared(&fixture, &exec, vec![prompt], Some(OBJECTIVE)).await;
+
+            assert_eq!(request.len(), 2);
+            assert_eq!(request[0].text(), "fix the build");
+            assert_eq!(request[1].text(), OBJECTIVE);
+        }
+
+        #[tokio::test]
+        async fn context_after_a_tool_batch_leaves_the_tool_result_message_unchanged() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let config = config_with_context_hook(&fixture.config);
+            let mut history = vec![ChatMessage::user().text("fix the build").build()];
+            history.extend(tool_step("call-1"));
+            let stored_result = serde_json::to_value(history.last().unwrap()).unwrap();
+
+            let request = prepared_in(&config, &exec, history, None).await;
+
+            assert_eq!(request.len(), 4);
+            let mut result = request[2].clone();
+            result.cache = None;
+            assert_eq!(serde_json::to_value(result).unwrap(), stored_result);
+            assert!(request[3].text().contains("durable only"));
+            assert!(request[3].text().contains("<hook-context event=context"));
+        }
+
+        #[tokio::test]
+        async fn context_hook_sees_durable_history_only() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let config = config_with_context_hook(&fixture.config);
+            let prompt = ChatMessage::user().text("fix the build").build();
+
+            let request = prepared_in(&config, &exec, vec![prompt], Some(OBJECTIVE)).await;
+
+            let tail = request.last().unwrap().text();
+            assert!(tail.contains("durable only"), "{tail}");
+            assert!(!tail.contains("saw objective"), "{tail}");
+        }
+
+        #[tokio::test]
+        async fn objective_and_hook_text_share_one_message_objective_first() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let config = config_with_context_hook(&fixture.config);
+            let prompt = ChatMessage::user().text("fix the build").build();
+
+            let request = prepared_in(&config, &exec, vec![prompt], Some(OBJECTIVE)).await;
+
+            assert_eq!(request.len(), 2, "one tail message");
+            let tail = request[1].text();
+            assert!(tail.find("OBJECTIVE").unwrap() < tail.find("durable only").unwrap());
+        }
+
+        #[tokio::test]
+        async fn context_hook_contribution_is_request_scoped() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let with_hook = config_with_context_hook(&fixture.config);
+            let prompt = ChatMessage::user().text("fix the build").build();
+
+            let first = prepared_in(&with_hook, &exec, vec![prompt.clone()], None).await;
+            let second = prepared_in(&fixture.config, &exec, vec![prompt], None).await;
+
+            assert_eq!(first.len(), 2);
+            assert_eq!(second.len(), 1, "the next request does not carry the text");
+            assert!(!second[0].text().contains("durable only"));
+        }
+
+        #[tokio::test]
+        async fn last_two_durable_messages_are_hinted_and_the_tail_is_not() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let mut history = vec![ChatMessage::user().text("fix the build").build()];
+            history.extend(tool_step("call-1"));
+            history.extend(tool_step("call-2"));
+
+            let request = prepared(&fixture, &exec, history, Some(OBJECTIVE)).await;
+
+            // Five durable messages followed by the unhinted tail.
+            assert_eq!(request.len(), 6);
+            let flags: Vec<bool> = request.iter().map(hinted).collect();
+            assert_eq!(flags, [false, false, false, true, true, false]);
+        }
+
+        #[tokio::test]
+        async fn existing_history_hints_are_kept_and_hinting_is_idempotent() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let mut first = ChatMessage::user().text("fix the build").build();
+            first.cache = Some(querymt::chat::CacheHint::Ephemeral {
+                ttl_seconds: Some(300),
+            });
+            let mut history = vec![first];
+            history.extend(tool_step("call-1"));
+            history.extend(tool_step("call-2"));
+
+            let request = prepared(&fixture, &exec, history, None).await;
+
+            let flags: Vec<bool> = request.iter().map(hinted).collect();
+            assert_eq!(flags, [true, false, false, true, true]);
+            assert_eq!(
+                serde_json::to_value(apply_cache_breakpoints(&request)).unwrap(),
+                serde_json::to_value(&request).unwrap(),
+                "applying hints twice gives the same request"
+            );
+        }
+
         /// Task 2.3: the session-bound `skill` tool reaches `ToolsAvailable`
         /// for an agent with a catalog, but never the agent-level registry; an
         /// agent without a catalog is unchanged.
@@ -4066,7 +4475,11 @@ mod tests {
                     .with_reasoning_effort(ReasoningEffort::Medium)
             );
 
-            // Request 3: carries the instruction and succeeds.
+            // Request 3: carries the stored instruction and succeeds. The loop
+            // stores queued notices right before the request.
+            let context = crate::agent::execution::store_pending_notices(&exec, &context)
+                .await
+                .expect("store notice");
             let state = transition_before_llm_call(&fixture.config, &context, &exec)
                 .await
                 .expect("before 3");
@@ -4092,12 +4505,14 @@ mod tests {
             let ExecutionState::AfterLlm { response, context } = state else {
                 panic!("expected AfterLlm, got {}", state.name());
             };
-            assert!(
+            assert_eq!(
                 context
-                    .fragments
+                    .messages
                     .iter()
-                    .all(|f| f.key != "output_limit_recovery"),
-                "instruction must be gone after the normal reply"
+                    .filter(|message| format!("{message:?}").contains(instruction_marker))
+                    .count(),
+                1,
+                "instruction stays in history after the normal reply, once"
             );
             let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
                 .await
@@ -6012,6 +6427,183 @@ mod tests {
                 failures.is_empty(),
                 "accounting defects:\n{}",
                 failures.join("\n")
+            );
+        }
+    }
+
+    mod prefix_attribution_tests {
+        use super::*;
+        use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
+        use querymt::chat::{ChatOutput, FinishReason};
+        use querymt_agent_core::events::CachePrefixChange;
+
+        fn ok_response() -> ChatOutput {
+            ChatOutput::from_projections(
+                None,
+                Some("ok".into()),
+                None,
+                None,
+                Some(FinishReason::Stop),
+            )
+        }
+
+        /// Prepare and send one request; returns what its `LlmRequestEnd`
+        /// recorded.
+        async fn send(
+            fixture: &TestAgent,
+            exec: &ExecutionContext,
+            events: &mut tokio::sync::broadcast::Receiver<
+                querymt_agent_core::events::EventEnvelope,
+            >,
+            model: &str,
+            messages: Vec<ChatMessage>,
+        ) -> (Option<CachePrefixChange>, Option<u64>) {
+            let mut context = (*crate::test_utils::test_context(&exec.session_id, 0)).clone();
+            context.messages = Arc::from(messages.into_boxed_slice());
+            context.model = model.into();
+            let state = transition_before_llm_call(&fixture.config, &Arc::new(context), exec)
+                .await
+                .expect("before llm call");
+            let ExecutionState::CallLlm { context, request } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            transition_call_llm(&fixture.config, &context, &request, exec)
+                .await
+                .expect("call llm");
+            loop {
+                let envelope = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                    .await
+                    .expect("timed out waiting for LlmRequestEnd")
+                    .expect("event channel closed");
+                if let AgentEventKind::LlmRequestEnd {
+                    prefix_change,
+                    idle_secs,
+                    ..
+                } = envelope.kind()
+                {
+                    return (*prefix_change, *idle_secs);
+                }
+            }
+        }
+
+        fn user(text: &str) -> ChatMessage {
+            ChatMessage::user().text(text).build()
+        }
+
+        async fn fixture() -> TestAgent {
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat_with_tools()
+                .returning(|_, _| Ok(ok_response()));
+            TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await
+        }
+
+        #[tokio::test]
+        async fn request_end_attributes_each_prefix_change() {
+            let fixture = fixture().await;
+            let exec = fixture.execution_context().await;
+            let mut events = fixture.config.subscribe_events();
+            let base = vec![user("a"), user("b")];
+
+            let (change, idle) =
+                send(&fixture, &exec, &mut events, "mock-model", base.clone()).await;
+            assert_eq!(change, Some(CachePrefixChange::FirstRequest));
+            assert_eq!(idle, None, "no idle for the first request");
+
+            let mut grown = base.clone();
+            grown.push(user("c"));
+            let (change, idle) =
+                send(&fixture, &exec, &mut events, "mock-model", grown.clone()).await;
+            assert_eq!(change, Some(CachePrefixChange::None));
+            assert!(idle.is_some_and(|secs| secs < 5), "idle: {idle:?}");
+
+            let (change, _) =
+                send(&fixture, &exec, &mut events, "other-model", grown.clone()).await;
+            assert_eq!(change, Some(CachePrefixChange::Model));
+
+            // Compaction replaced the older messages.
+            let compacted = vec![user("summary"), user("c"), user("d")];
+            let (change, _) = send(&fixture, &exec, &mut events, "other-model", compacted).await;
+            assert_eq!(change, Some(CachePrefixChange::History));
+        }
+
+        #[tokio::test]
+        async fn a_new_runtime_reports_first_request_again() {
+            let fixture = fixture().await;
+            let mut events = fixture.config.subscribe_events();
+            let messages = vec![user("a")];
+
+            let exec = fixture.execution_context().await;
+            send(&fixture, &exec, &mut events, "mock-model", messages.clone()).await;
+
+            // A loaded session gets a fresh runtime, and with it no fingerprint.
+            let reloaded = fixture.execution_context().await;
+            let (change, idle) =
+                send(&fixture, &reloaded, &mut events, "mock-model", messages).await;
+            assert_eq!(change, Some(CachePrefixChange::FirstRequest));
+            assert_eq!(idle, None);
+        }
+
+        #[tokio::test]
+        async fn the_model_request_span_carries_the_attribution() {
+            use std::sync::Mutex;
+            use tracing_subscriber::layer::SubscriberExt;
+
+            #[derive(Default)]
+            struct Recorded(Mutex<Vec<(String, String)>>);
+            struct Capture(Arc<Recorded>);
+            struct Visit<'a>(&'a mut Vec<(String, String)>);
+            impl tracing::field::Visit for Visit<'_> {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.push((f.name().to_string(), format!("{v:?}")));
+                }
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    self.0.push((f.name().to_string(), v.to_string()));
+                }
+                fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+                    self.0.push((f.name().to_string(), v.to_string()));
+                }
+            }
+            impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+                fn on_record(
+                    &self,
+                    _id: &tracing::span::Id,
+                    values: &tracing::span::Record<'_>,
+                    _ctx: tracing_subscriber::layer::Context<'_, S>,
+                ) {
+                    values.record(&mut Visit(&mut self.0.0.lock().unwrap()));
+                }
+            }
+
+            let recorded = Arc::new(Recorded::default());
+            let subscriber = tracing_subscriber::registry().with(Capture(recorded.clone()));
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            let fixture = fixture().await;
+            let exec = fixture.execution_context().await;
+            let mut events = fixture.config.subscribe_events();
+            send(&fixture, &exec, &mut events, "mock-model", vec![user("a")]).await;
+            send(
+                &fixture,
+                &exec,
+                &mut events,
+                "mock-model",
+                vec![user("a"), user("b")],
+            )
+            .await;
+
+            let fields = recorded.0.lock().unwrap().clone();
+            let value = |name: &str| -> Vec<&str> {
+                fields
+                    .iter()
+                    .filter(|(k, _)| k == name)
+                    .map(|(_, v)| v.as_str())
+                    .collect()
+            };
+            assert_eq!(value("qmt.cache.prefix_change"), ["first_request", "none"]);
+            assert_eq!(
+                value("qmt.cache.idle_secs").len(),
+                1,
+                "only the second request"
             );
         }
     }

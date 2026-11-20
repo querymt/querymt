@@ -38,6 +38,35 @@ pub enum StopType {
 
 /// What an output-limit recovery step did.
 /// Typeshare-annotated: generated for TypeScript and Swift.
+/// Why a model request's cache prefix differs from the previous request's.
+/// When several apply, the first in declaration order after `FirstRequest`.
+#[typeshare]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CachePrefixChange {
+    /// No earlier request in this runtime (session just loaded or created).
+    FirstRequest,
+    Model,
+    Tools,
+    System,
+    History,
+    None,
+}
+
+impl CachePrefixChange {
+    /// The wire and span label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstRequest => "first_request",
+            Self::Model => "model",
+            Self::Tools => "tools",
+            Self::System => "system",
+            Self::History => "history",
+            Self::None => "none",
+        }
+    }
+}
+
 #[typeshare]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -533,6 +562,15 @@ pub enum AgentEventKind {
         /// Absent on events written before accounting records existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         accounting: Option<crate::accounting::RequestAccounting>,
+        /// Why this request's cache prefix differs from the previous one's.
+        /// Absent on events written before it was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix_change: Option<CachePrefixChange>,
+        /// Whole seconds since the session's previous main model request
+        /// ended; absent for the first request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        idle_secs: Option<u64>,
     },
     ProviderChanged {
         provider: String,
@@ -3190,6 +3228,80 @@ mod tests {
                 assert_eq!(title, Some(None), "title clear must survive round trip");
             }
             other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    fn request_end(extra: serde_json::Value) -> serde_json::Value {
+        let mut data = serde_json::json!({
+            "usage": null,
+            "tool_calls": 0,
+            "finish_reason": null,
+            "cost_usd": null,
+            "cumulative_cost_usd": null,
+            "context_tokens": 0,
+            "metrics": {"steps": 0, "turns": 0}
+        });
+        data.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::json!({"type": "llm_request_end", "data": data})
+    }
+
+    #[test]
+    fn request_end_carries_prefix_change_and_idle_secs() {
+        let event: AgentEventKind = serde_json::from_value(request_end(
+            serde_json::json!({"prefix_change": "history", "idle_secs": 1800}),
+        ))
+        .unwrap();
+        let AgentEventKind::LlmRequestEnd {
+            prefix_change,
+            idle_secs,
+            ..
+        } = &event
+        else {
+            panic!("unexpected kind: {event:?}");
+        };
+        assert_eq!(*prefix_change, Some(CachePrefixChange::History));
+        assert_eq!(*idle_secs, Some(1800));
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["data"]["prefix_change"], "history");
+        assert_eq!(json["data"]["idle_secs"], 1800);
+    }
+
+    #[test]
+    fn request_end_without_attribution_still_loads_and_omits_the_fields() {
+        // Events journaled before the fields existed.
+        let event: AgentEventKind =
+            serde_json::from_value(request_end(serde_json::json!({}))).unwrap();
+        let AgentEventKind::LlmRequestEnd {
+            prefix_change,
+            idle_secs,
+            ..
+        } = &event
+        else {
+            panic!("unexpected kind: {event:?}");
+        };
+        assert_eq!((*prefix_change, *idle_secs), (None, None));
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(json["data"].get("prefix_change").is_none());
+        assert!(json["data"].get("idle_secs").is_none());
+    }
+
+    #[test]
+    fn cache_prefix_change_labels_match_serde() {
+        for change in [
+            CachePrefixChange::FirstRequest,
+            CachePrefixChange::Model,
+            CachePrefixChange::Tools,
+            CachePrefixChange::System,
+            CachePrefixChange::History,
+            CachePrefixChange::None,
+        ] {
+            assert_eq!(
+                serde_json::to_value(change).unwrap(),
+                serde_json::Value::String(change.as_str().to_string())
+            );
         }
     }
 }

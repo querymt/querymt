@@ -3,7 +3,7 @@ use crate::middleware::{
     WaitCondition, WaitReason,
 };
 use crate::test_utils::{mock_tool_call, test_context};
-use querymt::chat::{ChatMessage, ChatRole, FinishReason, ToolResultPart};
+use querymt::chat::{ChatMessage, FinishReason, ToolResultPart};
 use querymt_agent_core::events::StopType;
 use std::sync::Arc;
 
@@ -162,7 +162,7 @@ fn test_conversation_context_counts_user_messages() {
 }
 
 #[test]
-fn test_conversation_context_inject_message() {
+fn test_conversation_context_queue_notice_does_not_touch_messages() {
     let context = ConversationContext::new(
         "sess-1".into(),
         Arc::from([]),
@@ -171,13 +171,16 @@ fn test_conversation_context_inject_message() {
         "mock-model".into(),
     );
 
-    let injected = context.inject_message("hello".to_string());
+    let queued = context.queue_notice(
+        querymt_agent_core::model::NoticeSource::DuplicateCode,
+        "hello".to_string(),
+    );
 
-    assert_eq!(context.messages.len(), 0);
-    assert_eq!(injected.messages.len(), 1);
-    assert!(matches!(injected.messages[0].role, ChatRole::User));
-    assert_eq!(injected.messages[0].text(), "hello");
-    assert!(injected.is_first_turn());
+    assert!(context.pending_notices.is_empty());
+    assert!(queued.messages.is_empty());
+    assert_eq!(queued.pending_notices.len(), 1);
+    assert_eq!(queued.pending_notices[0].content, "hello");
+    assert!(queued.is_first_turn());
 }
 
 #[test]

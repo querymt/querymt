@@ -87,7 +87,10 @@ impl MiddlewareDriver for DuplicateToolCallMiddleware {
                 if let Some(warning) = self.check_for_duplicates(&context.session_id).await {
                     debug!("DuplicateToolCallMiddleware: duplicate detected, injecting warning");
 
-                    let new_context = context.inject_message(warning);
+                    let new_context = context.queue_notice(
+                        querymt_agent_core::model::NoticeSource::DuplicateToolCall,
+                        warning,
+                    );
                     Ok(ExecutionState::BeforeLlmCall {
                         context: Arc::new(new_context),
                     })

@@ -41,6 +41,7 @@ fn format_stop_hook_continuation_message(
 
 mod llm_retry;
 mod maintenance;
+pub(crate) mod prefix;
 pub(crate) use maintenance::{CompactionOutcome, TRIGGER_MANUAL, compact_history};
 mod progress_sink;
 mod tool_calls;
@@ -196,15 +197,19 @@ fn has_effective_task_completion_tool(tools: &[querymt::chat::Tool]) -> bool {
         .any(|tool| tool.function.name == "complete_task")
 }
 
-fn refresh_objective_fragment(
+/// Attach the rendered run objective to the context as request-scoped text,
+/// only when `[agent.execution] run_objective` is `true`. The objective is
+/// still built and amended, and its events are emitted, in both cases.
+fn refresh_objective(
+    config: &AgentConfig,
     context: &Arc<crate::middleware::ConversationContext>,
     exec_ctx: &ExecutionContext,
 ) -> Arc<crate::middleware::ConversationContext> {
-    Arc::new(context.upsert_fragment(
-        "run_objective",
-        render_run_objective(exec_ctx),
-        crate::middleware::ContextPriority::High,
-    ))
+    let objective = config
+        .execution_policy
+        .run_objective
+        .then(|| Arc::from(render_run_objective(exec_ctx)));
+    Arc::new((**context).clone().with_request_objective(objective))
 }
 
 pub(crate) async fn apply_pending_steering(
@@ -343,8 +348,60 @@ pub(crate) async fn apply_pending_steering(
     .with_profile(context.profile.clone())
     .with_last_applied(context.last_applied)
     .with_request_overrides(context.request_overrides)
-    .with_fragments(context.fragments.clone());
+    .carrying_notices_from(context);
     Ok(Some(Arc::new(next)))
+}
+
+/// Queue the periodic progress review as a `progress_review` notice.
+fn queue_progress_review(
+    context: &crate::middleware::ConversationContext,
+) -> crate::middleware::ConversationContext {
+    context.queue_notice(
+        querymt_agent_core::model::NoticeSource::ProgressReview,
+        crate::agent::objective::PROGRESS_REVIEW_NOTICE.to_string(),
+    )
+}
+
+/// Store queued notices as user messages before the model request.
+///
+/// Runs at the point where steering is applied, after any tool results in the
+/// context, so a notice never sits between a tool call and its result. Nothing
+/// is stored for a request that is never sent: the queue lives on the context
+/// and is dropped with it.
+pub(crate) async fn store_pending_notices(
+    exec_ctx: &ExecutionContext,
+    context: &Arc<crate::middleware::ConversationContext>,
+) -> Result<Arc<crate::middleware::ConversationContext>, anyhow::Error> {
+    if context.pending_notices.is_empty() {
+        return Ok(context.clone());
+    }
+    let mut messages = context.messages.to_vec();
+    let mut stored_mode_notice = context.stored_mode_notice.clone();
+    for notice in context.pending_notices.iter() {
+        if notice.source == querymt_agent_core::model::NoticeSource::AgentMode {
+            stored_mode_notice = Some(Arc::from(notice.content.as_str()));
+        }
+        let mut message = querymt_agent_core::model::AgentMessage::new(
+            exec_ctx.session_id.clone(),
+            querymt::chat::ChatRole::User,
+        );
+        message
+            .parts
+            .push(querymt_agent_core::model::MessagePart::Notice {
+                source: notice.source,
+                content: notice.content.clone(),
+            });
+        let chat_message = message
+            .to_chat_message()
+            .map_err(|error| anyhow::anyhow!("Invalid notice content: {error}"))?;
+        exec_ctx.add_message(message).await?;
+        messages.push(chat_message);
+    }
+    let mut next = (**context).clone();
+    next.messages = Arc::from(messages.into_boxed_slice());
+    next.pending_notices = Arc::from([]);
+    next.stored_mode_notice = stored_mode_notice;
+    Ok(Arc::new(next))
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -389,11 +446,11 @@ pub(crate) async fn execute_cycle_state_machine(
         exec_ctx.cancellation_token.is_cancelled()
     );
 
-    let messages: Arc<[querymt::chat::ChatMessage]> = async {
+    let (messages, stored_mode_notice): (Arc<[querymt::chat::ChatMessage]>, _) = async {
         let started = std::time::Instant::now();
-        let (history, summaries) = exec_ctx
+        let (history, summaries, stored_mode_notice) = exec_ctx
             .session_handle
-            .history_with_compaction()
+            .history_with_notice_state()
             .await
             .map_err(|error| anyhow::anyhow!("Failed to load session history: {error}"))?;
         exec_ctx.compaction_summaries = summaries;
@@ -402,7 +459,7 @@ pub(crate) async fn execute_cycle_state_machine(
         let span = tracing::Span::current();
         span.record("history_ms", elapsed_ms);
         span.record("message_count", messages.len() as u64);
-        Ok::<_, anyhow::Error>(messages)
+        Ok::<_, anyhow::Error>((messages, stored_mode_notice))
     }
     .instrument(info_span!(
         "agent.execution.history_load",
@@ -453,6 +510,7 @@ pub(crate) async fn execute_cycle_state_machine(
                 llm_config.model.as_str().into(),
             )
             .with_session_mode(session_mode)
+            .with_stored_mode_notice(stored_mode_notice)
             .with_profile(profile),
         )
     });
@@ -525,19 +583,14 @@ pub(crate) async fn execute_cycle_state_machine(
                 .await?
                 .unwrap_or(context);
                 let steps = context.stats.steps;
-                let checkpoint_due = (steps >= 7 && last_objective_checkpoint_step == 0)
-                    || (last_objective_checkpoint_step > 0
-                        && steps.saturating_sub(last_objective_checkpoint_step) >= 4);
-                if checkpoint_due {
+                let checkpoint_due = crate::agent::objective::progress_review_due(
+                    steps,
+                    last_objective_checkpoint_step,
+                );
+                let context = if checkpoint_due {
                     last_objective_checkpoint_step = steps;
-                    if let Some(objective) = exec_ctx.run_objective.as_mut() {
-                        objective.set_progress_review(Some(
-                            crate::agent::objective::ProgressReview {
-                                reason: "periodic_progress_review".to_string(),
-                                step: steps,
-                            },
-                        ));
-                    }
+                    // Stored as a notice whether or not the objective is sent.
+                    let context = Arc::new(queue_progress_review(&context));
                     config.emit_event(
                         &exec_ctx.session_id,
                         AgentEventKind::ObjectiveCheckpoint {
@@ -557,13 +610,11 @@ pub(crate) async fn execute_cycle_state_machine(
                                 .map(|t| t.revision),
                         },
                     );
-                } else if last_objective_checkpoint_step > 0
-                    && steps > last_objective_checkpoint_step
-                    && let Some(objective) = exec_ctx.run_objective.as_mut()
-                {
-                    objective.set_progress_review(None);
-                }
-                let context = refresh_objective_fragment(&context, exec_ctx);
+                    context
+                } else {
+                    context
+                };
+                let context = refresh_objective(config, &context, exec_ctx);
                 // Price limits read this cycle's committed accounting, which
                 // includes cache and auxiliary (compaction/summary) attempts
                 // that settled since the last main response.
@@ -597,6 +648,10 @@ pub(crate) async fn execute_cycle_state_machine(
                     ExecutionState::BeforeLlmCall {
                         context: ref conv_context,
                     } => {
+                        // Middleware queued its notices during step start; store
+                        // them now, after any tool results and before the request.
+                        let stored = store_pending_notices(exec_ctx, conv_context).await?;
+                        let conv_context = &stored;
                         let next =
                             transitions::transition_before_llm_call(config, conv_context, exec_ctx)
                                 .await?;
@@ -757,9 +812,9 @@ pub(crate) async fn execute_cycle_state_machine(
 
             ExecutionState::Complete { context } => {
                 exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Closing);
-                let (history, summaries) = exec_ctx
+                let (history, summaries, stored_mode_notice) = exec_ctx
                     .session_handle
-                    .history_with_compaction()
+                    .history_with_notice_state()
                     .await
                     .map_err(|error| anyhow::anyhow!("Failed to load session history: {error}"))?;
                 exec_ctx.compaction_summaries = summaries;
@@ -774,7 +829,8 @@ pub(crate) async fn execute_cycle_state_machine(
                     )
                     .with_session_mode(context.session_mode)
                     .with_profile(context.profile.clone())
-                    .with_fragments(context.fragments.clone()),
+                    .carrying_notices_from(&context)
+                    .with_stored_mode_notice(stored_mode_notice),
                 );
                 if let Some(context) = apply_pending_steering(
                     config,
@@ -829,7 +885,10 @@ pub(crate) async fn execute_cycle_state_machine(
                                     &stop_hook.additional_contexts,
                                 );
                                 state = ExecutionState::BeforeLlmCall {
-                                    context: Arc::new(current_context.inject_message(message)),
+                                    context: Arc::new(current_context.queue_notice(
+                                        querymt_agent_core::model::NoticeSource::StopHook,
+                                        message,
+                                    )),
                                 };
                                 continue;
                             }
@@ -855,7 +914,8 @@ pub(crate) async fn execute_cycle_state_machine(
                                     },
                                 );
                                 state = ExecutionState::BeforeLlmCall {
-                                    context: Arc::new(completed_context.inject_message(
+                                    context: Arc::new(completed_context.queue_notice(
+                                        querymt_agent_core::model::NoticeSource::TaskCompletion,
                                         "<system-reminder>\nThe current finite task remains active. Continue the work and call complete_task with concrete evidence when it is done, or ask the user for required information. An ordinary response stop does not complete the task.\n\nThis message was generated by the QueryMT task-completion runtime, not by the user.\n</system-reminder>".to_string(),
                                     )),
                                 };
@@ -979,7 +1039,10 @@ pub(crate) async fn execute_cycle_state_machine(
                                 stop_hook.stop_reason.or(stop_hook.block_reason),
                                 &stop_hook.additional_contexts,
                             );
-                            let next = Arc::new(stopped_context.inject_message(message));
+                            let next = Arc::new(stopped_context.queue_notice(
+                                querymt_agent_core::model::NoticeSource::StopHook,
+                                message,
+                            ));
                             state = ExecutionState::BeforeLlmCall { context: next };
                             continue;
                         }
@@ -1475,6 +1538,368 @@ mod tests {
             if result.call_id == "call-1" && result.parts[0].as_text().unwrap().starts_with("Skipped"))
         );
         assert_eq!(replay[1].text(), "change direction");
+    }
+
+    async fn notice_fixture() -> (
+        crate::test_utils::TestAgent,
+        crate::agent::execution_context::ExecutionContext,
+        Arc<crate::middleware::ConversationContext>,
+    ) {
+        use querymt::chat::{ChatMessage, ToolResultPart};
+
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let exec_ctx = fixture.execution_context().await;
+        let assistant = ChatMessage::assistant()
+            .tool_use("call-1", "read_file", json!({"path": "."}))
+            .tool_use("call-2", "read_file", json!({"path": ".."}))
+            .build();
+        let results = ChatMessage::user()
+            .tool_result(
+                "call-1".into(),
+                Some("read_file".into()),
+                false,
+                vec![ToolResultPart::text("one")],
+            )
+            .tool_result(
+                "call-2".into(),
+                Some("read_file".into()),
+                false,
+                vec![ToolResultPart::text("two")],
+            )
+            .build();
+        let context = Arc::new(crate::middleware::ConversationContext::new(
+            exec_ctx.session_id.clone().into(),
+            Arc::from(vec![assistant, results]),
+            Arc::new(crate::middleware::AgentStats::default()),
+            "mock".into(),
+            "mock".into(),
+        ));
+        (fixture, exec_ctx, context)
+    }
+
+    async fn stored_notices(
+        fixture: &crate::test_utils::TestAgent,
+        session_id: &str,
+    ) -> Vec<(querymt_agent_core::model::NoticeSource, String)> {
+        fixture
+            .config
+            .provider
+            .history_store()
+            .get_history(session_id)
+            .await
+            .expect("load history")
+            .into_iter()
+            .flat_map(|message| message.parts)
+            .filter_map(|part| match part {
+                querymt_agent_core::model::MessagePart::Notice { source, content } => {
+                    Some((source, content))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn progress_review_at_step_seven_is_stored_once_before_the_request() {
+        use querymt_agent_core::model::NoticeSource;
+
+        let (fixture, exec_ctx, context) = notice_fixture().await;
+        let mut last = 0usize;
+        let mut stored_reviews = 0;
+        let mut context = context;
+        for steps in 1..=10usize {
+            if crate::agent::objective::progress_review_due(steps, last) {
+                last = steps;
+                assert_eq!(steps, 7);
+                context = Arc::new(super::queue_progress_review(&context));
+            }
+            context = super::store_pending_notices(&exec_ctx, &context)
+                .await
+                .unwrap();
+            stored_reviews = stored_notices(&fixture, &exec_ctx.session_id).await.len();
+        }
+        assert_eq!(stored_reviews, 1);
+        assert_eq!(
+            stored_notices(&fixture, &exec_ctx.session_id).await[0].0,
+            NoticeSource::ProgressReview
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_review_with_the_objective_enabled_keeps_it_out_of_the_objective() {
+        // The review is a stored notice; the rendered objective never carries it.
+        let objective = crate::agent::objective::RunObjective::new(
+            querymt_agent_core::model::TurnId::new(),
+            "Implement the fix".into(),
+            "interactive".into(),
+            None,
+            None,
+        );
+        let rendered = objective.render();
+        assert!(!rendered.contains("Progress review"));
+        assert!(
+            crate::agent::objective::PROGRESS_REVIEW_NOTICE.contains("Completion means satisfying")
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_is_stable_when_a_notice_is_stored() {
+        let (_fixture, exec_ctx, context) = notice_fixture().await;
+        let before: Vec<String> = context
+            .messages
+            .iter()
+            .map(|message| format!("{message:?}"))
+            .collect();
+        let queued = Arc::new(super::queue_progress_review(&context));
+        let stored = super::store_pending_notices(&exec_ctx, &queued)
+            .await
+            .unwrap();
+        let after: Vec<String> = stored
+            .messages
+            .iter()
+            .map(|message| format!("{message:?}"))
+            .collect();
+        assert_eq!(&after[..before.len()], &before[..]);
+        assert_eq!(after.len(), before.len() + 1);
+    }
+
+    fn objective_for(prompt: &str) -> crate::agent::objective::RunObjective {
+        crate::agent::objective::RunObjective::new(
+            querymt_agent_core::model::TurnId::new(),
+            prompt.into(),
+            "interactive".into(),
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn run_objective_is_off_by_default_and_sent_when_enabled() {
+        let (fixture, exec_ctx, context) = notice_fixture().await;
+        let exec_ctx = exec_ctx.with_run_objective(objective_for("fix the build"));
+
+        // Default configuration: nothing is attached to the request.
+        assert!(!fixture.config.execution_policy.run_objective);
+        let off = super::refresh_objective(&fixture.config, &context, &exec_ctx);
+        assert!(off.request_objective.is_none());
+
+        // Enabled: the rendered objective is attached, durable messages untouched.
+        let mut config = (*fixture.config).clone();
+        config.execution_policy.run_objective = true;
+        let on = super::refresh_objective(&config, &context, &exec_ctx);
+        assert!(
+            on.request_objective
+                .as_deref()
+                .is_some_and(|text| text.contains("fix the build"))
+        );
+        assert_eq!(on.messages.len(), context.messages.len());
+    }
+
+    #[tokio::test]
+    async fn steering_reaches_the_model_once_and_objective_events_fire_without_the_objective() {
+        use querymt_agent_core::events::AgentEventKind;
+
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let steering = Arc::new(crate::agent::turn_control::SteeringInbox::new(
+            querymt_agent_core::model::TurnId::new(),
+        ));
+        steering
+            .push(
+                "input-1".into(),
+                None,
+                vec![crate::acp::protocol::ContentBlock::Text(
+                    crate::acp::protocol::TextContent::new("change direction"),
+                )],
+            )
+            .await
+            .unwrap();
+        let mut exec_ctx = fixture
+            .execution_context()
+            .await
+            .with_steering(steering)
+            .with_run_objective(objective_for("fix the build"));
+        let context = Arc::new(crate::middleware::ConversationContext::new(
+            exec_ctx.session_id.clone().into(),
+            Arc::from([]),
+            Arc::new(crate::middleware::AgentStats::default()),
+            "mock".into(),
+            "mock".into(),
+        ));
+        let mut events = fixture.config.subscribe_events();
+
+        let steered = super::apply_pending_steering(
+            &fixture.config,
+            &mut exec_ctx,
+            &context,
+            "before_model_request",
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let next = super::refresh_objective(&fixture.config, &steered, &exec_ctx);
+
+        // The steering text is in the stored message, once; the objective is not sent.
+        assert!(next.request_objective.is_none());
+        let texts: Vec<String> = next.messages.iter().map(|m| m.text()).collect();
+        assert_eq!(texts, ["change direction"]);
+        // The objective was still amended and its event emitted.
+        assert_eq!(exec_ctx.run_objective.as_ref().unwrap().revision, 2);
+        let mut saw_update = false;
+        while let Ok(Ok(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), events.recv()).await
+        {
+            saw_update |= matches!(event.kind(), AgentEventKind::ObjectiveUpdated { .. });
+        }
+        assert!(
+            saw_update,
+            "objective_updated is emitted when the objective is not sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_warning_kind_has_its_own_source() {
+        use querymt_agent_core::model::NoticeSource;
+
+        let (fixture, exec_ctx, context) = notice_fixture().await;
+        let queued = context
+            .queue_notice(NoticeSource::DuplicateToolCall, "same call".into())
+            .queue_notice(NoticeSource::DuplicateCode, "similar code".into());
+
+        super::store_pending_notices(&exec_ctx, &Arc::new(queued))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_notices(&fixture, &exec_ctx.session_id).await,
+            vec![
+                (NoticeSource::DuplicateToolCall, "same call".to_string()),
+                (NoticeSource::DuplicateCode, "similar code".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn notice_survives_into_the_next_turn() {
+        use querymt_agent_core::model::NoticeSource;
+
+        let (_fixture, exec_ctx, context) = notice_fixture().await;
+        let queued = Arc::new(context.queue_notice(NoticeSource::StopHook, "keep going".into()));
+        let stored = super::store_pending_notices(&exec_ctx, &queued)
+            .await
+            .unwrap();
+
+        // The next turn builds its first request from stored history.
+        let reloaded = exec_ctx.session_handle.history().await.unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].text(), "keep going");
+        assert_eq!(
+            reloaded[0].text(),
+            stored.messages.last().unwrap().text(),
+            "same content as the message sent in the previous turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn notice_follows_tool_results() {
+        use querymt_agent_core::model::NoticeSource;
+
+        let (fixture, exec_ctx, context) = notice_fixture().await;
+        let queued =
+            context.queue_notice(NoticeSource::DuplicateToolCall, "same call twice".into());
+
+        let stored = super::store_pending_notices(&exec_ctx, &Arc::new(queued))
+            .await
+            .unwrap();
+
+        assert_eq!(stored.messages.len(), 3);
+        assert!(stored.messages[1].has_tool_result());
+        assert_eq!(stored.messages[2].text(), "same call twice");
+        assert!(stored.pending_notices.is_empty());
+        assert_eq!(
+            stored_notices(&fixture, &exec_ctx.session_id).await,
+            vec![(
+                NoticeSource::DuplicateToolCall,
+                "same call twice".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn notice_is_stored_once() {
+        use querymt_agent_core::model::NoticeSource;
+
+        let (fixture, exec_ctx, context) = notice_fixture().await;
+        let queued = Arc::new(context.queue_notice(NoticeSource::TaskCompletion, "finish".into()));
+
+        let first = super::store_pending_notices(&exec_ctx, &queued)
+            .await
+            .unwrap();
+        let second = super::store_pending_notices(&exec_ctx, &first)
+            .await
+            .unwrap();
+
+        assert_eq!(second.messages.len(), first.messages.len());
+        assert_eq!(
+            second
+                .messages
+                .iter()
+                .filter(|message| message.text() == "finish")
+                .count(),
+            1
+        );
+        assert_eq!(
+            stored_notices(&fixture, &exec_ctx.session_id).await.len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn notice_for_a_request_that_is_never_sent_is_not_stored() {
+        use querymt_agent_core::model::NoticeSource;
+
+        let (fixture, exec_ctx, context) = notice_fixture().await;
+        // The run is cancelled before the next request: the queued notice is
+        // dropped with the context and nothing reaches storage.
+        let queued = context.queue_notice(NoticeSource::DuplicateCode, "review".into());
+        assert_eq!(queued.pending_notices.len(), 1);
+        assert_eq!(queued.messages.len(), 2);
+        drop(queued);
+
+        assert!(
+            stored_notices(&fixture, &exec_ctx.session_id)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn notice_is_reported_in_loaded_history() {
+        use querymt_agent_core::model::{MessagePart, NoticeSource};
+
+        let (fixture, exec_ctx, context) = notice_fixture().await;
+        let queued = Arc::new(context.queue_notice(NoticeSource::ParallelEdit, "edit once".into()));
+        super::store_pending_notices(&exec_ctx, &queued)
+            .await
+            .unwrap();
+
+        let history = fixture
+            .config
+            .provider
+            .history_store()
+            .get_history(&exec_ctx.session_id)
+            .await
+            .unwrap();
+        let part = history
+            .iter()
+            .flat_map(|message| message.parts.iter())
+            .find(|part| matches!(part, MessagePart::Notice { .. }))
+            .expect("notice part in loaded history");
+        assert_eq!(part.type_name(), "notice");
+        assert_eq!(
+            serde_json::to_value(part).unwrap(),
+            json!({"type": "Notice", "data": {"source": "parallel_edit", "content": "edit once"}})
+        );
     }
 
     #[test]

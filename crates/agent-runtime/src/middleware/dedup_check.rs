@@ -770,7 +770,10 @@ impl MiddlewareDriver for DedupCheckMiddleware {
             };
 
             // 5. Inject the compact summary into a new context
-            let new_context = Arc::new(context.inject_message(summary));
+            let new_context = Arc::new(context.queue_notice(
+                querymt_agent_core::model::NoticeSource::DuplicateCode,
+                summary,
+            ));
 
             tracing::Span::current().record("review_injected", true);
             tracing::Span::current().record("output_state", "BeforeLlmCall");

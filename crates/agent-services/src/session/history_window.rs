@@ -963,6 +963,8 @@ mod tests {
             context_tokens: u64::from(input),
             metrics: ExecutionMetrics { steps: 1, turns: 1 },
             accounting: None,
+            prefix_change: None,
+            idle_secs: None,
         }
     }
 

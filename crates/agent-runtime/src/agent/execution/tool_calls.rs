@@ -2104,7 +2104,8 @@ pub(super) async fn store_all_tool_results(
         )
         .with_session_mode(context.session_mode)
         .with_profile(context.profile.clone())
-        .with_last_applied(context.last_applied),
+        .with_last_applied(context.last_applied)
+        .carrying_notices_from(context),
     );
 
     // Aggregate changed file paths from tool results for dedup check

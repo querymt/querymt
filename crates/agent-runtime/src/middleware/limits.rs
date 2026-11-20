@@ -653,7 +653,9 @@ mod tests {
         let context = Arc::new(ConversationContext {
             session_id: "test".into(),
             messages: Arc::from([]),
-            fragments: Arc::from([]),
+            request_objective: None,
+            pending_notices: Arc::from([]),
+            stored_mode_notice: None,
             stats,
             provider: "mock".into(),
             model: "mock-model".into(),
@@ -685,7 +687,9 @@ mod tests {
         let context = Arc::new(ConversationContext {
             session_id: "test".into(),
             messages: Arc::from([]),
-            fragments: Arc::from([]),
+            request_objective: None,
+            pending_notices: Arc::from([]),
+            stored_mode_notice: None,
             stats,
             provider: "mock".into(),
             model: "mock-model".into(),

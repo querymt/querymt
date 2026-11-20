@@ -2,7 +2,7 @@ use querymt::chat::{ChatMessage, ChatOutput, ChatRole, FinishReason, GenerationO
 use std::sync::Arc;
 
 use querymt_agent_core::events::StopType;
-use querymt_agent_core::model::MessagePart;
+use querymt_agent_core::model::{MessagePart, NoticeSource};
 
 /// Statistics about agent execution
 #[derive(Debug, Clone, Default)]
@@ -107,17 +107,11 @@ pub struct ToolFunction {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ContextPriority {
-    Normal,
-    High,
-}
-
+/// Harness text waiting to be stored as a notice before the next model request.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextFragment {
-    pub key: &'static str,
+pub struct PendingNotice {
+    pub source: NoticeSource,
     pub content: String,
-    pub priority: ContextPriority,
 }
 
 /// Context passed to middleware during state transitions
@@ -151,7 +145,18 @@ pub struct ModelProfile {
 pub struct ConversationContext {
     pub session_id: Arc<str>,
     pub messages: Arc<[ChatMessage]>,
-    pub fragments: Arc<[ContextFragment]>,
+    /// Rendered run objective for this request, set only when
+    /// `[agent.execution] run_objective` is `true`. It is request-scoped: sent
+    /// in the request tail, never stored and never part of `messages`.
+    pub request_objective: Option<Arc<str>>,
+    /// Notices raised since the last model request. The loop stores them at the
+    /// request boundary, after any tool results; until then they are not part
+    /// of `messages`.
+    pub pending_notices: Arc<[PendingNotice]>,
+    /// Content of the most recent stored `agent_mode` notice in the effective
+    /// history, `None` when there is none. A `ChatMessage` does not carry its
+    /// notice source, so the mode comparison reads this instead.
+    pub stored_mode_notice: Option<Arc<str>>,
     pub stats: Arc<AgentStats>,
     /// Current provider for the session (for dynamic model info lookup)
     pub provider: Arc<str>,
@@ -187,7 +192,9 @@ impl ConversationContext {
         Self {
             session_id,
             messages,
-            fragments: Arc::from([]),
+            request_objective: None,
+            pending_notices: Arc::from([]),
+            stored_mode_notice: None,
             stats,
             provider,
             model,
@@ -220,114 +227,53 @@ impl ConversationContext {
             .count()
     }
 
-    /// Creates a new context with an injected message added
-    pub fn inject_message(&self, content: String) -> Self {
-        let mut messages = Vec::from(&*self.messages);
-
-        let injected_msg = ChatMessage::user().text(content).build();
-
-        messages.push(injected_msg);
-
-        Self {
-            session_id: self.session_id.clone(),
-            messages: Arc::from(messages.into_boxed_slice()),
-            fragments: self.fragments.clone(),
-            stats: self.stats.clone(),
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            session_mode: self.session_mode,
-            request_overrides: self.request_overrides,
-            profile: self.profile.clone(),
-            last_applied: self.last_applied,
-        }
-    }
-
-    pub fn upsert_fragment(
-        &self,
-        key: &'static str,
-        content: String,
-        priority: ContextPriority,
-    ) -> Self {
-        let mut fragments = self.fragments.to_vec();
-        fragments.retain(|fragment| fragment.key != key);
-        if !content.trim().is_empty() {
-            fragments.push(ContextFragment {
-                key,
-                content,
-                priority,
-            });
-            fragments.sort_by_key(|fragment| (fragment.priority, fragment.key));
-        }
+    /// Queue a notice to be stored before the next model request.
+    #[must_use]
+    pub fn queue_notice(&self, source: NoticeSource, content: String) -> Self {
+        let mut pending = self.pending_notices.to_vec();
+        pending.push(PendingNotice { source, content });
         let mut next = self.clone();
-        next.fragments = Arc::from(fragments.into_boxed_slice());
+        next.pending_notices = Arc::from(pending.into_boxed_slice());
         next
     }
 
-    pub fn remove_fragment(&self, key: &str) -> Self {
-        let mut next = self.clone();
-        next.fragments = Arc::from(
-            self.fragments
-                .iter()
-                .filter(|fragment| fragment.key != key)
-                .cloned()
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        );
-        next
+    /// Carry queued notices and the stored mode notice over from `previous`
+    /// to a rebuilt context (builder-style).
+    #[must_use]
+    pub fn carrying_notices_from(mut self, previous: &ConversationContext) -> Self {
+        self.pending_notices = previous.pending_notices.clone();
+        self.stored_mode_notice = previous.stored_mode_notice.clone();
+        self
     }
 
-    pub fn fragment_messages(&self) -> Vec<ChatMessage> {
-        self.fragments
+    /// Set the stored mode notice (builder-style).
+    #[must_use]
+    pub fn with_stored_mode_notice(mut self, content: Option<Arc<str>>) -> Self {
+        self.stored_mode_notice = content;
+        self
+    }
+
+    /// Content of the most recent `agent_mode` notice, counting notices that
+    /// are queued but not yet stored.
+    pub fn last_mode_notice(&self) -> Option<&str> {
+        self.pending_notices
             .iter()
-            .map(|fragment| ChatMessage::user().text(fragment.content.clone()).build())
-            .collect()
+            .rev()
+            .find(|notice| notice.source == NoticeSource::AgentMode)
+            .map(|notice| notice.content.as_str())
+            .or(self.stored_mode_notice.as_deref())
     }
 
-    pub fn request_messages(&self) -> Vec<ChatMessage> {
-        let mut messages = self.messages.to_vec();
-        let fragments = self.fragment_messages();
-        if fragments.is_empty() {
-            return messages;
-        }
-
-        // Keep the latest durable turn last. This preserves delegation and other
-        // resumed-turn feedback while still avoiding a message between tool use
-        // and its immediately following result.
-        if messages
-            .last()
-            .is_some_and(|last| last.role == ChatRole::User && last.has_tool_result())
-        {
-            if let Some(mut latest) = messages.pop() {
-                for fragment in fragments {
-                    for part in fragment.portable_input_parts() {
-                        latest.push_input_part(part);
-                    }
-                }
-                messages.push(latest);
-            }
-        } else if messages
-            .last()
-            .is_some_and(|last| last.role == ChatRole::Assistant)
-        {
-            // A retained partial reply must be followed by guidance, not used as prefill.
-            messages.extend(fragments);
-        } else if let Some(latest) = messages.pop() {
-            messages.extend(fragments);
-            messages.push(latest);
-        } else {
-            messages.extend(fragments);
-        }
-        messages
+    /// Set the request-scoped run objective (builder-style).
+    #[must_use]
+    pub fn with_request_objective(mut self, objective: Option<Arc<str>>) -> Self {
+        self.request_objective = objective;
+        self
     }
 
     /// Set the per-session mode on this context (builder-style).
     pub fn with_session_mode(mut self, mode: crate::agent::core::AgentMode) -> Self {
         self.session_mode = mode;
-        self
-    }
-
-    pub fn with_fragments(mut self, fragments: Arc<[ContextFragment]>) -> Self {
-        self.fragments = fragments;
         self
     }
 
@@ -647,87 +593,30 @@ mod tests {
     use super::*;
     use querymt::chat::ToolResultPart;
 
-    #[test]
-    fn append_only_history_preserves_prepared_cache_prefix() {
-        let hint = querymt::chat::CacheHint::Ephemeral {
-            ttl_seconds: Some(1800),
-        };
-        let first = ChatMessage::user().text("reference").cache(hint).build();
-        let context = ConversationContext::new(
+    fn context_with(messages: Vec<ChatMessage>) -> ConversationContext {
+        ConversationContext::new(
             Arc::from("session"),
-            Arc::from([first.clone()]),
+            Arc::from(messages),
             Arc::new(AgentStats::default()),
             Arc::from("provider"),
             Arc::from("model"),
-        );
-        let previous = context.request_messages();
-        let context = ConversationContext::new(
-            Arc::from("session"),
-            Arc::from([
-                first,
-                ChatMessage::assistant().text("answer").build(),
-                ChatMessage::user().text("follow-up").build(),
-            ]),
-            Arc::new(AgentStats::default()),
-            Arc::from("provider"),
-            Arc::from("model"),
-        );
-        let current = context.request_messages();
-        assert_eq!(
-            serde_json::to_value(&previous).unwrap(),
-            serde_json::to_value(&current[..previous.len()]).unwrap()
-        );
+        )
     }
 
     #[test]
-    fn request_messages_keep_latest_feedback_after_context_fragments() {
+    fn request_objective_is_not_part_of_the_durable_messages() {
         let latest = ChatMessage::user().text("Delegation completed").build();
-        let context = ConversationContext::new(
-            Arc::from("session"),
-            Arc::from([latest]),
-            Arc::new(AgentStats::default()),
-            Arc::from("provider"),
-            Arc::from("model"),
-        )
-        .upsert_fragment(
-            "run_objective",
-            "objective".to_string(),
-            ContextPriority::High,
-        );
+        let context =
+            context_with(vec![latest]).with_request_objective(Some(Arc::from("objective")));
 
-        let messages = context.request_messages();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].text(), "objective");
-        assert_eq!(messages[1].text(), "Delegation completed");
+        assert_eq!(context.messages.len(), 1);
+        assert_eq!(context.messages[0].text(), "Delegation completed");
+        assert_eq!(context.request_objective.as_deref(), Some("objective"));
     }
 
     #[test]
-    fn request_messages_append_fragments_after_tool_results() {
-        let latest = ChatMessage::user()
-            .part(querymt::chat::ChatInputPart::tool_result(
-                querymt::chat::ToolResult::text("call-1", "result"),
-            ))
-            .build();
-        let context = ConversationContext::new(
-            Arc::from("session"),
-            Arc::from([latest]),
-            Arc::new(AgentStats::default()),
-            Arc::from("provider"),
-            Arc::from("model"),
-        )
-        .upsert_fragment(
-            "run_objective",
-            "objective".to_string(),
-            ContextPriority::High,
-        );
-
-        let messages = context.request_messages();
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].portable_input_parts()[0].is_tool_result());
-        assert_eq!(
-            messages[0].portable_input_parts()[1].as_text(),
-            Some("objective")
-        );
+    fn contexts_carry_no_request_objective_by_default() {
+        assert!(context_with(Vec::new()).request_objective.is_none());
     }
 
     #[test]

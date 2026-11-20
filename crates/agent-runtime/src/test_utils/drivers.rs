@@ -117,7 +117,10 @@ impl MessageInjectingDriver {
     fn inject(&self, state: ExecutionState) -> Result<ExecutionState> {
         match state {
             ExecutionState::BeforeLlmCall { context } => Ok(ExecutionState::BeforeLlmCall {
-                context: Arc::new(context.inject_message(self.inject_content.clone())),
+                context: Arc::new(context.queue_notice(
+                    querymt_agent_core::model::NoticeSource::DuplicateToolCall,
+                    self.inject_content.clone(),
+                )),
             }),
             other => Ok(other),
         }

@@ -243,3 +243,121 @@ fn lifetime_raise_ignores_markers_that_were_dropped() {
     assert!(body["system"][0]["cache_control"].get("ttl").is_none());
     assert!(body["system"][2]["cache_control"].get("ttl").is_none());
 }
+
+fn without_cache_control(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "cache_control")
+                .map(|(key, v)| (key.clone(), without_cache_control(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_cache_control).collect()),
+        other => other.clone(),
+    }
+}
+
+fn tool_step(call_id: &str) -> [ChatMessage; 2] {
+    let call = ChatMessage::assistant()
+        .tool_use(call_id, "read_tool", json!({"path": "src/lib.rs"}))
+        .build();
+    let result = ChatMessage::user()
+        .tool_result(
+            call_id.to_string(),
+            Some("read_tool".to_string()),
+            false,
+            vec![querymt::chat::ToolResultPart::text("file contents")],
+        )
+        .build();
+    [call, result]
+}
+
+/// Durable history as the agent stores it: the task, a tool step, then a
+/// stored notice. The last two messages carry the hints.
+fn durable_history(steps: usize) -> Vec<ChatMessage> {
+    let mut messages = vec![plain_user("fix the bug")];
+    for step in 0..steps {
+        let [call, result] = tool_step(&format!("toolu_{step}"));
+        messages.push(call);
+        messages.push(result);
+        if step == 0 {
+            messages.push(plain_user("<notice>Plan mode is active.</notice>"));
+        }
+    }
+    let len = messages.len();
+    for message in &mut messages[len - 2..] {
+        message.cache = Some(hint());
+    }
+    messages
+}
+
+#[test]
+fn earlier_durable_messages_are_identical_one_tool_step_later() {
+    for trailing in [false, true] {
+        let tail = || plain_user("Current objective: fix the bug");
+
+        let mut first = durable_history(1);
+        let first_durable = first.len();
+        let mut second = durable_history(2);
+        let second_durable = second.len();
+        if trailing {
+            first.push(tail());
+            second.push(tail());
+        }
+
+        let first_body = request_body(system_sections(1, &[1]), &first);
+        let second_body = request_body(system_sections(1, &[1]), &second);
+        let first_messages = first_body["messages"].as_array().unwrap();
+        let second_messages = second_body["messages"].as_array().unwrap();
+
+        // Everything the first request sent from the durable history is a
+        // byte-identical prefix of the second, apart from where the markers sit.
+        for index in 0..first_durable {
+            assert_eq!(
+                without_cache_control(&first_messages[index]),
+                without_cache_control(&second_messages[index]),
+                "message {index} changed (trailing: {trailing})"
+            );
+        }
+        assert_eq!(first_body["system"], second_body["system"]);
+
+        // Markers sit on the last two durable messages only, never on the
+        // unhinted trailing message.
+        assert_eq!(
+            marked_messages(&first_body),
+            vec![first_durable - 2, first_durable - 1]
+        );
+        assert_eq!(
+            marked_messages(&second_body),
+            vec![second_durable - 2, second_durable - 1]
+        );
+        assert_eq!(
+            second_messages.len(),
+            second_durable + usize::from(trailing)
+        );
+        if trailing {
+            assert_eq!(count_cache_control(&second_messages[second_durable]), 0);
+        }
+    }
+}
+
+#[test]
+fn stored_notice_is_part_of_the_cached_prefix() {
+    let messages = durable_history(2);
+    let body = request_body(system_sections(1, &[1]), &messages);
+    let notice = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|m| {
+            m["content"][0]["text"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("<notice>"))
+        })
+        .expect("notice is sent");
+
+    // The notice sits before the second step's markers, so the later request
+    // reads it from the cache instead of rewriting it.
+    assert_eq!(notice, 3);
+    assert!(marked_messages(&body).iter().all(|&i| i > notice));
+}

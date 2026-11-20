@@ -25,6 +25,32 @@
   `..Default::default()`: `LlamaCppConfig` now implements `Default` and has
   `LlamaCppConfig::new(model)`, so later new options won't break callers again.
   Config files are unaffected.
+- **BREAKING (model requests, prompt caching):** the model request is now an
+  append-only prefix of stored history plus one trailing request message.
+  - The run objective is no longer sent with every request by default. Set
+    `[agent.execution] run_objective = true` to restore it (new key, default
+    `false`). When on, it is sent in the trailing message, so it no longer
+    changes the cached prefix.
+  - Reminders (agent mode, output limit, progress review, Stop-hook and
+    task-completion messages, duplicate-call and duplicate-code guidance,
+    parallel-edit and context-usage warnings, background-command notices) are
+    stored once as `notice` message parts instead of being added to every
+    model call. A mode reminder is stored when the mode changes, with a leave
+    notice when the session moves to a mode without one.
+  - Context hooks now receive durable history only (no run objective and no
+    other hooks' `additional_context`). Their `additional_context` is sent in
+    the trailing request message and is not stored.
+  - Rollback: a session that holds a `notice` part cannot be loaded by a build
+    from before this change (unknown message part kind).
+- **Request attribution:** `llm_request_end` events carry `prefix_change`
+  (`first_request`, `model`, `tools`, `system`, `history` or `none`) and
+  `idle_secs`, and the model request span carries `qmt.cache.prefix_change` and
+  `qmt.cache.idle_secs`.
+- **Tool order:** the tool list sent to the model is sorted by name, and
+  `ToolRegistry` keeps registration order, so the tool prefix is byte-stable
+  between requests.
+- **Compaction:** the summary is followed by the session's active task, so a
+  compacted session keeps its task commitment.
 - **Subagents API (Rust, Python, hooks, ACP):** `Agent::builder()`,
   `AgentBuilder::subagent`, `Agent::add_subagent` / `remove_subagent` /
   `subagents` / `has_subagents` / `on_subagents_changed` /

@@ -47,6 +47,38 @@ pub(crate) fn compaction_prompt(instructions: Option<&str>) -> String {
     }
 }
 
+/// The active task's identifier, deliverable and acceptance criteria, verbatim,
+/// for appending to a compaction summary.
+///
+/// With the run objective off by default, compaction is the one place that can
+/// lose these. Returns `None` when there is no active task, or it has neither a
+/// deliverable nor acceptance criteria.
+pub(crate) fn active_task_section(task: Option<&crate::session::domain::Task>) -> Option<String> {
+    let task = task.filter(|task| task.status == crate::session::domain::TaskStatus::Active)?;
+    let deliverable = task
+        .expected_deliverable
+        .as_deref()
+        .filter(|s| !s.is_empty());
+    let criteria = task
+        .acceptance_criteria
+        .as_deref()
+        .filter(|s| !s.is_empty());
+    if deliverable.is_none() && criteria.is_none() {
+        return None;
+    }
+    let mut lines = vec![format!("Task: {}", task.public_id)];
+    if let Some(deliverable) = deliverable {
+        lines.push(format!("Deliverable: {deliverable}"));
+    }
+    if let Some(criteria) = criteria {
+        lines.push(format!("Acceptance criteria: {criteria}"));
+    }
+    Some(format!(
+        "<active_task note=\"verbatim, still in force after this summary\">\n{}\n</active_task>",
+        lines.join("\n")
+    ))
+}
+
 /// Upper bound on the verbatim user prompts carried across a compaction.
 const ORIGINAL_TASK_MAX_BYTES: usize = 16 * 1024;
 /// Most recent user prompts carried across a compaction.
@@ -1367,6 +1399,56 @@ mod tests {
             .unwrap();
         assert_eq!(result.summary, "Valid continuation summary");
         assert_eq!(provider.call_count(), 2);
+    }
+
+    fn task_with(
+        status: crate::session::domain::TaskStatus,
+        deliverable: Option<&str>,
+        criteria: Option<&str>,
+    ) -> crate::session::domain::Task {
+        let now = time::OffsetDateTime::now_utc();
+        crate::session::domain::Task {
+            id: 1,
+            public_id: "task-7".into(),
+            session_id: 1,
+            kind: crate::session::domain::TaskKind::Finite,
+            status,
+            expected_deliverable: deliverable.map(str::to_owned),
+            acceptance_criteria: criteria.map(str::to_owned),
+            revision: 1,
+            creation_key: None,
+            completion_evidence: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn compaction_with_an_active_task_carries_its_identifier_and_criteria() {
+        use crate::session::domain::TaskStatus;
+        let task = task_with(
+            TaskStatus::Active,
+            Some("a parser fix"),
+            Some("all tests pass"),
+        );
+
+        let section = active_task_section(Some(&task)).expect("task section");
+
+        assert!(section.contains("task-7"));
+        assert!(section.contains("Deliverable: a parser fix"));
+        assert!(section.contains("Acceptance criteria: all tests pass"));
+    }
+
+    #[test]
+    fn compaction_without_an_active_task_has_no_task_section() {
+        use crate::session::domain::TaskStatus;
+        assert!(active_task_section(None).is_none());
+        // Finished, and active-but-empty tasks add nothing either.
+        let done = task_with(TaskStatus::Done, Some("x"), Some("y"));
+        assert!(active_task_section(Some(&done)).is_none());
+        let empty = task_with(TaskStatus::Active, None, None);
+        assert!(active_task_section(Some(&empty)).is_none());
     }
 
     #[tokio::test]

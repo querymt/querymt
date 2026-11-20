@@ -839,12 +839,41 @@ async fn context_replacement_is_request_only_and_chained() {
         projected[0].portable_input_parts()[0].as_text(),
         Some("projected")
     );
-    assert!(
-        projected[0].portable_input_parts()[1]
-            .as_text()
-            .unwrap()
-            .contains("memory")
-    );
+    // `additional_context` is request-scoped: returned separately, never merged
+    // into a durable message.
+    assert_eq!(projected[0].portable_input_parts().len(), 1);
+    assert_eq!(result.additional_context.len(), 1);
+    assert!(result.additional_context[0].contains("memory"));
+    assert!(result.additional_context[0].contains("<hook-context event=context"));
+}
+
+#[tokio::test]
+async fn context_hook_without_additional_context_returns_none() {
+    let config = HooksConfig {
+        enabled: true,
+        context: vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![command_hook("printf '{}'".into())],
+        }],
+        ..HooksConfig::default()
+    };
+    let result = Hooks::new(config)
+        .unwrap()
+        .run_context(ContextHookRequest {
+            session_id: "s".into(),
+            mcp_tool_state: None,
+            turn_id: "t".into(),
+            cwd: None,
+            model: "m".into(),
+            permission_mode: "default".into(),
+            trigger: "user_prompt".into(),
+            context_window: 1000,
+            messages: vec![querymt::chat::ChatMessage::user().text("stored").build()],
+        })
+        .await
+        .unwrap();
+    assert!(result.additional_context.is_empty());
+    assert_eq!(result.messages.unwrap().len(), 1);
 }
 
 #[tokio::test]

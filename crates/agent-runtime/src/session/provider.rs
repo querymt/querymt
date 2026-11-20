@@ -987,13 +987,20 @@ impl SessionHandle {
         self.project_history(&agent_msgs)
     }
 
-    pub(crate) async fn history_with_compaction(
+    /// Effective history, its compaction summaries, and the content of the
+    /// most recent stored `agent_mode` notice (a `ChatMessage` does not carry
+    /// its notice source, so it is read here from the stored messages).
+    pub(crate) async fn history_with_notice_state(
         &self,
-    ) -> SessionResult<(Vec<ChatMessage>, Vec<ChatMessage>)> {
+    ) -> SessionResult<(
+        Vec<ChatMessage>,
+        Vec<ChatMessage>,
+        Option<std::sync::Arc<str>>,
+    )> {
         let agent_msgs = self.get_effective_agent_history().await?;
         let messages = self.project_history(&agent_msgs)?;
         let summaries = crate::agent::utils::genai::compaction_summaries(&agent_msgs, &messages);
-        Ok((messages, summaries))
+        Ok((messages, summaries, last_mode_notice(&agent_msgs)))
     }
 
     fn project_history(&self, agent_msgs: &[AgentMessage]) -> SessionResult<Vec<ChatMessage>> {
@@ -1444,6 +1451,21 @@ pub(crate) fn record_auth_source(source: AuthSource) {
 }
 
 /// True when `error` means stored OAuth tokens could not be refreshed.
+/// Content of the most recent `agent_mode` notice in `messages`.
+pub(crate) fn last_mode_notice(messages: &[AgentMessage]) -> Option<Arc<str>> {
+    messages
+        .iter()
+        .rev()
+        .flat_map(|message| message.parts.iter().rev())
+        .find_map(|part| match part {
+            MessagePart::Notice {
+                source: querymt_agent_core::model::NoticeSource::AgentMode,
+                content,
+            } => Some(Arc::from(content.as_str())),
+            _ => None,
+        })
+}
+
 fn is_oauth_refresh_failure(error: &SessionError) -> bool {
     matches!(error, SessionError::CredentialRefresh { .. })
 }

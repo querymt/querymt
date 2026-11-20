@@ -229,6 +229,11 @@ pub(super) async fn run_ai_compaction(
                 ctx.model.clone(),
             )
             .with_session_mode(ctx.session_mode)
+            // Compaction may have removed the stored reminder; read the
+            // surviving one so the next request stores it again if needed.
+            .with_stored_mode_notice(crate::session::provider::last_mode_notice(
+                &filtered_messages,
+            ))
             .with_profile(ctx.profile.clone()),
         )
     } else {
@@ -442,6 +447,15 @@ pub(crate) async fn compact_history(
         let error = anyhow::Error::from(error);
         emit_compaction_failure(config, session_id, &compaction_id, &error).await;
         return Err(error);
+    }
+
+    // Appended after validation, like the verbatim prompts, so it can never
+    // rescue an empty summary.
+    if let Some(section) =
+        crate::session::compaction::active_task_section(exec_ctx.state.active_task.as_ref())
+    {
+        result.summary_token_count += section.len() / 4;
+        result.summary = format!("{}\n\n{section}", result.summary);
     }
 
     let post_hook = match config

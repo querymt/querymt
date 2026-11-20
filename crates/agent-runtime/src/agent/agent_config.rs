@@ -444,6 +444,9 @@ impl AgentConfig {
             }
         }
 
+        // Ordered by name so the head of the request is the same across
+        // restarts and MCP refreshes (a refresh re-appends that server's tools).
+        filtered.sort_by(|a, b| a.function.name.cmp(&b.function.name));
         filtered
     }
 
@@ -482,6 +485,65 @@ mod tests {
         let config =
             Arc::new(AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm).build());
         (config, temp_dir)
+    }
+
+    fn chat_tool(name: &str) -> querymt::chat::Tool {
+        querymt::chat::Tool {
+            tool_type: "function".to_string(),
+            function: querymt::chat::FunctionTool {
+                name: name.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        }
+    }
+
+    fn request_tool_names(
+        config: &AgentConfig,
+        runtime: &crate::agent::core::SessionRuntime,
+    ) -> Vec<String> {
+        let provider: Arc<dyn querymt::LLMProvider> =
+            Arc::new(crate::test_utils::SharedLlmProvider::new(
+                crate::test_utils::MockLlmProvider::new(),
+                vec![chat_tool("zeta_provider"), chat_tool("alpha_provider")],
+            ));
+        let tool_set = crate::tools::ToolSet::new(
+            Arc::clone(&config.tool_registry),
+            crate::tools::ToolRegistry::new(),
+        );
+        config
+            .collect_tools(provider, Some(runtime), None, &tool_set)
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect()
+    }
+
+    /// "MCP server refresh keeps the order": a refresh that reports the same
+    /// tools in another order (it re-appends that server's tools) must not
+    /// change the request's tool list.
+    #[tokio::test]
+    async fn request_tool_list_is_ordered_by_name_and_survives_an_mcp_refresh() {
+        let (config, _td) = make_config().await;
+        let defs = vec![chat_tool("mcp_b"), chat_tool("mcp_a"), chat_tool("mcp_c")];
+        let state = crate::agent::core::McpToolState::new(HashMap::new(), defs.clone());
+        let runtime = crate::agent::core::SessionRuntime::new(None, HashMap::new(), state.clone());
+
+        let before = request_tool_names(&config, &runtime);
+        let mut sorted = before.clone();
+        sorted.sort();
+        assert_eq!(before, sorted, "ordered by name");
+
+        // The refresh reports the same tools, re-appended in a different order.
+        let mut reordered = defs;
+        reordered.rotate_left(1);
+        state.rcu(|current| crate::agent::core::McpToolSnapshot {
+            tool_defs: reordered.clone(),
+            tools_hash: None,
+            ..current.clone()
+        });
+
+        assert_eq!(request_tool_names(&config, &runtime), before);
     }
 
     #[tokio::test]

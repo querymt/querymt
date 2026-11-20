@@ -226,7 +226,10 @@ impl MiddlewareDriver for ContextMiddleware {
                         "ContextMiddleware: usage warning injected for session {}",
                         context.session_id
                     );
-                    let new_context = context.inject_message(warning);
+                    let new_context = context.queue_notice(
+                        querymt_agent_core::model::NoticeSource::ContextUsage,
+                        warning,
+                    );
                     return Ok(ExecutionState::BeforeLlmCall {
                         context: Arc::new(new_context),
                     });
@@ -651,9 +654,10 @@ mod tests {
             ExecutionState::BeforeLlmCall {
                 context: new_context,
             } => {
-                assert!(
-                    new_context.messages.len() > context.messages.len(),
-                    "Should inject warning message before compact threshold"
+                assert_eq!(
+                    new_context.pending_notices.len(),
+                    1,
+                    "Should queue warning notice before compact threshold"
                 );
             }
             ExecutionState::Stopped {
@@ -717,11 +721,11 @@ mod tests {
             ExecutionState::BeforeLlmCall {
                 context: result_ctx,
             } => {
-                // Warning should be injected in the messages
-                assert_ne!(
-                    context.messages.len(),
-                    result_ctx.messages.len(),
-                    "Should inject warning message"
+                // Warning should be queued as a notice
+                assert_eq!(
+                    result_ctx.pending_notices.len(),
+                    1,
+                    "Should queue warning notice"
                 );
             }
             ExecutionState::Stopped { .. } => {
@@ -753,10 +757,11 @@ mod tests {
             ExecutionState::BeforeLlmCall {
                 context: new_context,
             } => {
-                // Message should be injected - new context has more messages
-                assert!(
-                    new_context.messages.len() > context.messages.len(),
-                    "Should inject warning message"
+                // The warning is queued as a `context_usage` notice.
+                assert_eq!(new_context.pending_notices.len(), 1);
+                assert_eq!(
+                    new_context.pending_notices[0].source,
+                    querymt_agent_core::model::NoticeSource::ContextUsage
                 );
             }
             _ => panic!("Expected BeforeLlmCall with injected message"),

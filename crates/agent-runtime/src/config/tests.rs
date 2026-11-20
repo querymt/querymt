@@ -176,6 +176,27 @@ fn test_removed_permission_keys_fail_naming_the_key() {
 }
 
 #[test]
+fn run_objective_defaults_to_false_and_is_configurable() {
+    let omitted = parse_agent("");
+    assert!(!omitted.execution.run_objective);
+    assert!(!RuntimeExecutionPolicy::from(&omitted.execution).run_objective);
+
+    let enabled = parse_agent("[agent.execution]\nrun_objective = true");
+    assert!(enabled.execution.run_objective);
+    assert!(RuntimeExecutionPolicy::from(&enabled.execution).run_objective);
+}
+
+#[test]
+fn invalid_run_objective_setting_is_rejected_naming_the_key() {
+    let err = toml::from_str::<AgentSettings>(
+        "provider = \"p\"\nmodel = \"m\"\n[execution]\nrun_objective = \"auto\"",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("run_objective"), "{err}");
+}
+
+#[test]
 fn test_system_single_string() {
     let agent = parse_agent("system = \"hello\"");
     assert_eq!(agent.system.len(), 1);

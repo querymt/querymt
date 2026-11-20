@@ -656,7 +656,12 @@ async fn inject_wait_message(
         },
     );
 
-    Ok(Arc::new(context.inject_message(content)))
+    // The message is stored above as a text part; mirror it in the live context.
+    let mut messages = context.messages.to_vec();
+    messages.push(querymt::chat::ChatMessage::user().text(content).build());
+    let mut next = (**context).clone();
+    next.messages = Arc::from(messages.into_boxed_slice());
+    Ok(Arc::new(next))
 }
 
 #[cfg(test)]

@@ -189,8 +189,8 @@ impl MiddlewareDriver for DelegationGuardMiddleware {
                                             "DelegationGuardMiddleware: blocking duplicate delegation"
                                         );
 
-                                        // Inject warning message and stop execution
-                                        let _new_context = context.inject_message(warning);
+                                        // The run stops, so the warning is never sent.
+                                        let _ = warning;
                                         return Ok(ExecutionState::Stopped {
                                             message: "Delegation blocked by guard".into(),
                                             stop_type: StopType::DelegationBlocked,
