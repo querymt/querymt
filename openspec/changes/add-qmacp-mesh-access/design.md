@@ -1,0 +1,9 @@
+# Design: qmacp mesh access
+
+Add a nested `mesh` command in `crates/qmacp/src/commands.rs` (`Command`, `run`), with a dedicated CLI module for arguments and request construction. Use `AcpClient::extension` in `crates/qmacp/src/client.rs` and `extension_payload` in `crates/qmacp/src/session.rs`; no new third-party dependencies. Mesh request and notification names come from the sibling `add-mesh-peer-access` ACP delta. Read the advertised capability and never assume owner authority from the URL.
+
+Use the existing `CliError` and output envelope in `crates/qmacp/src/output.rs`. For mutation failures preserve known peer and revision context and typed server error data. Distinguish a returned rejection from unknown delivery; do not automatically read a later revision and retry. Convert decimal Mtok into exact whole-token strings. Pass a JSON grant object so the command can express multiple independently configured providers in one replacement. Require explicit acknowledgment of host shell for a Full replacement.
+
+Use the existing `AcpClient::connect_with_events` for the bounded, one-result watch command. Decode only the v1 peer invalidation fields; subscribe before capability discovery so an invalidation received during handshake is not lost. Treat the result as a hint to run a new `mesh get`. A streaming subscription, an unbounded watch, and watch within `exec` are unnecessary for this release. Existing commands keep their behavior.
+
+Unit and mock-WebSocket checks prove exact client payloads without credentials. The backend change owns binding ACP to authenticated owner connections; run the rebuilt qmacp against an isolated candidate after that authority and the mesh handlers exist. qmacp adds no session DB changes and does not affect provider WASM, Python, or mobile builds.
