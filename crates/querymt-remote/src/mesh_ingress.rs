@@ -32,6 +32,9 @@ use crate::provider_transport::MESH_MESSAGE_SIZE_MAXIMUM;
 const LEGACY_PROTOCOL: StreamProtocol = StreamProtocol::new("/kameo/messaging/1.0.0");
 const MAX_IN_FLIGHT: usize = 100;
 
+mod router;
+pub use router::{InboundAccess, InboundRouter, PeerRequest};
+
 #[cfg(test)]
 mod tests;
 
