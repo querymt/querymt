@@ -196,7 +196,7 @@ impl LocalAgentHandle {
     > {
         use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
         use futures_util::{StreamExt, stream::FuturesUnordered};
-        use querymt_remote::ask_remote_with_timeout;
+        use querymt_remote::request_timeout::{SharingAskError, ask_with_sharing};
 
         use crate::error::AgentError;
         let mesh = self
@@ -236,14 +236,16 @@ impl LocalAgentHandle {
                 .lookup_actor_no_retry::<RemoteNodeManager>(direct_dht_name.clone())
                 .await
             {
-                Ok(Some(node_manager_ref)) => {
+                Ok(Some(node_manager_ref))
+                    if node_manager_ref.id().peer_id() == parsed_peer_id.as_ref() =>
+                {
                     log::debug!(
                         "find_node_manager: fast-path DHT hit for '{}'",
                         direct_dht_name
                     );
                     return Ok(node_manager_ref);
                 }
-                Ok(None) => {
+                Ok(_) => {
                     log::debug!(
                         "find_node_manager: no direct DHT entry for '{}', trying next scope",
                         direct_dht_name
@@ -279,7 +281,9 @@ impl LocalAgentHandle {
                 match result {
                     Ok(node_manager_ref) => {
                         let peer_id = node_manager_ref.id().peer_id().copied();
-                        if peer_id == Some(local_peer_id) {
+                        if peer_id == Some(local_peer_id)
+                            || parsed_peer_id.is_some_and(|expected| peer_id != Some(expected))
+                        {
                             continue;
                         }
                         // No is_peer_alive check here — we contact the peer
@@ -295,10 +299,11 @@ impl LocalAgentHandle {
                         }
 
                         let semaphore = Arc::clone(&semaphore);
+                        let mesh = mesh.clone();
                         lookups.push(async move {
                             let permit = semaphore.acquire_owned().await.ok();
                             let res =
-                                ask_remote_with_timeout(&node_manager_ref, &GetNodeInfo, timeout)
+                                ask_with_sharing(&mesh, &node_manager_ref, &GetNodeInfo, timeout)
                                     .await;
                             drop(permit);
                             (node_manager_ref, cache_key, peer_id, res)
@@ -313,13 +318,16 @@ impl LocalAgentHandle {
 
         while let Some((node_manager_ref, cache_key, peer_id, result)) = lookups.next().await {
             match result {
-                Ok(info) => {
+                Ok(info) if peer_id == Some(*info.node_id.as_peer_id()) => {
                     self.insert_cached_remote_node(cache_key, info.clone());
                     if info.node_id.to_string() == node_id {
                         return Ok(node_manager_ref);
                     }
                 }
-                Err(kameo::error::RemoteSendError::ReplyTimeout) => {
+                Ok(_) => {
+                    log::warn!("find_node_manager: GetNodeInfo returned a different peer identity")
+                }
+                Err(SharingAskError::Actor(kameo::error::RemoteSendError::ReplyTimeout)) => {
                     log::warn!(
                         "find_node_manager: GetNodeInfo timed out for peer {:?}",
                         peer_id

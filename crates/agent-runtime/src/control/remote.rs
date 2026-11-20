@@ -9,7 +9,8 @@ pub struct RemoteNodeInfo {
     pub id: String,
     pub label: String,
     pub capabilities: Vec<String>,
-    pub active_sessions: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_sessions: Option<u32>,
     pub transport: String,
     pub last_seen_at: Option<String>,
 }
@@ -172,11 +173,9 @@ pub async fn list_remote_nodes(agent: &LocalAgentHandle) -> Vec<RemoteNodeInfo> 
                 id: node.node_id.to_string(),
                 label: node.hostname,
                 capabilities: node.capabilities,
-                active_sessions: crate::agent::utils::u32_from_usize(
-                    node.active_sessions,
-                    "active_sessions",
-                    None,
-                ),
+                active_sessions: node.active_sessions.map(|count| {
+                    crate::agent::utils::u32_from_usize(count, "active_sessions", None)
+                }),
                 transport: "unknown".to_string(),
                 last_seen_at: None,
             })

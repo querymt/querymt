@@ -77,8 +77,9 @@ pub struct NodeInfo {
     pub hostname: String,
     /// Node capabilities (e.g., "shell", "filesystem", "gpu")
     pub capabilities: Vec<String>,
-    /// Number of active sessions
-    pub active_sessions: usize,
+    /// Number of active sessions, when disclosed by the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_sessions: Option<usize>,
 }
 
 // ── Remote-only actor and messages ────────────────────────────────────────────
@@ -113,6 +114,7 @@ mod remote_impl {
     use kameo::Actor;
     use kameo::message::{Context, Message};
     use kameo::remote::_internal;
+    use querymt_remote::mesh_ingress::{InboundAccess, InboundRouter, PeerRequest};
     use serde::{Deserialize, Serialize};
 
     use std::collections::HashMap;
@@ -350,7 +352,7 @@ mod remote_impl {
             invite_id: String,
             /// Optional human-readable mesh name from the invite grant.
             mesh_name: Option<String>,
-            /// The joiner's own PeerId (self-declared; baked into the token on success).
+            /// The joiner's PeerId, which must match the authenticated caller on guarded ingress.
             peer_id: String,
         },
         /// Reconnect using a previously issued membership token.
@@ -371,7 +373,7 @@ mod remote_impl {
         NoInviteStore,
         #[error("invalid peer id")]
         InvalidPeerId,
-        #[error("peer_id does not match membership token")]
+        #[error("peer_id does not match the authenticated caller or membership token")]
         PeerIdMismatch,
         #[error("host is not a member of this mesh")]
         NotAMember,
@@ -509,6 +511,84 @@ mod remote_impl {
         pub fn with_node_name(mut self, name: String) -> Self {
             self.node_name = Some(name);
             self
+        }
+
+        pub(crate) fn register_guarded_discovery(
+            router: &InboundRouter,
+            store: Arc<dyn querymt_remote::peer_access::GrantStore>,
+            actor: &kameo::actor::ActorRef<Self>,
+        ) {
+            use querymt_remote::peer_access::{PeerGrant, SharingProtocol};
+
+            Self::register_admission(router, actor);
+            let weak = actor.downgrade();
+            let describe = move |origin: PeerRequest, msg: GetNodeInfo| {
+                let weak = weak.clone();
+                let store = store.clone();
+                async move {
+                    let actor = weak.upgrade().ok_or(AgentError::MeshNotBootstrapped)?;
+                    let mut info = actor.ask(msg).await.map_err(|error| match error {
+                        kameo::error::SendError::HandlerError(error) => error,
+                        _ => AgentError::MeshNotBootstrapped,
+                    })?;
+                    let protocol = origin.protocol();
+                    let grant = store
+                        .grant(origin.key())
+                        .await
+                        .map_or(PeerGrant::None, |state| state.grant);
+                    info.capabilities.retain(|name| match name.as_str() {
+                        "shell" => grant == PeerGrant::Full,
+                        "filesystem" => grant.allows_filesystem(protocol),
+                        _ => false,
+                    });
+                    if !grant.allows_sessions(protocol) {
+                        // Old decoders require a numeric field; v1 can omit it.
+                        info.active_sessions = (protocol == SharingProtocol::Legacy).then_some(0);
+                    }
+                    Ok::<_, AgentError>(info)
+                }
+            };
+            router.register_ask::<Self, GetNodeInfo, _, _, _, _>(
+                actor.id(),
+                InboundAccess::Identity,
+                describe.clone(),
+            );
+            router.register_v1_ask::<Self, GetNodeInfo, _, _, _, _>(
+                actor.id(),
+                InboundAccess::Identity,
+                describe,
+            );
+        }
+
+        fn register_admission(router: &InboundRouter, actor: &kameo::actor::ActorRef<Self>) {
+            let weak = actor.downgrade();
+            let admit = move |origin: PeerRequest, msg: AdmissionRequest| {
+                let weak = weak.clone();
+                async move {
+                    let claimed = match &msg {
+                        AdmissionRequest::Invite { peer_id, .. }
+                        | AdmissionRequest::Token { peer_id, .. } => peer_id,
+                    };
+                    if origin.key().peer.to_string() != *claimed {
+                        return Err(AdmissionRejection::PeerIdMismatch);
+                    }
+                    let actor = weak.upgrade().ok_or(AdmissionRejection::NoMeshHandle)?;
+                    actor.ask(msg).await.map_err(|error| match error {
+                        kameo::error::SendError::HandlerError(rejection) => rejection,
+                        _ => AdmissionRejection::NoMeshHandle,
+                    })
+                }
+            };
+            router.register_ask::<Self, AdmissionRequest, _, _, _, _>(
+                actor.id(),
+                InboundAccess::Identity,
+                admit.clone(),
+            );
+            router.register_v1_ask::<Self, AdmissionRequest, _, _, _, _>(
+                actor.id(),
+                InboundAccess::Identity,
+                admit,
+            );
         }
     }
 
@@ -2102,7 +2182,7 @@ mod remote_impl {
                 node_id,
                 hostname,
                 capabilities: vec!["shell".to_string(), "filesystem".to_string()],
-                active_sessions,
+                active_sessions: Some(active_sessions),
             })
         }
     }
@@ -2165,21 +2245,16 @@ mod remote_impl {
                             );
 
                             // Persist admitted peer to mesh_state.json for reconnection support
-                            if let Some(mesh_state_store) = mesh.mesh_state_store() {
-                                let mesh_id = crate::agent::remote::invite::mesh_id_for(
-                                    &mesh.peer_id().to_string(),
-                                    mesh_name.as_deref(),
-                                );
-                                if let Err(e) = mesh_state_store
+                            if let Some(mesh_state_store) = mesh.mesh_state_store()
+                                && let Err(e) = mesh_state_store
                                     .write()
-                                    .add_admitted_peer(&mesh_id, token.clone())
-                                {
-                                    log::warn!(
-                                        "Failed to persist admitted peer {} to mesh state: {}",
-                                        peer_id,
-                                        e
-                                    );
-                                }
+                                    .add_admitted_peer(&token.mesh_id, token.clone())
+                            {
+                                log::warn!(
+                                    "Failed to persist admitted peer {} to mesh state: {}",
+                                    peer_id,
+                                    e
+                                );
                             }
 
                             // Transport acceptance alone is not scope authorization.
@@ -2240,7 +2315,18 @@ mod remote_impl {
                     if !mesh.active_scopes().contains(&scope) {
                         return Err(AdmissionRejection::NotAMember);
                     }
-                    // Any member of this scope can verify the self-contained token.
+                    // Membership tokens are issued by the host whose identity namespaces the
+                    // scope. A valid signature from any other key is not admission authority.
+                    if membership_token
+                        .mesh_id
+                        .split_once(':')
+                        .map(|(host, _)| host)
+                        != Some(membership_token.admitted_by.as_str())
+                    {
+                        return Err(AdmissionRejection::Denied(
+                            "membership issuer is not the scope host".into(),
+                        ));
+                    }
                     match InviteStore::verify_membership_token(&membership_token) {
                         Ok(()) => {
                             log::info!(

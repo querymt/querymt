@@ -1105,48 +1105,111 @@ mod node_manager_tests {
     }
 
     #[tokio::test]
-    async fn test_admission_request_invite_preserves_mesh_name() {
-        let mesh = get_test_mesh().await;
-        let (config, _td) = test_agent_config().await;
-        let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
-        let nm_ref = RemoteNodeManager::spawn(RemoteNodeManager::new(
-            config,
-            registry,
-            Some(mesh.clone()),
-            Arc::new(parking_lot::Mutex::new(None)),
-        ));
+    async fn guarded_admission_binds_peer_and_keeps_discovery_identity_only() {
+        use kameo::remote::{
+            RemoteActor, RemoteMessage,
+            messaging::{SwarmRequest, SwarmResponse},
+        };
+        use querymt_remote::mesh_ingress::{InboundRouter, MeshIngress};
+        use querymt_remote::peer_access::{
+            GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState,
+        };
 
-        let invite = mesh
-            .create_invite(Some("named-mesh".to_string()), None, Some(1), false)
-            .unwrap();
-        let joiner_peer_id = libp2p::identity::Keypair::generate_ed25519()
-            .public()
-            .to_peer_id()
-            .to_string();
-
-        let response = nm_ref
-            .ask(AdmissionRequest::Invite {
-                invite_id: invite.grant.invite_id.clone(),
-                mesh_name: invite.grant.mesh_name.clone(),
-                peer_id: joiner_peer_id,
-            })
-            .await
-            .expect("admission request should succeed");
-
-        match response {
-            AdmissionResponse::Admitted {
-                membership_token, ..
-            } => {
-                assert_eq!(
-                    membership_token.mesh_id,
-                    crate::agent::remote::invite::mesh_id_for(
-                        &mesh.peer_id().to_string(),
-                        Some("named-mesh"),
-                    )
-                );
+        struct EmptyStore;
+        #[async_trait::async_trait]
+        impl GrantStore for EmptyStore {
+            async fn grant(&self, _: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+                Ok(PeerGrantState::default())
             }
-            other => panic!("expected admitted response, got {other:?}"),
+            async fn replace_grant(
+                &self,
+                _: &PeerGrantKey,
+                _: Uuid,
+                _: PeerGrant,
+            ) -> Result<PeerGrantState, GrantStoreError> {
+                panic!("admission must not write a grant")
+            }
+            async fn managed_peers(
+                &self,
+                _: &querymt_remote::NodeId,
+            ) -> Result<Vec<querymt_remote::NodeId>, GrantStoreError> {
+                Ok(Vec::new())
+            }
         }
+        fn ask<M: serde::Serialize>(actor_id: kameo::actor::ActorId, message: &M) -> SwarmRequest
+        where
+            RemoteNodeManager: RemoteMessage<M>,
+        {
+            SwarmRequest::Ask {
+                actor_id,
+                actor_remote_id: <RemoteNodeManager as RemoteActor>::REMOTE_ID.into(),
+                message_remote_id: <RemoteNodeManager as RemoteMessage<M>>::REMOTE_ID.into(),
+                payload: rmp_serde::to_vec_named(message).unwrap(),
+                mailbox_timeout: None,
+                reply_timeout: None,
+                immediate: false,
+            }
+        }
+
+        let mesh = get_test_mesh().await;
+        let (actor, _config, _td) = spawn_test_node_manager_with_mesh().await;
+        let store = Arc::new(EmptyStore);
+        let ingress = InboundRouter::new(*mesh.peer_id(), store.clone());
+        RemoteNodeManager::register_guarded_discovery(&ingress, store, &actor);
+        let invite = mesh
+            .create_invite(Some("named-mesh".into()), None, Some(1), false)
+            .unwrap();
+        let joiner = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let request = AdmissionRequest::Invite {
+            invite_id: invite.grant.invite_id,
+            mesh_name: invite.grant.mesh_name,
+            peer_id: joiner.to_string(),
+        };
+        let SwarmResponse::Ask(Err(RemoteSendError::HandlerError(bytes))) = ingress
+            .handle_legacy(libp2p::PeerId::random(), ask(actor.id(), &request))
+            .await
+        else {
+            panic!("expected a caller mismatch")
+        };
+        assert_eq!(
+            rmp_serde::from_slice::<crate::agent::remote::node_manager::AdmissionRejection>(&bytes)
+                .unwrap(),
+            crate::agent::remote::node_manager::AdmissionRejection::PeerIdMismatch
+        );
+        let SwarmResponse::Ask(Ok(bytes)) = ingress
+            .handle_v1(joiner, ask(actor.id(), &request))
+            .await
+            .unwrap()
+        else {
+            panic!("the rejected caller must not consume the single-use invite")
+        };
+        let AdmissionResponse::Admitted {
+            membership_token, ..
+        } = rmp_serde::from_slice(&bytes).unwrap()
+        else {
+            panic!("expected admission")
+        };
+        assert_eq!(membership_token.peer_id, joiner.to_string());
+        assert_eq!(
+            membership_token.mesh_id,
+            crate::agent::remote::invite::mesh_id_for(
+                &mesh.peer_id().to_string(),
+                Some("named-mesh")
+            )
+        );
+        let SwarmResponse::Ask(Ok(bytes)) = ingress
+            .handle_v1(joiner, ask(actor.id(), &GetNodeInfo))
+            .await
+            .unwrap()
+        else {
+            panic!("admitted peer should discover the host even without a grant")
+        };
+        let info: crate::agent::remote::NodeInfo = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(info.node_id.as_peer_id(), mesh.peer_id());
+        assert!(info.capabilities.is_empty());
+        assert_eq!(info.active_sessions, None);
     }
 
     #[tokio::test]
@@ -1640,7 +1703,7 @@ mod node_manager_tests {
             .expect("get_node_info should succeed");
 
         assert!(!info.hostname.is_empty(), "hostname should not be empty");
-        assert_eq!(info.active_sessions, 0);
+        assert_eq!(info.active_sessions, Some(0));
         assert!(!info.capabilities.is_empty());
     }
 
@@ -1656,7 +1719,7 @@ mod node_manager_tests {
         }
 
         let info = nm_ref.ask(GetNodeInfo).await.expect("info");
-        assert_eq!(info.active_sessions, 2);
+        assert_eq!(info.active_sessions, Some(2));
     }
 
     #[tokio::test]
