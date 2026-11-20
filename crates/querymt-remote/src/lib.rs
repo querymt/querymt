@@ -23,6 +23,7 @@ pub mod mesh_runtime_support;
 pub mod mesh_state;
 pub mod names;
 pub mod node_id;
+pub mod peer_access;
 pub mod provider_backend;
 pub mod provider_backend_helpers;
 pub mod provider_catalog;

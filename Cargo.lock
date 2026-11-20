@@ -12284,6 +12284,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "querymt",
  "querymt-agent-core",
+ "querymt-remote",
  "querymt-workspace-hack",
  "rusqlite",
  "serde_json",

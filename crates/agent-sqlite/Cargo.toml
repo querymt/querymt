@@ -12,10 +12,12 @@ path = "src/lib.rs"
 [features]
 # `TestStorage` and `sqlite_conn_with_schema` for tests in the layers above (design D6).
 test-support = ["dep:tempfile", "querymt-agent-core/test-support"]
+mesh-access = ["dep:querymt-remote"]
 
 [dependencies]
 querymt = { path = "../querymt", default-features = false }
 querymt-agent-core = { path = "../agent-core" }
+querymt-remote = { path = "../querymt-remote", default-features = false, optional = true }
 async-trait.workspace = true
 log.workspace = true
 parking_lot = "0.13"
