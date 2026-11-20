@@ -26,7 +26,7 @@ use clap::Parser;
 use futures::StreamExt;
 use qmt_llama_cpp::{LlamaCppConfig, create_provider};
 use querymt::chat::{ChatCall, ChatMessage};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(about = "Vision chat with llama.cpp multimodal models")]
@@ -99,42 +99,7 @@ async fn run(
         n_ctx: Some(args.n_ctx),
         n_gpu_layers: Some(args.n_gpu_layers),
         max_tokens: Some(args.max_tokens),
-        temperature: None,
-        top_p: None,
-        min_p: None,
-        top_k: None,
-        repeat_penalty: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        penalty_last_n: None,
-        system: vec![],
-        n_batch: None,
-        n_threads: None,
-        n_threads_batch: None,
-        seed: None,
-        chat_template: None,
-        use_chat_template: None,
-        add_bos: None,
-        log: None,
-        enable_thinking: None,
-        reasoning_effort: None,
-        preserve_reasoning: None,
-        thinking_budget: None,
-        flash_attention: None,
-        kv_cache_type_k: None,
-        kv_cache_type_v: None,
-        mmproj_threads: None,
-        mmproj_use_gpu: None,
-        n_ubatch: None,
-        text_only: None,
-        speculative: None,
-        backend_sampling: None,
-        json_schema: None,
-        grammar_backend: None,
-        devices: None,
-        tensor_split: None,
-        split_mode: None,
-        main_gpu: None,
+        ..Default::default()
     };
 
     println!("Loading model: {}", args.model);
@@ -187,7 +152,7 @@ async fn run(
     Ok(())
 }
 
-fn detect_mime(path: &PathBuf) -> Result<String, Box<dyn std::error::Error>> {
+fn detect_mime(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())

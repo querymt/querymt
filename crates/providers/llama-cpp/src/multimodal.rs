@@ -20,6 +20,14 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
+/// Optional multimodal inputs for one generation call: the context plus the
+/// bitmaps that its media markers refer to.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MediaInputs<'a> {
+    pub(crate) ctx: Option<&'a MultimodalContext>,
+    pub(crate) bitmaps: &'a [MtmdBitmap],
+}
+
 /// Wrapper around MtmdContext with provider-specific utilities.
 pub(crate) struct MultimodalContext {
     ctx: Mutex<MtmdContext>,
@@ -172,7 +180,7 @@ impl MultimodalContext {
             .mmproj_use_gpu
             // When n_gpu_layers is None the model backend defaults to full GPU offload
             // (e.g. Metal on Apple Silicon), so the mmproj should follow suit.
-            .unwrap_or_else(|| cfg.n_gpu_layers.map_or(true, |n| n > 0));
+            .unwrap_or_else(|| cfg.n_gpu_layers.is_none_or(|n| n > 0));
 
         let params = MtmdContextParams {
             use_gpu,
@@ -528,47 +536,7 @@ mod tests {
 
         let cfg = LlamaCppConfig {
             model: "test.gguf".to_string(),
-            system: vec![],
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            min_p: None,
-            top_k: None,
-            repeat_penalty: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            penalty_last_n: None,
-            n_ctx: None,
-            n_batch: None,
-            n_threads: None,
-            n_threads_batch: None,
-            n_gpu_layers: None,
-            seed: None,
-            chat_template: None,
-            use_chat_template: None,
-            add_bos: None,
-            log: None,
-            enable_thinking: None,
-            reasoning_effort: None,
-            preserve_reasoning: None,
-            thinking_budget: None,
-            flash_attention: None,
-            kv_cache_type_k: None,
-            kv_cache_type_v: None,
-            mmproj_path: None,
-            media_marker: None,
-            mmproj_threads: None,
-            mmproj_use_gpu: None,
-            n_ubatch: None,
-            text_only: None,
-            speculative: None,
-            backend_sampling: None,
-            json_schema: None,
-            grammar_backend: None,
-            devices: None,
-            tensor_split: None,
-            split_mode: None,
-            main_gpu: None,
+            ..Default::default()
         };
 
         // Case: multiple top-level images + tool result with nested images

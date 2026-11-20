@@ -9,9 +9,22 @@
   their separate repositories, follow the workspace version, and are built for
   every platform and attached to stable and nightly releases. The qmacp agent
   skill moved to `skills/qmacp`.
+- **llama-cpp: LoRA adapters.** New provider option `lora`, a list with one
+  GGUF adapter (`path`: local file or Hugging Face `<repo>:<selector>`,
+  `scale`: finite float, default `1.0`, `0` disables). The adapter is loaded
+  with the base model and applied to chat, streaming, completion, tool-call,
+  multimodal and speculative (target) generation. Changing the adapter path
+  reloads the model; changing only the scale does not. New exports
+  `LoraAdapterConfig`, `LoraScale` and `LoraScaleError`.
 
 ### Behavior changes
 
+- **BREAKING (Rust API, llama-cpp):** `qmt_llama_cpp::LlamaCppConfig` has a new
+  public field `lora: Vec<LoraAdapterConfig>`. Struct literals must add
+  `lora: Vec::new()`, or better `..LlamaCppConfig::new(model)` /
+  `..Default::default()`: `LlamaCppConfig` now implements `Default` and has
+  `LlamaCppConfig::new(model)`, so later new options won't break callers again.
+  Config files are unaffected.
 - **Subagents API (Rust, Python, hooks, ACP):** `Agent::builder()`,
   `AgentBuilder::subagent`, `Agent::add_subagent` / `remove_subagent` /
   `subagents` / `has_subagents` / `on_subagents_changed` /

@@ -250,9 +250,9 @@ fn render_template(
         reasoning_scale,
         reasoning_effort
     );
-    let add_generation_prompt = messages.last().map_or(true, |msg| {
-        msg.role == querymt::chat::ChatRole::User || msg.has_tool_result()
-    });
+    let add_generation_prompt = messages
+        .last()
+        .is_none_or(|msg| msg.role == querymt::chat::ChatRole::User || msg.has_tool_result());
     let context = ChatTemplateContext {
         messages: messages_value,
         tools: tools_value,

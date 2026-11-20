@@ -142,13 +142,12 @@ fn extract_reasoning_blocks(
     let mut reasoning = String::new();
     let mut in_thinking = starts_in_thinking;
 
-    if starts_in_thinking {
-        if let ReasoningFormat::GemmaChannel {
+    if starts_in_thinking
+        && let ReasoningFormat::GemmaChannel {
             implicit_leading_reasoning_prefix: true,
         } = reasoning_format
-        {
-            rest = rest.strip_prefix("thought\n").unwrap_or(rest);
-        }
+    {
+        rest = rest.strip_prefix("thought\n").unwrap_or(rest);
     }
 
     while !rest.is_empty() {
@@ -1096,7 +1095,9 @@ mod tests {
     #[test]
     fn builds_qwen3_tool_grammar() {
         let tool = sample_tool();
-        let grammar = ToolFormat::Qwen3.grammar(&[tool.clone()]).unwrap();
+        let grammar = ToolFormat::Qwen3
+            .grammar(std::slice::from_ref(&tool))
+            .unwrap();
         assert!(grammar.lazy);
         assert!(grammar.grammar.contains("<tool_call>"));
         assert!(grammar.grammar.contains(r#"\"glob\""#));
@@ -1110,7 +1111,7 @@ mod tests {
             (ToolFormat::FunctionGemma, "<start_function_call>"),
             (ToolFormat::Gemma4, "<|tool_call>"),
         ] {
-            let grammar = format.grammar(&[tool.clone()]).unwrap();
+            let grammar = format.grammar(std::slice::from_ref(&tool)).unwrap();
             assert!(grammar.lazy);
             assert_eq!(grammar.triggers[0].value, trigger);
         }
