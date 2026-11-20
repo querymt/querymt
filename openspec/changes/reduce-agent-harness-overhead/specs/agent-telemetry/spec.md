@@ -41,7 +41,7 @@ The spans `middleware.driver`, `middleware.phase`, `agent.execution.middleware.t
 - **THEN** the model request span, the `execute_tool shell` span and the `agent.tool.invoke` span are exported with the same names and attributes as before
 
 ### Requirement: Model request spans report their attempts
-Every exported model request span SHALL carry the integer attribute `gen_ai.request.attempt`, holding the number of attempts made for that request, and one span event of the same name per attempt, in order. Retries after provider-reported failures, transport failures and broken streams SHALL count as attempts. The event of a failed attempt SHALL carry the failure message. A reply re-requested with a higher output cap SHALL be a new request with its own span.
+Every exported model request span SHALL carry the integer attribute `gen_ai.request.attempt`, holding the number of attempts made for that request, and one span event of the same name per attempt, in order. Retries after provider-reported failures, transport failures and broken streams SHALL count as attempts. The event of a failed attempt SHALL carry the failure's `error.type` and SHALL NOT carry the failure message, which can contain endpoints or credentials. An attempt that is cancelled SHALL add no event. A reply re-requested with a higher output cap SHALL be a new request with its own span.
 
 #### Scenario: Request without a retry
 - **WHEN** a model request succeeds on its first attempt
@@ -50,7 +50,7 @@ Every exported model request span SHALL carry the integer attribute `gen_ai.requ
 #### Scenario: Retry after an overloaded error
 - **WHEN** a model request fails with an overloaded error and succeeds when retried
 - **THEN** its span carries `gen_ai.request.attempt = 2` and two `gen_ai.request.attempt` events
-- **AND** the first event carries the overloaded error message
+- **AND** the first event carries the failure's `error.type` and no error message
 
 #### Scenario: Stream recreated after a break
 - **WHEN** a streaming response breaks and the request is sent again and succeeds

@@ -101,7 +101,7 @@ impl Tool for GetFunctionTool {
 
         let mut file_results = Vec::new();
         for path_str in &path_strs {
-            let target = resolve_target(path_str, &root);
+            let target = resolve_target("path", path_str, &root)?;
             let content = tokio::fs::read_to_string(&target)
                 .await
                 .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {e}")))?;

@@ -69,8 +69,13 @@ async fn plain_file_and_inline_sections_receive_runtime_cache_defaults() {
         .await
         .unwrap();
     let mut config = serde_json::json!({"system": resolved, "api_mode": "responses"});
-    querymt_agent_services::model_heuristics::ModelDefaults::for_model("openai", "gpt-5.6", None)
-        .apply_to(&mut config, "session");
+    // What `qmt-openai` declares for Responses on a model with breakpoints.
+    let declaration = querymt::chat::PromptCacheCapabilities::BREAKPOINTS.with_max_ttl_secs(1800);
+    querymt_agent_services::model_heuristics::apply_system_cache_defaults(
+        &mut config,
+        &declaration,
+        0,
+    );
     assert_eq!(config["system"][0]["text"], "stable instructions");
     assert_eq!(
         config["system"][0]["cache"],
@@ -194,6 +199,97 @@ fn invalid_run_objective_setting_is_rejected_naming_the_key() {
     .unwrap_err()
     .to_string();
     assert!(err.contains("run_objective"), "{err}");
+}
+
+#[test]
+fn prompt_cache_settings_default_when_omitted() {
+    let omitted = parse_agent("");
+    assert_eq!(omitted.execution.prompt_cache.ttl_secs, 0);
+    assert_eq!(
+        RuntimeExecutionPolicy::from(&omitted.execution)
+            .prompt_cache
+            .ttl_secs,
+        0
+    );
+
+    // An empty table and an explicit value both load.
+    let empty = parse_agent("[agent.execution.prompt_cache]");
+    assert_eq!(empty.execution.prompt_cache.ttl_secs, 0);
+    let set = parse_agent("[agent.execution.prompt_cache]\nttl_secs = 3600");
+    assert_eq!(
+        RuntimeExecutionPolicy::from(&set.execution)
+            .prompt_cache
+            .ttl_secs,
+        3600
+    );
+    let boundary = parse_agent("[agent.execution.prompt_cache]\nttl_secs = 86400");
+    assert_eq!(boundary.execution.prompt_cache.ttl_secs, 86_400);
+}
+
+#[test]
+fn out_of_range_prompt_cache_lifetime_is_rejected_naming_the_key() {
+    for value in ["100000", "-1", "\"1h\"", "1.5"] {
+        let err = toml::from_str::<AgentSettings>(&format!(
+            "provider = \"p\"\nmodel = \"m\"\n[execution.prompt_cache]\nttl_secs = {value}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ttl_secs"), "{value}: {err}");
+    }
+}
+
+#[test]
+fn unknown_prompt_cache_key_is_rejected_naming_the_key() {
+    let err = toml::from_str::<AgentSettings>(
+        "provider = \"p\"\nmodel = \"m\"\n[execution.prompt_cache]\nkeep_alive = true",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("keep_alive"), "{err}");
+}
+
+#[test]
+fn prompt_cache_schema_bounds_the_lifetime() {
+    let schema = serde_json::to_value(schemars::schema_for!(
+        querymt_agent_core::config::execution::PromptCacheConfig
+    ))
+    .unwrap();
+    let ttl = &schema["properties"]["ttl_secs"];
+    assert_eq!(ttl["minimum"], 0, "{schema}");
+    assert_eq!(ttl["maximum"], 86_400, "{schema}");
+}
+
+#[test]
+fn transport_wait_defaults_when_omitted_and_is_configurable() {
+    let omitted = parse_agent("");
+    assert_eq!(omitted.execution.rate_limit.transport_wait_secs, 10);
+    assert_eq!(
+        RuntimeExecutionPolicy::from(&omitted.execution)
+            .rate_limit
+            .transport_wait_secs,
+        10
+    );
+
+    let set = parse_agent("[agent.execution.rate_limit]\ntransport_wait_secs = 30");
+    assert_eq!(set.execution.rate_limit.transport_wait_secs, 30);
+    assert_eq!(
+        RuntimeExecutionPolicy::from(&set.execution)
+            .rate_limit
+            .transport_wait_secs,
+        30
+    );
+}
+
+#[test]
+fn out_of_range_transport_wait_is_rejected_naming_the_key() {
+    for value in ["900", "301", "-1", "\"soon\""] {
+        let err = toml::from_str::<AgentSettings>(&format!(
+            "provider = \"p\"\nmodel = \"m\"\n[execution.rate_limit]\ntransport_wait_secs = {value}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("transport_wait_secs"), "{value}: {err}");
+    }
 }
 
 #[test]

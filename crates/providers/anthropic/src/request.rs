@@ -4,6 +4,7 @@ use crate::auth::{oauth_billing_header, oauth_text_block};
 use crate::cache_breakpoints::{MAX_CACHE_BREAKPOINTS, normalize_cache_breakpoints};
 use crate::config::Anthropic;
 use crate::model::ThinkingClass;
+use crate::tool_changes::{INLINE_TOOLS_BETA, StrictInUse, has_tool_change, place_tool_changes};
 use crate::wire::request::{
     AnthropicCompleteRequest, AnthropicMessage, ImageSource, MessageContent, ToolResultContent,
 };
@@ -128,11 +129,28 @@ impl Anthropic {
         if self.resolved_key().is_empty() {
             return Err(LLMError::AuthError("Missing Anthropic API key".to_string()));
         }
-        self.declared_tool_names(tools)?;
+        self.request_tool_names(tools, messages)?;
+        self.check_tool_changes(messages)?;
+        let tool_changes = has_tool_change(messages);
+
+        let maybe_tool_slice: Option<&[Tool]> = tools.or(self.tools.as_deref());
+        let anthropic_tools = maybe_tool_slice.map(|slice| self.build_tools(slice));
+        // The strict tools in effect: tools added by a tool change count
+        // against the same request-wide strict limits, tools it removes or
+        // redefines no longer do.
+        let mut reserved_strict: StrictInUse = anthropic_tools
+            .iter()
+            .flatten()
+            .filter(|tool| tool.strict == Some(true))
+            .map(|tool| (tool.name.clone(), tool.schema.as_ref().clone()))
+            .collect();
 
         let mut anthropic_messages: Vec<AnthropicMessage> = messages
             .iter()
-            .map(|m| {
+            .map(|m| -> Result<AnthropicMessage, LLMError> {
+                if m.has_tool_change() {
+                    return self.tool_change_entry(m, &mut reserved_strict);
+                }
                 let mut content: Vec<MessageContent> = Vec::new();
 
                 // Replay generated reasoning and function calls from structured
@@ -244,6 +262,9 @@ impl Anthropic {
                                 content.push(block);
                             }
                         }
+                        // Handled above: a message with a tool change is
+                        // sent as its own `system` entry.
+                        ChatInputPart::ToolChange(_) => {}
                         ChatInputPart::ToolResult(result) => {
                             // Anthropic supports multi-content tool results natively:
                             // { type: "tool_result", tool_use_id, content: [text, image, ...] }
@@ -274,18 +295,16 @@ impl Anthropic {
                     *slot = Some(cache_control_from_hint(cache_hint));
                 }
 
-                AnthropicMessage {
+                Ok(AnthropicMessage {
                     role: match m.role {
                         ChatRole::User => "user",
                         ChatRole::Assistant => "assistant",
                     },
                     content,
-                }
+                })
             })
-            .collect();
-
-        let maybe_tool_slice: Option<&[Tool]> = tools.or(self.tools.as_deref());
-        let anthropic_tools = maybe_tool_slice.map(|slice| self.build_tools(slice));
+            .collect::<Result<_, _>>()?;
+        anthropic_messages = place_tool_changes(anthropic_messages)?;
 
         let tool_choice = match self.tool_choice {
             Some(ToolChoice::Auto) => {
@@ -401,7 +420,12 @@ impl Anthropic {
             .uri(url.as_str())
             .header(CONTENT_TYPE, "application/json");
 
-        let builder = self.add_auth_headers(builder);
+        let betas: &[&str] = if tool_changes {
+            &[INLINE_TOOLS_BETA]
+        } else {
+            &[]
+        };
+        let builder = self.add_auth_headers(builder, betas);
 
         Ok(builder.body(json_req)?)
     }

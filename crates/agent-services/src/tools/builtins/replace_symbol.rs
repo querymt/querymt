@@ -207,7 +207,7 @@ impl Tool for ReplaceSymbolTool {
             let mut resolved: Vec<ResolvedReplacement> = Vec::new();
 
             for req in &requests {
-                let target = resolve_target(&req.path, &root);
+                let target = resolve_target("path", &req.path, &root)?;
 
                 // Read file if not already loaded
                 let content = match file_contents.get(&target) {

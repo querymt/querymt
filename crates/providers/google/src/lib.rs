@@ -942,6 +942,8 @@ impl HTTPChatProvider for Google {
                             google_parts.push(GoogleContentPart::text(text.clone()));
                         }
                     }
+                    // Tool changes are rejected by the host adapter (no `tool_updates`).
+                    ChatInputPart::ToolChange(_) => {}
                     ChatInputPart::Attachment(media) => match media.source() {
                         MediaSource::Inline { data } => {
                             if let Some(media_type) = media.media_type() {

@@ -6,8 +6,7 @@ Session logs and trace spans for 2026-11-05 to 2026-11-19 (373 sessions, 19.2k m
 
 - **Prompt cache.** The newest cache breakpoint is never read back. When the first request of a turn is a full cache write, the second is a full write again in 441 of 542 turns (58.2M tokens, 19% of all cache writes), and in steady state 51.2M tokens are written for 28.1M tokens of context growth. Request-scoped context (the run objective) is merged into, or placed before, the newest history message, so that message differs on the next request. Five kinds of harness notice (stop-hook continuations, the task-completion reminder, two duplicate warnings, the parallel-edit note) are added in memory and never stored, so they are missing when the next turn reloads history; this is read from the call sites and not yet shown by a test.
 - **Run objective.** In the 14 days to 2026-11-20 (18.9k requests, 1,330 runs) the run objective was the prompt again plus one fixed sentence in over 90% of runs, about 150 tokens per request. Nothing measures whether it changes behaviour.
-- **Blocking waits.** `shell` has no time limit and no background mode. 270 calls ran 5 minutes or longer (up to 13.4 h), mostly `sleep N; check` and `ssh … nohup` commands. 311 requests then rewrote the whole context (66.8M tokens) because the 5-minute cache lifetime had passed while a tool was running.
-- **Shell ergonomics.** 2,048 of 2,115 cargo invocations are piped through `tail`/`head`/`grep`, because truncation keeps only the head of the output. That hides the command's exit status and forces re-runs. About 4,000 commands are plain `grep`/`sed`/`cat`/`ls`.
+- **Shell calls.** A call returns only when every holder of its output pipes has exited, not when the command exits, so a command that leaves a detached process behind blocks until that process dies. 39 `shell` starts have no end event, 27 of them followed by a cancellation.
 - **Harness overhead.** 1.81M of 3.04M exported spans are sub-millisecond actor dispatch spans, and another 0.44M are per-step bookkeeping spans; together 74% of the export. Clients poll `runtimeState` (173k calls), `session/list` (41.8k, 289 ms average) and `getLifecycle` (31k). Two provider plugins whose files are missing are loaded again on every model listing and authentication status read (444 and 415 attempts, up to 111 in one process), and the failed attempts are exported as successful spans.
 - **Journal volume.** 46.8k `progress_recorded` events (18% of journal rows, 28 MB) repeat data that is already in other events.
 
@@ -22,28 +21,23 @@ The groups are independent and can land separately, in the order below.
 - The run objective is not sent by default. New key `[agent.execution] run_objective` (boolean, default `false`) sends it again, after the last durable message. **BREAKING** (behaviour): requests no longer carry the objective unless the key is set.
 - The only other request-scoped text is `additional_context` from `context` hooks, sent after the last durable message. **BREAKING** (hooks): `context` hooks receive durable history only.
 - Tool definitions are sent in name order, so the same tools give the same request after a restart or an MCP refresh (35 of 38 tool-list changes in the 14 days were order only).
-- Providers declare prompt-cache support (explicit breakpoints, selectable lifetimes) in their chat capabilities. Default system hints follow that declaration instead of a provider-name list. **BREAKING** (provider plugins): a plugin built before this change declares nothing and gets no default system hints until rebuilt.
-- New config `[agent.execution.prompt_cache] ttl_secs` and `background_ttl_secs`, mapped to the nearest lifetime the provider declares.
+- Providers declare prompt-cache support (explicit breakpoints, longest selectable lifetime) in their chat capabilities. Default system hints follow that declaration instead of a provider-name list. **BREAKING** (provider plugins): a plugin built before this change declares nothing and gets no default system hints until rebuilt.
+- New config `[agent.execution.prompt_cache] ttl_secs`, requested by default hints, capped at the longest lifetime the provider declares; the provider rounds it to one it supports.
 - Every model request records why its cache prefix changed (`prefix_change`) and how long the session was idle (`idle_secs`), in the request-end event and the trace span.
 
-**B. Background commands**
+**B. Background commands (moved out)**
 
-- `shell` accepts `background` and `wake_on_exit`. New tools `job_wait` and `job_kill`.
-- A foreground command that runs longer than `[agent.execution.shell] foreground_limit_secs` (default 240) is moved to the background instead of blocking. **BREAKING** (tools): a `shell` call no longer blocks indefinitely.
-- When a background command exits, the session is told: before the next model request if a run is active, or by starting a run if the session is idle.
-- New durable events `background_command_started` and `background_command_exited`; runtime state lists running commands.
+- Moved to a separate change, `add-background-commands`. See Non-goals.
 
 **C. Shell execution**
 
 - A call returns when its command exits, even if detached descendants keep its output open.
-- Truncated output keeps the beginning and the end. **BREAKING** (tools): today only the beginning is kept.
 - A cancelled call always gets an end event (27 cancelled calls in the window have none).
-- Commands receive `QMT_SESSION_ID`, so external scripts can call back with `qmacp`.
-- A one-line hint names the dedicated tool when a command is only a file read, search or listing (`[agent.execution.shell] dedicated_tool_hints`, default on).
+- What a `shell` result contains and how large output is cut stay as they are. See Non-goals.
 
 **D. Retries and output cap**
 
-- Transport failures (timeout, connect failure, broken stream) retry after `[agent.execution.rate_limit] transport_wait_secs` (default 2) instead of `default_wait_secs` (60).
+- Transport failures (timeout, connect failure, broken stream) retry after `[agent.execution.rate_limit] transport_wait_secs` (default 10) instead of `default_wait_secs` (60).
 - At reasoning effort `high` or `max` the initial output cap is `min(64000, model output limit)`. 15 of the 16 escalations in the window were at those efforts and each discarded a complete reply; every retried reply then fit within 64,000 tokens.
 
 **E. Tool errors and arguments**
@@ -78,6 +72,8 @@ The groups are independent and can land separately, in the order below.
 
 ## Non-goals
 
+- **Background commands and a limit on blocking `shell` calls.** `shell` keeps running without a time limit: 270 calls ran 5 minutes or longer (up to 13.4 h), mostly `sleep N; check` and `ssh … nohup` commands, and 311 requests rewrote the whole context (66.8M tokens) because the 5-minute cache lifetime had passed while a tool was running. An earlier revision of this change added background commands, a 240-second foreground limit, `job_wait` and `job_kill`, exit notices and wake-up runs. They moved to a separate change, `add-background-commands`, together with `QMT_SESSION_ID`, the dedicated-tool hints and `background_ttl_secs`. Design "Deferred to `add-background-commands`" says why, and what that change has to settle first.
+- **Changing `shell` output.** The shared truncation step keeps only the head of a tool result, so an oversized `shell` result loses the end of its output and `stderr` and is no longer valid JSON. An earlier revision kept both ends and wrote the complete output to a file; it was dropped because it changes what the tool returns, and how much output to keep is already the model's choice (2,048 of 2,115 cargo invocations are piped through `tail`/`head`/`grep`).
 - **Batched image removal.** No code removes images from requests, and tool-result pruning already runs once per turn above a threshold.
 - **Removing the run objective code.** The bookkeeping and its events stay; only sending it is switched off.
 
@@ -95,8 +91,7 @@ The groups are independent and can land separately, in the order below.
 
 ### New Capabilities
 
-- `background-commands`: starting, waiting for, stopping and being notified about shell commands that outlive a tool call.
-- `shell-command-execution`: how a `shell` call completes, truncates output, reports cancellation and steers toward dedicated tools.
+- `shell-command-execution`: when a `shell` call completes and how its cancellation is reported.
 - `llm-request-retries`: how long the agent waits before retrying a failed model request.
 - `provider-plugin-loading`: when the agent attempts to load a provider plugin again after a failed attempt.
 - `session-journal-content`: which session activity is stored in the journal and which is live-only or not recorded.
@@ -117,9 +112,9 @@ The groups are independent and can land separately, in the order below.
 
 - `querymt`: chat capabilities gain a prompt-cache declaration and a tool-update declaration, and chat messages gain a tool-change kind that crosses the Extism boundary (public Rust API, additive); the plugin registry remembers failed loads (features `extism_host`, `tracing`); this also applies to `querymt-cli` and `querymt-py`, which use the same registry.
 - `qmt-anthropic`, `qmt-openai`, `qmt-codex`: declare prompt-cache support (features `native` and `extism`). `qmt-anthropic` also sends tool-change markers.
-- `querymt-agent-core`: new events, new `llm_request_end` fields, new config tables and key, new stored message part kinds for notices and tool changes.
-- `querymt-agent-services`: `shell`, `job_wait`, `job_kill`, path resolution, system cache defaults, output truncation.
-- `querymt-agent-runtime`: request assembly, stored notices, mode reminders, hints, context hooks, tool order, waits, retries, output cap, tool dispatch errors, ACP notifications, session listing spans, remote lifecycle requests (feature `remote`).
+- `querymt-agent-core`: new `llm_request_end` fields, a new config table and keys, new stored message part kinds for notices and tool changes.
+- `querymt-agent-services`: `shell` completion, path resolution, system cache defaults.
+- `querymt-agent-runtime`: request assembly, stored notices, mode reminders, hints, context hooks, tool order, retries, output cap, tool dispatch errors, ACP notifications, session listing spans, remote lifecycle requests (feature `remote`).
 - `querymt-agent-sqlite`: the lifecycle update reports whether anything changed.
 - `querymt-agent-index`: one span moves to debug level.
 - `querymt-utils`: default trace filter.
@@ -127,16 +122,15 @@ The groups are independent and can land separately, in the order below.
 
 **Contracts**
 
-- Config: new tables `[agent.execution.prompt_cache]` and `[agent.execution.shell]`; new keys `[agent.execution] run_objective` and `[agent.execution.rate_limit] transport_wait_secs`.
+- Config: new table `[agent.execution.prompt_cache]`; new keys `[agent.execution] run_objective` and `[agent.execution.rate_limit] transport_wait_secs`.
 - Extism plugin contract: the capabilities JSON gains an optional field. No contract version bump is planned; an older plugin simply declares no cache support. This is the one compatibility decision to confirm in review.
-- typeshare / ACP: two new event kinds, two new fields on `llm_request_end`, a `background_commands` list in runtime state, two new notifications, and two new message part kinds in loaded history (notice, tool change).
+- typeshare / ACP: two new fields on `llm_request_end`, two new notifications, and two new message part kinds in loaded history (notice, tool change).
 - Session DB schema: no migration expected; parts are stored as JSON. A build from before this change may not load a session that contains the new part kinds (see design "Migration Plan").
 - Python bindings: no API change.
 
 **querymt-desktop follow-ups (not planned here)**
 
 - Replace polling of `runtimeState`, `models`, `delegateModels`, `getLifecycle` and `session/list` with the existing and new notifications.
-- Show running background commands and their exit.
 - Surface `prefix_change` (for example the cost of a model switch on a large session).
 - Render or hide the new notice and tool-change parts in loaded history.
 - Confirm nothing reads `progress_recorded` for tool calls or the journaled snapshot events.

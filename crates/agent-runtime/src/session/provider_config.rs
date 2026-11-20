@@ -118,7 +118,15 @@ pub(crate) async fn resolve_provider_config(
             let model_info = ModelDefaults::wants_model_info(provider_name, builder.value())
                 .then(|| querymt_agent_services::model_info::get_model_info(provider_name, model))
                 .flatten();
-            let defaults = ModelDefaults::for_model(provider_name, model, model_info.as_ref());
+            // The configured effort picks the starting output cap (`high` and
+            // `max` start higher), so it is read from the merged config before
+            // schema pruning can drop it.
+            let effort = builder
+                .value()
+                .get("reasoning_effort")
+                .and_then(|value| serde_json::from_value(value.clone()).ok());
+            let defaults = ModelDefaults::for_model(provider_name, model, model_info.as_ref())
+                .with_reasoning_effort(effort);
             // Resolve caps before applying defaults so an explicit `max_tokens`
             // is recognised as its own ceiling.
             output_caps = defaults.output_caps(builder.value());

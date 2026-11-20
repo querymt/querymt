@@ -37,6 +37,17 @@ This brief will replace the conversation history. Write it for the work that rem
 
 If needed output was cleared or truncated, name the `session_history` call_id or a narrow command to retrieve it. Do not invent observations."#;
 
+/// Whether a stored message holds only tool baseline / tool change records.
+fn is_tool_record_only(message: &AgentMessage) -> bool {
+    !message.parts.is_empty()
+        && message.parts.iter().all(|part| {
+            matches!(
+                part,
+                MessagePart::ToolBaseline { .. } | MessagePart::ToolChange { .. }
+            )
+        })
+}
+
 /// The compaction prompt, extended with the user's focus instructions when given.
 pub(crate) fn compaction_prompt(instructions: Option<&str>) -> String {
     match instructions.map(str::trim).filter(|s| !s.is_empty()) {
@@ -294,8 +305,12 @@ impl SessionCompaction {
         max_prompt_bytes: Option<usize>,
         instructions: Option<&str>,
     ) -> Result<Vec<querymt::chat::ChatMessage>> {
+        // The summary needs the conversation, not the tool definitions: tool
+        // baselines and tool changes are left out. The request carries no tool
+        // list, and a provider rejects such a record as a message.
         let mut chat_messages: Vec<querymt::chat::ChatMessage> = messages
             .iter()
+            .filter(|message| !is_tool_record_only(message))
             .map(|message| message.to_chat_message_with_max_prompt_bytes(max_prompt_bytes))
             .collect::<std::result::Result<_, _>>()?;
 
@@ -2131,6 +2146,47 @@ mod tests {
                 .text()
                 .contains("conversation")
         );
+    }
+
+    #[test]
+    fn compaction_request_leaves_out_tool_baselines_and_changes() {
+        let fixture = CompactionFixture::new();
+        let mut messages = MessageFixture::simple_conversation("s1");
+        let tool = querymt::chat::Tool {
+            tool_type: "function".into(),
+            function: querymt::chat::FunctionTool {
+                name: "deploy".into(),
+                description: "Deploy".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        };
+        let record = |part: MessagePart| {
+            let mut message = MessageFixture::user_message("r", "s1", "");
+            message.parts = vec![part];
+            message
+        };
+        messages.insert(
+            1,
+            record(MessagePart::ToolBaseline {
+                tools: vec![tool.clone()],
+                origin: "anthropic/claude-sonnet-5-5".into(),
+            }),
+        );
+        messages.push(record(MessagePart::ToolChange {
+            added: vec![tool],
+            removed: vec!["old".into()],
+        }));
+
+        let chat = fixture
+            .service
+            .build_compaction_messages(&messages, None)
+            .unwrap();
+
+        assert_eq!(chat.len(), messages.len() - 2 + 1, "records are left out");
+        assert!(!chat.iter().any(|m| m.has_tool_change()));
+        // A provider that rejects tool-change messages accepts the request.
+        querymt::chat::reject_tool_changes("acme", &chat).unwrap();
     }
 
     #[test]

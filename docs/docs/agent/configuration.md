@@ -157,8 +157,42 @@ backend = "git"           # "git" or "none"
 [agent.execution.rate_limit]
 max_retries = 3
 default_wait_secs = 60
+transport_wait_secs = 10  # 0..=300; base wait after a failure the provider never answered
 backoff_multiplier = 2.0
+
+# Prompt cache
+[agent.execution.prompt_cache]
+ttl_secs = 0              # 0..=86400; 0 keeps the provider's default cache lifetime
 ```
+
+`default_wait_secs` is the base wait before retrying a failure the provider
+answered (overloaded, rate limited, a 5xx status) when it supplied no delay of
+its own. A delay the provider does supply (`Retry-After`, `retry-after-ms`,
+`x-ratelimit-reset-requests`, or a delay named in the error message) is used
+instead, capped at `max_wait_secs`.
+
+`transport_wait_secs` is the base wait for failures where no answer arrived:
+connection refused or reset, DNS failure, a timeout, or a response stream that
+broke or could not be decoded. These carry no delay hint and are usually brief,
+so they do not wait the 60 seconds. With the defaults the retries wait about 10
+seconds and then about 20 (`backoff_multiplier`), and the attempts are counted
+against `max_retries` together with the other failures. `0` retries at once. A
+value outside `0..=300`, or one that is not an integer, fails the load with an
+error naming `transport_wait_secs`.
+
+`ttl_secs` is the cache lifetime that the agent's default cache hints (the
+first and last system section and the last two messages) request. It is capped
+at the longest lifetime the provider offers (3600 for Anthropic, 1800 for OpenAI
+Responses), and the provider rounds it up to one it supports (Anthropic: up to
+300 gives 5 minutes, more gives 1 hour; OpenAI Responses: 30 minutes). `0`, the
+default, requests no lifetime, so the provider's own default applies. A provider
+that offers no choice of lifetime ignores the setting. Hints you set yourself
+with `cache = { ephemeral = { ttl_seconds = ... } }` keep their own lifetime.
+Anthropic bills a 1-hour cache write at twice the input price against 1.25 times
+for 5 minutes, so a longer lifetime pays off only when you often pause for 5 to
+60 minutes. Use `qmt.cache.prefix_change` and `qmt.cache.idle_secs` to see how
+often that happens. A value outside `0..=86400`, one that is not an integer, or
+an unknown key in the table fails the load with an error naming the key.
 
 #### Snapshot scope and retention
 
@@ -444,6 +478,41 @@ tools = ["filesystem.read_file", "filesystem.write_file"]
 # Mix with built-in tools
 tools = ["read_tool", "filesystem.*", "shell"]
 ```
+
+### Tools that change during a session
+
+An MCP server can add, remove or redefine tools while a session runs (a
+`tools/list_changed` notification), and the offered tools can change in other
+ways, for example when a skill changes the `skill` tool's description. Editing
+the tool list at the head of a request invalidates the provider's prompt cache
+for the whole conversation, so the agent avoids that where the provider allows
+it:
+
+- A provider that can change tools inside the conversation declares
+  `tool_updates` in its chat capabilities. Today that is Anthropic, for the
+  models that accept it: Opus 4.8, 5 and 5.5, Sonnet 5.5, Haiku 5.5 and the
+  Fable 5 and Mythos 5 families. Sonnet 5, Haiku 4.5 and older models do not.
+  A provider plugin built before the declaration existed is treated as not
+  declaring it.
+- For such a provider the agent stores the offered tools in the session history
+  as a baseline before the first request, after a compaction and after a model
+  change. The baseline is the request's tool list and is never sent as a
+  message. When the tools offered now differ from the baseline plus the changes
+  stored after it, the agent stores one change (the definitions added or
+  redefined, and the names removed) after the tool results and sends it as a
+  message in the conversation. The tool list at the head of the request stays
+  the same, so the cached prefix is still read and the request records
+  `prefix_change = "none"`.
+- Every other provider gets the tools offered now as the request's tool list, as
+  before, and nothing is stored. A change then costs one cache rewrite and the
+  request records `prefix_change = "tools"`. Baselines and changes stored under
+  an earlier model stay in the history and are left out of requests to such a
+  provider.
+
+Tools are always sent ordered by name, so a restart or an MCP refresh that
+reports the same tools does not change the request. Tool changes follow the
+tool results of the step they were found in and are never placed between a tool
+call and its result.
 
 ## Middleware Configuration
 

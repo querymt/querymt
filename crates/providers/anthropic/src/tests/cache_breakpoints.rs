@@ -12,6 +12,20 @@ fn hint() -> CacheHint {
     CacheHint::Ephemeral { ttl_seconds: None }
 }
 
+#[test]
+fn anthropic_declares_breakpoints_and_both_lifetimes_for_every_model() {
+    use querymt::chat::http::HTTPChatProvider;
+    for model in [
+        "claude-sonnet-5-5",
+        "claude-haiku-4-5",
+        "claude-3-7-sonnet-20250219",
+    ] {
+        let cache = anthropic_for(model, None, 4096).capabilities().prompt_cache;
+        assert!(cache.explicit_breakpoints, "{model}");
+        assert_eq!(cache.max_ttl_secs, Some(3600), "{model}");
+    }
+}
+
 fn hinted_user(text: &str) -> ChatMessage {
     ChatMessage::user().text(text).cache(hint()).build()
 }

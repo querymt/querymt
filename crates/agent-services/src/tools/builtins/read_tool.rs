@@ -104,7 +104,7 @@ impl ToolTrait for ReadTool {
         let root = args
             .get("root")
             .and_then(Value::as_str)
-            .map(|s| context.resolve_path(s))
+            .map(|s| context.resolve_path_arg("root", s))
             .transpose()?
             .or_else(|| context.cwd().map(|p| p.to_path_buf()))
             .ok_or_else(|| ToolError::InvalidRequest("No working directory available".into()))?;
@@ -119,7 +119,7 @@ impl ToolTrait for ReadTool {
             return Err(ToolError::InvalidRequest("limit must be >= 1".to_string()));
         }
 
-        let path = context.resolve_path(path)?;
+        let path = context.resolve_path_arg("path", path)?;
         let target = if path.is_absolute() {
             path
         } else {

@@ -176,7 +176,7 @@ impl Tool for MultiEditTool {
             }
         }
 
-        let file_path = context.resolve_path(file_path_str)?;
+        let file_path = context.resolve_path_arg("file_path", file_path_str)?;
 
         // Mutating phase runs under the checkout mutation gate when the
         // session has one (see `run_under_mutation_gate`).

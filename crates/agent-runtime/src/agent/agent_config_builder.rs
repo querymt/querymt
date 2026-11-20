@@ -534,6 +534,8 @@ impl AgentConfigBuilder {
 
     /// Sets the full execution policy at once (tool output, pruning, compaction, rate limit).
     pub fn with_execution_policy(mut self, policy: RuntimeExecutionPolicy) -> Self {
+        self.provider
+            .set_cache_ttl_secs(policy.prompt_cache.ttl_secs);
         self.execution_policy = policy;
         self
     }
@@ -707,6 +709,20 @@ mod tests {
     async fn default_mode_is_build() {
         let (builder, _td) = make_builder().await;
         assert_eq!(builder.default_mode_value(), AgentMode::Build);
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_lifetime_reaches_the_session_provider() {
+        let (builder, _td) = make_builder().await;
+        assert_eq!(builder.provider.cache_ttl_secs(), 0);
+
+        let mut policy = RuntimeExecutionPolicy::default();
+        policy.prompt_cache.ttl_secs = 3600;
+        let builder = builder.with_execution_policy(policy);
+
+        assert_eq!(builder.provider.cache_ttl_secs(), 3600);
+        // Clones of the provider (one per session) see the same setting.
+        assert_eq!(builder.provider.as_ref().clone().cache_ttl_secs(), 3600);
     }
 
     #[tokio::test]

@@ -43,7 +43,8 @@ pub(crate) fn apply_message_to_request(
 
     for part in &parts {
         match part {
-            ChatInputPart::Text { .. } => {}
+            // Tool changes are rejected before a request is built.
+            ChatInputPart::Text { .. } | ChatInputPart::ToolChange(_) => {}
             ChatInputPart::Attachment(media) => match (&media.kind, media.source()) {
                 (MediaKind::Image, MediaSource::Inline { data }) => {
                     let image = load_from_memory(data).map_err(|e| {

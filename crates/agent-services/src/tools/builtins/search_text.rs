@@ -518,7 +518,7 @@ impl ToolTrait for SearchTextTool {
         let root = args
             .get("path")
             .and_then(Value::as_str)
-            .map(|s| context.resolve_path(s))
+            .map(|s| context.resolve_path_arg("path", s))
             .transpose()?
             .or_else(|| context.cwd().map(|p| p.to_path_buf()))
             .ok_or_else(|| ToolError::InvalidRequest("No working directory available".into()))?;

@@ -52,11 +52,11 @@ Retries after transport failures and retries after provider-reported failures SH
 - **THEN** the request fails without a retry wait
 
 ### Requirement: The transport wait setting is validated
-`[agent.execution.rate_limit]` SHALL accept `transport_wait_secs` (integer seconds, 0 to 300, default 2). A value outside the range or of the wrong type SHALL be a load error naming `transport_wait_secs`.
+`[agent.execution.rate_limit]` SHALL accept `transport_wait_secs` (integer seconds, 0 to 300, default 10). A value outside the range or of the wrong type SHALL be a load error naming `transport_wait_secs`.
 
 #### Scenario: Transport wait defaults when omitted
 - **WHEN** a configuration does not set `transport_wait_secs`
-- **THEN** it loads with `transport_wait_secs = 2`
+- **THEN** it loads with `transport_wait_secs = 10`
 
 #### Scenario: Out-of-range transport wait is rejected
 - **WHEN** `[agent.execution.rate_limit]` sets `transport_wait_secs = 900` or `transport_wait_secs = -1`

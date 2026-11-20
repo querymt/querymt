@@ -261,6 +261,11 @@ For a provider that declares `tool_updates`, the agent SHALL store the offered t
 - **WHEN** the user switches to another model whose provider declares `tool_updates`
 - **THEN** the first request to that model carries the tools offered now as its tool list
 
+#### Scenario: Switching to a model without support and back
+- **WHEN** the user switches from a model that declares `tool_updates` to one that does not, and back to the first model
+- **THEN** the requests to the first model again carry the most recent stored baseline for it and the tool changes stored after it
+- **AND** a new baseline is stored only when the stored one was built for another provider or model
+
 #### Scenario: Tool list survives a restart
 - **WHEN** a session with one stored tool-change message is loaded by a new agent process
 - **THEN** its next request carries the same tool list and the same tool-change message as its last request before the restart
@@ -297,11 +302,29 @@ A tool-change message stored before the most recent baseline SHALL NOT be sent i
 - **THEN** the requests to that model carry the tools offered now as their tool list and do not contain the earlier tool-change message
 
 ### Requirement: Tool-change messages follow tool results
-A tool-change message SHALL never be placed between a tool call and its result. A change found while tool results are pending SHALL be stored after them.
+A baseline or tool-change message SHALL never be placed between a tool call and its result. A change found while tool results are pending SHALL be stored after them. A tool-change message SHALL be stored only when the newest conversation message is a user message, so that it directly follows one.
 
 #### Scenario: Tool change follows tool results
 - **WHEN** a tool is added while a batch of tool calls runs
 - **THEN** the tool-change message is stored after the batch's tool results
+
+#### Scenario: Nothing is stored while a tool call awaits its result
+- **WHEN** a request is prepared while the newest conversation message is a tool call without a result
+- **THEN** no baseline or tool-change message is stored for it
+- **AND** the request carries the tools offered now as its tool list and none of the stored tool records
+
+#### Scenario: Tool change waits for a user message
+- **WHEN** the tools differ and the newest conversation message is an assistant reply without a tool call
+- **THEN** no tool-change message is stored for that request
+- **AND** one is stored after the next user message
+
+### Requirement: Compaction leaves out tool records
+The request that generates a compaction summary SHALL NOT contain a baseline or a tool-change message, whichever provider runs it.
+
+#### Scenario: Compaction with stored tool records
+- **WHEN** a session whose history holds a baseline and a tool change is compacted
+- **THEN** the compaction request contains neither
+- **AND** the compaction succeeds on a provider that does not declare `tool_updates`
 
 ### Requirement: Providers without tool-update support receive the current tool list
 For a provider that does not declare `tool_updates`, the request's tool list SHALL be the tools offered now, and no baseline or tool-change message SHALL be stored.
@@ -318,15 +341,15 @@ Baselines and tool-change messages already in session history, for example store
 - **THEN** the next request contains no tool-change message, its tool list is the tools offered now, and the stored tool-change message is still in session history
 
 ### Requirement: Providers declare prompt-cache support
-A provider's chat capabilities SHALL include a `prompt_cache` declaration for the configured model and endpoint with two fields: `explicit_breakpoints` (boolean) and `ttl_secs` (the selectable cache lifetimes in seconds, ascending; empty when the lifetime cannot be chosen). A provider or plugin that reports no declaration SHALL be treated as `explicit_breakpoints = false` with no selectable lifetimes.
+A provider's chat capabilities SHALL include a `prompt_cache` declaration for the configured model and endpoint with two fields: `explicit_breakpoints` (boolean) and `max_ttl_secs` (the longest cache lifetime in seconds the provider accepts; absent when the lifetime cannot be chosen). A provider or plugin that reports no declaration, or a declaration without a field, SHALL be treated as `explicit_breakpoints = false` with no selectable lifetime.
 
 #### Scenario: Anthropic declaration
 - **WHEN** the capabilities of an Anthropic provider are read
-- **THEN** `prompt_cache.explicit_breakpoints` is true and `prompt_cache.ttl_secs` is `[300, 3600]`
+- **THEN** `prompt_cache.explicit_breakpoints` is true and `prompt_cache.max_ttl_secs` is 3600
 
 #### Scenario: OpenAI Responses declaration follows the model
 - **WHEN** the capabilities of an OpenAI Responses provider are read for a model that supports cache breakpoints
-- **THEN** `prompt_cache.explicit_breakpoints` is true and `prompt_cache.ttl_secs` is `[1800]`
+- **THEN** `prompt_cache.explicit_breakpoints` is true and `prompt_cache.max_ttl_secs` is 1800
 
 #### Scenario: Model without breakpoint support
 - **WHEN** the capabilities of an OpenAI Responses provider are read for a model that does not support cache breakpoints
@@ -334,60 +357,61 @@ A provider's chat capabilities SHALL include a `prompt_cache` declaration for th
 
 #### Scenario: Plugin built before the declaration existed
 - **WHEN** a provider plugin returns capabilities without a `prompt_cache` field
-- **THEN** the plugin loads and is treated as declaring no explicit breakpoints and no selectable lifetimes
+- **THEN** the plugin loads and is treated as declaring no explicit breakpoints and no selectable lifetime
 
 ### Requirement: Prompt cache settings are validated
-`[agent.execution.prompt_cache]` SHALL accept `ttl_secs` (integer seconds, 0 to 86400, default 0, where 0 means the provider's default lifetime) and `background_ttl_secs` (integer seconds, 0 to 86400, default 3600, where 0 means no separate background lifetime). A value outside the range, a non-integer value or an unknown key in the table SHALL be a load error naming the key.
+`[agent.execution.prompt_cache]` SHALL accept `ttl_secs` (integer seconds, 0 to 86400, default 0, where 0 means the provider's default lifetime). A value outside the range, a non-integer value or an unknown key in the table SHALL be a load error naming the key.
 
 #### Scenario: Prompt cache settings default when omitted
 - **WHEN** a configuration has no `[agent.execution.prompt_cache]` table
-- **THEN** it loads with `ttl_secs = 0` and `background_ttl_secs = 3600`
+- **THEN** it loads with `ttl_secs = 0`
 
 #### Scenario: Out-of-range lifetime is rejected
-- **WHEN** `[agent.execution.prompt_cache]` sets `ttl_secs = 100000` or `background_ttl_secs = -1`
-- **THEN** loading fails with an error naming the offending key
+- **WHEN** `[agent.execution.prompt_cache]` sets `ttl_secs = 100000` or `ttl_secs = -1`
+- **THEN** loading fails with an error naming `ttl_secs`
 
 #### Scenario: Unknown prompt cache key is rejected
 - **WHEN** `[agent.execution.prompt_cache]` sets `keep_alive = true`
 - **THEN** loading fails with an error naming `keep_alive`
 
 ### Requirement: Default hints request the configured lifetime
-When `ttl_secs` is greater than 0, every default cache hint the agent adds, on system sections and on messages, SHALL request the shortest lifetime the provider declares that is at least `ttl_secs`, or the longest declared lifetime when none is that long. When the provider declares no selectable lifetimes, or `ttl_secs` is 0, default hints SHALL request no lifetime. Hints set explicitly in configuration SHALL keep their own lifetime.
+When `ttl_secs` is greater than 0 and the provider declares `max_ttl_secs`, every default cache hint the agent adds, on system sections and on messages, SHALL request `min(ttl_secs, max_ttl_secs)` seconds. When the provider declares no `max_ttl_secs`, or `ttl_secs` is 0, default hints SHALL request no lifetime. Hints set explicitly in configuration SHALL keep their own lifetime.
 
-#### Scenario: Requested lifetime is available
-- **WHEN** `ttl_secs = 3600` and the provider declares lifetimes `[300, 3600]`
-- **THEN** every default hint requests 3600 seconds
-
-#### Scenario: Requested lifetime is rounded up
-- **WHEN** `ttl_secs = 600` and the provider declares lifetimes `[300, 3600]`
+#### Scenario: Requested lifetime is within the provider's maximum
+- **WHEN** `ttl_secs = 3600` and the provider declares `max_ttl_secs = 3600`
 - **THEN** every default hint requests 3600 seconds
 
 #### Scenario: Requested lifetime exceeds what the provider offers
-- **WHEN** `ttl_secs = 3600` and the provider declares lifetimes `[1800]`
+- **WHEN** `ttl_secs = 3600` and the provider declares `max_ttl_secs = 1800`
 - **THEN** every default hint requests 1800 seconds
 
-#### Scenario: Provider without selectable lifetimes
-- **WHEN** `ttl_secs = 3600` and the provider declares no selectable lifetimes
+#### Scenario: Provider without a selectable lifetime
+- **WHEN** `ttl_secs = 3600` and the provider declares no `max_ttl_secs`
 - **THEN** default hints request no lifetime and the request is sent
+
+#### Scenario: Default lifetime
+- **WHEN** `ttl_secs` is 0
+- **THEN** default hints request no lifetime
 
 #### Scenario: Explicit hint lifetime wins
 - **WHEN** `ttl_secs = 3600` and a system section is configured with `cache = { ephemeral = { ttl_seconds = 300 } }`
 - **THEN** that section's hint requests 300 seconds
 
-### Requirement: Requests sent during background work use the background lifetime
-While a session has at least one running background command, a model request SHALL use `background_ttl_secs` in place of `ttl_secs` for its default hints when `background_ttl_secs` is the larger of the two. When `background_ttl_secs` is 0, or no background command is running, `ttl_secs` SHALL apply.
+### Requirement: Providers round a requested lifetime up
+A provider SHALL send a requested cache lifetime, on a default or an explicit hint, as the shortest lifetime it supports that is at least the requested one. A request for more than the longest lifetime it supports SHALL fail with an error that names the lifetime, except where the provider declares no selectable lifetime and sends no lifetime.
 
-#### Scenario: Background command is running
-- **WHEN** `ttl_secs = 0`, `background_ttl_secs = 3600`, the provider declares `[300, 3600]` and a request is sent while a background command runs
-- **THEN** every default hint of that request requests 3600 seconds
+#### Scenario: Anthropic rounds up
+- **WHEN** a hint requests 600 seconds on an Anthropic provider
+- **THEN** the request carries the 1-hour lifetime
+- **AND** a hint requesting 120 seconds carries the 5-minute lifetime
 
-#### Scenario: No background command is running
-- **WHEN** `ttl_secs = 0`, `background_ttl_secs = 3600` and a request is sent with no background command running
-- **THEN** default hints request no lifetime
+#### Scenario: OpenAI Responses rounds up to 30 minutes
+- **WHEN** a hint requests 600 seconds on an OpenAI Responses provider
+- **THEN** the request carries the 30-minute lifetime
 
-#### Scenario: Background lifetime is disabled
-- **WHEN** `background_ttl_secs = 0` and a request is sent while a background command runs
-- **THEN** default hints use `ttl_secs`
+#### Scenario: OpenAI Responses rejects a longer lifetime
+- **WHEN** a hint requests 3600 seconds on an OpenAI Responses provider
+- **THEN** the request fails with an error naming 3600
 
 ### Requirement: Cache prefix changes are attributed
 For every main model request the agent SHALL record `prefix_change` and `idle_secs` in the request-end event, and as `qmt.cache.prefix_change` and `qmt.cache.idle_secs` on the request's trace span. `prefix_change` SHALL be `first_request`, `model`, `tools`, `system`, `history` or `none`; when several apply, the first in that order. `idle_secs` SHALL be the whole seconds since the session's previous main model request ended, and absent for `first_request`.

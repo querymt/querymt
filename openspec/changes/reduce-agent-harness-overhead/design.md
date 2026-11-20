@@ -12,8 +12,7 @@ See proposal.md for motivation and measurements. The current state that shapes t
 - **Context hooks.** `run_context` (`crates/agent-runtime/src/hooks/engine.rs:905`) receives the combined list, may replace it, and may add request-only `additional_context`. Hints are computed after the hook.
 - **System hints.** `crates/agent-services/src/model_heuristics.rs:157` adds default system hints when the provider name is `anthropic` or `codex`, or `openai` with `api_mode = "responses"`. This happens on the parameter JSON, before a provider instance exists.
 - **Capabilities.** `ChatCapabilities` (`crates/querymt/src/chat/mod.rs:839`) is `Copy`, has two fields (`streaming`, `options`) and is read from a built provider. Extism plugins return it as JSON from a `capabilities` export; missing fields default.
-- **Shell.** `crates/agent-services/src/tools/builtins/shell.rs` waits on `wait_with_output` with no time limit, so it returns only when every holder of the output pipes has exited. Nothing in the tool layer can outlive a tool call.
-- **Waiting.** The execution loop already has a waiting state for delegations (`crates/agent-runtime/src/agent/execution/wait.rs`) and already injects content at the model-request boundary (`apply_pending_steering`, `reconcile_suspended_delegations`). Queued inputs can already start a run on an idle session.
+- **Shell.** `crates/agent-services/src/tools/builtins/shell.rs` waits on `wait_with_output`, so it returns only when every holder of the output pipes has exited, and it buffers the whole output in memory.
 
 Constraints: no session DB migration; no compatibility layers (AGENTS.md); the Extism contract versions stay as they are; `querymt` and provider crates must build for `wasm32-wasip1`.
 
@@ -22,14 +21,14 @@ Constraints: no session DB migration; no compatibility layers (AGENTS.md); the E
 **Goals:**
 
 - A request's durable messages are byte-identical to the same messages in the previous request, for every provider.
-- No tool call blocks a run for longer than the default cache lifetime.
 - Each group in proposal.md can be implemented, tested and released on its own.
 
 **Non-Goals:**
 
 - Changing the session DB schema or how history is pruned. History gains new part kinds (D19, D21) and the compaction summary gains task criteria (D20); nothing else about storage changes.
 - Removing the run objective bookkeeping or its events. Only sending it changes (D20).
-- A general job scheduler. Background commands are shell processes owned by one session and one agent process.
+- Background commands, a time limit on `shell` calls, dedicated-tool hints and `QMT_SESSION_ID` for commands. See D7.
+- Changing what a `shell` result contains or how large output is cut. See D9.
 - Provider-specific cache tuning beyond what a provider declares.
 
 ## Decisions
@@ -66,32 +65,31 @@ Behaviour changes that follow, marked **BREAKING** in the proposal: requests car
 
 ### D2. Providers declare prompt-cache support; the agent probes it before the final build
 
-`ChatCapabilities` gains `prompt_cache` with `explicit_breakpoints: bool` and `ttl_secs` (ascending list, at most four entries). `ChatCapabilities` stays `Copy`: the list is a small fixed-capacity inline value that serializes as a JSON array. Declarations:
+`ChatCapabilities` gains `prompt_cache` with `explicit_breakpoints: bool` and `max_ttl_secs: Option<u32>`, the longest cache lifetime the provider accepts (`None` when the lifetime cannot be chosen). Both are plain derived serde fields, so `ChatCapabilities` stays `Copy` and an older plugin that omits them reads as `false` and `None`. Declarations:
 
-| Provider | `explicit_breakpoints` | `ttl_secs` |
+| Provider | `explicit_breakpoints` | `max_ttl_secs` |
 |---|---|---|
-| `qmt-anthropic` | true | `[300, 3600]` |
-| `qmt-openai`, Responses, model supports breakpoints | true | `[1800]` |
-| `qmt-openai`, otherwise | false | `[]` |
-| `qmt-codex` | as its Responses backend supports | as above |
-| all others | false (default) | `[]` |
+| `qmt-anthropic` | true | 3600 |
+| `qmt-openai`, Responses, model supports breakpoints | true | 1800 |
+| `qmt-openai`, otherwise | false | none |
+| `qmt-codex` | false: the ChatGPT backend rejects `prompt_cache_breakpoint` and `prompt_cache_options`, and the adapter drops every hint | none |
+| all others | false (default) | none |
 
 System hints are part of the configuration a provider is built from, so the declaration is needed before the final build. The agent builds the provider once without default hints, reads its capabilities, and if `explicit_breakpoints` is true and a default hint is due, builds it again with the hinted system prompt. The declaration is cached in the process per provider configuration, so the extra build happens once per distinct configuration, and never for providers that declare nothing (which includes every local-model provider).
 
 Alternatives considered:
 
 - **A capabilities method on `LLMProviderFactory`.** One build instead of two, but it changes a trait that native plugin libraries implement, while `stabilize-native-plugin-abi` is in flight.
-- **Add default system hints for every provider and let unsupporting providers ignore them.** Cannot map a configured lifetime to what the provider offers, and OpenAI Responses rejects any lifetime other than 1800.
+- **Add default system hints for every provider and let unsupporting providers ignore them.** Cannot tell a provider that caches from one that does not, and a hinted system prompt changes the provider configuration for nothing.
+- **Declare the full list of selectable lifetimes.** The agent would pick from it itself, but the list needs a fixed-capacity type to keep `ChatCapabilities` `Copy`, and the adapters already translate a requested lifetime to one they support. A maximum is all the agent needs.
 
 The name list in `model_heuristics.rs` is removed. The Extism capabilities JSON gains an optional field; an older plugin omits it and is treated as declaring nothing, which is the plugin-side **BREAKING** change in the proposal.
 
-### D3. The agent maps configured lifetimes; the default stays the provider default
+### D3. The agent requests the configured lifetime, capped; the provider rounds it; the default stays the provider default
 
-For default hints the agent picks, from the declared `ttl_secs`, the shortest lifetime that is at least the configured value, else the longest. Adapters keep their own translation for explicit hints.
+For default hints the agent requests `min(ttl_secs, max_ttl_secs)`. With `ttl_secs = 0`, or a provider that declares no `max_ttl_secs`, it requests no lifetime. The provider sends the shortest lifetime it supports that is at least the requested one: `qmt-anthropic` already maps up to 300 seconds to 5 minutes and anything longer to 1 hour, and `qmt-openai` Responses sends 30 minutes for any request up to 1800 and keeps rejecting longer ones, so an explicit hint asking for more than the backend offers still fails loudly. This applies to explicit hints as well as default ones.
 
 `ttl_secs` defaults to 0 (provider default) because a longer lifetime is not free. At Anthropic's published multipliers (cache write 1.25x for 5 minutes and 2x for 1 hour, cache read 0.1x), a 1-hour write costs 0.75x more per written token, and an avoided expiry saves about 1.15x per token of context. On the 14-day sample, 492 requests rewrote 92.9M tokens after a 5 to 60 minute pause; a 1-hour lifetime would have saved about 107M token-equivalents there. Against that, every other cache write would have cost more: about 161M extra on the 308M tokens written today, so a global 1-hour lifetime would have lost. After D1 removes the repeated and excess writes (about 86M), the extra cost falls to about 97M, which is roughly break-even. The result depends on how often a user pauses for 5 to 60 minutes, so the default is revisited with `prefix_change` and `idle_secs` data (D4).
-
-`background_ttl_secs` defaults to 3600 because a running background command predicts exactly that kind of pause.
 
 ### D4. Each request records why its prefix changed
 
@@ -103,66 +101,54 @@ This adds one serialization pass over the history per request. The task that add
 
 ### D5. No keep-alive requests
 
-Re-reading the cache every few minutes during a wait would keep it warm without a longer lifetime. At about 135k tokens of context each ping costs about 13.5k token-equivalents, so a 40-minute wait costs about 108k against about 155k for one rewrite. That is a small saving for extra background traffic and a new failure mode (pings racing a resumed run). A longer lifetime while background work runs (D3) gets the same result with no extra requests.
+Re-reading the cache every few minutes during a wait would keep it warm without a longer lifetime. At about 135k tokens of context each ping costs about 13.5k token-equivalents, so a 40-minute wait costs about 108k against about 155k for one rewrite. That is a small saving for extra background traffic and a new failure mode (pings racing a resumed run). A longer lifetime (D3) gets the same result with no extra requests. Whether to request one only while long work is running is left to `add-background-commands` (D7).
 
-### D6. Background commands live in a process-wide registry keyed by session
+### D6. A shell call waits for the command, not for its pipes
 
-A command that outlives its tool call needs an owner that outlives the call and the run. The registry is owned by the agent process and keyed by session id. `shell`, `job_wait` and `job_kill` reach it through the tool context, the same way the todo tools reach their store, so `querymt-agent-services` defines the registry type and `querymt-agent-runtime` holds the instance.
+`wait_with_output` waits for the child and for end of stream on both pipes, so a detached descendant that inherited stdout or stderr keeps the call open until it exits. Instead, `shell` starts the command with both streams piped as today, and two reader tasks copy stdout and stderr into in-memory buffers. The call waits for the child's exit (or the cancellation token, as today), then gives the readers up to 1 second to reach end of stream:
 
-It is not stored on the session actor, because an idle actor can be unloaded (`release_managed_owner_lease`, `crates/agent-runtime/src/agent/handle/session_lifecycle.rs:100`) and that must not stop a running command. The first implementation task confirms which unload paths exist and that none of them drops the registry entry.
+- With no lingering holder the readers finish at once, so nothing changes for ordinary commands.
+- With a detached descendant holding a pipe, the call returns after the grace period with what the readers have collected. The readers are not stopped: they keep draining and discard what they read until end of stream, so the descendant does not get `SIGPIPE` on its next write. A reader lives as long as the process holding its pipe.
+- The result is built as today (`exit_code`, `stdout`, `stderr`) and goes through the shared truncation step unchanged. Buffers are unbounded, as with `wait_with_output`.
+- Cancellation and the process-group kill (`setsid`, `KillProcessGroup`) are unchanged. A normal return still leaves the group running.
 
-Every `shell` command, foreground or background, is started the same way: stdout and stderr stay piped, and two reader tasks copy each chunk into a bounded in-memory buffer (first and last part, see D9) and append it to one output file in the session's existing overflow directory, named by job id. Consequences:
+Alternative considered: redirect the child's output to a file, with no pipes. stdout and stderr could then no longer be reported separately, and it would add a file per call.
 
-- Moving a foreground command to the background is only a change of owner: the call returns, the readers and the child handle stay in the registry. Nothing is restarted and no output is lost.
-- A foreground call waits for the child's exit, then gives the readers up to 1 second to reach end of stream. With no lingering holder they finish at once; with a detached child holding the pipe the call returns anyway.
-- Memory use is bounded. Today `wait_with_output` buffers everything.
+An earlier revision also bounded the buffers to the first and last part and kept the full output in a file (D9), and before that kept the readers and the child in a process-wide registry, so that a command could outlive its call (D7). Neither is part of this change.
 
-Alternative considered: redirect the child's output straight to the file, with no pipes. The command could then survive an agent restart, but stdout and stderr could no longer be reported separately in a foreground result, and re-adopting processes after a restart is out of scope. Commands die with the agent process and are recorded as `lost`.
+### D7. Deferred to `add-background-commands`
 
-### D7. Exit delivery reuses the two boundaries that already exist
+An earlier revision of this design had a process-wide registry of background commands (in D6), exit notices and wake-up runs (D7), a 240-second foreground limit (D8), dedicated-tool hints (D10), `QMT_SESSION_ID` for commands, and `background_ttl_secs` (D3). All of it moved to a separate change, `add-background-commands`. The removed text, including the `background-commands` delta spec and task group 4, is in git history at `3e0ee3ef`. D8 and D10 keep their numbers so that references to later decisions stay valid.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Running: shell background=true, or foreground limit reached
-    Running --> Exited: process exits
-    Running --> Killed: job_kill, session closed, delegation finished
-    Running --> Lost: agent process died
-    Exited --> Reported: job_wait returned it
-    Exited --> Noticed: run active, before next model request
-    Exited --> Woke: session idle and wake_on_exit
-    Exited --> Held: session idle, wake_on_exit=false
-    Held --> Noticed: next run, before first model request
-```
+Why it moved:
 
-- **Run active.** Before each model request the loop already reconciles suspended delegations and applies pending steering (`crates/agent-runtime/src/agent/execution/mod.rs:511`). Undelivered exits are drained at the same point and stored as one notice with source `background_command` (D19). It is durable, not part of the request tail (D1), so it stays in the cached prefix.
-- **Session idle.** The registry tells the session that a command exited. If no run is active and `wake_on_exit` is set, a run starts with the exit notices as input. Scheduled runs are the precedent for a run that no user prompt started (`ExecutionOrigin::Scheduled`, `crates/agent-runtime/src/agent/session_actor.rs:2562`); a new origin is added and `run_started.origin` reports `background_command`.
-- **Race at the end of a run.** An exit can arrive after the run's last model request. When a run completes, the session checks for undelivered exits with `wake_on_exit` and starts a wake-up run if there are any.
+- **The cache saving is not shown.** The 311 requests that rewrote the context after a long tool call have no breakdown by wait length. The plan could help in two ways only. A model that waits with `job_wait` (at most 240 s per call) makes a request inside every cache lifetime, which is the keep-alive D5 rejects, with output tokens and a stored call and result on top. A model that ends its turn and is woken later depends on the 1-hour lifetime. Neither depends on how an exit is delivered.
+- **The foreground limit was a provider constant.** 240 s was chosen to fit under Anthropic's 300 s default lifetime. It means nothing for a provider that declares no cache (D2), and it changed what a blocking call returns after the model had made it.
+- **The contract had special cases.** A call could return `moved_to_background`, and when every background slot was taken it kept blocking until an unrelated command ended.
+- **The hints were unmeasured.** How many of the roughly 4,000 commands that start with `grep`, `sed`, `cat` or `ls` pass the syntactic check was never counted, so their effect was unknown.
 
-There is no new waiting state. A model that has nothing else to do either calls `job_wait` (at most 240 s per call) or ends its turn and is woken.
+What that change has to settle first:
 
-Waiting for something that is not a local child process (a training run on another host, a file appearing) is expressed as a background command that exits when the condition holds, for example an `ssh` loop that polls and then prints the result. The tool description says so. This replaces the `sleep 3000; check` pattern with one call and one wake-up.
+- Count the 311 requests by wait length (5 to 10 minutes, 10 to 30, 30 to 60, longer) and state the saving expected in each range.
+- One wait parameter chosen by the model, with a configured ceiling, in place of `background` plus a foreground limit, so that every call returns either `exited` or `running`.
+- One way to notify a session, carrying an origin and the exit result, used by the registry in-process and offered over ACP. A script can then call back with `qmacp` for work that is not a child of the agent (a remote job, CI) or that has to survive an agent restart. Steering is not that primitive as it stands: it stores a user-voice part and amends the run objective (`apply_pending_steering`).
+- In-process waiting stays the mechanism for local children. A callback written into the command is lost when the command is killed, and it needs the ACP WebSocket server, which stdio, embedded, Python and mobile hosts do not run.
+- Whether a command may read its session id, decided together with who may send input to that session over ACP.
+- How Anthropic bills a request that switches default hints from the 5-minute to the 1-hour lifetime, before any lifetime that applies only while a command runs.
 
-Alternatives considered:
+### D8. (moved)
 
-- **Callback through `qmacp`.** The model would append something like `; qmacp prompt "$QMT_SESSION_ID" done` to its command. This needs the ACP WebSocket server (`qmtcode --acp-ws`), which stdio, embedded, Python and mobile hosts do not run. The model would have to write it correctly every time. The callback would arrive as a user prompt, the exit code and output would not be captured unless scripted, and a turn that is still running would be steered rather than notified. It stays possible: `QMT_SESSION_ID` is exported for scripts that want it, at no cost.
-- **A `sleep`/timer tool.** Solves waiting, but not output capture or exit status, and the model would still poll.
-- **Suspend the run until the command exits.** Keeps one run open for hours and holds its run lease. Ending the run and waking later reuses what queued inputs and schedules already do.
+The foreground limit moved to `add-background-commands`. See D7.
 
-### D8. The foreground limit is 240 seconds
+### D9. (dropped) `shell` output is not reshaped
 
-The limit has to be shorter than the shortest default cache lifetime (300 s) with room for the following request. In the window, 279 `shell` spans ran 5 minutes or longer and 1,205 ran between 1 and 5 minutes; how many of the latter exceed 240 s was not measured. A build that takes longer than the limit is moved, and the model continues with `job_wait` or ends its turn. `job_wait` is capped at 240 s for the same reason.
+An earlier revision had `shell` keep the first and last part of each stream, write the complete output to a file in the overflow directory, and bypass the shared truncation step. It was dropped: it changes what the tool returns, which the model has learned to work with, and how much output to keep is already the model's choice (2,048 of 2,115 cargo invocations filter through `tail`, `head` or `grep`).
 
-When every `max_background` slot is taken at the limit, the command stays in the foreground until it exits or a slot frees, then moves without a restart. This keeps the concurrency bound, at the cost that a hung command blocks as it does today while the slots are busy. Exempting moved commands from the bound, or killing them at the limit, were rejected: the first breaks `max_background`, the second loses work.
+The known defect stays: the shared step (`crates/agent-runtime/src/agent/execution/tool_calls.rs`) keeps the head of a result, so an oversized `shell` result loses the end of its output and `stderr` and is no longer valid JSON. The tool description, its truncation hint and `crates/agent/examples/prompts/coder.md` are unchanged.
 
-The hung `ssh … nohup` calls (up to 13.4 h) are a different case from a detached local child: the `ssh` process itself stays alive until the remote command closes its output. The return-on-exit behaviour in D6 does not help there. The foreground limit does.
+### D10. (moved)
 
-### D9. `shell` bounds its own output
-
-Today every tool result is cut by one shared step that keeps the head (`crates/agent-runtime/src/agent/execution/tool_calls.rs:793`). For `shell` the result is a JSON string with `exit_code`, `stdout` and `stderr`, so a head cut drops `stderr` and leaves invalid JSON. `shell` instead bounds each stream while reading it (D6), keeping the first and last part with at least half of the budget for the last part, and names the output file from D6 as the place to read the rest. Its results then stay under the shared limit and are not cut a second time. Other tools keep head truncation.
-
-### D10. Dedicated-tool hints are a syntactic check
-
-The check is deliberately narrow: the command is one invocation of a listed program and contains no pipe, redirection, command separator or substitution. It cannot say whether a pipeline could have been a `search_text` call, and it does not try. About 4,000 commands in the window start with `grep`, `sed`, `cat` or `ls`; how many of them pass this check was not measured, so the effect is unknown until it ships. The hint is one line appended to the result and costs a few tokens when it fires.
+Dedicated-tool hints moved to `add-background-commands`. See D7.
 
 ### D11. Missing end events after cancellation: cause not yet known
 
@@ -176,7 +162,7 @@ The base wait is chosen by error class:
 
 | Class | Errors | Base wait |
 |---|---|---|
-| Transport | `LLMError::Transport` (except `ProtocolMismatch`, which is not retried), `HttpError`, `IoError` | `transport_wait_secs` (2) |
+| Transport | `LLMError::Transport` (except `ProtocolMismatch`, which is not retried), `HttpError`, `IoError` | `transport_wait_secs` (10) |
 | Provider | `RateLimited`, `HttpStatus` 429/5xx, retryable `ProviderResponseError`, `PluginError` | provider hint, else `default_wait_secs` (60) |
 
 Backoff multiplier, jitter, `max_wait_secs` and the shared attempt budget are unchanged. `PluginError` stays in the provider class because its cause is unknown.
@@ -207,7 +193,7 @@ Lifecycle requests for a session owned by a node that is not connected: 73 calls
 
 - **Actor dispatch spans** come from kameo (`kameo::actor::kind`, info level). The default trace filter already prepends `iroh=warn` unless the user names that target (`telemetry_trace_filter`, `crates/querymt-utils/src/telemetry.rs:380`); `kameo=warn` is added the same way.
 - **Bookkeeping spans** change from `info_span!` to `debug_span!` at their eleven sites.
-- **Attempts.** One model request span covers all attempts of that request (35 of 39 retry waits in the window are children of a `chat` span). So the span gets the final attempt count as `gen_ai.request.attempt` and one event per attempt. This is what otelite appears to read, judging by strings in its binary (an integer cast of that attribute, and a filter on events of that name); its source was not read. The task verifies against `otelite retries` with a forced retry.
+- **Attempts.** One model request span covers all attempts of that request (35 of 39 retry waits in the window are children of a `chat` span). So the span gets the number of attempts started as `gen_ai.request.attempt` (set when an attempt starts) and one event per attempt that ended. A failed attempt's event carries `error.type`, not the message: the existing privacy rule (`assert_private`) forbids error text in spans, and messages can echo endpoints. A cancelled attempt adds no event. The recorder is `genai::RequestAttempts`, shared by the non-streaming loop (`call_chat_with_retry`) and the streaming budget (`StreamRetryBudget::with_attempts`). This is what otelite appears to read, judging by strings in its binary (an integer cast of that attribute, and a filter on events of that name); its source was not read. The task verifies against `otelite retries` with a forced retry.
 - **`otelite cache`** returns nothing although `otelite usage` reports our cache tokens from the same spans. The cause is unknown. One task investigates; a fix on our side is added only if we are emitting something non-standard.
 
 ### D17. The plugin registry remembers failed loads
@@ -223,7 +209,7 @@ The registry keeps, per provider, the error and a fingerprint of the cause: for 
 
 ### D19. Harness notices are stored messages
 
-A notice is text the harness sends the model on its own behalf. It becomes a new stored part kind, `notice`, with a `source` and the text, held in a user-role message and sent to the model as that text. Sources: `agent_mode`, `output_limit`, `progress_review`, `stop_hook`, `task_completion`, `duplicate_tool_call`, `duplicate_code`, `parallel_edit`, `context_usage` (the context-usage warning of `ContextMiddleware`), and `background_command` for the exit notices of D7.
+A notice is text the harness sends the model on its own behalf. It becomes a new stored part kind, `notice`, with a `source` and the text, held in a user-role message and sent to the model as that text. Sources: `agent_mode`, `output_limit`, `progress_review`, `stop_hook`, `task_completion`, `duplicate_tool_call`, `duplicate_code`, `parallel_edit`, `context_usage` (the context-usage warning of `ContextMiddleware`), and `background_command`. Nothing in this change writes the last one; it is kept for the exit notices of `add-background-commands` (D7).
 
 - **Storing.** Middleware and the loop queue a notice on the context instead of calling `inject_message`. The loop stores queued notices before the model request, at the point where steering is applied (`apply_pending_steering`), after any tool results. Middleware needs no store access, and a cancelled run stores nothing it did not send.
 - **Mode reminders.** Before each request the loop finds the most recent `agent_mode` notice in the effective history and compares it with the session mode at that moment. It stores the reminder when the mode has one and the last notice is for another mode or missing. It stores a leave notice when the mode has no reminder and the last notice is a reminder. Checking at request time, not at switch time, means the roughly 970 switches in 14 days that cycle build, plan, review and back without a request store nothing, and a reminder lost to compaction or undo is stored again.
@@ -257,7 +243,7 @@ Today any change to the offered tools changes the head of the request, which inv
 
 `querymt` gains the capability flag and a tool-change message kind. The agent sends that kind only to providers that declare the flag, so a plugin built before this change never receives one. `prefix_change` (D4) hashes the leading list, so a change sent as a marker reports `none`.
 
-Anthropic sends a marker as a system-role entry in `messages` holding `tool_addition` and `tool_removal` blocks, with the beta header `inline-tools-2026-09-15`. This shape is taken from opencode v2.3.2 (`packages/ai/src/protocols/anthropic-messages.ts`), not from Anthropic's documentation, and opencode's own tree has no caller that produces a marker. The group's first task confirms the shape, the supporting models and the header against the documentation and corrects the delta spec before any code.
+Anthropic sends a marker as a system-role entry in `messages` holding `tool_addition` and `tool_removal` blocks, with the beta header `inline-tools-2026-09-15`. The shape was first taken from opencode v2.3.2, then confirmed (task 10.1) against Anthropic's documentation ("Mid-conversation system messages and tool changes", https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages) and the live endpoint, over OAuth. Two API rules shape the adapter: the system entry must directly follow a user entry and be last or precede an assistant entry, so the adapter sends it after any user entries that follow it in history (request-scoped tail, a prompt sent after an interrupted run); and only some models accept it (see the delta spec), so the declaration is per model id.
 
 Alternatives considered:
 
@@ -278,32 +264,27 @@ Expected effect is small: 3 real tool-list changes in 14 days, none mid-run. Sor
 - **[Context hooks that edited the objective or a reminder stop seeing them as fragments.]** → Marked BREAKING, documented in `docs/docs/agent/hooks.md` and CHANGELOG. Reminders are now ordinary history messages a hook can see. No shipped hook is known to edit either.
 - **[Tool-change markers rest on a beta API read from another project's source.]** The header may also be refused on the OAuth path. → Group I starts with a confirmation task and stops if the API is not usable; the declaration defaults to false, so nothing changes for a provider until it opts in.
 - **[Two provider builds for the capability probe.]** → Once per distinct provider configuration per process, only for providers that end up with hints. Native and Extism builds are constructor calls without network I/O; the task measures it.
-- **[A wake-up run spends tokens with nobody watching.]** → It happens only for commands the model started, once per exit batch, and is bounded by the same turn limits as any run. `wake_on_exit = false` turns it off per command. A woken run that starts another background command can wake itself again; `max_background` bounds the fan-out, not the chain length. An explicit chain limit is left out until it is seen to matter.
-- **[Moving a command to the background changes what the model sees.]** A 5-minute build now returns "running" instead of its result. → The result says so, includes the output so far and names `job_wait`. Set `foreground_limit_secs = 0` to restore blocking calls.
-- **[Background commands outlive cancellation.]** A user who cancels a run may expect everything to stop. → Runtime state lists running commands, the desktop follow-up shows them, and closing the session stops them. Cancelling does not, because a cancelled run is often followed by "continue".
-- **[Snapshots and background writes.]** A background command can modify files while later tool calls are snapshotted, so its changes are attributed to whichever call was snapshotted next. → Same situation as a detached process today; turn-level undo still covers them. Documented, not solved.
 - **[Fewer journal events could break a consumer.]** → In this repository only an example and a benchmark read the affected events. The desktop follow-up confirms the same for `querymt-desktop` before group F ships.
 - **[Hiding kameo spans removes parents from traces.]** Spans created inside a handler become roots or attach to the caller's span. → That is how they already appear for work that crosses a spawn. `QMT_TELEMETRY_LEVEL=info,kameo=info` restores them.
 - **[A remembered plugin failure hides a fixed plugin.]** → Local files are re-checked by size and modification time on every use, and `querymt/refreshModels` clears the record. A replacement that keeps both values is only picked up by the refresh.
-- **[A 2-second transport retry can hit a provider that is down.]** → The attempt budget is unchanged (3), and the second wait doubles.
+- **[A 10-second transport retry can hit a provider that is down.]** → The attempt budget is unchanged (3), and the second wait doubles (10 s, then 20 s).
 
 ## Migration Plan
 
 Groups ship independently, in proposal order, each behind its own tests. No data migration and no schema change.
 
 1. **A (caching).** Ship D1, D19, D20 and D4 first and watch `prefix_change` and cache-write totals for a week on real sessions before changing any lifetime default. D2 and D3 follow.
-2. **C, then B (shell, background commands).** C changes how every command is started (D6), which B builds on.
+2. **C (shell).**
 3. **D, E, F, G, H** in any order.
 4. **I (tool-change markers)** last. It needs A, and its first task can end the group.
 
-Rollback is a revert of the group's commits. Configuration added by a group is rejected as an unknown key after its revert, so a rollback note goes in the CHANGELOG entry for groups A, B and D. Group A also stores new part kinds; see the rollback risk above.
+Rollback is a revert of the group's commits. Configuration added by a group is rejected as an unknown key after its revert, so a rollback note goes in the CHANGELOG entry for groups A and D. Group A also stores new part kinds; see the rollback risk above.
 
 Rebuild `qmt-anthropic`, `qmt-openai` and `qmt-codex` plugins with group A, so they carry the declaration.
 
 ## Open Questions
 
 - Should `ttl_secs` default to 3600 for providers that offer it? Decide from `prefix_change` and `idle_secs` data after D1 and D4 have run for a week (D3 has the estimate).
-- Is a limit on consecutive wake-up runs needed? Decide from use.
 - Should the run objective code be deleted, or its default changed? Decide from the off/on comparison in group 1 and from use.
 - Does Anthropic accept the tool-change beta header on the OAuth path, and for which models? Answered by the first task of group I.
 - What makes `otelite cache` return nothing, and can `otelite agents` learn about the `qmt-tracer` scope? The second is an upstream request.

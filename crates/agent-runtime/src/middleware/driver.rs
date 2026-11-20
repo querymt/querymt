@@ -7,7 +7,7 @@ use querymt_agent_core::events::SessionLimits;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, info_span, instrument};
+use tracing::{Instrument, debug_span, instrument};
 
 /// One prepared tool call as seen by middleware review.
 ///
@@ -292,6 +292,7 @@ impl CompositeDriver {
 
     #[instrument(
         name = "middleware.phase",
+        level = "debug",
         skip(self, state, runtime),
         fields(
             phase = %phase.name(),
@@ -329,7 +330,7 @@ impl CompositeDriver {
                 current_state_name
             );
 
-            let span = info_span!(
+            let span = debug_span!(
                 "middleware.driver",
                 name = %driver_name,
                 phase = %phase.name(),

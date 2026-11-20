@@ -410,6 +410,18 @@ pub fn estimate_chat_tokens(messages: &[ChatMessage]) -> usize {
                                     .map_or(0, |name| estimator.estimate_text(name)),
                             )
                         }
+                        // A baseline is never sent as a message. A change is
+                        // the definitions it adds plus the names it removes.
+                        ChatInputPart::ToolChange(change) if change.baseline => 0,
+                        ChatInputPart::ToolChange(change) => {
+                            let added = change.added.iter().fold(0usize, |sum, tool| {
+                                let definition = serde_json::to_string(tool).unwrap_or_default();
+                                sum.saturating_add(estimator.estimate_text(&definition))
+                            });
+                            change.removed.iter().fold(added, |sum, name| {
+                                sum.saturating_add(estimator.estimate_text(name))
+                            })
+                        }
                     };
                     total.saturating_add(tokens)
                 })

@@ -45,6 +45,7 @@ pub(crate) mod prefix;
 pub(crate) use maintenance::{CompactionOutcome, TRIGGER_MANUAL, compact_history};
 mod progress_sink;
 mod tool_calls;
+pub(crate) mod tool_history;
 mod transitions;
 mod wait;
 mod wave_plan;
@@ -60,7 +61,7 @@ use crate::middleware::ExecutionState;
 use log::{debug, info, trace, warn};
 use querymt_agent_core::events::{AgentEventKind, ExecutionMetrics, StopType};
 use std::sync::Arc;
-use tracing::{Instrument, info_span, instrument};
+use tracing::{Instrument, debug_span, info_span, instrument};
 
 /// Outcome of a single execution cycle
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -540,7 +541,7 @@ pub(crate) async fn execute_cycle_state_machine(
 
     state = driver
         .run_turn_start_cancellable(state, Some(&exec_ctx.runtime), &exec_ctx.cancellation_token)
-        .instrument(info_span!(
+        .instrument(debug_span!(
             "agent.execution.middleware.turn_start",
             session_id = %exec_ctx.session_id
         ))
@@ -642,7 +643,7 @@ pub(crate) async fn execute_cycle_state_machine(
                         Some(&exec_ctx.runtime),
                         &exec_ctx.cancellation_token,
                     )
-                    .instrument(info_span!(
+                    .instrument(debug_span!(
                         "agent.execution.middleware.step_start",
                         session_id = %exec_ctx.session_id
                     ))
@@ -687,7 +688,7 @@ pub(crate) async fn execute_cycle_state_machine(
                         Some(&exec_ctx.runtime),
                         &exec_ctx.cancellation_token,
                     )
-                    .instrument(info_span!(
+                    .instrument(debug_span!(
                         "agent.execution.middleware.after_llm",
                         session_id = %exec_ctx.session_id
                     ))
@@ -764,7 +765,7 @@ pub(crate) async fn execute_cycle_state_machine(
                             Some(&exec_ctx.runtime),
                             &exec_ctx.cancellation_token,
                         )
-                        .instrument(info_span!(
+                        .instrument(debug_span!(
                             "agent.execution.middleware.processing_tool_calls",
                             session_id = %exec_ctx.session_id
                         ))
@@ -846,7 +847,7 @@ pub(crate) async fn execute_cycle_state_machine(
                         Some(&exec_ctx.runtime),
                         &exec_ctx.cancellation_token,
                     )
-                    .instrument(info_span!(
+                    .instrument(debug_span!(
                         "agent.execution.middleware.turn_end",
                         session_id = %exec_ctx.session_id
                     ))

@@ -332,7 +332,7 @@ pub(crate) fn extract_media(messages: &[ChatMessage]) -> Vec<MediaAttachment> {
                         }
                     }
                 }
-                ChatInputPart::Text { .. } => {}
+                ChatInputPart::Text { .. } | ChatInputPart::ToolChange(_) => {}
             }
         }
     }

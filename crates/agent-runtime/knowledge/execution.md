@@ -65,10 +65,13 @@ note.
   of the shared `max_attempts`. If output was already emitted the retry still happens and
   may repeat visible text (`TODO(stream-retry-safety)`).
 - **Delay** (`retry_delay_secs`): the provider's retry hint when present, capped at
-  `max_wait_secs` and not jittered; otherwise `default_wait_secs` times
-  `backoff_multiplier` to the power of (retry number minus one), so the first retry waits
-  `default_wait_secs`, with proportional jitter (`jitter_ratio`), capped at
-  `max_wait_secs`.
+  `max_wait_secs` and not jittered; otherwise a base wait times `backoff_multiplier` to the
+  power of (retry number minus one), with proportional jitter (`jitter_ratio`), capped at
+  `max_wait_secs`. The base is `transport_wait_secs` (default 10) for failures the provider
+  never answered (`LLMError::Transport`, `HttpError`, `IoError`: connection failure,
+  timeout, broken or undecodable stream) and `default_wait_secs` (default 60) for
+  everything else, including `PluginError`, whose cause is unknown. The first retry waits
+  the base.
 - **Events:** each wait emits `RateLimited` or `LlmRetryWait` (streams also
   `StreamRecovering`) and each resume `RateLimitResume` or `LlmRetryResume`. The wait is
   a `select!` against the cancel token, so cancelling during a delay ends the turn

@@ -408,6 +408,40 @@ pub(super) async fn execute_prepared_tool_call(
         })
 }
 
+/// Ends a started call whose execution stops before its own `ToolCallEnd`: the
+/// future was dropped (run cancelled, the cancel signal won the race against the
+/// tool) or an infrastructure error returned early. Every `ToolCallStart` then
+/// has exactly one end event.
+struct ToolCallEndGuard<'a> {
+    config: &'a AgentConfig,
+    exec_ctx: &'a ExecutionContext,
+    call: &'a MiddlewareToolCall,
+    /// Cleared right before the call emits its own end event.
+    armed: bool,
+}
+
+impl Drop for ToolCallEndGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let result = if self.exec_ctx.cancellation_token.is_cancelled() {
+            "Error: Cancelled by user"
+        } else {
+            "Error: internal tool execution failed"
+        };
+        self.config.emit_event(
+            &self.exec_ctx.session_id,
+            AgentEventKind::ToolCallEnd {
+                tool_call_id: self.call.id.clone(),
+                tool_name: self.call.function.name.clone(),
+                is_error: true,
+                result: result.to_owned(),
+            },
+        );
+    }
+}
+
 async fn execute_prepared_inner(
     config: &AgentConfig,
     call: &MiddlewareToolCall,
@@ -437,6 +471,12 @@ async fn execute_prepared_inner(
             arguments: arguments_json.clone(),
         },
     );
+    let mut end_guard = ToolCallEndGuard {
+        config,
+        exec_ctx,
+        call,
+        armed: true,
+    };
 
     // Progress recording is observational — a failure here must not abort the
     // tool call itself, otherwise the tool_use block ends up without a matching
@@ -556,6 +596,7 @@ async fn execute_prepared_inner(
         .collect::<Vec<_>>()
         .join("\n");
 
+    end_guard.armed = false;
     config.emit_event(
         &exec_ctx.session_id,
         AgentEventKind::ToolCallEnd {
@@ -1689,6 +1730,7 @@ impl Drop for PendingPermissionGuard {
 /// (e.g., delegation).
 #[instrument(
     name = "agent.tool.side_effects",
+    level = "debug",
     skip(config, result, exec_ctx),
     fields(
         session_id = %exec_ctx.session_id,

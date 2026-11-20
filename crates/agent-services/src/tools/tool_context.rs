@@ -66,11 +66,21 @@ pub trait ToolContext: Send + Sync {
     /// Get the current working directory, if set.
     fn cwd(&self) -> Option<&Path>;
 
-    /// Resolve a path. Returns error if cwd is None and path is relative.
+    /// Resolve a path argument called `path`. See [`Self::resolve_path_arg`].
     fn resolve_path(&self, path: &str) -> Result<PathBuf, ToolError> {
-        let path = Path::new(path);
+        self.resolve_path_arg("path", path)
+    }
+
+    /// Resolve the value of the path argument `arg`.
+    ///
+    /// A leading `~` or `~/` is the home directory of the user running the
+    /// agent process; when none is known the call fails with an error naming
+    /// `arg`. Absolute paths are used as written, and a relative path is joined
+    /// to the working directory (an error if there is none).
+    fn resolve_path_arg(&self, arg: &str, path: &str) -> Result<PathBuf, ToolError> {
+        let path = super::path::expand_tilde_arg(arg, path)?;
         if path.is_absolute() {
-            Ok(path.to_path_buf())
+            Ok(path.into_owned())
         } else {
             self.cwd().map(|cwd| cwd.join(path)).ok_or_else(|| {
                 ToolError::InvalidRequest(

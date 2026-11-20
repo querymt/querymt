@@ -49,13 +49,13 @@ produces a tree of child spans describing every step that was executed.
 | `agent.llm.call_with_retry` | Retry wrapper; `operation` is `provider_init` or `chat` |
 | `agent.tools.collect` | Collecting and hashing tool definitions (`tool_count`, `tools_bytes`) |
 | `agent.hooks.context` | Running context hooks before the request |
-| `agent.request.cache_breakpoints` | Applying cache hints to the request messages |
+| `agent.request.cache_breakpoints` | Applying cache hints to the request messages (debug level) |
 | `agent.accounting.open` | Opening the durable accounting record before dispatch |
 | `providers.registry.load` | (Re)parsing the models.dev registry (`reason`: `cold` or `changed`, `bytes`, `parse_ms`) |
 | `http_adapter.credential_refresh` | Refreshing the provider credential |
 | `http_adapter.prepare_request` | Building the HTTP request (`http.request.body.size`) |
 | `http_adapter.send` | Sending the request, up to response headers |
-| `agent.execution.middleware.*` | Middleware phases (`turn_start`, `step_start`, `after_llm`, `processing_tool_calls`) |
+| `agent.execution.middleware.*` | Middleware phases (`turn_start`, `step_start`, `after_llm`, `processing_tool_calls`, `turn_end`; debug level) |
 
 **Tool calls**
 
@@ -65,7 +65,7 @@ produces a tree of child spans describing every step that was executed.
 | `agent.tool.invoke` | Invoking a single tool (includes `source`: `builtin`, `mcp`, or `provider`) |
 | `agent.tool.permission` | Evaluating tool permissions |
 | `agent.tool.permission_wait` | Waiting for user permission |
-| `agent.tool.side_effects` | Processing tool side-effects |
+| `agent.tool.side_effects` | Processing tool side-effects (debug level) |
 | `agent.tool.snapshot.*` | Workspace snapshot operations (`prepare`, `diff`, `metadata`) |
 | `agent.tools.store_all_results` | Persisting tool results |
 
@@ -134,8 +134,8 @@ these operations (`operation`: `start`, `callback`, `logout`; `outcome`: `ok` or
 
 | Span name | Description |
 |---|---|
-| `middleware.phase` | Running a middleware phase |
-| `middleware.driver` | Middleware driver orchestration |
+| `middleware.phase` | Running a middleware phase (debug level) |
+| `middleware.driver` | Middleware driver orchestration (debug level) |
 | `middleware.dedup_check.analyze` | Duplicate-content analysis |
 | `middleware.dedup_check.update_index` | Updating the dedup index |
 | `middleware.dedup_check.turn_end` | Dedup end-of-turn bookkeeping |
@@ -154,6 +154,18 @@ Agent spans follow the
 Metadata includes known providers, models, request settings, response IDs,
 finish reasons, token usage, errors, and tool status. Input totals include cache
 read/write tokens; output totals include reasoning tokens, with breakdowns when available.
+
+#### Request attempts
+
+A `chat {model}` span covers every attempt of one model request. It carries the
+integer attribute `gen_ai.request.attempt` (the number of attempts started) and
+one `gen_ai.request.attempt` event per attempt that ended, in order, with the
+same attribute on the event. Retries after provider errors, transport failures
+and streams that broke all count. The event of a failed attempt also carries
+`error.type`; the error message is not exported. A cancelled attempt adds no
+event, and a reply requested again at a higher output cap is a new request with
+its own span. Provider setup retries (`agent.llm.call_with_retry` with
+`operation = provider_init`) are not attempts of a request.
 
 When available, `gen_ai.conversation.id` and its `session.id` alias identify the
 current session. Delegates use their own session ID.
@@ -329,6 +341,30 @@ export QMT_TELEMETRY_LEVEL=warn
 # Include debug-level spans and logs (more verbose)
 export QMT_TELEMETRY_LEVEL=debug
 ```
+
+#### Spans that need debug level
+
+Per-step bookkeeping spans are only exported at `debug` or more verbose, so a
+default trace describes work (model requests, tool calls) and not internals:
+`middleware.driver`, `middleware.phase`, `agent.execution.middleware.turn_start`,
+`.step_start`, `.after_llm`, `.processing_tool_calls`, `.turn_end`,
+`agent.tool.side_effects`, `agent.request.cache_breakpoints`,
+`model_inventory.get_snapshot` and `function_index.remove_file`. Model request,
+`execute_tool` and `agent.tool.invoke` spans are unchanged.
+
+#### Actor dispatch spans
+
+The actor framework (`kameo`) creates a span for every message an actor handles.
+There are very many, most under a millisecond, so unless `QMT_TELEMETRY_LEVEL`
+names the `kameo` target, `kameo` is limited to `warn` (like `iroh`). Spans
+created while a message is handled are still exported. To export the dispatch
+spans again:
+
+```sh
+export QMT_TELEMETRY_LEVEL=info,kameo=info
+```
+
+A stricter global level such as `warn` or `error` already applies to both.
 
 The console filter (`RUST_LOG`) is independent — you can keep the console
 quiet while still exporting detailed telemetry, or vice versa:

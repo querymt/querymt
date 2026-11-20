@@ -279,8 +279,13 @@ type `model_token_limit`. A reply that is cut off in the middle of a tool call n
 runs that call; the model is told to split the write into smaller calls.
 
 **Initial cap and ceiling.** With no `max_tokens` configured, Anthropic requests start at
-`min(32000, model output limit)` and the model's output limit is the ceiling. If the
-limit is unknown, 32,000 is used for both.
+`min(32000, model output limit)` and the model's output limit is the ceiling. At
+reasoning effort `high` or `max` the requests start at `min(64000, model output limit)`
+instead, because reasoning tokens count against the cap and long replies were being cut
+off and discarded at 32,000. The effort is read when the provider is built for a request,
+so a change of effort applies from the next request. If the limit is unknown, 32,000 is
+used for both at every effort. An explicit `max_tokens` is used as it is and is also the
+ceiling.
 
 **Default instruction.** `{cap}` expands to the cap that was hit:
 

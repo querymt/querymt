@@ -1309,12 +1309,13 @@ fn dotagents_sections_count_as_system_sections() {
     assert_eq!(params.system.len(), 3);
 
     let mut config = serde_json::to_value(&params).unwrap();
-    querymt_agent_services::model_heuristics::ModelDefaults::for_model(
-        "anthropic",
-        "claude-3-7-sonnet-20250219",
-        None,
-    )
-    .apply_to(&mut config, "session");
+    // What `qmt-anthropic` declares.
+    let declaration = querymt::chat::PromptCacheCapabilities::BREAKPOINTS.with_max_ttl_secs(3600);
+    querymt_agent_services::model_heuristics::apply_system_cache_defaults(
+        &mut config,
+        &declaration,
+        0,
+    );
 
     let sections: Vec<querymt::params::SystemPrompt> =
         serde_json::from_value(config["system"].clone()).unwrap();

@@ -390,7 +390,8 @@ fn try_legacy_input_part(
                         ChatInputPart::Attachment(media) => {
                             result.parts.push(ToolResultPart::Attachment(media));
                         }
-                        ChatInputPart::ToolResult(_) => {}
+                        // A legacy block never produces these.
+                        ChatInputPart::ToolResult(_) | ChatInputPart::ToolChange(_) => {}
                     }
                 }
             }

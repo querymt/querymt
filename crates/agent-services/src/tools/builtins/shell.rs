@@ -1,9 +1,14 @@
 //! Shell tool implementation using ToolContext
 
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
 use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 
 use crate::tools::{CapabilityRequirement, FileAccess, Tool as ToolTrait, ToolContext, ToolError};
 
@@ -36,6 +41,54 @@ fn detach_session() -> std::io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// How long a call waits for its output streams to close after the command exited.
+/// A detached descendant can hold them open for as long as it runs.
+const OUTPUT_GRACE: Duration = Duration::from_secs(1);
+
+/// Copies one output stream of the command into memory.
+///
+/// After [`PipeReader::take`] the task keeps reading and discards the data until
+/// end of stream, so a process still holding the pipe does not get `SIGPIPE`.
+struct PipeReader {
+    buffer: Arc<Mutex<Option<Vec<u8>>>>,
+    task: JoinHandle<()>,
+}
+
+impl PipeReader {
+    fn spawn(pipe: Option<impl AsyncRead + Unpin + Send + 'static>) -> Self {
+        let buffer = Arc::new(Mutex::new(Some(Vec::new())));
+        let sink = Arc::clone(&buffer);
+        let task = tokio::spawn(async move {
+            let Some(mut pipe) = pipe else { return };
+            let mut chunk = vec![0u8; 8192];
+            while let Ok(read @ 1..) = pipe.read(&mut chunk).await {
+                if let Some(buffer) = sink.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
+                    buffer.extend_from_slice(&chunk[..read]);
+                }
+            }
+        });
+        Self { buffer, task }
+    }
+
+    /// The output read so far; later output is discarded.
+    fn take(&self) -> Vec<u8> {
+        self.buffer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or_default()
+    }
+}
+
+/// Wait up to [`OUTPUT_GRACE`] for both streams to end, then take what was read.
+async fn collect_output(mut stdout: PipeReader, mut stderr: PipeReader) -> (Vec<u8>, Vec<u8>) {
+    let _ = tokio::time::timeout(OUTPUT_GRACE, async {
+        let _ = tokio::join!(&mut stdout.task, &mut stderr.task);
+    })
+    .await;
+    (stdout.take(), stderr.take())
 }
 
 #[cfg(unix)]
@@ -129,7 +182,7 @@ impl ToolTrait for ShellTool {
         let workdir = args
             .get("workdir")
             .and_then(Value::as_str)
-            .map(|s| context.resolve_path(s))
+            .map(|s| context.resolve_path_arg("workdir", s))
             .transpose()?;
 
         let arg_list = args.get("args").and_then(Value::as_array);
@@ -153,7 +206,7 @@ impl ToolTrait for ShellTool {
             .ok_or_else(|| ToolError::InvalidRequest("No working directory available".into()))?;
         cmd.current_dir(dir);
 
-        // Pipe stdout/stderr so we can read them after waiting, and detach
+        // Pipe stdout/stderr so they can be read while the command runs, and detach
         // stdin so commands that read from it receive EOF instead of the terminal.
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -171,9 +224,14 @@ impl ToolTrait for ShellTool {
         // SIGKILL to the direct child automatically.
         cmd.kill_on_drop(true);
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| ToolError::ProviderError(format!("command failed to spawn: {}", e)))?;
+
+        // Read the streams separately from waiting on the child: a detached
+        // descendant may hold them open long after the command exited.
+        let stdout = PipeReader::spawn(child.stdout.take());
+        let stderr = PipeReader::spawn(child.stderr.take());
 
         #[cfg(unix)]
         let mut group_guard = KillProcessGroup(child.id());
@@ -188,11 +246,11 @@ impl ToolTrait for ShellTool {
             }
             None::<std::path::PathBuf>
         };
-        let wait = child.wait_with_output();
+        let wait = child.wait();
         tokio::pin!(executable, wait);
         let mut identity_pending = cfg!(target_os = "linux");
         let cancel = context.cancellation_token();
-        let output = loop {
+        let status = loop {
             tokio::select! {
                 executable = &mut executable, if identity_pending => {
                     identity_pending = false;
@@ -203,13 +261,14 @@ impl ToolTrait for ShellTool {
                     }
                 }
                 result = &mut wait => {
-                    let output = result
+                    let status = result
                         .map_err(|e| ToolError::ProviderError(format!("command failed: {}", e)))?;
+                    // Processes the command left running are not stopped by its exit.
                     #[cfg(unix)]
                     {
                         group_guard.0 = None;
                     }
-                    break output;
+                    break status;
                 }
                 _ = cancel.cancelled() => {
                     return Err(ToolError::ProviderError("Cancelled by user".to_string()));
@@ -217,11 +276,13 @@ impl ToolTrait for ShellTool {
             }
         };
 
-        shell_exit_code(output.status.code());
+        let (stdout, stderr) = collect_output(stdout, stderr).await;
+
+        shell_exit_code(status.code());
         let result = json!({
-            "exit_code": output.status.code().unwrap_or(-1),
-            "stdout": String::from_utf8_lossy(&output.stdout),
-            "stderr": String::from_utf8_lossy(&output.stderr),
+            "exit_code": status.code().unwrap_or(-1),
+            "stdout": String::from_utf8_lossy(&stdout),
+            "stderr": String::from_utf8_lossy(&stderr),
         });
 
         serde_json::to_string(&result)
@@ -306,6 +367,29 @@ mod tests {
 
         assert_eq!(parsed["exit_code"], 0);
         assert!(parsed["stdout"].as_str().unwrap().contains("hello"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_workdir_expands_a_leading_tilde() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = ShellTool::new();
+
+        let result = first_text_block(
+            tool.call(json!({"command": "pwd -P", "workdir": "~"}), &context)
+                .await
+                .unwrap(),
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(parsed["exit_code"], 0);
+        let printed = std::path::PathBuf::from(parsed["stdout"].as_str().unwrap().trim());
+        assert_eq!(printed, dunce::canonicalize(home).unwrap());
     }
 
     #[tokio::test]
@@ -592,5 +676,100 @@ mod tests {
         let _ = handle.await;
 
         assert_process_exits(pid).await;
+    }
+
+    /// Stops a leftover process even when an assertion fails.
+    #[cfg(unix)]
+    struct KillOnDrop(i32);
+
+    #[cfg(unix)]
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: sends a signal to a process this test started.
+            unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_leaving_a_detached_child_returns_when_it_exits() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let pid_file = temp_dir.path().join("child.pid");
+        let args = json!({
+            "command": format!("sleep 300 & echo $! > {}; echo started", pid_file.display())
+        });
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ShellTool::new().call(args, &context),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let leftover = KillOnDrop(wait_for_pid(&pid_file).await);
+
+        let parsed: Value = serde_json::from_str(&first_text_block(
+            result
+                .expect("call must not wait for the detached child")
+                .unwrap(),
+        ))
+        .unwrap();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "took {elapsed:?}"
+        );
+        assert_eq!(parsed["exit_code"], 0);
+        assert_eq!(parsed["stdout"], "started\n");
+        // SAFETY: `kill` with signal 0 only checks that the process exists.
+        assert_eq!(
+            unsafe { libc::kill(leftover.0, 0) },
+            0,
+            "the leftover process must keep running"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_without_lingering_processes_returns_without_grace_delay() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let started = std::time::Instant::now();
+        let result = ShellTool::new()
+            .call(json!({"command": "echo hello"}), &context)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let parsed: Value = serde_json::from_str(&first_text_block(result)).unwrap();
+
+        assert_eq!(parsed["exit_code"], 0);
+        assert_eq!(parsed["stdout"].as_str().unwrap().trim(), "hello");
+        assert!(elapsed < OUTPUT_GRACE, "took {elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_written_just_before_exit_is_kept() {
+        const MIB: usize = 1024 * 1024;
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let result = ShellTool::new()
+            .call(
+                json!({"command": format!("head -c {MIB} /dev/zero | tr '\\0' x; echo done >&2")}),
+                &context,
+            )
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&first_text_block(result)).unwrap();
+
+        assert_eq!(parsed["exit_code"], 0);
+        let stdout = parsed["stdout"].as_str().unwrap();
+        assert_eq!(stdout.len(), MIB);
+        assert!(stdout.bytes().all(|byte| byte == b'x'));
+        assert_eq!(parsed["stderr"], "done\n");
     }
 }

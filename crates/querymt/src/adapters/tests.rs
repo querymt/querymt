@@ -547,6 +547,7 @@ async fn http_adapter_returns_private_context_to_non_streaming_decoder() {
 struct OptionsRecordingProvider {
     uri: String,
     seen: Arc<std::sync::Mutex<Vec<(bool, GenerationOptions)>>>,
+    tool_updates: bool,
 }
 
 impl HTTPChatProvider for OptionsRecordingProvider {
@@ -554,6 +555,7 @@ impl HTTPChatProvider for OptionsRecordingProvider {
         ChatCapabilities::NONE
             .with_streaming(true)
             .with_options(GenerationOptionSupport::ALL)
+            .with_tool_updates(self.tool_updates)
     }
 
     fn prepare_chat_request(
@@ -619,6 +621,7 @@ async fn http_adapter_forwards_options_to_prepare_chat_request() {
     let adapter = LLMProviderFromHTTP::new(Box::new(OptionsRecordingProvider {
         uri,
         seen: Arc::clone(&seen),
+        tool_updates: false,
     }));
     let options = GenerationOptions::default()
         .with_max_tokens(128_000)
@@ -645,6 +648,7 @@ async fn http_adapter_forwards_options_on_streaming_requests() {
     let adapter = LLMProviderFromHTTP::new(Box::new(OptionsRecordingProvider {
         uri,
         seen: Arc::clone(&seen),
+        tool_updates: false,
     }));
     let options = GenerationOptions::default().with_max_tokens(64_000);
 
@@ -665,6 +669,7 @@ async fn http_adapter_without_options_prepares_with_empty_options() {
     let adapter = LLMProviderFromHTTP::new(Box::new(OptionsRecordingProvider {
         uri,
         seen: Arc::clone(&seen),
+        tool_updates: false,
     }));
 
     adapter
@@ -816,4 +821,94 @@ async fn http_adapter_frames_split_utf8_json_and_sse_once() {
             finish_reason: crate::chat::FinishReason::Stop
         }
     ));
+}
+
+fn tool_change_messages() -> Vec<crate::chat::ChatMessage> {
+    use crate::chat::{ChatInputPart, ChatMessage, FunctionTool, Tool, ToolChange};
+    vec![
+        ChatMessage::from_user_parts(vec![ChatInputPart::text("hi")]),
+        ChatMessage::from_tool_change(ToolChange {
+            added: vec![Tool {
+                tool_type: "function".into(),
+                function: FunctionTool {
+                    name: "deploy".into(),
+                    description: "Deploy".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    strict: None,
+                },
+            }],
+            removed: Vec::new(),
+            ..Default::default()
+        }),
+    ]
+}
+
+#[tokio::test]
+async fn http_adapter_rejects_tool_change_for_provider_without_the_declaration() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let adapter = LLMProviderFromHTTP::new(Box::new(OptionsRecordingProvider {
+        uri: "http://127.0.0.1:1".into(),
+        seen: Arc::clone(&seen),
+        tool_updates: false,
+    }))
+    .with_name("acme");
+    let messages = tool_change_messages();
+
+    let err = adapter
+        .chat(&ChatCall::new(&messages))
+        .await
+        .expect_err("chat must fail");
+    assert!(
+        matches!(&err, LLMError::InvalidRequest(m) if m.contains("acme")),
+        "{err:?}"
+    );
+    let err = match adapter.chat_stream(&ChatCall::new(&messages)).await {
+        Ok(_) => panic!("stream must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(&err, LLMError::InvalidRequest(m) if m.contains("acme")),
+        "{err:?}"
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "no request may be prepared for a rejected tool change"
+    );
+}
+
+#[tokio::test]
+async fn http_adapter_passes_tool_change_to_provider_that_declares_it() {
+    let uri = serve_once("HTTP/1.1 200 OK", &[], b"{}").await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let adapter = LLMProviderFromHTTP::new(Box::new(OptionsRecordingProvider {
+        uri,
+        seen: Arc::clone(&seen),
+        tool_updates: true,
+    }))
+    .with_name("acme");
+    let messages = tool_change_messages();
+
+    adapter
+        .chat(&ChatCall::new(&messages))
+        .await
+        .expect("declared provider accepts the message");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn http_adapter_without_tool_change_is_unaffected_by_the_declaration() {
+    let uri = serve_once("HTTP/1.1 200 OK", &[], b"{}").await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let adapter = LLMProviderFromHTTP::new(Box::new(OptionsRecordingProvider {
+        uri,
+        seen: Arc::clone(&seen),
+        tool_updates: false,
+    }));
+    let messages = &tool_change_messages()[..1];
+
+    adapter
+        .chat(&ChatCall::new(messages))
+        .await
+        .expect("plain messages still work");
+    assert_eq!(seen.lock().unwrap().len(), 1);
 }

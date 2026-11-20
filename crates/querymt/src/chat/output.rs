@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use std::{fmt, str::FromStr};
 
-use super::{ChatMessagePartDelta, ChatRole, FinishReason};
+use super::{ChatMessagePartDelta, ChatRole, FinishReason, Tool};
 use crate::{FunctionCall, ToolCall, Usage};
 
 /// Provider-specific fields retained by the structured chat contract.
@@ -1004,11 +1004,90 @@ pub enum ChatInputPart {
     Text { text: String },
     /// A validated attachment (image, audio, video, document, or resource link).
     Attachment(Box<MediaPart>),
+    /// A change to the offered tools, effective from this point of the
+    /// conversation on. Only sent to providers whose
+    /// [`ChatCapabilities::tool_updates`](super::ChatCapabilities::tool_updates)
+    /// is true; every other provider fails a request that contains it.
+    ToolChange(ToolChange),
     /// The result of a previously requested tool call.
     ToolResult(ToolResult),
 }
 
+/// Tools added, redefined or removed inside a conversation.
+///
+/// `added` holds full definitions (a definition under an already offered name
+/// replaces it) in the order to send them; `removed` holds names. Both lists
+/// are applied in order: additions first, then removals.
+///
+/// A *baseline* is the same record with `baseline` set: `added` is then the
+/// whole offered tool list and `removed` is empty. A baseline is how a
+/// caller's history records the tool list a request starts from; it is never
+/// sent to a provider as a message, the caller sends its tools as the request's
+/// tool list instead.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ToolChange {
+    /// Definitions added or redefined, in name order.
+    #[serde(default)]
+    pub added: Vec<Tool>,
+    /// Names of tools no longer offered.
+    #[serde(default)]
+    pub removed: Vec<String>,
+    /// This record is a baseline: `added` replaces the whole tool list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub baseline: bool,
+    /// What a baseline was built for (the caller's provider and model
+    /// identity), so the caller can tell when it no longer applies. Opaque to
+    /// providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+impl ToolChange {
+    /// A change adding or redefining `added` and removing `removed`.
+    pub fn new(added: Vec<Tool>, removed: Vec<String>) -> Self {
+        Self {
+            added,
+            removed,
+            baseline: false,
+            origin: None,
+        }
+    }
+
+    /// A baseline of `tools`, built for `origin`.
+    pub fn baseline(tools: Vec<Tool>, origin: impl Into<String>) -> Self {
+        Self {
+            added: tools,
+            removed: Vec::new(),
+            baseline: true,
+            origin: Some(origin.into()),
+        }
+    }
+
+    /// Whether the change adds, redefines and removes nothing.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
 impl ChatInputPart {
+    /// Create a tool-change input part.
+    pub fn tool_change(change: ToolChange) -> Self {
+        ChatInputPart::ToolChange(change)
+    }
+
+    /// Returns the tool change if this is a tool-change part.
+    pub fn as_tool_change(&self) -> Option<&ToolChange> {
+        match self {
+            ChatInputPart::ToolChange(change) => Some(change),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this is a tool-change part.
+    pub fn is_tool_change(&self) -> bool {
+        matches!(self, ChatInputPart::ToolChange(_))
+    }
+
     /// Create a text input part.
     pub fn text(text: impl Into<String>) -> Self {
         ChatInputPart::Text { text: text.into() }

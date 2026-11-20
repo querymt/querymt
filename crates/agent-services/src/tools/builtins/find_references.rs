@@ -123,7 +123,7 @@ impl Tool for FindSymbolReferencesTool {
         let mut matches: Vec<RefMatch> = Vec::new();
 
         for search_path in &search_paths {
-            let resolved = resolve_target(search_path, &root);
+            let resolved = resolve_target("paths", search_path, &root)?;
             if resolved.is_file() {
                 self.search_file(
                     &resolved,

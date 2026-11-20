@@ -36,7 +36,7 @@ fn path_to_uri(context: &dyn ToolContext, path: &str) -> Result<String, ToolErro
     if path.starts_with("file://") {
         return Ok(path.to_string());
     }
-    let resolved = context.resolve_path(path)?;
+    let resolved = context.resolve_path_arg("path", path)?;
     Ok(format!("file://{}", resolved.display()))
 }
 

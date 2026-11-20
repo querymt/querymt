@@ -32,6 +32,18 @@ impl Anthropic {
     /// tool names (see `TOOL_PREFIX`); `strict_tools` is matched against the
     /// unprefixed name.
     pub(crate) fn build_tools<'a>(&self, tools: &'a [Tool]) -> Vec<AnthropicTool<'a>> {
+        self.build_tools_reserving(tools, &[])
+    }
+
+    /// Like [`Self::build_tools`], for tools sent after other strict tools
+    /// (`reserved`, their converted schemas): the request-wide strict limits
+    /// count the reserved schemas too, and `tools` fall back to non-strict
+    /// when they would exceed them.
+    pub(crate) fn build_tools_reserving<'a>(
+        &self,
+        tools: &'a [Tool],
+        reserved: &[Value],
+    ) -> Vec<AnthropicTool<'a>> {
         let plain = || -> Vec<AnthropicTool<'a>> {
             tools
                 .iter()
@@ -88,7 +100,8 @@ impl Anthropic {
         if strict_schemas.is_empty() {
             return plain();
         }
-        if let Err(limit) = strict_schema::budget(&strict_schemas) {
+        let counted: Vec<Value> = reserved.iter().chain(&strict_schemas).cloned().collect();
+        if let Err(limit) = strict_schema::budget(&counted) {
             log::warn!(target: "qmt_anthropic", "strict tools omitted for this request: {limit}");
             return plain();
         }

@@ -5,7 +5,8 @@ use querymt::{
     HTTPLLMProvider,
     auth::ApiKeyResolver,
     chat::{
-        ChatCall, ChatCapabilities, ChatOutput, StreamChunk, Tool, ToolChoice,
+        ChatCall, ChatCapabilities, ChatOutput, PromptCacheCapabilities, StreamChunk, Tool,
+        ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -180,8 +181,14 @@ impl HTTPChatProvider for Codex {
         Ok(Box::new(CodexStreamParser::default()))
     }
 
+    /// Declares no prompt-cache breakpoints: the ChatGPT backend rejects
+    /// `prompt_cache_breakpoint` and `prompt_cache_options` (hints are dropped
+    /// in `codex_chat_request`), so default hints would only be discarded.
+    /// The default `PromptCacheCapabilities::NONE` states that explicitly.
     fn capabilities(&self) -> ChatCapabilities {
-        ChatCapabilities::NONE.with_streaming(true)
+        ChatCapabilities::NONE
+            .with_prompt_cache(PromptCacheCapabilities::NONE)
+            .with_streaming(true)
     }
 }
 
@@ -351,6 +358,23 @@ mod extism_exports {
         config = Codex,
         factory = CodexFactory,
         name   = "codex",
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::{Codex, HTTPChatProvider, PromptCacheCapabilities};
+
+    #[test]
+    fn chatgpt_backend_declares_no_explicit_breakpoints() {
+        let provider: Codex = serde_json::from_value(serde_json::json!({
+            "api_key": "test-key",
+            "model": "gpt-5.6"
+        }))
+        .unwrap();
+        let caps = HTTPChatProvider::capabilities(&provider);
+        assert!(caps.streaming);
+        assert_eq!(caps.prompt_cache, PromptCacheCapabilities::NONE);
     }
 }
 

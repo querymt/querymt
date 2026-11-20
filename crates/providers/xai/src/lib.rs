@@ -850,7 +850,8 @@ fn to_xai_responses_input(
                         XaiAttachment::File(file) => XaiResponsesInputContent::InputFile(file),
                     });
                 }
-                ChatInputPart::ToolResult(_) => {}
+                // Tool changes are rejected by the host adapter (no `tool_updates`).
+                ChatInputPart::ToolResult(_) | ChatInputPart::ToolChange(_) => {}
             }
         }
 

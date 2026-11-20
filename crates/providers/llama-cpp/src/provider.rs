@@ -473,6 +473,7 @@ impl ChatProvider for LlamaCppProvider {
     }
 
     async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+        querymt::chat::reject_tool_changes("llama-cpp", call.messages)?;
         let (messages, tools) = (call.messages, call.tools);
         let cfg = self.cfg.with_overrides(call.options);
         let max_tokens = cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
@@ -622,6 +623,7 @@ impl ChatProvider for LlamaCppProvider {
     }
 
     async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
+        querymt::chat::reject_tool_changes("llama-cpp", call.messages)?;
         let (messages, tools) = (call.messages, call.tools);
         let cfg = self.cfg.with_overrides(call.options);
         let max_tokens = cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);

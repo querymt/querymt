@@ -390,7 +390,10 @@ impl LLMProviderFactory for ExtismFactory {
 
         if self.supports_http_adapter_abi() {
             let http_provider: Box<dyn HTTPLLMProvider> = Box::new(provider);
-            return Ok(Box::new(LLMProviderFromHTTP::new(http_provider)));
+            let name = LLMProviderFactory::name(self).to_string();
+            return Ok(Box::new(
+                LLMProviderFromHTTP::new(http_provider).with_name(name),
+            ));
         }
 
         Ok(Box::new(provider))
@@ -1347,6 +1350,32 @@ mod tests {
 
         assert!(caps.streaming);
         assert!(caps.options.max_tokens && !caps.options.reasoning_effort);
+    }
+
+    #[test]
+    fn plugin_capabilities_without_prompt_cache_declare_no_breakpoints() {
+        // Built before the declaration existed: the export omits the field.
+        let caps = r#"{"streaming":true,"options":{"max_tokens":true,"reasoning_effort":false}}"#;
+        let provider = provider_over(wat_plugin(&[("capabilities", caps)]));
+
+        let caps = HTTPChatProvider::capabilities(&provider);
+
+        assert!(caps.streaming);
+        assert_eq!(
+            caps.prompt_cache,
+            crate::chat::PromptCacheCapabilities::NONE
+        );
+    }
+
+    #[test]
+    fn plugin_capabilities_carry_the_prompt_cache_declaration() {
+        let caps = r#"{"prompt_cache":{"explicit_breakpoints":true,"max_ttl_secs":3600}}"#;
+        let provider = provider_over(wat_plugin(&[("capabilities", caps)]));
+
+        let caps = HTTPChatProvider::capabilities(&provider);
+
+        assert!(caps.prompt_cache.explicit_breakpoints);
+        assert_eq!(caps.prompt_cache.max_ttl_secs, Some(3600));
     }
 
     #[test]

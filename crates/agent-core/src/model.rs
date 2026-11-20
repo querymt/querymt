@@ -5,6 +5,7 @@ use crate::snapshot_id::SnapshotId;
 use base64::Engine as _;
 use querymt::chat::{
     ChatInputPart, ChatOutput, ChatOutputItem, MediaKind, MediaPart, MediaSource, MediaType,
+    ToolChange,
 };
 use querymt::{
     ToolCall,
@@ -724,6 +725,24 @@ pub enum MessagePart {
         source: NoticeSource,
         content: String,
     },
+    /// The tool list a request starts from, stored before the first request
+    /// of a session, after a compaction and after a model change, for a
+    /// provider that declares `tool_updates`. It is not sent as a message: the
+    /// most recent baseline is the request's leading tool list, and tool
+    /// changes stored after it are sent as messages.
+    ToolBaseline {
+        /// The offered tools, in the order the request lists them.
+        tools: Vec<querymt::chat::Tool>,
+        /// The provider and model the baseline was built for, `provider/model`.
+        origin: String,
+    },
+    /// A change to the offered tools since the baseline and the earlier tool
+    /// changes: definitions added or redefined, in name order, and names
+    /// removed. Sent to the provider as a tool-change message at its position.
+    ToolChange {
+        added: Vec<querymt::chat::Tool>,
+        removed: Vec<String>,
+    },
     /// Turn snapshot start: worktree state before turn (user prompt)
     TurnSnapshotStart {
         turn_id: TurnId,
@@ -767,6 +786,8 @@ impl MessagePart {
             MessagePart::Compaction { .. } => "compaction",
             MessagePart::CompactionRequest { .. } => "compaction_request",
             MessagePart::Notice { .. } => "notice",
+            MessagePart::ToolBaseline { .. } => "tool_baseline",
+            MessagePart::ToolChange { .. } => "tool_change",
             MessagePart::TurnSnapshotStart { .. } => "turn_snapshot_start",
             MessagePart::TurnSnapshotPatch { .. } => "turn_snapshot_patch",
         }
@@ -1014,6 +1035,15 @@ impl AgentMessage {
                 MessagePart::Notice { content, .. } => {
                     input_parts.push(ChatInputPart::text(content.clone()))
                 }
+                // Both project to a tool-change record that names itself, so
+                // the request builder can fold the history without the stored
+                // parts. A baseline is never sent as a message.
+                MessagePart::ToolBaseline { tools, origin } => input_parts.push(
+                    ChatInputPart::tool_change(ToolChange::baseline(tools.clone(), origin.clone())),
+                ),
+                MessagePart::ToolChange { added, removed } => input_parts.push(
+                    ChatInputPart::tool_change(ToolChange::new(added.clone(), removed.clone())),
+                ),
                 _ => {}
             }
         }

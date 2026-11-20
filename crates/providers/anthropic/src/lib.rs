@@ -14,6 +14,7 @@ mod response;
 mod stream;
 mod strict_schema;
 mod thinking;
+mod tool_changes;
 mod tool_names;
 mod tools;
 mod wire;
