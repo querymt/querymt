@@ -139,6 +139,9 @@ pub struct Model {
     pub provider: String,
     /// Bare model name within the provider (`claude-opus-4`).
     pub model: String,
+    /// Mesh node serving the model (`node_id`); `None`: the agent's own.
+    pub node_id: Option<String>,
+    /// Display name of that node (`node_label`, else its id).
     pub node: Option<String>,
     /// Context window in tokens (`_querymt/modelInfo`), when known.
     pub context: Option<u64>,
@@ -147,7 +150,47 @@ pub struct Model {
     raw: Value,
 }
 
+/// Selection key of a model (desktop `getModelSelectionKey`): its id, or for
+/// a model served by a mesh node, id and node, so the same model on several
+/// machines stays distinct.
+pub fn model_key(id: &str, node_id: Option<&str>) -> String {
+    match node_id {
+        Some(node) => format!("{REMOTE_MODEL_KEY}{}", json!([id, node])),
+        None => id.to_string(),
+    }
+}
+
+const REMOTE_MODEL_KEY: &str = "querymt:model:";
+
+/// The model of `models` a selection key names (desktop
+/// `findModelBySelectionKey`). A bare id saved before keys carried the node
+/// prefers the agent's own model.
+pub fn find_model<'a>(models: &'a [Model], key: &str) -> Option<&'a Model> {
+    models.iter().find(|m| m.key() == key).or_else(|| {
+        let mut same = models.iter().filter(|m| m.id == key);
+        let first = same.next()?;
+        Some(
+            std::iter::once(first)
+                .chain(same)
+                .find(|m| m.node_id.is_none())
+                .unwrap_or(first),
+        )
+    })
+}
+
 impl Model {
+    pub fn key(&self) -> String {
+        model_key(&self.id, self.node_id.as_deref())
+    }
+
+    /// `label from provider on node` (desktop `modelSelectionTooltip`).
+    pub fn describe(&self) -> String {
+        match &self.node {
+            Some(node) => format!("{} from {} on {node}", self.label, self.provider),
+            None => format!("{} from {}", self.label, self.provider),
+        }
+    }
+
     /// `1M` / `200K` style context size, or `UNK`.
     pub fn context_short(&self) -> String {
         match self.context {
@@ -1671,7 +1714,7 @@ impl AgentsStore {
         self.prefs
             .launch_models
             .get(agent_id)
-            .and_then(|id| models.iter().find(|m| &m.id == id))
+            .and_then(|key| find_model(models, key))
             .or_else(|| models.first())
     }
 
@@ -1747,15 +1790,48 @@ impl AgentsStore {
         cx.notify();
     }
 
+    /// Recently chosen models, newest first, each machine's copy distinct.
     pub fn recent_models(&self, agent_id: &str) -> Vec<&Model> {
         let models = self.models(agent_id);
+        let mut seen = std::collections::HashSet::new();
         self.prefs
             .recent_models
             .get(agent_id)
             .into_iter()
             .flatten()
-            .filter_map(|id| models.iter().find(|m| &m.id == id))
+            .filter_map(|key| find_model(models, key))
+            .filter(|m| seen.insert(m.key()))
             .collect()
+    }
+
+    /// Put a chosen model (selection key) first in the agent's recent list.
+    fn remember_model(&mut self, agent_id: &str, key: &str) {
+        let recent = self
+            .prefs
+            .recent_models
+            .entry(agent_id.to_string())
+            .or_default();
+        recent.retain(|k| k != key);
+        recent.insert(0, key.to_string());
+        recent.truncate(5);
+    }
+
+    /// Selection key of the open session's model, with a node only when it
+    /// is not the agent's own machine.
+    pub fn session_model_key(&self) -> Option<String> {
+        let view = self.session.as_ref()?;
+        let own = self
+            .runtime(&view.agent_id)
+            .and_then(|rt| rt.mesh.as_ref())
+            .and_then(|m| m.peer_id.as_deref());
+        let node = view.model_node.as_deref().filter(|n| Some(*n) != own);
+        Some(model_key(view.model.as_deref()?, node))
+    }
+
+    /// The open session's model in its agent's catalog.
+    pub fn session_model(&self) -> Option<&Model> {
+        let view = self.session.as_ref()?;
+        find_model(self.models(&view.agent_id), &self.session_model_key()?)
     }
 
     pub fn set_launch_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
@@ -1934,18 +2010,10 @@ impl AgentsStore {
         rt.tasks.retain(|t| !t.is_ready());
     }
 
-    pub fn set_launch_model(&mut self, agent_id: &str, model_id: String, cx: &mut Context<Self>) {
-        let recent = self
-            .prefs
-            .recent_models
-            .entry(agent_id.to_string())
-            .or_default();
-        recent.retain(|id| id != &model_id);
-        recent.insert(0, model_id.clone());
-        recent.truncate(5);
-        self.prefs
-            .launch_models
-            .insert(agent_id.to_string(), model_id);
+    /// Choose the model new sessions start with (a selection key).
+    pub fn set_launch_model(&mut self, agent_id: &str, key: String, cx: &mut Context<Self>) {
+        self.remember_model(agent_id, &key);
+        self.prefs.launch_models.insert(agent_id.to_string(), key);
         self.save();
         cx.notify();
     }
@@ -2659,6 +2727,7 @@ impl AgentsStore {
                     view.options = options.clone();
                     view.mode = Some(mode.clone());
                     view.model = model.as_ref().map(|m| m.id.clone());
+                    view.model_node = model.as_ref().and_then(|m| m.node_id.clone());
                     s.session = Some(view);
                     cx.notify();
                 });
@@ -3367,6 +3436,8 @@ impl AgentsStore {
 
     /// Change a session config option (`session/set_config_option`); an empty
     /// `config_id` means the mode of an agent that only has `session/set_mode`.
+    /// Change a session config option; for `model`, `value` is a selection
+    /// key ([`model_key`]), so the model on the chosen machine is sent.
     pub fn set_session_option(&mut self, config_id: &str, value: &str, cx: &mut Context<Self>) {
         let Some(view) = self.session.as_mut() else {
             return;
@@ -3381,18 +3452,23 @@ impl AgentsStore {
         } else {
             config_id.to_string()
         };
+        // The model by selection key: its id goes on the wire, its catalog
+        // entry (with the node) in `_meta`.
+        let model = (config_id == "model")
+            .then(|| find_model(&rt.models, value))
+            .flatten()
+            .cloned();
+        let wire = model.as_ref().map_or(value, |m| m.id.as_str()).to_string();
         view.pending_options.insert(key.clone());
         let req = if config_id.is_empty() {
             rpc.request(
                 "session/set_mode",
-                json!({ "sessionId": session_id, "modeId": value }),
+                json!({ "sessionId": session_id, "modeId": wire }),
             )
         } else {
             let mut params =
-                json!({ "sessionId": session_id, "configId": config_id, "value": value });
-            if config_id == "model"
-                && let Some(model) = rt.models.iter().find(|m| m.id == value)
-            {
+                json!({ "sessionId": session_id, "configId": config_id, "value": wire });
+            if let Some(model) = &model {
                 let mut entry = model.raw.clone();
                 if let Some(obj) = entry.as_object_mut() {
                     obj.remove("availability");
@@ -3401,18 +3477,12 @@ impl AgentsStore {
             }
             rpc.request("session/set_config_option", params)
         };
-        let (config_id, value) = (config_id.to_string(), value.to_string());
-        if config_id == "model" {
-            let recent = self
-                .prefs
-                .recent_models
-                .entry(agent_id.clone())
-                .or_default();
-            recent.retain(|id| id != &value);
-            recent.insert(0, value.clone());
-            recent.truncate(5);
+        let config_id = config_id.to_string();
+        if let Some(model) = &model {
+            self.remember_model(&agent_id, &model.key());
             self.save();
         }
+        let node = model.and_then(|m| m.node_id);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = req.await;
@@ -3429,18 +3499,29 @@ impl AgentsStore {
                     match result {
                         Ok(resp) => {
                             if config_id.is_empty() {
-                                view.mode = Some(value.clone());
+                                view.mode = Some(wire.clone());
                             } else if resp.get("configOptions").is_some() {
                                 view.apply_config(resp.get("configOptions"));
+                                // A confirmation without the model entry names
+                                // the model but not its machine: keep the choice.
+                                if config_id == "model"
+                                    && !view.model_has_entry()
+                                    && view.model.as_deref() == Some(wire.as_str())
+                                {
+                                    view.model_node = node.clone();
+                                }
                             } else {
                                 if let Some(o) = view.options.iter_mut().find(|o| {
                                     o.get("id").and_then(Value::as_str) == Some(&config_id)
                                 }) {
-                                    o["currentValue"] = Value::String(value.clone());
+                                    o["currentValue"] = Value::String(wire.clone());
                                 }
                                 match config_id.as_str() {
-                                    "model" => view.model = Some(value.clone()),
-                                    "mode" => view.mode = Some(value.clone()),
+                                    "model" => {
+                                        view.model = Some(wire.clone());
+                                        view.model_node = node.clone();
+                                    }
+                                    "mode" => view.mode = Some(wire.clone()),
                                     _ => {}
                                 }
                             }
@@ -4572,6 +4653,7 @@ fn parse_models(v: &Value) -> Vec<Model> {
                 provider: s("provider").unwrap_or_default(),
                 model,
                 node: s("node_label").or_else(|| s("node_id")),
+                node_id: s("node_id"),
                 context: None,
                 modalities: Vec::new(),
                 raw: m.clone(),
@@ -5062,6 +5144,64 @@ mod tests {
         assert!(!SendShortcut::ShiftEnter.submits(false, false));
         assert!(SendShortcut::SecondaryEnter.submits(false, true));
         assert!(!SendShortcut::SecondaryEnter.submits(false, false));
+    }
+
+    #[test]
+    fn same_model_on_two_machines_stays_distinct() {
+        let models = parse_models(&json!({ "models": [
+            { "id": "codex/gpt-6.1-sol", "provider": "codex", "model": "gpt-6.1-sol" },
+            { "id": "codex/gpt-6.1-sol", "provider": "codex", "model": "gpt-6.1-sol",
+              "node_id": "peer-thor", "node_label": "thor" },
+        ]}));
+        let (local, remote) = (&models[0], &models[1]);
+        assert_eq!(local.key(), "codex/gpt-6.1-sol");
+        assert_ne!(local.key(), remote.key());
+        assert_eq!(
+            find_model(&models, &remote.key()).unwrap().node.as_deref(),
+            Some("thor")
+        );
+        assert!(find_model(&models, &local.key()).unwrap().node_id.is_none());
+        // A bare id saved before keys had nodes prefers the agent's own model.
+        assert!(find_model(&models[1..], "codex/gpt-6.1-sol").is_some());
+        assert_eq!(remote.describe(), "gpt-6.1-sol from codex on thor");
+
+        let mut store = AgentsStore {
+            configs: Vec::new(),
+            prefs: Prefs::default(),
+            launch: Default::default(),
+            session: None,
+            requests: Vec::new(),
+            runtime: HashMap::new(),
+            _launch_task: None,
+        };
+        store.runtime.entry("a".into()).or_default().models = models.clone();
+        store.remember_model("a", &remote.key());
+        store.remember_model("a", &local.key());
+        let recent: Vec<String> = store.recent_models("a").iter().map(|m| m.key()).collect();
+        assert_eq!(recent, [local.key(), remote.key()]);
+    }
+
+    #[test]
+    fn session_tracks_the_machine_of_its_model() {
+        let option = |node: Option<&str>| {
+            let mut entry = json!({ "id": "codex/m", "provider": "codex", "model": "m" });
+            if let Some(node) = node {
+                entry["node_id"] = json!(node);
+            }
+            json!([{ "id": "model", "type": "select", "currentValue": "codex/m",
+                     "_meta": { "querymt": { "modelEntry": entry } } }])
+        };
+        let mut view = crate::session::SessionView::default();
+        view.apply_config(Some(&option(Some("peer-thor"))));
+        assert_eq!(view.model_node.as_deref(), Some("peer-thor"));
+        // A confirmation without the entry keeps the machine of the same model…
+        view.apply_config(Some(&json!([{ "id": "model", "currentValue": "codex/m" }])));
+        assert_eq!(view.model_node.as_deref(), Some("peer-thor"));
+        // …and drops it for another model.
+        view.apply_config(Some(&json!([{ "id": "model", "currentValue": "codex/n" }])));
+        assert!(view.model_node.is_none());
+        view.apply_config(Some(&option(None)));
+        assert!(view.model_node.is_none());
     }
 
     #[test]

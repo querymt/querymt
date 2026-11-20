@@ -763,6 +763,9 @@ pub struct SessionView {
     pub active_started_at: Option<f64>,
     pub mode: Option<String>,
     pub model: Option<String>,
+    /// Mesh node serving `model`, from the model option's
+    /// `_meta.querymt.modelEntry.node_id`; `None`: the agent's own.
+    pub model_node: Option<String>,
     /// Session config options (`session/new` / `session/load` shape), kept
     /// current through `config_option_update`.
     pub options: Vec<Value>,
@@ -1414,6 +1417,7 @@ impl SessionView {
             active_started_at: self.active_started_at,
             mode: self.mode.clone(),
             model: self.model.clone(),
+            model_node: self.model_node.clone(),
             options: self.options.clone(),
             modes: self.modes.clone(),
             pending_options: self.pending_options.clone(),
@@ -1947,6 +1951,14 @@ impl SessionView {
         self.select_option(&["thought_level", "reasoning", "reasoning_effort", "thought"])
     }
 
+    /// The model option carries its catalog entry, so `model_node` is known.
+    pub fn model_has_entry(&self) -> bool {
+        self.options.iter().any(|o| {
+            o.get("id").and_then(Value::as_str) == Some("model")
+                && o.pointer("/_meta/querymt/modelEntry").is_some()
+        })
+    }
+
     /// Short model label (`anthropic/claude-x` -> `claude-x`), from the model
     /// option's choice label when it has one.
     pub fn model_label(&self) -> Option<String> {
@@ -2069,7 +2081,21 @@ impl SessionView {
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             match o.get("id").and_then(Value::as_str) {
-                Some("model") => self.model = current,
+                Some("model") => {
+                    match o.pointer("/_meta/querymt/modelEntry") {
+                        Some(entry) => {
+                            self.model_node = entry
+                                .get("node_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        }
+                        // Without the entry the machine is unknown: keep it
+                        // for the same model, never carry it to another one.
+                        None if self.model != current => self.model_node = None,
+                        None => {}
+                    }
+                    self.model = current;
+                }
                 Some("mode") => self.mode = current,
                 _ => {}
             }
