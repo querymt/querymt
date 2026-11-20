@@ -1,0 +1,24 @@
+{
+  "task_name": "adaptive-rejection-sampler",
+  "dataset": "harborframework/terminal-bench-2.1",
+  "harness": "querymt",
+  "sandbox": "docker",
+  "reward": 0.0,
+  "rewards": {
+    "reward": 0.0
+  },
+  "reward_key": "reward",
+  "rollout_type": "eval",
+  "capture_level": "text",
+  "n_turns": 8,
+  "n_roots": 1,
+  "budget_stop_count": 0,
+  "n_trainable_tokens": 0,
+  "multi_turn": true,
+  "atif": "match",
+  "trace_source": "atif",
+  "findings": [],
+  "ok": true,
+  "error": null,
+  "exception_type": null
+}

@@ -101,6 +101,19 @@ jobs:
             archive_ext: tar.gz
             cargo_package: querymt-agent
             cargo_features: oauth,dashboard,zbus-secret-service,systemd-credentials,remote
+          # Headless run/export binary for the harness-adapter experiment (default features).
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: qmt-headless
+            bin_name: qmt-headless
+            archive_ext: tar.gz
+            cargo_package: querymt-agent
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            binary: qmt-headless
+            bin_name: qmt-headless
+            archive_ext: tar.gz
+            cargo_package: querymt-agent
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             binary: qmacp
@@ -291,6 +304,14 @@ jobs:
           RUSTFLAGS: ${{ matrix.rust_flags || '' }}
         run: cargo build --release -p ${{ matrix.cargo_package }} --example qmtcode --features "${{ matrix.cargo_features }}" --target ${{ matrix.target }}
 
+      # Build the qmt-headless example binary (default features: no dashboard,
+      # mesh, OAuth or ACP server)
+      - name: Build qmt-headless with Cargo
+        if: matrix.binary == 'qmt-headless'
+        env:
+          QMT_VERSION: ${{ inputs.qmt_version }}
+        run: cargo build --locked --release -p ${{ matrix.cargo_package }} --example qmt-headless --target ${{ matrix.target }}
+
       # Build the standalone ACP (qmacp) and MCP (qmcp) client binaries.
       # Their version is the workspace version plus the git SHA (build.rs).
       - name: Build ${{ matrix.binary }} with Cargo
@@ -308,8 +329,8 @@ jobs:
           STAGING="$ARTIFACT_DIR/$PKG"
           mkdir -p "$STAGING"
           
-          # Copy binary from appropriate location (qmtcode is a cargo example)
-          if [ "${{ matrix.binary }}" = "qmtcode" ]; then
+          # Copy binary from appropriate location (qmtcode and qmt-headless are cargo examples)
+          if [ "${{ matrix.binary }}" = "qmtcode" ] || [ "${{ matrix.binary }}" = "qmt-headless" ]; then
             cp "target/${{ matrix.target }}/release/examples/${{ matrix.bin_name }}" "$STAGING/"
           else
             cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$STAGING/"

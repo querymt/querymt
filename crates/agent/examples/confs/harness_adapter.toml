@@ -1,0 +1,50 @@
+# Harness adapter profile
+#
+# Frozen QueryMT harness profile (run with `qmt-headless run`) used both to train a harness adapter (LoRA, RL) and to
+# serve it. The endpoint, served model name and API key come only from the
+# environment: QMT_BASE_URL, QMT_MODEL and QMT_API_KEY (all required).
+#
+# Model history is append-only (no pruning, no compaction, no context
+# middleware) and model calls are capped by the `limits` middleware. Do not
+# edit this file after training an adapter against it: the published adapter
+# carries a copy and publishing checks its SHA-256.
+
+[profile]
+id = "harness-adapter"
+name = "Harness adapter"
+
+[agent]
+provider = "openai"
+model = "${QMT_MODEL}"
+api_key = "${QMT_API_KEY}"
+tools = [
+  "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
+  "glob", "search_text", "ls", "index", "get_symbol", "get_function",
+  "find_symbol_references", "shell", "todowrite", "todoread",
+]
+system = [
+  { file = "../prompts/default_system.txt" },
+  { file = "../prompts/harness_adapter_meta.jinja2" }
+]
+
+[agent.parameters]
+base_url = "${QMT_BASE_URL}"
+temperature = 0.8
+top_p = 1.0
+
+[agent.execution]
+# Keep earlier messages byte-identical between steps: no per-step objective block.
+run_objective = false
+
+[agent.execution.pruning]
+enabled = false
+
+[agent.execution.compaction]
+auto = false
+
+[agent.execution.snapshot]
+backend = "none"
+
+[[middleware]]
+type = "limits"
+max_steps = 50

@@ -3,9 +3,11 @@
 
 mod dotagents_manifest_preview_test;
 mod dotagents_runtime_e2e_test;
+mod harness_adapter_profile_test;
 mod hybrid_id_scheme_test;
 #[cfg(feature = "remote")]
 mod lan_mesh_capabilities;
 mod model_switching_preserves_system_prompt_test;
+mod qmt_headless_binary_test;
 mod repository_knowledge_matrix;
 mod set_planning_context_preserves_custom_params_test;
