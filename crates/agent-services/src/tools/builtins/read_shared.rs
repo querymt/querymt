@@ -29,120 +29,187 @@ pub async fn render_read_output(
 ) -> Result<Vec<ToolResultPart>, String> {
     let metadata = tokio::fs::metadata(target)
         .await
-        .map_err(|e| format!("stat failed: {}", e))?;
+        .map_err(|e| format!("stat failed: {e}"))?;
 
     if metadata.is_file() {
-        // Guard against loading enormous binaries into memory.
-        if metadata.len() > MAX_BINARY_READ_BYTES {
-            return Ok(vec![ToolResultPart::text(format!(
-                "File too large to read inline ({} bytes, limit {} bytes). \
-                 Use an external tool to process this file.",
-                metadata.len(),
-                MAX_BINARY_READ_BYTES,
-            ))]);
-        }
-
-        let bytes = tokio::fs::read(target)
+        let file = tokio::fs::File::open(target)
             .await
-            .map_err(|e| format!("read failed: {}", e))?;
-
-        // Binary detection: images get returned as validated attachment parts.
-        if let Some(mime_type) = detect_image_mime(&bytes) {
-            let media = MediaPart::new(
-                MediaKind::Image,
-                mime_type.parse().ok(),
-                MediaSource::Inline { data: bytes },
-            )
-            .map_err(|e| format!("invalid image media: {e}"))?;
-            return Ok(vec![ToolResultPart::Attachment(Box::new(media))]);
-        }
-
-        // Not a recognised binary format — try to interpret as UTF-8 text.
-        match String::from_utf8(bytes) {
-            Ok(content) => {
-                let lines: Vec<&str> = content.lines().collect();
-                let total_lines = lines.len();
-                let end_idx = (offset + limit).min(total_lines);
-
-                let mut file_content = String::new();
-                for (idx, line_content) in lines.iter().enumerate().take(end_idx).skip(offset) {
-                    let line_number = idx + 1;
-                    file_content.push_str(&format!("{:05}| {}\n", line_number, line_content));
-                }
-
-                if end_idx < total_lines {
-                    file_content.push_str(&format!(
-                        "\n(File has more lines. Use 'offset' parameter to read beyond line {})\n",
-                        end_idx
-                    ));
-                } else {
-                    file_content
-                        .push_str(&format!("\n(End of file - total {} lines)\n", total_lines));
-                }
-
-                return Ok(vec![ToolResultPart::text(format!(
-                    "<path>{}</path>\n<type>file</type>\n<content>\n{}</content>",
-                    target.display(),
-                    file_content
-                ))]);
-            }
-            Err(_) => {
-                return Ok(vec![ToolResultPart::text(format!(
-                    "Binary file '{}'; not a supported format (image/text). \
-                     Use an external tool to process this file.",
-                    target.display(),
-                ))]);
-            }
-        }
+            .map_err(|e| format!("open failed: {e}"))?;
+        return read_open_file(file, target, offset, limit).await;
     }
 
     if metadata.is_dir() {
         let mut entries = Vec::new();
         let mut dir = tokio::fs::read_dir(target)
             .await
-            .map_err(|e| format!("read dir failed: {}", e))?;
-
+            .map_err(|e| format!("read dir failed: {e}"))?;
         while let Some(entry) = dir
             .next_entry()
             .await
-            .map_err(|e| format!("read dir entry failed: {}", e))?
+            .map_err(|e| format!("read dir entry failed: {e}"))?
         {
-            let name = entry.file_name().to_string_lossy().to_string();
+            let name = entry.file_name().to_string_lossy().into_owned();
             let is_dir = entry
                 .file_type()
                 .await
-                .map_err(|e| format!("stat dir entry failed: {}", e))?
+                .map_err(|e| format!("stat dir entry failed: {e}"))?
                 .is_dir();
             entries.push((name, is_dir));
         }
-
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let total_entries = entries.len();
-        let end_idx = (offset + limit).min(total_entries);
-        let has_more = end_idx < total_entries;
-
-        let mut entries_output = String::new();
-        for (name, is_dir) in entries.iter().take(end_idx).skip(offset) {
+        let total = entries.len();
+        let end = offset.saturating_add(limit).min(total);
+        let mut body = String::new();
+        for (name, is_dir) in entries.iter().take(end).skip(offset) {
+            body.push_str(name);
             if *is_dir {
-                entries_output.push_str(&format!("{}/\n", name));
-            } else {
-                entries_output.push_str(&format!("{}\n", name));
+                body.push('/');
             }
+            body.push('\n');
         }
-
-        let shown = end_idx.saturating_sub(offset.min(total_entries));
-        entries_output.push_str(&format!("({} entries)\n", shown));
-        if has_more {
-            entries_output.push_str("(More entries available. Use a higher offset.)\n");
+        let shown = end.saturating_sub(offset);
+        body.push_str(&format!("({shown} entries)\n"));
+        if end < total {
+            body.push_str("(More entries available. Use a higher offset.)\n");
         }
-
         return Ok(vec![ToolResultPart::text(format!(
-            "<path>{}</path>\n<type>directory</type>\n<entries>\n{}</entries>",
+            "<path>{}</path>\n<type>directory</type>\n<entries>\n{body}</entries>",
             target.display(),
-            entries_output
         ))]);
     }
 
-    Err("Target is neither a file nor a directory".to_string())
+    Err("Target is neither a file nor a directory".into())
+}
+
+async fn read_open_file(
+    file: tokio::fs::File,
+    label: &Path,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<ToolResultPart>, String> {
+    use std::fmt::Write as _;
+    use tokio::io::AsyncReadExt as _;
+
+    let too_large = || {
+        vec![ToolResultPart::text(format!(
+            "File too large to read inline (limit {MAX_BINARY_READ_BYTES} bytes). Use an external tool to process this file."
+        ))]
+    };
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|e| format!("stat failed: {e}"))?;
+    if !metadata.is_file() {
+        return Err("Target is not a regular file".into());
+    }
+    if metadata.len() > MAX_BINARY_READ_BYTES {
+        return Ok(too_large());
+    }
+    let mut bytes = Vec::new();
+    let count = file
+        .take(MAX_BINARY_READ_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    if count as u64 > MAX_BINARY_READ_BYTES {
+        return Ok(too_large());
+    }
+    if let Some(mime_type) = detect_image_mime(&bytes) {
+        let media = MediaPart::new(
+            MediaKind::Image,
+            mime_type.parse().ok(),
+            MediaSource::Inline { data: bytes },
+        )
+        .map_err(|e| format!("invalid image media: {e}"))?;
+        return Ok(vec![ToolResultPart::Attachment(Box::new(media))]);
+    }
+    let Ok(content) = String::from_utf8(bytes) else {
+        return Ok(vec![ToolResultPart::text(format!(
+            "Binary file '{}'; not a supported format (image/text). Use an external tool to process this file.",
+            label.display(),
+        ))]);
+    };
+    let total = content.lines().count();
+    let end = offset.saturating_add(limit).min(total);
+    let mut body = String::new();
+    for (index, line) in content.lines().enumerate().take(end).skip(offset) {
+        let _ = writeln!(body, "{:05}| {line}", index + 1);
+    }
+    if end < total {
+        let _ = writeln!(
+            body,
+            "\n(File has more lines. Use 'offset' parameter to read beyond line {end})"
+        );
+    } else {
+        let _ = writeln!(body, "\n(End of file - total {total} lines)");
+    }
+    Ok(vec![ToolResultPart::text(format!(
+        "<path>{}</path>\n<type>file</type>\n<content>\n{body}</content>",
+        label.display(),
+    ))])
+}
+
+/// Read a regular file from an already selected workspace root. The kernel
+/// confines path resolution; rendering never opens the requested path again.
+/// Platforms without the required confinement primitive refuse the operation.
+#[cfg(target_os = "linux")]
+pub async fn render_confined_file(
+    root: &Path,
+    relative: &Path,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<ToolResultPart>, String> {
+    use rustix::fs::{self, FileType, Mode, OFlags, ResolveFlags};
+    use std::os::fd::AsFd;
+    use std::path::Component;
+
+    if !root.is_absolute()
+        || !relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return Err("workspace path is not confined".into());
+    }
+    let root = root.to_owned();
+    let relative = relative.to_owned();
+    let label = relative.clone();
+    let file = tokio::task::spawn_blocking(move || {
+        let root = fs::openat2(
+            fs::CWD,
+            &root,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        )?;
+        let target = fs::openat2(
+            &root,
+            &relative,
+            OFlags::PATH | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+        )?;
+        let stat = fs::fstat(&target)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_nlink != 1 {
+            return Err(std::io::Error::other(
+                "workspace reads require a regular, single-link file",
+            ));
+        }
+        // Reopen the verified inode via our own descriptor, not the user's path.
+        use std::os::fd::AsRawFd as _;
+        std::fs::File::open(format!("/proc/self/fd/{}", target.as_fd().as_raw_fd()))
+    })
+    .await
+    .map_err(|e| format!("workspace read task failed: {e}"))?
+    .map_err(|e| format!("workspace file unavailable: {e}"))?;
+    read_open_file(tokio::fs::File::from_std(file), &label, offset, limit).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn render_confined_file(
+    _root: &Path,
+    _relative: &Path,
+    _offset: usize,
+    _limit: usize,
+) -> Result<Vec<ToolResultPart>, String> {
+    Err("confined workspace reads are not supported on this host".into())
 }

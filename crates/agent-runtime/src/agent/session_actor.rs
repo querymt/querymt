@@ -2198,7 +2198,6 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
     ) -> Self::Reply {
         use crate::agent::file_proxy::{FileProxyError, ReadRemoteFileResponse};
         use crate::tools::builtins::read_shared::render_read_output;
-        use base64::Engine as _;
 
         let cwd = self
             .runtime
@@ -2228,26 +2227,63 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
             .await
             .map_err(FileProxyError::ReadError)?;
 
-        // Map the single result part returned by render_read_output to the
-        // appropriate ReadRemoteFileResponse variant.
-        let Some(block) = blocks.into_iter().next() else {
-            return Ok(ReadRemoteFileResponse::Binary);
+        Ok(ReadRemoteFileResponse::from_blocks(blocks))
+    }
+}
+
+#[cfg(feature = "remote")]
+pub(crate) struct ReadPeerFile(pub(crate) ReadRemoteFile);
+
+#[cfg(feature = "remote")]
+impl Message<ReadPeerFile> for SessionActor {
+    type Reply = Result<
+        crate::agent::file_proxy::ReadRemoteFileResponse,
+        crate::agent::file_proxy::FileProxyError,
+    >;
+
+    async fn handle(
+        &mut self,
+        ReadPeerFile(msg): ReadPeerFile,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        use crate::agent::file_proxy::{FileProxyError, ReadRemoteFileResponse, is_shareable_path};
+        use crate::tools::builtins::read_shared::{DEFAULT_READ_LIMIT, render_confined_file};
+        use std::path::Path;
+
+        let cwd = self
+            .runtime
+            .cwd
+            .as_deref()
+            .ok_or(FileProxyError::NoWorkingDirectory)?;
+        // Anchor to the session's workspace, not an ancestor discovered by a
+        // fresh scan influenced by files the peer can access.
+        let index = self
+            .runtime
+            .workspace_handle
+            .get()
+            .and_then(|workspace| workspace.file_index());
+        let root = index.as_ref().map_or(cwd, |index| index.root.as_path());
+        let supplied = Path::new(&msg.path);
+        let joined = if supplied.is_absolute() {
+            supplied.to_owned()
+        } else {
+            cwd.join(supplied)
         };
-        match block {
-            querymt::chat::ToolResultPart::Attachment(media) => Ok(ReadRemoteFileResponse::Image {
-                mime_type: media
-                    .media_type()
-                    .map(ToString::to_string)
-                    .unwrap_or_default(),
-                base64_data: match media.source() {
-                    querymt::chat::MediaSource::Inline { data } => {
-                        base64::engine::general_purpose::STANDARD.encode(data)
-                    }
-                    _ => String::new(),
-                },
-            }),
-            querymt::chat::ToolResultPart::Text { text } => Ok(ReadRemoteFileResponse::Text(text)),
+        let relative = joined
+            .strip_prefix(root)
+            .map_err(|_| FileProxyError::AccessDenied)?;
+        if !is_shareable_path(relative) {
+            return Err(FileProxyError::AccessDenied);
         }
+        let blocks = render_confined_file(
+            root,
+            relative,
+            msg.offset,
+            msg.limit.min(DEFAULT_READ_LIMIT),
+        )
+        .await
+        .map_err(FileProxyError::ReadError)?;
+        Ok(ReadRemoteFileResponse::from_blocks(blocks))
     }
 }
 

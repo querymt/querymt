@@ -75,7 +75,81 @@ pub(crate) fn register_session_routes(
         return;
     };
     register_session_history(router, actor);
+    register_file_proxy(router, actor);
     register_session_subscriptions(router, mesh, store.clone(), actor);
+}
+
+pub(super) fn register_file_proxy(router: &InboundRouter, actor: &ActorRef<SessionActor>) {
+    use crate::agent::file_proxy::{FileProxyError, is_shareable_path};
+    use crate::agent::session_actor::ReadPeerFile;
+    use std::path::Path;
+
+    let weak = actor.downgrade();
+    let index = move |_, message: messages::GetFileIndex| {
+        let weak = weak.clone();
+        async move {
+            let actor = weak
+                .upgrade()
+                .ok_or_else(|| FileProxyError::ActorSend("session stopped".into()))?;
+            let mut index = actor
+                .ask(message)
+                .mailbox_timeout(Duration::from_secs(3))
+                .reply_timeout(Duration::from_secs(10))
+                .send()
+                .await
+                .map_err(file_proxy_send_error)?;
+            index
+                .files
+                .retain(|entry| is_shareable_path(Path::new(&entry.path)));
+            Ok::<_, FileProxyError>(index)
+        }
+    };
+    let weak = actor.downgrade();
+    let read = move |_, message| {
+        let weak = weak.clone();
+        async move {
+            let actor = weak
+                .upgrade()
+                .ok_or_else(|| FileProxyError::ActorSend("session stopped".into()))?;
+            actor
+                .ask(ReadPeerFile(message))
+                .mailbox_timeout(Duration::from_secs(3))
+                .reply_timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(file_proxy_send_error)
+        }
+    };
+    router.register_ask::<SessionActor, messages::GetFileIndex, _, _, _, _>(
+        actor.id(),
+        InboundAccess::LegacyFull,
+        index.clone(),
+    );
+    router.register_v1_ask::<SessionActor, messages::GetFileIndex, _, _, _, _>(
+        actor.id(),
+        InboundAccess::Filesystem,
+        index,
+    );
+    router.register_ask::<SessionActor, messages::ReadRemoteFile, _, _, _, _>(
+        actor.id(),
+        InboundAccess::LegacyFull,
+        read.clone(),
+    );
+    router.register_v1_ask::<SessionActor, messages::ReadRemoteFile, _, _, _, _>(
+        actor.id(),
+        InboundAccess::Filesystem,
+        read,
+    );
+}
+
+fn file_proxy_send_error<M>(
+    error: kameo::error::SendError<M, crate::agent::file_proxy::FileProxyError>,
+) -> crate::agent::file_proxy::FileProxyError {
+    use crate::agent::file_proxy::FileProxyError;
+    match error {
+        kameo::error::SendError::HandlerError(error) => error,
+        other => FileProxyError::ActorSend(other.to_string()),
+    }
 }
 
 pub(super) fn register_session_subscriptions(

@@ -183,6 +183,43 @@ impl SessionActorRef {
         Ok(())
     }
 
+    async fn request_remote_file<M, R>(
+        mesh: Option<&crate::agent::remote::MeshHandle>,
+        actor: &kameo::actor::RemoteActorRef<SessionActor>,
+        message: &M,
+    ) -> Result<R, FileProxyError>
+    where
+        SessionActor: kameo::message::Message<M> + kameo::remote::RemoteMessage<M>,
+        M: serde::Serialize + Send + Sync + 'static,
+        <SessionActor as kameo::message::Message<M>>::Reply:
+            kameo::reply::Reply<Ok = R, Error = FileProxyError>,
+        R: serde::de::DeserializeOwned,
+    {
+        use querymt_remote::mesh_ingress::{SharingCallError, SharingRejection};
+        use querymt_remote::request_timeout::{SharingAskError, ask_with_sharing};
+
+        let timeout = Self::REMOTE_IO_REPLY_TIMEOUT;
+        let error = match mesh {
+            Some(mesh) => match ask_with_sharing(mesh, actor, message, timeout).await {
+                Ok(response) => return Ok(response),
+                Err(SharingAskError::Actor(error)) => error,
+                Err(SharingAskError::Sharing(SharingCallError::Rejected(
+                    SharingRejection::Denied | SharingRejection::Changed,
+                ))) => return Err(FileProxyError::AccessDenied),
+                Err(SharingAskError::Sharing(SharingCallError::Transport(error))) => error.into(),
+                Err(error) => return Err(FileProxyError::ActorSend(error.to_string())),
+            },
+            None => match querymt_remote::ask_remote_with_timeout(actor, message, timeout).await {
+                Ok(response) => return Ok(response),
+                Err(error) => error,
+            },
+        };
+        Err(match querymt_remote::classify_remote_send_error(error) {
+            Ok(failure) => FileProxyError::from_transport_failure(failure),
+            Err(error) => error,
+        })
+    }
+
     async fn read_remote<M>(
         mesh: Option<&crate::agent::remote::MeshHandle>,
         actor: &kameo::actor::RemoteActorRef<SessionActor>,
@@ -1416,21 +1453,11 @@ impl SessionActorRef {
                 .map_err(|e| FileProxyError::ActorSend(e.to_string())),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::GetFileIndex)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_IO_REPLY_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| {
-                    match classify_remote_send_error_with_timeout_message(
-                        e,
-                        "GetFileIndex timed out on remote session",
-                    ) {
-                        Ok(failure) => FileProxyError::from_transport_failure(failure),
-                        Err(handler_error) => handler_error,
-                    }
-                }),
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                Self::request_remote_file(mesh.as_deref(), actor_ref, &messages::GetFileIndex).await
+            }
         }
     }
 
@@ -1466,25 +1493,20 @@ impl SessionActorRef {
                 .map_err(|e| FileProxyError::ActorSend(e.to_string())),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::ReadRemoteFile {
-                    path,
-                    offset,
-                    limit,
-                })
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_IO_REPLY_TIMEOUT)
-                .send()
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                Self::request_remote_file(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &messages::ReadRemoteFile {
+                        path,
+                        offset,
+                        limit,
+                    },
+                )
                 .await
-                .map_err(|e| {
-                    match classify_remote_send_error_with_timeout_message(
-                        e,
-                        "ReadRemoteFile timed out on remote session",
-                    ) {
-                        Ok(failure) => FileProxyError::from_transport_failure(failure),
-                        Err(handler_error) => handler_error,
-                    }
-                }),
+            }
         }
     }
 

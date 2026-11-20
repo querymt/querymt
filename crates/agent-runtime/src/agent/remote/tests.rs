@@ -1259,11 +1259,19 @@ mod node_manager_tests {
 
         let mesh = get_test_mesh().await;
         let (manager, config, _dir) = spawn_test_node_manager_with_mesh().await;
-        let (SessionActorRef::Local(session), _) =
-            spawn_test_session_with_id(config, "retained-reference").await
-        else {
-            panic!("fixture session must be local");
-        };
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = SessionRuntime::new(
+            Some(workspace.path().canonicalize().unwrap()),
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let stored = config
+            .provider
+            .history_store()
+            .create_session(Some("retained-reference".into()), None, None, None)
+            .await
+            .expect("persist fixture session");
+        let session = SessionActor::spawn(SessionActor::new(config, stored.public_id, runtime));
         let host = *mesh.peer_id();
         let peer = libp2p::PeerId::random();
         let store = Arc::new(Store(
@@ -1283,6 +1291,7 @@ mod node_manager_tests {
         let ingress = InboundRouter::new(host, store.clone());
         RemoteNodeManager::register_guarded_discovery(&ingress, store.clone(), &manager);
         crate::agent::remote::remote_actor_impl::register_session_history(&ingress, &session);
+        crate::agent::remote::remote_actor_impl::register_file_proxy(&ingress, &session);
         let actor = session.id();
         let history = || node_ask::<SessionActor, _>(actor, &crate::agent::messages::GetHistory);
         let listing = || {
@@ -1302,6 +1311,59 @@ mod node_manager_tests {
             ingress.handle_v1(peer, listing()).await,
             Ok(SwarmResponse::Ask(Ok(_)))
         ));
+        let read = |path: &str| {
+            node_ask::<SessionActor, _>(
+                actor,
+                &crate::agent::messages::ReadRemoteFile {
+                    path: path.to_owned(),
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+        };
+        assert!(matches!(
+            ingress.handle_v1(peer, read("example.txt")).await,
+            Err(SharingRejection::Denied)
+        ));
+        assert!(matches!(
+            ingress
+                .handle_v1(
+                    peer,
+                    node_ask::<SessionActor, _>(actor, &crate::agent::messages::GetFileIndex)
+                )
+                .await,
+            Err(SharingRejection::Denied)
+        ));
+        #[cfg(target_os = "linux")]
+        {
+            use crate::agent::file_proxy::ReadRemoteFileResponse;
+            std::fs::write(workspace.path().join("example.txt"), "from workspace\n").unwrap();
+            let external = tempfile::NamedTempFile::new().unwrap();
+            std::os::unix::fs::symlink(external.path(), workspace.path().join("external.txt"))
+                .unwrap();
+            *store.1.lock() = PeerGrantState {
+                revision: Uuid::now_v7(),
+                grant: PeerGrant::Custom {
+                    sessions: true,
+                    filesystem: true,
+                    providers: vec![],
+                },
+            };
+            let Ok(SwarmResponse::Ask(Ok(reply))) =
+                ingress.handle_v1(peer, read("example.txt")).await
+            else {
+                panic!("granted workspace file must be readable")
+            };
+            assert!(
+                matches!(rmp_serde::from_slice::<ReadRemoteFileResponse>(&reply).unwrap(), ReadRemoteFileResponse::Text(text) if text.contains("from workspace"))
+            );
+            for path in ["external.txt", external.path().to_str().unwrap()] {
+                assert!(matches!(
+                    ingress.handle_v1(peer, read(path)).await,
+                    Ok(SwarmResponse::Ask(Err(RemoteSendError::HandlerError(_))))
+                ));
+            }
+        }
         *store.1.lock() = PeerGrantState {
             revision: Uuid::now_v7(),
             grant: PeerGrant::None,
