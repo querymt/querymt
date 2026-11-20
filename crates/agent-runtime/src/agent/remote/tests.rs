@@ -1106,10 +1106,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn guarded_admission_binds_peer_and_keeps_discovery_identity_only() {
-        use kameo::remote::{
-            RemoteActor, RemoteMessage,
-            messaging::{SwarmRequest, SwarmResponse},
-        };
+        use kameo::remote::messaging::SwarmResponse;
         use querymt_remote::mesh_ingress::{InboundRouter, MeshIngress};
         use querymt_remote::peer_access::{
             GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState,
@@ -1136,20 +1133,6 @@ mod node_manager_tests {
                 Ok(Vec::new())
             }
         }
-        fn ask<M: serde::Serialize>(actor_id: kameo::actor::ActorId, message: &M) -> SwarmRequest
-        where
-            RemoteNodeManager: RemoteMessage<M>,
-        {
-            SwarmRequest::Ask {
-                actor_id,
-                actor_remote_id: <RemoteNodeManager as RemoteActor>::REMOTE_ID.into(),
-                message_remote_id: <RemoteNodeManager as RemoteMessage<M>>::REMOTE_ID.into(),
-                payload: rmp_serde::to_vec_named(message).unwrap(),
-                mailbox_timeout: None,
-                reply_timeout: None,
-                immediate: false,
-            }
-        }
 
         let mesh = get_test_mesh().await;
         let (actor, _config, _td) = spawn_test_node_manager_with_mesh().await;
@@ -1168,7 +1151,10 @@ mod node_manager_tests {
             peer_id: joiner.to_string(),
         };
         let SwarmResponse::Ask(Err(RemoteSendError::HandlerError(bytes))) = ingress
-            .handle_legacy(libp2p::PeerId::random(), ask(actor.id(), &request))
+            .handle_legacy(
+                libp2p::PeerId::random(),
+                node_ask::<RemoteNodeManager, _>(actor.id(), &request),
+            )
             .await
         else {
             panic!("expected a caller mismatch")
@@ -1179,7 +1165,10 @@ mod node_manager_tests {
             crate::agent::remote::node_manager::AdmissionRejection::PeerIdMismatch
         );
         let SwarmResponse::Ask(Ok(bytes)) = ingress
-            .handle_v1(joiner, ask(actor.id(), &request))
+            .handle_v1(
+                joiner,
+                node_ask::<RemoteNodeManager, _>(actor.id(), &request),
+            )
             .await
             .unwrap()
         else {
@@ -1200,7 +1189,10 @@ mod node_manager_tests {
             )
         );
         let SwarmResponse::Ask(Ok(bytes)) = ingress
-            .handle_v1(joiner, ask(actor.id(), &GetNodeInfo))
+            .handle_v1(
+                joiner,
+                node_ask::<RemoteNodeManager, _>(actor.id(), &GetNodeInfo),
+            )
             .await
             .unwrap()
         else {
@@ -1210,6 +1202,124 @@ mod node_manager_tests {
         assert_eq!(info.node_id.as_peer_id(), mesh.peer_id());
         assert!(info.capabilities.is_empty());
         assert_eq!(info.active_sessions, None);
+    }
+
+    fn node_ask<A, M>(
+        actor_id: kameo::actor::ActorId,
+        message: &M,
+    ) -> kameo::remote::messaging::SwarmRequest
+    where
+        A: kameo::remote::RemoteActor + kameo::remote::RemoteMessage<M>,
+        M: serde::Serialize,
+    {
+        kameo::remote::messaging::SwarmRequest::Ask {
+            actor_id,
+            actor_remote_id: <A as kameo::remote::RemoteActor>::REMOTE_ID.into(),
+            message_remote_id: <A as kameo::remote::RemoteMessage<M>>::REMOTE_ID.into(),
+            payload: rmp_serde::to_vec_named(message).unwrap(),
+            mailbox_timeout: None,
+            reply_timeout: None,
+            immediate: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn sessions_off_blocks_an_existing_reference() {
+        use kameo::remote::messaging::SwarmResponse;
+        use querymt_remote::mesh_ingress::{InboundRouter, MeshIngress, SharingRejection};
+        use querymt_remote::peer_access::{
+            GrantStore, GrantStoreError, PeerGrant, PeerGrantKey, PeerGrantState,
+        };
+
+        struct Store(PeerGrantKey, parking_lot::Mutex<PeerGrantState>);
+        #[async_trait::async_trait]
+        impl GrantStore for Store {
+            async fn grant(&self, key: &PeerGrantKey) -> Result<PeerGrantState, GrantStoreError> {
+                Ok(if *key == self.0 {
+                    self.1.lock().clone()
+                } else {
+                    PeerGrantState::default()
+                })
+            }
+            async fn replace_grant(
+                &self,
+                _: &PeerGrantKey,
+                _: Uuid,
+                _: PeerGrant,
+            ) -> Result<PeerGrantState, GrantStoreError> {
+                unreachable!("test changes its fixture state directly")
+            }
+            async fn managed_peers(
+                &self,
+                _: &querymt_remote::NodeId,
+            ) -> Result<Vec<querymt_remote::NodeId>, GrantStoreError> {
+                unreachable!("not used by reads")
+            }
+        }
+
+        let mesh = get_test_mesh().await;
+        let (manager, config, _dir) = spawn_test_node_manager_with_mesh().await;
+        let (SessionActorRef::Local(session), _) =
+            spawn_test_session_with_id(config, "retained-reference").await
+        else {
+            panic!("fixture session must be local");
+        };
+        let host = *mesh.peer_id();
+        let peer = libp2p::PeerId::random();
+        let store = Arc::new(Store(
+            PeerGrantKey {
+                host: querymt_remote::NodeId::from_peer_id(host),
+                peer: querymt_remote::NodeId::from_peer_id(peer),
+            },
+            parking_lot::Mutex::new(PeerGrantState {
+                revision: Uuid::now_v7(),
+                grant: PeerGrant::Custom {
+                    sessions: true,
+                    filesystem: false,
+                    providers: vec![],
+                },
+            }),
+        ));
+        let ingress = InboundRouter::new(host, store.clone());
+        RemoteNodeManager::register_guarded_discovery(&ingress, store.clone(), &manager);
+        crate::agent::remote::remote_actor_impl::register_session_history(&ingress, &session);
+        let actor = session.id();
+        let history = || node_ask::<SessionActor, _>(actor, &crate::agent::messages::GetHistory);
+        let listing = || {
+            node_ask::<RemoteNodeManager, _>(
+                manager.id(),
+                &ListRemoteSessions {
+                    offset: None,
+                    limit: None,
+                },
+            )
+        };
+        assert!(matches!(
+            ingress.handle_v1(peer, history()).await,
+            Ok(SwarmResponse::Ask(Ok(_)))
+        ));
+        assert!(matches!(
+            ingress.handle_v1(peer, listing()).await,
+            Ok(SwarmResponse::Ask(Ok(_)))
+        ));
+        *store.1.lock() = PeerGrantState {
+            revision: Uuid::now_v7(),
+            grant: PeerGrant::None,
+        };
+        assert!(matches!(
+            ingress.handle_v1(peer, history()).await,
+            Err(SharingRejection::Denied)
+        ));
+        assert!(matches!(
+            ingress.handle_v1(peer, listing()).await,
+            Err(SharingRejection::Denied)
+        ));
+        assert!(
+            session
+                .ask(crate::agent::messages::GetHistory)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

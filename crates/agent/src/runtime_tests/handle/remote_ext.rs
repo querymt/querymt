@@ -2005,6 +2005,23 @@ async fn unreachable_owner_with_local_window_serves_stale_snapshot() {
 
 #[cfg(feature = "remote")]
 #[tokio::test]
+async fn confirmed_denial_cannot_fall_back_to_cached_history() {
+    let (viewer, _) = viewer_with_synced_history("rs-denied", "node-z", 4).await;
+    let error = viewer
+        .handle
+        .build_remote_attach_snapshot_with_budget(
+            "rs-denied",
+            Some(crate::session::history_window::LoadWindow::default()),
+            Err(crate::error::AgentError::MeshAccessDenied),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("confirmed denial must not return a cached snapshot");
+    assert_eq!(error.data.unwrap()["code"], "mesh_access_denied");
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
 async fn load_session_with_unreachable_owner_serves_the_local_window_as_stale() {
     // No mesh in this fixture: connecting to the owner fails outright.
     let (viewer, _) = viewer_with_synced_history("rs-5", "node-v", 4).await;

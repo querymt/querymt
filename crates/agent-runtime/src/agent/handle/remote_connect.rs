@@ -1296,7 +1296,7 @@ impl LocalAgentHandle {
             });
         }
         state.wait_synced().await;
-        Ok(())
+        connected.session_ref.check_history_access().await
     }
 
     /// Build candidate metadata without mutating durable state. Persistence is

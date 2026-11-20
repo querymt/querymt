@@ -2,6 +2,32 @@ use super::*;
 
 impl LocalAgentHandle {
     #[cfg(feature = "remote")]
+    async fn read_remote_session_metadata<M, R>(
+        &self,
+        node: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        request: &M,
+    ) -> Result<R, agent_client_protocol::Error>
+    where
+        crate::agent::remote::RemoteNodeManager:
+            kameo::message::Message<M> + kameo::remote::RemoteMessage<M>,
+        M: serde::Serialize + Send + Sync + 'static,
+        <crate::agent::remote::RemoteNodeManager as kameo::message::Message<M>>::Reply:
+            kameo::reply::Reply<Ok = R, Error = crate::error::AgentError>,
+        R: serde::de::DeserializeOwned,
+    {
+        use crate::error::AgentError;
+        let mesh = self.mesh().ok_or(AgentError::MeshNotBootstrapped)?;
+        querymt_remote::request_timeout::ask_with_sharing(
+            &mesh,
+            node,
+            request,
+            Self::remote_request_timeout(),
+        )
+        .await
+        .map_err(|error| AgentError::from_sharing_ask(error).into())
+    }
+
+    #[cfg(feature = "remote")]
     fn map_remote_node_manager_error(
         error: kameo::error::RemoteSendError<crate::error::AgentError>,
     ) -> agent_client_protocol::Error {
@@ -369,14 +395,8 @@ impl LocalAgentHandle {
         agent_client_protocol::Error,
     > {
         use crate::agent::remote::ListRemoteSessions;
-        let timeout = Self::remote_request_timeout();
-        querymt_remote::ask_remote_with_timeout(
-            node_manager_ref,
-            &ListRemoteSessions { offset, limit },
-            timeout,
-        )
-        .await
-        .map_err(Self::map_remote_node_manager_error)
+        self.read_remote_session_metadata(node_manager_ref, &ListRemoteSessions { offset, limit })
+            .await
     }
 
     /// List a filtered owner page and its authoritative lifecycle metadata.
@@ -393,8 +413,7 @@ impl LocalAgentHandle {
         crate::agent::remote::node_manager::ListRemoteSessionsWithLifecycleResponse,
         agent_client_protocol::Error,
     > {
-        let timeout = Self::remote_request_timeout();
-        querymt_remote::ask_remote_with_timeout(
+        self.read_remote_session_metadata(
             node_manager_ref,
             &crate::agent::remote::ListRemoteSessionsWithLifecycle {
                 offset,
@@ -403,10 +422,8 @@ impl LocalAgentHandle {
                 scope,
                 lifecycle,
             },
-            timeout,
         )
         .await
-        .map_err(Self::map_remote_node_manager_error)
     }
 
     /// Read lifecycle state from the authoritative owner without attaching an actor.
@@ -416,14 +433,11 @@ impl LocalAgentHandle {
         node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
         session_id: String,
     ) -> Result<crate::session::lifecycle::SessionLifecycle, agent_client_protocol::Error> {
-        let timeout = Self::remote_request_timeout();
-        querymt_remote::ask_remote_with_timeout(
+        self.read_remote_session_metadata(
             node_manager_ref,
             &crate::agent::remote::GetRemoteSessionLifecycle { session_id },
-            timeout,
         )
         .await
-        .map_err(Self::map_remote_node_manager_error)
     }
 
     /// Patch lifecycle state on the authoritative owner without attaching an actor.

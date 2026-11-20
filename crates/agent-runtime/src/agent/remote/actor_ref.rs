@@ -43,6 +43,8 @@ pub enum SessionActorRef {
         peer_label: String,
         /// Stable node id for routing/identity; display should continue using `peer_label`.
         remote_node_id: Option<String>,
+        /// Transport used to negotiate sharing with the session owner.
+        mesh: Option<std::sync::Arc<crate::agent::remote::MeshHandle>>,
     },
 }
 
@@ -165,6 +167,50 @@ impl SessionActorRef {
             actor_ref,
             peer_label,
             remote_node_id: None,
+            mesh: None,
+        }
+    }
+
+    /// Check the current grant without transferring history before serving a cached read.
+    pub(crate) async fn check_history_access(&self) -> Result<(), AgentError> {
+        if let Self::Remote {
+            mesh: Some(mesh), ..
+        } = self
+            && mesh.inbound_router().is_some()
+        {
+            self.get_event_stream_since(Some(i64::MAX), 1).await?;
+        }
+        Ok(())
+    }
+
+    async fn read_remote<M>(
+        mesh: Option<&crate::agent::remote::MeshHandle>,
+        actor: &kameo::actor::RemoteActorRef<SessionActor>,
+        message: &M,
+        timeout: Duration,
+    ) -> Result<
+        <<SessionActor as kameo::message::Message<M>>::Reply as kameo::reply::Reply>::Ok,
+        AgentError,
+    >
+    where
+        SessionActor: kameo::message::Message<M> + kameo::remote::RemoteMessage<M>,
+        M: serde::Serialize + Send + Sync + 'static,
+        <SessionActor as kameo::message::Message<M>>::Reply:
+            kameo::reply::Reply<Error = AgentError>,
+        <<SessionActor as kameo::message::Message<M>>::Reply as kameo::reply::Reply>::Ok:
+            serde::de::DeserializeOwned,
+    {
+        match mesh {
+            Some(mesh) => {
+                querymt_remote::request_timeout::ask_with_sharing(mesh, actor, message, timeout)
+                    .await
+                    .map_err(AgentError::from_sharing_ask)
+            }
+            None => querymt_remote::ask_remote_with_timeout(actor, message, timeout)
+                .await
+                .map_err(|error| {
+                    Self::map_agent_timeout_remote_send_error(error, "session read timed out")
+                }),
         }
     }
 }
@@ -803,18 +849,16 @@ impl SessionActorRef {
                 .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::GetHistory)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| {
-                    AcpError::from(Self::map_agent_timeout_remote_send_error(
-                        e,
-                        "GetHistory timed out on remote session",
-                    ))
-                }),
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => Self::read_remote(
+                mesh.as_deref(),
+                actor_ref,
+                &messages::GetHistory,
+                Self::REMOTE_HISTORY_REPLY_TIMEOUT,
+            )
+            .await
+            .map_err(AcpError::from),
         }
     }
 
@@ -839,18 +883,17 @@ impl SessionActorRef {
                 .await
                 .map_err(Self::map_local_agent_send_error),
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&request)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
-                .send()
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                Self::read_remote(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &request,
+                    Self::REMOTE_HISTORY_REPLY_TIMEOUT,
+                )
                 .await
-                .map_err(|e| {
-                    Self::map_agent_timeout_remote_send_error(
-                        e,
-                        "GetUserPrompts timed out on remote session",
-                    )
-                }),
+            }
         };
         match direct {
             Err(error) if crate::agent::event_chunk::is_unsupported_message(&error) => {
@@ -921,19 +964,16 @@ impl SessionActorRef {
                 .map_err(|e| AgentError::RemoteActor(e.to_string())),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => {
-                let page = actor_ref
-                    .ask(&message)
-                    .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                    .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        Self::map_agent_timeout_remote_send_error(
-                            e,
-                            "GetEventStreamSince timed out on remote session",
-                        )
-                    })?;
+            Self::Remote {
+                actor_ref, mesh, ..
+            } => {
+                let page = Self::read_remote(
+                    mesh.as_deref(),
+                    actor_ref,
+                    &message,
+                    Self::REMOTE_HISTORY_REPLY_TIMEOUT,
+                )
+                .await?;
                 crate::agent::load_telemetry::record_mesh_history_request(page.events.len());
                 Ok(page)
             }
@@ -966,6 +1006,7 @@ impl SessionActorRef {
                 actor_ref,
                 peer_label,
                 remote_node_id,
+                mesh,
             } => {
                 let owner = remote_node_id.as_deref().unwrap_or(peer_label);
                 crate::agent::event_chunk::chunk_with_fallback(
@@ -973,18 +1014,13 @@ impl SessionActorRef {
                     &crate::agent::event_chunk::CHUNK_SUPPORT,
                     request,
                     |request| async move {
-                        let chunk = actor_ref
-                            .ask(&request)
-                            .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                            .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
-                            .send()
-                            .await
-                            .map_err(|e| {
-                                Self::map_agent_timeout_remote_send_error(
-                                    e,
-                                    "GetEventStreamChunk timed out on remote session",
-                                )
-                            })?;
+                        let chunk = Self::read_remote(
+                            mesh.as_deref(),
+                            actor_ref,
+                            &request,
+                            Self::REMOTE_HISTORY_REPLY_TIMEOUT,
+                        )
+                        .await?;
                         crate::agent::load_telemetry::record_mesh_history_request(
                             chunk.events.len(),
                         );

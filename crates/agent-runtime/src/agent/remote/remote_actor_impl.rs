@@ -18,7 +18,53 @@
 use crate::agent::messages;
 use crate::agent::remote::event_relay::{EventRelayActor, RelayLagged, RelayedEvent};
 use crate::agent::session_actor::SessionActor;
-use kameo::remote::_internal;
+use crate::error::AgentError;
+use kameo::actor::ActorRef;
+use kameo::message::Message;
+use kameo::remote::{_internal, RemoteActor, RemoteMessage};
+use kameo::reply::Reply;
+use querymt_remote::mesh_ingress::{InboundAccess, InboundRouter};
+use std::time::Duration;
+
+// Use only for reads that are safe under the session grant. Mutations must
+// carry their authenticated origin into the actor and deferred work instead.
+pub(crate) fn register_session_read<A, M>(router: &InboundRouter, actor: &ActorRef<A>)
+where
+    A: RemoteActor + RemoteMessage<M> + Message<M>,
+    M: serde::de::DeserializeOwned + Send + 'static,
+    A::Reply: Reply<Error = AgentError>,
+    <A::Reply as Reply>::Ok: serde::Serialize + Send,
+{
+    let weak = actor.downgrade();
+    let read = move |_, msg| {
+        let weak = weak.clone();
+        async move {
+            let actor = weak
+                .upgrade()
+                .ok_or_else(|| AgentError::RemoteActor("session reader stopped".into()))?;
+            actor
+                .ask(msg)
+                .mailbox_timeout(Duration::from_secs(10))
+                .reply_timeout(Duration::from_secs(60))
+                .send()
+                .await
+                .map_err(|error| match error {
+                    kameo::error::SendError::HandlerError(error) => error,
+                    other => AgentError::RemoteActor(other.to_string()),
+                })
+        }
+    };
+    router.register_ask::<A, M, _, _, _, _>(actor.id(), InboundAccess::LegacyFull, read.clone());
+    router.register_v1_ask::<A, M, _, _, _, _>(actor.id(), InboundAccess::Sessions, read);
+}
+
+pub(crate) fn register_session_history(router: &InboundRouter, actor: &ActorRef<SessionActor>) {
+    register_session_read::<_, messages::GetHistory>(router, actor);
+    register_session_read::<_, messages::GetUserPrompts>(router, actor);
+    register_session_read::<_, messages::GetEventStream>(router, actor);
+    register_session_read::<_, messages::GetEventStreamSince>(router, actor);
+    register_session_read::<_, messages::GetEventStreamChunk>(router, actor);
+}
 
 // ── RemoteActor ──────────────────────────────────────────────────────────
 

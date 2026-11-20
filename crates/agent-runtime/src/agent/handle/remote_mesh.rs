@@ -145,6 +145,11 @@ impl LocalAgentHandle {
                 .collect::<Vec<_>>()
         };
         for (session_id, actor_ref) in local_sessions {
+            if let Some(router) = runtime.as_mesh_handle().inbound_router() {
+                crate::agent::remote::remote_actor_impl::register_session_history(
+                    router, &actor_ref,
+                );
+            }
             let dht_name = crate::agent::remote::scope::scoped_session(scope, &session_id);
             runtime.register_actor(actor_ref, dht_name).await;
         }

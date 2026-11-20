@@ -343,6 +343,11 @@ impl SessionRegistry {
             let runtime = MeshRuntimeHandle::from(mesh.clone());
             let scopes = runtime.active_scopes();
             for (session_id, actor_ref) in &self.local_actor_refs {
+                if let Some(router) = mesh.inbound_router() {
+                    crate::agent::remote::remote_actor_impl::register_session_history(
+                        router, actor_ref,
+                    );
+                }
                 for scope in &scopes {
                     let dht_name = scoped_session(scope, session_id);
                     let runtime = runtime.clone();
@@ -531,6 +536,11 @@ impl SessionRegistry {
             && let Some(ref mesh) = self.mesh
         {
             let runtime = MeshRuntimeHandle::from(mesh.clone());
+            if let Some(router) = mesh.inbound_router() {
+                crate::agent::remote::remote_actor_impl::register_session_history(
+                    router, &actor_ref,
+                );
+            }
             for scope in runtime.active_scopes() {
                 let dht_name = scoped_session(&scope, &session_id);
                 let runtime = runtime.clone();
@@ -551,6 +561,11 @@ impl SessionRegistry {
     pub fn remove(&mut self, session_id: &str) -> Option<SessionActorRef> {
         #[cfg(feature = "remote")]
         if let Some(ref mesh) = self.mesh {
+            if let (Some(router), Some(actor)) =
+                (mesh.inbound_router(), self.local_actor_refs.get(session_id))
+            {
+                router.withdraw_actor(actor.id());
+            }
             let runtime = MeshRuntimeHandle::from(mesh.clone());
             for scope in runtime.active_scopes() {
                 let session_dht_name = scoped_session(&scope, session_id);
@@ -614,6 +629,7 @@ impl SessionRegistry {
             actor_ref,
             peer_label,
             remote_node_id,
+            ..
         } = &session_ref
         else {
             return None;
@@ -964,6 +980,7 @@ pub(crate) async fn prepare_remote_attachment(
         actor_ref: remote_ref.clone(),
         peer_label: peer_label.clone(),
         remote_node_id: remote_node_id.clone(),
+        mesh: mesh.clone().map(Arc::new),
     };
     let relay_ref = EventRelayActor::spawn(
         EventRelayActor::new(
@@ -1191,6 +1208,7 @@ async fn cleanup_attachment_parts(parts: RemoteAttachmentCleanupParts<'_>, notif
             actor_ref,
             remote_node_id,
             peer_label,
+            ..
         } => (
             actor_ref.id().sequence_id(),
             remote_node_id.as_deref().unwrap_or(""),

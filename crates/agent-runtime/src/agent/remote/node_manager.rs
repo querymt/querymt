@@ -521,6 +521,10 @@ mod remote_impl {
             use querymt_remote::peer_access::{PeerGrant, SharingProtocol};
 
             Self::register_admission(router, actor);
+            use crate::agent::remote::remote_actor_impl::register_session_read;
+            register_session_read::<_, ListRemoteSessions>(router, actor);
+            register_session_read::<_, ListRemoteSessionsWithLifecycle>(router, actor);
+            register_session_read::<_, GetRemoteSessionLifecycle>(router, actor);
             let weak = actor.downgrade();
             let describe = move |origin: PeerRequest, msg: GetNodeInfo| {
                 let weak = weak.clone();
@@ -920,6 +924,11 @@ mod remote_impl {
                 return SessionHandoff::no_attach_path();
             }
 
+            if let Some(router) = self.mesh.as_ref().and_then(MeshHandle::inbound_router) {
+                crate::agent::remote::remote_actor_impl::register_session_history(
+                    router, &actor_ref,
+                );
+            }
             match std::panic::AssertUnwindSafe(async { actor_ref.into_remote_ref().await })
                 .catch_unwind()
                 .await
