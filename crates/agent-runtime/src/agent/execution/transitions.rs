@@ -258,13 +258,12 @@ pub(super) async fn transition_before_llm_call(
         });
     }
     // Clones the whole history, so its cost grows with the conversation.
-    let messages = info_span!(
+    let mut messages = info_span!(
         "agent.request.cache_breakpoints",
         message_count = messages.len() as u64
     )
     .in_scope(|| apply_cache_breakpoints(&messages));
     // The tail follows the hinted durable messages and carries no hint.
-    let mut messages = messages;
     messages.extend(request_tail);
     // Re-evaluate room after history, steering, tools, and context hooks are prepared.
     let mut options = context.request_overrides;
@@ -294,11 +293,12 @@ fn system_prompt_hash(
         .llm_config()
         .and_then(|llm| llm.params.as_ref())
         .and_then(|params| params.get("system"));
+    // A JSON value and an optional string always serialize.
     let bytes = match pinned {
         Some(system) => serde_json::to_vec(system),
         None => serde_json::to_vec(&config.provider.initial_config().system),
     }
-    .unwrap_or_default();
+    .expect("system prompt serializes to JSON");
     querymt_agent_core::hash::RapidHash::new(&bytes)
 }
 
@@ -1862,17 +1862,12 @@ pub(super) async fn transition_after_llm(
     }
 
     let new_context = Arc::new(
-        crate::middleware::ConversationContext::new(
-            context.session_id.clone(),
-            Arc::from(messages.into_boxed_slice()),
-            Arc::new(updated_stats),
-            context.provider.clone(),
-            context.model.clone(),
-        )
-        .with_session_mode(context.session_mode)
-        .with_profile(context.profile.clone())
-        .with_last_applied(response.applied)
-        .carrying_notices_from(context),
+        context
+            .with_history(
+                Arc::from(messages.into_boxed_slice()),
+                Arc::new(updated_stats),
+            )
+            .with_last_applied(response.applied),
     );
 
     let output_status = structured_output.as_ref().and_then(|output| output.status);
@@ -6513,7 +6508,7 @@ mod tests {
             grown.push(user("c"));
             let (change, idle) =
                 send(&fixture, &exec, &mut events, "mock-model", grown.clone()).await;
-            assert_eq!(change, Some(CachePrefixChange::None));
+            assert_eq!(change, Some(CachePrefixChange::Unchanged));
             assert!(idle.is_some_and(|secs| secs < 5), "idle: {idle:?}");
 
             let (change, _) =

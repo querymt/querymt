@@ -2094,19 +2094,10 @@ pub(super) async fn store_all_tool_results(
             .map_err(|error| anyhow::anyhow!("Invalid stored tool result content: {error}"))?,
     );
 
-    let new_context = Arc::new(
-        crate::middleware::ConversationContext::new(
-            context.session_id.clone(),
-            Arc::from(messages.into_boxed_slice()),
-            context.stats.clone(),
-            context.provider.clone(),
-            context.model.clone(),
-        )
-        .with_session_mode(context.session_mode)
-        .with_profile(context.profile.clone())
-        .with_last_applied(context.last_applied)
-        .carrying_notices_from(context),
-    );
+    let new_context = Arc::new(context.with_history(
+        Arc::from(messages.into_boxed_slice()),
+        context.stats.clone(),
+    ));
 
     // Aggregate changed file paths from tool results for dedup check
     let mut combined = querymt_agent_index::DiffPaths::default();

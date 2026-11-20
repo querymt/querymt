@@ -221,20 +221,15 @@ pub(super) async fn run_ai_compaction(
         new_stats.context_tokens = new_context_tokens;
 
         Arc::new(
-            crate::middleware::ConversationContext::new(
-                ctx.session_id.clone(),
+            ctx.with_history(
                 Arc::from(chat_messages.into_boxed_slice()),
                 Arc::new(new_stats),
-                ctx.provider.clone(),
-                ctx.model.clone(),
             )
-            .with_session_mode(ctx.session_mode)
             // Compaction may have removed the stored reminder; read the
             // surviving one so the next request stores it again if needed.
             .with_stored_mode_notice(crate::session::provider::last_mode_notice(
                 &filtered_messages,
-            ))
-            .with_profile(ctx.profile.clone()),
+            )),
         )
     } else {
         return Err(anyhow::anyhow!("No context available for compaction"));
@@ -454,8 +449,12 @@ pub(crate) async fn compact_history(
     if let Some(section) =
         crate::session::compaction::active_task_section(exec_ctx.state.active_task.as_ref())
     {
-        result.summary_token_count += section.len() / 4;
-        result.summary = format!("{}\n\n{section}", result.summary);
+        use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
+        result.summary_token_count = result
+            .summary_token_count
+            .saturating_add(SimpleTokenEstimator.estimate(&section));
+        result.summary.push_str("\n\n");
+        result.summary.push_str(&section);
     }
 
     let post_hook = match config

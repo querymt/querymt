@@ -6,6 +6,7 @@
 use crate::tools::ToolExecutionClass;
 use crate::tools::context::{FileAccess, Tool};
 use crate::tools::registry::{ToolRegistry, file_access_of};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -32,7 +33,7 @@ impl ToolSet {
     /// Definitions of all tools, one per name (session tools win).
     pub fn definitions(&self) -> Vec<querymt::chat::Tool> {
         let mut defs = self.session.definitions();
-        let shadowed = self.session.names();
+        let shadowed: HashSet<String> = self.session.names().into_iter().collect();
         defs.extend(
             self.agent
                 .names()

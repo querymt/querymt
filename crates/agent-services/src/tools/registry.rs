@@ -1,25 +1,22 @@
 //! Tool registry for managing and finding tools
 
 use crate::tools::context::{FileAccess, Tool};
-use indexmap::IndexMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Registry for managing available tools.
 ///
-/// Tools are kept in registration order, so `definitions()` and `names()` are
-/// deterministic: the tool declarations sent to a model do not change order
-/// between processes (which would break prompt-prefix reuse).
+/// Tools are kept sorted by name (byte order), so `definitions()` and
+/// `names()` are deterministic regardless of registration order or process.
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
-    tools: IndexMap<String, Arc<dyn Tool>>,
+    tools: BTreeMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self {
-            tools: IndexMap::new(),
-        }
+        Self::default()
     }
 
     pub fn add(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
@@ -34,7 +31,7 @@ impl ToolRegistry {
         self
     }
 
-    /// Definitions of all tools, in registration order.
+    /// Definitions of all tools, ordered by name.
     pub fn definitions(&self) -> Vec<querymt::chat::Tool> {
         self.tools.values().map(|tool| tool.definition()).collect()
     }
@@ -98,9 +95,10 @@ impl ToolRegistry {
     }
 
     pub fn remove(&mut self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.shift_remove(name)
+        self.tools.remove(name)
     }
 
+    /// Names of all tools, ordered by name.
     pub fn names(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
     }
@@ -213,38 +211,28 @@ mod tests {
             .collect()
     }
 
-    /// Two registries built separately (as two processes would) from the same
-    /// registrations list their tools identically, in registration order, both
-    /// through `definitions()` and through `names()` (which `ToolSet` uses).
+    /// Listing is ordered by name (bytes) and does not depend on the order
+    /// tools were registered in.
     #[test]
-    fn listing_follows_registration_order_across_separately_built_registries() {
-        let names = [
-            "write_file",
-            "shell",
-            "read_tool",
-            "edit",
-            "glob",
-            "search_text",
-            "todowrite",
-            "skill",
-            "question",
-            "browse",
-            "delete_file",
-            "multiedit",
-        ];
-        let (first, second) = (registry_of(&names), registry_of(&names));
+    fn listing_is_ordered_by_name_whatever_the_registration_order() {
+        let names = ["write_file", "shell", "Zed", "read_tool", "edit", "glob"];
+        let mut sorted = names;
+        sorted.sort_unstable();
+        let mut reversed = names;
+        reversed.reverse();
 
-        assert_eq!(definition_names(&first), names);
-        assert_eq!(definition_names(&first), definition_names(&second));
-        assert_eq!(first.names(), names);
-        assert_eq!(first.names(), second.names());
+        for order in [names, reversed] {
+            let registry = registry_of(&order);
+            assert_eq!(definition_names(&registry), sorted);
+            assert_eq!(registry.names(), sorted);
+        }
     }
 
     #[test]
     fn removing_a_tool_keeps_the_order_of_the_rest() {
         let mut registry = registry_of(&["c", "a", "b", "d"]);
         registry.remove("a");
-        assert_eq!(registry.names(), ["c", "b", "d"]);
+        assert_eq!(registry.names(), ["b", "c", "d"]);
     }
 
     #[tokio::test]

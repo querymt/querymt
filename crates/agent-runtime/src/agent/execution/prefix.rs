@@ -8,6 +8,7 @@
 
 use querymt::chat::ChatMessage;
 use querymt_agent_core::hash::RapidHash;
+use std::sync::Arc;
 use std::time::Instant;
 
 pub(crate) use querymt_agent_core::events::CachePrefixChange as PrefixChange;
@@ -28,7 +29,8 @@ pub(crate) struct PrefixAttribution {
 /// comparison and the fingerprint costs eight bytes per message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PrefixFingerprint {
-    model: String,
+    provider: Arc<str>,
+    model: Arc<str>,
     tools: RapidHash,
     system: RapidHash,
     history: Vec<RapidHash>,
@@ -36,14 +38,15 @@ pub(crate) struct PrefixFingerprint {
 
 impl PrefixFingerprint {
     pub(crate) fn new(
-        provider: &str,
-        model: &str,
+        provider: &Arc<str>,
+        model: &Arc<str>,
         tools: RapidHash,
         system: RapidHash,
         durable_messages: &[ChatMessage],
     ) -> Self {
         Self {
-            model: format!("{provider}/{model}"),
+            provider: Arc::clone(provider),
+            model: Arc::clone(model),
             tools,
             system,
             history: durable_messages.iter().map(message_hash).collect(),
@@ -53,7 +56,7 @@ impl PrefixFingerprint {
     /// First difference from `previous`, in the order model, tools, system,
     /// history. Appended history is not a difference.
     fn change_from(&self, previous: &Self) -> PrefixChange {
-        if self.model != previous.model {
+        if self.provider != previous.provider || self.model != previous.model {
             PrefixChange::Model
         } else if self.tools != previous.tools {
             PrefixChange::Tools
@@ -62,7 +65,7 @@ impl PrefixFingerprint {
         } else if !self.history.starts_with(&previous.history) {
             PrefixChange::History
         } else {
-            PrefixChange::None
+            PrefixChange::Unchanged
         }
     }
 }
@@ -77,7 +80,8 @@ fn message_hash(message: &ChatMessage) -> RapidHash {
     } else {
         serde_json::to_vec(message)
     }
-    .unwrap_or_else(|error| error.to_string().into_bytes());
+    // A chat message is plain data with string keys: it always serializes.
+    .expect("chat message serializes to JSON");
     RapidHash::new(&bytes)
 }
 
@@ -139,8 +143,8 @@ mod tests {
         history: &[ChatMessage],
     ) -> PrefixFingerprint {
         PrefixFingerprint::new(
-            "anthropic",
-            model,
+            &Arc::from("anthropic"),
+            &Arc::from(model),
             RapidHash::new(tools),
             RapidHash::new(system),
             history,
@@ -174,7 +178,7 @@ mod tests {
             fingerprint("m", b"t", b"s", &next),
             ended + Duration::from_secs(12),
         );
-        assert_eq!(a.change, PrefixChange::None);
+        assert_eq!(a.change, PrefixChange::Unchanged);
         assert_eq!(a.idle_secs, Some(12));
     }
 
@@ -186,7 +190,7 @@ mod tests {
             fingerprint("m", b"t", b"s", &first),
             ended + Duration::from_secs(1800),
         );
-        assert_eq!(a.change, PrefixChange::None);
+        assert_eq!(a.change, PrefixChange::Unchanged);
         assert_eq!(a.idle_secs, Some(1800));
     }
 
@@ -203,8 +207,8 @@ mod tests {
         let first = [user("a")];
         let (mut state, ended) = after_first(&first);
         let switched = PrefixFingerprint::new(
-            "openai",
-            "m",
+            &Arc::from("openai"),
+            &Arc::from("m"),
             RapidHash::new(b"t"),
             RapidHash::new(b"s"),
             &first,
@@ -269,7 +273,7 @@ mod tests {
             fingerprint("m", b"t", b"s", &[user("a"), user("b"), user("c")]),
             ended,
         );
-        assert_eq!(a.change, PrefixChange::None);
+        assert_eq!(a.change, PrefixChange::Unchanged);
     }
 
     #[test]
@@ -282,7 +286,7 @@ mod tests {
             fingerprint("m", b"t", b"s", &first),
             ended + Duration::from_secs(5),
         );
-        assert_eq!(a.change, PrefixChange::None);
+        assert_eq!(a.change, PrefixChange::Unchanged);
         assert_eq!(a.idle_secs, Some(5));
     }
 
@@ -303,7 +307,7 @@ mod tests {
             PrefixChange::Tools,
             PrefixChange::System,
             PrefixChange::History,
-            PrefixChange::None,
+            PrefixChange::Unchanged,
         ]
         .into_iter()
         .map(PrefixChange::as_str)

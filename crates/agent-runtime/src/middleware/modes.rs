@@ -326,18 +326,7 @@ mod tests {
 
     /// Mimics the loop storing queued notices: the last one becomes the stored notice.
     fn stored(context: &ConversationContext, mode: AgentMode) -> Arc<ConversationContext> {
-        let last = context.last_mode_notice().map(Arc::from);
-        Arc::new(
-            ConversationContext::new(
-                "s".into(),
-                Arc::from([]),
-                Arc::new(crate::middleware::AgentStats::default()),
-                "mock".into(),
-                "mock".into(),
-            )
-            .with_session_mode(mode)
-            .with_stored_mode_notice(last),
-        )
+        self::context(mode, context.last_mode_notice())
     }
 
     #[tokio::test]

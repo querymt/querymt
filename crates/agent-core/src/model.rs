@@ -615,8 +615,13 @@ where
 }
 
 /// Who raised a stored [`MessagePart::Notice`].
+///
+/// A source this build does not know (written by a newer build) loads as
+/// [`Unknown`](Self::Unknown) instead of failing the whole history load; the
+/// notice text is still sent to the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum NoticeSource {
     AgentMode,
     OutputLimit,
@@ -628,24 +633,9 @@ pub enum NoticeSource {
     ParallelEdit,
     ContextUsage,
     BackgroundCommand,
-}
-
-impl NoticeSource {
-    /// The wire name of this source, as stored and reported in history.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::AgentMode => "agent_mode",
-            Self::OutputLimit => "output_limit",
-            Self::ProgressReview => "progress_review",
-            Self::StopHook => "stop_hook",
-            Self::TaskCompletion => "task_completion",
-            Self::DuplicateToolCall => "duplicate_tool_call",
-            Self::DuplicateCode => "duplicate_code",
-            Self::ParallelEdit => "parallel_edit",
-            Self::ContextUsage => "context_usage",
-            Self::BackgroundCommand => "background_command",
-        }
-    }
+    /// Any source added by a later build.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1244,8 +1234,6 @@ mod tests {
         assert_eq!(back, turn);
     }
 
-    /// A stored turn id that is not a UUID must not fail loading, and records
-    /// carrying the same text must still pair.
     /// Rollback risk for stored notices: a reader built before the `notice`
     /// kind existed has no variant for it and rejects the whole part. The
     /// storage layer turns that into a failed history load.
@@ -1277,6 +1265,27 @@ mod tests {
         assert_eq!(message.to_chat_message().unwrap().text(), "plan mode");
     }
 
+    /// A notice source added by a later build must not fail loading.
+    #[test]
+    fn unknown_notice_source_loads_as_unknown_and_keeps_its_text() {
+        let part: MessagePart = serde_json::from_str(
+            r#"{"type":"Notice","data":{"source":"tool_change","content":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            part,
+            MessagePart::Notice {
+                source: NoticeSource::Unknown,
+                content: "x".into(),
+            }
+        );
+        let mut message = AgentMessage::new("s".into(), ChatRole::User);
+        message.parts.push(part);
+        assert_eq!(message.to_chat_message().unwrap().text(), "x");
+    }
+
+    /// A stored turn id that is not a UUID must not fail loading, and records
+    /// carrying the same text must still pair.
     #[test]
     fn turn_id_that_is_not_a_uuid_still_pairs() {
         let literal = |kind: &str, extra: &str| {

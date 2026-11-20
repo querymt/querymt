@@ -237,13 +237,23 @@ impl ConversationContext {
         next
     }
 
-    /// Carry queued notices and the stored mode notice over from `previous`
-    /// to a rebuilt context (builder-style).
+    /// A context over a new history with new stats.
+    ///
+    /// Everything else carries over, notice state included (queued notices,
+    /// stored mode notice), so a rebuild cannot silently drop it. The two
+    /// request-scoped values are reset: the run objective is attached again
+    /// for every request, and request overrides are consumed by exactly one
+    /// request. Chain `with_request_overrides` / `with_last_applied` /
+    /// `with_stored_mode_notice` to set them on the result.
     #[must_use]
-    pub fn carrying_notices_from(mut self, previous: &ConversationContext) -> Self {
-        self.pending_notices = previous.pending_notices.clone();
-        self.stored_mode_notice = previous.stored_mode_notice.clone();
-        self
+    pub fn with_history(&self, messages: Arc<[ChatMessage]>, stats: Arc<AgentStats>) -> Self {
+        Self {
+            messages,
+            stats,
+            request_objective: None,
+            request_overrides: GenerationOptions::NONE,
+            ..self.clone()
+        }
     }
 
     /// Set the stored mode notice (builder-style).

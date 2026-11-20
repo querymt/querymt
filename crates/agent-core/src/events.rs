@@ -36,10 +36,9 @@ pub enum StopType {
     Other,
 }
 
-/// What an output-limit recovery step did.
-/// Typeshare-annotated: generated for TypeScript and Swift.
 /// Why a model request's cache prefix differs from the previous request's.
 /// When several apply, the first in declaration order after `FirstRequest`.
+/// Typeshare-annotated: generated for TypeScript and Swift.
 #[typeshare]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -50,7 +49,9 @@ pub enum CachePrefixChange {
     Tools,
     System,
     History,
-    None,
+    /// The prefix is unchanged: only history was appended.
+    #[serde(rename = "none")]
+    Unchanged,
 }
 
 impl CachePrefixChange {
@@ -62,11 +63,13 @@ impl CachePrefixChange {
             Self::Tools => "tools",
             Self::System => "system",
             Self::History => "history",
-            Self::None => "none",
+            Self::Unchanged => "none",
         }
     }
 }
 
+/// What an output-limit recovery step did.
+/// Typeshare-annotated: generated for TypeScript and Swift.
 #[typeshare]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -3296,7 +3299,7 @@ mod tests {
             CachePrefixChange::Tools,
             CachePrefixChange::System,
             CachePrefixChange::History,
-            CachePrefixChange::None,
+            CachePrefixChange::Unchanged,
         ] {
             assert_eq!(
                 serde_json::to_value(change).unwrap(),

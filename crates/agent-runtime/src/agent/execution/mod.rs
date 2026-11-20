@@ -337,18 +337,12 @@ pub(crate) async fn apply_pending_steering(
         );
     }
 
-    let next = crate::middleware::ConversationContext::new(
-        context.session_id.clone(),
-        Arc::from(messages.into_boxed_slice()),
-        context.stats.clone(),
-        context.provider.clone(),
-        context.model.clone(),
-    )
-    .with_session_mode(context.session_mode)
-    .with_profile(context.profile.clone())
-    .with_last_applied(context.last_applied)
-    .with_request_overrides(context.request_overrides)
-    .carrying_notices_from(context);
+    let next = context
+        .with_history(
+            Arc::from(messages.into_boxed_slice()),
+            context.stats.clone(),
+        )
+        .with_request_overrides(context.request_overrides);
     Ok(Some(Arc::new(next)))
 }
 
@@ -362,45 +356,50 @@ fn queue_progress_review(
     )
 }
 
-/// Store queued notices as user messages before the model request.
+/// Store all queued notices as one user message (one `Notice` part each)
+/// before the model request.
 ///
 /// Runs at the point where steering is applied, after any tool results in the
-/// context, so a notice never sits between a tool call and its result. Nothing
-/// is stored for a request that is never sent: the queue lives on the context
-/// and is dropped with it.
+/// context, so a notice never sits between a tool call and its result. One
+/// message (instead of one per notice) avoids a run of consecutive user
+/// messages and makes the write all-or-nothing. After a tool batch it still
+/// follows the tool-result user message; providers whose chat template
+/// requires strictly alternating roles must merge adjacent user messages.
+///
+/// Nothing is stored for a request that is never sent: the queue lives on the
+/// context and is dropped with it.
 pub(crate) async fn store_pending_notices(
     exec_ctx: &ExecutionContext,
     context: &Arc<crate::middleware::ConversationContext>,
 ) -> Result<Arc<crate::middleware::ConversationContext>, anyhow::Error> {
+    use querymt_agent_core::model::{AgentMessage, MessagePart};
+
     if context.pending_notices.is_empty() {
         return Ok(context.clone());
     }
-    let mut messages = context.messages.to_vec();
-    let mut stored_mode_notice = context.stored_mode_notice.clone();
-    for notice in context.pending_notices.iter() {
-        if notice.source == querymt_agent_core::model::NoticeSource::AgentMode {
-            stored_mode_notice = Some(Arc::from(notice.content.as_str()));
-        }
-        let mut message = querymt_agent_core::model::AgentMessage::new(
-            exec_ctx.session_id.clone(),
-            querymt::chat::ChatRole::User,
-        );
-        message
-            .parts
-            .push(querymt_agent_core::model::MessagePart::Notice {
+    let mut message = AgentMessage::new(exec_ctx.session_id.clone(), querymt::chat::ChatRole::User);
+    message.parts.extend(
+        context
+            .pending_notices
+            .iter()
+            .map(|notice| MessagePart::Notice {
                 source: notice.source,
                 content: notice.content.clone(),
-            });
-        let chat_message = message
-            .to_chat_message()
-            .map_err(|error| anyhow::anyhow!("Invalid notice content: {error}"))?;
-        exec_ctx.add_message(message).await?;
-        messages.push(chat_message);
-    }
+            }),
+    );
+    let chat_message = message
+        .to_chat_message()
+        .map_err(|error| anyhow::anyhow!("Invalid notice content: {error}"))?;
+    exec_ctx.add_message(message).await?;
+
+    let mut messages = context.messages.to_vec();
+    messages.push(chat_message);
     let mut next = (**context).clone();
     next.messages = Arc::from(messages.into_boxed_slice());
+    if let Some(mode) = context.last_mode_notice() {
+        next.stored_mode_notice = Some(Arc::from(mode));
+    }
     next.pending_notices = Arc::from([]);
-    next.stored_mode_notice = stored_mode_notice;
     Ok(Arc::new(next))
 }
 
@@ -587,10 +586,11 @@ pub(crate) async fn execute_cycle_state_machine(
                     steps,
                     last_objective_checkpoint_step,
                 );
-                let context = if checkpoint_due {
+                let mut context = context;
+                if checkpoint_due {
                     last_objective_checkpoint_step = steps;
                     // Stored as a notice whether or not the objective is sent.
-                    let context = Arc::new(queue_progress_review(&context));
+                    context = Arc::new(queue_progress_review(&context));
                     config.emit_event(
                         &exec_ctx.session_id,
                         AgentEventKind::ObjectiveCheckpoint {
@@ -610,10 +610,7 @@ pub(crate) async fn execute_cycle_state_machine(
                                 .map(|t| t.revision),
                         },
                     );
-                    context
-                } else {
-                    context
-                };
+                }
                 let context = refresh_objective(config, &context, exec_ctx);
                 // Price limits read this cycle's committed accounting, which
                 // includes cache and auxiliary (compaction/summary) attempts
@@ -820,17 +817,10 @@ pub(crate) async fn execute_cycle_state_machine(
                 exec_ctx.compaction_summaries = summaries;
                 let history = Arc::from(history.into_boxed_slice());
                 let fallback_context = Arc::new(
-                    crate::middleware::ConversationContext::new(
-                        context.session_id.clone(),
-                        history,
-                        context.stats.clone(),
-                        context.provider.clone(),
-                        context.model.clone(),
-                    )
-                    .with_session_mode(context.session_mode)
-                    .with_profile(context.profile.clone())
-                    .carrying_notices_from(&context)
-                    .with_stored_mode_notice(stored_mode_notice),
+                    context
+                        .with_history(history, context.stats.clone())
+                        .with_last_applied(querymt::chat::GenerationOptions::NONE)
+                        .with_stored_mode_notice(stored_mode_notice),
                 );
                 if let Some(context) = apply_pending_steering(
                     config,
@@ -1605,7 +1595,6 @@ mod tests {
 
         let (fixture, exec_ctx, context) = notice_fixture().await;
         let mut last = 0usize;
-        let mut stored_reviews = 0;
         let mut context = context;
         for steps in 1..=10usize {
             if crate::agent::objective::progress_review_due(steps, last) {
@@ -1616,17 +1605,14 @@ mod tests {
             context = super::store_pending_notices(&exec_ctx, &context)
                 .await
                 .unwrap();
-            stored_reviews = stored_notices(&fixture, &exec_ctx.session_id).await.len();
         }
-        assert_eq!(stored_reviews, 1);
-        assert_eq!(
-            stored_notices(&fixture, &exec_ctx.session_id).await[0].0,
-            NoticeSource::ProgressReview
-        );
+        let stored = stored_notices(&fixture, &exec_ctx.session_id).await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].0, NoticeSource::ProgressReview);
     }
 
-    #[tokio::test]
-    async fn progress_review_with_the_objective_enabled_keeps_it_out_of_the_objective() {
+    #[test]
+    fn progress_review_with_the_objective_enabled_keeps_it_out_of_the_objective() {
         // The review is a stored notice; the rendered objective never carries it.
         let objective = crate::agent::objective::RunObjective::new(
             querymt_agent_core::model::TurnId::new(),
@@ -1645,22 +1631,54 @@ mod tests {
     #[tokio::test]
     async fn prefix_is_stable_when_a_notice_is_stored() {
         let (_fixture, exec_ctx, context) = notice_fixture().await;
-        let before: Vec<String> = context
-            .messages
-            .iter()
-            .map(|message| format!("{message:?}"))
-            .collect();
+        let before = serde_json::to_value(&*context.messages).unwrap();
         let queued = Arc::new(super::queue_progress_review(&context));
         let stored = super::store_pending_notices(&exec_ctx, &queued)
             .await
             .unwrap();
-        let after: Vec<String> = stored
-            .messages
+        let after = serde_json::to_value(&stored.messages[..context.messages.len()]).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(stored.messages.len(), context.messages.len() + 1);
+    }
+
+    /// Several queued notices become one stored user message, so roles keep
+    /// alternating and the write is all-or-nothing.
+    #[tokio::test]
+    async fn several_notices_are_stored_as_one_message() {
+        use querymt_agent_core::model::{MessagePart, NoticeSource};
+
+        let (fixture, exec_ctx, context) = notice_fixture().await;
+        let queued = context
+            .queue_notice(NoticeSource::DuplicateToolCall, "same call".into())
+            .queue_notice(NoticeSource::AgentMode, "plan reminder".into());
+
+        let stored = super::store_pending_notices(&exec_ctx, &Arc::new(queued))
+            .await
+            .unwrap();
+
+        assert_eq!(stored.messages.len(), context.messages.len() + 1);
+        assert_eq!(stored.stored_mode_notice.as_deref(), Some("plan reminder"));
+        assert!(stored.pending_notices.is_empty());
+        let history = fixture
+            .config
+            .provider
+            .history_store()
+            .get_history(&exec_ctx.session_id)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "one stored message");
+        let sources: Vec<_> = history[0]
+            .parts
             .iter()
-            .map(|message| format!("{message:?}"))
+            .filter_map(|part| match part {
+                MessagePart::Notice { source, .. } => Some(*source),
+                _ => None,
+            })
             .collect();
-        assert_eq!(&after[..before.len()], &before[..]);
-        assert_eq!(after.len(), before.len() + 1);
+        assert_eq!(
+            sources,
+            [NoticeSource::DuplicateToolCall, NoticeSource::AgentMode]
+        );
     }
 
     fn objective_for(prompt: &str) -> crate::agent::objective::RunObjective {
