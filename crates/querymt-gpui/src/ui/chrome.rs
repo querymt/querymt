@@ -165,6 +165,7 @@ impl QmtApp {
             Page::Sessions => "Sessions",
             Page::Agents => "Agents",
             Page::Mesh => "Mesh",
+            Page::Automations => "Automations",
             Page::Session => "Session",
             Page::Settings => "Settings",
         };

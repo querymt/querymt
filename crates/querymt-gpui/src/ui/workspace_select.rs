@@ -1,4 +1,4 @@
-//! Workspace path field of the Start composer with completion: the
+//! Workspace path field (Start composer, New automation) with completion: the
 //! workspaces the session list knows about, plus (for an agent on this
 //! machine) the folders under the typed path, both fuzzy-matched.
 //!
@@ -7,14 +7,17 @@
 //! closes the list.
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Enter, Escape, IndentInline, Input, MoveDown, MoveUp};
+use gpui_kit::component::input::{
+    Enter, Escape, IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp,
+};
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::{QmtApp, kit};
-use crate::store::Endpoint;
-use crate::theme::Palette;
+use super::kit;
+use super::smooth_scroll::SmoothScroll;
+use crate::store::{AgentsStore, Endpoint};
+use crate::theme::palette;
 use crate::util::{fuzzy_score, workspace_name};
 
 /// Known workspaces shown at most (they come before folders).
@@ -145,7 +148,7 @@ fn list_dirs(base: &str) -> Vec<String> {
         .collect()
 }
 
-/// The browser has no filesystem; [`QmtApp::local_fs`] is false there.
+/// The browser has no filesystem; [`WorkspaceField::local_fs`] is false there.
 #[cfg(target_family = "wasm")]
 fn list_dirs(_base: &str) -> Vec<String> {
     Vec::new()
@@ -161,16 +164,102 @@ fn home_dir() -> Option<String> {
     None
 }
 
-impl QmtApp {
-    /// The agent sessions start on runs on this machine, so its paths can be
-    /// completed from the local filesystem.
+/// A workspace path input with completion. Owns the completion state; the
+/// input itself is shared with whoever reads the path.
+pub(super) struct WorkspaceField {
+    store: Entity<AgentsStore>,
+    input: Entity<InputState>,
+    /// Agent whose machine the path is on; `None`: the primary agent.
+    agent: Option<String>,
+    /// Dialog look (faint fill, faint focus border) rather than the composer's.
+    dialog: bool,
+    disabled: bool,
+    smooth_scroll: SmoothScroll,
+    open: bool,
+    cursor: usize,
+    scroll: ScrollHandle,
+    /// Last folder listing: base dir and folder names.
+    dirs: Option<(String, Vec<String>)>,
+    /// Directory being listed.
+    loading: Option<String>,
+    task: Option<Task<()>>,
+    _subs: Vec<Subscription>,
+}
+
+impl WorkspaceField {
+    pub(super) fn new(
+        store: Entity<AgentsStore>,
+        input: Entity<InputState>,
+        dialog: bool,
+        smooth_scroll: SmoothScroll,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let subs = vec![
+            cx.subscribe(&input, |this, _, ev: &InputEvent, cx| match ev {
+                InputEvent::Change => {
+                    this.open = true;
+                    this.refresh_dirs(cx);
+                    cx.notify();
+                }
+                InputEvent::Focus => {
+                    // List again, so folders created meanwhile show up.
+                    this.open = true;
+                    this.dirs = None;
+                    this.loading = None;
+                    this.refresh_dirs(cx);
+                    cx.notify();
+                }
+                InputEvent::Blur => {
+                    this.open = false;
+                    cx.notify();
+                }
+                _ => {}
+            }),
+        ];
+        Self {
+            store,
+            input,
+            agent: None,
+            dialog,
+            disabled: false,
+            smooth_scroll,
+            open: false,
+            cursor: 0,
+            scroll: ScrollHandle::new(),
+            dirs: None,
+            loading: None,
+            task: None,
+            _subs: subs,
+        }
+    }
+
+    pub(super) fn set_agent(&mut self, agent: Option<String>, cx: &mut Context<Self>) {
+        if self.agent != agent {
+            self.agent = agent;
+            self.dirs = None;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
+        if self.disabled != disabled {
+            self.disabled = disabled;
+            self.open = false;
+            cx.notify();
+        }
+    }
+
+    /// The agent's machine is this one, so its paths can be completed from
+    /// the local filesystem.
     fn local_fs(&self, cx: &App) -> bool {
         if cfg!(target_family = "wasm") {
             return false;
         }
         let store = self.store.read(cx);
-        match store
-            .primary_agent()
+        match self
+            .agent
+            .clone()
+            .or_else(|| store.primary_agent())
             .and_then(|a| store.config(&a))
             .map(|c| &c.endpoint)
         {
@@ -187,6 +276,7 @@ impl QmtApp {
             .all_sessions()
             .into_iter()
             .filter(|s| s.remote.is_none())
+            .filter(|s| self.agent.as_ref().is_none_or(|a| &s.agent_id == a))
             .collect();
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         let mut out: Vec<String> = Vec::new();
@@ -200,19 +290,19 @@ impl QmtApp {
         out
     }
 
-    fn workspace_suggestions(&self, cx: &App) -> Vec<Suggestion> {
-        if !self.ws_open {
+    fn items(&self, cx: &App) -> Vec<Suggestion> {
+        if !self.open || self.disabled {
             return Vec::new();
         }
         let local = self.local_fs(cx);
         let home = local.then(home_dir).flatten();
         let listing = self
-            .ws_dirs
+            .dirs
             .as_ref()
             .filter(|_| local)
             .map(|(base, names)| (base.as_str(), names.as_slice()));
         suggestions(
-            &self.cwd.read(cx).value(),
+            &self.input.read(cx).value(),
             home.as_deref(),
             &self.known_workspaces(cx),
             listing,
@@ -221,134 +311,126 @@ impl QmtApp {
 
     /// The field changed or gained focus: reset the highlight and list the
     /// typed directory in the background when it is not listed yet.
-    pub(super) fn refresh_workspace_dirs(&mut self, cx: &mut Context<Self>) {
-        self.ws_cursor = 0;
-        self.ws_scroll.scroll_to_item(0);
+    fn refresh_dirs(&mut self, cx: &mut Context<Self>) {
+        self.cursor = 0;
+        self.scroll.scroll_to_item(0);
         if !self.local_fs(cx) {
             return;
         }
         let home = home_dir();
-        let Some((base, _)) = dir_query(&self.cwd.read(cx).value(), home.as_deref()) else {
+        let Some((base, _)) = dir_query(&self.input.read(cx).value(), home.as_deref()) else {
             return;
         };
-        if self.ws_dirs.as_ref().is_some_and(|(b, _)| *b == base)
-            || self.ws_loading.as_deref() == Some(base.as_str())
+        if self.dirs.as_ref().is_some_and(|(b, _)| *b == base)
+            || self.loading.as_deref() == Some(base.as_str())
         {
             return;
         }
-        self.ws_loading = Some(base.clone());
+        self.loading = Some(base.clone());
         // Replacing the task drops (cancels) a listing of an older directory.
-        self.ws_task = Some(cx.spawn(async move |this, cx| {
+        self.task = Some(cx.spawn(async move |this, cx| {
             let dir = base.clone();
             let names = cx
                 .background_executor()
                 .spawn(async move { list_dirs(&dir) })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.ws_loading.as_deref() == Some(base.as_str()) {
-                    this.ws_loading = None;
+                if this.loading.as_deref() == Some(base.as_str()) {
+                    this.loading = None;
                 }
-                this.ws_dirs = Some((base, names));
+                this.dirs = Some((base, names));
                 cx.notify();
             });
         }));
     }
 
-    /// Focus: list again, so folders created meanwhile show up.
-    pub(super) fn open_workspace_suggestions(&mut self, cx: &mut Context<Self>) {
-        self.ws_open = true;
-        self.ws_dirs = None;
-        self.ws_loading = None;
-        self.refresh_workspace_dirs(cx);
-        cx.notify();
-    }
-
-    fn pick_workspace(
-        &mut self,
-        path: String,
-        drill: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn pick(&mut self, path: String, drill: bool, window: &mut Window, cx: &mut Context<Self>) {
         let value = if drill && !path.ends_with('/') {
             format!("{path}/")
         } else {
             path
         };
-        self.cwd.update(cx, |s, cx| s.set_value(value, window, cx));
-        self.ws_open = drill;
-        self.refresh_workspace_dirs(cx);
+        self.input
+            .update(cx, |s, cx| s.set_value(value, window, cx));
+        self.open = drill;
+        self.refresh_dirs(cx);
         cx.notify();
     }
 
-    fn move_workspace_cursor(&mut self, down: bool, cx: &mut Context<Self>) -> bool {
-        let len = self.workspace_suggestions(cx).len();
+    fn move_cursor(&mut self, down: bool, cx: &mut Context<Self>) -> bool {
+        let len = self.items(cx).len();
         if len == 0 {
             return false;
         }
-        let cursor = self.ws_cursor.min(len - 1);
-        self.ws_cursor = if down {
+        let cursor = self.cursor.min(len - 1);
+        self.cursor = if down {
             (cursor + 1) % len
         } else {
             (cursor + len - 1) % len
         };
-        self.ws_scroll.scroll_to_item(self.ws_cursor);
+        self.scroll.scroll_to_item(self.cursor);
         cx.notify();
         true
     }
 
     /// Pick the highlighted suggestion; `drill` completes into it instead.
-    fn accept_workspace(
-        &mut self,
-        drill: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let items = self.workspace_suggestions(cx);
-        let Some(item) = items.get(self.ws_cursor.min(items.len().saturating_sub(1))) else {
+    fn accept(&mut self, drill: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let items = self.items(cx);
+        let Some(item) = items.get(self.cursor.min(items.len().saturating_sub(1))) else {
             return false;
         };
-        self.pick_workspace(item.path.clone(), drill, window, cx);
+        self.pick(item.path.clone(), drill, window, cx);
         true
     }
+}
 
-    /// The workspace path input and its suggestion list.
-    pub(super) fn workspace_field(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
-        let items = self.workspace_suggestions(cx);
-        let cursor = self.ws_cursor.min(items.len().saturating_sub(1));
-        let field = h_flex()
-            .px_2()
-            .rounded(px(8.))
-            .bg(p.card)
+impl Render for WorkspaceField {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *palette(cx);
+        let items = self.items(cx);
+        let cursor = self.cursor.min(items.len().saturating_sub(1));
+        let shell = if self.dialog {
+            let focused = self.input.read(cx).focus_handle(cx).is_focused(window);
+            kit::field_shell(focused, &p).h(px(36.))
+        } else {
+            h_flex().px_2().rounded(px(8.)).bg(p.card)
+        };
+        let field = shell
             .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
-                if this.move_workspace_cursor(false, cx) {
+                if this.move_cursor(false, cx) {
                     cx.stop_propagation();
                 }
             }))
             .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
-                if this.move_workspace_cursor(true, cx) {
+                if this.move_cursor(true, cx) {
                     cx.stop_propagation();
                 }
             }))
             .capture_action(cx.listener(|this, _: &Enter, window, cx| {
-                if this.accept_workspace(false, window, cx) {
+                if this.accept(false, window, cx) {
                     cx.stop_propagation();
                 }
             }))
             .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
-                if this.accept_workspace(true, window, cx) {
+                if this.accept(true, window, cx) {
                     cx.stop_propagation();
                 }
             }))
             .capture_action(cx.listener(|this, _: &Escape, _, cx| {
-                if !this.workspace_suggestions(cx).is_empty() {
-                    this.ws_open = false;
+                if !this.items(cx).is_empty() {
+                    this.open = false;
                     cx.stop_propagation();
                     cx.notify();
                 }
             }))
             .child(kit::icon(IconName::FolderSearch, 15., p.dim))
-            .child(Input::new(&self.cwd).appearance(false).flex_1());
+            .child(
+                Input::new(&self.input)
+                    .appearance(false)
+                    .aria_label("Workspace")
+                    .disabled(self.disabled)
+                    .flex_1(),
+            );
 
         let (hover, text, dim) = (p.card_hover, p.text, p.dim);
         let popover = (!items.is_empty()).then(|| {
@@ -405,7 +487,7 @@ impl QmtApp {
                             )
                         })
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.pick_workspace(path.clone(), false, window, cx)
+                            this.pick(path.clone(), false, window, cx)
                         }))
                         .into_any_element()
                 })
@@ -421,7 +503,7 @@ impl QmtApp {
                     .p_1()
                     .max_h(px(LIST_MAX_H))
                     .overflow_y_scroll()
-                    .track_scroll(&self.ws_scroll)
+                    .track_scroll(&self.scroll)
                     .rounded(px(10.))
                     .bg(p.surface)
                     .border_1()
@@ -434,7 +516,7 @@ impl QmtApp {
                     .children(rows)
                     .map(|el| self.smooth_scroll.region("workspace-list", el)),
             )
-            .with_priority(1)
+            .with_priority(3)
         });
         div().relative().w_full().child(field).children(popover)
     }

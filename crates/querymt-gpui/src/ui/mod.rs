@@ -1,6 +1,7 @@
 //! Root view: QueryMT shell (sidebar + page) and modal overlays.
 
 mod agents;
+mod automations;
 mod chrome;
 mod code;
 mod inbox;
@@ -44,6 +45,7 @@ pub enum Page {
     Start,
     Inbox,
     Sessions,
+    Automations,
     Agents,
     Mesh,
     Settings,
@@ -207,6 +209,7 @@ pub struct QmtApp {
     attach_error: Option<String>,
     session_query: Entity<InputState>,
     session_filters: SessionFilters,
+    automations: automations::AutomationPage,
     /// Which Sessions-page groups are open.
     session_groups: sessions::GroupOpenState,
     /// Virtualized Sessions page list.
@@ -309,15 +312,8 @@ pub struct QmtApp {
     profile_menu_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// Popovers just closed by an outside mouse down, so their triggers toggle.
     dismissed: kit::Dismissed,
-    /// Workspace path completion of the Start composer: list shown,
-    /// highlighted row, last folder listing (base dir, names) and the
-    /// directory being listed.
-    ws_open: bool,
-    ws_cursor: usize,
-    ws_scroll: ScrollHandle,
-    ws_dirs: Option<(String, Vec<String>)>,
-    ws_loading: Option<String>,
-    ws_task: Option<Task<()>>,
+    /// Start composer's workspace field, editing `cwd`.
+    workspace: Entity<workspace_select::WorkspaceField>,
     _subs: Vec<Subscription>,
 }
 
@@ -365,6 +361,9 @@ impl QmtApp {
                 this.request_collapsed
                     .retain(|k, _| s.requests.iter().any(|r| &r.key == k));
                 this.open_pending_session(cx);
+                if this.page == Page::Automations {
+                    this.load_automations(false, cx);
+                }
                 cx.notify();
             }),
             // Follow the OS light/dark switch when the theme is set to System.
@@ -378,18 +377,10 @@ impl QmtApp {
                     cx.notify();
                 }
             }),
-            cx.subscribe_in(&cwd, window, |this, _, ev: &InputEvent, _, cx| match ev {
-                InputEvent::Change => {
-                    this.ws_open = true;
-                    this.refresh_workspace_dirs(cx);
+            cx.subscribe_in(&cwd, window, |_, _, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::Change) {
                     cx.notify();
                 }
-                InputEvent::Focus => this.open_workspace_suggestions(cx),
-                InputEvent::Blur => {
-                    this.ws_open = false;
-                    cx.notify();
-                }
-                _ => {}
             }),
             cx.subscribe_in(
                 &model_query,
@@ -444,10 +435,15 @@ impl QmtApp {
         ));
 
         let (page, details) = initial_view(&store, cx);
+        let smooth_scroll = smooth_scroll::SmoothScroll::default();
+        let workspace = {
+            let (store, cwd, scroll) = (store.clone(), cwd.clone(), smooth_scroll.clone());
+            cx.new(|cx| workspace_select::WorkspaceField::new(store, cwd, false, scroll, cx))
+        };
         Self {
             store,
             page,
-            smooth_scroll: smooth_scroll::SmoothScroll::default(),
+            smooth_scroll,
             cwd,
             prompt,
             model_open: false,
@@ -457,6 +453,7 @@ impl QmtApp {
             attach_error: None,
             session_query,
             session_filters: SessionFilters::default(),
+            automations: Default::default(),
             session_groups: Default::default(),
             session_list: Default::default(),
             group_shown: HashMap::new(),
@@ -523,12 +520,7 @@ impl QmtApp {
             profile_viewport_h: px(0.),
             profile_menu_bounds: Default::default(),
             dismissed: kit::Dismissed::default(),
-            ws_open: false,
-            ws_cursor: 0,
-            ws_scroll: ScrollHandle::new(),
-            ws_dirs: None,
-            ws_loading: None,
-            ws_task: None,
+            workspace,
             _subs: subs,
         }
     }
@@ -557,6 +549,9 @@ impl QmtApp {
         self.session_options_open = false;
         self.session_details_open = false;
         self.session_menu_open = false;
+        if page == Page::Automations {
+            self.load_automations(true, cx);
+        }
         // Mesh and Settings show live server data: refresh it on entry.
         if matches!(page, Page::Mesh | Page::Settings)
             && let Some(agent) = self.store.read(cx).primary_agent()
@@ -792,6 +787,14 @@ impl QmtApp {
                         cx,
                     ))
                     .child(separator())
+                    .child(self.nav_item(
+                        Page::Automations,
+                        IconName::CalendarClock,
+                        "Automations",
+                        None,
+                        &p,
+                        cx,
+                    ))
                     .child(self.nav_item(Page::Agents, IconName::Bot, "Agents", None, &p, cx))
                     .child(self.nav_item(Page::Mesh, IconName::Network, "Mesh", None, &p, cx))
                     .child(separator())
@@ -1133,6 +1136,14 @@ impl QmtApp {
                     ))
                     .child(section("Manage"))
                     .child(self.nav_item(
+                        Page::Automations,
+                        IconName::CalendarClock,
+                        "Automations",
+                        None,
+                        &p,
+                        cx,
+                    ))
+                    .child(self.nav_item(
                         Page::Agents,
                         IconName::Bot,
                         "Agents",
@@ -1239,6 +1250,7 @@ fn initial_view(store: &Entity<AgentsStore>, cx: &App) -> (Page, Option<String>)
         Some("sessions") => Page::Sessions,
         Some("inbox") => Page::Inbox,
         Some("mesh") => Page::Mesh,
+        Some("automations") => Page::Automations,
         Some("settings") => Page::Settings,
 
         _ => Page::Start,
@@ -1258,6 +1270,7 @@ impl Render for QmtApp {
             Page::Sessions => self.render_sessions(cx).into_any_element(),
             Page::Agents => self.render_agents(cx).into_any_element(),
             Page::Mesh => self.render_mesh(cx).into_any_element(),
+            Page::Automations => self.render_automations(cx).into_any_element(),
             Page::Settings => self.render_settings(cx).into_any_element(),
             Page::Inbox => self.render_inbox(window, cx).into_any_element(),
             Page::Session => self.render_session(window, cx).into_any_element(),
@@ -1269,6 +1282,7 @@ impl Render for QmtApp {
             .render_preview(radii, window, cx)
             .or_else(|| self.render_palette(radii, cx))
             .or_else(|| self.render_model_modal(radii, cx))
+            .or_else(|| self.render_automation_overlay(radii, cx))
             .or_else(|| self.render_overlay(radii, cx));
         let header = self.render_header(window, cx).into_any_element();
         let render_ms = crate::util::now_ms() - render_started;
@@ -1308,7 +1322,7 @@ impl Render for QmtApp {
                 if ev.keystroke.key != "escape" {
                     return;
                 }
-                if this.close_topmost() {
+                if this.close_topmost() || this.close_automation_overlay(cx) {
                     this.last_escape = None;
                     cx.stop_propagation();
                     cx.notify();
