@@ -244,6 +244,14 @@ pub fn action_btn(
     p: &Palette,
 ) -> Stateful<Div> {
     let (hover_border, hover_bg) = (p.border_strong, p.card_hover);
+    btn_base(id, enabled, compact, p).when(enabled, |el| {
+        el.hover(move |s| s.border_color(hover_border).bg(hover_bg))
+    })
+}
+
+/// Shape, type and cursor of the app buttons, without a hover style: GPUI
+/// allows one hover style per element, so each variant sets its own.
+fn btn_base(id: impl Into<ElementId>, enabled: bool, compact: bool, p: &Palette) -> Stateful<Div> {
     h_flex()
         .id(id)
         .flex_none()
@@ -261,7 +269,6 @@ pub fn action_btn(
         .map(|el| {
             if enabled {
                 el.cursor_pointer()
-                    .hover(move |s| s.border_color(hover_border).bg(hover_bg))
             } else {
                 el.opacity(0.5)
             }
@@ -276,24 +283,84 @@ pub fn flat_btn(
     compact: bool,
     p: &Palette,
 ) -> Stateful<Div> {
-    let (fill, fill_hover) = if p.dark {
+    flat_tone(id, enabled, compact, p, flat_fill(p), p.text)
+}
+
+fn flat_tone(
+    id: impl Into<ElementId>,
+    enabled: bool,
+    compact: bool,
+    p: &Palette,
+    (fill, fill_hover): (Hsla, Hsla),
+    text: Hsla,
+) -> Stateful<Div> {
+    btn_base(id, enabled, compact, p)
+        .border_color(transparent_black())
+        .bg(fill)
+        .text_color(text)
+        .when(enabled, |el| el.hover(move |s| s.bg(fill_hover)))
+}
+
+/// [`flat_btn`] in a soft accent tint: the confirm action of a dialog
+/// (desktop `.app-dialog .action-btn-accent`).
+pub fn soft_accent_btn(id: impl Into<ElementId>, enabled: bool, p: &Palette) -> Stateful<Div> {
+    flat_tone(
+        id,
+        enabled,
+        true,
+        p,
+        (p.accent_dim.opacity(0.8), p.accent_dim),
+        p.accent,
+    )
+}
+
+/// Border of a focused dialog field (desktop `--subtle-border-strong`):
+/// faint, never a coloured ring.
+pub fn field_focus_border(p: &Palette) -> Hsla {
+    if p.dark {
+        hsla(0., 0., 1., 0.13)
+    } else {
+        Hsla::from(rgb(0x241f31)).opacity(0.14)
+    }
+}
+
+/// Frame of a dialog text field (desktop `.app-dialog .input-shell`): the
+/// [`flat_btn`] fill, no border until focused. Put an `Input` with
+/// `appearance(false)` inside.
+pub fn field_shell(focused: bool, p: &Palette) -> Div {
+    h_flex()
+        .px(px(10.))
+        .gap_2()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(if focused {
+            field_focus_border(p)
+        } else {
+            transparent_black()
+        })
+        .bg(flat_fill(p).0)
+}
+
+/// Rest and hover fills of [`flat_btn`].
+pub fn flat_fill(p: &Palette) -> (Hsla, Hsla) {
+    if p.dark {
         (hsla(0., 0., 1., 0.045), hsla(0., 0., 1., 0.09))
     } else {
         (p.muted.opacity(0.07), p.muted.opacity(0.13))
-    };
-    action_btn(id, enabled, compact, p)
-        .border_color(transparent_black())
-        .bg(fill)
-        .when(enabled, |el| el.hover(move |s| s.bg(fill_hover)))
+    }
 }
 
 /// [`flat_btn`] in the destructive tone (Clear API key, Reset app data).
 pub fn danger_btn(id: impl Into<ElementId>, enabled: bool, p: &Palette) -> Stateful<Div> {
     let danger = p.danger;
-    flat_btn(id, enabled, true, p)
-        .bg(danger.opacity(0.1))
-        .text_color(danger)
-        .when(enabled, |el| el.hover(move |s| s.bg(danger.opacity(0.16))))
+    flat_tone(
+        id,
+        enabled,
+        true,
+        p,
+        (danger.opacity(0.1), danger.opacity(0.16)),
+        danger,
+    )
 }
 
 /// [`action_btn`] in the accent fill: the one primary action of a dialog or
@@ -304,12 +371,14 @@ pub fn accent_btn(
     compact: bool,
     p: &Palette,
 ) -> Stateful<Div> {
-    let (fill, hover, text) = (p.accent, p.accent_hover, p.on_accent);
-    action_btn(id, enabled, compact, p)
-        .border_color(transparent_black())
-        .bg(fill)
-        .text_color(text)
-        .when(enabled, |el| el.hover(move |s| s.bg(hover)))
+    flat_tone(
+        id,
+        enabled,
+        compact,
+        p,
+        (p.accent, p.accent_hover),
+        p.on_accent,
+    )
 }
 
 /// Square, icon-only [`flat_btn`] with a tooltip.

@@ -74,15 +74,18 @@ pub fn bind_keys(cx: &mut App) {
 #[derive(Clone)]
 enum PaletteTarget {
     NewSession,
+    SchedulePrompt,
+    ScheduleCurrentSession,
     ToggleSidebar,
     Page(Page),
     Session(Box<SessionSummary>),
 }
 
-const PAGES: [(Page, IconName, &str); 6] = [
+const PAGES: [(Page, IconName, &str); 7] = [
     (Page::Start, IconName::LayoutDashboard, "Start"),
     (Page::Inbox, IconName::Inbox, "Inbox"),
     (Page::Sessions, IconName::MessagesSquare, "Sessions"),
+    (Page::Automations, IconName::CalendarClock, "Automations"),
     (Page::Agents, IconName::Bot, "Agents"),
     (Page::Mesh, IconName::Network, "Mesh"),
     (Page::Settings, IconName::Settings, "Settings"),
@@ -240,6 +243,15 @@ impl QmtApp {
         self.palette_open = false;
         match target {
             PaletteTarget::NewSession => return self.new_session(window, cx),
+            PaletteTarget::SchedulePrompt | PaletteTarget::ScheduleCurrentSession => {
+                self.open_automation_dialog(
+                    matches!(target, PaletteTarget::ScheduleCurrentSession),
+                    window,
+                    cx,
+                );
+                cx.notify();
+                return;
+            }
             PaletteTarget::ToggleSidebar => self.toggle_sidebar(cx),
             PaletteTarget::Page(page) => self.go(page, cx),
             PaletteTarget::Session(s) => self.open_summary(&s, cx),
@@ -297,8 +309,35 @@ impl QmtApp {
     /// The command palette (Ctrl/Cmd+P): actions, pages and sidebar sessions.
     fn palette_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let sessions = self.sidebar_sessions(cx);
+        let mut action_targets = vec![PaletteTarget::NewSession, PaletteTarget::ToggleSidebar];
+        let mut actions = CommandGroup::new()
+            .label("Actions")
+            .item(CommandItem::new().label("New session").icon(IconName::Plus))
+            .item(
+                CommandItem::new()
+                    .label("Toggle sidebar")
+                    .icon(IconName::PanelLeftClose),
+            );
+        for (current, target, label) in [
+            (false, PaletteTarget::SchedulePrompt, "Schedule a prompt…"),
+            (
+                true,
+                PaletteTarget::ScheduleCurrentSession,
+                "Schedule current session…",
+            ),
+        ] {
+            if self.has_automation_target(current, cx) {
+                action_targets.push(target);
+                actions = actions.item(
+                    CommandItem::new()
+                        .label(label)
+                        .icon(IconName::CalendarClock)
+                        .keywords(["automation"]),
+                );
+            }
+        }
         let targets: Rc<Vec<Vec<PaletteTarget>>> = Rc::new(vec![
-            vec![PaletteTarget::NewSession, PaletteTarget::ToggleSidebar],
+            action_targets,
             PAGES
                 .iter()
                 .map(|(page, ..)| PaletteTarget::Page(*page))
@@ -308,14 +347,6 @@ impl QmtApp {
                 .map(|s| PaletteTarget::Session(Box::new(s.clone())))
                 .collect(),
         ]);
-        let actions = CommandGroup::new()
-            .label("Actions")
-            .item(CommandItem::new().label("New session").icon(IconName::Plus))
-            .item(
-                CommandItem::new()
-                    .label("Toggle sidebar")
-                    .icon(IconName::PanelLeftClose),
-            );
         let pages = CommandGroup::new().label("Go to").items(
             PAGES
                 .iter()

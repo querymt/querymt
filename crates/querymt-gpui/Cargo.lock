@@ -5689,6 +5689,7 @@ dependencies = [
  "dirs 6.0.0",
  "futures",
  "gpui-kit",
+ "iana-time-zone",
  "js-sys",
  "markdown",
  "opentelemetry",

@@ -4,6 +4,8 @@
 //! Mirrors `querymt-desktop/src/lib/stores/agents.svelte.ts` at the scope of
 //! those two pages. Views observe the entity and re-render on `cx.notify()`.
 
+pub(crate) mod automations;
+
 use std::{collections::HashMap, rc::Rc, time::Duration};
 
 use gpui_kit::{AsyncApp, Context, Image, ImageFormat, Task, WeakEntity};
@@ -1078,6 +1080,7 @@ pub struct AgentRuntime {
     pub can_delete_sessions: bool,
     /// Parent session id -> its loaded direct children.
     pub children: HashMap<String, ChildList>,
+    pub(crate) schedules: automations::ScheduleCatalog,
     pub mesh: Option<MeshStatus>,
     pub mesh_nodes: Vec<MeshNode>,
     pub mesh_invites: Vec<MeshInvite>,
@@ -1287,6 +1290,9 @@ pub struct Prefs {
     /// `show_remote_sessions` is on.
     #[serde(default)]
     pub remote_session_peers: Vec<String>,
+    /// Time zone last picked for an automation; empty: the system zone.
+    #[serde(default)]
+    pub schedule_timezone: String,
 }
 
 impl Prefs {
@@ -1944,6 +1950,13 @@ impl AgentsStore {
         cx.notify();
     }
 
+    pub fn set_schedule_timezone(&mut self, zone: String) {
+        if self.prefs.schedule_timezone != zone {
+            self.prefs.schedule_timezone = zone;
+            self.save();
+        }
+    }
+
     pub fn set_cwd(&mut self, cwd: String) {
         if self.prefs.cwd != cwd {
             self.prefs.cwd = cwd;
@@ -2367,6 +2380,7 @@ impl AgentsStore {
         rt.tasks.clear();
         rt.generation += 1;
         let generation = rt.generation;
+        rt.schedules = Default::default();
         rt.state = ConnState::Connecting;
         rt.pid = None;
         rt.log(format!("Connecting to {}…", config.endpoint_label()));
@@ -4106,6 +4120,13 @@ impl AgentsStore {
                     || method.ends_with("session/update")
                 {
                     self.schedule_sessions_refresh(id, Duration::from_millis(1200), cx);
+                } else if method.trim_start_matches('_') == "querymt/schedules/changed" {
+                    if self
+                        .live(id, generation)
+                        .is_some_and(|rt| rt.schedules.loaded || rt.schedules.loading)
+                    {
+                        self.refresh_schedules(id, cx);
+                    }
                 } else if method.contains("models/changed") || method.contains("nodesChanged") {
                     self.refresh(id, cx);
                 }

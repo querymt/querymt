@@ -15,6 +15,21 @@ use crate::store::{AgentConfig, ConnState, Endpoint, normalize_address};
 use crate::theme::{Palette, palette};
 
 const CAN_SPAWN: bool = cfg!(not(target_family = "wasm"));
+
+/// Full-window backdrop of the app's modals. It rounds itself: GPUI's
+/// overflow mask is rectangular, so the frame cannot clip its corners.
+pub(super) fn modal_scrim(id: &'static str, radii: Corners<Pixels>, p: &Palette) -> Stateful<Div> {
+    div()
+        .id(id)
+        .absolute()
+        .inset_0()
+        .rounded_tl(radii.top_left)
+        .rounded_tr(radii.top_right)
+        .rounded_bl(radii.bottom_left)
+        .rounded_br(radii.bottom_right)
+        .bg(gpui_kit::black().opacity(if p.dark { 0.55 } else { 0.28 }))
+        .occlude()
+}
 /// Width of the stats columns of an agent row (four 60px columns).
 const STATS_W: f32 = 252.;
 
@@ -583,18 +598,7 @@ impl QmtApp {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let p = *palette(cx);
-        let scrim = |id: &'static str| {
-            div()
-                .id(id)
-                .absolute()
-                .inset_0()
-                .rounded_tl(radii.top_left)
-                .rounded_tr(radii.top_right)
-                .rounded_bl(radii.bottom_left)
-                .rounded_br(radii.bottom_right)
-                .bg(gpui_kit::black().opacity(if p.dark { 0.55 } else { 0.28 }))
-                .occlude()
-        };
+        let scrim = |id: &'static str| modal_scrim(id, radii, &p);
 
         if self.confirm_reset {
             let card = self
@@ -966,7 +970,7 @@ impl QmtApp {
         Some(self.render_details(&id, scrim("scrim-details"), &p, cx))
     }
 
-    fn modal_card(&self, p: &Palette) -> Div {
+    pub(super) fn modal_card(&self, p: &Palette) -> Div {
         v_flex()
             .gap_4()
             .p_5()
@@ -977,13 +981,20 @@ impl QmtApp {
             .shadow_lg()
     }
 
-    fn centered(&self, scrim: Stateful<Div>, card: Div, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn centered(
+        &self,
+        scrim: Stateful<Div>,
+        card: Div,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         scrim
             .flex()
             .items_center()
             .justify_center()
             .on_click(cx.listener(|this, _, _, cx| {
-                this.close_topmost();
+                if !this.close_topmost() {
+                    this.close_automation_overlay(cx);
+                }
                 cx.notify();
             }))
             .child(

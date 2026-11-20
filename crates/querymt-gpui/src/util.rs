@@ -54,6 +54,59 @@ fn format_rfc3339(secs: i64) -> String {
     )
 }
 
+/// The system's IANA time zone, or `UTC` when it cannot be read.
+pub fn system_time_zone() -> String {
+    iana_time_zone::get_timezone()
+        .ok()
+        .filter(|zone| !zone.is_empty())
+        .unwrap_or_else(|| "UTC".into())
+}
+
+/// IANA zone names for a picker, sorted; always has UTC and the system zone.
+pub fn time_zones() -> Vec<String> {
+    let mut zones = known_time_zones();
+    zones.push("UTC".into());
+    zones.push(system_time_zone());
+    zones.sort();
+    zones.dedup();
+    zones
+}
+
+/// Zones of the tz database's `zone1970.tab` (one per region).
+#[cfg(not(target_family = "wasm"))]
+fn known_time_zones() -> Vec<String> {
+    let dirs = std::env::var("TZDIR").into_iter().chain(
+        [
+            "/usr/share/zoneinfo",
+            "/etc/zoneinfo",
+            "/usr/share/lib/zoneinfo",
+        ]
+        .map(String::from),
+    );
+    dirs.filter_map(|dir| std::fs::read_to_string(format!("{dir}/zone1970.tab")).ok())
+        .map(|tab| parse_zone_tab(&tab))
+        .find(|zones| !zones.is_empty())
+        .unwrap_or_default()
+}
+
+#[cfg(target_family = "wasm")]
+fn known_time_zones() -> Vec<String> {
+    js_sys::Intl::supported_values_of(js_sys::Intl::SupportedValuesKey::TimeZone)
+        .iter()
+        .map(String::from)
+        .collect()
+}
+
+/// Zone names of a `zone.tab`-style file: the third column of each entry.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+fn parse_zone_tab(tab: &str) -> Vec<String> {
+    tab.lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split('\t').nth(2))
+        .map(str::to_owned)
+        .collect()
+}
+
 pub fn workspace_name(cwd: &str) -> String {
     cwd.trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])
@@ -198,7 +251,19 @@ pub fn split_front_matter(text: &str) -> Option<(FrontMatter, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_rfc3339, fuzzy_score, parse_rfc3339_ms, split_front_matter};
+    use super::{
+        format_rfc3339, fuzzy_score, parse_rfc3339_ms, parse_zone_tab, split_front_matter,
+        time_zones,
+    };
+
+    #[test]
+    fn zone_tab_lists_the_zone_column() {
+        let tab = "# comment\nAD\t+4230+00131\tEurope/Andorra\nUS\t+404251-0740023\tAmerica/New_York\tEastern (most areas)\n";
+        assert_eq!(parse_zone_tab(tab), ["Europe/Andorra", "America/New_York"]);
+        let zones = time_zones();
+        assert!(zones.iter().any(|z| z == "UTC"));
+        assert!(zones.is_sorted());
+    }
 
     #[test]
     fn front_matter_is_split_from_the_body() {

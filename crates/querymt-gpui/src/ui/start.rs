@@ -893,7 +893,7 @@ impl QmtApp {
             .border_1()
             .border_color(p.border)
             .shadow_sm()
-            .child(self.workspace_field(&p, cx))
+            .child(self.workspace.clone())
             .child(div().px_1().text_xs().text_color(p.dim).child(match &host {
                 Some(host) => format!("Use an absolute path on {host}, where the agent runs."),
                 None => "Use an absolute path on the machine where the agent runs.".to_string(),
