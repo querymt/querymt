@@ -11,7 +11,7 @@ path = "src/lib.rs"
 
 [features]
 # Kameo remote actors, libp2p mesh and the QR/invite flows.
-remote = ["kameo/remote", "dep:libp2p", "querymt-remote/kameo-mesh", "querymt-remote/qr"]
+remote = ["kameo/remote", "dep:libp2p", "querymt-remote/kameo-mesh", "querymt-remote/qr", "querymt-agent-sqlite/mesh-access"]
 # OAuth token support (keyring) and rmcp's OAuth client.
 oauth = ["querymt-utils/oauth", "rmcp/auth"]
 # Dynamic provider plugin loading.

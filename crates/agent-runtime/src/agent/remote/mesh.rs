@@ -8,10 +8,51 @@ mod join;
 
 pub use querymt_remote::{
     MeshError, MeshEvent, MeshHandle, MeshRoute, MeshRuntimeConfig, MeshRuntimeHandle, MeshScopeId,
-    PeerEvent, RouteTable, bootstrap_mesh_runtime,
+    PeerEvent, RouteTable,
 };
 
 use querymt_remote::SignedInviteGrant;
+
+/// Start an agent host with policy installed before accepting mesh RPCs.
+pub async fn bootstrap_mesh_runtime(
+    config: &MeshRuntimeConfig,
+) -> Result<MeshRuntimeHandle, MeshError> {
+    use querymt_remote::{NodeId, peer_access::quota::QuotaStore};
+    let bootstrap_error = |error: &dyn std::fmt::Display| {
+        MeshError::SwarmError(format!("mesh access startup: {error}"))
+    };
+    let identity_path = match &config.identity_file {
+        Some(path) => path.clone(),
+        None => {
+            querymt_remote::identity::default_identity_path().map_err(|e| bootstrap_error(&e))?
+        }
+    };
+    if let Some(parent) = identity_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| bootstrap_error(&error))?;
+    }
+    let mut store_path = identity_path.as_os_str().to_os_string();
+    store_path.push(".access.sqlite3");
+    let store = std::sync::Arc::new(
+        querymt_agent_sqlite::mesh_access::SqliteMeshAccess::open_exclusive(
+            std::path::PathBuf::from(store_path),
+        )
+        .await
+        .map_err(|e| bootstrap_error(&e))?,
+    );
+    let identity = querymt_remote::identity::load_or_generate_keypair(Some(&identity_path))
+        .map_err(|e| bootstrap_error(&e))?;
+    let host = NodeId::from_peer_id(identity.public().to_peer_id());
+    store
+        .reconcile_startup(&host)
+        .await
+        .map_err(|e| bootstrap_error(&e))?;
+    querymt_remote::bootstrap_mesh_runtime_with_policy(config, store).await
+}
 
 pub async fn join_mesh_via_invite(
     invite: &SignedInviteGrant,

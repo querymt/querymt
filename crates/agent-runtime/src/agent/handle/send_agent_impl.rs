@@ -131,7 +131,11 @@ impl SendAgent for LocalAgentHandle {
     }
 
     async fn ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
-        self.handle_ext_method(req).await
+        self.handle_ext_method(req, false).await
+    }
+
+    async fn owner_ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+        self.handle_ext_method(req, true).await
     }
 
     #[tracing::instrument(name = "acp.ext_notification", skip_all)]

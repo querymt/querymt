@@ -298,6 +298,39 @@ impl QuotaStore for SqliteMeshAccess {
         .await
     }
 
+    async fn access_snapshot(
+        &self,
+        key: &PeerGrantKey,
+        now: i64,
+    ) -> Result<(PeerGrantState, Vec<QuotaStatus>), QuotaError> {
+        utc_date(now)?;
+        let key = key.clone();
+        self.with_conn(move |conn| {
+            let tx = begin(conn)?;
+            let grant = load_grant(&tx, &key)?;
+            let scopes = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, provider_id, model_id FROM quota_scopes WHERE host_id=?1 AND peer_id=?2 ORDER BY provider_id, model_id",
+                ).map_err(backend)?;
+                stmt.query_map(params![key.host.to_string(), key.peer.to_string()], |row| {
+                    let model: String = row.get(2)?;
+                    Ok((row.get::<_, i64>(0)?, QuotaScope {
+                        provider_id: row.get(1)?, model_id: (!model.is_empty()).then_some(model),
+                    }))
+                }).map_err(backend)?.collect::<Result<Vec<_>, _>>().map_err(backend)?
+            };
+            let mut quotas = Vec::with_capacity(scopes.len());
+            for (id, scope) in scopes {
+                if let Some(period) = current_period(&tx, id)? {
+                    let period = roll_forward(&tx, id, period, now)?;
+                    quotas.push(status(&tx, scope, Some(period))?);
+                }
+            }
+            tx.commit().map_err(backend)?;
+            Ok((grant, quotas))
+        }).await
+    }
+
     async fn edit_quota(
         &self,
         key: &PeerGrantKey,

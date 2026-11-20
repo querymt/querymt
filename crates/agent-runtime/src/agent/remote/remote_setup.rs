@@ -89,6 +89,12 @@ pub async fn spawn_and_register_local_mesh_actors_with_name(
     let node_manager_ref = RemoteNodeManager::spawn(node_manager);
     if let (Some(router), Some(store)) = (mesh.inbound_router(), mesh.quota_store()) {
         RemoteNodeManager::register_guarded_discovery(router, store.clone(), &node_manager_ref);
+        crate::agent::handle::ext_mesh::register_peer_access_read(
+            router,
+            store.clone(),
+            &node_manager_ref,
+            handle.model_inventory.clone(),
+        );
     }
 
     let provider_backend =

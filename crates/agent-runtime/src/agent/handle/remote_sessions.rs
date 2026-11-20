@@ -469,7 +469,8 @@ impl LocalAgentHandle {
         // Missing metadata must not block loading a healthy remote session.
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             let manager = self.find_node_manager(node_id).await.ok()?;
-            querymt_remote::ask_remote_with_timeout(
+            querymt_remote::request_timeout::ask_with_sharing(
+                &self.mesh()?,
                 &manager,
                 &GetRemoteSessionProfile {
                     session_id: session_id.to_string(),
@@ -509,25 +510,18 @@ impl LocalAgentHandle {
     {
         use crate::agent::remote::CreateRemoteSession;
         if let Some(profile_id) = profile_id {
-            return querymt_remote::ask_remote_with_timeout(
-                node_manager_ref,
-                &crate::agent::remote::node_manager::CreateRemoteSessionWithProfile {
-                    cwd,
-                    profile_id,
-                },
-                Self::remote_request_timeout(),
-            )
-            .await
-            .map_err(Self::map_remote_node_manager_error);
+            return self
+                .read_remote_session_metadata(
+                    node_manager_ref,
+                    &crate::agent::remote::node_manager::CreateRemoteSessionWithProfile {
+                        cwd,
+                        profile_id,
+                    },
+                )
+                .await;
         }
-        let timeout = Self::remote_request_timeout();
-        querymt_remote::ask_remote_with_timeout(
-            node_manager_ref,
-            &CreateRemoteSession { cwd },
-            timeout,
-        )
-        .await
-        .map_err(Self::map_remote_node_manager_error)
+        self.read_remote_session_metadata(node_manager_ref, &CreateRemoteSession { cwd })
+            .await
     }
 
     /// Fork a session on a remote node and return the forked child's live session ref.

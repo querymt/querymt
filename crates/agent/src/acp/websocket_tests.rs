@@ -72,6 +72,34 @@ fn recovery_transport_accepts_only_loopback_websocket_peers() {
 }
 
 #[test]
+fn mesh_owner_requires_one_matching_non_browser_credential() {
+    use super::websocket::mesh_owner_authorized;
+    use sha2::{Digest, Sha256};
+
+    let token = "synthetic-token-for-websocket-owner-tests";
+    let digest = Sha256::digest(token.as_bytes()).into();
+    let mut headers = HeaderMap::new();
+    assert!(!mesh_owner_authorized(&headers, Some(&digest)));
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer incorrect-credential-for-owner-tests"),
+    );
+    assert!(!mesh_owner_authorized(&headers, Some(&digest)));
+    let auth = HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
+    headers.insert(header::AUTHORIZATION, auth.clone());
+    assert!(mesh_owner_authorized(&headers, Some(&digest)));
+    assert!(!mesh_owner_authorized(&headers, None));
+    headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://127.0.0.1:3030"),
+    );
+    assert!(!mesh_owner_authorized(&headers, Some(&digest)));
+    headers.remove(header::ORIGIN);
+    headers.append(header::AUTHORIZATION, auth);
+    assert!(!mesh_owner_authorized(&headers, Some(&digest)));
+}
+
+#[test]
 fn dashboard_websocket_origin_must_match_host() {
     let mut headers = HeaderMap::new();
     headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:3000"));

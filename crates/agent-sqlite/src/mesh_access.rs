@@ -26,6 +26,7 @@ mod quota;
 #[derive(Clone)]
 pub struct SqliteMeshAccess {
     conn: Arc<Mutex<Connection>>,
+    lease: Option<Arc<std::fs::File>>,
 }
 
 impl SqliteMeshAccess {
@@ -37,7 +38,29 @@ impl SqliteMeshAccess {
             .map_err(backend)??;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            lease: None,
         })
+    }
+
+    /// Hold the startup/recovery lease until the last handle and database job drop.
+    pub async fn open_exclusive(path: impl AsRef<Path>) -> Result<Self, GrantStoreError> {
+        let path = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let lease = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path.with_extension("lock"))
+                .map_err(backend)?;
+            lease.try_lock().map_err(backend)?;
+            Ok(Self {
+                conn: Arc::new(Mutex::new(open_store(path)?)),
+                lease: Some(Arc::new(lease)),
+            })
+        })
+        .await
+        .map_err(backend)?
     }
 
     async fn with_conn<T: Send + 'static, E: From<GrantStoreError> + Send + 'static>(
@@ -45,9 +68,13 @@ impl SqliteMeshAccess {
         f: impl FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,
     ) -> Result<T, E> {
         let conn = Arc::clone(&self.conn);
-        tokio::task::spawn_blocking(move || f(&mut conn.lock()))
-            .await
-            .map_err(backend)?
+        let lease = self.lease.clone();
+        tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            f(&mut conn.lock())
+        })
+        .await
+        .map_err(backend)?
     }
 }
 
@@ -204,6 +231,18 @@ mod tests {
             host: NodeId::parse("12D3KooWJ5MP5JUR1c8pF37dNHGGrVhCGHEHwrCYyowX6dPJtV6t").unwrap(),
             peer: NodeId::parse("12D3KooWQKkiEPk7f8Sp2LXj7S2BJMAMePSz23RQPYGVBCGiyhJE").unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn exclusive_host_lease_outlives_individual_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mesh-access.db");
+        let first = SqliteMeshAccess::open_exclusive(&path).await.unwrap();
+        let clone = first.clone();
+        drop(first);
+        assert!(SqliteMeshAccess::open_exclusive(&path).await.is_err());
+        drop(clone);
+        assert!(SqliteMeshAccess::open_exclusive(&path).await.is_ok());
     }
 
     #[tokio::test]

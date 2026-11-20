@@ -57,7 +57,7 @@ pub async fn join_mesh_via_invite(
         peers: Vec::new(),
         auto_fallback: false,
     };
-    let runtime = querymt_remote::bootstrap_mesh_runtime(&config).await?;
+    let runtime = super::bootstrap_mesh_runtime(&config).await?;
     let mesh = runtime.as_mesh_handle();
     let mesh_state = mesh
         .mesh_state_store()

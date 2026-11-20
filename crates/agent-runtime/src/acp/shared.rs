@@ -318,6 +318,17 @@ pub async fn dispatch_rpc_message_with_context<S: SendAgent>(
     request: RpcMessage,
     context: RpcDispatchContext,
 ) {
+    dispatch_rpc_message_with_owner(state, request, context, false).await;
+}
+
+/// Dispatch using owner authority derived by the transport, never by the request.
+#[doc(hidden)]
+pub async fn dispatch_rpc_message_with_owner<S: SendAgent>(
+    state: RpcDispatchState<S>,
+    request: RpcMessage,
+    context: RpcDispatchContext,
+    owner: bool,
+) {
     let RpcDispatchState {
         agent,
         session_owners,
@@ -325,13 +336,14 @@ pub async fn dispatch_rpc_message_with_context<S: SendAgent>(
         conn_id,
         tx,
     } = state;
-    let output = handle_rpc_message_with_context(
+    let output = handle_rpc_message_with_owner(
         agent.as_ref(),
         &session_owners,
         &pending_elicitations,
         &conn_id,
         request,
         context,
+        owner,
     )
     .await;
 
@@ -669,6 +681,7 @@ pub trait AcpSessionHooks: Send + Sync {
 }
 
 pub const QMT_NOTIFICATION_MESH_NODES_CHANGED: &str = "querymt/mesh/nodesChanged";
+pub const QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED: &str = "querymt/mesh/peerAccessChanged";
 pub const QMT_NOTIFICATION_MESH_JOINED: &str = "querymt/mesh/joined";
 pub const QMT_NOTIFICATION_MESH_PEER_EXPIRED: &str = "querymt/mesh/peerExpired";
 pub const QMT_NOTIFICATION_MODELS_CHANGED: &str = "querymt/models/changed";
@@ -2886,6 +2899,27 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
     req: RpcMessage,
     context: RpcDispatchContext,
 ) -> RpcDispatchOutput {
+    handle_rpc_message_with_owner(
+        agent,
+        session_owners,
+        pending_elicitations,
+        conn_id,
+        req,
+        context,
+        false,
+    )
+    .await
+}
+
+async fn handle_rpc_message_with_owner<S: SendAgent>(
+    agent: &S,
+    session_owners: &SessionOwnerMap,
+    pending_elicitations: &PendingElicitationMap,
+    conn_id: &str,
+    req: RpcMessage,
+    context: RpcDispatchContext,
+    owner: bool,
+) -> RpcDispatchOutput {
     let rpc_method = req.method.clone();
     let rpc_params = req.params.clone();
     let mut notifications = Vec::new();
@@ -3450,9 +3484,8 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                     } else {
                         false
                     };
-                    let response = agent.ext_method(ext_req).await.map(|r| {
-                        serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null)
-                    });
+                    let response = if owner { agent.owner_ext_method(ext_req).await } else { agent.ext_method(ext_req).await }
+                        .map(|r| serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null));
                     match response {
                         Ok(mut value) => {
                             let session_id = session_id_for_owner.clone().or_else(|| {

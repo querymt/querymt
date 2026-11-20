@@ -3,9 +3,10 @@ use querymt::plugin::host::PluginRegistry;
 use querymt_agent::LocalAgentHandle;
 use querymt_agent::acp::protocol::ExtRequest;
 use querymt_agent::agent::agent_config_builder::AgentConfigBuilder;
+use querymt_agent::agent::remote::bootstrap_mesh_runtime;
 use querymt_agent::send_agent::SendAgent;
 use querymt_agent::session::sqlite_storage::SqliteStorage;
-use querymt_remote::{LanDiscovery, LanMeshConfig, MeshRuntimeConfig, bootstrap_mesh_handle};
+use querymt_remote::{LanDiscovery, LanMeshConfig, MeshRuntimeConfig};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
         .build(),
     );
     let handle = LocalAgentHandle::from_config(config);
-    let mesh = bootstrap_mesh_handle(&MeshRuntimeConfig {
+    let mesh = bootstrap_mesh_runtime(&MeshRuntimeConfig {
         enabled: true,
         lan: Some(LanMeshConfig {
             listen: Some("/ip4/127.0.0.1/tcp/0".into()),
@@ -50,7 +51,9 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
         auto_fallback: false,
     })
     .await
-    .expect("LAN mesh");
+    .expect("guarded LAN mesh");
+    let mesh = mesh.as_mesh_handle().clone();
+    assert!(mesh.inbound_router().is_some());
     handle.set_mesh(mesh.clone());
 
     let response = handle
@@ -66,6 +69,65 @@ async fn lan_mesh_reports_lan_transport_and_rejects_invites() {
     assert_eq!(result["transport"]["mesh_transport"], "lan");
     assert_eq!(result["features"]["mesh"], true);
     assert_eq!(result["features"]["mesh_invites"], false);
+    assert!(result.get("mesh_access_version").is_none());
+    let request = |method, params| {
+        ExtRequest::new(
+            method,
+            serde_json::value::to_raw_value(&params).unwrap().into(),
+        )
+    };
+    let response = handle
+        .owner_ext_method(request("querymt/capabilities", serde_json::json!({})))
+        .await
+        .unwrap();
+    let owner_caps: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+    assert_eq!(owner_caps["mesh_access_version"], 1);
+    let peer = libp2p::PeerId::random().to_string();
+    let read_params = serde_json::json!({"version": 1, "peer_id": peer});
+    let denied = handle
+        .ext_method(request("querymt/mesh/getPeerAccess", read_params.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.data.unwrap()["code"], "mesh_access_owner_required");
+    let response = handle
+        .owner_ext_method(request("querymt/mesh/getPeerAccess", read_params.clone()))
+        .await
+        .unwrap();
+    let initial: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+    assert_eq!(initial["outgoing"]["grant"]["mode"], "none");
+    let mut updates = handle.subscribe_ext_notifications();
+    let mut params = serde_json::json!({"version": 2, "peer_id": peer,
+        "expected_revision": initial["outgoing"]["revision"], "scope": {"provider_id":"fixture","model_id":"offline"},
+        "operation":"reconfigure", "limit": {"kind":"finite", "limit_tokens":"9007199254740993", "window":"weekly"}});
+    let invalid = handle
+        .owner_ext_method(request("querymt/mesh/setPeerQuota", params.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(invalid.data.unwrap()["code"], "mesh_access_invalid_params");
+    assert!(updates.try_recv().is_err());
+    params["version"] = serde_json::json!(1);
+    let response = handle
+        .owner_ext_method(request("querymt/mesh/setPeerQuota", params.clone()))
+        .await
+        .unwrap();
+    let written: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+    let quota = &written["outgoing"]["quotas"][0];
+    assert_eq!(quota["limit"]["limit_tokens"], "9007199254740993");
+    assert_eq!(quota["usage"]["available_tokens"], "9007199254740993");
+    assert_eq!(quota["active"], false);
+    let notification = updates
+        .try_recv()
+        .expect("committed quota change notification");
+    assert_eq!(
+        notification.method.as_ref(),
+        "querymt/mesh/peerAccessChanged"
+    );
+    let stale = handle
+        .owner_ext_method(request("querymt/mesh/setPeerQuota", params))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.data.unwrap()["code"], "mesh_access_conflict");
+    assert!(updates.try_recv().is_err());
 
     let response = handle
         .ext_method(ExtRequest::new(

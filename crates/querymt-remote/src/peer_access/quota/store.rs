@@ -23,6 +23,15 @@ pub trait QuotaStore: GrantStore {
         now: i64,
     ) -> Result<QuotaStatus, QuotaError>;
 
+    /// Read the grant and all stored quota scopes from one snapshot.
+    async fn access_snapshot(
+        &self,
+        key: &PeerGrantKey,
+        _now: i64,
+    ) -> Result<(crate::peer_access::PeerGrantState, Vec<QuotaStatus>), QuotaError> {
+        Ok((self.grant(key).await?, Vec::new()))
+    }
+
     /// Edit a quota and advance the same revision used for grant edits.
     async fn edit_quota(
         &self,

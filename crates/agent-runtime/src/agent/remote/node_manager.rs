@@ -98,6 +98,9 @@ pub use remote_impl::{
 };
 
 #[cfg(feature = "remote")]
+pub(crate) use remote_impl::GetPeerSharing;
+
+#[cfg(feature = "remote")]
 mod remote_impl {
     use super::{
         ListRemoteSessionsResponse, ListRemoteSessionsWithLifecycleResponse, NodeInfo,
@@ -125,6 +128,13 @@ mod remote_impl {
     use tokio::sync::Mutex;
 
     // ── Messages ──────────────────────────────────────────────────────────────
+
+    #[derive(Serialize, Deserialize)]
+    pub(crate) struct GetPeerSharing;
+
+    impl kameo::remote::RemoteMessage<GetPeerSharing> for RemoteNodeManager {
+        const REMOTE_ID: &'static str = "querymt::GetPeerSharing.v1";
+    }
 
     /// Create a new session on this node.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -572,6 +582,17 @@ mod remote_impl {
                 actor,
                 InboundAccess::LegacyFull,
             );
+            register_session_request::<_, CreateRemoteSession>(
+                router,
+                actor,
+                InboundAccess::LegacyFull,
+            );
+            register_session_request::<_, CreateRemoteSessionWithProfile>(
+                router,
+                actor,
+                InboundAccess::LegacyFull,
+            );
+            register_session_read::<_, GetRemoteSessionProfile>(router, actor);
             register_session_read::<_, ListRemoteSessions>(router, actor);
             register_session_read::<_, ListRemoteSessionsWithLifecycle>(router, actor);
             register_session_read::<_, GetRemoteSessionLifecycle>(router, actor);

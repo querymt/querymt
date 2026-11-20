@@ -1,12 +1,25 @@
 use super::*;
 
 impl LocalAgentHandle {
-    pub(super) async fn handle_ext_capabilities(&self) -> Result<ExtResponse, Error> {
-        let capabilities = crate::control::capabilities::get_capabilities(self);
+    pub(super) async fn handle_ext_capabilities(&self, owner: bool) -> Result<ExtResponse, Error> {
+        let mut capabilities = crate::control::capabilities::get_capabilities(self);
+        if owner && self.has_mesh_access_store() {
+            capabilities.mesh_access_version = Some(1);
+            capabilities
+                .methods
+                .extend(super::ext_mesh::ACCESS_METHODS.map(str::to_owned));
+            capabilities
+                .notifications
+                .push(crate::acp::shared::QMT_NOTIFICATION_MESH_PEER_ACCESS_CHANGED.to_owned());
+        }
         super::utils::ext_json_response(&capabilities)
     }
 
-    pub(super) async fn handle_ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_method(
+        &self,
+        req: ExtRequest,
+        owner: bool,
+    ) -> Result<ExtResponse, Error> {
         match req.method.as_ref() {
             "querymt/models" => self.handle_ext_models().await,
             "querymt/profiles" => self.handle_ext_profiles(req).await,
@@ -66,10 +79,13 @@ impl LocalAgentHandle {
             "querymt/worktree/remove" => self.handle_ext_worktree_remove(req).await,
             "querymt/worktree/recover" => self.handle_ext_worktree_recover(req).await,
             "querymt/worktree/archive" => self.handle_ext_worktree_archive(req).await,
-            "querymt/capabilities" => self.handle_ext_capabilities().await,
+            "querymt/capabilities" => self.handle_ext_capabilities(owner).await,
             "querymt/mesh/status" => self.handle_ext_mesh_status().await,
             "querymt/mesh/join" => self.handle_ext_mesh_join(req).await,
-            "querymt/mesh/nodes" => self.handle_ext_mesh_nodes().await,
+            "querymt/mesh/nodes" => self.handle_ext_mesh_nodes(owner).await,
+            m if super::ext_mesh::ACCESS_METHODS.contains(&m) => {
+                self.handle_ext_mesh_access(req, owner).await
+            }
             "querymt/mesh/createInvite" => self.handle_ext_mesh_create_invite(req).await,
             "querymt/mesh/listInvites" => self.handle_ext_mesh_list_invites().await,
             "querymt/mesh/revokeInvite" => self.handle_ext_mesh_revoke_invite(req).await,

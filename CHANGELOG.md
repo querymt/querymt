@@ -12,6 +12,9 @@
 
 ### Behavior changes
 
+- **Mesh sharing:** Agent mesh runtimes start with no sharing grants. Joining a
+  scope does not grant access in either direction. Use owner ACP to grant access
+  explicitly; pre-upgrade clients require Full access on an upgraded host.
 - **Scheduled execution:** Schedules with no recorded origin no longer run as
   the owner. Recreate older jobs you trust from the host to record their local
   origin. A peer-origin job needs its original host and current grant revision.
