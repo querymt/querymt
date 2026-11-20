@@ -1005,7 +1005,7 @@ impl ModelInventory {
                             .peer_id()
                             .copied()
                             .filter(|peer| *peer != local_peer)
-                            .map(|peer| Ok((peer, (node_ref, scope.clone())))),
+                            .map(|peer| Ok((peer, scope.clone()))),
                         Err(error) => {
                             tracing::debug!(%scope, %error, "Remote node discovery failed");
                             Some(Err(RemoteCatalogFailure::Unavailable))
@@ -1015,12 +1015,12 @@ impl ModelInventory {
                 })
         }));
         let node_timeout = self.inner.inv_config.remote_node_timeout;
-        collect_remote_catalogs(discoveries, |peer_id, (node_ref, discovered_scope)| async move {
+        collect_remote_catalogs(discoveries, |peer_id, discovered_scope| async move {
             // Query the scope that actually advertised this node before trying
             // other active scopes, so an unrelated DHT miss cannot consume its budget.
             let peer_scopes: Vec<_> = std::iter::once(discovered_scope.clone())
                 .chain(scopes.iter().filter(|scope| **scope != discovered_scope).cloned()).collect();
-            let query = Self::query_peer_catalog(mesh, &node_ref, peer_id, &peer_scopes, node_timeout);
+            let query = Self::query_peer_catalog(mesh, peer_id, &peer_scopes, node_timeout);
             match tokio::time::timeout(node_timeout, query).await {
                 Ok(outcome) => outcome,
                 Err(_) => {
@@ -1034,26 +1034,14 @@ impl ModelInventory {
     #[cfg(feature = "remote")]
     async fn query_peer_catalog(
         mesh: &MeshRuntimeHandle,
-        node_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
         peer_id: libp2p::PeerId,
         scopes: &[querymt_remote::MeshScopeId],
         node_timeout: Duration,
     ) -> Result<Vec<ModelEntry>, RemoteCatalogFailure> {
-        use crate::agent::remote::GetNodeInfo;
-        use querymt_remote::{
-            GetProviderCatalog, ProviderCatalogActor, ask_remote_with_timeout,
-            scoped_provider_catalog,
-        };
-        let node_info = ask_remote_with_timeout(node_ref, &GetNodeInfo, node_timeout)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%peer_id, %error, "GetNodeInfo failed during model refresh");
-                if matches!(error, kameo::error::RemoteSendError::ReplyTimeout) {
-                    RemoteCatalogFailure::TimedOut
-                } else {
-                    RemoteCatalogFailure::Unavailable
-                }
-            })?;
+        use querymt_remote::mesh_ingress::{SharingCallError, SharingRejection};
+        use querymt_remote::request_timeout::{SharingAskError, ask_with_sharing};
+        use querymt_remote::{GetProviderCatalog, ProviderCatalogActor, scoped_provider_catalog};
+        let node_id = peer_id.to_string();
         let mut failure = RemoteCatalogFailure::Unavailable;
         for scope in scopes {
             let name = scoped_provider_catalog(scope, &peer_id);
@@ -1071,25 +1059,39 @@ impl ModelInventory {
                     continue;
                 }
             };
-            let snapshot =
-                match ask_remote_with_timeout(&catalog, &GetProviderCatalog, node_timeout).await {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        if matches!(error, kameo::error::RemoteSendError::ReplyTimeout) {
-                            failure = RemoteCatalogFailure::TimedOut;
-                        }
-                        tracing::warn!(%peer_id, %scope, %error, "GetProviderCatalog failed");
-                        continue;
+            if catalog.id().peer_id() != Some(&peer_id) {
+                continue;
+            }
+            let snapshot = match ask_with_sharing(
+                mesh.as_mesh_handle(),
+                &catalog,
+                &GetProviderCatalog,
+                node_timeout,
+            )
+            .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(SharingAskError::Sharing(SharingCallError::Rejected(
+                    SharingRejection::Denied | SharingRejection::Changed,
+                ))) => {
+                    // A denial withdraws the last known catalog, unlike an unreachable peer.
+                    return Ok(Vec::new());
+                }
+                Err(error) => {
+                    if matches!(
+                        error,
+                        SharingAskError::Actor(kameo::error::RemoteSendError::ReplyTimeout)
+                            | SharingAskError::Sharing(SharingCallError::Transport(
+                                libp2p::request_response::OutboundFailure::Timeout
+                            ))
+                    ) {
+                        failure = RemoteCatalogFailure::TimedOut;
                     }
-                };
-            let node_id = crate::agent::remote::NodeId::parse(&snapshot.node.node_id)
-                .ok()
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| node_info.node_id.to_string());
-            let label = snapshot
-                .node
-                .node_label
-                .unwrap_or_else(|| node_info.hostname.clone());
+                    tracing::warn!(%peer_id, %scope, %error, "GetProviderCatalog failed");
+                    continue;
+                }
+            };
+            let label = snapshot.node.node_label;
             return Ok(snapshot
                 .providers
                 .into_iter()
@@ -1109,7 +1111,7 @@ impl ModelInventory {
                         provider,
                         model,
                         node_id: Some(node_id.clone()),
-                        node_label: Some(label.clone()),
+                        node_label: label.clone(),
                         family: entry.family,
                         quant: entry.quant,
                     }

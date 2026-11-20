@@ -1,5 +1,5 @@
 #[cfg(feature = "kameo-mesh")]
-use crate::{MeshRuntimeHandle, scoped_provider_catalog, scoped_provider_host};
+use crate::{MeshRuntimeHandle, MeshScopeId, scoped_provider_catalog, scoped_provider_host};
 use crate::{
     ProviderCatalogActor, ProviderCatalogBackend, ProviderHostActor, RemoteProviderBackend,
     RemoteProviderHostError,
@@ -18,6 +18,8 @@ pub struct ProviderShare {
     backend: Arc<dyn RemoteProviderBackend<Error = RemoteProviderHostError>>,
     #[cfg(feature = "kameo-mesh")]
     catalog: Arc<dyn ProviderCatalogBackend>,
+    #[cfg(feature = "kameo-mesh")]
+    guarded_registration: Arc<std::sync::OnceLock<()>>,
 }
 
 impl ProviderShare {
@@ -35,6 +37,8 @@ impl ProviderShare {
             backend,
             #[cfg(feature = "kameo-mesh")]
             catalog,
+            #[cfg(feature = "kameo-mesh")]
+            guarded_registration: Default::default(),
         }
     }
 
@@ -46,33 +50,47 @@ impl ProviderShare {
         &self.provider_catalog
     }
 
+    /// Publish this provider share in every active scope of the mesh runtime.
     #[cfg(feature = "kameo-mesh")]
     pub async fn register_on_mesh(&self, runtime: &MeshRuntimeHandle) {
+        for scope in runtime.active_scopes() {
+            self.register_scope(runtime, &scope).await;
+        }
+    }
+
+    /// Publish the provider share in one scope. Adding a scope does not replace
+    /// the existing guarded handlers or their active stream state.
+    #[cfg(feature = "kameo-mesh")]
+    pub async fn register_scope(&self, runtime: &MeshRuntimeHandle, scope: &MeshScopeId) {
         let mesh = runtime.as_mesh_handle();
         if let (Some(router), Some(store)) = (mesh.inbound_router(), mesh.quota_store()) {
-            let provider = Arc::new(guarded::GuardedProvider {
-                backend: self.backend.clone(),
-                catalog: self.catalog.clone(),
-                store: store.clone(),
+            // Kameo has one mesh runtime per process, so the same share is
+            // registered once and then published under multiple names.
+            self.guarded_registration.get_or_init(|| {
+                let provider = Arc::new(guarded::GuardedProvider {
+                    backend: self.backend.clone(),
+                    catalog: self.catalog.clone(),
+                    store: store.clone(),
+                });
+                provider.clone().install(
+                    router,
+                    self.provider_catalog.id(),
+                    self.provider_host.id(),
+                );
+                guarded::streams::install(provider, mesh, router, self.provider_host.id());
             });
-            provider
-                .clone()
-                .install(router, self.provider_catalog.id(), self.provider_host.id());
-            guarded::streams::install(provider, mesh, router, self.provider_host.id());
         }
-        for scope in runtime.active_scopes() {
-            runtime
-                .register_actor(
-                    self.provider_host.clone(),
-                    scoped_provider_host(&scope, runtime.peer_id()),
-                )
-                .await;
-            runtime
-                .register_actor(
-                    self.provider_catalog.clone(),
-                    scoped_provider_catalog(&scope, runtime.peer_id()),
-                )
-                .await;
-        }
+        runtime
+            .register_actor(
+                self.provider_host.clone(),
+                scoped_provider_host(scope, runtime.peer_id()),
+            )
+            .await;
+        runtime
+            .register_actor(
+                self.provider_catalog.clone(),
+                scoped_provider_catalog(scope, runtime.peer_id()),
+            )
+            .await;
     }
 }

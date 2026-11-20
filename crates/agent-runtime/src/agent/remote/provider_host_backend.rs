@@ -2,8 +2,10 @@ use crate::agent::agent_config::AgentConfig;
 use crate::session::provider::ProviderRequest;
 use async_trait::async_trait;
 use querymt::LLMProvider;
+#[cfg(any(test, feature = "test-support"))]
+use querymt_remote::ProviderHostActor;
 use querymt_remote::{
-    ProviderBuildRequest, ProviderHostActor, RemoteProviderBackend, RemoteProviderHostError,
+    ProviderBuildRequest, RemoteProviderBackend, RemoteProviderHostError,
     params_for_remote_provider,
 };
 use std::sync::Arc;
@@ -88,6 +90,7 @@ pub fn provider_backend_from_config(
     Arc::new(AgentConfigProviderBackend { config })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn provider_host_from_config(config: Arc<AgentConfig>) -> ProviderHostActor {
     ProviderHostActor::new(provider_backend_from_config(config))
 }
