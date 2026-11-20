@@ -27,7 +27,14 @@ mod tests;
 type AskResult = Result<Vec<u8>, RemoteSendError<Vec<u8>>>;
 type Handler =
     dyn Fn(PeerRequest, Vec<u8>) -> Pin<Box<dyn Future<Output = AskResult> + Send>> + Send + Sync;
-type Routes = HashMap<ActorId, HashMap<(SharingProtocol, &'static str, &'static str), Arc<Route>>>;
+type RouteKey = (SharingProtocol, Delivery, &'static str, &'static str);
+type Routes = HashMap<ActorId, HashMap<RouteKey, Arc<Route>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Delivery {
+    Ask,
+    Tell,
+}
 
 /// Trusted local metadata captured at the network boundary. It is not wire data.
 #[derive(Debug, Clone)]
@@ -97,8 +104,8 @@ struct Route {
     handler: Box<Handler>,
 }
 
-/// Host-bound registry for explicitly supported guarded asks. Unknown routes,
-/// tells and actor lifecycle operations are never forwarded to Kameo.
+/// Host-bound registry for explicitly supported guarded messages. Unknown routes
+/// and remote actor lifecycle operations are never forwarded to Kameo.
 pub struct InboundRouter {
     host: PeerId,
     store: Arc<dyn GrantStore>,
@@ -131,7 +138,13 @@ impl InboundRouter {
         F: Fn(PeerRequest, M) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R, E>> + Send + 'static,
     {
-        self.register::<A, M, R, E, F, Fut>(actor_id, SharingProtocol::Legacy, access, handler);
+        self.register::<A, M, R, E, F, Fut>(
+            actor_id,
+            SharingProtocol::Legacy,
+            Delivery::Ask,
+            access,
+            handler,
+        );
     }
 
     /// Install a handler only for the grant-aware protocol.
@@ -148,13 +161,43 @@ impl InboundRouter {
         F: Fn(PeerRequest, M) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R, E>> + Send + 'static,
     {
-        self.register::<A, M, R, E, F, Fut>(actor_id, SharingProtocol::V1, access, handler);
+        self.register::<A, M, R, E, F, Fut>(
+            actor_id,
+            SharingProtocol::V1,
+            Delivery::Ask,
+            access,
+            handler,
+        );
+    }
+
+    /// Install an explicitly guarded legacy notification route. The handler must
+    /// validate the authenticated sender and active context before accepting a callback.
+    pub fn register_legacy_tell<A, M, E, F, Fut>(
+        &self,
+        actor_id: ActorId,
+        access: InboundAccess,
+        handler: F,
+    ) where
+        A: RemoteActor + RemoteMessage<M>,
+        M: DeserializeOwned + Send + 'static,
+        E: Serialize + Send,
+        F: Fn(PeerRequest, M) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+    {
+        self.register::<A, M, (), E, F, Fut>(
+            actor_id,
+            SharingProtocol::Legacy,
+            Delivery::Tell,
+            access,
+            handler,
+        );
     }
 
     fn register<A, M, R, E, F, Fut>(
         &self,
         actor_id: ActorId,
         protocol: SharingProtocol,
+        delivery: Delivery,
         access: InboundAccess,
         handler: F,
     ) where
@@ -186,6 +229,7 @@ impl InboundRouter {
         self.routes.write().entry(actor_id).or_default().insert(
             (
                 protocol,
+                delivery,
                 <A as RemoteActor>::REMOTE_ID,
                 <A as RemoteMessage<M>>::REMOTE_ID,
             ),
@@ -216,27 +260,47 @@ impl InboundRouter {
         }
     }
 
-    async fn route_ask(
+    async fn dispatch(
         &self,
         peer: PeerId,
         request: SwarmRequest,
         protocol: SharingProtocol,
     ) -> Result<AskResult, SharingRejection> {
-        let SwarmRequest::Ask {
-            actor_id,
-            actor_remote_id,
-            message_remote_id,
-            payload,
-            ..
-        } = request
-        else {
-            return Ok(Err(RemoteSendError::BadActorType));
+        let (delivery, actor_id, actor_remote_id, message_remote_id, payload) = match request {
+            SwarmRequest::Ask {
+                actor_id,
+                actor_remote_id,
+                message_remote_id,
+                payload,
+                ..
+            } => (
+                Delivery::Ask,
+                actor_id,
+                actor_remote_id,
+                message_remote_id,
+                payload,
+            ),
+            SwarmRequest::Tell {
+                actor_id,
+                actor_remote_id,
+                message_remote_id,
+                payload,
+                ..
+            } => (
+                Delivery::Tell,
+                actor_id,
+                actor_remote_id,
+                message_remote_id,
+                payload,
+            ),
+            _ => return Ok(Err(RemoteSendError::BadActorType)),
         };
         if actor_id.peer_id() != Some(&self.host) {
             return Ok(Err(RemoteSendError::BadActorType));
         }
         let route_key = (
             protocol,
+            delivery,
             actor_remote_id.as_ref(),
             message_remote_id.as_ref(),
         );
@@ -285,7 +349,7 @@ impl InboundRouter {
     }
 
     async fn ask(&self, peer: PeerId, request: SwarmRequest) -> AskResult {
-        self.route_ask(peer, request, SharingProtocol::Legacy)
+        self.dispatch(peer, request, SharingProtocol::Legacy)
             .await
             .map_err(legacy_denied)?
     }
@@ -310,7 +374,7 @@ impl MeshIngress for InboundRouter {
     ) -> Result<SwarmResponse, SharingRejection> {
         match request {
             ask @ SwarmRequest::Ask { .. } => self
-                .route_ask(peer, ask, SharingProtocol::V1)
+                .dispatch(peer, ask, SharingProtocol::V1)
                 .await
                 .map(SwarmResponse::Ask),
             _ => Err(SharingRejection::UnsupportedOperation),
@@ -320,7 +384,19 @@ impl MeshIngress for InboundRouter {
     async fn handle_legacy(&self, peer: PeerId, request: SwarmRequest) -> SwarmResponse {
         match request {
             ask @ SwarmRequest::Ask { .. } => SwarmResponse::Ask(self.ask(peer, ask).await),
-            SwarmRequest::Tell { .. } => SwarmResponse::Tell(Err(RemoteSendError::BadActorType)),
+            tell @ SwarmRequest::Tell { .. } => {
+                let result = self
+                    .ask(peer, tell)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| match error {
+                        RemoteSendError::HandlerError(_) => {
+                            RemoteSendError::DeserializeMessage("mesh notification rejected".into())
+                        }
+                        error => error.map_err(|_| unreachable!("handler error handled above")),
+                    });
+                SwarmResponse::Tell(result)
+            }
             SwarmRequest::Link { .. } => SwarmResponse::Link(Err(RemoteSendError::BadActorType)),
             SwarmRequest::Unlink { .. } => {
                 SwarmResponse::Unlink(Err(RemoteSendError::BadActorType))

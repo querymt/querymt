@@ -212,6 +212,78 @@ async fn grant_aware_route_authorizes_custom_sessions_only_on_v1() {
 }
 
 #[tokio::test]
+async fn provider_relay_requires_expected_host_and_active_request_without_reverse_grant() {
+    use crate::StreamRelayMessage;
+    use crate::provider_stream_router::{
+        AttachStreamConsumer, ProviderStreamRouterActor, RegisterRequest, register_peer_relay,
+    };
+    use crate::stream_router_protocol::RoutedStreamRelayMessage;
+    use kameo::actor::Spawn;
+    use querymt::chat::StreamChunk;
+
+    let client = PeerId::random();
+    let host = PeerId::random();
+    let ingress = InboundRouter::new(client, Arc::new(TestStore::default()));
+    let actor = ProviderStreamRouterActor::spawn(ProviderStreamRouterActor::new(None, None));
+    let actor_id = ActorId::new_with_peer_id(actor.id().sequence_id(), client);
+    register_peer_relay(&ingress, actor_id, &actor, host);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    actor
+        .ask(RegisterRequest {
+            request_id: "active".into(),
+        })
+        .await
+        .unwrap();
+    actor
+        .ask(AttachStreamConsumer {
+            request_id: "active".into(),
+            consumer_tx: tx,
+        })
+        .await
+        .unwrap();
+
+    let relay = |request_id: &str, text: &str| SwarmRequest::Tell {
+        actor_id,
+        actor_remote_id: <ProviderStreamRouterActor as RemoteActor>::REMOTE_ID.into(),
+        message_remote_id:
+            <ProviderStreamRouterActor as RemoteMessage<RoutedStreamRelayMessage>>::REMOTE_ID.into(),
+        payload: rmp_serde::to_vec_named(&RoutedStreamRelayMessage {
+            request_id: request_id.into(),
+            message: StreamRelayMessage::Chunk(StreamChunk::Text(text.into())),
+            seq: None,
+        })
+        .unwrap(),
+        mailbox_timeout: None,
+        immediate: false,
+    };
+    assert!(matches!(
+        ingress
+            .handle_legacy(PeerId::random(), relay("active", "wrong host"))
+            .await,
+        SwarmResponse::Tell(Err(_))
+    ));
+    assert!(matches!(
+        ingress
+            .handle_legacy(host, relay("missing", "wrong request"))
+            .await,
+        SwarmResponse::Tell(Err(_))
+    ));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        ingress
+            .handle_legacy(host, relay("active", "legacy data"))
+            .await,
+        SwarmResponse::Tell(Ok(()))
+    ));
+    assert!(
+        matches!(rx.try_recv(), Ok(StreamRelayMessage::Chunk(StreamChunk::Text(text))) if text == "legacy data")
+    );
+}
+
+#[tokio::test]
 async fn legacy_router_suppresses_reply_after_grant_changes() {
     let host = PeerId::random();
     let peer = PeerId::random();

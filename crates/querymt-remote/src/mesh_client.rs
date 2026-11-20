@@ -27,9 +27,10 @@ use tokio::sync::{RwLock, mpsc};
 static PROVIDER_HOST_CACHE: OnceLock<
     RwLock<HashMap<String, kameo::actor::RemoteActorRef<ProviderHostActor>>>,
 > = OnceLock::new();
-static STREAM_ROUTER_CACHE: OnceLock<
-    RwLock<HashMap<String, kameo::actor::ActorRef<ProviderStreamRouterActor>>>,
-> = OnceLock::new();
+type StreamRouterKey = (PeerId, Option<PeerId>, String);
+type StreamRouters =
+    RwLock<HashMap<StreamRouterKey, kameo::actor::ActorRef<ProviderStreamRouterActor>>>;
+static STREAM_ROUTER_CACHE: OnceLock<StreamRouters> = OnceLock::new();
 
 fn provider_ask_error(error: SharingAskError<crate::RemoteProviderHostError>) -> LLMError {
     match error {
@@ -82,8 +83,7 @@ impl KameoMeshClientTransport {
         PROVIDER_HOST_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
     }
 
-    fn stream_router_cache()
-    -> &'static RwLock<HashMap<String, kameo::actor::ActorRef<ProviderStreamRouterActor>>> {
+    fn stream_router_cache() -> &'static StreamRouters {
         STREAM_ROUTER_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
     }
 
@@ -160,28 +160,30 @@ impl KameoMeshClientTransport {
     async fn get_or_create_stream_router(
         &self,
         session_id: &str,
+        host: PeerId,
     ) -> kameo::actor::ActorRef<ProviderStreamRouterActor> {
-        if let Some(cached) = Self::stream_router_cache()
-            .read()
-            .await
-            .get(session_id)
-            .cloned()
-        {
-            return cached;
-        }
-
-        let router = ProviderStreamRouterActor::new(None, None);
-        let prepared =
-            ProviderStreamRouterActor::prepare().reply_timeout(Self::STREAM_ROUTER_TIMEOUT);
-        let router_ref = prepared.actor_ref().clone();
-        prepared.spawn(router);
-
-        Self::stream_router_cache()
-            .write()
-            .await
-            .insert(session_id.to_string(), router_ref.clone());
-
-        router_ref
+        let ingress = self.mesh.inbound_router();
+        let key = (self.peer_id(), ingress.map(|_| host), session_id.to_owned());
+        let mut routers = Self::stream_router_cache().write().await;
+        routers
+            .entry(key)
+            .or_insert_with(|| {
+                let router = ProviderStreamRouterActor::new(None, None);
+                let prepared =
+                    ProviderStreamRouterActor::prepare().reply_timeout(Self::STREAM_ROUTER_TIMEOUT);
+                let actor = prepared.actor_ref().clone();
+                if let Some(ingress) = ingress {
+                    crate::provider_stream_router::register_peer_relay(
+                        ingress,
+                        actor.id(),
+                        &actor,
+                        host,
+                    );
+                }
+                prepared.spawn(router);
+                actor
+            })
+            .clone()
     }
 }
 
@@ -223,11 +225,17 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
 
     async fn prepare_stream_router(
         &self,
+        host: &Self::HostRef,
         session_id: &str,
         request_id: &str,
         consumer_tx: mpsc::UnboundedSender<StreamRelayMessage>,
     ) -> Result<(Self::RouterRef, Self::RemoteRouterRef), LLMError> {
-        let router = self.get_or_create_stream_router(session_id).await;
+        let peer = host
+            .id()
+            .peer_id()
+            .copied()
+            .ok_or_else(|| sharing_error(SharingCallError::Unavailable))?;
+        let router = self.get_or_create_stream_router(session_id, peer).await;
         router
             .ask(RegisterRequest {
                 request_id: request_id.to_string(),

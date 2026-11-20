@@ -155,7 +155,7 @@ where
         );
         let (_router_ref, remote_router_ref) = self
             .core
-            .prepare_stream_router(&session_id, &request_id, tx)
+            .prepare_stream_router(&host_ref, &session_id, &request_id, tx)
             .await?;
         tracing::debug!(
             target: "querymt_remote::provider::stream",

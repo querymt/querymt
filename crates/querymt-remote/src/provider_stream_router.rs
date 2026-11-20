@@ -53,6 +53,47 @@ pub struct DetachStreamConsumer {
     pub request_id: String,
 }
 
+// This local message is not registered as a remote message.
+#[cfg(feature = "kameo-mesh")]
+struct AuthenticatedRelay(RoutedStreamRelayMessage);
+
+/// Bind relay ingress to the resource host selected by the client, without
+/// granting that host access to any other local operation.
+#[cfg(feature = "kameo-mesh")]
+pub(crate) fn register_peer_relay(
+    ingress: &crate::mesh_ingress::InboundRouter,
+    actor_id: kameo::actor::ActorId,
+    actor: &kameo::actor::ActorRef<ProviderStreamRouterActor>,
+    host: libp2p::PeerId,
+) {
+    use crate::mesh_ingress::{InboundAccess, PeerRequest};
+
+    let weak = actor.downgrade();
+    let relay = move |peer: PeerRequest, msg| {
+        let weak = weak.clone();
+        async move {
+            if peer.key().peer.as_peer_id() != &host {
+                return Err("provider relay sender is not the stream host".to_owned());
+            }
+            let actor = weak.upgrade().ok_or("provider relay is no longer active")?;
+            actor
+                .ask(AuthenticatedRelay(msg))
+                .await
+                .map_err(|error| error.to_string())
+        }
+    };
+    ingress.register_legacy_tell::<ProviderStreamRouterActor, RoutedStreamRelayMessage, _, _, _>(
+        actor_id,
+        InboundAccess::Identity,
+        relay.clone(),
+    );
+    ingress.register_v1_ask::<ProviderStreamRouterActor, RoutedStreamRelayMessage, _, _, _, _>(
+        actor_id,
+        InboundAccess::Identity,
+        relay,
+    );
+}
+
 /// Outcome of admitting a sequenced message.
 #[derive(Debug)]
 enum Admitted {
@@ -441,6 +482,30 @@ impl Message<RoutedStreamRelayMessage> for ProviderStreamRouterActor {
         msg: RoutedStreamRelayMessage,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        let _ = self.route_relay(msg, ctx.actor_ref(), false);
+    }
+}
+
+#[cfg(feature = "kameo-mesh")]
+impl Message<AuthenticatedRelay> for ProviderStreamRouterActor {
+    type Reply = Result<(), RouterError>;
+
+    async fn handle(
+        &mut self,
+        msg: AuthenticatedRelay,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.route_relay(msg.0, ctx.actor_ref(), true)
+    }
+}
+
+impl ProviderStreamRouterActor {
+    fn route_relay(
+        &self,
+        msg: RoutedStreamRelayMessage,
+        actor: &kameo::actor::ActorRef<Self>,
+        require_active_consumer: bool,
+    ) -> Result<(), RouterError> {
         let message_type = match &msg.message {
             StreamRelayMessage::Chunk(_) => "chunk",
             StreamRelayMessage::ChunkBatch(_) => "chunk_batch",
@@ -459,8 +524,25 @@ impl Message<RoutedStreamRelayMessage> for ProviderStreamRouterActor {
                 message_type,
                 "dropped relay message for unknown request id"
             );
-            return;
+            return Err(RouterError::Invariant(
+                "stream request not registered".into(),
+            ));
         };
+        if require_active_consumer {
+            if request.is_terminal() {
+                // Acknowledge transport retransmissions without replaying data.
+                return Ok(());
+            }
+            if !request
+                .consumer_tx
+                .as_ref()
+                .is_some_and(|tx| !tx.is_closed())
+            {
+                return Err(RouterError::Invariant(
+                    "stream has no active consumer".into(),
+                ));
+            }
+        }
 
         let schedule_check = request.route(msg.seq, msg.message);
         tracing::trace!(
@@ -473,13 +555,10 @@ impl Message<RoutedStreamRelayMessage> for ProviderStreamRouterActor {
         );
         drop(requests);
         if schedule_check {
-            schedule_gap_check(
-                ctx.actor_ref().clone(),
-                msg.request_id.clone(),
-                self.gap_timeout,
-            );
+            schedule_gap_check(actor.clone(), msg.request_id, self.gap_timeout);
         }
         self.cleanup_expired_requests();
+        Ok(())
     }
 }
 
