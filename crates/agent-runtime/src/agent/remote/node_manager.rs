@@ -106,10 +106,12 @@ mod remote_impl {
     use crate::agent::agent_config::AgentConfig;
     use crate::agent::remote::NodeId;
     use crate::agent::remote::mesh::MeshHandle;
-    use crate::agent::session_actor::SessionActor;
+    use crate::agent::session_actor::{PeerTurn, SessionActor, TurnAuthority};
     use crate::agent::session_registry::SessionRegistry;
     use crate::error::AgentError;
-    use crate::session::domain_schedule::{Schedule, ScheduleExecutionLimits, ScheduleTrigger};
+    use crate::session::domain_schedule::{
+        Schedule, ScheduleExecutionLimits, ScheduleOrigin, ScheduleTrigger,
+    };
     use futures_util::FutureExt;
     use kameo::Actor;
     use kameo::message::{Context, Message};
@@ -283,6 +285,11 @@ mod remote_impl {
         pub schedule_public_id: String,
     }
 
+    struct PeerScheduleRequest<M> {
+        request: M,
+        authority: Arc<PeerTurn>,
+    }
+
     /// List schedules owned by this node, optionally filtered by session.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ListRemoteSchedules {
@@ -314,6 +321,34 @@ mod remote_impl {
     pub struct DeleteRemoteSchedule {
         pub schedule_public_id: String,
     }
+
+    enum ScheduleAction {
+        Pause,
+        Resume,
+        Trigger,
+        Delete,
+    }
+
+    trait PeerScheduleAction: Send + 'static {
+        const ACTION: ScheduleAction;
+        fn schedule_id(&self) -> &str;
+    }
+
+    macro_rules! peer_schedule_action {
+        ($message:ty, $action:ident) => {
+            impl PeerScheduleAction for $message {
+                const ACTION: ScheduleAction = ScheduleAction::$action;
+                fn schedule_id(&self) -> &str {
+                    &self.schedule_public_id
+                }
+            }
+        };
+    }
+
+    peer_schedule_action!(PauseRemoteSchedule, Pause);
+    peer_schedule_action!(ResumeRemoteSchedule, Resume);
+    peer_schedule_action!(TriggerRemoteSchedule, Trigger);
+    peer_schedule_action!(DeleteRemoteSchedule, Delete);
 
     /// Shut down the live runtime actor for a session on this node.
     ///
@@ -521,6 +556,12 @@ mod remote_impl {
             use querymt_remote::peer_access::{PeerGrant, SharingProtocol};
 
             Self::register_admission(router, actor);
+            Self::register_peer_schedule_ask::<CreateRemoteSchedule, _>(router, &store, actor);
+            Self::register_peer_schedule_ask::<ListRemoteSchedules, _>(router, &store, actor);
+            Self::register_peer_schedule_ask::<PauseRemoteSchedule, _>(router, &store, actor);
+            Self::register_peer_schedule_ask::<ResumeRemoteSchedule, _>(router, &store, actor);
+            Self::register_peer_schedule_ask::<TriggerRemoteSchedule, _>(router, &store, actor);
+            Self::register_peer_schedule_ask::<DeleteRemoteSchedule, _>(router, &store, actor);
             use crate::agent::remote::remote_actor_impl::register_session_read;
             register_session_read::<_, ListRemoteSessions>(router, actor);
             register_session_read::<_, ListRemoteSessionsWithLifecycle>(router, actor);
@@ -561,6 +602,46 @@ mod remote_impl {
                 actor.id(),
                 InboundAccess::Identity,
                 describe,
+            );
+        }
+
+        fn register_peer_schedule_ask<M, R>(
+            router: &InboundRouter,
+            store: &Arc<dyn querymt_remote::peer_access::GrantStore>,
+            actor: &kameo::actor::ActorRef<Self>,
+        ) where
+            Self: kameo::remote::RemoteMessage<M> + Message<PeerScheduleRequest<M>>,
+            M: serde::de::DeserializeOwned + Send + 'static,
+            R: serde::Serialize + Send + 'static,
+            <Self as Message<PeerScheduleRequest<M>>>::Reply:
+                kameo::reply::Reply<Ok = R, Error = AgentError>,
+        {
+            let weak = actor.downgrade();
+            let store = store.clone();
+            let handle = move |origin: PeerRequest, request| {
+                let weak = weak.clone();
+                let store = store.clone();
+                async move {
+                    let actor = weak.upgrade().ok_or(AgentError::MeshNotBootstrapped)?;
+                    let authority = Arc::new(PeerTurn::from_request(&origin, store)?);
+                    actor
+                        .ask(PeerScheduleRequest { request, authority })
+                        .await
+                        .map_err(|error| match error {
+                            kameo::error::SendError::HandlerError(error) => error,
+                            _ => AgentError::MeshNotBootstrapped,
+                        })
+                }
+            };
+            router.register_ask::<Self, M, _, _, _, _>(
+                actor.id(),
+                InboundAccess::LegacyFull,
+                handle.clone(),
+            );
+            router.register_v1_ask::<Self, M, _, _, _, _>(
+                actor.id(),
+                InboundAccess::LegacyFull,
+                handle,
             );
         }
 
@@ -752,22 +833,29 @@ mod remote_impl {
 
         async fn create_schedule(
             &self,
-            session_public_id: &str,
-            prompt: &str,
-            trigger: ScheduleTrigger,
-            max_steps: Option<u32>,
-            max_cost_usd: Option<f64>,
-            max_runs: Option<u32>,
-        ) -> Result<String, AgentError> {
+            request: CreateRemoteSchedule,
+            origin: Option<Arc<PeerTurn>>,
+        ) -> Result<CreateRemoteScheduleResponse, AgentError> {
             use crate::session::domain::{Task, TaskKind, TaskStatus};
+            let CreateRemoteSchedule {
+                session_id: session_public_id,
+                prompt,
+                trigger,
+                max_steps,
+                max_cost_usd,
+                max_runs,
+            } = request;
+            if let Some(origin) = &origin {
+                TurnAuthority::Peer(origin.clone()).check().await?;
+            }
 
             let store = self.config.provider.history_store();
             let session = store
-                .get_session(session_public_id)
+                .get_session(&session_public_id)
                 .await
                 .map_err(|e| AgentError::Internal(e.to_string()))?
                 .ok_or_else(|| AgentError::SessionNotFound {
-                    session_id: session_public_id.to_string(),
+                    session_id: session_public_id.clone(),
                 })?;
 
             let scheduler = self
@@ -782,7 +870,7 @@ mod remote_impl {
                 session_id: session.id,
                 kind: TaskKind::Recurring,
                 status: TaskStatus::Active,
-                expected_deliverable: Some(prompt.to_string()),
+                expected_deliverable: Some(prompt),
                 acceptance_criteria: None,
                 revision: 1,
                 creation_key: None,
@@ -796,13 +884,12 @@ mod remote_impl {
                 .await
                 .map_err(|e| AgentError::Internal(e.to_string()))?;
 
-            let mut schedule = Schedule::new(
-                task.public_id.clone(),
-                session_public_id.to_string(),
-                trigger,
-            );
+            let mut schedule = Schedule::new(task.public_id.clone(), session_public_id, trigger);
             schedule.task_id = task.id;
             schedule.session_id = session.id;
+            schedule.config.origin = origin
+                .as_ref()
+                .map_or(ScheduleOrigin::Unknown, |peer| peer.schedule_origin());
 
             if max_runs.is_some() {
                 schedule.config.max_runs = max_runs;
@@ -816,7 +903,7 @@ mod remote_impl {
 
             let schedule_public_id = schedule.public_id.clone();
             match scheduler.add_schedule(schedule).await {
-                Ok(()) => Ok(schedule_public_id),
+                Ok(()) => Ok(CreateRemoteScheduleResponse { schedule_public_id }),
                 Err(e) => {
                     let msg = e.to_string();
                     if Self::is_actor_not_running_error(&msg) {
@@ -1873,18 +1960,82 @@ mod remote_impl {
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             let shared_state = self.shared_state.clone();
+            ctx.spawn(async move { shared_state.create_schedule(msg, None).await })
+        }
+    }
+
+    impl Message<PeerScheduleRequest<CreateRemoteSchedule>> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<CreateRemoteScheduleResponse, AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: PeerScheduleRequest<CreateRemoteSchedule>,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let state = self.shared_state.clone();
             ctx.spawn(async move {
-                let schedule_public_id = shared_state
-                    .create_schedule(
-                        &msg.session_id,
-                        &msg.prompt,
-                        msg.trigger,
-                        msg.max_steps,
-                        msg.max_cost_usd,
-                        msg.max_runs,
-                    )
+                state
+                    .create_schedule(msg.request, Some(msg.authority))
+                    .await
+            })
+        }
+    }
+
+    impl Message<PeerScheduleRequest<ListRemoteSchedules>> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<ListRemoteSchedulesResponse, AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: PeerScheduleRequest<ListRemoteSchedules>,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let state = self.shared_state.clone();
+            ctx.spawn(async move {
+                let origin = msg.authority.schedule_origin();
+                TurnAuthority::Peer(msg.authority).check().await?;
+                let mut schedules = state
+                    .list_schedules(msg.request.session_id.as_deref())
                     .await?;
-                Ok(CreateRemoteScheduleResponse { schedule_public_id })
+                schedules.retain(|schedule| schedule.config.origin == origin);
+                Ok(ListRemoteSchedulesResponse { schedules })
+            })
+        }
+    }
+
+    impl<M: PeerScheduleAction> Message<PeerScheduleRequest<M>> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: PeerScheduleRequest<M>,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let state = self.shared_state.clone();
+            ctx.spawn(async move {
+                let origin = msg.authority.schedule_origin();
+                let authority = TurnAuthority::Peer(msg.authority);
+                authority.check().await?;
+                let scheduler = state
+                    .get_or_start_scheduler()
+                    .await
+                    .ok_or_else(RemoteNodeManagerState::scheduler_unavailable_error)?;
+                let id = msg.request.schedule_id();
+                let schedule = scheduler
+                    .get_schedule(id)
+                    .await
+                    .map_err(|error| AgentError::Internal(error.to_string()))?
+                    .ok_or(AgentError::MeshAccessDenied)?;
+                if schedule.config.origin != origin {
+                    return Err(AgentError::MeshAccessDenied);
+                }
+                authority.check().await?;
+                match M::ACTION {
+                    ScheduleAction::Pause => scheduler.pause_schedule(id).await,
+                    ScheduleAction::Resume => scheduler.resume_schedule(id).await,
+                    ScheduleAction::Trigger => scheduler.trigger_now(id).await,
+                    ScheduleAction::Delete => scheduler.remove_schedule(id).await,
+                }
+                .map_err(|error| AgentError::Internal(error.to_string()))
             })
         }
     }

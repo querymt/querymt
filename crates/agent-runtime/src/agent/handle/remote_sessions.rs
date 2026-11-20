@@ -640,10 +640,8 @@ impl LocalAgentHandle {
         request: crate::agent::remote::CreateRemoteSchedule,
     ) -> Result<crate::agent::remote::CreateRemoteScheduleResponse, agent_client_protocol::Error>
     {
-        let timeout = Self::remote_request_timeout();
-        querymt_remote::ask_remote_with_timeout(node_manager_ref, &request, timeout)
+        self.read_remote_session_metadata(node_manager_ref, &request)
             .await
-            .map_err(Self::map_remote_node_manager_error)
     }
 
     #[cfg(feature = "remote")]
@@ -655,14 +653,8 @@ impl LocalAgentHandle {
     {
         use crate::agent::remote::ListRemoteSchedules;
 
-        let timeout = Self::remote_request_timeout();
-        querymt_remote::ask_remote_with_timeout(
-            node_manager_ref,
-            &ListRemoteSchedules { session_id },
-            timeout,
-        )
-        .await
-        .map_err(Self::map_remote_node_manager_error)
+        self.read_remote_session_metadata(node_manager_ref, &ListRemoteSchedules { session_id })
+            .await
     }
 
     #[cfg(feature = "remote")]
@@ -673,14 +665,11 @@ impl LocalAgentHandle {
     ) -> Result<(), agent_client_protocol::Error> {
         use crate::agent::remote::PauseRemoteSchedule;
 
-        let timeout = Self::remote_request_timeout();
-        querymt_remote::ask_remote_with_timeout(
+        self.read_remote_session_metadata(
             node_manager_ref,
             &PauseRemoteSchedule { schedule_public_id },
-            timeout,
         )
         .await
-        .map_err(Self::map_remote_node_manager_error)
     }
 
     #[cfg(feature = "remote")]
@@ -691,14 +680,11 @@ impl LocalAgentHandle {
     ) -> Result<(), agent_client_protocol::Error> {
         use crate::agent::remote::ResumeRemoteSchedule;
 
-        let timeout = Self::remote_request_timeout();
-        querymt_remote::ask_remote_with_timeout(
+        self.read_remote_session_metadata(
             node_manager_ref,
             &ResumeRemoteSchedule { schedule_public_id },
-            timeout,
         )
         .await
-        .map_err(Self::map_remote_node_manager_error)
     }
 
     #[cfg(feature = "remote")]
@@ -709,14 +695,11 @@ impl LocalAgentHandle {
     ) -> Result<(), agent_client_protocol::Error> {
         use crate::agent::remote::TriggerRemoteSchedule;
 
-        let timeout = Self::remote_request_timeout();
-        querymt_remote::ask_remote_with_timeout(
+        self.read_remote_session_metadata(
             node_manager_ref,
             &TriggerRemoteSchedule { schedule_public_id },
-            timeout,
         )
         .await
-        .map_err(Self::map_remote_node_manager_error)
     }
 
     #[cfg(feature = "remote")]
@@ -727,14 +710,11 @@ impl LocalAgentHandle {
     ) -> Result<(), agent_client_protocol::Error> {
         use crate::agent::remote::DeleteRemoteSchedule;
 
-        let timeout = Self::remote_request_timeout();
-        querymt_remote::ask_remote_with_timeout(
+        self.read_remote_session_metadata(
             node_manager_ref,
             &DeleteRemoteSchedule { schedule_public_id },
-            timeout,
         )
         .await
-        .map_err(Self::map_remote_node_manager_error)
     }
 
     /// Finds the node manager of a remote member's peer. The node is resolved

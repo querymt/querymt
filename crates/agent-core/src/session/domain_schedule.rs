@@ -88,6 +88,29 @@ pub struct ScheduleExecutionLimits {
     pub max_cost_usd: Option<f64>,
 }
 
+/// Authority the host recorded when creating the schedule. A missing field in
+/// an older row cannot distinguish a local job from one created over the mesh.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScheduleOrigin {
+    #[default]
+    Unknown,
+    Local,
+    Peer {
+        host: String,
+        peer: String,
+        revision: uuid::Uuid,
+        protocol: SchedulePeerProtocol,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulePeerProtocol {
+    Legacy,
+    V1,
+}
+
 /// Operational configuration for a schedule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleConfig {
@@ -107,6 +130,9 @@ pub struct ScheduleConfig {
     pub backoff_base_seconds: u64,
     /// Middleware-style execution limits for scheduled cycles.
     pub execution_limits: Option<ScheduleExecutionLimits>,
+    /// Durable authority, separate from user-controlled prompt and limits.
+    #[serde(default)]
+    pub origin: ScheduleOrigin,
 }
 
 fn default_max_consecutive_failures() -> u32 {
@@ -131,6 +157,7 @@ impl Default for ScheduleConfig {
             jitter_percent: default_jitter_percent(),
             backoff_base_seconds: default_backoff_base_seconds(),
             execution_limits: None,
+            origin: ScheduleOrigin::Unknown,
         }
     }
 }
@@ -213,7 +240,10 @@ impl Schedule {
             ScheduleTrigger::EventDriven { .. } => None,
             ScheduleTrigger::OnceAt { at } => Some(*at),
         };
-        let mut config = ScheduleConfig::default();
+        let mut config = ScheduleConfig {
+            origin: ScheduleOrigin::Local,
+            ..ScheduleConfig::default()
+        };
         if is_once {
             config.max_runs = Some(1);
         }
@@ -396,6 +426,12 @@ mod tests {
                 max_steps: Some(50),
                 max_cost_usd: Some(1.5),
             }),
+            origin: ScheduleOrigin::Peer {
+                host: "host-node".into(),
+                peer: "peer-node".into(),
+                revision: uuid::Uuid::now_v7(),
+                protocol: SchedulePeerProtocol::V1,
+            },
         };
         let json = serde_json::to_string(&config).unwrap();
         let rt: ScheduleConfig = serde_json::from_str(&json).unwrap();
@@ -403,6 +439,13 @@ mod tests {
         assert_eq!(rt.max_consecutive_failures, 5);
         assert_eq!(rt.max_runtime_seconds, 300);
         assert!(rt.execution_limits.is_some());
+        assert_eq!(rt.origin, config.origin);
+    }
+
+    #[test]
+    fn legacy_schedule_config_does_not_claim_owner_authority() {
+        let config: ScheduleConfig = serde_json::from_str(r#"{"max_runs":5}"#).unwrap();
+        assert_eq!(config.origin, ScheduleOrigin::Unknown);
     }
 
     // ── State machine transitions ────────────────────────────────────────

@@ -108,6 +108,8 @@ pub struct ScheduledPrompt {
     pub prompt_text: String,
     /// Optional per-cycle execution limits (max_steps, max_cost_usd).
     pub execution_limits: Option<crate::session::domain_schedule::ScheduleExecutionLimits>,
+    /// Trusted origin loaded by the scheduler from the stored schedule.
+    pub origin: crate::session::domain_schedule::ScheduleOrigin,
 }
 
 // ══════════════════════════════════════════════════════════════════════════

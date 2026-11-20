@@ -12,6 +12,9 @@
 
 ### Behavior changes
 
+- **Scheduled execution:** Schedules with no recorded origin no longer run as
+  the owner. Recreate older jobs you trust from the host to record their local
+  origin. A peer-origin job needs its original host and current grant revision.
 - **Subagents API (Rust, Python, hooks, ACP):** `Agent::builder()`,
   `AgentBuilder::subagent`, `Agent::add_subagent` / `remove_subagent` /
   `subagents` / `has_subagents` / `on_subagents_changed` /

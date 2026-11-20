@@ -1090,6 +1090,7 @@ impl SchedulerActor {
             task_public_id: schedule.task_public_id.clone(),
             prompt_text,
             execution_limits: schedule.config.execution_limits.clone(),
+            origin: schedule.config.origin.clone(),
         };
 
         match actor_ref.tell_scheduled_prompt(scheduled_prompt).await {

@@ -355,6 +355,20 @@ impl PeerTurn {
         })
     }
 
+    pub(crate) fn schedule_origin(&self) -> crate::session::domain_schedule::ScheduleOrigin {
+        use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
+        use querymt_remote::peer_access::SharingProtocol;
+        ScheduleOrigin::Peer {
+            host: self.key.host.to_string(),
+            peer: self.key.peer.to_string(),
+            revision: self.revision,
+            protocol: match self.protocol {
+                SharingProtocol::Legacy => SchedulePeerProtocol::Legacy,
+                SharingProtocol::V1 => SchedulePeerProtocol::V1,
+            },
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_authority(
         revision: Uuid,
@@ -2825,6 +2839,63 @@ impl SessionActor {
 // 3. Emits ScheduledExecutionCompleted / ScheduledExecutionFailed terminal
 //    events so the SchedulerActor can correlate cycle outcomes.
 
+impl SessionActor {
+    fn schedule_authority(
+        &self,
+        origin: crate::session::domain_schedule::ScheduleOrigin,
+    ) -> Result<TurnAuthority, AgentError> {
+        use crate::session::domain_schedule::ScheduleOrigin;
+        match origin {
+            ScheduleOrigin::Local => Ok(TurnAuthority::Local),
+            #[cfg(feature = "remote")]
+            ScheduleOrigin::Peer {
+                host,
+                peer,
+                revision,
+                protocol,
+            } => {
+                use crate::session::domain_schedule::SchedulePeerProtocol;
+                use querymt_remote::{
+                    NodeId,
+                    peer_access::{PeerGrantKey, SharingProtocol},
+                };
+
+                let mesh = self.mesh.as_ref().ok_or(AgentError::MeshAccessDenied)?;
+                let store = mesh
+                    .quota_store()
+                    .ok_or(AgentError::MeshAccessDenied)?
+                    .clone();
+                let host = NodeId::parse(&host).map_err(|_| AgentError::MeshAccessDenied)?;
+                if host.as_peer_id() != mesh.peer_id() {
+                    return Err(AgentError::MeshAccessDenied);
+                }
+                let peer = NodeId::parse(&peer).map_err(|_| AgentError::MeshAccessDenied)?;
+                Ok(TurnAuthority::Peer(Arc::new(PeerTurn {
+                    key: PeerGrantKey { host, peer },
+                    revision,
+                    protocol: match protocol {
+                        SchedulePeerProtocol::Legacy => SharingProtocol::Legacy,
+                        SchedulePeerProtocol::V1 => SharingProtocol::V1,
+                    },
+                    store,
+                })))
+            }
+            _ => Err(AgentError::MeshAccessDenied),
+        }
+    }
+
+    fn emit_scheduled_admission_failure(&self, schedule_public_id: &str, error: &AgentError) {
+        self.config.emit_event(
+            &self.session_id,
+            AgentEventKind::ScheduledExecutionFailed {
+                schedule_public_id: schedule_public_id.to_owned(),
+                turn_id: None,
+                error: error.to_string(),
+            },
+        );
+    }
+}
+
 impl Message<ScheduledPrompt> for SessionActor {
     type Reply = DelegatedReply<Result<PromptResponse, AgentError>>;
 
@@ -2837,6 +2908,21 @@ impl Message<ScheduledPrompt> for SessionActor {
             "Session {}: ScheduledPrompt received (schedule={})",
             self.session_id, msg.schedule_public_id
         );
+
+        let authority = match self.schedule_authority(msg.origin) {
+            Ok(authority) => match authority.check().await {
+                Ok(()) => Ok(authority),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        let authority = match authority {
+            Ok(authority) => authority,
+            Err(error) => {
+                self.emit_scheduled_admission_failure(&msg.schedule_public_id, &error);
+                return ctx.spawn(async move { Err(error) });
+            }
+        };
 
         if self.active_run.is_some() {
             let session_id = self.session_id.clone();
@@ -2857,17 +2943,11 @@ impl Message<ScheduledPrompt> for SessionActor {
         // failure removes the cycle and aborts the timeout. Terminal handling is
         // idempotent per (schedule, turn), so a racing timeout is dropped.
         if let Err(error) = self.acquire_run_lease().await {
-            self.config.emit_event(
-                &self.session_id,
-                AgentEventKind::ScheduledExecutionFailed {
-                    schedule_public_id: msg.schedule_public_id.clone(),
-                    turn_id: None,
-                    error: error.to_string(),
-                },
-            );
+            self.emit_scheduled_admission_failure(&msg.schedule_public_id, &error);
             return ctx.spawn(async move { Err(error) });
         }
 
+        self.active_authority = authority.clone();
         self.prompt_running = true;
         self.turn_state.generation = self.turn_state.generation.saturating_add(1);
         let prompt_generation = self.turn_state.generation;
@@ -2924,22 +3004,26 @@ impl Message<ScheduledPrompt> for SessionActor {
 
         ctx.spawn(
             async move {
-                let result = execute_prompt_detached(DetachedPromptExecution {
-                    req: prompt_request,
-                    session_id: session_id.clone(),
-                    runtime,
-                    config: config.clone(),
-                    cancel_token,
-                    mode,
-                    tool_config,
-                    execution_origin: crate::agent::execution_context::ExecutionOrigin::Scheduled {
-                        schedule_public_id: schedule_public_id.clone(),
-                        task_public_id: task_public_id.clone(),
+                let result = execute_authorized_prompt(
+                    DetachedPromptExecution {
+                        req: prompt_request,
+                        session_id: session_id.clone(),
+                        runtime,
+                        config: config.clone(),
+                        cancel_token,
+                        mode,
+                        tool_config,
+                        execution_origin:
+                            crate::agent::execution_context::ExecutionOrigin::Scheduled {
+                                schedule_public_id: schedule_public_id.clone(),
+                                task_public_id: task_public_id.clone(),
+                            },
+                        turn_id,
+                        steering,
+                        phase_reporter,
                     },
-                    turn_id,
-                    steering,
-                    phase_reporter,
-                })
+                    &authority,
+                )
                 .await;
 
                 // Emit explicit scheduled terminal events for SchedulerActor correlation
@@ -3170,6 +3254,7 @@ fn run_disposition(
     }
 }
 
+#[cfg(test)]
 async fn execute_prompt_detached(exec: DetachedPromptExecution) -> Result<PromptRun, AgentError> {
     execute_authorized_prompt(exec, &TurnAuthority::Local).await
 }
@@ -5749,6 +5834,50 @@ mod tests {
             .map(|e| e.session_seq)
             .collect();
         assert_eq!(stored, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn scheduled_prompt_without_verifiable_origin_cannot_run_as_owner() {
+        use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
+
+        let fixture = ActorFixture::new().await;
+        let mut events = fixture.config.subscribe_events();
+        for origin in [
+            ScheduleOrigin::Unknown,
+            ScheduleOrigin::Peer {
+                host: "persisted-host".into(),
+                peer: "persisted-peer".into(),
+                revision: Uuid::now_v7(),
+                protocol: SchedulePeerProtocol::V1,
+            },
+        ] {
+            let result = fixture
+                .actor_ref
+                .ask(ScheduledPrompt {
+                    schedule_public_id: "schedule-1".into(),
+                    task_public_id: "task-1".into(),
+                    prompt_text: "must not execute".into(),
+                    execution_limits: None,
+                    origin,
+                })
+                .await;
+            assert!(matches!(
+                result,
+                Err(kameo::error::SendError::HandlerError(
+                    AgentError::MeshAccessDenied
+                ))
+            ));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut refused = 0;
+            while refused < 2 {
+                if matches!(events.recv().await.unwrap().kind(), AgentEventKind::ScheduledExecutionFailed { schedule_public_id, .. } if schedule_public_id == "schedule-1") {
+                    refused += 1;
+                }
+            }
+        }).await.unwrap();
+        assert!(fixture.run_lifecycle().await.is_empty());
+        assert_eq!(fixture.history_writes.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

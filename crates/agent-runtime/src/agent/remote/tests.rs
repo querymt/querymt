@@ -1060,8 +1060,8 @@ mod node_manager_tests {
     use crate::agent::remote::node_manager::{
         AdmissionRequest, AdmissionResponse, CreateRemoteSchedule, CreateRemoteSession,
         DeleteRemoteSchedule, ForkRemoteSession, GetNodeInfo, ListRemoteSchedules,
-        ListRemoteSessions, PauseRemoteSchedule, RemoteNodeManager, ResumeRemoteSchedule,
-        ResumeRemoteSession, SessionHandoff, StopRemoteSessionRuntime,
+        ListRemoteSchedulesResponse, ListRemoteSessions, PauseRemoteSchedule, RemoteNodeManager,
+        ResumeRemoteSchedule, ResumeRemoteSession, SessionHandoff, StopRemoteSessionRuntime,
     };
     use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
     use crate::session::domain::IntentSnapshot;
@@ -1271,7 +1271,8 @@ mod node_manager_tests {
             .create_session(Some("retained-reference".into()), None, None, None)
             .await
             .expect("persist fixture session");
-        let session = SessionActor::spawn(SessionActor::new(config, stored.public_id, runtime));
+        let session_id = stored.public_id;
+        let session = SessionActor::spawn(SessionActor::new(config, session_id.clone(), runtime));
         let host = *mesh.peer_id();
         let peer = libp2p::PeerId::random();
         let store = Arc::new(Store(
@@ -1364,6 +1365,97 @@ mod node_manager_tests {
                 ));
             }
         }
+        let create_schedule = || {
+            node_ask::<RemoteNodeManager, _>(
+                manager.id(),
+                &CreateRemoteSchedule {
+                    session_id: session_id.clone(),
+                    prompt: "inert scheduled work".into(),
+                    trigger: crate::session::domain_schedule::ScheduleTrigger::Interval {
+                        seconds: 3600,
+                    },
+                    max_steps: None,
+                    max_cost_usd: None,
+                    max_runs: None,
+                },
+            )
+        };
+        let list_schedules = || {
+            node_ask::<RemoteNodeManager, _>(
+                manager.id(),
+                &ListRemoteSchedules {
+                    session_id: Some(session_id.clone()),
+                },
+            )
+        };
+        assert!(matches!(
+            ingress.handle_v1(peer, create_schedule()).await,
+            Err(SharingRejection::Denied)
+        ));
+        let revision = Uuid::now_v7();
+        *store.1.lock() = PeerGrantState {
+            revision,
+            grant: PeerGrant::Full,
+        };
+        assert!(matches!(
+            ingress.handle_v1(peer, create_schedule()).await,
+            Ok(SwarmResponse::Ask(Ok(_)))
+        ));
+        let Ok(SwarmResponse::Ask(Ok(bytes))) = ingress.handle_v1(peer, list_schedules()).await
+        else {
+            panic!("peer should see the schedule it created");
+        };
+        let schedules = rmp_serde::from_slice::<ListRemoteSchedulesResponse>(&bytes)
+            .unwrap()
+            .schedules;
+        use crate::session::domain_schedule::{ScheduleOrigin, SchedulePeerProtocol};
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(
+            schedules[0].config.origin,
+            ScheduleOrigin::Peer {
+                host: host.to_string(),
+                peer: peer.to_string(),
+                revision,
+                protocol: SchedulePeerProtocol::V1,
+            }
+        );
+        let pause = || {
+            node_ask::<RemoteNodeManager, _>(
+                manager.id(),
+                &PauseRemoteSchedule {
+                    schedule_public_id: schedules[0].public_id.clone(),
+                },
+            )
+        };
+        assert!(matches!(
+            ingress.handle_v1(peer, pause()).await,
+            Ok(SwarmResponse::Ask(Ok(_)))
+        ));
+        // Regranting does not adopt work that belonged to the previous revision.
+        *store.1.lock() = PeerGrantState {
+            revision: Uuid::now_v7(),
+            grant: PeerGrant::Full,
+        };
+        let Ok(SwarmResponse::Ask(Ok(bytes))) = ingress.handle_v1(peer, list_schedules()).await
+        else {
+            panic!("peer list after regrant must succeed");
+        };
+        let Ok(SwarmResponse::Ask(Err(RemoteSendError::HandlerError(error)))) =
+            ingress.handle_v1(peer, pause()).await
+        else {
+            panic!("retained schedule ID must not control the previous grant's work");
+        };
+        assert!(matches!(
+            rmp_serde::from_slice::<crate::error::AgentError>(&error).unwrap(),
+            crate::error::AgentError::MeshAccessDenied
+        ));
+        assert!(
+            rmp_serde::from_slice::<ListRemoteSchedulesResponse>(&bytes)
+                .unwrap()
+                .schedules
+                .is_empty()
+        );
+
         *store.1.lock() = PeerGrantState {
             revision: Uuid::now_v7(),
             grant: PeerGrant::None,
