@@ -14,6 +14,8 @@ pub mod mesh_events;
 #[cfg(feature = "kameo-mesh")]
 pub mod mesh_handle;
 #[cfg(feature = "kameo-mesh")]
+pub mod mesh_ingress;
+#[cfg(feature = "kameo-mesh")]
 pub mod mesh_routes;
 #[cfg(feature = "kameo-mesh")]
 pub mod mesh_runtime;
