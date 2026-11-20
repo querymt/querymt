@@ -42,12 +42,13 @@ mod unified_behaviour {
     use kameo::remote;
     use libp2p::swarm::{NetworkBehaviour, behaviour::toggle::Toggle, derive_prelude::Either};
 
-    use crate::mesh_ingress::{Egress, Inbound};
+    use crate::mesh_ingress::{Egress, Inbound, SharingWire};
 
     #[derive(NetworkBehaviour)]
     pub(super) struct GuardedMessaging {
         pub(super) egress: Egress,
         pub(super) ingress: Inbound,
+        pub(super) sharing: SharingWire,
     }
 
     #[derive(NetworkBehaviour)]
@@ -61,7 +62,7 @@ use unified_behaviour::{
     GuardedMessaging, GuardedMessagingEvent, UnifiedMeshBehaviour, UnifiedMeshBehaviourEvent,
 };
 
-use crate::mesh_ingress::{Egress, Inbound, MeshIngress};
+use crate::mesh_ingress::{Egress, Inbound, MeshIngress, SharingCallError, SharingWire};
 
 fn kameo_behaviour(
     peer: PeerId,
@@ -74,6 +75,7 @@ fn kameo_behaviour(
         Some(gate) => Either::Right(GuardedMessaging {
             egress: Egress(kameo),
             ingress: Inbound::new(Arc::clone(gate), timeout),
+            sharing: SharingWire::new(Arc::clone(gate), timeout),
         }),
     }
 }
@@ -561,6 +563,12 @@ async fn bootstrap_with_ingress(
                                         peer_iroh_scope_loop.remove(&pid);
                                     }
                                 }
+                            }
+                        }
+                        SwarmCommand::Sharing { peer, request, tx } => {
+                            match &mut swarm.behaviour_mut().kameo {
+                                Either::Right(guarded) => guarded.sharing.send(peer, request, tx),
+                                Either::Left(_) => { let _ = tx.send(Err(SharingCallError::Unavailable)); }
                             }
                         }
                         SwarmCommand::Shutdown { completion } => {

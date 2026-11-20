@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-use super::MeshIngress;
+use super::{MeshIngress, SharingRejection};
 use crate::NodeId;
 use crate::peer_access::{GrantStore, PeerGrant, PeerGrantKey, SharingProtocol};
 
@@ -27,7 +27,7 @@ mod tests;
 type AskResult = Result<Vec<u8>, RemoteSendError<Vec<u8>>>;
 type Handler =
     dyn Fn(PeerRequest, Vec<u8>) -> Pin<Box<dyn Future<Output = AskResult> + Send>> + Send + Sync;
-type Routes = HashMap<ActorId, HashMap<(&'static str, &'static str), Arc<Route>>>;
+type Routes = HashMap<ActorId, HashMap<(SharingProtocol, &'static str, &'static str), Arc<Route>>>;
 
 /// Trusted local metadata captured at the network boundary. It is not wire data.
 #[derive(Debug, Clone)]
@@ -56,6 +56,34 @@ pub enum InboundAccess {
     Identity,
     /// Full access on the legacy contract, regardless of advertised peer version.
     LegacyFull,
+    /// Grant-aware session operations (not sufficient for tool execution).
+    Sessions,
+    /// Grant-aware workspace operations.
+    Filesystem,
+    /// At least one provider is shared. The handler must check the actual binding.
+    Providers,
+}
+
+impl InboundAccess {
+    fn permits(self, grant: &PeerGrant, protocol: SharingProtocol) -> bool {
+        if self == Self::Identity {
+            return true;
+        }
+        if protocol == SharingProtocol::Legacy {
+            return grant == &PeerGrant::Full;
+        }
+        match self {
+            Self::Identity => true,
+            Self::LegacyFull => grant == &PeerGrant::Full,
+            Self::Sessions => grant.allows_sessions(protocol),
+            Self::Filesystem => grant.allows_filesystem(protocol),
+            Self::Providers => match grant {
+                PeerGrant::Full => true,
+                PeerGrant::Custom { providers, .. } => !providers.is_empty(),
+                PeerGrant::None => false,
+            },
+        }
+    }
 }
 
 struct Route {
@@ -97,6 +125,40 @@ impl InboundRouter {
         F: Fn(PeerRequest, M) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R, E>> + Send + 'static,
     {
+        self.register::<A, M, R, E, F, Fut>(actor_id, SharingProtocol::Legacy, access, handler);
+    }
+
+    /// Install a handler only for the grant-aware protocol.
+    pub fn register_v1_ask<A, M, R, E, F, Fut>(
+        &self,
+        actor_id: ActorId,
+        access: InboundAccess,
+        handler: F,
+    ) where
+        A: RemoteActor + RemoteMessage<M>,
+        M: DeserializeOwned + Send + 'static,
+        R: Serialize + Send,
+        E: Serialize + Send,
+        F: Fn(PeerRequest, M) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, E>> + Send + 'static,
+    {
+        self.register::<A, M, R, E, F, Fut>(actor_id, SharingProtocol::V1, access, handler);
+    }
+
+    fn register<A, M, R, E, F, Fut>(
+        &self,
+        actor_id: ActorId,
+        protocol: SharingProtocol,
+        access: InboundAccess,
+        handler: F,
+    ) where
+        A: RemoteActor + RemoteMessage<M>,
+        M: DeserializeOwned + Send + 'static,
+        R: Serialize + Send,
+        E: Serialize + Send,
+        F: Fn(PeerRequest, M) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, E>> + Send + 'static,
+    {
         let handler = Arc::new(handler);
         let handler: Box<Handler> = Box::new(move |peer, bytes| {
             let handler = Arc::clone(&handler);
@@ -117,6 +179,7 @@ impl InboundRouter {
         });
         self.routes.write().entry(actor_id).or_default().insert(
             (
+                protocol,
                 <A as RemoteActor>::REMOTE_ID,
                 <A as RemoteMessage<M>>::REMOTE_ID,
             ),
@@ -129,21 +192,30 @@ impl InboundRouter {
         self.routes.write().remove(&actor);
     }
 
-    async fn full_grant_revision(
+    async fn grant_revision(
         &self,
         peer: &PeerRequest,
-    ) -> Result<Uuid, RemoteSendError<Vec<u8>>> {
+        access: InboundAccess,
+    ) -> Result<Option<Uuid>, SharingRejection> {
+        if access == InboundAccess::Identity {
+            return Ok(None);
+        }
         match self.store.grant(peer.key()).await {
-            Ok(state) if state.grant == PeerGrant::Full => Ok(state.revision),
-            Ok(_) => Err(legacy_denied()),
+            Ok(state) if access.permits(&state.grant, peer.protocol) => Ok(Some(state.revision)),
+            Ok(_) => Err(SharingRejection::Denied),
             Err(error) => {
-                tracing::warn!(%error, "cannot authorize legacy mesh request");
-                Err(legacy_denied())
+                tracing::warn!(%error, "cannot authorize mesh request");
+                Err(SharingRejection::Unavailable)
             }
         }
     }
 
-    async fn ask(&self, peer: PeerId, request: SwarmRequest) -> AskResult {
+    async fn route_ask(
+        &self,
+        peer: PeerId,
+        request: SwarmRequest,
+        protocol: SharingProtocol,
+    ) -> Result<AskResult, SharingRejection> {
         let SwarmRequest::Ask {
             actor_id,
             actor_remote_id,
@@ -152,71 +224,91 @@ impl InboundRouter {
             ..
         } = request
         else {
-            return Err(RemoteSendError::BadActorType);
+            return Ok(Err(RemoteSendError::BadActorType));
         };
         if actor_id.peer_id() != Some(&self.host) {
-            return Err(RemoteSendError::BadActorType);
+            return Ok(Err(RemoteSendError::BadActorType));
         }
+        let route_key = (
+            protocol,
+            actor_remote_id.as_ref(),
+            message_remote_id.as_ref(),
+        );
         let Some(route) = self
             .routes
             .read()
             .get(&actor_id)
-            .and_then(|routes| routes.get(&(actor_remote_id.as_ref(), message_remote_id.as_ref())))
+            .and_then(|routes| routes.get(&route_key))
             .cloned()
         else {
-            return Err(RemoteSendError::UnknownMessage {
+            return Ok(Err(RemoteSendError::UnknownMessage {
                 actor_remote_id,
                 message_remote_id,
-            });
+            }));
         };
         let origin = PeerRequest {
             key: PeerGrantKey {
                 host: NodeId::from_peer_id(self.host),
                 peer: NodeId::from_peer_id(peer),
             },
-            protocol: SharingProtocol::Legacy,
+            protocol,
         };
-        let revision = match route.access {
-            InboundAccess::Identity => None,
-            InboundAccess::LegacyFull => Some(self.full_grant_revision(&origin).await?),
-        };
+        let revision = self.grant_revision(&origin, route.access).await?;
         let is_current = || {
             self.routes
                 .read()
                 .get(&actor_id)
-                .and_then(|routes| {
-                    routes.get(&(actor_remote_id.as_ref(), message_remote_id.as_ref()))
-                })
+                .and_then(|routes| routes.get(&route_key))
                 .is_some_and(|current| Arc::ptr_eq(current, &route))
         };
         if !is_current() {
-            return Err(RemoteSendError::ActorNotRunning);
+            return Ok(Err(RemoteSendError::ActorNotRunning));
         }
         let result = (route.handler)(origin.clone(), payload).await;
-        if let Some(revision) = revision
-            && !matches!(self.full_grant_revision(&origin).await, Ok(current) if current == revision)
+        if revision.is_some()
+            && !matches!(self.grant_revision(&origin, route.access).await, Ok(current) if current == revision)
         {
-            return Err(RemoteSendError::SerializeReply(
-                "mesh grant changed before reply".into(),
-            ));
+            return Err(SharingRejection::Changed);
         }
         if !is_current() {
-            return Err(RemoteSendError::SerializeReply(
-                "mesh route changed before reply".into(),
-            ));
+            return Err(SharingRejection::Changed);
         }
-        result
+        Ok(result)
+    }
+
+    async fn ask(&self, peer: PeerId, request: SwarmRequest) -> AskResult {
+        self.route_ask(peer, request, SharingProtocol::Legacy)
+            .await
+            .map_err(legacy_denied)?
     }
 }
 
 // Legacy Kameo has no wire access-denied variant. Use an existing terminal
 // error shape rather than making a refusal look like a reconnect.
-fn legacy_denied() -> RemoteSendError<Vec<u8>> {
-    RemoteSendError::DeserializeMessage("mesh access denied".into())
+fn legacy_denied(rejection: SharingRejection) -> RemoteSendError<Vec<u8>> {
+    if rejection == SharingRejection::Changed {
+        RemoteSendError::SerializeReply(rejection.to_string())
+    } else {
+        RemoteSendError::DeserializeMessage(rejection.to_string())
+    }
 }
 
 #[async_trait]
 impl MeshIngress for InboundRouter {
+    async fn handle_v1(
+        &self,
+        peer: PeerId,
+        request: SwarmRequest,
+    ) -> Result<SwarmResponse, SharingRejection> {
+        match request {
+            ask @ SwarmRequest::Ask { .. } => self
+                .route_ask(peer, ask, SharingProtocol::V1)
+                .await
+                .map(SwarmResponse::Ask),
+            _ => Err(SharingRejection::UnsupportedOperation),
+        }
+    }
+
     async fn handle_legacy(&self, peer: PeerId, request: SwarmRequest) -> SwarmResponse {
         match request {
             ask @ SwarmRequest::Ask { .. } => SwarmResponse::Ask(self.ask(peer, ask).await),

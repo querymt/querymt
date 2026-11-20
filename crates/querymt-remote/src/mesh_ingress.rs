@@ -1,9 +1,8 @@
-//! Opt-in authenticated inbound boundary for Kameo's legacy wire format.
+//! Authenticated inbound boundary for legacy and grant-aware mesh requests.
 //!
-//! Kameo 0.22 drops the caller identity before dispatch. When guarded ingress is
-//! enabled, its original inbound messaging substreams are disabled. The same
-//! wire protocol is negotiated by a receive-only libp2p behavior instead. Kameo
-//! still owns outbound messaging and actor discovery.
+//! Kameo 0.22 drops caller identity before dispatch. A guarded mesh disables its
+//! original inbound messaging substreams. The legacy listener and the separate
+//! grant-aware protocol deliver authenticated caller identity to the same gate.
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -30,10 +29,14 @@ use tokio::task::JoinSet;
 use crate::provider_transport::MESH_MESSAGE_SIZE_MAXIMUM;
 
 const LEGACY_PROTOCOL: StreamProtocol = StreamProtocol::new("/kameo/messaging/1.0.0");
+const SHARING_PROTOCOL: StreamProtocol = StreamProtocol::new("/querymt/mesh-sharing/1");
 const MAX_IN_FLIGHT: usize = 100;
 
 mod router;
+mod wire;
 pub use router::{InboundAccess, InboundRouter, PeerRequest};
+pub(crate) use wire::{ResponseSender, SharingRequest, SharingResponse, SharingWire};
+pub use wire::{SharingCallError, SharingRejection};
 
 #[cfg(test)]
 mod tests;
@@ -46,6 +49,15 @@ mod tests;
 pub trait MeshIngress: Send + Sync + 'static {
     /// Handle a request received on the legacy wire protocol.
     async fn handle_legacy(&self, peer: PeerId, request: SwarmRequest) -> SwarmResponse;
+
+    /// Handle an actor operation negotiated on the grant-aware protocol.
+    async fn handle_v1(
+        &self,
+        _peer: PeerId,
+        _request: SwarmRequest,
+    ) -> Result<SwarmResponse, SharingRejection> {
+        Err(SharingRejection::UnsupportedOperation)
+    }
 }
 
 type Wire = cbor::Behaviour<SwarmRequest, SwarmResponse>;

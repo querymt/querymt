@@ -13,6 +13,15 @@ impl MeshIngress for RecordingGate {
         self.0.send(peer).unwrap();
         overloaded(request)
     }
+
+    async fn handle_v1(
+        &self,
+        peer: PeerId,
+        _: SwarmRequest,
+    ) -> Result<SwarmResponse, SharingRejection> {
+        self.0.send(peer).unwrap();
+        Err(SharingRejection::Denied)
+    }
 }
 
 fn lan<B: NetworkBehaviour>(behaviour: impl FnOnce(PeerId) -> B) -> libp2p::Swarm<B> {
@@ -94,6 +103,72 @@ async fn round_trip<B: NetworkBehaviour>(
     }
     assert_eq!(calls.try_recv().unwrap(), client_peer);
     assert!(calls.try_recv().is_err());
+}
+
+async fn exchange<B: NetworkBehaviour>(
+    client: &mut libp2p::Swarm<SharingWire>,
+    server: &mut libp2p::Swarm<B>,
+    request: SharingRequest,
+) -> Result<SharingResponse, SharingCallError> {
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    client
+        .behaviour_mut()
+        .send(*server.local_peer_id(), request, tx);
+    loop {
+        tokio::select! {
+            result = &mut rx => return result.unwrap(),
+            _ = client.select_next_some() => {},
+            _ = server.select_next_some() => {},
+        }
+    }
+}
+
+#[tokio::test]
+async fn sharing_wire_distinguishes_legacy_negotiation_from_denial() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (tx, mut calls) = mpsc::unbounded_channel();
+        let gate = Arc::new(RecordingGate(tx));
+        let mut server = lan(|peer| guarded_test_behaviour(peer, gate.clone()));
+        let mut client = lan(|_| SharingWire::new(gate.clone(), Duration::from_secs(3)));
+        let addr = listening(&mut server, "/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
+        let host = *server.local_peer_id();
+        client.add_peer_address(host, addr);
+        assert!(matches!(
+            exchange(&mut client, &mut server, SharingRequest::Probe).await,
+            Ok(SharingResponse::Supported)
+        ));
+        let ask = SwarmRequest::Ask {
+            actor_id: ActorId::new_with_peer_id(17, host),
+            actor_remote_id: "test::Echo".into(),
+            message_remote_id: "test::EchoRequest".into(),
+            payload: vec![],
+            mailbox_timeout: None,
+            reply_timeout: None,
+            immediate: false,
+        };
+        assert!(matches!(
+            exchange(
+                &mut client,
+                &mut server,
+                SharingRequest::Actor(Box::new(ask))
+            )
+            .await,
+            Ok(SharingResponse::Actor(Err(SharingRejection::Denied)))
+        ));
+        assert_eq!(calls.try_recv().unwrap(), *client.local_peer_id());
+        assert!(calls.try_recv().is_err());
+
+        let mut legacy =
+            lan(|peer| remote::Behaviour::new(peer, messaging_config(Duration::from_secs(3))));
+        let addr = listening(&mut legacy, "/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
+        client.add_peer_address(*legacy.local_peer_id(), addr);
+        assert!(matches!(
+            exchange(&mut client, &mut legacy, SharingRequest::Probe).await,
+            Err(SharingCallError::UnsupportedProtocol)
+        ));
+    })
+    .await
+    .expect("sharing negotiation test timed out");
 }
 
 #[tokio::test]

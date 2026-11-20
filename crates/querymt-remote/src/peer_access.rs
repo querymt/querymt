@@ -12,7 +12,7 @@ mod store;
 pub use store::{GrantStore, GrantStoreError, PeerGrantState};
 
 /// Wire contract under which a protected operation was received.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SharingProtocol {
     /// Legacy wire format: only an explicit Full grant permits resource access.
     Legacy,

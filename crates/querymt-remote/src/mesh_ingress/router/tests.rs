@@ -167,6 +167,51 @@ async fn legacy_router_requires_transport_bound_full_grant() {
 }
 
 #[tokio::test]
+async fn grant_aware_route_authorizes_custom_sessions_only_on_v1() {
+    let host = PeerId::random();
+    let peer = PeerId::random();
+    let actor = ActorId::new_with_peer_id(17, host);
+    let store = Arc::new(TestStore::default());
+    let router = InboundRouter::new(host, store.clone());
+    router.register_v1_ask::<FixtureActor, Echo, _, String, _, _>(
+        actor,
+        InboundAccess::Sessions,
+        |origin, _| async move {
+            assert_eq!(origin.protocol(), SharingProtocol::V1);
+            Ok(origin.key().peer.to_string())
+        },
+    );
+    assert!(matches!(
+        router.handle_v1(peer, request(actor, peer)).await,
+        Err(SharingRejection::Denied)
+    ));
+    store
+        .replace_grant(
+            &key(host, peer),
+            Uuid::nil(),
+            PeerGrant::Custom {
+                sessions: true,
+                filesystem: false,
+                providers: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    let SwarmResponse::Ask(Ok(reply)) = router.handle_v1(peer, request(actor, peer)).await.unwrap()
+    else {
+        panic!("expected the granted session route to succeed");
+    };
+    assert_eq!(
+        rmp_serde::from_slice::<String>(&reply).unwrap(),
+        peer.to_string()
+    );
+    assert!(matches!(
+        router.handle_legacy(peer, request(actor, peer)).await,
+        SwarmResponse::Ask(Err(RemoteSendError::UnknownMessage { .. }))
+    ));
+}
+
+#[tokio::test]
 async fn legacy_router_suppresses_reply_after_grant_changes() {
     let host = PeerId::random();
     let peer = PeerId::random();
